@@ -1,0 +1,9 @@
+/var/log/trapd/events.ndjson {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

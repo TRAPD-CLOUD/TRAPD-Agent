@@ -15,13 +15,15 @@ use crate::schema::{
 };
 
 pub struct NetworkCollector {
-    known: HashSet<String>,
+    known_tcp: HashSet<String>,
+    known_udp: HashSet<String>,
 }
 
 impl NetworkCollector {
     pub fn new() -> Self {
         Self {
-            known: HashSet::new(),
+            known_tcp: HashSet::new(),
+            known_udp: HashSet::new(),
         }
     }
 }
@@ -108,20 +110,20 @@ impl Collector for NetworkCollector {
                 .await
                 .unwrap_or_default();
 
-            let mut entries = Vec::new();
-
+            // ── TCP (established only) ──────────────────────────────────────
+            let mut tcp_entries = Vec::new();
             match procfs::net::tcp() {
-                Ok(v) => entries.extend(v),
+                Ok(v) => tcp_entries.extend(v),
                 Err(e) => warn!("Failed to read /proc/net/tcp: {e}"),
             }
             match procfs::net::tcp6() {
-                Ok(v) => entries.extend(v),
+                Ok(v) => tcp_entries.extend(v),
                 Err(e) => warn!("Failed to read /proc/net/tcp6: {e}"),
             }
 
-            let mut new_known: HashSet<String> = HashSet::new();
+            let mut new_tcp: HashSet<String> = HashSet::new();
 
-            for entry in &entries {
+            for entry in &tcp_entries {
                 if entry.state != TcpState::Established {
                     continue;
                 }
@@ -130,16 +132,14 @@ impl Collector for NetworkCollector {
                 let src_port = entry.local_address.port();
                 let dst_addr = entry.remote_address.ip().to_string();
                 let dst_port = entry.remote_address.port();
-
                 let key = format!("{src_addr}:{src_port}-{dst_addr}:{dst_port}-tcp");
-                new_known.insert(key.clone());
+                new_tcp.insert(key.clone());
 
-                if self.known.contains(&key) {
+                if self.known_tcp.contains(&key) {
                     continue;
                 }
 
-                let (pid_opt, proc_name_opt) = resolve_pid_name(entry.inode, &inode_map);
-
+                let (pid, process) = resolve_pid_name(entry.inode, &inode_map);
                 let event = AgentEvent::new(
                     agent_id,
                     hostname.clone(),
@@ -153,17 +153,64 @@ impl Collector for NetworkCollector {
                         dst_addr,
                         dst_port,
                         state: "established".to_string(),
-                        pid: pid_opt,
-                        process: proc_name_opt,
+                        pid,
+                        process,
                     }),
                 );
-
                 if tx.send(event).await.is_err() {
                     return Ok(());
                 }
             }
+            self.known_tcp = new_tcp;
 
-            self.known = new_known;
+            // ── UDP (all sockets) ────────────────────────────────────────────
+            let mut udp_entries = Vec::new();
+            match procfs::net::udp() {
+                Ok(v) => udp_entries.extend(v),
+                Err(e) => warn!("Failed to read /proc/net/udp: {e}"),
+            }
+            match procfs::net::udp6() {
+                Ok(v) => udp_entries.extend(v),
+                Err(e) => warn!("Failed to read /proc/net/udp6: {e}"),
+            }
+
+            let mut new_udp: HashSet<String> = HashSet::new();
+
+            for entry in &udp_entries {
+                let src_addr = entry.local_address.ip().to_string();
+                let src_port = entry.local_address.port();
+                let dst_addr = entry.remote_address.ip().to_string();
+                let dst_port = entry.remote_address.port();
+                let key = format!("{src_addr}:{src_port}-{dst_addr}:{dst_port}-udp");
+                new_udp.insert(key.clone());
+
+                if self.known_udp.contains(&key) {
+                    continue;
+                }
+
+                let (pid, process) = resolve_pid_name(entry.inode, &inode_map);
+                let event = AgentEvent::new(
+                    agent_id,
+                    hostname.clone(),
+                    EventClass::Network,
+                    EventAction::Connection,
+                    Severity::Info,
+                    EventData::NetworkConnection(NetworkConnectionData {
+                        protocol: "udp".to_string(),
+                        src_addr,
+                        src_port,
+                        dst_addr,
+                        dst_port,
+                        state: "open".to_string(),
+                        pid,
+                        process,
+                    }),
+                );
+                if tx.send(event).await.is_err() {
+                    return Ok(());
+                }
+            }
+            self.known_udp = new_udp;
         }
     }
 }

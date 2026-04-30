@@ -43,10 +43,11 @@ pub enum EventClass {
     Network,
     System,
     User,
+    Filesystem,
 }
 
-// snake_case covers all existing single-word variants unchanged ("create", "terminate", etc.)
-// and correctly serializes new multi-word variants ("logon_failed", "session_open", etc.).
+// snake_case: single-word variants are unchanged ("create", "delete", etc.);
+// multi-word variants serialise correctly ("logon_failed", "session_open", etc.).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventAction {
@@ -58,6 +59,8 @@ pub enum EventAction {
     LogonFailed,
     SessionOpen,
     SessionClose,
+    Delete,
+    Modify,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +81,7 @@ pub enum EventData {
     SystemSnapshot(SystemSnapshotData),
     UserLogon(UserLogonData),
     UserSession(UserSessionData),
+    FileEvent(FileEventData),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +140,11 @@ pub struct UserLogonData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSessionData {
     pub username: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEventData {
+    pub path: String,
 }
 
 #[cfg(test)]
