@@ -32,8 +32,15 @@ impl RingBuffer {
         self.inner.push_back(event);
     }
 
-    pub fn pop(&mut self) -> Option<AgentEvent> {
-        self.inner.pop_front()
+    /// Returns up to `n` events from the front without removing them.
+    pub fn peek_batch(&self, n: usize) -> Vec<AgentEvent> {
+        self.inner.iter().take(n).cloned().collect()
+    }
+
+    /// Removes the first `n` events from the front.
+    pub fn drain(&mut self, n: usize) {
+        let count = n.min(self.inner.len());
+        self.inner.drain(..count);
     }
 }
 
@@ -42,3 +49,20 @@ impl Default for RingBuffer {
         Self::new()
     }
 }
+
+#[cfg(test)]
+impl RingBuffer {
+    pub fn with_max(max: usize) -> Self {
+        Self {
+            inner: VecDeque::new(),
+            max,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+#[cfg(test)]
+mod tests;

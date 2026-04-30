@@ -20,3 +20,5 @@ chrono             = { version = "0.4", features = ["serde"] }
 hostname           = "0.4"
 procfs             = "0.17"
 sysinfo            = "0.30"
+reqwest            = { version = "0.12", features = ["json"] }
+inotify            = "0.10"

@@ -42,15 +42,25 @@ pub enum EventClass {
     Process,
     Network,
     System,
+    User,
+    Filesystem,
 }
 
+// snake_case: single-word variants are unchanged ("create", "delete", etc.);
+// multi-word variants serialise correctly ("logon_failed", "session_open", etc.).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum EventAction {
     Create,
     Terminate,
     Connection,
     Snapshot,
+    Logon,
+    LogonFailed,
+    SessionOpen,
+    SessionClose,
+    Delete,
+    Modify,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +79,9 @@ pub enum EventData {
     ProcessTerminate(ProcessTerminateData),
     NetworkConnection(NetworkConnectionData),
     SystemSnapshot(SystemSnapshotData),
+    UserLogon(UserLogonData),
+    UserSession(UserSessionData),
+    FileEvent(FileEventData),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,3 +126,26 @@ pub struct SystemSnapshotData {
     pub uptime_secs:      u64,
     pub load_avg:         [f64; 3],
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserLogonData {
+    pub username:    String,
+    pub src_addr:    Option<String>,
+    pub src_port:    Option<u16>,
+    pub auth_method: Option<String>,
+    pub success:     bool,
+}
+
+/// Used for session_open / session_close events where only the username is known.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSessionData {
+    pub username: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEventData {
+    pub path: String,
+}
+
+#[cfg(test)]
+mod tests;
