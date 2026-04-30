@@ -1,0 +1,14 @@
+[Unit]
+Description=TRAPD Security Agent
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/trapd-agent
+Restart=always
+RestartSec=5
+Environment=TRAPD_OUTPUT=file
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/trapd/agent.env
+
+[Install]
+WantedBy=multi-user.target
