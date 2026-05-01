@@ -54,7 +54,7 @@ TMP_BINARY="/tmp/trapd-agent-${LATEST_TAG}"
 echo "Downloading ${BINARY_NAME}..."
 curl -fL "$DOWNLOAD_URL" -o "$TMP_BINARY"
 chmod +x "$TMP_BINARY"
-mv "$TMP_BINARY" "$INSTALL_BIN"
+mv -f "$TMP_BINARY" "$INSTALL_BIN"
 echo "Installed to ${INSTALL_BIN}"
 
 # ── Create directories ───────────────────────────────────────────────────────
@@ -136,7 +136,7 @@ DOWNLOAD_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${BI
 TMP_BINARY="/tmp/trapd-agent-new"
 curl -fL "\$DOWNLOAD_URL" -o "\$TMP_BINARY"
 chmod +x "\$TMP_BINARY"
-mv "\$TMP_BINARY" "\$INSTALL_BIN"
+mv -f "\$TMP_BINARY" "\$INSTALL_BIN"
 systemctl restart trapd-agent
 log "Updated to \${LATEST_TAG}."
 UPDATER
