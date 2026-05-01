@@ -5,7 +5,6 @@ use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::collectors::Collector;
 use crate::schema::{
@@ -37,7 +36,7 @@ impl Collector for AuthLogCollector {
     async fn run(
         &mut self,
         tx:       Sender<AgentEvent>,
-        agent_id: Uuid,
+        agent_id: String,
         hostname: String,
     ) -> Result<()> {
         let mut file = match File::open(AUTH_LOG).await {
@@ -65,7 +64,7 @@ impl Collector for AuthLogCollector {
                     break; // no new data yet
                 }
                 let trimmed = line.trim_end();
-                if let Some(event) = parse_auth_line(trimmed, agent_id, hostname.clone()) {
+                if let Some(event) = parse_auth_line(trimmed, agent_id.clone(), hostname.clone()) {
                     if tx.send(event).await.is_err() {
                         return Ok(()); // channel closed
                     }
@@ -75,10 +74,10 @@ impl Collector for AuthLogCollector {
     }
 }
 
-fn parse_auth_line(line: &str, agent_id: Uuid, hostname: String) -> Option<AgentEvent> {
+fn parse_auth_line(line: &str, agent_id: String, hostname: String) -> Option<AgentEvent> {
     if let Some(ev) = parse_accepted(line, "password") {
         return Some(AgentEvent::new(
-            agent_id, hostname,
+            agent_id.clone(), hostname.clone(),
             EventClass::User, EventAction::Logon,
             Severity::Info,
             EventData::UserLogon(ev),
@@ -87,7 +86,7 @@ fn parse_auth_line(line: &str, agent_id: Uuid, hostname: String) -> Option<Agent
 
     if let Some(ev) = parse_accepted(line, "publickey") {
         return Some(AgentEvent::new(
-            agent_id, hostname,
+            agent_id.clone(), hostname.clone(),
             EventClass::User, EventAction::Logon,
             Severity::Info,
             EventData::UserLogon(ev),
@@ -96,7 +95,7 @@ fn parse_auth_line(line: &str, agent_id: Uuid, hostname: String) -> Option<Agent
 
     if let Some(ev) = parse_failed(line) {
         return Some(AgentEvent::new(
-            agent_id, hostname,
+            agent_id.clone(), hostname.clone(),
             EventClass::User, EventAction::LogonFailed,
             Severity::Medium,
             EventData::UserLogon(ev),
@@ -105,7 +104,7 @@ fn parse_auth_line(line: &str, agent_id: Uuid, hostname: String) -> Option<Agent
 
     if let Some(ev) = parse_session(line, true) {
         return Some(AgentEvent::new(
-            agent_id, hostname,
+            agent_id.clone(), hostname.clone(),
             EventClass::User, EventAction::SessionOpen,
             Severity::Info,
             EventData::UserSession(ev),
@@ -114,7 +113,7 @@ fn parse_auth_line(line: &str, agent_id: Uuid, hostname: String) -> Option<Agent
 
     if let Some(ev) = parse_session(line, false) {
         return Some(AgentEvent::new(
-            agent_id, hostname,
+            agent_id.clone(), hostname.clone(),
             EventClass::User, EventAction::SessionClose,
             Severity::Info,
             EventData::UserSession(ev),

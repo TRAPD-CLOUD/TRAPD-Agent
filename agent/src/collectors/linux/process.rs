@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::collectors::Collector;
 use crate::schema::{
@@ -115,7 +114,7 @@ impl Collector for ProcessCollector {
     async fn run(
         &mut self,
         tx:       Sender<AgentEvent>,
-        agent_id: Uuid,
+        agent_id: String,
         hostname: String,
     ) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(3));
@@ -140,7 +139,7 @@ impl Collector for ProcessCollector {
             for pid in current_pids.difference(&self.known_pids).copied().collect::<Vec<_>>() {
                 if let Some(info) = current.get(&pid) {
                     let event = AgentEvent::new(
-                        agent_id,
+                        agent_id.clone(),
                         hostname.clone(),
                         EventClass::Process,
                         EventAction::Create,
@@ -158,7 +157,7 @@ impl Collector for ProcessCollector {
             for pid in self.known_pids.difference(&current_pids).copied().collect::<Vec<_>>() {
                 let name = self.known_names.remove(&pid).unwrap_or_default();
                 let event = AgentEvent::new(
-                    agent_id,
+                    agent_id.clone(),
                     hostname.clone(),
                     EventClass::Process,
                     EventAction::Terminate,

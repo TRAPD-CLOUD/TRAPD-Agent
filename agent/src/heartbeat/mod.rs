@@ -2,11 +2,10 @@ use chrono::Utc;
 use serde::Serialize;
 use tokio::time::{interval, Duration};
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 #[derive(Serialize)]
 struct HeartbeatPayload {
-    agent_id:  Uuid,
+    agent_id:  String,
     hostname:  String,
     timestamp: chrono::DateTime<Utc>,
 }
@@ -15,14 +14,14 @@ pub struct Heartbeat {
     client:        reqwest::Client,
     heartbeat_url: String,
     token:         String,
-    agent_id:      Uuid,
+    agent_id:      String,
     hostname:      String,
 }
 
 impl Heartbeat {
     pub fn new(
         backend_url: &str,
-        agent_id:    Uuid,
+        agent_id:    String,
         token:       String,
         hostname:    String,
     ) -> Self {
@@ -45,7 +44,7 @@ impl Heartbeat {
 
     async fn send(&self) {
         let payload = HeartbeatPayload {
-            agent_id:  self.agent_id,
+            agent_id:  self.agent_id.clone(),
             hostname:  self.hostname.clone(),
             timestamp: Utc::now(),
         };

@@ -7,7 +7,6 @@ use procfs::net::TcpState;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::collectors::Collector;
 use crate::schema::{
@@ -98,7 +97,7 @@ impl Collector for NetworkCollector {
     async fn run(
         &mut self,
         tx:       Sender<AgentEvent>,
-        agent_id: Uuid,
+        agent_id: String,
         hostname: String,
     ) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(5));
@@ -141,7 +140,7 @@ impl Collector for NetworkCollector {
 
                 let (pid, process) = resolve_pid_name(entry.inode, &inode_map);
                 let event = AgentEvent::new(
-                    agent_id,
+                    agent_id.clone(),
                     hostname.clone(),
                     EventClass::Network,
                     EventAction::Connection,
@@ -190,7 +189,7 @@ impl Collector for NetworkCollector {
 
                 let (pid, process) = resolve_pid_name(entry.inode, &inode_map);
                 let event = AgentEvent::new(
-                    agent_id,
+                    agent_id.clone(),
                     hostname.clone(),
                     EventClass::Network,
                     EventAction::Connection,

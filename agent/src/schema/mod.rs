@@ -5,7 +5,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub event_id:  Uuid,
-    pub agent_id:  Uuid,
+    /// Server-assigned agent identifier (e.g. "agent_AbCdEf123").
+    pub agent_id:  String,
     pub hostname:  String,
     pub timestamp: DateTime<Utc>,
     pub class:     EventClass,
@@ -16,7 +17,7 @@ pub struct AgentEvent {
 
 impl AgentEvent {
     pub fn new(
-        agent_id: Uuid,
+        agent_id: String,
         hostname: String,
         class: EventClass,
         action: EventAction,
