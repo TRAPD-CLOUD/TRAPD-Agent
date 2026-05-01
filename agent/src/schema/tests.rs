@@ -7,7 +7,7 @@ use super::{
 
 fn process_create_event() -> AgentEvent {
     AgentEvent::new(
-        Uuid::new_v4(),
+        Uuid::new_v4().to_string(),
         "test-host".to_string(),
         EventClass::Process,
         EventAction::Create,
@@ -68,7 +68,7 @@ fn test_timestamp_is_rfc3339() {
 #[test]
 fn test_system_snapshot_class_and_action() {
     let event = AgentEvent::new(
-        Uuid::new_v4(),
+        Uuid::new_v4().to_string(),
         "host".to_string(),
         EventClass::System,
         EventAction::Snapshot,

@@ -7,7 +7,7 @@ use crate::schema::{
 
 fn dummy_event() -> AgentEvent {
     AgentEvent::new(
-        Uuid::new_v4(),
+        Uuid::new_v4().to_string(),
         "test-host".to_string(),
         EventClass::System,
         EventAction::Snapshot,
