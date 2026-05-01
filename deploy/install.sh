@@ -113,6 +113,11 @@ INSTALL_BIN="${INSTALL_BIN}"
 
 log() { echo "\$(date -u +"%Y-%m-%dT%H:%M:%SZ") trapd-update: \$*"; }
 
+if [[ \$EUID -ne 0 ]]; then
+    log "ERROR: trapd-update must be run as root (try: sudo trapd-update)." >&2
+    exit 1
+fi
+
 LATEST_TAG=\$(curl -sf "https://api.github.com/repos/\${REPO}/releases/latest" \\
     | grep '"tag_name"' \\
     | head -1 \\
@@ -133,10 +138,12 @@ fi
 
 log "Updating \$CURRENT_VERSION → \$LATEST_TAG..."
 DOWNLOAD_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${BINARY_NAME}"
-TMP_BINARY="/tmp/trapd-agent-new"
+TMP_BINARY=\$(mktemp -t trapd-agent.XXXXXX)
+trap 'rm -f "\$TMP_BINARY"' EXIT
 curl -fL "\$DOWNLOAD_URL" -o "\$TMP_BINARY"
 chmod +x "\$TMP_BINARY"
 mv -f "\$TMP_BINARY" "\$INSTALL_BIN"
+trap - EXIT
 systemctl restart trapd-agent
 log "Updated to \${LATEST_TAG}."
 UPDATER
