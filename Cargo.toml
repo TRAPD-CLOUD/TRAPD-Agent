@@ -1,3 +1,6 @@
 [workspace]
-members = ["agent"]
+members  = ["agent", "trapd-agent-ebpf", "xtask"]
 resolver = "2"
+
+[workspace.metadata.xtask]
+ebpf-programs = ["trapd-agent-ebpf"]
