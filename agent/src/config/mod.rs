@@ -3,7 +3,6 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 fn default_poll_interval() -> u64 { 60 }
 fn default_fs_watch_paths() -> Vec<String> {
@@ -51,7 +50,7 @@ impl ConfigPuller {
     pub fn new(
         config:      Arc<RwLock<AgentConfig>>,
         backend_url: &str,
-        agent_id:    Uuid,
+        agent_id:    &str,
         token:       String,
     ) -> Self {
         Self {

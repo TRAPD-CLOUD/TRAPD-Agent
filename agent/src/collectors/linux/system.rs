@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
-use uuid::Uuid;
 
 use crate::collectors::Collector;
 use crate::schema::{AgentEvent, EventAction, EventClass, EventData, Severity, SystemSnapshotData};
@@ -82,7 +81,7 @@ impl Collector for SystemCollector {
     async fn run(
         &mut self,
         tx:       Sender<AgentEvent>,
-        agent_id: Uuid,
+        agent_id: String,
         hostname: String,
     ) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(60));
@@ -93,7 +92,7 @@ impl Collector for SystemCollector {
             let snapshot = tokio::task::spawn_blocking(collect_system_info).await??;
 
             let event = AgentEvent::new(
-                agent_id,
+                agent_id.clone(),
                 hostname.clone(),
                 EventClass::System,
                 EventAction::Snapshot,

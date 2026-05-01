@@ -1,7 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc::Sender;
-use uuid::Uuid;
 
 use crate::schema::AgentEvent;
 
@@ -12,7 +11,7 @@ pub trait Collector: Send + Sync + 'static {
     async fn run(
         &mut self,
         tx:       Sender<AgentEvent>,
-        agent_id: Uuid,
+        agent_id: String,
         hostname: String,
     ) -> Result<()>;
 }

@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use inotify::{EventMask, Inotify, WatchMask};
 use tokio::sync::mpsc::Sender;
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::collectors::Collector;
 use crate::schema::{AgentEvent, EventAction, EventClass, EventData, FileEventData, Severity};
@@ -39,7 +38,7 @@ impl Collector for FilesystemCollector {
     async fn run(
         &mut self,
         tx:       Sender<AgentEvent>,
-        agent_id: Uuid,
+        agent_id: String,
         hostname: String,
     ) -> Result<()> {
         // Internal channel: blocking inotify thread → async event consumer
@@ -95,7 +94,7 @@ impl Collector for FilesystemCollector {
         // Async consumer: convert raw events to AgentEvents and forward to pipeline
         while let Some((action, path)) = fs_rx.recv().await {
             let event = AgentEvent::new(
-                agent_id,
+                agent_id.clone(),
                 hostname.clone(),
                 EventClass::Filesystem,
                 action,
