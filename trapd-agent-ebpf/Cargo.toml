@@ -1,0 +1,25 @@
+# Standalone workspace — NOT a member of the root workspace.
+# This crate targets bpfel-unknown-none (eBPF kernel programs) and is
+# compiled with nightly + bpf-linker via `cargo xtask build-ebpf --release`.
+[workspace]
+
+[package]
+name    = "trapd-agent-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "trapd-agent-exec"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf     = { version = "0.1", features = ["macros"] }
+aya-log-ebpf = "0.1"
+
+[profile.release]
+lto       = true
+opt-level = "z"
+panic     = "abort"
+
+[profile.dev]
+panic = "abort"

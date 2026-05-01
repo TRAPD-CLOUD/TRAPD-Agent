@@ -1,4 +1,5 @@
 pub mod authlog;
+pub mod ebpf_exec;
 pub mod filesystem;
 pub mod network;
 pub mod process;

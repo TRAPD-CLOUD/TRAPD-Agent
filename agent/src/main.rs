@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use tokio::fs;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 mod collectors;
@@ -15,6 +15,7 @@ mod schema;
 mod transport;
 
 use collectors::linux::authlog::AuthLogCollector;
+use collectors::linux::ebpf_exec::EbpfExecCollector;
 use collectors::linux::filesystem::FilesystemCollector;
 use collectors::linux::network::NetworkCollector;
 use collectors::linux::process::ProcessCollector;
@@ -41,7 +42,6 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // device_id is the stable hardware/VM identity (UUID, persistent across re-enrollments)
     let device_id = load_or_create_device_id()
         .await
         .context("Failed to load/create device_id")?;
@@ -50,18 +50,17 @@ async fn main() -> Result<()> {
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let backend_url = std::env::var("TRAPD_BACKEND_URL")
-        .expect("TRAPD_BACKEND_URL env var must be set");
+    let backend_url =
+        std::env::var("TRAPD_BACKEND_URL").expect("TRAPD_BACKEND_URL env var must be set");
 
-    // Enrollment: loads persisted credentials or performs first-run enrollment
     let creds = enrollment::load_or_enroll(&backend_url, &device_id, &hostname)
         .await
         .context("Failed to obtain agent credentials")?;
 
     let agent_id = creds.agent_id.clone();
-    let token = creds.agent_secret.clone();
+    let token    = creds.agent_secret.clone();
 
-    let output_mode = OutputMode::from_env();
+    let output_mode  = OutputMode::from_env();
     let output_label = match output_mode {
         OutputMode::Stdout => "stdout",
         OutputMode::File   => "file",
@@ -77,7 +76,7 @@ async fn main() -> Result<()> {
     );
 
     let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(AgentConfig::default()));
-    let ring_buffer: Arc<Mutex<RingBuffer>> = Arc::new(Mutex::new(RingBuffer::new()));
+    let ring_buffer: Arc<Mutex<RingBuffer>>    = Arc::new(Mutex::new(RingBuffer::new()));
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
 
@@ -90,12 +89,29 @@ async fn main() -> Result<()> {
             let cname  = c.name();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = c.run(tx2, aid, host).await {
-                    error!("{cname} exited with error: {e}");
+                    error!("{cname} exited with error: {e:#}");
                 }
             }));
         }};
     }
 
+    // ── eBPF exec tracer (real-time, kernel-level) ───────────────────────────
+    // Spawned first: catches execve(2) events instantly via ring buffer.
+    // Falls back gracefully if the eBPF binary is not installed.
+    let ebpf = EbpfExecCollector::new();
+    if ebpf.is_available() {
+        info!("eBPF exec tracer available — spawning EbpfExecCollector");
+        spawn_collector!(ebpf);
+    } else {
+        warn!(
+            "eBPF binary not found — exec events will be detected by polling only.\n\
+             To enable: cargo xtask build-ebpf --release && \
+             cp target/bpfel-unknown-none/release/trapd-agent-exec \
+             /usr/lib/trapd-agent/"
+        );
+    }
+
+    // ── Polling collectors (userspace, all platforms) ────────────────────────
     spawn_collector!(SystemCollector::new());
     spawn_collector!(ProcessCollector::new());
     spawn_collector!(NetworkCollector::new());
@@ -128,7 +144,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    let transport = Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone());
+    let transport =
+        Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone());
     tokio::spawn(async move { transport.run().await });
 
     let config_puller = ConfigPuller::new(
@@ -159,18 +176,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Persistent device UUID — stable across re-enrollments and reboots.
 async fn load_or_create_device_id() -> Result<String> {
     let dir  = device_dir()?;
     let file = dir.join("device_id");
 
     if file.exists() {
-        let raw = fs::read_to_string(&file)
-            .await
-            .context("Failed to read device_id file")?;
+        let raw     = fs::read_to_string(&file).await.context("Failed to read device_id file")?;
         let trimmed = raw.trim();
-        // Accept both UUID and legacy UUID string formats
-        let _ = Uuid::parse_str(trimmed).context("device_id file contains invalid UUID")?;
+        let _       = Uuid::parse_str(trimmed).context("device_id file contains invalid UUID")?;
         return Ok(trimmed.to_string());
     }
 

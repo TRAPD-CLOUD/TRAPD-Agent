@@ -1,6 +1,6 @@
 [package]
 name    = "trapd-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -22,3 +22,9 @@ procfs             = "0.17"
 sysinfo            = "0.30"
 reqwest            = { version = "0.12", features = ["json"] }
 inotify            = "0.10"
+
+# eBPF userspace loader — Linux only.
+# Only needed at runtime if the eBPF binary is installed;
+# compiles cleanly on all platforms.
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.13", features = ["async_tokio"] }
