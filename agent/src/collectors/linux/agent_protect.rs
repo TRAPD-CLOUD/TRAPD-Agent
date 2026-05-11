@@ -133,10 +133,10 @@ fn run_protect_sync(
             if tx.blocking_send(ev).is_err() { return; }
 
             // Re-apply immutable flag if an immutable file was tampered with.
-            if mask.contains(EventMask::ATTRIB) || mask.contains(EventMask::MODIFY) {
-                if IMMUTABLE_FILES.contains(&path.as_str()) {
-                    apply_chattr_immutable(&path);
-                }
+            if (mask.contains(EventMask::ATTRIB) || mask.contains(EventMask::MODIFY))
+                && IMMUTABLE_FILES.contains(&path.as_str())
+            {
+                apply_chattr_immutable(&path);
             }
         }
     }

@@ -201,8 +201,8 @@ fn run_sync(
             // ── Ransomware: Shannon entropy on MODIFY ─────────────────────────
             if mask.contains(EventMask::MODIFY) {
                 if let Some(entropy) = compute_file_entropy(&path) {
-                    if entropy >= ENTROPY_THRESHOLD {
-                        if send(&tx, AgentEvent::new(
+                    if entropy >= ENTROPY_THRESHOLD
+                        && send(&tx, AgentEvent::new(
                             agent_id.clone(), hostname.clone(),
                             EventClass::Filesystem, EventAction::RansomwareIndicator, Severity::High,
                             EventData::RansomwareIndicator(RansomwareIndicatorData {
@@ -216,14 +216,14 @@ fn run_sync(
                                     "Shannon entropy {entropy:.2} bits/byte (threshold {ENTROPY_THRESHOLD})"
                                 ),
                             }),
-                        )) { return; }
-                    }
+                        ))
+                    { return; }
                 }
 
                 // Track modification rate across the sliding window.
                 let now = Instant::now();
                 mod_window.push_back(now);
-                while mod_window.front().map_or(false, |t| now.duration_since(*t) > MASS_MOD_WINDOW) {
+                while mod_window.front().is_some_and(|t| now.duration_since(*t) > MASS_MOD_WINDOW) {
                     mod_window.pop_front();
                 }
                 if mod_window.len() >= MASS_MOD_THRESHOLD {
@@ -249,31 +249,29 @@ fn run_sync(
             }
 
             // ── Ransomware: suspicious extension on CREATE / RENAME ───────────
-            if mask.contains(EventMask::MOVED_TO) || mask.contains(EventMask::CREATE) {
-                if has_ransom_extension(&path) {
-                    if send(&tx, AgentEvent::new(
-                        agent_id.clone(), hostname.clone(),
-                        EventClass::Filesystem, EventAction::RansomwareIndicator, Severity::High,
-                        EventData::RansomwareIndicator(RansomwareIndicatorData {
-                            indicator_type: "suspicious_extension".to_string(),
-                            path:           Some(path.clone()),
-                            pid:            None,
-                            comm:           None,
-                            entropy:        None,
-                            write_rate:     None,
-                            details:        format!(
-                                "File appeared with ransomware-associated extension: {path}"
-                            ),
-                        }),
-                    )) { return; }
-                }
-            }
+            if (mask.contains(EventMask::MOVED_TO) || mask.contains(EventMask::CREATE))
+                && has_ransom_extension(&path)
+                && send(&tx, AgentEvent::new(
+                    agent_id.clone(), hostname.clone(),
+                    EventClass::Filesystem, EventAction::RansomwareIndicator, Severity::High,
+                    EventData::RansomwareIndicator(RansomwareIndicatorData {
+                        indicator_type: "suspicious_extension".to_string(),
+                        path:           Some(path.clone()),
+                        pid:            None,
+                        comm:           None,
+                        entropy:        None,
+                        write_rate:     None,
+                        details:        format!(
+                            "File appeared with ransomware-associated extension: {path}"
+                        ),
+                    }),
+                ))
+            { return; }
 
             // ── Ransomware: backup directory deletion ─────────────────────────
             if (mask.contains(EventMask::DELETE) || mask.contains(EventMask::MOVED_FROM))
                 && is_backup_path(&path)
-            {
-                if send(&tx, AgentEvent::new(
+                && send(&tx, AgentEvent::new(
                     agent_id.clone(), hostname.clone(),
                     EventClass::Filesystem, EventAction::RansomwareIndicator, Severity::High,
                     EventData::RansomwareIndicator(RansomwareIndicatorData {
@@ -285,19 +283,14 @@ fn run_sync(
                         write_rate:     None,
                         details:        format!("Backup path deleted or moved: {path}"),
                     }),
-                )) { return; }
-            }
+                ))
+            { return; }
 
             // ── Basic inotify event (always emitted) ──────────────────────────
             if let Some(action) = mask_to_action(mask) {
-                let severity = if is_fim_path(&path) {
-                    Severity::Info
-                } else {
-                    Severity::Info
-                };
                 if send(&tx, AgentEvent::new(
                     agent_id.clone(), hostname.clone(),
-                    EventClass::Filesystem, action, severity,
+                    EventClass::Filesystem, action, Severity::Info,
                     EventData::FileEvent(FileEventData { path }),
                 )) { return; }
             }
