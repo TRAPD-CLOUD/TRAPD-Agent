@@ -16,6 +16,7 @@ mod transport;
 
 use collectors::linux::authlog::AuthLogCollector;
 use collectors::linux::ebpf_exec::EbpfExecCollector;
+use collectors::linux::ebpf_syscalls::EbpfSyscallCollector;
 use collectors::linux::filesystem::FilesystemCollector;
 use collectors::linux::network::NetworkCollector;
 use collectors::linux::process::ProcessCollector;
@@ -95,16 +96,29 @@ async fn main() -> Result<()> {
         }};
     }
 
-    // ── eBPF exec tracer (real-time, kernel-level) ───────────────────────────
-    // Spawned first: catches execve(2) events instantly via ring buffer.
-    // Falls back gracefully if the eBPF binary is not installed.
-    let ebpf = EbpfExecCollector::new();
-    if ebpf.is_available() {
+    // ── eBPF tracers (real-time, kernel-level) ───────────────────────────────
+    // Both collectors load the same eBPF binary and attach independent programs.
+    // They fall back gracefully if the binary is not installed.
+    let ebpf_exec = EbpfExecCollector::new();
+    if ebpf_exec.is_available() {
         info!("eBPF exec tracer available — spawning EbpfExecCollector");
-        spawn_collector!(ebpf);
+        spawn_collector!(ebpf_exec);
     } else {
         warn!(
             "eBPF binary not found — exec events will be detected by polling only.\n\
+             To enable: cargo xtask build-ebpf --release && \
+             cp target/bpfel-unknown-none/release/trapd-agent-exec \
+             /usr/lib/trapd-agent/"
+        );
+    }
+
+    let ebpf_syscalls = EbpfSyscallCollector::new();
+    if ebpf_syscalls.is_available() {
+        info!("eBPF syscall tracer available — spawning EbpfSyscallCollector");
+        spawn_collector!(ebpf_syscalls);
+    } else {
+        warn!(
+            "eBPF binary not found — syscall events (open/connect/fork/…) unavailable.\n\
              To enable: cargo xtask build-ebpf --release && \
              cp target/bpfel-unknown-none/release/trapd-agent-exec \
              /usr/lib/trapd-agent/"

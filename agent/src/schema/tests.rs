@@ -1,8 +1,9 @@
 use uuid::Uuid;
 
 use super::{
-    AgentEvent, EventAction, EventClass, EventData, ProcessCreateData, Severity,
-    SystemSnapshotData,
+    AgentEvent, DnsData, EventAction, EventClass, EventData, FileOpenData, ForkData, MmapData,
+    ModuleLoadData, NetworkSocketData, NsChangeData, ProcessCreateData, PtraceData, Severity,
+    ShmData, SystemSnapshotData,
 };
 
 fn process_create_event() -> AgentEvent {
@@ -108,4 +109,275 @@ fn test_snake_case_action_variants() {
     assert_eq!(lf, r#""logon_failed""#);
     assert_eq!(so, r#""session_open""#);
     assert_eq!(sc, r#""session_close""#);
+}
+
+#[test]
+fn test_new_ebpf_action_serialization() {
+    let cases: &[(&str, EventAction)] = &[
+        ("\"open\"",       EventAction::Open),
+        ("\"bind\"",       EventAction::Bind),
+        ("\"accept\"",     EventAction::Accept),
+        ("\"fork\"",       EventAction::Fork),
+        ("\"unlink\"",     EventAction::Unlink),
+        ("\"rename\"",     EventAction::Rename),
+        ("\"chmod\"",      EventAction::Chmod),
+        ("\"chown\"",      EventAction::Chown),
+        ("\"mmap\"",       EventAction::Mmap),
+        ("\"ptrace\"",     EventAction::Ptrace),
+        ("\"module_load\"",EventAction::ModuleLoad),
+        ("\"shmget\"",     EventAction::Shmget),
+        ("\"shmat\"",      EventAction::Shmat),
+        ("\"ns_change\"",  EventAction::NsChange),
+        ("\"dns_query\"",  EventAction::DnsQuery),
+    ];
+    for (expected, action) in cases {
+        let got = serde_json::to_string(action).expect("must serialize");
+        assert_eq!(&got, expected, "wrong serialization for {expected}");
+    }
+}
+
+#[test]
+fn test_new_ebpf_class_serialization() {
+    assert_eq!(serde_json::to_string(&EventClass::Memory).unwrap(), r#""memory""#);
+    assert_eq!(serde_json::to_string(&EventClass::Kernel).unwrap(), r#""kernel""#);
+    assert_eq!(serde_json::to_string(&EventClass::Ipc).unwrap(),    r#""ipc""#);
+}
+
+#[test]
+fn test_file_open_event_roundtrip() {
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "host".to_string(),
+        EventClass::Filesystem,
+        EventAction::Open,
+        Severity::Info,
+        EventData::FileOpen(FileOpenData {
+            pid:      42,
+            uid:      1000,
+            gid:      1000,
+            username: "alice".to_string(),
+            comm:     "vim".to_string(),
+            path:     "/etc/passwd".to_string(),
+            flags:    0x241,
+        }),
+    );
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"],         "filesystem");
+    assert_eq!(val["action"],        "open");
+    assert_eq!(val["data"]["path"],  "/etc/passwd");
+    assert_eq!(val["data"]["pid"],   42);
+    assert_eq!(val["data"]["flags"], 0x241_u64);
+}
+
+#[test]
+fn test_fork_event_roundtrip() {
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "host".to_string(),
+        EventClass::Process,
+        EventAction::Fork,
+        Severity::Info,
+        EventData::Fork(ForkData {
+            parent_pid:  100,
+            child_pid:   200,
+            parent_comm: "bash".to_string(),
+            child_comm:  "bash".to_string(),
+        }),
+    );
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"],              "process");
+    assert_eq!(val["action"],             "fork");
+    assert_eq!(val["data"]["parent_pid"], 100);
+    assert_eq!(val["data"]["child_pid"],  200);
+}
+
+#[test]
+fn test_mmap_event_roundtrip() {
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "host".to_string(),
+        EventClass::Memory,
+        EventAction::Mmap,
+        Severity::Medium,
+        EventData::Mmap(MmapData {
+            pid:         1337,
+            uid:         0,
+            gid:         0,
+            username:    "root".to_string(),
+            comm:        "loader".to_string(),
+            addr:        0x7fff_0000,
+            len:         4096,
+            prot:        0x4,
+            flags:       0x22,
+            description: "anon|exec".to_string(),
+        }),
+    );
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"],  "memory");
+    assert_eq!(val["action"], "mmap");
+    assert_eq!(val["data"]["description"], "anon|exec");
+    assert_eq!(val["severity"], "medium");
+}
+
+#[test]
+fn test_ptrace_event_roundtrip() {
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "host".to_string(),
+        EventClass::Process,
+        EventAction::Ptrace,
+        Severity::High,
+        EventData::Ptrace(PtraceData {
+            pid:        666,
+            uid:        0,
+            gid:        0,
+            username:   "root".to_string(),
+            comm:       "gdb".to_string(),
+            request:    16,
+            target_pid: 1000,
+        }),
+    );
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"],              "process");
+    assert_eq!(val["action"],             "ptrace");
+    assert_eq!(val["severity"],           "high");
+    assert_eq!(val["data"]["request"],    16);
+    assert_eq!(val["data"]["target_pid"], 1000);
+}
+
+#[test]
+fn test_module_load_event_roundtrip() {
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "host".to_string(),
+        EventClass::Kernel,
+        EventAction::ModuleLoad,
+        Severity::High,
+        EventData::ModuleLoad(ModuleLoadData {
+            pid:      1,
+            uid:      0,
+            gid:      0,
+            username: "root".to_string(),
+            name:     "evil_rootkit".to_string(),
+            taints:   0,
+        }),
+    );
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"],          "kernel");
+    assert_eq!(val["action"],         "module_load");
+    assert_eq!(val["data"]["name"],   "evil_rootkit");
+    assert_eq!(val["data"]["taints"], 0);
+}
+
+#[test]
+fn test_network_socket_event_roundtrip() {
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "host".to_string(),
+        EventClass::Network,
+        EventAction::Connection,
+        Severity::Info,
+        EventData::NetworkSocket(NetworkSocketData {
+            pid:      42,
+            uid:      1000,
+            gid:      1000,
+            username: "alice".to_string(),
+            comm:     "curl".to_string(),
+            op:       "connect".to_string(),
+            family:   "ipv4".to_string(),
+            addr:     "93.184.216.34".to_string(),
+            port:     443,
+        }),
+    );
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"],        "network");
+    assert_eq!(val["data"]["op"],   "connect");
+    assert_eq!(val["data"]["port"], 443);
+}
+
+#[test]
+fn test_dns_event_roundtrip() {
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "host".to_string(),
+        EventClass::Network,
+        EventAction::DnsQuery,
+        Severity::Info,
+        EventData::Dns(DnsData {
+            pid:      99,
+            uid:      1000,
+            gid:      1000,
+            username: "nobody".to_string(),
+            comm:     "systemd-resolved".to_string(),
+            dst_addr: "8.8.8.8".to_string(),
+            dst_port: 53,
+        }),
+    );
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"],            "network");
+    assert_eq!(val["action"],           "dns_query");
+    assert_eq!(val["data"]["dst_addr"], "8.8.8.8");
+    assert_eq!(val["data"]["dst_port"], 53);
+}
+
+#[test]
+fn test_ns_change_event_roundtrip() {
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "host".to_string(),
+        EventClass::Process,
+        EventAction::NsChange,
+        Severity::Medium,
+        EventData::NsChange(NsChangeData {
+            pid:        777,
+            uid:        0,
+            gid:        0,
+            username:   "root".to_string(),
+            comm:       "runc".to_string(),
+            op:         "unshare".to_string(),
+            namespaces: "pid,net,mnt".to_string(),
+            flags:      0x6002_0000,
+        }),
+    );
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"],              "process");
+    assert_eq!(val["action"],             "ns_change");
+    assert_eq!(val["data"]["op"],         "unshare");
+    assert_eq!(val["data"]["namespaces"], "pid,net,mnt");
+}
+
+#[test]
+fn test_shm_event_roundtrip() {
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "host".to_string(),
+        EventClass::Ipc,
+        EventAction::Shmget,
+        Severity::Low,
+        EventData::Shm(ShmData {
+            pid:      500,
+            uid:      1000,
+            gid:      1000,
+            username: "bob".to_string(),
+            comm:     "app".to_string(),
+            op:       "shmget".to_string(),
+            key:      12345,
+            size:     65536,
+            flags:    0o600,
+        }),
+    );
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"],        "ipc");
+    assert_eq!(val["action"],       "shmget");
+    assert_eq!(val["data"]["key"],  12345);
+    assert_eq!(val["data"]["size"], 65536);
 }

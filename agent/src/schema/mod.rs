@@ -5,7 +5,6 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub event_id:  Uuid,
-    /// Server-assigned agent identifier (e.g. "agent_AbCdEf123").
     pub agent_id:  String,
     pub hostname:  String,
     pub timestamp: DateTime<Utc>,
@@ -45,6 +44,12 @@ pub enum EventClass {
     System,
     User,
     Filesystem,
+    /// Anonymous/executable memory mappings (fileless malware).
+    Memory,
+    /// Kernel-level events (module loads).
+    Kernel,
+    /// Inter-process communication (shared memory).
+    Ipc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,8 +57,6 @@ pub enum EventClass {
 pub enum EventAction {
     Create,
     Terminate,
-    /// execve(2) — process image replacement detected via eBPF tracepoint.
-    /// Faster and more complete than polling-based Create detection.
     Exec,
     Connection,
     Snapshot,
@@ -63,6 +66,37 @@ pub enum EventAction {
     SessionClose,
     Delete,
     Modify,
+    // ── New eBPF-sourced actions ──────────────────────────────────────────────
+    /// openat(2) with write/create/truncate flags.
+    Open,
+    /// bind(2) – process registering a listening socket.
+    Bind,
+    /// accept4(2) – process accepting an incoming connection.
+    Accept,
+    /// clone(2)/fork(2) – child process creation.
+    Fork,
+    /// unlinkat(2) – file deletion.
+    Unlink,
+    /// renameat2(2) – file rename/move.
+    Rename,
+    /// fchmodat(2) – permission change.
+    Chmod,
+    /// fchownat(2) – ownership change.
+    Chown,
+    /// mmap(2) with executable or RWX flags.
+    Mmap,
+    /// ptrace(2) – debugging / injection.
+    Ptrace,
+    /// Kernel module loaded (insmod/modprobe).
+    ModuleLoad,
+    /// shmget(2) – shared memory segment created.
+    Shmget,
+    /// shmat(2) – shared memory segment attached.
+    Shmat,
+    /// unshare(2)/setns(2) – namespace change (potential container escape).
+    NsChange,
+    /// UDP sendmsg to port 53 – DNS query.
+    DnsQuery,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,14 +113,29 @@ pub enum Severity {
 pub enum EventData {
     ProcessCreate(ProcessCreateData),
     ProcessTerminate(ProcessTerminateData),
-    /// Real-time exec event from eBPF — one per execve(2), zero polling lag.
     ProcessExec(ExecEventData),
     NetworkConnection(NetworkConnectionData),
     SystemSnapshot(SystemSnapshotData),
     UserLogon(UserLogonData),
     UserSession(UserSessionData),
     FileEvent(FileEventData),
+    // ── New eBPF-sourced event data ───────────────────────────────────────────
+    FileOpen(FileOpenData),
+    NetworkSocket(NetworkSocketData),
+    Fork(ForkData),
+    FileUnlink(FileUnlinkData),
+    FileRename(FileRenameData),
+    FileChmod(FileChmodData),
+    FileChown(FileChownData),
+    Mmap(MmapData),
+    Ptrace(PtraceData),
+    ModuleLoad(ModuleLoadData),
+    Shm(ShmData),
+    NsChange(NsChangeData),
+    Dns(DnsData),
 }
+
+// ── Existing data structs ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessCreateData {
@@ -105,33 +154,17 @@ pub struct ProcessTerminateData {
     pub name: String,
 }
 
-/// Exec event captured via eBPF sched/sched_process_exec tracepoint.
-///
-/// Represents a single execve(2) call — fired the moment the kernel commits
-/// to replacing the process image. Short-lived processes (one-shot scripts,
-/// C2 loaders, shell injections) that vanish before the next poll interval
-/// are fully captured.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecEventData {
-    /// User-space visible PID
-    pub pid: i32,
-    /// Parent PID (from /proc)
-    pub ppid: i32,
-    /// Real UID
-    pub uid: u32,
-    /// Real GID
-    pub gid: u32,
-    /// Username resolved from /etc/passwd
+    pub pid:      i32,
+    pub ppid:     i32,
+    pub uid:      u32,
+    pub gid:      u32,
     pub username: String,
-    /// Short process name from kernel task_struct.comm (≤ 15 chars)
-    pub comm: String,
-    /// Absolute path of the exec'd binary
-    pub exe: String,
-    /// Full command line including arguments (from /proc/<pid>/cmdline)
-    pub cmdline: String,
-    /// Working directory at time of exec (from /proc/<pid>/cwd)
-    pub cwd: String,
-    /// Short container ID (12 hex chars) if running inside a container
+    pub comm:     String,
+    pub exe:      String,
+    pub cmdline:  String,
+    pub cwd:      String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
 }
@@ -171,7 +204,6 @@ pub struct UserLogonData {
     pub success:     bool,
 }
 
-/// Used for session_open / session_close events where only the username is known.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSessionData {
     pub username: String,
@@ -180,6 +212,178 @@ pub struct UserSessionData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEventData {
     pub path: String,
+}
+
+// ── New eBPF-sourced data structs ────────────────────────────────────────────
+
+/// File open event (openat with write/create/truncate flags).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileOpenData {
+    pub pid:      i32,
+    pub uid:      u32,
+    pub gid:      u32,
+    pub username: String,
+    pub comm:     String,
+    pub path:     String,
+    /// Raw openat(2) flags bitmask.
+    pub flags:    u64,
+}
+
+/// Network socket operation: connect, bind, or accept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkSocketData {
+    pub pid:      i32,
+    pub uid:      u32,
+    pub gid:      u32,
+    pub username: String,
+    pub comm:     String,
+    /// "connect" | "bind" | "accept"
+    pub op:       String,
+    /// "ipv4" | "ipv6" | "unknown"
+    pub family:   String,
+    pub addr:     String,
+    pub port:     u16,
+}
+
+/// Process fork/clone event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkData {
+    pub parent_pid:  i32,
+    pub child_pid:   i32,
+    pub parent_comm: String,
+    pub child_comm:  String,
+}
+
+/// File deletion (unlinkat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileUnlinkData {
+    pub pid:      i32,
+    pub uid:      u32,
+    pub gid:      u32,
+    pub username: String,
+    pub comm:     String,
+    pub path:     String,
+}
+
+/// File rename/move (renameat2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileRenameData {
+    pub pid:      i32,
+    pub uid:      u32,
+    pub gid:      u32,
+    pub username: String,
+    pub comm:     String,
+    pub old_path: String,
+    pub new_path: String,
+}
+
+/// Permission change (fchmodat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChmodData {
+    pub pid:      i32,
+    pub uid:      u32,
+    pub gid:      u32,
+    pub username: String,
+    pub comm:     String,
+    pub path:     String,
+    /// New mode in octal (e.g. 0o755).
+    pub mode:     u32,
+}
+
+/// Ownership change (fchownat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChownData {
+    pub pid:      i32,
+    pub uid:      u32,
+    pub gid:      u32,
+    pub username: String,
+    pub comm:     String,
+    pub path:     String,
+    pub new_uid:  u32,
+    pub new_gid:  u32,
+}
+
+/// Suspicious mmap (anonymous+executable or writable+executable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MmapData {
+    pub pid:   i32,
+    pub uid:   u32,
+    pub gid:   u32,
+    pub username: String,
+    pub comm:  String,
+    pub addr:  u64,
+    pub len:   u64,
+    /// Raw PROT_* bitmask.
+    pub prot:  u32,
+    /// Raw MAP_* bitmask.
+    pub flags: u32,
+    /// Human-readable flags summary, e.g. "anon|exec" or "rwx".
+    pub description: String,
+}
+
+/// ptrace(2) call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtraceData {
+    pub pid:        i32,
+    pub uid:        u32,
+    pub gid:        u32,
+    pub username:   String,
+    pub comm:       String,
+    pub request:    u32,
+    pub target_pid: i32,
+}
+
+/// Kernel module loaded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleLoadData {
+    pub pid:     i32,
+    pub uid:     u32,
+    pub gid:     u32,
+    pub username: String,
+    pub name:    String,
+    pub taints:  u32,
+}
+
+/// Shared memory syscall (shmget or shmat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShmData {
+    pub pid:      i32,
+    pub uid:      u32,
+    pub gid:      u32,
+    pub username: String,
+    pub comm:     String,
+    /// "shmget" or "shmat"
+    pub op:       String,
+    pub key:      i32,
+    pub size:     u64,
+    pub flags:    i32,
+}
+
+/// Namespace change (unshare or setns).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NsChangeData {
+    pub pid:      i32,
+    pub uid:      u32,
+    pub gid:      u32,
+    pub username: String,
+    pub comm:     String,
+    /// "unshare" or "setns"
+    pub op:       String,
+    /// Comma-separated namespace types, e.g. "pid,net,mnt".
+    pub namespaces: String,
+    pub flags:    u64,
+}
+
+/// DNS query detected via kprobe on udp_sendmsg.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsData {
+    pub pid:      i32,
+    pub uid:      u32,
+    pub gid:      u32,
+    pub username: String,
+    pub comm:     String,
+    pub dst_addr: String,
+    pub dst_port: u16,
 }
 
 #[cfg(test)]
