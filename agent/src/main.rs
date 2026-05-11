@@ -12,6 +12,7 @@ mod heartbeat;
 mod output;
 mod pipeline;
 mod schema;
+mod selfprotect;
 mod transport;
 
 use collectors::linux::agent_protect::AgentProtectCollector;
@@ -31,6 +32,14 @@ use transport::Transport;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ── Watchdog detection — must happen before the async runtime does anything ──
+    // If we were spawned as a watchdog subprocess, run the watchdog loop and
+    // never return.  This exits the process; tokio does not start.
+    if let Some(monitored_pid) = selfprotect::watchdog::detect() {
+        selfprotect::watchdog::run_watchdog(monitored_pid);
+        // run_watchdog() is `-> !`
+    }
+
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("trapd-agent v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -43,6 +52,24 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // ── Kernel hardening audit (advisory, does not block startup) ────────────
+    selfprotect::kernel_hardening::audit();
+
+    // ── Binary integrity check ───────────────────────────────────────────────
+    // Computes SHA256 of /proc/self/exe and compares against the stored baseline.
+    // On first run the baseline is written.  Any mismatch aborts startup.
+    if let Err(e) = selfprotect::binary_integrity::check() {
+        error!("{e:#}");
+        anyhow::bail!("{e}");
+    }
+
+    // ── Spawn watchdog subprocess ────────────────────────────────────────────
+    // Must happen early, before any state is set up, so the watchdog can
+    // restart us cleanly.  The watchdog runs in a detached process (setsid).
+    selfprotect::watchdog::spawn_detached();
+
+    // ── Main agent startup ───────────────────────────────────────────────────
 
     let device_id = load_or_create_device_id()
         .await
@@ -98,8 +125,6 @@ async fn main() -> Result<()> {
     }
 
     // ── eBPF tracers (real-time, kernel-level) ───────────────────────────────
-    // Both collectors load the same eBPF binary and attach independent programs.
-    // They fall back gracefully if the binary is not installed.
     let ebpf_exec = EbpfExecCollector::new();
     if ebpf_exec.is_available() {
         info!("eBPF exec tracer available — spawning EbpfExecCollector");
@@ -133,6 +158,18 @@ async fn main() -> Result<()> {
     spawn_collector!(AuthLogCollector::new());
     spawn_collector!(FilesystemCollector::new());
     spawn_collector!(AgentProtectCollector::new());
+
+    // ── Anti-ptrace monitor ──────────────────────────────────────────────────
+    // Periodic userspace check for TracerPid in /proc/self/status.
+    // Clone tx before drop so the monitor can send events on the same pipeline.
+    {
+        let tx_ap = tx.clone();
+        let aid   = agent_id.clone();
+        let host  = hostname.clone();
+        tokio::spawn(async move {
+            selfprotect::anti_ptrace::run(tx_ap, aid, host).await;
+        });
+    }
 
     drop(tx);
 

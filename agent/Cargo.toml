@@ -20,15 +20,17 @@ chrono             = { version = "0.4", features = ["serde"] }
 hostname           = "0.4"
 procfs             = "0.17"
 sysinfo            = "0.30"
-reqwest            = { version = "0.12", features = ["json"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 inotify            = "0.10"
 rusqlite           = { version = "0.31", features = ["bundled"] }
 sha2               = "0.10"
 hex                = "0.4"
 walkdir            = "2"
+ed25519-dalek      = { version = "2", features = ["pkcs8", "pem"] }
 
 # eBPF userspace loader — Linux only.
 # Only needed at runtime if the eBPF binary is installed;
 # compiles cleanly on all platforms.
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13", features = ["async_tokio"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "process", "fs"] }

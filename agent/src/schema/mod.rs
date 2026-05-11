@@ -105,6 +105,8 @@ pub enum EventAction {
     AgentTamper,
     /// Abnormal write-syscall rate per process (eBPF).
     WriteRateAnomaly,
+    /// kill(2)/tkill(2)/tgkill(2) targeting the protected agent PID (eBPF).
+    KillAttempt,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +149,7 @@ pub enum EventData {
     RansomwareIndicator(RansomwareIndicatorData),
     AgentTamper(AgentTamperData),
     WriteRateAnomaly(WriteRateAnomalyData),
+    KillAttempt(KillAttemptData),
 }
 
 // ── Existing data structs ────────────────────────────────────────────────────
@@ -454,6 +457,25 @@ pub struct WriteRateAnomalyData {
     pub write_count:     u64,
     /// Threshold that triggered this event.
     pub burst_threshold: u64,
+}
+
+/// kill(2)/tkill(2)/tgkill(2) targeting the protected agent PID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KillAttemptData {
+    /// PID of the process that sent the kill signal.
+    pub sender_pid: u32,
+    /// UID of the sending process.
+    pub sender_uid: u32,
+    /// GID of the sending process.
+    pub sender_gid: u32,
+    /// Username resolved from sender_uid.
+    pub sender_comm: String,
+    /// The target PID (should match the agent's own PID).
+    pub target_pid:  i32,
+    /// Signal number (9 = SIGKILL, 15 = SIGTERM).
+    pub signal:      i32,
+    /// Human-readable signal name.
+    pub signal_name: String,
 }
 
 #[cfg(test)]
