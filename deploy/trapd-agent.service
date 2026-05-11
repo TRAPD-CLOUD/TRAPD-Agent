@@ -1,14 +1,63 @@
 [Unit]
 Description=TRAPD Security Agent
-After=network.target
+Documentation=https://github.com/trapd-cloud/trapd-agent
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/trapd-agent
 Restart=always
 RestartSec=5
+TimeoutStopSec=30
+
 Environment=TRAPD_OUTPUT=file
 Environment=RUST_LOG=info
 EnvironmentFile=-/etc/trapd/agent.env
+
+# ── Filesystem isolation ──────────────────────────────────────────────────────
+# /usr, /boot, /efi are read-only; agent binary in /usr/local/bin is protected.
+ProtectSystem=strict
+# /home and /root are read-only; device_id/credentials live in ReadWritePaths.
+ProtectHome=read-only
+PrivateTmp=true
+# Explicit writable paths: agent state, config, logs.
+ReadWritePaths=-/etc/trapd -/var/lib/trapd -/var/log/trapd -/root/.trapd
+
+# ── Privilege isolation ───────────────────────────────────────────────────────
+# Prevent privilege escalation via setuid/setgid after start.
+NoNewPrivileges=true
+# Only the capabilities the agent truly needs:
+#   CAP_NET_ADMIN  — iptables / nftables for network containment
+#   CAP_SYS_PTRACE — reading /proc/<PID>/* for process telemetry
+#   CAP_BPF        — loading eBPF programs (kernel ≥ 5.8)
+#   CAP_PERFMON    — attaching to perf/tracepoint events (kernel ≥ 5.8)
+#   CAP_NET_RAW    — raw packet capture / XDP
+#   CAP_IPC_LOCK   — locking memory (eBPF maps)
+#   CAP_LINUX_IMMUTABLE — chattr +i on config files
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE
+
+# ── Memory safety ─────────────────────────────────────────────────────────────
+# Deny mapping of memory regions that are simultaneously writable and executable.
+# Rust code and eBPF kernel-side JIT both comply; Rust JIT is not used.
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# ── Misc hardening ────────────────────────────────────────────────────────────
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+ProtectControlGroups=true
+# Allow reading kernel logs (/dev/kmsg) for security telemetry.
+ProtectKernelLogs=false
+# Allow changing kernel tunables only when needed (set to true to harden further).
+ProtectKernelTunables=false
+ProtectKernelModules=false
+
+# Allowlist of syscall groups.  @system-service covers the baseline;
+# bpf(2) and perf_event_open(2) are required for eBPF; process syscalls for watchdog fork.
+SystemCallFilter=@system-service @network-io @file-system @process bpf perf_event_open
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

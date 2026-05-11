@@ -7,6 +7,7 @@ mod exec;
 mod file_manip;
 mod file_open;
 mod fork;
+mod kill;
 mod mmap;
 mod module_load;
 mod namespace;

@@ -42,8 +42,9 @@ use tracing::info;
 use crate::collectors::Collector;
 use crate::schema::{
     AgentEvent, DnsData, EventAction, EventClass, EventData, FileChmodData, FileChownData,
-    FileOpenData, FileRenameData, FileUnlinkData, ForkData, MmapData, ModuleLoadData,
-    NetworkSocketData, NsChangeData, PtraceData, Severity, ShmData, WriteRateAnomalyData,
+    FileOpenData, FileRenameData, FileUnlinkData, ForkData, KillAttemptData, MmapData,
+    ModuleLoadData, NetworkSocketData, NsChangeData, PtraceData, Severity, ShmData,
+    WriteRateAnomalyData,
 };
 
 // ── Kernel ↔ Userspace struct layouts ────────────────────────────────────────
@@ -217,6 +218,17 @@ struct RawWriteRateEvent {
     comm:            [u8; COMM_LEN],
     write_count:     u64,
     burst_threshold: u64,
+}
+
+/// Matches `KillSignalEvent` in trapd-agent-ebpf/src/kill.rs exactly.
+#[repr(C)]
+struct RawKillSignalEvent {
+    sender_pid: u32,
+    sender_uid: u32,
+    sender_gid: u32,
+    target_pid: i32,
+    signal:     i32,
+    comm:       [u8; COMM_LEN],
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
@@ -428,6 +440,9 @@ impl Collector for EbpfSyscallCollector {
         attach_tp!("syscalls", "sys_enter_unshare");
         attach_tp!("syscalls", "sys_enter_setns");
         attach_tp!("syscalls", "sys_enter_write");
+        attach_tp!("syscalls", "sys_enter_kill");
+        attach_tp!("syscalls", "sys_enter_tkill");
+        attach_tp!("syscalls", "sys_enter_tgkill");
 
         // ── Attach kprobe ─────────────────────────────────────────────────────
         {
@@ -471,8 +486,29 @@ impl Collector for EbpfSyscallCollector {
         let mut afd_ns        = open_rb!("NS_CHANGE_EVENTS");
         let mut afd_dns        = open_rb!("DNS_EVENTS");
         let mut afd_write_rate = open_rb!("WRITE_RATE_EVENTS");
+        let mut afd_kill       = open_rb!("KILL_SIGNAL_EVENTS");
 
-        info!("eBPF syscall tracer attached: 18 programs (17 tracepoints + 1 kprobe)");
+        // ── Write protected PID into the PROTECTED_PID eBPF array map ────────
+        // The kill-detection tracepoints use this to filter events to only those
+        // targeting the agent itself.
+        {
+            use aya::maps::Array;
+            let map = bpf
+                .map_mut("PROTECTED_PID")
+                .context("PROTECTED_PID map not found in eBPF binary")?;
+            let mut pid_map: Array<_, u32> = map
+                .try_into()
+                .context("PROTECTED_PID is not an Array map")?;
+            pid_map
+                .set(0, std::process::id(), 0)
+                .context("Failed to write agent PID into PROTECTED_PID eBPF map")?;
+            info!(
+                agent_pid = std::process::id(),
+                "eBPF kill-shield: agent PID registered in PROTECTED_PID map"
+            );
+        }
+
+        info!("eBPF syscall tracer attached: 21 programs (20 tracepoints + 1 kprobe)");
 
         loop {
             tokio::select! {
@@ -838,6 +874,45 @@ impl Collector for EbpfSyscallCollector {
                                     comm:            cstr(&ev.comm).to_string(),
                                     write_count:     ev.write_count,
                                     burst_threshold: ev.burst_threshold,
+                                }),
+                            );
+                            if tx.send(event).await.is_err() { return Ok(()); }
+                        }
+                    }
+                    guard.clear_ready();
+                }
+
+                Ok(mut guard) = afd_kill.readable_mut() => {
+                    let rb = guard.get_inner_mut();
+                    while let Some(item) = rb.next() {
+                        if let Some(ev) = unsafe { read_raw::<RawKillSignalEvent>(&item) } {
+                            let sender_comm = cstr(&ev.comm).to_string();
+                            let signal_name = match ev.signal {
+                                9  => "SIGKILL",
+                                15 => "SIGTERM",
+                                _  => "SIG?",
+                            };
+                            tracing::warn!(
+                                sender_pid  = ev.sender_pid,
+                                sender_uid  = ev.sender_uid,
+                                sender_comm = %sender_comm,
+                                target_pid  = ev.target_pid,
+                                signal      = ev.signal,
+                                signal_name = signal_name,
+                                "KILL-SHIELD: kill signal detected targeting the agent"
+                            );
+                            let event = AgentEvent::new(
+                                agent_id.clone(), hostname.clone(),
+                                EventClass::Process, EventAction::KillAttempt,
+                                Severity::Critical,
+                                EventData::KillAttempt(KillAttemptData {
+                                    sender_pid:  ev.sender_pid,
+                                    sender_uid:  ev.sender_uid,
+                                    sender_gid:  ev.sender_gid,
+                                    sender_comm,
+                                    target_pid:  ev.target_pid,
+                                    signal:      ev.signal,
+                                    signal_name: signal_name.to_string(),
                                 }),
                             );
                             if tx.send(event).await.is_err() { return Ok(()); }
