@@ -14,6 +14,7 @@ mod pipeline;
 mod schema;
 mod transport;
 
+use collectors::linux::agent_protect::AgentProtectCollector;
 use collectors::linux::authlog::AuthLogCollector;
 use collectors::linux::ebpf_exec::EbpfExecCollector;
 use collectors::linux::ebpf_syscalls::EbpfSyscallCollector;
@@ -131,6 +132,7 @@ async fn main() -> Result<()> {
     spawn_collector!(NetworkCollector::new());
     spawn_collector!(AuthLogCollector::new());
     spawn_collector!(FilesystemCollector::new());
+    spawn_collector!(AgentProtectCollector::new());
 
     drop(tx);
 

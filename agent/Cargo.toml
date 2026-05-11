@@ -22,6 +22,10 @@ procfs             = "0.17"
 sysinfo            = "0.30"
 reqwest            = { version = "0.12", features = ["json"] }
 inotify            = "0.10"
+rusqlite           = { version = "0.31", features = ["bundled"] }
+sha2               = "0.10"
+hex                = "0.4"
+walkdir            = "2"
 
 # eBPF userspace loader — Linux only.
 # Only needed at runtime if the eBPF binary is installed;

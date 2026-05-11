@@ -97,6 +97,14 @@ pub enum EventAction {
     NsChange,
     /// UDP sendmsg to port 53 – DNS query.
     DnsQuery,
+    /// SHA256 hash mismatch against trusted baseline (FIM).
+    IntegrityViolation,
+    /// Ransomware behavioral indicator (high entropy, mass rename, backup deletion, write burst).
+    RansomwareIndicator,
+    /// Tampering with agent-owned configuration files.
+    AgentTamper,
+    /// Abnormal write-syscall rate per process (eBPF).
+    WriteRateAnomaly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +114,7 @@ pub enum Severity {
     Low,
     Medium,
     High,
+    Critical,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +142,11 @@ pub enum EventData {
     Shm(ShmData),
     NsChange(NsChangeData),
     Dns(DnsData),
+    // ── FIM + Ransomware + Agent-protection ──────────────────────────────────
+    IntegrityViolation(IntegrityViolationData),
+    RansomwareIndicator(RansomwareIndicatorData),
+    AgentTamper(AgentTamperData),
+    WriteRateAnomaly(WriteRateAnomalyData),
 }
 
 // ── Existing data structs ────────────────────────────────────────────────────
@@ -384,6 +398,62 @@ pub struct DnsData {
     pub comm:     String,
     pub dst_addr: String,
     pub dst_port: u16,
+}
+
+// ── FIM / Ransomware / Agent-protection data structs ────────────────────────
+
+/// SHA256 hash mismatch between trusted baseline and current file state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityViolationData {
+    pub path:          String,
+    /// Baseline hash stored at last trusted snapshot, format: "sha256:<hex>".
+    pub expected_hash: String,
+    /// Hash computed at detection time, format: "sha256:<hex>".
+    pub actual_hash:   String,
+    /// Difference in file size (bytes): positive = grown, negative = shrunk.
+    pub size_delta:    i64,
+}
+
+/// Ransomware behavioral indicator detected in userspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RansomwareIndicatorData {
+    /// One of: "high_entropy" | "suspicious_extension" | "backup_deletion" | "high_write_rate"
+    pub indicator_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path:           Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid:            Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comm:           Option<String>,
+    /// Shannon entropy of the file (bits per byte). Present for "high_entropy".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entropy:        Option<f64>,
+    /// Modifications per window. Present for "high_write_rate".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_rate:     Option<u64>,
+    pub details:        String,
+}
+
+/// Tampering with agent-owned configuration or data files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTamperData {
+    pub path:   String,
+    /// "create" | "modify" | "delete" | "move"
+    pub action: String,
+}
+
+/// Per-process write-syscall burst detected by the eBPF write tracer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteRateAnomalyData {
+    pub pid:             i32,
+    pub uid:             u32,
+    pub gid:             u32,
+    pub username:        String,
+    pub comm:            String,
+    /// Accumulated write count at the time of emission.
+    pub write_count:     u64,
+    /// Threshold that triggered this event.
+    pub burst_threshold: u64,
 }
 
 #[cfg(test)]
