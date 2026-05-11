@@ -43,7 +43,7 @@ use crate::collectors::Collector;
 use crate::schema::{
     AgentEvent, DnsData, EventAction, EventClass, EventData, FileChmodData, FileChownData,
     FileOpenData, FileRenameData, FileUnlinkData, ForkData, MmapData, ModuleLoadData,
-    NetworkSocketData, NsChangeData, PtraceData, Severity, ShmData,
+    NetworkSocketData, NsChangeData, PtraceData, Severity, ShmData, WriteRateAnomalyData,
 };
 
 // ── Kernel ↔ Userspace struct layouts ────────────────────────────────────────
@@ -205,6 +205,18 @@ struct RawDnsEvent {
     dst_port: u16,
     comm:     [u8; COMM_LEN],
     dst_addr: [u8; 16],
+}
+
+/// Matches `WriteRateEvent` in trapd-agent-ebpf/src/write.rs exactly.
+#[repr(C)]
+struct RawWriteRateEvent {
+    pid:             u32,
+    uid:             u32,
+    gid:             u32,
+    _pad:            u32,
+    comm:            [u8; COMM_LEN],
+    write_count:     u64,
+    burst_threshold: u64,
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
@@ -415,6 +427,7 @@ impl Collector for EbpfSyscallCollector {
         attach_tp!("syscalls", "sys_enter_shmat");
         attach_tp!("syscalls", "sys_enter_unshare");
         attach_tp!("syscalls", "sys_enter_setns");
+        attach_tp!("syscalls", "sys_enter_write");
 
         // ── Attach kprobe ─────────────────────────────────────────────────────
         {
@@ -456,9 +469,10 @@ impl Collector for EbpfSyscallCollector {
         let mut afd_module    = open_rb!("MODULE_LOAD_EVENTS");
         let mut afd_shm       = open_rb!("SHM_EVENTS");
         let mut afd_ns        = open_rb!("NS_CHANGE_EVENTS");
-        let mut afd_dns       = open_rb!("DNS_EVENTS");
+        let mut afd_dns        = open_rb!("DNS_EVENTS");
+        let mut afd_write_rate = open_rb!("WRITE_RATE_EVENTS");
 
-        info!("eBPF syscall tracer attached: 17 programs (16 tracepoints + 1 kprobe)");
+        info!("eBPF syscall tracer attached: 18 programs (17 tracepoints + 1 kprobe)");
 
         loop {
             tokio::select! {
@@ -799,6 +813,31 @@ impl Collector for EbpfSyscallCollector {
                                     comm:     cstr(&ev.comm).to_string(),
                                     dst_addr: format_addr(ev.family, &ev.dst_addr),
                                     dst_port: ev.dst_port,
+                                }),
+                            );
+                            if tx.send(event).await.is_err() { return Ok(()); }
+                        }
+                    }
+                    guard.clear_ready();
+                }
+
+                Ok(mut guard) = afd_write_rate.readable_mut() => {
+                    let rb = guard.get_inner_mut();
+                    while let Some(item) = rb.next() {
+                        if let Some(ev) = unsafe { read_raw::<RawWriteRateEvent>(&item) } {
+                            let username = proc_username(ev.uid);
+                            let event = AgentEvent::new(
+                                agent_id.clone(), hostname.clone(),
+                                EventClass::Filesystem, EventAction::WriteRateAnomaly,
+                                Severity::High,
+                                EventData::WriteRateAnomaly(WriteRateAnomalyData {
+                                    pid:             ev.pid as i32,
+                                    uid:             ev.uid,
+                                    gid:             ev.gid,
+                                    username,
+                                    comm:            cstr(&ev.comm).to_string(),
+                                    write_count:     ev.write_count,
+                                    burst_threshold: ev.burst_threshold,
                                 }),
                             );
                             if tx.send(event).await.is_err() { return Ok(()); }

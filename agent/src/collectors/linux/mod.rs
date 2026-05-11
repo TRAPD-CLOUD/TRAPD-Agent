@@ -1,3 +1,4 @@
+pub mod agent_protect;
 pub mod authlog;
 pub mod ebpf_exec;
 pub mod ebpf_syscalls;

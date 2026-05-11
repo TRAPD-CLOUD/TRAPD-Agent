@@ -13,6 +13,7 @@ mod namespace;
 mod network;
 mod ptrace;
 mod shm;
+mod write;
 
 // ── Shared constants ─────────────────────────────────────────────────────────
 /// Kernel task comm name length (task_struct.comm is 16 bytes incl. NUL).
