@@ -27,10 +27,13 @@ sha2               = "0.10"
 hex                = "0.4"
 walkdir            = "2"
 ed25519-dalek      = { version = "2", features = ["pkcs8", "pem"] }
+base64             = "0.22"
+globset            = "0.4"
+ipnet              = { version = "2", features = ["serde"] }
 
 # eBPF userspace loader — Linux only.
 # Only needed at runtime if the eBPF binary is installed;
 # compiles cleanly on all platforms.
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13", features = ["async_tokio"] }
-nix = { version = "0.29", default-features = false, features = ["signal", "process", "fs"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "process", "fs", "user"] }

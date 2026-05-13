@@ -12,11 +12,12 @@ mod mmap;
 mod module_load;
 mod namespace;
 mod network;
+mod process_block;
 mod ptrace;
 mod shm;
 mod write;
 
-// ── Shared constants ─────────────────────────────────────────────────────────
+// ── Shared constants ─────────────────────────────────────────────────────────────────────────
 /// Kernel task comm name length (task_struct.comm is 16 bytes incl. NUL).
 pub(crate) const COMM_LEN: usize = 16;
 /// Maximum path length captured in eBPF (stack-safe; full PATH_MAX = 4096).

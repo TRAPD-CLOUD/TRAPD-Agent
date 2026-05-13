@@ -17,6 +17,8 @@ fn default_enabled_collectors() -> Vec<String> {
         "filesystem".into(),
     ]
 }
+fn default_prevention_enabled() -> bool { true }
+fn default_command_poll_interval() -> u64 { 10 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -26,6 +28,19 @@ pub struct AgentConfig {
     pub enabled_collectors:   Vec<String>,
     #[serde(default = "default_fs_watch_paths")]
     pub fs_watch_paths:       Vec<String>,
+
+    // ── Prevention (active response) ────────────────────────────────────────────────────────────────────
+    /// Master switch for the prevention subsystem.  When `false` the engine
+    /// never spawns and the agent behaves as pure telemetry.
+    #[serde(default = "default_prevention_enabled")]
+    pub prevention_enabled:   bool,
+    /// Interval between calls to `GET /api/v1/agents/{id}/commands`.
+    #[serde(default = "default_command_poll_interval")]
+    pub command_poll_interval_secs: u64,
+    /// Additional IPs that remain reachable when the host is in `isolate`
+    /// mode (the management channel is always on the allow-list).
+    #[serde(default)]
+    pub isolation_allowlist_ips: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -34,6 +49,9 @@ impl Default for AgentConfig {
             poll_interval_secs: default_poll_interval(),
             enabled_collectors: default_enabled_collectors(),
             fs_watch_paths:     default_fs_watch_paths(),
+            prevention_enabled: default_prevention_enabled(),
+            command_poll_interval_secs: default_command_poll_interval(),
+            isolation_allowlist_ips:    Vec::new(),
         }
     }
 }
