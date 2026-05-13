@@ -4,10 +4,10 @@
 //! Two input streams:
 //!
 //!   1. **Events**  — every `AgentEvent` flowing through the telemetry pipe
-//!     is tee'd into this engine.  On `ExecEventData` we run `enforce_exec`
-//!     to apply IoC rules in real time.
+//!      is tee'd into this engine.  On `ExecEventData` we run `enforce_exec`
+//!      to apply IoC rules in real time.
 //!   2. **Commands** — verified `CommandEnvelope`s from the backend puller.
-//!     Each is dispatched to the matching handler (kill / isolate / …).
+//!      Each is dispatched to the matching handler (kill / isolate / …).
 //!
 //! Errors are audited but never propagated; the prevention engine MUST keep
 //! running even when individual actions fail (e.g. `nft` missing on the box).
@@ -231,7 +231,7 @@ impl Engine {
                     "restore",
                     record.original_path.clone(),
                     true,
-                    "file restored from quarantine".into(),
+                    "file restored from quarantine",
                     None,
                     Some(cmd_id.into()),
                     serde_json::to_value(&record).unwrap_or(serde_json::Value::Null),
@@ -292,7 +292,7 @@ impl Engine {
                         "ip_unblock",
                         ip_owned.clone(),
                         true,
-                        "TTL expired".into(),
+                        "TTL expired",
                         None,
                         Some(cmd_id),
                         serde_json::Value::Null,

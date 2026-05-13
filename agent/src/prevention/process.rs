@@ -86,10 +86,7 @@ pub fn enforce_exec(
         sha.as_deref(),
     );
 
-    let m = match m {
-        Some(m) => m,
-        None    => return None,
-    };
+    let m = m?;
 
     let details = serde_json::json!({
         "pid":     exec.pid,

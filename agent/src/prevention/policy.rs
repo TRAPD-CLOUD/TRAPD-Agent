@@ -51,6 +51,7 @@ pub enum IocRule {
     Domain       { id: String, value: String, action: RuleAction },
 }
 
+#[allow(dead_code)]
 impl IocRule {
     pub fn id(&self) -> &str {
         match self {
@@ -141,6 +142,7 @@ impl PolicyStore {
     }
 
     pub fn rules(&self) -> &[IocRule] { &self.raw }
+    #[allow(dead_code)]
     pub fn comm_set(&self) -> &HashSet<String> { &self.comm }
 
     /// Match a process exec event.  Returns the highest-severity match
@@ -198,6 +200,7 @@ impl PolicyStore {
     }
 
     /// Match a network destination.
+    #[allow(dead_code)]
     pub fn match_network(&self, addr: IpAddr, port: u16) -> Option<Match> {
         let mut best: Option<Match> = None;
         for (id, ip, action) in &self.ips {
@@ -231,6 +234,7 @@ impl PolicyStore {
     }
 
     /// Match a DNS query name (case-insensitive exact match).
+    #[allow(dead_code)]
     pub fn match_domain(&self, qname: &str) -> Option<Match> {
         let q = qname.to_ascii_lowercase();
         if self.domains.contains(&q) {

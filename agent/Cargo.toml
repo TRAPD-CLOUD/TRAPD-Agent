@@ -36,4 +36,4 @@ ipnet              = { version = "2", features = ["serde"] }
 # compiles cleanly on all platforms.
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13", features = ["async_tokio"] }
-nix = { version = "0.29", default-features = false, features = ["signal", "process", "fs"] }
+nix = { version = "0.29", default-features = false, features = ["signal", "process", "fs", "user"] }

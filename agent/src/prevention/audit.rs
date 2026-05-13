@@ -25,6 +25,7 @@ impl AuditEmitter {
     /// Emit one prevention event.  Best-effort — if the pipeline is full or
     /// shut down the event is dropped and a warning is logged so we never
     /// stall the response path on telemetry backpressure.
+    #[allow(clippy::too_many_arguments)]
     pub fn emit(
         &self,
         action:    EventAction,
