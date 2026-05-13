@@ -1,0 +1,7 @@
+[toolchain]
+# Pin a nightly recent enough that transitive deps requiring Rust >= 1.87
+# (e.g. aya-ebpf-cty 0.2.3 / aya-ebpf-macros 0.1.2 / cargo-platform 0.3.x)
+# still resolve. The eBPF crate must be built with nightly so that the
+# `-Z build-std` flag and the `bpfel-unknown-none` target are available.
+channel    = "nightly-2025-08-15"
+components = ["rust-src"]
