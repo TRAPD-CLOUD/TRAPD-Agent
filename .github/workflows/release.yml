@@ -13,14 +13,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nightly toolchain + rust-src (required for eBPF build)
+        run: |
+          rustup toolchain install nightly --component rust-src
+
       - uses: Swatinem/rust-cache@v2
-      - name: Build release binary
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
+      - name: Build agent (release)
         run: cargo build --release --manifest-path agent/Cargo.toml
-      - name: Rename binary
-        run: mv target/release/trapd-agent trapd-agent-linux-x86_64
+
+      - name: Build eBPF binary (release)
+        run: cargo xtask build-ebpf --release
+
+      - name: Stage release assets
+        run: |
+          cp target/release/trapd-agent trapd-agent-linux-x86_64
+          cp trapd-agent-ebpf/target/bpfel-unknown-none/release/trapd-agent-exec trapd-agent-exec
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: trapd-agent-linux-x86_64
+          files: |
+            trapd-agent-linux-x86_64
+            trapd-agent-exec
           generate_release_notes: true
