@@ -54,8 +54,8 @@ pub fn process_block_exec(ctx: TracePointContext) -> u32 {
 
 #[inline(always)]
 fn try_block(_ctx: &TracePointContext) -> Result<(), i64> {
-    let mut comm = [0u8; COMM_LEN];
-    unsafe { bpf_get_current_comm(&mut comm); }
+    let comm = [0u8; COMM_LEN];
+    let comm = bpf_get_current_comm().unwrap_or(comm);
 
     if unsafe { BLOCKED_COMMS.get(&comm).is_some() } {
         // bpf_send_signal sends to current task — the just-execed process.

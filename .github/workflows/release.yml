@@ -16,9 +16,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install nightly toolchain + rust-src (required for eBPF build)
+      # The eBPF crate pins its own nightly via trapd-agent-ebpf/rust-toolchain.toml.
+      # Trigger rustup to install it (with the rust-src component) up front so the
+      # download cost is paid before the build step and so rust-cache picks it up.
+      - name: Install pinned nightly toolchain + rust-src (eBPF build)
+        working-directory: trapd-agent-ebpf
         run: |
-          rustup toolchain install nightly --component rust-src
+          rustup show active-toolchain
+          rustc --version
 
       - uses: Swatinem/rust-cache@v2
 

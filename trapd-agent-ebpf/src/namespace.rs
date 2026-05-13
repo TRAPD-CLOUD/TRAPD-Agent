@@ -86,8 +86,8 @@ fn emit_ns(op: u8, flags: u64, nstype: u32) -> Result<(), i64> {
     let uid = (uid_gid & 0xFFFF_FFFF) as u32;
     let gid = (uid_gid >> 32) as u32;
 
-    let mut comm = [0u8; COMM_LEN];
-    unsafe { bpf_get_current_comm(&mut comm); }
+    let comm = [0u8; COMM_LEN];
+    let comm = bpf_get_current_comm().unwrap_or(comm);
 
     let mut entry = NS_CHANGE_EVENTS.reserve::<NsChangeEvent>(0).ok_or(-1i64)?;
     let ev = unsafe { entry.assume_init_mut() };

@@ -13,7 +13,9 @@ name = "trapd-agent-exec"
 path = "src/main.rs"
 
 [dependencies]
-aya-ebpf     = { version = "0.1", features = ["macros"] }
+# aya-ebpf 0.1.x exports the procedural macros unconditionally; there is no
+# `macros` feature on this crate (it used to live on the older `aya-bpf`).
+aya-ebpf     = "0.1"
 aya-log-ebpf = "0.1"
 
 [profile.release]

@@ -265,7 +265,7 @@ fn current_task_info() -> (u32, u32, u32, [u8; COMM_LEN]) {
     let uid_gid = bpf_get_current_uid_gid();
     let uid = (uid_gid & 0xFFFF_FFFF) as u32;
     let gid = (uid_gid >> 32) as u32;
-    let mut comm = [0u8; COMM_LEN];
-    unsafe { bpf_get_current_comm(&mut comm); }
+    let comm = [0u8; COMM_LEN];
+    let comm = bpf_get_current_comm().unwrap_or(comm);
     (pid, uid, gid, comm)
 }
