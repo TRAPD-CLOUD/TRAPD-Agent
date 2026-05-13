@@ -50,6 +50,8 @@ pub enum EventClass {
     Kernel,
     /// Inter-process communication (shared memory).
     Ipc,
+    /// Active prevention / response actions taken by the agent.
+    Prevention,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,47 +68,48 @@ pub enum EventAction {
     SessionClose,
     Delete,
     Modify,
-    // ── New eBPF-sourced actions ──────────────────────────────────────────────
-    /// openat(2) with write/create/truncate flags.
+    // ── New eBPF-sourced actions ─────────────────────────────────────
     Open,
-    /// bind(2) – process registering a listening socket.
     Bind,
-    /// accept4(2) – process accepting an incoming connection.
     Accept,
-    /// clone(2)/fork(2) – child process creation.
     Fork,
-    /// unlinkat(2) – file deletion.
     Unlink,
-    /// renameat2(2) – file rename/move.
     Rename,
-    /// fchmodat(2) – permission change.
     Chmod,
-    /// fchownat(2) – ownership change.
     Chown,
-    /// mmap(2) with executable or RWX flags.
     Mmap,
-    /// ptrace(2) – debugging / injection.
     Ptrace,
-    /// Kernel module loaded (insmod/modprobe).
     ModuleLoad,
-    /// shmget(2) – shared memory segment created.
     Shmget,
-    /// shmat(2) – shared memory segment attached.
     Shmat,
-    /// unshare(2)/setns(2) – namespace change (potential container escape).
     NsChange,
-    /// UDP sendmsg to port 53 – DNS query.
     DnsQuery,
-    /// SHA256 hash mismatch against trusted baseline (FIM).
     IntegrityViolation,
-    /// Ransomware behavioral indicator (high entropy, mass rename, backup deletion, write burst).
     RansomwareIndicator,
-    /// Tampering with agent-owned configuration files.
     AgentTamper,
-    /// Abnormal write-syscall rate per process (eBPF).
     WriteRateAnomaly,
-    /// kill(2)/tkill(2)/tgkill(2) targeting the protected agent PID (eBPF).
     KillAttempt,
+    // ── Prevention actions (active response) ────────────────────────────────────
+    /// Process was terminated (SIGKILL) by the prevention engine.
+    ProcessBlocked,
+    /// Host placed into full network isolation (only management channel reachable).
+    NetworkIsolated,
+    /// Network isolation lifted.
+    NetworkDeisolated,
+    /// A specific IP/CIDR was added to the network deny-list.
+    IpBlocked,
+    /// A previously-blocked IP/CIDR was removed from the deny-list.
+    IpUnblocked,
+    /// File was quarantined (moved + chmod 000 + chattr +i).
+    FileQuarantined,
+    /// File was restored from quarantine to its original path.
+    FileRestored,
+    /// An IoC policy was updated (rules added, removed, reloaded).
+    PolicyUpdated,
+    /// A signed response command was rejected (bad signature, expired, replay).
+    CommandRejected,
+    /// A signed response command was accepted and executed.
+    CommandAccepted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,7 +133,7 @@ pub enum EventData {
     UserLogon(UserLogonData),
     UserSession(UserSessionData),
     FileEvent(FileEventData),
-    // ── New eBPF-sourced event data ───────────────────────────────────────────
+    // ── eBPF-sourced event data ──────────────────────────────────────
     FileOpen(FileOpenData),
     NetworkSocket(NetworkSocketData),
     Fork(ForkData),
@@ -144,15 +147,16 @@ pub enum EventData {
     Shm(ShmData),
     NsChange(NsChangeData),
     Dns(DnsData),
-    // ── FIM + Ransomware + Agent-protection ──────────────────────────────────
     IntegrityViolation(IntegrityViolationData),
     RansomwareIndicator(RansomwareIndicatorData),
     AgentTamper(AgentTamperData),
     WriteRateAnomaly(WriteRateAnomalyData),
     KillAttempt(KillAttemptData),
+    // ── Prevention event payload ────────────────────────────────────────
+    Prevention(PreventionEventData),
 }
 
-// ── Existing data structs ────────────────────────────────────────────────────
+// ── Existing data structs ────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessCreateData {
@@ -231,9 +235,6 @@ pub struct FileEventData {
     pub path: String,
 }
 
-// ── New eBPF-sourced data structs ────────────────────────────────────────────
-
-/// File open event (openat with write/create/truncate flags).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileOpenData {
     pub pid:      i32,
@@ -242,11 +243,9 @@ pub struct FileOpenData {
     pub username: String,
     pub comm:     String,
     pub path:     String,
-    /// Raw openat(2) flags bitmask.
     pub flags:    u64,
 }
 
-/// Network socket operation: connect, bind, or accept.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkSocketData {
     pub pid:      i32,
@@ -254,15 +253,12 @@ pub struct NetworkSocketData {
     pub gid:      u32,
     pub username: String,
     pub comm:     String,
-    /// "connect" | "bind" | "accept"
     pub op:       String,
-    /// "ipv4" | "ipv6" | "unknown"
     pub family:   String,
     pub addr:     String,
     pub port:     u16,
 }
 
-/// Process fork/clone event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkData {
     pub parent_pid:  i32,
@@ -271,7 +267,6 @@ pub struct ForkData {
     pub child_comm:  String,
 }
 
-/// File deletion (unlinkat).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileUnlinkData {
     pub pid:      i32,
@@ -282,7 +277,6 @@ pub struct FileUnlinkData {
     pub path:     String,
 }
 
-/// File rename/move (renameat2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRenameData {
     pub pid:      i32,
@@ -294,7 +288,6 @@ pub struct FileRenameData {
     pub new_path: String,
 }
 
-/// Permission change (fchmodat).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChmodData {
     pub pid:      i32,
@@ -303,11 +296,9 @@ pub struct FileChmodData {
     pub username: String,
     pub comm:     String,
     pub path:     String,
-    /// New mode in octal (e.g. 0o755).
     pub mode:     u32,
 }
 
-/// Ownership change (fchownat).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChownData {
     pub pid:      i32,
@@ -320,7 +311,6 @@ pub struct FileChownData {
     pub new_gid:  u32,
 }
 
-/// Suspicious mmap (anonymous+executable or writable+executable).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MmapData {
     pub pid:   i32,
@@ -330,15 +320,11 @@ pub struct MmapData {
     pub comm:  String,
     pub addr:  u64,
     pub len:   u64,
-    /// Raw PROT_* bitmask.
     pub prot:  u32,
-    /// Raw MAP_* bitmask.
     pub flags: u32,
-    /// Human-readable flags summary, e.g. "anon|exec" or "rwx".
     pub description: String,
 }
 
-/// ptrace(2) call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtraceData {
     pub pid:        i32,
@@ -350,7 +336,6 @@ pub struct PtraceData {
     pub target_pid: i32,
 }
 
-/// Kernel module loaded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleLoadData {
     pub pid:     i32,
@@ -361,7 +346,6 @@ pub struct ModuleLoadData {
     pub taints:  u32,
 }
 
-/// Shared memory syscall (shmget or shmat).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShmData {
     pub pid:      i32,
@@ -369,14 +353,12 @@ pub struct ShmData {
     pub gid:      u32,
     pub username: String,
     pub comm:     String,
-    /// "shmget" or "shmat"
     pub op:       String,
     pub key:      i32,
     pub size:     u64,
     pub flags:    i32,
 }
 
-/// Namespace change (unshare or setns).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NsChangeData {
     pub pid:      i32,
@@ -384,14 +366,11 @@ pub struct NsChangeData {
     pub gid:      u32,
     pub username: String,
     pub comm:     String,
-    /// "unshare" or "setns"
     pub op:       String,
-    /// Comma-separated namespace types, e.g. "pid,net,mnt".
     pub namespaces: String,
     pub flags:    u64,
 }
 
-/// DNS query detected via kprobe on udp_sendmsg.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsData {
     pub pid:      i32,
@@ -403,24 +382,16 @@ pub struct DnsData {
     pub dst_port: u16,
 }
 
-// ── FIM / Ransomware / Agent-protection data structs ────────────────────────
-
-/// SHA256 hash mismatch between trusted baseline and current file state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrityViolationData {
     pub path:          String,
-    /// Baseline hash stored at last trusted snapshot, format: "sha256:<hex>".
     pub expected_hash: String,
-    /// Hash computed at detection time, format: "sha256:<hex>".
     pub actual_hash:   String,
-    /// Difference in file size (bytes): positive = grown, negative = shrunk.
     pub size_delta:    i64,
 }
 
-/// Ransomware behavioral indicator detected in userspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RansomwareIndicatorData {
-    /// One of: "high_entropy" | "suspicious_extension" | "backup_deletion" | "high_write_rate"
     pub indicator_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path:           Option<String>,
@@ -428,24 +399,19 @@ pub struct RansomwareIndicatorData {
     pub pid:            Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comm:           Option<String>,
-    /// Shannon entropy of the file (bits per byte). Present for "high_entropy".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entropy:        Option<f64>,
-    /// Modifications per window. Present for "high_write_rate".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub write_rate:     Option<u64>,
     pub details:        String,
 }
 
-/// Tampering with agent-owned configuration or data files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTamperData {
     pub path:   String,
-    /// "create" | "modify" | "delete" | "move"
     pub action: String,
 }
 
-/// Per-process write-syscall burst detected by the eBPF write tracer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteRateAnomalyData {
     pub pid:             i32,
@@ -453,29 +419,52 @@ pub struct WriteRateAnomalyData {
     pub gid:             u32,
     pub username:        String,
     pub comm:            String,
-    /// Accumulated write count at the time of emission.
     pub write_count:     u64,
-    /// Threshold that triggered this event.
     pub burst_threshold: u64,
 }
 
-/// kill(2)/tkill(2)/tgkill(2) targeting the protected agent PID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KillAttemptData {
-    /// PID of the process that sent the kill signal.
     pub sender_pid: u32,
-    /// UID of the sending process.
     pub sender_uid: u32,
-    /// GID of the sending process.
     pub sender_gid: u32,
-    /// Username resolved from sender_uid.
     pub sender_comm: String,
-    /// The target PID (should match the agent's own PID).
     pub target_pid:  i32,
-    /// Signal number (9 = SIGKILL, 15 = SIGTERM).
     pub signal:      i32,
-    /// Human-readable signal name.
     pub signal_name: String,
+}
+
+// ── Prevention event payload ─────────────────────────────────────────────────────────
+
+/// One uniform payload type for every prevention/response action emitted by the
+/// agent.  The `kind` field is a stable string discriminator so the backend can
+/// route without exhaustively matching on Rust enums:
+///
+///   "process_block"        — process killed
+///   "network_isolate"      — full host isolation enabled
+///   "network_deisolate"    — full host isolation lifted
+///   "ip_block"/"ip_unblock"
+///   "quarantine"/"restore"
+///   "policy_update"
+///   "command_rejected"/"command_accepted"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreventionEventData {
+    pub kind:   String,
+    /// The thing being acted on:  PID, IP, file path, command id, …
+    pub target: String,
+    /// Whether the underlying syscall / shell-out succeeded.
+    pub success: bool,
+    /// Free-form human-readable reason or error message.
+    pub reason: String,
+    /// Optional IoC rule id that triggered this action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id:    Option<String>,
+    /// Optional id of the signed command that requested this action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// Free-form structured details (process metadata, hashes, etc.).
+    #[serde(skip_serializing_if = "serde_json::Value::is_null", default)]
+    pub details:    serde_json::Value,
 }
 
 #[cfg(test)]
