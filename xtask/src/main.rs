@@ -5,8 +5,10 @@
 //!
 //! Requirements:
 //!   cargo install bpf-linker
-//!   rustup install nightly
-//!   rustup component add rust-src --toolchain nightly
+//!
+//! The nightly toolchain and rust-src component are pinned by
+//! `trapd-agent-ebpf/rust-toolchain.toml` and installed automatically by
+//! rustup when the eBPF crate is built.
 
 use std::{
     env,
@@ -30,8 +32,8 @@ fn usage() -> ExitCode {
         "Usage:\n  cargo xtask build-ebpf [--release]\n\n\
          Requirements:\n  \
            cargo install bpf-linker\n  \
-           rustup install nightly\n  \
-           rustup component add rust-src --toolchain nightly"
+         The pinned nightly toolchain + rust-src component are installed\n  \
+         automatically from trapd-agent-ebpf/rust-toolchain.toml."
     );
     ExitCode::FAILURE
 }
@@ -43,9 +45,12 @@ fn build_ebpf(release: bool) -> ExitCode {
     let ebpf_dir = workspace.join("trapd-agent-ebpf");
     let profile = if release { "release" } else { "debug" };
 
+    // trapd-agent-ebpf/rust-toolchain.toml pins a known-good nightly with
+    // the rust-src component, so we let rustup pick the toolchain here
+    // instead of forcing `+nightly` (which would bypass the pin).
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&ebpf_dir)
-        .args(["+nightly", "build"])
+        .arg("build")
         .args(["--target", "bpfel-unknown-none"])
         .args(["-Z", "build-std=core"]);
     if release {
