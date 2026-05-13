@@ -11,7 +11,10 @@ set -euo pipefail
 
 REPO="trapd-cloud/trapd-agent"
 BINARY_NAME="trapd-agent-linux-x86_64"
+EBPF_BINARY_NAME="trapd-agent-exec"
 INSTALL_BIN="/usr/local/bin/trapd-agent"
+EBPF_INSTALL_DIR="/usr/lib/trapd-agent"
+EBPF_INSTALL_BIN="${EBPF_INSTALL_DIR}/trapd-agent-exec"
 UPDATE_BIN="/usr/local/bin/trapd-update"
 SERVICE_FILE="/etc/systemd/system/trapd-agent.service"
 UPDATE_SERVICE_FILE="/etc/systemd/system/trapd-update.service"
@@ -47,7 +50,7 @@ fi
 
 echo "Latest release: ${LATEST_TAG}"
 
-# ── Download binary ─────────────────────────────────────────────────────────
+# ── Download agent binary ────────────────────────────────────────────────────
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${BINARY_NAME}"
 TMP_BINARY="/tmp/trapd-agent-${LATEST_TAG}"
 
@@ -56,6 +59,20 @@ curl -fL "$DOWNLOAD_URL" -o "$TMP_BINARY"
 chmod +x "$TMP_BINARY"
 mv -f "$TMP_BINARY" "$INSTALL_BIN"
 echo "Installed to ${INSTALL_BIN}"
+
+# ── Download eBPF binary ─────────────────────────────────────────────────────
+EBPF_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${EBPF_BINARY_NAME}"
+TMP_EBPF="/tmp/trapd-agent-exec-${LATEST_TAG}"
+
+echo "Downloading ${EBPF_BINARY_NAME}..."
+mkdir -p "$EBPF_INSTALL_DIR"
+if curl -fL "$EBPF_URL" -o "$TMP_EBPF" 2>/dev/null; then
+    chmod 644 "$TMP_EBPF"
+    mv -f "$TMP_EBPF" "$EBPF_INSTALL_BIN"
+    echo "eBPF program installed to ${EBPF_INSTALL_BIN}"
+else
+    echo "WARNING: eBPF binary not found in release — kernel-side pre-exec blocking disabled." >&2
+fi
 
 # ── Create directories ───────────────────────────────────────────────────────
 mkdir -p "$ENV_DIR" "$LOG_DIR"
@@ -87,7 +104,7 @@ ENVEOF
 fi
 
 # ── Write trapd-agent.service ────────────────────────────────────────────────
-cat > "$SERVICE_FILE" <<'EOF'
+cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=TRAPD Security Agent
 After=network.target
@@ -97,6 +114,10 @@ ExecStart=/usr/local/bin/trapd-agent
 Restart=always
 RestartSec=5
 EnvironmentFile=/etc/trapd/agent.env
+Environment=TRAPD_EBPF_PATH=${EBPF_INSTALL_BIN}
+
+# Capabilities for eBPF loading, network containment and file quarantine
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE
 
 [Install]
 WantedBy=multi-user.target
@@ -109,7 +130,10 @@ set -euo pipefail
 
 REPO="${REPO}"
 BINARY_NAME="${BINARY_NAME}"
+EBPF_BINARY_NAME="${EBPF_BINARY_NAME}"
 INSTALL_BIN="${INSTALL_BIN}"
+EBPF_INSTALL_DIR="${EBPF_INSTALL_DIR}"
+EBPF_INSTALL_BIN="${EBPF_INSTALL_BIN}"
 
 log() { echo "\$(date -u +"%Y-%m-%dT%H:%M:%SZ") trapd-update: \$*"; }
 
@@ -132,11 +156,22 @@ if [[ "\$CURRENT_VERSION" == "\$LATEST_VERSION" ]]; then
 fi
 
 log "Updating \$CURRENT_VERSION → \$LATEST_TAG..."
+
 DOWNLOAD_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${BINARY_NAME}"
 TMP_BINARY="/tmp/trapd-agent-new"
 curl -fL "\$DOWNLOAD_URL" -o "\$TMP_BINARY"
 chmod +x "\$TMP_BINARY"
 mv -f "\$TMP_BINARY" "\$INSTALL_BIN"
+
+EBPF_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${EBPF_BINARY_NAME}"
+TMP_EBPF="/tmp/trapd-agent-exec-new"
+if curl -fL "\$EBPF_URL" -o "\$TMP_EBPF" 2>/dev/null; then
+    chmod 644 "\$TMP_EBPF"
+    mkdir -p "\$EBPF_INSTALL_DIR"
+    mv -f "\$TMP_EBPF" "\$EBPF_INSTALL_BIN"
+    log "eBPF binary updated."
+fi
+
 systemctl restart trapd-agent
 log "Updated to \${LATEST_TAG}."
 UPDATER

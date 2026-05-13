@@ -38,11 +38,14 @@ fn usage() -> ExitCode {
 
 fn build_ebpf(release: bool) -> ExitCode {
     let workspace = workspace_root();
+    // trapd-agent-ebpf has its own [workspace] and is NOT a member of the root
+    // workspace, so we must cd into it before invoking cargo.
+    let ebpf_dir = workspace.join("trapd-agent-ebpf");
     let profile = if release { "release" } else { "debug" };
 
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&workspace)
-        .args(["+nightly", "build", "--package", "trapd-agent-ebpf"])
+    cmd.current_dir(&ebpf_dir)
+        .args(["+nightly", "build"])
         .args(["--target", "bpfel-unknown-none"])
         .args(["-Z", "build-std=core"]);
     if release {
@@ -62,7 +65,7 @@ fn build_ebpf(release: bool) -> ExitCode {
             ExitCode::FAILURE
         }
         Ok(_) => {
-            let out = workspace
+            let out = ebpf_dir
                 .join("target/bpfel-unknown-none")
                 .join(profile)
                 .join("trapd-agent-exec");
