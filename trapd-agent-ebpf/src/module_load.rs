@@ -6,6 +6,7 @@ use aya_ebpf::{
     macros::{map, tracepoint},
     maps::RingBuf,
     programs::TracePointContext,
+    EbpfContext,
 };
 
 /// Kernel module load event — every insmod/modprobe is a rootkit risk.
