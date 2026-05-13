@@ -6,6 +6,7 @@ use aya_ebpf::{
     macros::{map, tracepoint},
     maps::RingBuf,
     programs::TracePointContext,
+    EbpfContext,
 };
 
 use crate::{COMM_LEN, PATH_LEN};
@@ -49,8 +50,8 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
     let uid = (uid_gid & 0xFFFF_FFFF) as u32;
     let gid = (uid_gid >> 32) as u32;
 
-    let mut comm = [0u8; COMM_LEN];
-    unsafe { bpf_get_current_comm(&mut comm); }
+    let comm = [0u8; COMM_LEN];
+    let comm = bpf_get_current_comm().unwrap_or(comm);
 
     // __data_loc: bits[15:0] = byte offset from TP record start to the string
     let data_loc: u32 = unsafe { ctx.read_at(8).map_err(|_| -1i64)? };
