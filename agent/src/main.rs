@@ -11,6 +11,7 @@ mod enrollment;
 mod heartbeat;
 mod output;
 mod pipeline;
+mod prevention;
 mod schema;
 mod selfprotect;
 mod transport;
@@ -32,12 +33,8 @@ use transport::Transport;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ── Watchdog detection — must happen before the async runtime does anything ──
-    // If we were spawned as a watchdog subprocess, run the watchdog loop and
-    // never return.  This exits the process; tokio does not start.
     if let Some(monitored_pid) = selfprotect::watchdog::detect() {
         selfprotect::watchdog::run_watchdog(monitored_pid);
-        // run_watchdog() is `-> !`
     }
 
     if std::env::args().nth(1).as_deref() == Some("--version") {
@@ -53,23 +50,14 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // ── Kernel hardening audit (advisory, does not block startup) ────────────
     selfprotect::kernel_hardening::audit();
 
-    // ── Binary integrity check ───────────────────────────────────────────────
-    // Computes SHA256 of /proc/self/exe and compares against the stored baseline.
-    // On first run the baseline is written.  Any mismatch aborts startup.
     if let Err(e) = selfprotect::binary_integrity::check() {
         error!("{e:#}");
         anyhow::bail!("{e}");
     }
 
-    // ── Spawn watchdog subprocess ────────────────────────────────────────────
-    // Must happen early, before any state is set up, so the watchdog can
-    // restart us cleanly.  The watchdog runs in a detached process (setsid).
     selfprotect::watchdog::spawn_detached();
-
-    // ── Main agent startup ───────────────────────────────────────────────────
 
     let device_id = load_or_create_device_id()
         .await
@@ -109,6 +97,32 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
 
+    // ── Prevention subsystem (active response) ────────────────────────────────────────
+    let prevention_enabled = agent_config
+        .read().map(|c| c.prevention_enabled).unwrap_or(true);
+    let prev_event_tx = if prevention_enabled {
+        match start_prevention(
+            &backend_url,
+            &agent_id,
+            &token,
+            &hostname,
+            tx.clone(),
+            Arc::clone(&agent_config),
+        ).await {
+            Ok(tx) => {
+                info!("Prevention subsystem started");
+                Some(tx)
+            }
+            Err(e) => {
+                warn!(error = %e, "prevention subsystem failed to start — continuing in telemetry-only mode");
+                None
+            }
+        }
+    } else {
+        info!("Prevention subsystem disabled in config");
+        None
+    };
+
     macro_rules! spawn_collector {
         ($collector:expr) => {{
             let mut c  = $collector;
@@ -124,18 +138,12 @@ async fn main() -> Result<()> {
         }};
     }
 
-    // ── eBPF tracers (real-time, kernel-level) ───────────────────────────────
     let ebpf_exec = EbpfExecCollector::new();
     if ebpf_exec.is_available() {
         info!("eBPF exec tracer available — spawning EbpfExecCollector");
         spawn_collector!(ebpf_exec);
     } else {
-        warn!(
-            "eBPF binary not found — exec events will be detected by polling only.\n\
-             To enable: cargo xtask build-ebpf --release && \
-             cp target/bpfel-unknown-none/release/trapd-agent-exec \
-             /usr/lib/trapd-agent/"
-        );
+        warn!("eBPF binary not found — exec events will be detected by polling only.");
     }
 
     let ebpf_syscalls = EbpfSyscallCollector::new();
@@ -143,15 +151,9 @@ async fn main() -> Result<()> {
         info!("eBPF syscall tracer available — spawning EbpfSyscallCollector");
         spawn_collector!(ebpf_syscalls);
     } else {
-        warn!(
-            "eBPF binary not found — syscall events (open/connect/fork/…) unavailable.\n\
-             To enable: cargo xtask build-ebpf --release && \
-             cp target/bpfel-unknown-none/release/trapd-agent-exec \
-             /usr/lib/trapd-agent/"
-        );
+        warn!("eBPF binary not found — syscall events unavailable.");
     }
 
-    // ── Polling collectors (userspace, all platforms) ────────────────────────
     spawn_collector!(SystemCollector::new());
     spawn_collector!(ProcessCollector::new());
     spawn_collector!(NetworkCollector::new());
@@ -159,9 +161,6 @@ async fn main() -> Result<()> {
     spawn_collector!(FilesystemCollector::new());
     spawn_collector!(AgentProtectCollector::new());
 
-    // ── Anti-ptrace monitor ──────────────────────────────────────────────────
-    // Periodic userspace check for TracerPid in /proc/self/status.
-    // Clone tx before drop so the monitor can send events on the same pipeline.
     {
         let tx_ap = tx.clone();
         let aid   = agent_id.clone();
@@ -175,25 +174,13 @@ async fn main() -> Result<()> {
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
     let mode = output_mode;
+    let prev_tx = prev_event_tx.clone();
     let mut consumer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            if let Err(err) = write_event(&event, &mode).await {
-                error!("Failed to write event: {err}");
+            if let Some(p) = &prev_tx {
+                let _ = p.try_send(event.clone());
             }
-            match buf_for_consumer.lock() {
-                Ok(mut buf) => buf.push(event),
-                Err(e)      => error!("Ring buffer mutex poisoned: {e}"),
-            }
-
-            while let Ok(e) = rx.try_recv() {
-                if let Err(err) = write_event(&e, &mode).await {
-                    error!("Failed to write event: {err}");
-                }
-                match buf_for_consumer.lock() {
-                    Ok(mut buf) => buf.push(e),
-                    Err(e)      => error!("Ring buffer mutex poisoned: {e}"),
-                }
-            }
+            handle_event(&event, &mode, &buf_for_consumer).await;
         }
     });
 
@@ -227,6 +214,136 @@ async fn main() -> Result<()> {
     consumer.await.ok();
     info!("Shutdown complete");
     Ok(())
+}
+
+async fn handle_event(
+    event: &schema::AgentEvent,
+    mode:  &OutputMode,
+    buf:   &Arc<Mutex<RingBuffer>>,
+) {
+    if let Err(err) = write_event(event, mode).await {
+        error!("Failed to write event: {err}");
+    }
+    match buf.lock() {
+        Ok(mut b) => b.push(event.clone()),
+        Err(e)    => error!("Ring buffer mutex poisoned: {e}"),
+    }
+}
+
+/// Build / spawn the prevention subsystem.  Returns the sender used by the
+/// tee in the main consumer to forward events to the enforcement engine.
+async fn start_prevention(
+    backend_url: &str,
+    agent_id:    &str,
+    token:       &str,
+    hostname:    &str,
+    pipeline_tx: tokio::sync::mpsc::Sender<schema::AgentEvent>,
+    cfg_handle:  Arc<RwLock<AgentConfig>>,
+) -> Result<tokio::sync::mpsc::Sender<schema::AgentEvent>> {
+    use std::path::Path;
+    use prevention::{
+        audit::AuditEmitter,
+        command_puller::CommandPuller,
+        commands::Verifier,
+        engine::{Engine, EngineConfig},
+        network::{detect_backend, ensure_chains},
+        policy::{load_local_policy, PolicyHandle},
+        COMMAND_PUBKEY_PATH, LOCAL_POLICY_PATH, NONCE_STORE,
+    };
+
+    prevention::ensure_state_dirs();
+
+    let (event_tx, event_rx) =
+        tokio::sync::mpsc::channel::<schema::AgentEvent>(1024);
+
+    let audit = AuditEmitter::new(pipeline_tx.clone(), agent_id.into(), hostname.into());
+
+    let store = load_local_policy(Path::new(LOCAL_POLICY_PATH))
+        .context("load /etc/trapd/policy.json")?;
+    let policy = PolicyHandle::new(store);
+
+    let backend = detect_backend();
+    if let Err(e) = ensure_chains(backend) {
+        warn!(error = %e, "could not initialise firewall chains — IP/isolation actions will fail");
+    }
+
+    let allowlist = build_isolation_allowlist(backend_url, &cfg_handle);
+
+    let engine_cfg = EngineConfig {
+        net_backend: backend,
+        default_isolation_allowlist: allowlist,
+    };
+
+    let verifier = match Verifier::new(
+        Path::new(COMMAND_PUBKEY_PATH),
+        agent_id.to_string(),
+        Path::new(NONCE_STORE),
+    ) {
+        Ok(v) => Some(Arc::new(v)),
+        Err(e) => {
+            warn!(error = %e, "command verifier unavailable — backend commands will not be processed");
+            None
+        }
+    };
+
+    let engine = Arc::new(Engine::new(policy.clone(), audit.clone(), engine_cfg));
+    engine.spawn_event_loop(event_rx);
+
+    if let Some(v) = verifier {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
+        let poll_secs = cfg_handle
+            .read().map(|c| c.command_poll_interval_secs).unwrap_or(10);
+        let puller = CommandPuller::new(
+            backend_url,
+            agent_id,
+            token.to_string(),
+            v,
+            audit.clone(),
+            cmd_tx,
+            poll_secs,
+        );
+        tokio::spawn(async move { puller.run().await });
+        Arc::clone(&engine).spawn_command_loop(cmd_rx);
+    }
+
+    let lsm = prevention::lsm_loader::LsmHandle::try_load();
+    lsm.sync(&policy).await;
+
+    Ok(event_tx)
+}
+
+fn build_isolation_allowlist(
+    backend_url: &str,
+    cfg:         &Arc<RwLock<AgentConfig>>,
+) -> Vec<std::net::IpAddr> {
+    let mut out: Vec<std::net::IpAddr> = Vec::new();
+
+    if let Some(host) = backend_host(backend_url) {
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            out.push(ip);
+        } else if let Ok(addrs) =
+            std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:443"))
+        {
+            for a in addrs { out.push(a.ip()); }
+        }
+    }
+
+    if let Ok(c) = cfg.read() {
+        for raw in &c.isolation_allowlist_ips {
+            if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+                if !out.contains(&ip) { out.push(ip); }
+            }
+        }
+    }
+
+    out
+}
+
+fn backend_host(url: &str) -> Option<String> {
+    let s = url.split("://").nth(1).unwrap_or(url);
+    let s = s.split('/').next().unwrap_or(s);
+    let s = s.split(':').next().unwrap_or(s);
+    if s.is_empty() { None } else { Some(s.to_string()) }
 }
 
 async fn load_or_create_device_id() -> Result<String> {
