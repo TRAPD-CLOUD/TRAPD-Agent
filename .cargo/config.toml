@@ -1,0 +1,5 @@
+[alias]
+# `cargo xtask <subcommand>` runs the workspace's xtask binary so the
+# release workflow can invoke `cargo xtask build-ebpf --release` without
+# spelling out `cargo run --package xtask -- build-ebpf --release`.
+xtask = "run --package xtask --"
