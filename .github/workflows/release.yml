@@ -39,7 +39,9 @@ jobs:
       - name: Stage release assets
         run: |
           cp target/release/trapd-agent trapd-agent-linux-x86_64
-          cp trapd-agent-ebpf/target/bpfel-unknown-none/release/trapd-agent-exec trapd-agent-exec
+          # The eBPF crate redirects its target-dir to ../target (root) via
+          # trapd-agent-ebpf/.cargo/config.toml, so the artifact lands here:
+          cp target/bpfel-unknown-none/release/trapd-agent-exec trapd-agent-exec
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

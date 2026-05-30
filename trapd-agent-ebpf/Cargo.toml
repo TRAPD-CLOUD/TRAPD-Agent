@@ -20,7 +20,7 @@ aya-log-ebpf = "0.1"
 
 [profile.release]
 lto       = true
-opt-level = "z"
+opt-level = 3
 panic     = "abort"
 
 [profile.dev]

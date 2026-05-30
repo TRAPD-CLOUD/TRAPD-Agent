@@ -45,9 +45,11 @@ fn build_ebpf(release: bool) -> ExitCode {
     let ebpf_dir = workspace.join("trapd-agent-ebpf");
     let profile = if release { "release" } else { "debug" };
 
-    // trapd-agent-ebpf/rust-toolchain.toml pins a known-good nightly with
-    // the rust-src component, so we let rustup pick the toolchain here
-    // instead of forcing `+nightly` (which would bypass the pin).
+    // The eBPF crate must build with the nightly pinned in
+    // trapd-agent-ebpf/rust-toolchain.toml (for `-Z build-std` + the
+    // `bpfel-unknown-none` target).
+    let toolchain = pinned_ebpf_toolchain(&ebpf_dir);
+
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&ebpf_dir)
         .arg("build")
@@ -55,6 +57,31 @@ fn build_ebpf(release: bool) -> ExitCode {
         .args(["-Z", "build-std=core"]);
     if release {
         cmd.arg("--release");
+    }
+
+    // When this xtask runs through rustup (`cargo xtask …`, or in CI after
+    // `dtolnay/rust-toolchain@stable`), rustup exports `RUSTUP_TOOLCHAIN=stable`
+    // (and RUSTC/RUSTDOC) into our environment. The child `cargo` would inherit
+    // it and pin to stable — OVERRIDING the directory's nightly toolchain file —
+    // so `-Z build-std` fails with "the `-Z` flag is only accepted on the
+    // nightly channel". We instead pin the child explicitly to the same nightly
+    // for BOTH cargo and the `bpf-linker` it spawns; if they resolved to
+    // different toolchains, bpf-linker would load a mismatched LLVM and reject
+    // the bitcode ("aggregate returns are not supported"). Drop the inherited
+    // RUSTC/wrappers so the toolchain's own rustc/rustdoc are used.
+    cmd.env_remove("RUSTC")
+        .env_remove("RUSTDOC")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    match &toolchain {
+        Some(tc) => {
+            cmd.env("RUSTUP_TOOLCHAIN", tc);
+        }
+        // No channel parsed: fall back to letting the directory's toolchain
+        // file drive resolution (requires the inherited override be cleared).
+        None => {
+            cmd.env_remove("RUSTUP_TOOLCHAIN");
+        }
     }
 
     eprintln!("==> Building eBPF programs ({profile}) …");
@@ -70,7 +97,10 @@ fn build_ebpf(release: bool) -> ExitCode {
             ExitCode::FAILURE
         }
         Ok(_) => {
-            let out = ebpf_dir
+            // trapd-agent-ebpf/.cargo/config.toml redirects target-dir to
+            // ../target, so the artifact lands under the workspace target dir,
+            // not inside the eBPF crate.
+            let out = workspace
                 .join("target/bpfel-unknown-none")
                 .join(profile)
                 .join("trapd-agent-exec");
@@ -86,4 +116,26 @@ fn workspace_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
     p
+}
+
+/// Parse `channel = "…"` from `<ebpf_dir>/rust-toolchain.toml` so we can pin the
+/// child cargo (and the bpf-linker it spawns) to the exact same nightly the
+/// crate is pinned to. Returns `None` if the file or key is absent.
+fn pinned_ebpf_toolchain(ebpf_dir: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(ebpf_dir.join("rust-toolchain.toml")).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("channel") {
+            // `channel = "nightly-YYYY-MM-DD"` → extract the quoted value.
+            if let Some(start) = rest.find('"') {
+                if let Some(end) = rest[start + 1..].find('"') {
+                    return Some(rest[start + 1..start + 1 + end].to_string());
+                }
+            }
+        }
+    }
+    None
 }
