@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::{QUARANTINE_DIR, QUARANTINE_INDEX};
+use super::{quarantine_dir, quarantine_index};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuarantineRecord {
@@ -46,7 +46,8 @@ pub struct QuarantineIndex {
 
 impl QuarantineIndex {
     pub fn load() -> Self {
-        let path = Path::new(QUARANTINE_INDEX);
+        let index = quarantine_index();
+        let path = index.as_path();
         if !path.exists() { return Self::default(); }
         match fs::read(path) {
             Ok(b)  => serde_json::from_slice(&b).unwrap_or_default(),
@@ -56,9 +57,9 @@ impl QuarantineIndex {
 
     pub fn save(&self) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(self)?;
-        let tmp = PathBuf::from(format!("{QUARANTINE_INDEX}.tmp"));
+        let tmp = PathBuf::from(format!("{}.tmp", quarantine_index().display()));
         fs::write(&tmp, bytes).context("write tmp index")?;
-        fs::rename(&tmp, QUARANTINE_INDEX).context("rename index")?;
+        fs::rename(&tmp, quarantine_index()).context("rename index")?;
         Ok(())
     }
 }
@@ -79,10 +80,10 @@ pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
 
     let sha = sha256_of(path)?;
 
-    fs::create_dir_all(QUARANTINE_DIR).context("create quarantine dir")?;
-    let _ = set_mode(Path::new(QUARANTINE_DIR), 0o700);
+    fs::create_dir_all(quarantine_dir()).context("create quarantine dir")?;
+    let _ = set_mode(&quarantine_dir(), 0o700);
 
-    let stored = PathBuf::from(format!("{QUARANTINE_DIR}/{sha}.bin"));
+    let stored = quarantine_dir().join(format!("{sha}.bin"));
 
     move_or_copy(path, &stored)?;
 

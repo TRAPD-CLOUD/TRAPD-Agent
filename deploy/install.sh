@@ -22,6 +22,7 @@ UPDATE_TIMER_FILE="/etc/systemd/system/trapd-update.timer"
 LOGROTATE_FILE="/etc/logrotate.d/trapd"
 ENV_DIR="/etc/trapd"
 LOG_DIR="/var/log/trapd"
+STATE_DIR="/var/lib/trapd"
 
 # ── Preflight checks ────────────────────────────────────────────────────────
 for cmd in curl systemctl; do
@@ -75,12 +76,20 @@ else
 fi
 
 # ── Create directories ───────────────────────────────────────────────────────
-mkdir -p "$ENV_DIR" "$LOG_DIR"
+# systemd's StateDirectory=/LogsDirectory= also create these, but doing it here
+# keeps a manual (non-systemd) run working too.
+mkdir -p "$ENV_DIR" "$LOG_DIR" "$STATE_DIR"
+chmod 700 "$STATE_DIR"
 
 # ── Write agent.env (from env vars if provided) ──────────────────────────────
 ENV_FILE="${ENV_DIR}/agent.env"
 
-if [[ -n "${TRAPD_BACKEND_URL:-}" && -n "${TRAPD_ENROLL_TOKEN:-}" ]]; then
+# Strip any trailing slash from the backend URL so the agent never builds
+# double-slash request paths.
+TRAPD_BACKEND_URL="${TRAPD_BACKEND_URL:-}"
+TRAPD_BACKEND_URL="${TRAPD_BACKEND_URL%/}"
+
+if [[ -n "${TRAPD_BACKEND_URL}" && -n "${TRAPD_ENROLL_TOKEN:-}" ]]; then
     echo "Writing agent config to ${ENV_FILE}..."
     cat > "$ENV_FILE" <<ENVEOF
 TRAPD_BACKEND_URL=${TRAPD_BACKEND_URL}
@@ -90,7 +99,9 @@ RUST_LOG=info
 ENVEOF
     chmod 600 "$ENV_FILE"
     echo "Config written — agent will enroll automatically on first start."
-elif [[ ! -f "$ENV_FILE" ]]; then
+elif [[ -f "$ENV_FILE" ]]; then
+    echo "Keeping existing ${ENV_FILE} (not overwriting)."
+else
     echo ""
     echo "⚠️  TRAPD_BACKEND_URL or TRAPD_ENROLL_TOKEN not set."
     echo "   Edit ${ENV_FILE} before starting the agent:"
@@ -103,21 +114,55 @@ ENVEOF
     chmod 600 "$ENV_FILE"
 fi
 
-# ── Write trapd-agent.service ────────────────────────────────────────────────
+# ── Write trapd-agent.service (hardened, $HOME-independent) ───────────────────
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=TRAPD Security Agent
-After=network.target
+Documentation=https://github.com/trapd-cloud/trapd-agent
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/trapd-agent
 Restart=always
 RestartSec=5
-EnvironmentFile=/etc/trapd/agent.env
-Environment=TRAPD_EBPF_PATH=${EBPF_INSTALL_BIN}
+TimeoutStopSec=30
 
-# Capabilities for eBPF loading, network containment and file quarantine
+Environment=TRAPD_OUTPUT=file
+Environment=RUST_LOG=info
+# Canonical, \$HOME-independent locations.  Setting these explicitly means the
+# agent never depends on systemd providing \$HOME (it does not for system
+# services) — this was the historical enrollment crash-loop root cause.
+Environment=TRAPD_STATE_DIR=${STATE_DIR}
+Environment=TRAPD_CONFIG_DIR=${ENV_DIR}
+Environment=TRAPD_LOG_DIR=${LOG_DIR}
+Environment=HOME=${STATE_DIR}
+Environment=TRAPD_EBPF_PATH=${EBPF_INSTALL_BIN}
+EnvironmentFile=-/etc/trapd/agent.env
+
+# systemd creates/owns these with correct permissions on every start.
+StateDirectory=trapd
+StateDirectoryMode=0700
+LogsDirectory=trapd
+ConfigurationDirectory=trapd
+
+# ── Hardening ────────────────────────────────────────────────────────────────
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=-/etc/trapd -/var/lib/trapd -/var/log/trapd
+NoNewPrivileges=true
+# Capabilities for eBPF loading, network containment and file quarantine.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE
+MemoryDenyWriteExecute=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+ProtectControlGroups=true
+SystemCallFilter=@system-service @network-io @file-system @process bpf perf_event_open
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

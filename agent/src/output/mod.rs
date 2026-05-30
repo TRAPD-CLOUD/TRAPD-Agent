@@ -1,4 +1,5 @@
 use std::env;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use tokio::fs::{self, OpenOptions};
@@ -7,11 +8,14 @@ use tracing::info;
 
 use crate::schema::AgentEvent;
 
-const LOG_DIR:  &str = "/var/log/trapd";
-const LOG_FILE: &str = "/var/log/trapd/events.ndjson";
-
 const MAX_FILE_BYTES:   u64 = 100 * 1024 * 1024; // 100 MB
 const MAX_ROTATED_FILES: u32 = 3;
+
+/// Absolute path to the NDJSON event log, resolved via [`crate::paths`] so it
+/// honours `TRAPD_LOG_DIR` (default `/var/log/trapd/events.ndjson`).
+fn log_file() -> PathBuf {
+    crate::paths::log_dir().join("events.ndjson")
+}
 
 #[derive(Debug, Clone)]
 pub enum OutputMode {
@@ -38,12 +42,13 @@ pub async fn write_event(event: &AgentEvent, mode: &OutputMode) -> Result<()> {
             out.flush().await?;
         }
         OutputMode::File => {
+            let log_file = log_file();
             ensure_log_dir().await?;
-            rotate_if_needed().await?;
+            rotate_if_needed(&log_file).await?;
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(LOG_FILE)
+                .open(&log_file)
                 .await?;
             file.write_all(line.as_bytes()).await?;
             file.write_all(b"\n").await?;
@@ -53,33 +58,34 @@ pub async fn write_event(event: &AgentEvent, mode: &OutputMode) -> Result<()> {
 }
 
 async fn ensure_log_dir() -> Result<()> {
-    fs::create_dir_all(LOG_DIR).await?;
+    fs::create_dir_all(crate::paths::log_dir()).await?;
     Ok(())
 }
 
-async fn rotate_if_needed() -> Result<()> {
-    match fs::metadata(LOG_FILE).await {
-        Ok(meta) if meta.len() >= MAX_FILE_BYTES => rotate_log().await,
+async fn rotate_if_needed(log_file: &std::path::Path) -> Result<()> {
+    match fs::metadata(log_file).await {
+        Ok(meta) if meta.len() >= MAX_FILE_BYTES => rotate_log(log_file).await,
         _ => Ok(()),
     }
 }
 
 /// Shift rotated files: .3 deleted, .2→.3, .1→.2, current→.1
-async fn rotate_log() -> Result<()> {
+async fn rotate_log(log_file: &std::path::Path) -> Result<()> {
+    let base = log_file.display().to_string();
     for i in (1..=MAX_ROTATED_FILES).rev() {
-        let src = format!("{LOG_FILE}.{i}");
+        let src = format!("{base}.{i}");
         if fs::try_exists(&src).await.unwrap_or(false) {
             if i == MAX_ROTATED_FILES {
                 fs::remove_file(&src).await?;
             } else {
-                let dst = format!("{LOG_FILE}.{}", i + 1);
+                let dst = format!("{base}.{}", i + 1);
                 fs::rename(&src, &dst).await?;
             }
         }
     }
-    if fs::try_exists(LOG_FILE).await.unwrap_or(false) {
-        fs::rename(LOG_FILE, format!("{LOG_FILE}.1")).await?;
-        info!("Log rotated: {LOG_FILE} → {LOG_FILE}.1");
+    if fs::try_exists(log_file).await.unwrap_or(false) {
+        fs::rename(log_file, format!("{base}.1")).await?;
+        info!("Log rotated: {base} → {base}.1");
     }
     Ok(())
 }

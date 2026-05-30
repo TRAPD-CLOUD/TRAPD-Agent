@@ -37,9 +37,10 @@ impl CommandPuller {
         out:         Sender<CommandEnvelope>,
         poll_secs:   u64,
     ) -> Self {
+        let base = crate::http::normalize_base_url(backend_url);
         Self {
-            client:   reqwest::Client::new(),
-            url:      format!("{backend_url}/api/v1/agents/{agent_id}/commands"),
+            client:   crate::http::control_client(),
+            url:      format!("{base}/api/v1/agents/{agent_id}/commands"),
             token,
             verifier,
             audit,

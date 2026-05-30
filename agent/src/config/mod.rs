@@ -19,6 +19,7 @@ fn default_enabled_collectors() -> Vec<String> {
 }
 fn default_prevention_enabled() -> bool { true }
 fn default_command_poll_interval() -> u64 { 10 }
+fn default_inventory_enabled() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -41,6 +42,12 @@ pub struct AgentConfig {
     /// mode (the management channel is always on the allow-list).
     #[serde(default)]
     pub isolation_allowlist_ips: Vec<String>,
+
+    // ── Asset inventory ─────────────────────────────────────────────────────
+    /// Master switch for periodic asset-inventory reporting (hardware, OS,
+    /// installed software, users).  When `false` no inventory is collected.
+    #[serde(default = "default_inventory_enabled")]
+    pub inventory_enabled: bool,
 }
 
 impl Default for AgentConfig {
@@ -52,6 +59,7 @@ impl Default for AgentConfig {
             prevention_enabled: default_prevention_enabled(),
             command_poll_interval_secs: default_command_poll_interval(),
             isolation_allowlist_ips:    Vec::new(),
+            inventory_enabled:  default_inventory_enabled(),
         }
     }
 }
@@ -71,10 +79,11 @@ impl ConfigPuller {
         agent_id:    &str,
         token:       String,
     ) -> Self {
+        let base = crate::http::normalize_base_url(backend_url);
         Self {
             config,
-            client:     reqwest::Client::new(),
-            config_url: format!("{backend_url}/api/v1/agents/{agent_id}/config"),
+            client:     crate::http::control_client(),
+            config_url: format!("{base}/api/v1/agents/{agent_id}/config"),
             token,
             etag:       None,
         }

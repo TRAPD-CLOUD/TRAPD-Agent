@@ -12,16 +12,33 @@ TimeoutStopSec=30
 
 Environment=TRAPD_OUTPUT=file
 Environment=RUST_LOG=info
+# Canonical, $HOME-independent state/config/log locations.  Setting these
+# explicitly means the agent never depends on systemd providing $HOME (it does
+# NOT for system services) — that missing $HOME was the historical enrollment
+# crash-loop: load_or_create_device_id() bailed and systemd restarted forever.
+Environment=TRAPD_STATE_DIR=/var/lib/trapd
+Environment=TRAPD_CONFIG_DIR=/etc/trapd
+Environment=TRAPD_LOG_DIR=/var/log/trapd
+Environment=HOME=/var/lib/trapd
 EnvironmentFile=-/etc/trapd/agent.env
+
+# systemd creates and owns these with the right permissions on every start:
+#   StateDirectory         -> /var/lib/trapd   (0700)  device_id, credentials
+#   LogsDirectory          -> /var/log/trapd   (0755)  events.ndjson
+#   ConfigurationDirectory -> /etc/trapd       (0755)  agent.env, policy, certs
+StateDirectory=trapd
+StateDirectoryMode=0700
+LogsDirectory=trapd
+ConfigurationDirectory=trapd
 
 # ── Filesystem isolation ──────────────────────────────────────────────────────
 # /usr, /boot, /efi are read-only; agent binary in /usr/local/bin is protected.
 ProtectSystem=strict
-# /home and /root are read-only; device_id/credentials live in ReadWritePaths.
-ProtectHome=read-only
+# State no longer lives under $HOME, so /home and /root can be fully hidden.
+ProtectHome=true
 PrivateTmp=true
 # Explicit writable paths: agent state, config, logs.
-ReadWritePaths=-/etc/trapd -/var/lib/trapd -/var/log/trapd -/root/.trapd
+ReadWritePaths=-/etc/trapd -/var/lib/trapd -/var/log/trapd
 
 # ── Privilege isolation ───────────────────────────────────────────────────────
 # Prevent privilege escalation via setuid/setgid after start.

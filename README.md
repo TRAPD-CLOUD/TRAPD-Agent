@@ -19,17 +19,47 @@ nano /etc/trapd/agent.env
 ```
 
 ```ini
-# Required: URL of your TRAPD backend
+# Required for a backend-connected agent: URL of your TRAPD backend.
+# If omitted (or with TRAPD_OFFLINE=1) the agent runs in OFFLINE mode and only
+# writes telemetry locally — handy for testing on a fresh box.
 TRAPD_BACKEND_URL=https://your-backend.com
 
-# Optional: pre-shared agent token (obtained automatically via enrollment if omitted)
-TRAPD_TOKEN=your-token
+# First-run enrollment token from the dashboard. Once enrolled, durable
+# credentials are stored in the state dir and this is no longer needed.
+TRAPD_ENROLL_TOKEN=enroll_xxxx
 
-# Optional: output destination — "file" writes to /var/log/trapd/events.ndjson
+# Optional: output destination — "file" writes to $TRAPD_LOG_DIR/events.ndjson
 TRAPD_OUTPUT=file
 
 # Optional: log verbosity (default: info)
 RUST_LOG=info
+
+# Optional: cap enrollment retries (0 / unset = retry forever, never crash-loop)
+#TRAPD_ENROLL_MAX_ATTEMPTS=0
+```
+
+### Filesystem layout
+
+The agent keeps state, config and logs in fixed, `$HOME`-independent locations
+(each overridable via an env var). This is what makes it run reliably under a
+hardened systemd unit, where `$HOME` is not set:
+
+| Kind   | Default          | Override env       | Contents                          |
+|--------|------------------|--------------------|-----------------------------------|
+| state  | `/var/lib/trapd` | `TRAPD_STATE_DIR`  | `device_id`, `credentials.json`   |
+| config | `/etc/trapd`     | `TRAPD_CONFIG_DIR` | `agent.env`, `policy.json`, certs |
+| logs   | `/var/log/trapd` | `TRAPD_LOG_DIR`    | `events.ndjson`                   |
+
+### Quick local test (no backend)
+
+```sh
+# Runs offline, emits NDJSON telemetry to ./trapd-test/log/events.ndjson
+mkdir -p trapd-test/{state,cfg,log}
+TRAPD_STATE_DIR=$PWD/trapd-test/state \
+TRAPD_CONFIG_DIR=$PWD/trapd-test/cfg \
+TRAPD_LOG_DIR=$PWD/trapd-test/log \
+TRAPD_OUTPUT=file RUST_LOG=info \
+  ./target/release/trapd-agent
 ```
 
 Apply changes:

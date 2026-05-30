@@ -23,27 +23,41 @@ pub mod network;
 pub mod policy;
 pub mod process;
 pub mod quarantine;
+pub mod software;
 
 use std::path::PathBuf;
 
-/// Root directory for all prevention-owned on-disk state.
-pub const STATE_DIR: &str = "/var/lib/trapd";
+// Prevention paths derive from the shared, $HOME-independent layout in
+// [`crate::paths`], so they honour TRAPD_STATE_DIR / TRAPD_CONFIG_DIR exactly
+// like device_id, credentials and the FIM baseline.  Under systemd-as-root they
+// resolve to /var/lib/trapd and /etc/trapd; in a non-root test run they follow
+// the overrides, so quarantine and the command verifier work there too.
+
 /// Directory holding quarantined file payloads.
-pub const QUARANTINE_DIR: &str = "/var/lib/trapd/quarantine";
+pub fn quarantine_dir() -> PathBuf {
+    crate::paths::state_dir().join("quarantine")
+}
 /// Quarantine index — JSON list of `QuarantineRecord`s.
-pub const QUARANTINE_INDEX: &str = "/var/lib/trapd/quarantine/index.json";
+pub fn quarantine_index() -> PathBuf {
+    quarantine_dir().join("index.json")
+}
 /// Replay-protection store — JSON list of accepted command-nonces.
-pub const NONCE_STORE: &str = "/var/lib/trapd/command_nonces.json";
+pub fn nonce_store() -> PathBuf {
+    crate::paths::state_dir().join("command_nonces.json")
+}
 /// Public key used to verify backend-issued response commands.
-pub const COMMAND_PUBKEY_PATH: &str = "/etc/trapd/command_signing.pub";
+pub fn command_pubkey_path() -> PathBuf {
+    crate::paths::config_dir().join("command_signing.pub")
+}
 /// Local boot-time IoC policy file (optional).
-pub const LOCAL_POLICY_PATH: &str = "/etc/trapd/policy.json";
+pub fn local_policy_path() -> PathBuf {
+    crate::paths::config_dir().join("policy.json")
+}
 
 /// Ensure the on-disk state hierarchy exists.  Best-effort; logs but never
 /// fails the agent because prevention is opt-in.
 pub fn ensure_state_dirs() {
-    for p in [STATE_DIR, QUARANTINE_DIR] {
-        let path = PathBuf::from(p);
+    for path in [crate::paths::state_dir().to_path_buf(), quarantine_dir()] {
         if let Err(e) = std::fs::create_dir_all(&path) {
             tracing::warn!(path = %path.display(), error = %e, "cannot create prevention state dir");
         }

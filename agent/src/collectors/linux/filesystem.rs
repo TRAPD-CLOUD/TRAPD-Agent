@@ -73,9 +73,10 @@ pub struct FilesystemCollector {
 
 impl FilesystemCollector {
     pub fn new() -> Self {
-        let db_path = std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".trapd").join("fim_baseline.db"))
-            .unwrap_or_else(|_| PathBuf::from("/var/lib/trapd/fim_baseline.db"));
+        // State lives in the canonical, $HOME-independent state dir (resolved by
+        // `crate::paths`) so the FIM baseline DB survives under systemd just like
+        // device_id and credentials.
+        let db_path = crate::paths::state_dir().join("fim_baseline.db");
         Self { db_path }
     }
 }

@@ -106,7 +106,49 @@ impl Engine {
             CommandPayload::UpdatePolicy { rules } => {
                 self.cmd_update_policy(rules.clone(), &cmd_id);
             }
+            CommandPayload::InstallPackage { name } => {
+                self.cmd_package(super::software::Operation::Install(name), &cmd_id);
+            }
+            CommandPayload::RemovePackage { name } => {
+                self.cmd_package(super::software::Operation::Remove(name), &cmd_id);
+            }
+            CommandPayload::UpgradePackage { name } => {
+                let op = match name {
+                    Some(n) => super::software::Operation::Upgrade(n),
+                    None => super::software::Operation::UpgradeAll,
+                };
+                self.cmd_package(op, &cmd_id);
+            }
         }
+    }
+
+    /// Run a software-management operation and audit the outcome.  Package work
+    /// shells out to the package manager (via an argv, no shell).
+    fn cmd_package(&self, op: super::software::Operation<'_>, cmd_id: &str) {
+        use crate::schema::{EventAction, Severity};
+        use super::software::Operation;
+
+        let (action, kind, target): (EventAction, &str, String) = match &op {
+            Operation::Install(p) => (EventAction::PackageInstalled, "package_install", p.to_string()),
+            Operation::Remove(p)  => (EventAction::PackageRemoved,   "package_remove",  p.to_string()),
+            Operation::Upgrade(p) => (EventAction::PackageUpgraded,  "package_upgrade", p.to_string()),
+            Operation::UpgradeAll => (EventAction::PackageUpgraded,  "package_upgrade", "<all>".to_string()),
+        };
+
+        let result = super::software::execute(op);
+        let severity = if result.success { Severity::Info } else { Severity::Medium };
+
+        self.audit.emit(
+            action,
+            severity,
+            kind,
+            target,
+            result.success,
+            result.summary,
+            None,
+            Some(cmd_id.into()),
+            json!({ "output": result.output }),
+        );
     }
 
     fn cmd_kill_pid(&self, pid: i32, cmd_id: &str) {

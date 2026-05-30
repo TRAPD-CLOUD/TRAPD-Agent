@@ -52,6 +52,8 @@ pub enum EventClass {
     Ipc,
     /// Active prevention / response actions taken by the agent.
     Prevention,
+    /// A behavioural/IOC detection raised by the local detection engine.
+    Detection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,15 @@ pub enum EventAction {
     CommandRejected,
     /// A signed response command was accepted and executed.
     CommandAccepted,
+    /// The local detection engine raised a finding (see `DetectionData`).
+    Detected,
+    // ── Software / asset management actions ─────────────────────────────────
+    /// A package was installed via a signed command.
+    PackageInstalled,
+    /// A package was removed via a signed command.
+    PackageRemoved,
+    /// A package (or all packages) were upgraded via a signed command.
+    PackageUpgraded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +165,8 @@ pub enum EventData {
     KillAttempt(KillAttemptData),
     // ── Prevention event payload ────────────────────────────────────────
     Prevention(PreventionEventData),
+    // ── Detection engine payload ────────────────────────────────────────
+    Detection(DetectionData),
 }
 
 // ── Existing data structs ────────────────────────────────────────────────────────────────────────
@@ -465,6 +478,40 @@ pub struct PreventionEventData {
     /// Free-form structured details (process metadata, hashes, etc.).
     #[serde(skip_serializing_if = "serde_json::Value::is_null", default)]
     pub details:    serde_json::Value,
+}
+
+// ── Detection engine payload ──────────────────────────────────────────────────
+
+/// One finding from the local detection engine.  The engine correlates raw
+/// telemetry (process exec, network connections, file events) against rules,
+/// IOC feeds and behavioural heuristics, and maps each hit to MITRE ATT&CK so
+/// the backend can route and prioritise without re-deriving context.
+///
+/// This type is deliberately platform-neutral: the same engine and schema will
+/// back the future Windows agent, only the *collectors* feeding it differ.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectionData {
+    /// Stable rule identifier, e.g. `lolbin.shell_spawns_downloader`.
+    pub rule_id:    String,
+    /// Human-readable title of what was detected.
+    pub title:      String,
+    /// Detection family: `ioc`, `lolbin`, `reverse_shell`, `beaconing`, …
+    pub category:   String,
+    /// MITRE ATT&CK tactic (e.g. `TA0011 Command and Control`), if mapped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mitre_tactic: Option<String>,
+    /// MITRE ATT&CK technique (e.g. `T1059.004`), if mapped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mitre_technique: Option<String>,
+    /// Confidence 0–100 that this is a true positive.
+    pub confidence: u8,
+    /// What the detection fired on: pid, ip:port, file path, hash, …
+    pub subject:    String,
+    /// Free-form explanation, including the matched evidence.
+    pub detail:     String,
+    /// Optional structured evidence (matched IOC, observed cadence, …).
+    #[serde(skip_serializing_if = "serde_json::Value::is_null", default)]
+    pub evidence:   serde_json::Value,
 }
 
 #[cfg(test)]
