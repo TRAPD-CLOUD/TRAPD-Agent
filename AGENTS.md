@@ -21,6 +21,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - `agent/src/config/mod.rs`: backend-delivered agent config schema.
 - `agent/src/prevention/commands.rs`: signed response command schema.
 - `agent/src/prevention/policy.rs`: IoC policy/rule schema.
+- `agent/src/deception/`: honeytoken deception subsystem — `profiler.rs` (deterministic recon profile / token candidates), `registry.rs` (deployed-token register at `<state>/honeytokens.json`), `mod.rs` (camouflaged deploy + safe revoke). Step 1 places and manages tokens; no detection yet.
 - `agent/src/transport/mod.rs`: event ingest transport.
 - `agent/src/output/mod.rs`: local stdout/file NDJSON output.
 - `agent/src/http/mod.rs`: shared HTTP client, TLS pinning, mTLS, timeouts.
@@ -46,7 +47,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 ## Filesystem Layout
 
-- State dir: default `/var/lib/trapd`, override `TRAPD_STATE_DIR`; contains `device_id`, `credentials.json`, nonces, baselines.
+- State dir: default `/var/lib/trapd`, override `TRAPD_STATE_DIR`; contains `device_id`, `credentials.json`, nonces, baselines, `honeytokens.json` (deployed-honeytoken register, `0600`).
 - Config dir: default `/etc/trapd`, override `TRAPD_CONFIG_DIR`; contains `agent.env`, `policy.json`, `ca.crt`, `agent.crt`, `agent.key`, `command_signing.pub`.
 - Log dir: default `/var/log/trapd`, override `TRAPD_LOG_DIR`; contains `events.ndjson`.
 - State dir is hardened to `0700`; credentials are atomically written as `0600`.
@@ -148,7 +149,7 @@ agent_tamper, write_rate_anomaly, kill_attempt, process_blocked,
 network_isolated, network_deisolated, ip_blocked, ip_unblocked,
 file_quarantined, file_restored, policy_updated, command_rejected,
 command_accepted, detected, package_installed, package_removed,
-package_upgraded
+package_upgraded, honeytoken_deployed, honeytoken_revoked, honeytoken_access
 ```
 
 ## EventData Schemas
@@ -515,7 +516,56 @@ package_upgraded
 }
 ```
 
-Known `kind` values include `process_block`, `network_isolate`, `network_deisolate`, `ip_block`, `ip_unblock`, `quarantine`, `restore`, `policy_update`, `command_rejected`, `command_accepted`.
+Known `kind` values include `process_block`, `network_isolate`, `network_deisolate`, `ip_block`, `ip_unblock`, `quarantine`, `restore`, `policy_update`, `command_rejected`, `command_accepted`, `honeytoken_deploy`, `honeytoken_revoke`, `honeytoken_response`.
+
+### `HoneytokenAccessData`
+
+Emitted (`class=detection`, `action=honeytoken_access`, severity `critical`) when a
+deployed honeytoken is opened. By construction no legitimate workflow reads a
+honeytoken, so `confidence` is always `100`. The payload binds the access to the
+accessor's full process lineage (the "flight recorder" idea) so the backend can
+reconstruct how the touching process came to exist.
+
+```json
+{
+  "token_id": "string (matches HoneytokenRecord.id)",
+  "path": "string (absolute path opened)",
+  "kind": "string (token family)",
+  "open_flags": "u64 (read-only access still fires)",
+  "confidence": "u8 (always 100)",
+  "mitre_tactic": "string",
+  "mitre_technique": "string",
+  "accessor": "ProcessLineage"
+}
+```
+
+### `ProcessLineage` / `ProcessAncestor`
+
+```json
+{
+  "pid": "i32",
+  "uid": "u32",
+  "gid": "u32",
+  "username": "string",
+  "comm": "string",
+  "exe": "string, optional",
+  "cmdline": "string, optional",
+  "ancestors": ["ProcessAncestor"]
+}
+```
+
+```json
+{
+  "pid": "i32",
+  "comm": "string",
+  "exe": "string, optional",
+  "cmdline": "string, optional"
+}
+```
+
+`ancestors` lists the parent chain nearest-first, walking up toward PID 1
+(bounded depth). The `honeytoken_response` prevention event (above) records the
+policy-driven reaction (`alert`/`kill`/`isolate`) taken for each access.
 
 ### `DetectionData`
 
@@ -608,6 +658,8 @@ Persisted locally in `credentials.json`.
 
 ### `InventorySnapshot`
 
+Current `schema_version` is `2` (v2 added `recon_profile`).
+
 ```json
 {
   "schema_version": "u32",
@@ -620,9 +672,102 @@ Persisted locally in `credentials.json`.
   "hardware": "HardwareInfo",
   "network": ["NetInterface"],
   "software": "SoftwareInventory",
-  "users": ["UserAccount"]
+  "users": ["UserAccount"],
+  "recon_profile": "ReconProfile"
 }
 ```
+
+### `ReconProfile`
+
+Deception recon profile: deterministic honeytoken candidates derived on-agent
+from the observed context (users + installed software + cheap on-host
+existence checks). Sent to the backend so it can generate believable content
+and rank placements. Candidates are pre-sorted by descending `score`.
+
+The candidate set follows the attacker playbook (MITRE **T1552** Unsecured
+Credentials / **T1083** File & Directory Discovery). The governing rule: a
+candidate is only proposed where the genuine artefact is plausible (e.g. no
+`~/.aws/credentials` unless `awscli` is installed), so the placement does not
+reveal the trap.
+
+```json
+{
+  "schema_version": "u32",
+  "candidates": ["TokenCandidate"]
+}
+```
+
+### `TokenCandidate`
+
+```json
+{
+  "kind": "string (ssh_private_key|aws_credentials|pgpass|my_cnf|docker_config|kube_config|webroot_env|root_backup_keys|passwords_kdbx|shell_history)",
+  "path": "string (absolute path where the genuine artefact would live)",
+  "mitre_technique": "string (e.g. T1552.004)",
+  "rationale": "string (which observed evidence justified this candidate)",
+  "context": ["string (tags: user:<name>, pkg:<name>, dir:<path>, …)"],
+  "score": "u8 (0-100, context strength × attacker attractiveness)",
+  "mode": "u32 (octal file mode, e.g. 384 = 0o600)",
+  "mimic_neighbor": "bool"
+}
+```
+
+Backend responsibilities for the recon profile:
+
+- **Content generation (LLM):** turn each chosen candidate into believable,
+  host-specific bait — a `.env` matching the detected app stack, fake secrets
+  in the correct format (AWS `AKIA…` layout, JWT structure, DB connection
+  strings with plausible internal hostnames). Embed an out-of-band canary
+  marker in the content.
+- **Placement ranking:** decide which candidates to deploy first. Start with
+  the deterministic `score` the agent already computed; a trained model
+  replaces it in step 2 once hit/miss telemetry exists.
+- Issue chosen candidates back as signed `deploy_honeytoken` commands.
+
+## Deception Step 2: Access Detection, Response & ML Feedback Loop
+
+### On-agent detection (eBPF + userspace)
+
+- eBPF (`trapd-agent-ebpf/src/file_open.rs`): two new maps ride the existing
+  `sys_enter_openat` program — `HONEYTOKEN_PATHS` (absolute path, NUL-padded to
+  256 bytes → token id) and the dedicated `HONEYTOKEN_ACCESS_EVENTS` ring
+  buffer. On an open whose path is in the table the program emits an access
+  event **regardless of open flags** (the read-only detection fix), while the
+  general read-only suppression on `FILE_OPEN_EVENTS` is unchanged.
+- **Design note (path-gate + userspace inode verification):** matching is by
+  exact path in the kernel rather than by inode. The codebase deliberately
+  avoids dereferencing kernel structs in BPF (CO-RE is fragile across kernels —
+  see `process_block.rs`), and `sys_enter_openat` exposes only the user path
+  pointer. The userspace consumer re-verifies identity against the token's
+  recorded device+inode, so the authoritative check is inode-based even though
+  the cheap in-kernel gate is path-based. A future hardening is a BTF/CO-RE
+  inode read to also catch relative-path / symlink opens at the kernel layer.
+- Userspace (`agent/src/collectors/linux/ebpf_syscalls.rs` +
+  `agent/src/detection/honeytoken.rs`): a reconciler arms `HONEYTOKEN_PATHS`
+  from the on-disk register (`<state>/honeytokens.json`) every 15s; a consumer
+  enriches each hit with full `/proc` lineage, applies the false-positive
+  allowlist + agent self-exclusion, and emits a `HoneytokenAccess` detection.
+- The prevention engine reacts per `honeytoken_response` policy
+  (`alert`/`kill`/`isolate`) and audits the decision as a `honeytoken_response`
+  prevention event.
+
+### Backend feedback loop (ML)
+
+This is where real training data first exists — a token is either touched (by
+whom, how soon after deployment) or never touched over N days. The backend
+should:
+
+- **Hit telemetry:** persist every `HoneytokenAccess` event and pair it with the
+  originating `deploy_honeytoken` (via `token_id`) to derive the per-token
+  signal (touched vs. dormant, latency-to-touch, accessor lineage).
+- **Re-ranking:** feed that signal fleet-wide into the placement ranker from
+  step 1b, learning which token archetypes & paths actually catch attackers vs.
+  which are dead weight — closing the loop back onto candidate selection.
+- **Rotation / aging:** rotate stale tokens (regenerate content, vary path) via
+  `revoke_honeytoken` + `deploy_honeytoken` so a returning attacker cannot
+  memorise them.
+- **Drift:** when a host's `recon_profile` changes (new package → new plausible
+  location), propose new placements.
 
 ### `OsInfo`
 
@@ -731,9 +876,18 @@ Persisted locally in `credentials.json`.
   "prevention_enabled": "bool, default true",
   "command_poll_interval_secs": "u64, default 10",
   "isolation_allowlist_ips": ["string"],
-  "inventory_enabled": "bool, default true"
+  "inventory_enabled": "bool, default true",
+  "honeytoken_detection_enabled": "bool, default true",
+  "honeytoken_response": "string, default \"alert\" (none|alert|kill|isolate)",
+  "honeytoken_accessor_allowlist": ["string (extra benign accessor comms)"]
 }
 ```
+
+`honeytoken_response` escalates: `none` (detection only, no engine action) <
+`alert` (critical prevention event) < `kill` (also SIGKILL the accessor) <
+`isolate` (also full host network isolation). `honeytoken_accessor_allowlist`
+extends the built-in sweeper allowlist (mlocate/updatedb, AV scanners, backup
+tools, and the agent itself) used to suppress false positives.
 
 ## Command Schemas
 
@@ -775,7 +929,36 @@ Discriminated by `kind`.
 { "kind": "install_package", "name": "string" }
 { "kind": "remove_package", "name": "string" }
 { "kind": "upgrade_package", "name": "string, optional" }
+{ "kind": "deploy_honeytoken", "path": "string", "content_b64": "base64 string", "mode": "u32 octal, optional, default 0", "mimic_neighbor": "bool, optional, default false", "canary_marker": "string, optional", "token_kind": "string, optional" }
+{ "kind": "revoke_honeytoken", "path": "string" }
 ```
+
+#### `deploy_honeytoken` / `revoke_honeytoken` semantics
+
+- `content_b64` is base64 of the **fully-formed** bait content the backend
+  generated (the LLM content-generation job). The agent never generates
+  content and no LLM runs on the endpoint.
+- `mode` is an octal file mode encoded as an integer (e.g. `384` = `0o600`).
+  `0` means "adopt the mimicked neighbour's mode"; if there is no neighbour the
+  agent falls back to `0o600`.
+- `mimic_neighbor=true` makes the agent copy owner/group and atime/mtime from a
+  sibling file in the same directory so the token blends in.
+- `canary_marker` is the out-of-band tracking marker embedded in `content_b64`
+  by the backend (e.g. a fake AWS key id tied to a monitored honeypot account,
+  or a tracking domain). It is recorded locally for correlation; the agent does
+  not parse it back out of the content.
+- `token_kind` is the recon candidate family echoed back (`ssh_private_key`,
+  `aws_credentials`, …); recorded in the register for attribution.
+- Safety invariants enforced on the agent: the target path must be **absolute**
+  with no `..` component; the agent **refuses to overwrite** an existing file
+  (so real user data is never clobbered); `revoke_honeytoken` only removes a
+  path that is present in the local register (`<state>/honeytokens.json`), so a
+  command can never make the agent delete a file it did not plant.
+- Outcomes are reported as `class=prevention` audit events with
+  `action=honeytoken_deployed` / `honeytoken_revoked` and `kind`
+  `honeytoken_deploy` / `honeytoken_revoke`. The audit `details` carry only
+  safe metadata (id, kind, mode, size, sha256, mimic info, `has_canary`) —
+  never the bait content itself.
 
 ## Policy Schemas
 
@@ -815,7 +998,7 @@ Discriminated by `type`.
 - Event ingest must accept an array, not NDJSON, for `/api/v1/ingest/events`.
 - Local file output is NDJSON: one serialized `AgentEvent` per line.
 - Treat unknown `EventAction`/payload combinations defensively; the agent evolves with new eBPF and prevention actions.
-- Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=prevention` -> `PreventionEventData`; `class=detection, action=detected` -> `DetectionData`.
+- Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=prevention` -> `PreventionEventData`; `class=detection, action=detected` -> `DetectionData`; `class=detection, action=honeytoken_access` -> `HoneytokenAccessData`.
 - For command responses, return `[]` when no commands are pending.
 - Do not return unsigned commands. The agent rejects commands without a valid Ed25519 signature, matching `agent_id`, unexpired window, and fresh nonce.
 - Config endpoint should support `ETag` and `304 Not Modified`.

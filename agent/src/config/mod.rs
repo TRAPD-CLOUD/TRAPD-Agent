@@ -20,6 +20,8 @@ fn default_enabled_collectors() -> Vec<String> {
 fn default_prevention_enabled() -> bool { true }
 fn default_command_poll_interval() -> u64 { 10 }
 fn default_inventory_enabled() -> bool { true }
+fn default_honeytoken_detection_enabled() -> bool { true }
+fn default_honeytoken_response() -> String { "alert".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -48,6 +50,21 @@ pub struct AgentConfig {
     /// installed software, users).  When `false` no inventory is collected.
     #[serde(default = "default_inventory_enabled")]
     pub inventory_enabled: bool,
+
+    // ── Deception / honeytoken detection (step 2) ───────────────────────────
+    /// Master switch for honeytoken-access detection. When `false` the eBPF
+    /// match table is not armed and accesses are not raised as detections.
+    #[serde(default = "default_honeytoken_detection_enabled")]
+    pub honeytoken_detection_enabled: bool,
+    /// Automatic response to a honeytoken access, escalating:
+    /// `none` < `alert` < `kill` < `isolate`. Default `alert` (emit a critical
+    /// detection only); operators opt in to active response.
+    #[serde(default = "default_honeytoken_response")]
+    pub honeytoken_response: String,
+    /// Extra accessor comms to treat as benign sweepers, on top of the built-in
+    /// indexer/AV/backup allowlist (false-positive hardening).
+    #[serde(default)]
+    pub honeytoken_accessor_allowlist: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -60,6 +77,9 @@ impl Default for AgentConfig {
             command_poll_interval_secs: default_command_poll_interval(),
             isolation_allowlist_ips:    Vec::new(),
             inventory_enabled:  default_inventory_enabled(),
+            honeytoken_detection_enabled: default_honeytoken_detection_enabled(),
+            honeytoken_response: default_honeytoken_response(),
+            honeytoken_accessor_allowlist: Vec::new(),
         }
     }
 }

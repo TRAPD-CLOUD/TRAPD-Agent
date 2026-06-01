@@ -125,6 +125,13 @@ pub enum EventAction {
     PackageRemoved,
     /// A package (or all packages) were upgraded via a signed command.
     PackageUpgraded,
+    // ── Deception / honeytoken actions ──────────────────────────────────────
+    /// A honeytoken was placed on disk via a signed command.
+    HoneytokenDeployed,
+    /// A previously-deployed honeytoken was removed via a signed command.
+    HoneytokenRevoked,
+    /// A honeytoken was *accessed* (opened) — by definition an intrusion signal.
+    HoneytokenAccess,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +181,8 @@ pub enum EventData {
     Prevention(PreventionEventData),
     // ── Detection engine payload ────────────────────────────────────────
     Detection(DetectionData),
+    // ── Honeytoken access (deception) ───────────────────────────────────
+    HoneytokenAccess(HoneytokenAccessData),
 }
 
 // ── Existing data structs ────────────────────────────────────────────────────────────────────────
@@ -521,6 +530,57 @@ pub struct DetectionData {
     /// Optional structured evidence (matched IOC, observed cadence, …).
     #[serde(skip_serializing_if = "serde_json::Value::is_null", default)]
     pub evidence:   serde_json::Value,
+}
+
+// ── Honeytoken access payload (deception, step 2) ─────────────────────────────
+
+/// A honeytoken file was opened.  By construction no legitimate workflow reads a
+/// honeytoken, so this is a high-confidence intrusion signal.  The payload binds
+/// the access to its full process lineage (the "flight recorder" idea): the
+/// accessor plus its parent chain, so the backend can reconstruct *how* the
+/// process that touched the bait came to exist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoneytokenAccessData {
+    /// Id of the deployed token (matches `HoneytokenRecord::id`).
+    pub token_id: String,
+    /// Absolute path of the token that was opened.
+    pub path: String,
+    /// Token family (`ssh_private_key`, `aws_credentials`, …).
+    pub kind: String,
+    /// open(2) flags the accessor used (read-only access still fires).
+    pub open_flags: u64,
+    /// Always 100 — a honeytoken access has no benign interpretation.
+    pub confidence: u8,
+    pub mitre_tactic: String,
+    pub mitre_technique: String,
+    /// The accessing process and its ancestry.
+    pub accessor: ProcessLineage,
+}
+
+/// A process plus its parent chain, resolved from `/proc` at detection time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessLineage {
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub username: String,
+    pub comm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+    /// Parent chain, nearest parent first, walking up towards PID 1.
+    pub ancestors: Vec<ProcessAncestor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessAncestor {
+    pub pid: i32,
+    pub comm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

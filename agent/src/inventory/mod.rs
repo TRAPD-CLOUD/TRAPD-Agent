@@ -51,6 +51,10 @@ pub struct InventorySnapshot {
     pub network: Vec<NetInterface>,
     pub software: SoftwareInventory,
     pub users: Vec<UserAccount>,
+    /// Deception recon profile: honeytoken candidates derived deterministically
+    /// from the observed context above. The backend turns these into believable
+    /// content and ranks them before issuing `deploy_honeytoken` commands.
+    pub recon_profile: crate::deception::ReconProfile,
 }
 
 #[derive(Debug, Clone, Serialize)]

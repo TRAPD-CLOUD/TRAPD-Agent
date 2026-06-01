@@ -15,13 +15,20 @@ use super::{
     SoftwarePackage, UserAccount,
 };
 
-const SCHEMA_VERSION: u32 = 1;
+// v2 adds the deception `recon_profile` field derived from users + software.
+const SCHEMA_VERSION: u32 = 2;
 
 /// Build a full inventory snapshot for this host.
 pub fn gather(agent_id: String, device_id: String, hostname: String) -> InventorySnapshot {
     let mut sys = System::new();
     sys.refresh_memory();
     sys.refresh_cpu();
+
+    let software = gather_software();
+    let users = gather_users();
+    // Condense the observed context into honeytoken candidates. Pure heuristics
+    // over the data just gathered, plus cheap on-host stat()s for plausibility.
+    let recon_profile = crate::deception::build_profile(&users, &software);
 
     InventorySnapshot {
         schema_version: SCHEMA_VERSION,
@@ -33,8 +40,9 @@ pub fn gather(agent_id: String, device_id: String, hostname: String) -> Inventor
         os: gather_os(),
         hardware: gather_hardware(&sys),
         network: gather_network(),
-        software: gather_software(),
-        users: gather_users(),
+        software,
+        users,
+        recon_profile,
     }
 }
 

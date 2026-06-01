@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 mod collectors;
 mod config;
+mod deception;
 mod detection;
 mod enrollment;
 mod heartbeat;
@@ -184,7 +185,7 @@ async fn main() -> Result<()> {
         warn!("eBPF binary not found — exec events will be detected by polling only.");
     }
 
-    let ebpf_syscalls = EbpfSyscallCollector::new();
+    let ebpf_syscalls = EbpfSyscallCollector::new().with_config(Arc::clone(&agent_config));
     if ebpf_syscalls.is_available() {
         info!("eBPF syscall tracer available — spawning EbpfSyscallCollector");
         spawn_collector!(ebpf_syscalls);
@@ -362,8 +363,18 @@ async fn start_prevention(
         }
     };
 
-    let engine = Arc::new(Engine::new(policy.clone(), audit.clone(), engine_cfg));
-    engine.spawn_event_loop(event_rx);
+    // Register of honeytokens this host has deployed (deploy/revoke lifecycle).
+    let honeytokens = Arc::new(deception::HoneytokenStore::load());
+    info!(count = honeytokens.len(), "Honeytoken register loaded");
+
+    let engine = Arc::new(Engine::new(
+        policy.clone(),
+        audit.clone(),
+        engine_cfg,
+        honeytokens,
+        Arc::clone(&cfg_handle),
+    ));
+    Arc::clone(&engine).spawn_event_loop(event_rx);
 
     if let Some(v) = verifier {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);

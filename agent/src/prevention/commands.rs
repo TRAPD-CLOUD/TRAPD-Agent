@@ -81,6 +81,34 @@ pub enum CommandPayload {
         #[serde(default)]
         name: Option<String>,
     },
+    // ── Deception / honeytokens ──────────────────────────────────────────────
+    /// Place a host-tailored honeytoken whose content the backend generated.
+    ///
+    /// The agent writes `base64_decode(content_b64)` to `path` with camouflage:
+    /// it refuses to overwrite an existing file, applies `mode`, and — when
+    /// `mimic_neighbor` is set — copies owner/group + atime/mtime from a sibling
+    /// so the bait blends in. `canary_marker`, when present, is the out-of-band
+    /// tracking marker embedded in the content (recorded locally for later
+    /// correlation; the agent does not parse it out of the content itself).
+    DeployHoneytoken {
+        path: String,
+        content_b64: String,
+        /// Octal file mode (e.g. 384 = 0o600). `0` means "mimic the neighbour".
+        #[serde(default)]
+        mode: u32,
+        #[serde(default)]
+        mimic_neighbor: bool,
+        #[serde(default)]
+        canary_marker: Option<String>,
+        /// Optional token family echoed back from the recon candidate. Named
+        /// `token_kind` because `kind` is the enum's own serde tag.
+        #[serde(default)]
+        token_kind: Option<String>,
+    },
+    /// Remove a previously-deployed honeytoken. The agent only deletes a path
+    /// that is present in its local register, so this can never remove a real
+    /// file the agent did not plant.
+    RevokeHoneytoken { path: String },
 }
 
 /// Envelope signed by the backend.  All fields are part of the signed body.

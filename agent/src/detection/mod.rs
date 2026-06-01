@@ -24,6 +24,7 @@
 mod beaconing;
 mod behavior;
 mod dns_tunnel;
+pub mod honeytoken;
 mod ioc;
 mod netscan;
 
