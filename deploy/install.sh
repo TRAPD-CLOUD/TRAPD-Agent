@@ -125,6 +125,10 @@ fi
 # keeps a manual (non-systemd) run working too.
 mkdir -p "$ENV_DIR" "$LOG_DIR" "$STATE_DIR"
 chmod 700 "$STATE_DIR"
+# The config dir holds agent.env (enrollment token + backend URL), the mTLS
+# client key (agent.key) and CA certs.  Make it owner-only so an unprivileged
+# user cannot even enumerate which sensitive files are present.
+chmod 700 "$ENV_DIR"
 
 # ── Write agent.env (from env vars if provided) ──────────────────────────────
 ENV_FILE="${ENV_DIR}/agent.env"
