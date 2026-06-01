@@ -93,7 +93,10 @@ echo "Latest release: ${LATEST_TAG}"
 
 # ── Download agent binary ────────────────────────────────────────────────────
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${BINARY_NAME}"
-TMP_BINARY="/tmp/trapd-agent-${LATEST_TAG}"
+# Unpredictable temp paths (mktemp) so a local attacker cannot pre-create a
+# symlink at a guessable name and have root's `curl -o` follow it onto an
+# arbitrary file (TOCTOU).
+TMP_BINARY="$(mktemp /tmp/trapd-agent.XXXXXXXX)"
 
 echo "Downloading ${BINARY_NAME}..."
 curl -fL "$DOWNLOAD_URL" -o "$TMP_BINARY"
@@ -104,7 +107,7 @@ echo "Installed to ${INSTALL_BIN}"
 
 # ── Download eBPF binary ─────────────────────────────────────────────────────
 EBPF_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${EBPF_BINARY_NAME}"
-TMP_EBPF="/tmp/trapd-agent-exec-${LATEST_TAG}"
+TMP_EBPF="$(mktemp /tmp/trapd-agent-exec.XXXXXXXX)"
 
 echo "Downloading ${EBPF_BINARY_NAME}..."
 mkdir -p "$EBPF_INSTALL_DIR"
@@ -266,14 +269,14 @@ fi
 log "Updating \$CURRENT_VERSION → \$LATEST_TAG..."
 
 DOWNLOAD_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${BINARY_NAME}"
-TMP_BINARY="/tmp/trapd-agent-new"
+TMP_BINARY="\$(mktemp /tmp/trapd-agent.XXXXXXXX)"
 curl -fL "\$DOWNLOAD_URL" -o "\$TMP_BINARY"
 verify_checksum "\$TMP_BINARY" "\${DOWNLOAD_URL}.sha256"
 chmod +x "\$TMP_BINARY"
 mv -f "\$TMP_BINARY" "\$INSTALL_BIN"
 
 EBPF_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${EBPF_BINARY_NAME}"
-TMP_EBPF="/tmp/trapd-agent-exec-new"
+TMP_EBPF="\$(mktemp /tmp/trapd-agent-exec.XXXXXXXX)"
 if curl -fL "\$EBPF_URL" -o "\$TMP_EBPF" 2>/dev/null; then
     verify_checksum "\$TMP_EBPF" "\${EBPF_URL}.sha256"
     chmod 644 "\$TMP_EBPF"
