@@ -73,6 +73,17 @@ pub fn build_client(total_timeout: Duration, connect_timeout: Duration) -> reqwe
 fn apply_ca_pinning(builder: ClientBuilder) -> ClientBuilder {
     let path = paths::config_dir().join("ca.crt");
     if !path.exists() {
+        // No pinned CA: the agent — which receives remote commands such as
+        // kill_pid, isolate_network and install_package — falls back to the OS
+        // trust store, so *any* CA trusted by the host (a corporate proxy CA, a
+        // rogue CA planted by malware) could MITM the control channel. Emit a
+        // persistent warning so an operator running without pinning is doing so
+        // knowingly. Deploy a `<config>/ca.crt` to pin the backend.
+        warn!(
+            expected = %path.display(),
+            "TLS: no pinned CA — trusting the system root store for the command \
+             channel. This is INSECURE for a remote-control agent; provision ca.crt to pin."
+        );
         return builder;
     }
 
