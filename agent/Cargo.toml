@@ -31,6 +31,17 @@ base64             = "0.22"
 globset            = "0.4"
 ipnet              = { version = "2", features = ["serde"] }
 
+# Optional YARA file-scanning support — enable with `--features yara`.
+# Requires the libyara C library + headers at build time; off by default so the
+# standard build has no native dependency.  (The crate published by the
+# yara-rust project is named `yara`; the dependency key keeps the `yara-rust`
+# name used throughout the codebase.)
+yara-rust          = { version = "0.28", package = "yara", optional = true }
+
+[features]
+# Compile the optional YARA scanner (agent/src/detection/yara_scanner.rs).
+yara = ["dep:yara-rust"]
+
 # eBPF userspace loader — Linux only.
 # Only needed at runtime if the eBPF binary is installed;
 # compiles cleanly on all platforms.
