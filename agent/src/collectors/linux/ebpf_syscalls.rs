@@ -23,6 +23,8 @@
 //! | sys_enter_setns       | syscalls/sys_enter_setns              | NsChange     |
 //! | kprobe__udp_sendmsg   | kprobe:udp_sendmsg                    | Dns          |
 
+use std::collections::{HashMap as StdHashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::{fs, net::Ipv4Addr};
 
 use anyhow::{Context, Result};
@@ -34,12 +36,15 @@ use aya::{
 };
 // MapData is the owned map type returned by Ebpf::take_map; importing it here
 // ensures the TryFrom<Map> → RingBuf<MapData> conversion is unambiguous.
+use aya::maps::HashMap as BpfHashMap;
 use aya::maps::MapData;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::Sender;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::collectors::Collector;
+use crate::config::AgentConfig;
+use crate::detection::honeytoken::{self, AccessHit, Allowlist, RealProc};
 use crate::schema::{
     AgentEvent, DnsData, EventAction, EventClass, EventData, FileChmodData, FileChownData,
     FileOpenData, FileRenameData, FileUnlinkData, ForkData, KillAttemptData, MemfdCreateData,
@@ -53,6 +58,10 @@ use crate::schema::{
 
 const COMM_LEN: usize = 16;
 const PATH_LEN: usize = 256;
+
+/// Shared `token_id → (uuid, path, kind)` lookup, written by the honeytoken
+/// reconciler and read by the access consumer.
+type TokenIndex = Arc<RwLock<StdHashMap<u64, (String, String, String)>>>;
 
 #[repr(C)]
 struct RawFileOpenEvent {
@@ -254,6 +263,21 @@ struct RawMemfdEvent {
     _pad:     u32,
 }
 
+/// Matches `HoneytokenAccessEvent` in trapd-agent-ebpf/src/file_open.rs exactly.
+#[repr(C)]
+struct RawHoneytokenAccessEvent {
+    pid:          u32,
+    uid:          u32,
+    gid:          u32,
+    _pad:         u32,
+    token_id:     u64,
+    flags:        u64,
+    comm:         [u8; COMM_LEN],
+    filename:     [u8; PATH_LEN],
+    filename_len: u32,
+    _pad2:        u32,
+}
+
 // ── Event validation ──────────────────────────────────────────────────────────
 // Each event exposes its primary PID field so `read_raw` can reject records
 // whose decoded layout is implausible (see `RawEbpfEvent`).
@@ -285,21 +309,148 @@ impl_raw_event_pid! {
     RawKillSignalEvent  => sender_pid,
     RawSetuidEvent      => pid,
     RawMemfdEvent       => pid,
+    RawHoneytokenAccessEvent => pid,
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
 
 pub struct EbpfSyscallCollector {
     ebpf_path: Option<String>,
+    /// Live agent config — drives honeytoken-detection enable + accessor
+    /// allowlist. `None` disables honeytoken arming (e.g. in minimal tests).
+    cfg: Option<Arc<RwLock<AgentConfig>>>,
 }
 
 impl EbpfSyscallCollector {
     pub fn new() -> Self {
-        Self { ebpf_path: Self::locate_binary() }
+        Self { ebpf_path: Self::locate_binary(), cfg: None }
+    }
+
+    /// Attach the live config so honeytoken detection can be enabled and its
+    /// accessor allowlist read at runtime.
+    pub fn with_config(mut self, cfg: Arc<RwLock<AgentConfig>>) -> Self {
+        self.cfg = Some(cfg);
+        self
     }
 
     pub fn is_available(&self) -> bool {
         self.ebpf_path.is_some()
+    }
+
+    /// Wire up honeytoken detection on top of an already-loaded eBPF object.
+    ///
+    /// Two detached tasks: a reconciler that arms `HONEYTOKEN_PATHS` from the
+    /// on-disk register every 15s, and a consumer that enriches each access hit
+    /// into a `HoneytokenAccess` detection. No-ops if the binary lacks the maps.
+    fn spawn_honeytoken_tasks(
+        &self,
+        bpf: &mut Ebpf,
+        tx: Sender<AgentEvent>,
+        agent_id: String,
+        hostname: String,
+    ) {
+        let Some(paths_raw) = bpf.take_map("HONEYTOKEN_PATHS") else {
+            info!("eBPF honeytoken detection unavailable (older eBPF binary) — continuing without it");
+            return;
+        };
+        let paths_map: BpfHashMap<MapData, [u8; PATH_LEN], u64> = match BpfHashMap::try_from(paths_raw) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "HONEYTOKEN_PATHS not usable — honeytoken detection disabled");
+                return;
+            }
+        };
+        let access_afd = match bpf.take_map("HONEYTOKEN_ACCESS_EVENTS") {
+            Some(map) => match RingBuf::try_from(map).map_err(anyhow::Error::from).and_then(|rb| Ok(AsyncFd::new(rb)?)) {
+                Ok(afd) => afd,
+                Err(e) => {
+                    warn!(error = %e, "HONEYTOKEN_ACCESS_EVENTS not usable — honeytoken detection disabled");
+                    return;
+                }
+            },
+            None => {
+                warn!("HONEYTOKEN_ACCESS_EVENTS missing — honeytoken detection disabled");
+                return;
+            }
+        };
+
+        let cfg = self.cfg.clone();
+        let agent_pid = std::process::id();
+        // token_id(u64) → (uuid string, path, kind), written by the reconciler,
+        // read by the access consumer.
+        let token_index: TokenIndex = Arc::new(RwLock::new(StdHashMap::new()));
+
+        // Reconciler.
+        {
+            let token_index = Arc::clone(&token_index);
+            let cfg = cfg.clone();
+            let mut paths_map = paths_map;
+            tokio::spawn(async move {
+                let mut armed: HashSet<[u8; PATH_LEN]> = HashSet::new();
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+                loop {
+                    ticker.tick().await;
+                    let enabled = cfg
+                        .as_ref()
+                        .map(|c| c.read().map(|c| c.honeytoken_detection_enabled).unwrap_or(true))
+                        .unwrap_or(false);
+                    reconcile_honeytokens(&mut paths_map, &token_index, &mut armed, enabled);
+                }
+            });
+        }
+
+        // Access consumer.
+        {
+            let mut access_afd = access_afd;
+            tokio::spawn(async move {
+                info!("eBPF honeytoken detection active");
+                loop {
+                    let mut guard = match access_afd.readable_mut().await {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    let rb = guard.get_inner_mut();
+                    while let Some(item) = rb.next() {
+                        let Some(ev) = (unsafe { read_raw::<RawHoneytokenAccessEvent>(&item) }) else {
+                            continue;
+                        };
+                        // Resolve the token; fall back to the kernel-reported
+                        // path if the index has not caught up to a fresh deploy.
+                        let (tid, path, kind) = token_index
+                            .read()
+                            .ok()
+                            .and_then(|idx| idx.get(&ev.token_id).cloned())
+                            .unwrap_or_else(|| {
+                                (format!("0x{:x}", ev.token_id), cstr(&ev.filename).to_string(), "unknown".to_string())
+                            });
+                        let comm = cstr(&ev.comm).to_string();
+                        let extra: Vec<String> = cfg
+                            .as_ref()
+                            .and_then(|c| c.read().ok().map(|c| c.honeytoken_accessor_allowlist.clone()))
+                            .unwrap_or_default();
+                        let allowlist = Allowlist::new(agent_pid, &extra);
+                        let hit = AccessHit {
+                            pid: ev.pid as i32,
+                            uid: ev.uid,
+                            gid: ev.gid,
+                            comm: &comm,
+                            open_flags: ev.flags,
+                            token_id: &tid,
+                            path: &path,
+                            kind: &kind,
+                        };
+                        if let Some(event) =
+                            honeytoken::build_access_event(&agent_id, &hostname, &hit, &allowlist, &RealProc)
+                        {
+                            if tx.send(event).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    guard.clear_ready();
+                }
+            });
+        }
     }
 
     fn locate_binary() -> Option<String> {
@@ -347,6 +498,58 @@ fn proc_username(uid: u32) -> String {
             (u == uid).then(|| name.to_string())
         })
         .unwrap_or_else(|| format!("uid:{uid}"))
+}
+
+/// Build the fixed-size, NUL-padded `HONEYTOKEN_PATHS` key for an absolute
+/// path. Must mirror how the kernel reads the path into a zeroed buffer.
+fn path_key(path: &str) -> [u8; PATH_LEN] {
+    let mut key = [0u8; PATH_LEN];
+    let b = path.as_bytes();
+    // Leave at least one trailing NUL, matching the kernel's str read.
+    let n = b.len().min(PATH_LEN - 1);
+    key[..n].copy_from_slice(&b[..n]);
+    key
+}
+
+/// Bring the in-kernel `HONEYTOKEN_PATHS` table in line with the on-disk
+/// register: add newly-deployed tokens, drop revoked ones, and rebuild the
+/// `token_id → (uuid, path, kind)` index used to enrich access events. When
+/// detection is disabled the table is fully cleared so nothing is armed.
+fn reconcile_honeytokens(
+    map: &mut BpfHashMap<MapData, [u8; PATH_LEN], u64>,
+    token_index: &TokenIndex,
+    armed: &mut HashSet<[u8; PATH_LEN]>,
+    enabled: bool,
+) {
+    let mut desired: StdHashMap<[u8; PATH_LEN], u64> = StdHashMap::new();
+    let mut index: StdHashMap<u64, (String, String, String)> = StdHashMap::new();
+
+    if enabled {
+        for rec in crate::deception::HoneytokenStore::load().list() {
+            let key = path_key(&rec.path);
+            let tid = honeytoken::token_id_u64(&rec.id);
+            desired.insert(key, tid);
+            index.insert(tid, (rec.id.to_string(), rec.path.clone(), rec.kind.clone()));
+        }
+    }
+
+    // Arm newly-desired paths.
+    for (key, tid) in &desired {
+        if !armed.contains(key) && map.insert(key, tid, 0).is_ok() {
+            armed.insert(*key);
+        }
+    }
+    // Disarm paths no longer desired (revoked, or detection turned off).
+    let stale: Vec<[u8; PATH_LEN]> =
+        armed.iter().filter(|k| !desired.contains_key(*k)).copied().collect();
+    for key in stale {
+        let _ = map.remove(&key);
+        armed.remove(&key);
+    }
+
+    if let Ok(mut guard) = token_index.write() {
+        *guard = index;
+    }
 }
 
 fn format_ipv4(addr: &[u8; 16]) -> String {
@@ -598,6 +801,13 @@ impl Collector for EbpfSyscallCollector {
                 "eBPF kill-shield: agent PID registered in PROTECTED_PID map"
             );
         }
+
+        // ── Honeytoken detection (step 2; optional) ─────────────────────────
+        // Arms the HONEYTOKEN_PATHS match table from the on-disk register and
+        // consumes HONEYTOKEN_ACCESS_EVENTS. Runs in its own tasks so the main
+        // ring-buffer loop below is untouched; gracefully no-ops on an older
+        // eBPF binary that lacks these maps.
+        self.spawn_honeytoken_tasks(&mut bpf, tx.clone(), agent_id.clone(), hostname.clone());
 
         info!("eBPF syscall tracer attached: 25 programs (24 tracepoints + 1 kprobe)");
 

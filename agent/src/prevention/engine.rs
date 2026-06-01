@@ -13,7 +13,7 @@
 //! running even when individual actions fail (e.g. `nft` missing on the box).
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::collections::HashSet;
 
 use base64::Engine as _;
@@ -22,8 +22,9 @@ use tokio::sync::mpsc::Receiver;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::config::AgentConfig;
 use crate::deception::{self, DeployRequest, HoneytokenStore};
-use crate::schema::{AgentEvent, EventData};
+use crate::schema::{AgentEvent, EventData, HoneytokenAccessData};
 
 use super::audit::AuditEmitter;
 use super::commands::{CommandEnvelope, CommandPayload};
@@ -38,6 +39,39 @@ pub struct EngineConfig {
     pub default_isolation_allowlist: Vec<std::net::IpAddr>,
 }
 
+/// Escalating honeytoken-access response, parsed from `AgentConfig::honeytoken_response`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseLevel {
+    /// Detection only is emitted upstream; the engine takes no further action.
+    None,
+    /// Default: a critical prevention alert, no process action.
+    Alert,
+    /// Alert + SIGKILL the accessing process.
+    Kill,
+    /// Alert + kill + full host network isolation.
+    Isolate,
+}
+
+impl ResponseLevel {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" => ResponseLevel::None,
+            "kill" => ResponseLevel::Kill,
+            "isolate" | "isolate_network" | "jail" => ResponseLevel::Isolate,
+            _ => ResponseLevel::Alert, // safe default for unknown values
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ResponseLevel::None => "none",
+            ResponseLevel::Alert => "alert",
+            ResponseLevel::Kill => "kill",
+            ResponseLevel::Isolate => "isolate",
+        }
+    }
+}
+
 pub struct Engine {
     policy: PolicyHandle,
     audit:  AuditEmitter,
@@ -46,6 +80,8 @@ pub struct Engine {
     blocked: Arc<tokio::sync::Mutex<HashSet<String>>>,
     /// Register of honeytokens deployed on this host (deploy/revoke lifecycle).
     honeytokens: Arc<HoneytokenStore>,
+    /// Live agent config — read for the policy-driven honeytoken response level.
+    cfg_handle: Arc<RwLock<AgentConfig>>,
 }
 
 impl Engine {
@@ -54,6 +90,7 @@ impl Engine {
         audit: AuditEmitter,
         cfg: EngineConfig,
         honeytokens: Arc<HoneytokenStore>,
+        cfg_handle: Arc<RwLock<AgentConfig>>,
     ) -> Self {
         Self {
             policy,
@@ -61,20 +98,95 @@ impl Engine {
             cfg,
             blocked: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             honeytokens,
+            cfg_handle,
         }
     }
 
     /// Spawn the event-enforcement loop.  Consumes the receiver.
-    pub fn spawn_event_loop(&self, mut rx: Receiver<AgentEvent>) {
-        let policy = self.policy.clone();
-        let audit  = self.audit.clone();
+    ///
+    /// Two enforcement paths ride this stream: IoC enforcement on `ProcessExec`,
+    /// and the policy-driven auto-response on a `HoneytokenAccess` detection.
+    pub fn spawn_event_loop(self: Arc<Self>, mut rx: Receiver<AgentEvent>) {
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                if let EventData::ProcessExec(exec) = &event.data {
-                    let _ = process::enforce_exec(exec, &policy, &audit);
+                match &event.data {
+                    EventData::ProcessExec(exec) => {
+                        let _ = process::enforce_exec(exec, &self.policy, &self.audit);
+                    }
+                    EventData::HoneytokenAccess(data) => {
+                        self.respond_honeytoken(data).await;
+                    }
+                    _ => {}
                 }
             }
         });
+    }
+
+    /// Policy-driven response to a confirmed honeytoken access. Escalating:
+    /// `none` < `alert` < `kill` < `isolate`. Every decision is audited so the
+    /// backend sees exactly what was done (and gets the hit telemetry for the
+    /// ML feedback loop).
+    async fn respond_honeytoken(&self, data: &HoneytokenAccessData) {
+        let level = self.honeytoken_response_level();
+        let pid = data.accessor.pid;
+        let target = format!("{} (pid {})", data.path, pid);
+
+        // Above `alert`, terminate the accessing process. Best-effort: it may
+        // already have exited.
+        let mut actions: Vec<&str> = vec!["alert"];
+        let mut killed = false;
+        if matches!(level, ResponseLevel::Kill | ResponseLevel::Isolate) && pid > 0 {
+            killed = process::kill_pid(pid).is_ok();
+            actions.push(if killed { "kill" } else { "kill_failed" });
+        }
+        let mut isolated = false;
+        if matches!(level, ResponseLevel::Isolate) {
+            let mut allow = self.cfg.default_isolation_allowlist.clone();
+            allow.sort();
+            allow.dedup();
+            isolated = network::isolate(self.cfg.net_backend, &allow).is_ok();
+            actions.push(if isolated { "isolate" } else { "isolate_failed" });
+        }
+
+        let severity = match level {
+            ResponseLevel::None => crate::schema::Severity::High,
+            _ => crate::schema::Severity::Critical,
+        };
+        self.audit.emit(
+            crate::schema::EventAction::HoneytokenAccess,
+            severity,
+            "honeytoken_response",
+            target,
+            true,
+            format!(
+                "honeytoken '{}' accessed by {} (pid {}) — response level '{}'",
+                data.kind, data.accessor.comm, pid, level.as_str()
+            ),
+            None,
+            None,
+            json!({
+                "token_id": data.token_id,
+                "path": data.path,
+                "kind": data.kind,
+                "accessor_pid": pid,
+                "accessor_comm": data.accessor.comm,
+                "accessor_uid": data.accessor.uid,
+                "open_flags": data.open_flags,
+                "response_level": level.as_str(),
+                "actions": actions,
+                "killed": killed,
+                "isolated": isolated,
+            }),
+        );
+    }
+
+    fn honeytoken_response_level(&self) -> ResponseLevel {
+        let raw = self
+            .cfg_handle
+            .read()
+            .map(|c| c.honeytoken_response.clone())
+            .unwrap_or_else(|_| "alert".to_string());
+        ResponseLevel::parse(&raw)
     }
 
     /// Spawn the command-dispatch loop.

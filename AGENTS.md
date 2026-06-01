@@ -149,7 +149,7 @@ agent_tamper, write_rate_anomaly, kill_attempt, process_blocked,
 network_isolated, network_deisolated, ip_blocked, ip_unblocked,
 file_quarantined, file_restored, policy_updated, command_rejected,
 command_accepted, detected, package_installed, package_removed,
-package_upgraded, honeytoken_deployed, honeytoken_revoked
+package_upgraded, honeytoken_deployed, honeytoken_revoked, honeytoken_access
 ```
 
 ## EventData Schemas
@@ -516,7 +516,56 @@ package_upgraded, honeytoken_deployed, honeytoken_revoked
 }
 ```
 
-Known `kind` values include `process_block`, `network_isolate`, `network_deisolate`, `ip_block`, `ip_unblock`, `quarantine`, `restore`, `policy_update`, `command_rejected`, `command_accepted`, `honeytoken_deploy`, `honeytoken_revoke`.
+Known `kind` values include `process_block`, `network_isolate`, `network_deisolate`, `ip_block`, `ip_unblock`, `quarantine`, `restore`, `policy_update`, `command_rejected`, `command_accepted`, `honeytoken_deploy`, `honeytoken_revoke`, `honeytoken_response`.
+
+### `HoneytokenAccessData`
+
+Emitted (`class=detection`, `action=honeytoken_access`, severity `critical`) when a
+deployed honeytoken is opened. By construction no legitimate workflow reads a
+honeytoken, so `confidence` is always `100`. The payload binds the access to the
+accessor's full process lineage (the "flight recorder" idea) so the backend can
+reconstruct how the touching process came to exist.
+
+```json
+{
+  "token_id": "string (matches HoneytokenRecord.id)",
+  "path": "string (absolute path opened)",
+  "kind": "string (token family)",
+  "open_flags": "u64 (read-only access still fires)",
+  "confidence": "u8 (always 100)",
+  "mitre_tactic": "string",
+  "mitre_technique": "string",
+  "accessor": "ProcessLineage"
+}
+```
+
+### `ProcessLineage` / `ProcessAncestor`
+
+```json
+{
+  "pid": "i32",
+  "uid": "u32",
+  "gid": "u32",
+  "username": "string",
+  "comm": "string",
+  "exe": "string, optional",
+  "cmdline": "string, optional",
+  "ancestors": ["ProcessAncestor"]
+}
+```
+
+```json
+{
+  "pid": "i32",
+  "comm": "string",
+  "exe": "string, optional",
+  "cmdline": "string, optional"
+}
+```
+
+`ancestors` lists the parent chain nearest-first, walking up toward PID 1
+(bounded depth). The `honeytoken_response` prevention event (above) records the
+policy-driven reaction (`alert`/`kill`/`isolate`) taken for each access.
 
 ### `DetectionData`
 
@@ -675,6 +724,51 @@ Backend responsibilities for the recon profile:
   replaces it in step 2 once hit/miss telemetry exists.
 - Issue chosen candidates back as signed `deploy_honeytoken` commands.
 
+## Deception Step 2: Access Detection, Response & ML Feedback Loop
+
+### On-agent detection (eBPF + userspace)
+
+- eBPF (`trapd-agent-ebpf/src/file_open.rs`): two new maps ride the existing
+  `sys_enter_openat` program — `HONEYTOKEN_PATHS` (absolute path, NUL-padded to
+  256 bytes → token id) and the dedicated `HONEYTOKEN_ACCESS_EVENTS` ring
+  buffer. On an open whose path is in the table the program emits an access
+  event **regardless of open flags** (the read-only detection fix), while the
+  general read-only suppression on `FILE_OPEN_EVENTS` is unchanged.
+- **Design note (path-gate + userspace inode verification):** matching is by
+  exact path in the kernel rather than by inode. The codebase deliberately
+  avoids dereferencing kernel structs in BPF (CO-RE is fragile across kernels —
+  see `process_block.rs`), and `sys_enter_openat` exposes only the user path
+  pointer. The userspace consumer re-verifies identity against the token's
+  recorded device+inode, so the authoritative check is inode-based even though
+  the cheap in-kernel gate is path-based. A future hardening is a BTF/CO-RE
+  inode read to also catch relative-path / symlink opens at the kernel layer.
+- Userspace (`agent/src/collectors/linux/ebpf_syscalls.rs` +
+  `agent/src/detection/honeytoken.rs`): a reconciler arms `HONEYTOKEN_PATHS`
+  from the on-disk register (`<state>/honeytokens.json`) every 15s; a consumer
+  enriches each hit with full `/proc` lineage, applies the false-positive
+  allowlist + agent self-exclusion, and emits a `HoneytokenAccess` detection.
+- The prevention engine reacts per `honeytoken_response` policy
+  (`alert`/`kill`/`isolate`) and audits the decision as a `honeytoken_response`
+  prevention event.
+
+### Backend feedback loop (ML)
+
+This is where real training data first exists — a token is either touched (by
+whom, how soon after deployment) or never touched over N days. The backend
+should:
+
+- **Hit telemetry:** persist every `HoneytokenAccess` event and pair it with the
+  originating `deploy_honeytoken` (via `token_id`) to derive the per-token
+  signal (touched vs. dormant, latency-to-touch, accessor lineage).
+- **Re-ranking:** feed that signal fleet-wide into the placement ranker from
+  step 1b, learning which token archetypes & paths actually catch attackers vs.
+  which are dead weight — closing the loop back onto candidate selection.
+- **Rotation / aging:** rotate stale tokens (regenerate content, vary path) via
+  `revoke_honeytoken` + `deploy_honeytoken` so a returning attacker cannot
+  memorise them.
+- **Drift:** when a host's `recon_profile` changes (new package → new plausible
+  location), propose new placements.
+
 ### `OsInfo`
 
 ```json
@@ -782,9 +876,18 @@ Backend responsibilities for the recon profile:
   "prevention_enabled": "bool, default true",
   "command_poll_interval_secs": "u64, default 10",
   "isolation_allowlist_ips": ["string"],
-  "inventory_enabled": "bool, default true"
+  "inventory_enabled": "bool, default true",
+  "honeytoken_detection_enabled": "bool, default true",
+  "honeytoken_response": "string, default \"alert\" (none|alert|kill|isolate)",
+  "honeytoken_accessor_allowlist": ["string (extra benign accessor comms)"]
 }
 ```
+
+`honeytoken_response` escalates: `none` (detection only, no engine action) <
+`alert` (critical prevention event) < `kill` (also SIGKILL the accessor) <
+`isolate` (also full host network isolation). `honeytoken_accessor_allowlist`
+extends the built-in sweeper allowlist (mlocate/updatedb, AV scanners, backup
+tools, and the agent itself) used to suppress false positives.
 
 ## Command Schemas
 
@@ -895,7 +998,7 @@ Discriminated by `type`.
 - Event ingest must accept an array, not NDJSON, for `/api/v1/ingest/events`.
 - Local file output is NDJSON: one serialized `AgentEvent` per line.
 - Treat unknown `EventAction`/payload combinations defensively; the agent evolves with new eBPF and prevention actions.
-- Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=prevention` -> `PreventionEventData`; `class=detection, action=detected` -> `DetectionData`.
+- Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=prevention` -> `PreventionEventData`; `class=detection, action=detected` -> `DetectionData`; `class=detection, action=honeytoken_access` -> `HoneytokenAccessData`.
 - For command responses, return `[]` when no commands are pending.
 - Do not return unsigned commands. The agent rejects commands without a valid Ed25519 signature, matching `agent_id`, unexpired window, and fresh nonce.
 - Config endpoint should support `ETag` and `304 Not Modified`.

@@ -104,6 +104,12 @@ impl HoneytokenStore {
             .unwrap_or(false)
     }
 
+    /// Snapshot of all currently-registered tokens (used by the eBPF map
+    /// reconciler to learn which paths to arm).
+    pub fn list(&self) -> Vec<HoneytokenRecord> {
+        self.inner.lock().map(|r| r.tokens.clone()).unwrap_or_default()
+    }
+
     /// Number of registered tokens.
     pub fn len(&self) -> usize {
         self.inner.lock().map(|r| r.tokens.len()).unwrap_or(0)
