@@ -576,4 +576,61 @@ mod tests {
         assert!(!looks_like_host_or_url("trailingdot."));
         assert!(!looks_like_host_or_url("has space.net"));
     }
+
+    /// Concrete bait produced by the backend Phase-A generators
+    /// (services/web/lib/api/honeytoken/bait.ts) must pass these validators. This
+    /// proves the TS validator *port* (lib/api/honeytoken/validate.ts) agrees with
+    /// this authority on real generated output, so the backend never signs a
+    /// deploy the agent would then reject. Regenerate the samples with
+    /// `npx tsx scripts/honeytoken-bait-vectors.ts`.
+    #[test]
+    fn accepts_backend_generated_bait_samples() {
+        let samples: &[(&str, &str)] = &[
+            (
+                "aws_credentials",
+                "[default]\naws_access_key_id = AKIAPZ6OBOA9P3FWEGAS\naws_secret_access_key = EnzR6RgxkRxRsn7/oleQOf//iSMfogsvBWqTQ7Qk\nregion = us-east-1\noutput = json\n",
+            ),
+            (
+                "kube_config",
+                "apiVersion: v1\nkind: Config\nclusters:\n- cluster:\n    server: https://d8c930842acbaa05.obs-metrics.net:6443\n  name: prod\ncontexts:\n- context:\n    cluster: prod\n    user: alice\n  name: prod\ncurrent-context: prod\nusers:\n- name: alice\n  user:\n    token: kvA6+NBxwSQMOIE1xcFdR8wiJaDQqpW40gDNa6V1\n",
+            ),
+            (
+                "pgpass",
+                "db.acme.internal:5432:appdb:alice:C6mKv66mFsx7VChMZCi4\n",
+            ),
+            (
+                "webroot_env",
+                "APP_ENV=production\nAPP_KEY=base64:k0yGveOCR7N94UoonbSSxkvGD8D+OydS\nDB_CONNECTION=pgsql\nDB_HOST=db.acme.internal\nDB_PORT=5432\nDB_DATABASE=app\nDB_USERNAME=alice\nDB_PASSWORD=GNVPpW1F8Z34MOPYGjGf\nDATABASE_URL=postgres://alice:Tyte1hZE3IyXV5j9@db.acme.internal:5432/app\nAPP_SECRET=faze2SDdprL6YmymsaRIYa1wRD9WQ9UXD2Ffv7xv\nSENTRY_DSN=https://d80041613af751917d1f15aa5de859b2@37b006d8eb53e344.obs-metrics.net/1\n",
+            ),
+            (
+                "shadow_backup",
+                "alice:$6$9uED6SY9ZIZ3IzaD$xGNJMVFhDOAHAZdct9rAvWDbH4CCz1GWXx4jBipZpyD:19000:0:99999:7:::\n",
+            ),
+        ];
+        for (kind, content) in samples {
+            assert!(
+                validate_bait(kind, content.as_bytes()).is_ok(),
+                "backend-generated {kind} sample rejected"
+            );
+        }
+        // OOB canaries minted alongside those samples must validate too.
+        assert!(validate_out_of_band(&oob(
+            "aws_cloudtrail",
+            "AKIAPZ6OBOA9P3FWEGAS",
+            &["AKIAPZ6OBOA9P3FWEGAS"]
+        ))
+        .is_ok());
+        assert!(validate_out_of_band(&oob(
+            "kube_api",
+            "d8c930842acbaa05",
+            &["d8c930842acbaa05.obs-metrics.net"]
+        ))
+        .is_ok());
+        assert!(validate_out_of_band(&oob(
+            "http",
+            "37b006d8eb53e344",
+            &["37b006d8eb53e344.obs-metrics.net"]
+        ))
+        .is_ok());
+    }
 }
