@@ -3,15 +3,17 @@ use async_trait::async_trait;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tokio::sync::mpsc::Sender;
-use tokio::time::{interval, Duration};
-use tracing::warn;
+use tokio::time::{interval, sleep, Duration};
+use tracing::{info, warn};
 
 use crate::collectors::Collector;
 use crate::schema::{
     AgentEvent, EventAction, EventClass, EventData, Severity, UserLogonData, UserSessionData,
 };
 
-const AUTH_LOG: &str = "/var/log/auth.log";
+/// Candidate auth-log paths across distros: Debian/Ubuntu use `auth.log`,
+/// RHEL/Fedora/SUSE use `secure`. The first readable one wins.
+const AUTH_LOG_CANDIDATES: &[&str] = &["/var/log/auth.log", "/var/log/secure"];
 
 pub struct AuthLogCollector;
 
@@ -39,23 +41,42 @@ impl Collector for AuthLogCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
-        let mut file = match File::open(AUTH_LOG).await {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("AuthLogCollector: {AUTH_LOG} not found ({e}), skipping");
+        // Locate a readable auth log. On distros without one — or before the
+        // agent has been granted read access (CAP_DAC_READ_SEARCH) — keep
+        // retrying instead of giving up for the whole process lifetime.
+        let (path, file) = loop {
+            if let Some(found) = open_auth_log().await {
+                break found;
+            }
+            warn!(
+                "AuthLogCollector: no readable auth log in {AUTH_LOG_CANDIDATES:?}; retrying in 30s"
+            );
+            sleep(Duration::from_secs(30)).await;
+            if tx.is_closed() {
                 return Ok(());
             }
         };
-
-        // Seek to end — ignore historical entries
-        file.seek(std::io::SeekFrom::End(0)).await?;
+        info!("AuthLogCollector: tailing {path}");
 
         let mut reader = BufReader::new(file);
+        // Start at the end — ignore historical entries.
+        let mut offset = reader.seek(std::io::SeekFrom::End(0)).await?;
         let mut ticker = interval(Duration::from_secs(2));
         let mut line   = String::new();
 
         loop {
             ticker.tick().await;
+
+            // Handle log rotation / truncation: if the file shrank, logrotate
+            // rotated or truncated it — reopen the path from the start.
+            if let Ok(meta) = tokio::fs::metadata(&path).await {
+                if meta.len() < offset {
+                    if let Ok(f) = File::open(&path).await {
+                        reader = BufReader::new(f);
+                        offset = 0;
+                    }
+                }
+            }
 
             loop {
                 line.clear();
@@ -63,6 +84,7 @@ impl Collector for AuthLogCollector {
                 if n == 0 {
                     break; // no new data yet
                 }
+                offset += n as u64;
                 let trimmed = line.trim_end();
                 if let Some(event) = parse_auth_line(trimmed, agent_id.clone(), hostname.clone()) {
                     if tx.send(event).await.is_err() {
@@ -72,6 +94,16 @@ impl Collector for AuthLogCollector {
             }
         }
     }
+}
+
+/// Open the first readable auth-log candidate, returning its path and handle.
+async fn open_auth_log() -> Option<(String, File)> {
+    for path in AUTH_LOG_CANDIDATES {
+        if let Ok(f) = File::open(path).await {
+            return Some(((*path).to_string(), f));
+        }
+    }
+    None
 }
 
 fn parse_auth_line(line: &str, agent_id: String, hostname: String) -> Option<AgentEvent> {

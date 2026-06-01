@@ -105,6 +105,13 @@ chmod +x "$TMP_BINARY"
 mv -f "$TMP_BINARY" "$INSTALL_BIN"
 echo "Installed to ${INSTALL_BIN}"
 
+# Refresh the self-integrity baseline to the freshly installed binary, so a
+# re-install over an existing (now-stale) baseline doesn't make the agent flag
+# its own upgrade as tampering on the next start (selfprotect::binary_integrity).
+mkdir -p "$ENV_DIR"
+echo "sha256:$(sha256sum "$INSTALL_BIN" | awk '{print $1}')" > "${ENV_DIR}/binary.sha256"
+chmod 600 "${ENV_DIR}/binary.sha256"
+
 # ── Download eBPF binary ─────────────────────────────────────────────────────
 EBPF_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${EBPF_BINARY_NAME}"
 TMP_EBPF="$(mktemp /tmp/trapd-agent-exec.XXXXXXXX)"
@@ -197,12 +204,16 @@ ConfigurationDirectory=trapd
 
 # ── Hardening ────────────────────────────────────────────────────────────────
 ProtectSystem=strict
-ProtectHome=true
+# read-only (not hidden): FIM and ransomware-watch must see /home and /root,
+# while the agent itself still cannot modify them.
+ProtectHome=read-only
 PrivateTmp=true
 ReadWritePaths=-/etc/trapd -/var/lib/trapd -/var/log/trapd
 NoNewPrivileges=true
 # Capabilities for eBPF loading, network containment and file quarantine.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE
+# CAP_DAC_READ_SEARCH lets the (root) agent read root-owned/0640 logs such as
+# /var/log/auth.log and hash files under /home, /root for FIM (read-only).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE CAP_DAC_READ_SEARCH
 MemoryDenyWriteExecute=true
 LockPersonality=true
 RestrictRealtime=true

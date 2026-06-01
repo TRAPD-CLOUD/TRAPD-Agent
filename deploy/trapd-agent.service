@@ -34,8 +34,9 @@ ConfigurationDirectory=trapd
 # ── Filesystem isolation ──────────────────────────────────────────────────────
 # /usr, /boot, /efi are read-only; agent binary in /usr/local/bin is protected.
 ProtectSystem=strict
-# State no longer lives under $HOME, so /home and /root can be fully hidden.
-ProtectHome=true
+# read-only (not hidden): FIM and ransomware-watch must see /home and /root,
+# while the agent itself still cannot modify them.
+ProtectHome=read-only
 PrivateTmp=true
 # Explicit writable paths: agent state, config, logs.
 ReadWritePaths=-/etc/trapd -/var/lib/trapd -/var/log/trapd
@@ -51,7 +52,9 @@ NoNewPrivileges=true
 #   CAP_NET_RAW    — raw packet capture / XDP
 #   CAP_IPC_LOCK   — locking memory (eBPF maps)
 #   CAP_LINUX_IMMUTABLE — chattr +i on config files
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE
+#   CAP_DAC_READ_SEARCH — read root-owned/0640 logs (/var/log/auth.log) and hash
+#                         files under /home, /root for FIM (read-only)
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE CAP_DAC_READ_SEARCH
 
 # ── Memory safety ─────────────────────────────────────────────────────────────
 # Deny mapping of memory regions that are simultaneously writable and executable.
