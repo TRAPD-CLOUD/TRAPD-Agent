@@ -41,6 +41,9 @@ static MMAP_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 ///   offset 56 │ u64  arg5  off
 #[tracepoint]
 pub fn sys_enter_mmap(ctx: TracePointContext) -> u32 {
+    // Honeytoken gate first: a file-backed mmap of a token reads its contents
+    // without a read(2). Orthogonal to the suspicious-mapping filter below.
+    crate::file_open::check_mmap_honeytoken(&ctx);
     match try_mmap(&ctx) {
         Ok(_) => 0,
         Err(_) => 0,

@@ -6,6 +6,15 @@
 //! | Program               | Tracepoint / kprobe                   | Event type   |
 //! |-----------------------|---------------------------------------|--------------|
 //! | sys_enter_openat      | syscalls/sys_enter_openat             | FileOpen     |
+//! | sys_enter_open*       | syscalls/sys_enter_open               | Honeytoken   |
+//! | sys_enter_openat2*    | syscalls/sys_enter_openat2            | Honeytoken   |
+//! | sys_enter_newfstatat* | syscalls/sys_enter_newfstatat         | Honeytoken   |
+//! | sys_enter_statx*      | syscalls/sys_enter_statx              | Honeytoken   |
+//! | sys_enter_readlinkat* | syscalls/sys_enter_readlinkat         | Honeytoken   |
+//! | sys_enter_linkat*     | syscalls/sys_enter_linkat             | Honeytoken   |
+//! | sys_exit_open{,at,at2}*| syscalls/sys_exit_open*              | (fd binding) |
+//! | sys_enter_getdents64* | syscalls/sys_enter_getdents64         | Honeytoken   |
+//! | sys_enter_close*      | syscalls/sys_enter_close              | (fd pruning) |
 //! | sys_enter_connect     | syscalls/sys_enter_connect            | NetworkSocket|
 //! | sys_enter_bind        | syscalls/sys_enter_bind               | NetworkSocket|
 //! | sys_enter_accept4     | syscalls/sys_enter_accept4            | NetworkSocket|
@@ -22,6 +31,17 @@
 //! | sys_enter_unshare     | syscalls/sys_enter_unshare            | NsChange     |
 //! | sys_enter_setns       | syscalls/sys_enter_setns              | NsChange     |
 //! | kprobe__udp_sendmsg   | kprobe:udp_sendmsg                    | Dns          |
+//!
+//! Programs marked `*` are honeytoken-coverage tracepoints (issue #32, point 1)
+//! attached best-effort: they consult the same `HONEYTOKEN_PATHS` map as
+//! `sys_enter_openat` and emit `HoneytokenAccessEvent`s tagged with an
+//! `access_kind`. They are arch/kernel-specific (e.g. `open` is absent on arm64,
+//! `openat2` needs ≥ 5.6, `statx` needs ≥ 4.11), so a failed attach is logged
+//! and tolerated rather than aborting the collector. Token exec, delete and
+//! rename are gated inside the `sched_process_exec`, `sys_enter_unlinkat` and
+//! `sys_enter_renameat2` programs respectively. `mmap` (content read) and
+//! `getdents64` (directory recon) are correlated by binding the fd a token
+//! `open` returns (`sys_exit_open*`) and releasing it on `close`.
 
 use std::collections::{HashMap as StdHashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -44,7 +64,7 @@ use tracing::{info, warn};
 
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
-use crate::detection::honeytoken::{self, AccessHit, Allowlist, RealProc};
+use crate::detection::honeytoken::{self, AccessHit, AccessKind, Allowlist, RealProc};
 use crate::schema::{
     AgentEvent, DnsData, EventAction, EventClass, EventData, FileChmodData, FileChownData,
     FileOpenData, FileRenameData, FileUnlinkData, ForkData, KillAttemptData, MemfdCreateData,
@@ -275,7 +295,7 @@ struct RawHoneytokenAccessEvent {
     comm:         [u8; COMM_LEN],
     filename:     [u8; PATH_LEN],
     filename_len: u32,
-    _pad2:        u32,
+    access_kind:  u32,
 }
 
 // ── Event validation ──────────────────────────────────────────────────────────
@@ -360,6 +380,17 @@ impl EbpfSyscallCollector {
                 return;
             }
         };
+        // Parent-directory match table for getdents recon. Optional: an older
+        // eBPF binary without it simply means no directory-recon coverage.
+        let dirs_map: Option<BpfHashMap<MapData, [u8; PATH_LEN], u64>> = bpf
+            .take_map("HONEYTOKEN_DIRS")
+            .and_then(|raw| match BpfHashMap::try_from(raw) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    warn!(error = %e, "HONEYTOKEN_DIRS not usable — directory-recon coverage disabled");
+                    None
+                }
+            });
         let access_afd = match bpf.take_map("HONEYTOKEN_ACCESS_EVENTS") {
             Some(map) => match RingBuf::try_from(map).map_err(anyhow::Error::from).and_then(|rb| Ok(AsyncFd::new(rb)?)) {
                 Ok(afd) => afd,
@@ -385,8 +416,10 @@ impl EbpfSyscallCollector {
             let token_index = Arc::clone(&token_index);
             let cfg = cfg.clone();
             let mut paths_map = paths_map;
+            let mut dirs_map = dirs_map;
             tokio::spawn(async move {
                 let mut armed: HashSet<[u8; PATH_LEN]> = HashSet::new();
+                let mut armed_dirs: HashSet<[u8; PATH_LEN]> = HashSet::new();
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
                 loop {
                     ticker.tick().await;
@@ -394,7 +427,14 @@ impl EbpfSyscallCollector {
                         .as_ref()
                         .map(|c| c.read().map(|c| c.honeytoken_detection_enabled).unwrap_or(true))
                         .unwrap_or(false);
-                    reconcile_honeytokens(&mut paths_map, &token_index, &mut armed, enabled);
+                    reconcile_honeytokens(
+                        &mut paths_map,
+                        dirs_map.as_mut(),
+                        &token_index,
+                        &mut armed,
+                        &mut armed_dirs,
+                        enabled,
+                    );
                 }
             });
         }
@@ -438,6 +478,7 @@ impl EbpfSyscallCollector {
                             token_id: &tid,
                             path: &path,
                             kind: &kind,
+                            access_kind: AccessKind::from_u32(ev.access_kind),
                         };
                         if let Some(event) =
                             honeytoken::build_access_event(&agent_id, &hostname, &hit, &allowlist, &RealProc)
@@ -517,11 +558,14 @@ fn path_key(path: &str) -> [u8; PATH_LEN] {
 /// detection is disabled the table is fully cleared so nothing is armed.
 fn reconcile_honeytokens(
     map: &mut BpfHashMap<MapData, [u8; PATH_LEN], u64>,
+    mut dirs_map: Option<&mut BpfHashMap<MapData, [u8; PATH_LEN], u64>>,
     token_index: &TokenIndex,
     armed: &mut HashSet<[u8; PATH_LEN]>,
+    armed_dirs: &mut HashSet<[u8; PATH_LEN]>,
     enabled: bool,
 ) {
     let mut desired: StdHashMap<[u8; PATH_LEN], u64> = StdHashMap::new();
+    let mut desired_dirs: StdHashMap<[u8; PATH_LEN], u64> = StdHashMap::new();
     let mut index: StdHashMap<u64, (String, String, String)> = StdHashMap::new();
 
     if enabled {
@@ -530,6 +574,10 @@ fn reconcile_honeytokens(
             let tid = honeytoken::token_id_u64(&rec.id);
             desired.insert(key, tid);
             index.insert(tid, (rec.id.to_string(), rec.path.clone(), rec.kind.clone()));
+            // Arm the token's parent directory for getdents (directory) recon.
+            if let Some(parent) = std::path::Path::new(&rec.path).parent().and_then(|p| p.to_str()) {
+                desired_dirs.entry(path_key(parent)).or_insert(tid);
+            }
         }
     }
 
@@ -545,6 +593,21 @@ fn reconcile_honeytokens(
     for key in stale {
         let _ = map.remove(&key);
         armed.remove(&key);
+    }
+
+    // Same arm/disarm dance for the parent-directory table, when present.
+    if let Some(dirs) = dirs_map.as_mut() {
+        for (key, tid) in &desired_dirs {
+            if !armed_dirs.contains(key) && dirs.insert(key, tid, 0).is_ok() {
+                armed_dirs.insert(*key);
+            }
+        }
+        let stale_dirs: Vec<[u8; PATH_LEN]> =
+            armed_dirs.iter().filter(|k| !desired_dirs.contains_key(*k)).copied().collect();
+        for key in stale_dirs {
+            let _ = dirs.remove(&key);
+            armed_dirs.remove(&key);
+        }
     }
 
     if let Ok(mut guard) = token_index.write() {
@@ -711,7 +774,51 @@ impl Collector for EbpfSyscallCollector {
             }};
         }
 
+        // Best-effort attach: the program is loaded and attached, but a failure
+        // (e.g. the tracepoint does not exist on this arch/kernel, or the eBPF
+        // binary predates the program) is logged and tolerated instead of
+        // aborting the whole collector. Used for the honeytoken-coverage
+        // tracepoints, several of which are arch- or version-specific:
+        // `open` is absent on arm64, `openat2` needs ≥ 5.6, `statx` needs ≥ 4.11.
+        macro_rules! attach_tp_optional {
+            ($cat:expr, $name:expr) => {{
+                match bpf
+                    .program_mut($name)
+                    .and_then(|p| TryInto::<&mut TracePoint>::try_into(p).ok())
+                {
+                    Some(prog) => match prog.load().and_then(|_| prog.attach($cat, $name)) {
+                        Ok(_) => {}
+                        Err(e) => warn!(
+                            tracepoint = format!("{}/{}", $cat, $name),
+                            error = %e,
+                            "optional honeytoken tracepoint not attached — coverage reduced"
+                        ),
+                    },
+                    None => info!(
+                        tracepoint = format!("{}/{}", $cat, $name),
+                        "optional honeytoken tracepoint absent in eBPF binary — skipping"
+                    ),
+                }
+            }};
+        }
+
         attach_tp!("syscalls", "sys_enter_openat");
+        // ── Honeytoken coverage: additional access paths (issue #32, point 1) ──
+        // open/openat2 round out file-open coverage; the stat/statx/readlink
+        // tracepoints catch metadata recon; linkat catches hardlink evasion.
+        attach_tp_optional!("syscalls", "sys_enter_open");
+        attach_tp_optional!("syscalls", "sys_enter_openat2");
+        attach_tp_optional!("syscalls", "sys_enter_newfstatat");
+        attach_tp_optional!("syscalls", "sys_enter_statx");
+        attach_tp_optional!("syscalls", "sys_enter_readlinkat");
+        attach_tp_optional!("syscalls", "sys_enter_linkat");
+        // fd correlation for mmap (content read) + getdents64 (directory recon):
+        // the exit hooks bind a token open's returned fd, close prunes it.
+        attach_tp_optional!("syscalls", "sys_exit_openat");
+        attach_tp_optional!("syscalls", "sys_exit_open");
+        attach_tp_optional!("syscalls", "sys_exit_openat2");
+        attach_tp_optional!("syscalls", "sys_enter_getdents64");
+        attach_tp_optional!("syscalls", "sys_enter_close");
         attach_tp!("syscalls", "sys_enter_connect");
         attach_tp!("syscalls", "sys_enter_bind");
         attach_tp!("syscalls", "sys_enter_accept4");
@@ -809,7 +916,10 @@ impl Collector for EbpfSyscallCollector {
         // eBPF binary that lacks these maps.
         self.spawn_honeytoken_tasks(&mut bpf, tx.clone(), agent_id.clone(), hostname.clone());
 
-        info!("eBPF syscall tracer attached: 25 programs (24 tracepoints + 1 kprobe)");
+        info!(
+            "eBPF syscall tracer attached: 24 core tracepoints + 1 kprobe + \
+             up to 6 best-effort honeytoken-coverage tracepoints"
+        );
 
         loop {
             tokio::select! {

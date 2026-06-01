@@ -63,6 +63,25 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
     let fn_offset = (data_loc & 0xFFFF) as usize;
     let filename_ptr = (ctx.as_ptr() as usize).checked_add(fn_offset).ok_or(-1i64)? as *const u8;
 
+    // Read the executed binary's path into a local, zero-padded buffer first so
+    // we can (a) run it through the honeytoken gate and (b) copy it into the
+    // exec event. Doing the honeytoken check here — *before* reserving the exec
+    // event — keeps the two ring-buffer reservations from overlapping.
+    let mut filename = [0u8; PATH_LEN];
+    let written = unsafe {
+        bpf_probe_read_kernel_str_bytes(filename_ptr, &mut filename)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    };
+
+    // ── Honeytoken gate: someone executed a bait file ────────────────────────
+    crate::file_open::emit_honeytoken_buf(
+        &filename,
+        written as u32,
+        0,
+        crate::file_open::ACCESS_EXEC,
+    );
+
     let mut entry = EXEC_EVENTS.reserve::<ExecEvent>(0).ok_or(-1i64)?;
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid            = pid;
@@ -71,13 +90,8 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
     ev.gid            = gid;
     ev.comm           = comm;
     ev.ld_preload_len = 0;
-
-    let written = unsafe {
-        bpf_probe_read_kernel_str_bytes(filename_ptr, &mut ev.filename)
-            .map(|s| s.len())
-            .unwrap_or(0)
-    };
-    ev.filename_len = written as u32;
+    ev.filename       = filename;
+    ev.filename_len   = written as u32;
 
     entry.submit(0);
     Ok(())
