@@ -728,25 +728,29 @@ Backend responsibilities for the recon profile:
 
 ### On-agent detection (eBPF + userspace)
 
-- eBPF (`trapd-agent-ebpf/src/file_open.rs`): two new maps ride the existing
-  `sys_enter_openat` program — `HONEYTOKEN_PATHS` (absolute path, NUL-padded to
-  256 bytes → token id) and the dedicated `HONEYTOKEN_ACCESS_EVENTS` ring
-  buffer. On an open whose path is in the table the program emits an access
-  event **regardless of open flags** (the read-only detection fix), while the
-  general read-only suppression on `FILE_OPEN_EVENTS` is unchanged.
-- **Design note (path-gate + userspace inode verification):** matching is by
-  exact path in the kernel rather than by inode. The codebase deliberately
-  avoids dereferencing kernel structs in BPF (CO-RE is fragile across kernels —
-  see `process_block.rs`), and `sys_enter_openat` exposes only the user path
-  pointer. The userspace consumer re-verifies identity against the token's
-  recorded device+inode, so the authoritative check is inode-based even though
-  the cheap in-kernel gate is path-based. A future hardening is a BTF/CO-RE
-  inode read to also catch relative-path / symlink opens at the kernel layer.
+- eBPF (`trapd-agent-ebpf/src/file_open.rs`): a `HONEYTOKEN_INODES` hash map
+  (**inode number → token id**) plus a dedicated `HONEYTOKEN_ACCESS_EVENTS` ring
+  buffer. A `vfs_open` kprobe resolves the opened inode (`path → dentry →
+  d_inode → i_ino`) and, on a map hit, emits an access event **regardless of
+  open flags** (the read-only detection fix). The `sys_enter_openat` read-only
+  suppression on `FILE_OPEN_EVENTS` is unchanged.
+- **Why inode, why `vfs_open`:** matching the resolved inode is robust against
+  symlinks, relative paths and `..` (a single cheap hash lookup); path parsing
+  in BPF would be fragile. `sys_enter_openat` has no resolved inode, so the
+  match runs at `vfs_open` where the dentry/inode is known. The inode-walk uses
+  fixed x86_64 struct offsets read with `bpf_probe_read_kernel`; **every read is
+  fail-safe** (a wrong offset/bad pointer yields a miss, never a false
+  positive), and userspace re-verifies the hit against the token's recorded
+  inode. A BTF/CO-RE-driven offset resolution is the portability hardening
+  tracked for later. The `vfs_open` kprobe attaches best-effort — if it is
+  missing (older eBPF binary) the rest of the telemetry is unaffected.
 - Userspace (`agent/src/collectors/linux/ebpf_syscalls.rs` +
-  `agent/src/detection/honeytoken.rs`): a reconciler arms `HONEYTOKEN_PATHS`
-  from the on-disk register (`<state>/honeytokens.json`) every 15s; a consumer
-  enriches each hit with full `/proc` lineage, applies the false-positive
-  allowlist + agent self-exclusion, and emits a `HoneytokenAccess` detection.
+  `agent/src/detection/honeytoken.rs`): a reconciler `stat()`s every registered
+  token and arms `HONEYTOKEN_INODES` (inode → token id) from the on-disk
+  register (`<state>/honeytokens.json`) every 15s; a consumer resolves the
+  token id, enriches each hit with full `/proc` lineage, applies the
+  false-positive allowlist + agent self-exclusion, and emits a `HoneytokenAccess`
+  detection.
 - The prevention engine reacts per `honeytoken_response` policy
   (`alert`/`kill`/`isolate`) and audits the decision as a `honeytoken_response`
   prevention event.

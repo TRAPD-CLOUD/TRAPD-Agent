@@ -24,6 +24,7 @@
 //! | kprobe__udp_sendmsg   | kprobe:udp_sendmsg                    | Dns          |
 
 use std::collections::{HashMap as StdHashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, RwLock};
 use std::{fs, net::Ipv4Addr};
 
@@ -266,16 +267,14 @@ struct RawMemfdEvent {
 /// Matches `HoneytokenAccessEvent` in trapd-agent-ebpf/src/file_open.rs exactly.
 #[repr(C)]
 struct RawHoneytokenAccessEvent {
-    pid:          u32,
-    uid:          u32,
-    gid:          u32,
-    _pad:         u32,
-    token_id:     u64,
-    flags:        u64,
-    comm:         [u8; COMM_LEN],
-    filename:     [u8; PATH_LEN],
-    filename_len: u32,
-    _pad2:        u32,
+    pid:      u32,
+    uid:      u32,
+    gid:      u32,
+    _pad:     u32,
+    token_id: u64,
+    ino:      u64,
+    flags:    u64,
+    comm:     [u8; COMM_LEN],
 }
 
 // ── Event validation ──────────────────────────────────────────────────────────
@@ -349,14 +348,14 @@ impl EbpfSyscallCollector {
         agent_id: String,
         hostname: String,
     ) {
-        let Some(paths_raw) = bpf.take_map("HONEYTOKEN_PATHS") else {
+        let Some(inodes_raw) = bpf.take_map("HONEYTOKEN_INODES") else {
             info!("eBPF honeytoken detection unavailable (older eBPF binary) — continuing without it");
             return;
         };
-        let paths_map: BpfHashMap<MapData, [u8; PATH_LEN], u64> = match BpfHashMap::try_from(paths_raw) {
+        let inodes_map: BpfHashMap<MapData, u64, u64> = match BpfHashMap::try_from(inodes_raw) {
             Ok(m) => m,
             Err(e) => {
-                warn!(error = %e, "HONEYTOKEN_PATHS not usable — honeytoken detection disabled");
+                warn!(error = %e, "HONEYTOKEN_INODES not usable — honeytoken detection disabled");
                 return;
             }
         };
@@ -384,9 +383,9 @@ impl EbpfSyscallCollector {
         {
             let token_index = Arc::clone(&token_index);
             let cfg = cfg.clone();
-            let mut paths_map = paths_map;
+            let mut inodes_map = inodes_map;
             tokio::spawn(async move {
-                let mut armed: HashSet<[u8; PATH_LEN]> = HashSet::new();
+                let mut armed: HashSet<u64> = HashSet::new();
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
                 loop {
                     ticker.tick().await;
@@ -394,7 +393,7 @@ impl EbpfSyscallCollector {
                         .as_ref()
                         .map(|c| c.read().map(|c| c.honeytoken_detection_enabled).unwrap_or(true))
                         .unwrap_or(false);
-                    reconcile_honeytokens(&mut paths_map, &token_index, &mut armed, enabled);
+                    reconcile_honeytokens(&mut inodes_map, &token_index, &mut armed, enabled);
                 }
             });
         }
@@ -414,14 +413,15 @@ impl EbpfSyscallCollector {
                         let Some(ev) = (unsafe { read_raw::<RawHoneytokenAccessEvent>(&item) }) else {
                             continue;
                         };
-                        // Resolve the token; fall back to the kernel-reported
-                        // path if the index has not caught up to a fresh deploy.
+                        // Resolve the token from the index (kernel sends only
+                        // the inode + token id). Fall back to a synthetic id if
+                        // the index has not caught up to a very fresh deploy.
                         let (tid, path, kind) = token_index
                             .read()
                             .ok()
                             .and_then(|idx| idx.get(&ev.token_id).cloned())
                             .unwrap_or_else(|| {
-                                (format!("0x{:x}", ev.token_id), cstr(&ev.filename).to_string(), "unknown".to_string())
+                                (format!("0x{:x}", ev.token_id), format!("inode:{}", ev.ino), "unknown".to_string())
                             });
                         let comm = cstr(&ev.comm).to_string();
                         let extra: Vec<String> = cfg
@@ -500,51 +500,44 @@ fn proc_username(uid: u32) -> String {
         .unwrap_or_else(|| format!("uid:{uid}"))
 }
 
-/// Build the fixed-size, NUL-padded `HONEYTOKEN_PATHS` key for an absolute
-/// path. Must mirror how the kernel reads the path into a zeroed buffer.
-fn path_key(path: &str) -> [u8; PATH_LEN] {
-    let mut key = [0u8; PATH_LEN];
-    let b = path.as_bytes();
-    // Leave at least one trailing NUL, matching the kernel's str read.
-    let n = b.len().min(PATH_LEN - 1);
-    key[..n].copy_from_slice(&b[..n]);
-    key
-}
-
-/// Bring the in-kernel `HONEYTOKEN_PATHS` table in line with the on-disk
-/// register: add newly-deployed tokens, drop revoked ones, and rebuild the
-/// `token_id → (uuid, path, kind)` index used to enrich access events. When
-/// detection is disabled the table is fully cleared so nothing is armed.
+/// Bring the in-kernel `HONEYTOKEN_INODES` table in line with the on-disk
+/// register: `stat()` each deployed token to learn its inode, arm newly-seen
+/// inodes, drop revoked ones, and rebuild the `token_id → (uuid, path, kind)`
+/// index used to enrich access events. When detection is disabled the table is
+/// fully cleared so nothing is armed.
 fn reconcile_honeytokens(
-    map: &mut BpfHashMap<MapData, [u8; PATH_LEN], u64>,
+    map: &mut BpfHashMap<MapData, u64, u64>,
     token_index: &TokenIndex,
-    armed: &mut HashSet<[u8; PATH_LEN]>,
+    armed: &mut HashSet<u64>,
     enabled: bool,
 ) {
-    let mut desired: StdHashMap<[u8; PATH_LEN], u64> = StdHashMap::new();
+    // ino → token_id desired in the kernel map.
+    let mut desired: StdHashMap<u64, u64> = StdHashMap::new();
     let mut index: StdHashMap<u64, (String, String, String)> = StdHashMap::new();
 
     if enabled {
         for rec in crate::deception::HoneytokenStore::load().list() {
-            let key = path_key(&rec.path);
+            // The token must exist on disk to learn its inode; a vanished token
+            // simply is not armed (and will surface as a tamper signal later).
+            let Ok(meta) = fs::metadata(&rec.path) else { continue };
+            let ino = meta.ino();
             let tid = honeytoken::token_id_u64(&rec.id);
-            desired.insert(key, tid);
+            desired.insert(ino, tid);
             index.insert(tid, (rec.id.to_string(), rec.path.clone(), rec.kind.clone()));
         }
     }
 
-    // Arm newly-desired paths.
-    for (key, tid) in &desired {
-        if !armed.contains(key) && map.insert(key, tid, 0).is_ok() {
-            armed.insert(*key);
+    // Arm newly-desired inodes.
+    for (ino, tid) in &desired {
+        if !armed.contains(ino) && map.insert(ino, tid, 0).is_ok() {
+            armed.insert(*ino);
         }
     }
-    // Disarm paths no longer desired (revoked, or detection turned off).
-    let stale: Vec<[u8; PATH_LEN]> =
-        armed.iter().filter(|k| !desired.contains_key(*k)).copied().collect();
-    for key in stale {
-        let _ = map.remove(&key);
-        armed.remove(&key);
+    // Disarm inodes no longer desired (revoked, moved, or detection turned off).
+    let stale: Vec<u64> = armed.iter().filter(|k| !desired.contains_key(*k)).copied().collect();
+    for ino in stale {
+        let _ = map.remove(&ino);
+        armed.remove(&ino);
     }
 
     if let Ok(mut guard) = token_index.write() {
@@ -746,6 +739,27 @@ impl Collector for EbpfSyscallCollector {
             prog.load().context("BPF verifier rejected kprobe__udp_sendmsg")?;
             prog.attach("udp_sendmsg", 0)
                 .context("failed to attach kprobe on udp_sendmsg")?;
+        }
+
+        // ── Attach honeytoken inode kprobe (best-effort) ──────────────────────
+        // Present only in newer eBPF binaries. Its failure must never take down
+        // the rest of the telemetry, so we log and continue rather than bail.
+        match bpf.program_mut("vfs_open") {
+            Some(prog) => {
+                let attached = (|| -> Result<()> {
+                    let prog: &mut KProbe = prog
+                        .try_into()
+                        .context("vfs_open is not a KProbe")?;
+                    prog.load().context("BPF verifier rejected vfs_open")?;
+                    prog.attach("vfs_open", 0).context("failed to attach kprobe on vfs_open")?;
+                    Ok(())
+                })();
+                match attached {
+                    Ok(()) => info!("eBPF honeytoken inode kprobe attached on vfs_open"),
+                    Err(e) => warn!(error = %e, "honeytoken vfs_open kprobe unavailable — access detection disabled"),
+                }
+            }
+            None => info!("eBPF binary has no vfs_open program — honeytoken access detection unavailable"),
         }
 
         // ── Open ring buffer maps ─────────────────────────────────────────────
