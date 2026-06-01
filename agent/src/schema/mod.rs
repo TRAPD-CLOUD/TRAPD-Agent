@@ -132,6 +132,15 @@ pub enum EventAction {
     HoneytokenRevoked,
     /// A honeytoken was *accessed* (opened) — by definition an intrusion signal.
     HoneytokenAccess,
+    /// A process was frozen (SIGSTOP) for forensic capture instead of killed
+    /// ("freeze, snapshot, then decide" — issue #32, point 5).
+    ProcessFrozen,
+    /// A previously-frozen process was resumed (SIGCONT).
+    ProcessThawed,
+    /// Deception escalation triggered by a confirmed honeytoken hit — the agent's
+    /// signal for the backend to deploy more bait / redirect into a honeypot /
+    /// tarpit (issue #32, point 5).
+    DeceptionEscalation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,7 +191,9 @@ pub enum EventData {
     // ── Detection engine payload ────────────────────────────────────────
     Detection(DetectionData),
     // ── Honeytoken access (deception) ───────────────────────────────────
-    HoneytokenAccess(HoneytokenAccessData),
+    // Boxed: the forensic session/lineage payload is much larger than the other
+    // variants, so boxing keeps `EventData` compact (clippy::large_enum_variant).
+    HoneytokenAccess(Box<HoneytokenAccessData>),
 }
 
 // ── Existing data structs ────────────────────────────────────────────────────────────────────────
@@ -561,6 +572,88 @@ pub struct HoneytokenAccessData {
     pub mitre_technique: String,
     /// The accessing process and its ancestry.
     pub accessor: ProcessLineage,
+    /// Session / execution context of the accessor (issue #32, point 5):
+    /// login session, TTY, originating remote IP, container/namespace/cgroup.
+    /// `None` when `/proc` could not be read (e.g. the process already exited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionContext>,
+}
+
+/// Session / execution context of a process, captured from `/proc` at detection
+/// time (issue #32, point 5). Binds a honeytoken access to *who* and *where*: the
+/// login session, controlling terminal, the originating remote IP (correlated
+/// from auth.log), and the container / namespace / cgroup it ran in — so the
+/// backend can attribute the hit to a real session and attacker.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SessionContext {
+    /// Audit login uid (`/proc/<pid>/loginuid`); `u32::MAX` (unset) maps to `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loginuid: Option<u32>,
+    /// Username resolved from [`loginuid`](Self::loginuid).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_user: Option<String>,
+    /// Kernel audit session id (`/proc/<pid>/sessionid`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_session_id: Option<u32>,
+    /// Controlling terminal (e.g. `pts/3`, `tty1`), or `None` when detached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tty: Option<String>,
+    /// Current working directory of the accessor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Most specific cgroup path the accessor belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cgroup: Option<String>,
+    /// Container id parsed from the cgroup path, when the process is containerised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    /// Container runtime inferred from the cgroup path (`docker`/`containerd`/
+    /// `podman`/`kubepods`/`libpod`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_runtime: Option<String>,
+    /// Namespace inode ids the accessor runs in (distinguishes host vs container).
+    #[serde(default, skip_serializing_if = "NamespaceIds::is_empty")]
+    pub namespaces: NamespaceIds,
+    /// Remote source address of the login session, correlated best-effort from
+    /// recent auth.log logons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
+    /// Remote source port of that login session, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_port: Option<u16>,
+}
+
+/// Namespace inode ids of a process (`/proc/<pid>/ns/*`). Equal ids across
+/// processes mean the same namespace; differing from PID 1's means containerised.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct NamespaceIds {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mnt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cgroup: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipc: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uts: Option<u64>,
+}
+
+impl NamespaceIds {
+    /// True when no namespace id was resolved (used to omit the field entirely).
+    pub fn is_empty(&self) -> bool {
+        self.pid.is_none()
+            && self.net.is_none()
+            && self.mnt.is_none()
+            && self.user.is_none()
+            && self.cgroup.is_none()
+            && self.ipc.is_none()
+            && self.uts.is_none()
+    }
 }
 
 /// A process plus its parent chain, resolved from `/proc` at detection time.

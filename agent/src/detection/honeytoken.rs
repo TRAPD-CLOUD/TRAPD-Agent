@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use crate::schema::{
     AgentEvent, EventAction, EventClass, EventData, HoneytokenAccessData, ProcessAncestor,
-    ProcessLineage, Severity,
+    ProcessLineage, SessionContext, Severity,
 };
 
 /// How far up the parent chain we walk. Deep enough to capture
@@ -245,6 +245,9 @@ pub fn build_access_event(
         mitre_tactic: tactic.to_string(),
         mitre_technique: technique.to_string(),
         accessor,
+        // Session/forensic context (issue #32, point 5): who/where the accessor
+        // ran. The remote IP is correlated later by the engine's flight recorder.
+        session: proc.session(hit.pid),
     };
 
     Some(AgentEvent::new(
@@ -253,7 +256,7 @@ pub fn build_access_event(
         EventClass::Detection,
         EventAction::HoneytokenAccess,
         severity,
-        EventData::HoneytokenAccess(data),
+        EventData::HoneytokenAccess(Box::new(data)),
     ))
 }
 
@@ -290,6 +293,9 @@ pub trait ProcInfo {
     fn exe(&self, pid: i32) -> Option<String>;
     fn cmdline(&self, pid: i32) -> Option<String>;
     fn username(&self, uid: u32) -> String;
+    /// Session / execution context of the accessor (issue #32, point 5).
+    /// Best-effort; `None` when nothing could be resolved.
+    fn session(&self, pid: i32) -> Option<SessionContext>;
 }
 
 /// Reads the live `/proc` and `/etc/passwd`.
@@ -327,6 +333,9 @@ impl ProcInfo for RealProc {
     }
     fn username(&self, uid: u32) -> String {
         username_for_uid(uid)
+    }
+    fn session(&self, pid: i32) -> Option<SessionContext> {
+        crate::forensics::capture_session_opt(pid)
     }
 }
 
@@ -411,6 +420,9 @@ mod tests {
         }
         fn username(&self, _uid: u32) -> String {
             "tester".into()
+        }
+        fn session(&self, _pid: i32) -> Option<SessionContext> {
+            None // keep lineage tests independent of the host's /proc
         }
     }
 

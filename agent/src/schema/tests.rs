@@ -1,9 +1,10 @@
 use uuid::Uuid;
 
 use super::{
-    AgentEvent, DnsData, EventAction, EventClass, EventData, FileOpenData, ForkData, MmapData,
-    ModuleLoadData, NetworkSocketData, NsChangeData, ProcessCreateData, PtraceData, Severity,
-    ShmData, SystemSnapshotData,
+    AgentEvent, DnsData, EventAction, EventClass, EventData, FileOpenData, ForkData,
+    HoneytokenAccessData, MmapData, ModuleLoadData, NamespaceIds, NetworkSocketData, NsChangeData,
+    ProcessCreateData, ProcessLineage, PtraceData, SessionContext, Severity, ShmData,
+    SystemSnapshotData,
 };
 
 fn process_create_event() -> AgentEvent {
@@ -380,4 +381,79 @@ fn test_shm_event_roundtrip() {
     assert_eq!(val["action"],       "shmget");
     assert_eq!(val["data"]["key"],  12345);
     assert_eq!(val["data"]["size"], 65536);
+}
+
+#[test]
+fn test_honeytoken_access_event_with_session_roundtrip() {
+    // Exercises the boxed `HoneytokenAccess` variant and the point-5 session
+    // forensics: it must serialize and deserialize losslessly.
+    let session = SessionContext {
+        loginuid: Some(1000),
+        login_user: Some("alice".to_string()),
+        audit_session_id: Some(42),
+        tty: Some("pts/3".to_string()),
+        cwd: Some("/home/alice".to_string()),
+        cgroup: Some("/system.slice/sshd.service".to_string()),
+        container_id: None,
+        container_runtime: None,
+        namespaces: NamespaceIds { net: Some(4026531992), ..Default::default() },
+        remote_addr: Some("203.0.113.7".to_string()),
+        remote_port: Some(40222),
+    };
+    let data = HoneytokenAccessData {
+        token_id: "tok-1".to_string(),
+        path: "/home/alice/.aws/credentials".to_string(),
+        kind: "aws_credentials".to_string(),
+        access_kind: "open".to_string(),
+        open_flags: 0,
+        confidence: 100,
+        mitre_tactic: "TA0006 Credential Access".to_string(),
+        mitre_technique: "T1552.001".to_string(),
+        accessor: ProcessLineage {
+            pid: 4242,
+            uid: 1000,
+            gid: 1000,
+            username: "alice".to_string(),
+            comm: "cat".to_string(),
+            exe: Some("/bin/cat".to_string()),
+            cmdline: Some("cat .aws/credentials".to_string()),
+            ancestors: Vec::new(),
+        },
+        session: Some(session),
+    };
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "test-host".to_string(),
+        EventClass::Detection,
+        EventAction::HoneytokenAccess,
+        Severity::Critical,
+        EventData::HoneytokenAccess(Box::new(data)),
+    );
+
+    // `EventData` is `#[serde(untagged)]` — the backend routes by class+action,
+    // so (like the other schema tests) we assert the serialized JSON shape.
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"], "detection");
+    assert_eq!(val["action"], "honeytoken_access");
+    assert_eq!(val["data"]["confidence"], 100);
+    assert_eq!(val["data"]["session"]["login_user"], "alice");
+    assert_eq!(val["data"]["session"]["tty"], "pts/3");
+    assert_eq!(val["data"]["session"]["remote_addr"], "203.0.113.7");
+    assert_eq!(val["data"]["session"]["remote_port"], 40222);
+    assert_eq!(val["data"]["session"]["namespaces"]["net"], 4026531992u64);
+    // An unset namespace id is omitted entirely (skip_serializing_if).
+    assert!(val["data"]["session"]["namespaces"].get("mnt").is_none());
+}
+
+#[test]
+fn test_point5_event_actions_serialize_snake_case() {
+    for (action, want) in [
+        (EventAction::ProcessFrozen, "process_frozen"),
+        (EventAction::ProcessThawed, "process_thawed"),
+        (EventAction::DeceptionEscalation, "deception_escalation"),
+    ] {
+        let json = serde_json::to_string(&action).expect("serialize action");
+        assert_eq!(json, format!("\"{want}\""));
+    }
 }

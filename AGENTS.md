@@ -22,6 +22,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - `agent/src/prevention/commands.rs`: signed response command schema.
 - `agent/src/prevention/policy.rs`: IoC policy/rule schema.
 - `agent/src/deception/`: honeytoken deception subsystem — `profiler.rs` (deterministic recon profile / token candidates), `registry.rs` (deployed-token register at `<state>/honeytokens.json`, incl. out-of-band canary records), `validate.rs` (bait-content + out-of-band-canary validation and anti-fingerprinting guards), `mod.rs` (camouflaged deploy + safe revoke). Step 1 places and manages tokens; the on-host detection path lives in `detection/honeytoken.rs`.
+- `agent/src/forensics/`: response forensics (issue #32, point 5) — `session.rs` (login/TTY/container/namespace/cgroup context from `/proc`), `snapshot.rs` (point-in-time process capture for the freeze response), `recorder.rs` (bounded flight recorder of recent pid-bearing telemetry + remote-IP correlation).
 - `agent/src/transport/mod.rs`: event ingest transport.
 - `agent/src/output/mod.rs`: local stdout/file NDJSON output.
 - `agent/src/http/mod.rs`: shared HTTP client, TLS pinning, mTLS, timeouts.
@@ -516,7 +517,7 @@ package_upgraded, honeytoken_deployed, honeytoken_revoked, honeytoken_access
 }
 ```
 
-Known `kind` values include `process_block`, `network_isolate`, `network_deisolate`, `ip_block`, `ip_unblock`, `quarantine`, `restore`, `policy_update`, `command_rejected`, `command_accepted`, `honeytoken_deploy`, `honeytoken_revoke`, `honeytoken_response`.
+Known `kind` values include `process_block`, `network_isolate`, `network_deisolate`, `ip_block`, `ip_unblock`, `quarantine`, `restore`, `policy_update`, `command_rejected`, `command_accepted`, `honeytoken_deploy`, `honeytoken_revoke`, `honeytoken_response`, `process_freeze`, `process_thaw`, `deception_escalation`.
 
 ### `HoneytokenAccessData`
 
@@ -535,7 +536,32 @@ reconstruct how the touching process came to exist.
   "confidence": "u8 (always 100)",
   "mitre_tactic": "string",
   "mitre_technique": "string",
-  "accessor": "ProcessLineage"
+  "accessor": "ProcessLineage",
+  "session": "SessionContext, optional (issue #32 point 5)"
+}
+```
+
+### `SessionContext` (issue #32, point 5)
+
+Captured from `/proc` at detection time and attached to `HoneytokenAccessData`
+(and echoed, with the remote IP correlated, into the `honeytoken_response`
+event). Binds the access to *who* and *where*: the login session, controlling
+terminal, the originating remote IP, and the container/namespace/cgroup. All
+fields are optional and omitted when unresolved.
+
+```json
+{
+  "loginuid": "u32, optional",
+  "login_user": "string, optional (resolved from loginuid)",
+  "audit_session_id": "u32, optional",
+  "tty": "string, optional (e.g. pts/3)",
+  "cwd": "string, optional",
+  "cgroup": "string, optional (most specific cgroup path)",
+  "container_id": "string, optional (parsed from cgroup)",
+  "container_runtime": "string, optional (docker|containerd|cri-o|podman|kubepods)",
+  "namespaces": { "pid": "u64?", "net": "u64?", "mnt": "u64?", "user": "u64?", "cgroup": "u64?", "ipc": "u64?", "uts": "u64?" },
+  "remote_addr": "string, optional (correlated from auth.log logons)",
+  "remote_port": "u16, optional"
 }
 ```
 
@@ -565,7 +591,13 @@ reconstruct how the touching process came to exist.
 
 `ancestors` lists the parent chain nearest-first, walking up toward PID 1
 (bounded depth). The `honeytoken_response` prevention event (above) records the
-policy-driven reaction (`alert`/`kill`/`isolate`) taken for each access.
+policy-driven reaction (`alert`/`freeze`/`kill`/`isolate`) taken for each access,
+and its `details` bundle the point-5 forensics: `frozen`, the `snapshot`
+(process state / exe / cwd / cmdline / open files when frozen), the correlated
+`session`, the `flight_recorder` pre-history (recent pid-bearing telemetry for
+the accessor + its ancestry), and `escalation_triggered`. The `freeze` level
+sends SIGSTOP and snapshots instead of killing — "freeze, snapshot, then
+decide"; an operator then issues `freeze_pid`/`thaw_pid`/`kill_pid`.
 
 ### `DetectionData`
 
@@ -755,8 +787,15 @@ Backend responsibilities for the recon profile:
   enriches each hit with full `/proc` lineage, applies the false-positive
   allowlist + agent self-exclusion, and emits a `HoneytokenAccess` detection.
 - The prevention engine reacts per `honeytoken_response` policy
-  (`alert`/`kill`/`isolate`) and audits the decision as a `honeytoken_response`
-  prevention event.
+  (`alert`/`freeze`/`kill`/`isolate`) and audits the decision as a
+  `honeytoken_response` prevention event. Beyond alert/kill/isolate (issue #32,
+  point 5): `freeze` suspends the accessor (SIGSTOP) and captures a forensic
+  `snapshot` instead of killing; every response bundles the accessor's
+  `session` context and the `flight_recorder` pre-history; and when
+  `honeytoken_deception_escalation` is enabled the hit also emits a
+  `deception_escalation` signal for the backend to deploy more bait / redirect
+  into a honeypot / tarpit. Operators drive the post-freeze decision with the
+  signed `freeze_pid` / `thaw_pid` / `kill_pid` commands.
 
 ### Backend feedback loop (ML)
 
@@ -885,16 +924,20 @@ should:
   "isolation_allowlist_ips": ["string"],
   "inventory_enabled": "bool, default true",
   "honeytoken_detection_enabled": "bool, default true",
-  "honeytoken_response": "string, default \"alert\" (none|alert|kill|isolate)",
-  "honeytoken_accessor_allowlist": ["string (extra benign accessor comms)"]
+  "honeytoken_response": "string, default \"alert\" (none|alert|freeze|kill|isolate)",
+  "honeytoken_accessor_allowlist": ["string (extra benign accessor comms)"],
+  "honeytoken_deception_escalation": "bool, default false"
 }
 ```
 
 `honeytoken_response` escalates: `none` (detection only, no engine action) <
-`alert` (critical prevention event) < `kill` (also SIGKILL the accessor) <
-`isolate` (also full host network isolation). `honeytoken_accessor_allowlist`
-extends the built-in sweeper allowlist (mlocate/updatedb, AV scanners, backup
-tools, and the agent itself) used to suppress false positives.
+`alert` (critical prevention event) < `freeze` (alias `jail`: SIGSTOP the
+accessor and snapshot it — "freeze, snapshot, then decide") < `kill` (SIGKILL
+the accessor) < `isolate` (also full host network isolation).
+`honeytoken_accessor_allowlist` extends the built-in sweeper allowlist
+(mlocate/updatedb, AV scanners, backup tools, and the agent itself) used to
+suppress false positives. `honeytoken_deception_escalation` (default `false`)
+opts in to emitting a `deception_escalation` signal on each confirmed hit.
 
 ## Command Schemas
 
@@ -926,6 +969,8 @@ Discriminated by `kind`.
 
 ```json
 { "kind": "kill_pid", "pid": "i32" }
+{ "kind": "freeze_pid", "pid": "i32" }
+{ "kind": "thaw_pid", "pid": "i32" }
 { "kind": "isolate_network", "allowlist_ips": ["IP address string"] }
 { "kind": "deisolate_network" }
 { "kind": "quarantine_file", "path": "string" }
@@ -938,7 +983,18 @@ Discriminated by `kind`.
 { "kind": "upgrade_package", "name": "string, optional" }
 { "kind": "deploy_honeytoken", "path": "string", "content_b64": "base64 string", "mode": "u32 octal, optional, default 0", "mimic_neighbor": "bool, optional, default false", "canary_marker": "string, optional", "out_of_band": { "channel": "aws_cloudtrail|dns|http|kube_api|ssh_honeypot", "tracking_id": "string", "markers": ["string"] }, "token_kind": "string, optional", "breadcrumbs": [ { "path": "string", "content_b64": "base64 string", "mode": "u32 octal, optional", "append": "bool, optional" } ] }
 { "kind": "revoke_honeytoken", "path": "string" }
+{ "kind": "freeze_pid", "pid": "i32" }
+{ "kind": "thaw_pid", "pid": "i32" }
 ```
+
+#### `freeze_pid` / `thaw_pid` semantics (issue #32, point 5)
+
+- `freeze_pid` sends **SIGSTOP** to suspend a process without killing it, then
+  captures and audits a forensic `snapshot` (state, exe, cwd, cmdline, open
+  files) while it is frozen and cannot react — the operator-driven half of
+  "freeze, snapshot, then decide". Resume with `thaw_pid` (SIGCONT) or terminate
+  with `kill_pid`. Both are best-effort: a process that already exited audits
+  `success=false` rather than erroring.
 
 #### `deploy_honeytoken` / `revoke_honeytoken` semantics
 
@@ -1031,7 +1087,7 @@ Discriminated by `type`.
 - Event ingest must accept an array, not NDJSON, for `/api/v1/ingest/events`.
 - Local file output is NDJSON: one serialized `AgentEvent` per line.
 - Treat unknown `EventAction`/payload combinations defensively; the agent evolves with new eBPF and prevention actions.
-- Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=prevention` -> `PreventionEventData`; `class=detection, action=detected` -> `DetectionData`; `class=detection, action=honeytoken_access` -> `HoneytokenAccessData`.
+- Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=prevention` -> `PreventionEventData` (incl. `action=process_frozen`/`process_thawed`/`deception_escalation`); `class=detection, action=detected` -> `DetectionData`; `class=detection, action=honeytoken_access` -> `HoneytokenAccessData` (carries the optional `session` forensics).
 - For command responses, return `[]` when no commands are pending.
 - Do not return unsigned commands. The agent rejects commands without a valid Ed25519 signature, matching `agent_id`, unexpired window, and fresh nonce.
 - Config endpoint should support `ETag` and `304 Not Modified`.
