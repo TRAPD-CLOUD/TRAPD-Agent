@@ -32,7 +32,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use crate::schema::{
-    AgentEvent, DetectionData, EventAction, EventClass, EventData, Severity,
+    AgentEvent, DetectionData, EventAction, EventClass, EventData, Severity, SetuidData,
 };
 
 pub use ioc::IocSet;
@@ -121,6 +121,15 @@ impl DetectionEngine {
             }
             EventData::ProcessExec(p) => {
                 self.inspect_process(&p.comm, &p.exe, &p.cmdline, None, &mut out);
+                if let Some(ref ld_preload) = p.ld_preload {
+                    if let Some(d) = behavior::inspect_ld_preload(&p.comm, &p.exe, ld_preload) {
+                        let sev = severity_for(d.confidence);
+                        out.push(self.detection(sev, d));
+                    }
+                }
+            }
+            EventData::Setuid(s) => {
+                self.inspect_setuid(s, &mut out);
             }
             EventData::NetworkConnection(n) => {
                 self.inspect_network(&n.dst_addr, n.dst_port, &mut out);
@@ -173,6 +182,33 @@ impl DetectionEngine {
         if let Some(d) = behavior::inspect_process(comm, exe, cmdline) {
             let sev = severity_for(d.confidence);
             out.push(self.detection(sev, d));
+        }
+    }
+
+    fn inspect_setuid(&self, s: &SetuidData, out: &mut Vec<AgentEvent>) {
+        if s.new_uid == 0 && s.old_uid != 0 {
+            out.push(self.detection(
+                Severity::High,
+                DetectionData {
+                    rule_id:         "privesc.setuid_root".into(),
+                    title:           "Privilege escalation via setuid(0)".into(),
+                    category:        "privilege_escalation".into(),
+                    mitre_tactic:    Some("TA0004 Privilege Escalation".into()),
+                    mitre_technique: Some("T1548.001".into()),
+                    confidence:      90,
+                    subject:         s.comm.clone(),
+                    detail:          format!(
+                        "PID {} ({}) set effective UID to 0 (was UID {})",
+                        s.pid, s.comm, s.old_uid
+                    ),
+                    evidence: serde_json::json!({
+                        "pid":     s.pid,
+                        "old_uid": s.old_uid,
+                        "new_uid": s.new_uid,
+                        "comm":    s.comm,
+                    }),
+                },
+            ));
         }
     }
 

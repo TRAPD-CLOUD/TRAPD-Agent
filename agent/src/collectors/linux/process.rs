@@ -9,8 +9,8 @@ use tracing::warn;
 
 use crate::collectors::Collector;
 use crate::schema::{
-    AgentEvent, EventAction, EventClass, EventData, ProcessCreateData, ProcessTerminateData,
-    Severity,
+    AgentEvent, EventAction, EventClass, EventData, MemoryAnomalyData, ProcessCreateData,
+    ProcessTerminateData, Severity,
 };
 
 pub struct ProcessCollector {
@@ -49,6 +49,33 @@ fn load_passwd() -> Result<HashMap<u32, String>> {
         }
     }
     Ok(map)
+}
+
+/// Parse /proc/{pid}/maps and return (region, perms) pairs for rwx anonymous mappings.
+fn check_rwx_maps(pid: i32) -> Vec<(String, String)> {
+    let content = match fs::read_to_string(format!("/proc/{pid}/maps")) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut results = Vec::new();
+    for line in content.lines() {
+        let mut fields = line.split_whitespace();
+        let region     = match fields.next() { Some(r) => r, None => continue };
+        let perms      = match fields.next() { Some(p) => p, None => continue };
+        let _offset    = fields.next();
+        let _dev       = fields.next();
+        let inode_str  = match fields.next() { Some(i) => i, None => continue };
+        let pathname   = fields.next();
+
+        let inode: u64 = inode_str.parse().unwrap_or(1);
+        let is_rwx = perms.contains('r') && perms.contains('w') && perms.contains('x');
+        let is_anon = inode == 0 && pathname.is_none();
+
+        if is_rwx && is_anon {
+            results.push((region.to_string(), perms.to_string()));
+        }
+    }
+    results
 }
 
 fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCreateData> {
@@ -150,6 +177,25 @@ impl Collector for ProcessCollector {
                         return Ok(());
                     }
                     self.known_names.insert(pid, info.name.clone());
+
+                    // Check for rwx anonymous memory mappings (fileless shellcode indicator).
+                    for (region, perms) in check_rwx_maps(pid) {
+                        let anomaly = AgentEvent::new(
+                            agent_id.clone(),
+                            hostname.clone(),
+                            EventClass::Memory,
+                            EventAction::MemoryAnomaly,
+                            Severity::High,
+                            EventData::MemoryAnomaly(MemoryAnomalyData {
+                                pid,
+                                region,
+                                perms,
+                            }),
+                        );
+                        if tx.send(anomaly).await.is_err() {
+                            return Ok(());
+                        }
+                    }
                 }
             }
 

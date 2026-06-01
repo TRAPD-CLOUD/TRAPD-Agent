@@ -42,9 +42,9 @@ use tracing::info;
 use crate::collectors::Collector;
 use crate::schema::{
     AgentEvent, DnsData, EventAction, EventClass, EventData, FileChmodData, FileChownData,
-    FileOpenData, FileRenameData, FileUnlinkData, ForkData, KillAttemptData, MmapData,
-    ModuleLoadData, NetworkSocketData, NsChangeData, PtraceData, Severity, ShmData,
-    WriteRateAnomalyData,
+    FileOpenData, FileRenameData, FileUnlinkData, ForkData, KillAttemptData, MemfdCreateData,
+    MmapData, ModuleLoadData, NetworkSocketData, NsChangeData, PtraceData, Severity,
+    SetuidData, ShmData, WriteRateAnomalyData,
 };
 
 // ── Kernel ↔ Userspace struct layouts ────────────────────────────────────────
@@ -229,6 +229,29 @@ struct RawKillSignalEvent {
     target_pid: i32,
     signal:     i32,
     comm:       [u8; COMM_LEN],
+}
+
+/// Matches `SetuidEvent` in trapd-agent-ebpf/src/setuid.rs exactly.
+#[repr(C)]
+struct RawSetuidEvent {
+    pid:     u32,
+    old_uid: u32,
+    new_uid: u32,
+    _pad:    u32,
+    comm:    [u8; COMM_LEN],
+}
+
+const MEMFD_NAME_LEN: usize = 64;
+
+/// Matches `MemfdEvent` in trapd-agent-ebpf/src/memfd.rs exactly.
+#[repr(C)]
+struct RawMemfdEvent {
+    pid:      u32,
+    flags:    u32,
+    comm:     [u8; COMM_LEN],
+    name:     [u8; MEMFD_NAME_LEN],
+    name_len: u32,
+    _pad:     u32,
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
@@ -443,6 +466,10 @@ impl Collector for EbpfSyscallCollector {
         attach_tp!("syscalls", "sys_enter_kill");
         attach_tp!("syscalls", "sys_enter_tkill");
         attach_tp!("syscalls", "sys_enter_tgkill");
+        attach_tp!("syscalls", "sys_enter_setuid");
+        attach_tp!("syscalls", "sys_enter_setreuid");
+        attach_tp!("syscalls", "sys_enter_setresuid");
+        attach_tp!("syscalls", "sys_enter_memfd_create");
 
         // ── Attach kprobe ─────────────────────────────────────────────────────
         {
@@ -487,6 +514,8 @@ impl Collector for EbpfSyscallCollector {
         let mut afd_dns        = open_rb!("DNS_EVENTS");
         let mut afd_write_rate = open_rb!("WRITE_RATE_EVENTS");
         let mut afd_kill       = open_rb!("KILL_SIGNAL_EVENTS");
+        let mut afd_setuid     = open_rb!("SETUID_EVENTS");
+        let mut afd_memfd      = open_rb!("MEMFD_EVENTS");
 
         // ── Write protected PID into the PROTECTED_PID eBPF array map ────────
         // The kill-detection tracepoints use this to filter events to only those
@@ -508,7 +537,7 @@ impl Collector for EbpfSyscallCollector {
             );
         }
 
-        info!("eBPF syscall tracer attached: 21 programs (20 tracepoints + 1 kprobe)");
+        info!("eBPF syscall tracer attached: 25 programs (24 tracepoints + 1 kprobe)");
 
         loop {
             tokio::select! {
@@ -913,6 +942,48 @@ impl Collector for EbpfSyscallCollector {
                                     target_pid:  ev.target_pid,
                                     signal:      ev.signal,
                                     signal_name: signal_name.to_string(),
+                                }),
+                            );
+                            if tx.send(event).await.is_err() { return Ok(()); }
+                        }
+                    }
+                    guard.clear_ready();
+                }
+
+                Ok(mut guard) = afd_setuid.readable_mut() => {
+                    let rb = guard.get_inner_mut();
+                    while let Some(item) = rb.next() {
+                        if let Some(ev) = unsafe { read_raw::<RawSetuidEvent>(&item) } {
+                            let event = AgentEvent::new(
+                                agent_id.clone(), hostname.clone(),
+                                EventClass::Process, EventAction::Setuid,
+                                Severity::Info,
+                                EventData::Setuid(SetuidData {
+                                    pid:     ev.pid as i32,
+                                    old_uid: ev.old_uid,
+                                    new_uid: ev.new_uid,
+                                    comm:    cstr(&ev.comm).to_string(),
+                                }),
+                            );
+                            if tx.send(event).await.is_err() { return Ok(()); }
+                        }
+                    }
+                    guard.clear_ready();
+                }
+
+                Ok(mut guard) = afd_memfd.readable_mut() => {
+                    let rb = guard.get_inner_mut();
+                    while let Some(item) = rb.next() {
+                        if let Some(ev) = unsafe { read_raw::<RawMemfdEvent>(&item) } {
+                            let event = AgentEvent::new(
+                                agent_id.clone(), hostname.clone(),
+                                EventClass::Memory, EventAction::MemfdCreate,
+                                Severity::High,
+                                EventData::MemfdCreate(MemfdCreateData {
+                                    pid:   ev.pid as i32,
+                                    comm:  cstr(&ev.comm).to_string(),
+                                    name:  cstr(&ev.name).to_string(),
+                                    flags: ev.flags,
                                 }),
                             );
                             if tx.send(event).await.is_err() { return Ok(()); }

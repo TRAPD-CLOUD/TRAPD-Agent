@@ -91,6 +91,10 @@ pub enum EventAction {
     AgentTamper,
     WriteRateAnomaly,
     KillAttempt,
+    // ── New security-monitoring actions ─────────────────────────────────────────
+    Setuid,
+    MemfdCreate,
+    MemoryAnomaly,
     // ── Prevention actions (active response) ────────────────────────────────────
     /// Process was terminated (SIGKILL) by the prevention engine.
     ProcessBlocked,
@@ -163,6 +167,9 @@ pub enum EventData {
     AgentTamper(AgentTamperData),
     WriteRateAnomaly(WriteRateAnomalyData),
     KillAttempt(KillAttemptData),
+    Setuid(SetuidData),
+    MemfdCreate(MemfdCreateData),
+    MemoryAnomaly(MemoryAnomalyData),
     // ── Prevention event payload ────────────────────────────────────────
     Prevention(PreventionEventData),
     // ── Detection engine payload ────────────────────────────────────────
@@ -201,6 +208,8 @@ pub struct ExecEventData {
     pub cwd:      String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ld_preload: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -512,6 +521,29 @@ pub struct DetectionData {
     /// Optional structured evidence (matched IOC, observed cadence, …).
     #[serde(skip_serializing_if = "serde_json::Value::is_null", default)]
     pub evidence:   serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetuidData {
+    pub pid:     i32,
+    pub old_uid: u32,
+    pub new_uid: u32,
+    pub comm:    String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemfdCreateData {
+    pub pid:   i32,
+    pub comm:  String,
+    pub name:  String,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryAnomalyData {
+    pub pid:    i32,
+    pub region: String,
+    pub perms:  String,
 }
 
 #[cfg(test)]
