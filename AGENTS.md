@@ -21,7 +21,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - `agent/src/config/mod.rs`: backend-delivered agent config schema.
 - `agent/src/prevention/commands.rs`: signed response command schema.
 - `agent/src/prevention/policy.rs`: IoC policy/rule schema.
-- `agent/src/deception/`: honeytoken deception subsystem — `profiler.rs` (deterministic recon profile / token candidates), `registry.rs` (deployed-token register at `<state>/honeytokens.json`), `mod.rs` (camouflaged deploy + safe revoke). Step 1 places and manages tokens; no detection yet.
+- `agent/src/deception/`: honeytoken deception subsystem — `profiler.rs` (deterministic recon profile / token candidates), `registry.rs` (deployed-token register at `<state>/honeytokens.json`, incl. out-of-band canary records), `validate.rs` (bait-content + out-of-band-canary validation and anti-fingerprinting guards), `mod.rs` (camouflaged deploy + safe revoke). Step 1 places and manages tokens; the on-host detection path lives in `detection/honeytoken.rs`.
 - `agent/src/transport/mod.rs`: event ingest transport.
 - `agent/src/output/mod.rs`: local stdout/file NDJSON output.
 - `agent/src/http/mod.rs`: shared HTTP client, TLS pinning, mTLS, timeouts.
@@ -717,8 +717,15 @@ Backend responsibilities for the recon profile:
 - **Content generation (LLM):** turn each chosen candidate into believable,
   host-specific bait — a `.env` matching the detected app stack, fake secrets
   in the correct format (AWS `AKIA…` layout, JWT structure, DB connection
-  strings with plausible internal hostnames). Embed an out-of-band canary
-  marker in the content.
+  strings with plausible internal hostnames).
+- **Out-of-band canary (issue #32, point 2):** where the artefact supports it,
+  mint a *second-channel* canary on monitored honeypot infra and pass it back in
+  the `deploy_honeytoken` command's `out_of_band` block (a fake AWS key whose use
+  trips CloudTrail; a Canarytokens-style tracking DNS/HTTP domain; a kube-config
+  or SSH key aimed at honeypot infra). The agent validates and registers it; the
+  backend ingests the resulting deploy `details` (channel + `tracking_id` +
+  `markers` + host) so an inbound foreign signal can be attributed to the token,
+  host and attacker — a detection path fully independent of the on-host eBPF gate.
 - **Placement ranking:** decide which candidates to deploy first. Start with
   the deterministic `score` the agent already computed; a trained model
   replaces it in step 2 once hit/miss telemetry exists.
@@ -929,7 +936,7 @@ Discriminated by `kind`.
 { "kind": "install_package", "name": "string" }
 { "kind": "remove_package", "name": "string" }
 { "kind": "upgrade_package", "name": "string, optional" }
-{ "kind": "deploy_honeytoken", "path": "string", "content_b64": "base64 string", "mode": "u32 octal, optional, default 0", "mimic_neighbor": "bool, optional, default false", "canary_marker": "string, optional", "token_kind": "string, optional" }
+{ "kind": "deploy_honeytoken", "path": "string", "content_b64": "base64 string", "mode": "u32 octal, optional, default 0", "mimic_neighbor": "bool, optional, default false", "canary_marker": "string, optional", "out_of_band": { "channel": "aws_cloudtrail|dns|http|kube_api|ssh_honeypot", "tracking_id": "string", "markers": ["string"] }, "token_kind": "string, optional", "breadcrumbs": [ { "path": "string", "content_b64": "base64 string", "mode": "u32 octal, optional", "append": "bool, optional" } ] }
 { "kind": "revoke_honeytoken", "path": "string" }
 ```
 
@@ -943,12 +950,31 @@ Discriminated by `kind`.
   agent falls back to `0o600`.
 - `mimic_neighbor=true` makes the agent copy owner/group and atime/mtime from a
   sibling file in the same directory so the token blends in.
-- `canary_marker` is the out-of-band tracking marker embedded in `content_b64`
-  by the backend (e.g. a fake AWS key id tied to a monitored honeypot account,
-  or a tracking domain). It is recorded locally for correlation; the agent does
-  not parse it back out of the content.
+- `canary_marker` is the legacy single-string out-of-band tracking marker
+  embedded in `content_b64` by the backend (e.g. a fake AWS key id tied to a
+  monitored honeypot account, or a tracking domain). It is recorded locally for
+  correlation; the agent does not parse it back out of the content.
+- `out_of_band` is the **structured** out-of-band canary (issue #32, point 2):
+  the *second, independent* signal channel that fires when the bait is **used**
+  off-host, on infrastructure the agent does not control. `channel` is one of
+  `aws_cloudtrail` (fake AWS key → CloudTrail alarm), `dns`/`http`
+  (Canarytokens-style tracking domain / web-bug URL), `kube_api` (kube-config to
+  a honeypot API server) or `ssh_honeypot` (SSH key whose use logs a login).
+  `tracking_id` is the backend-assigned correlation key echoed back in the
+  foreign signal; `markers` are the *attacker-facing* identifiers embedded in the
+  bait (the fake key id, tracking FQDN/URL, key fingerprint, endpoint). The agent
+  **validates** the descriptor before placement (known channel; non-empty
+  `tracking_id`; ≥1 marker; channel↔marker shape; no shared TRAPD watermark) and
+  refuses to share any marker across tokens. It does **not** observe the channel
+  itself — it publishes the registration (see audit `details` below) so the
+  backend can correlate an inbound foreign signal back to this token and host
+  (Token ↔ Host ↔ attacker). Backend ingestion of the foreign signal lives in
+  the backend repo.
 - `token_kind` is the recon candidate family echoed back (`ssh_private_key`,
   `aws_credentials`, …); recorded in the register for attribution.
+- `breadcrumbs` are cross-linking artefacts placed alongside the token to make
+  it discoverable (issue #32, point 3); `append:true` safely appends to an
+  existing file (e.g. shell history) without truncation.
 - Safety invariants enforced on the agent: the target path must be **absolute**
   with no `..` component; the agent **refuses to overwrite** an existing file
   (so real user data is never clobbered); `revoke_honeytoken` only removes a
@@ -957,8 +983,15 @@ Discriminated by `kind`.
 - Outcomes are reported as `class=prevention` audit events with
   `action=honeytoken_deployed` / `honeytoken_revoked` and `kind`
   `honeytoken_deploy` / `honeytoken_revoke`. The audit `details` carry only
-  safe metadata (id, kind, mode, size, sha256, mimic info, `has_canary`) —
-  never the bait content itself.
+  safe metadata (id, kind, mode, size, sha256, mimic info, `has_canary`,
+  breadcrumb count) — never the bait content itself. When the token has an
+  `out_of_band` canary, the deploy `details` also carry an `out_of_band` block
+  (`channel`, `tracking_id`, `markers`) — this is the agent's **registration** of
+  the second channel, and together with the event's `agent_id`/`hostname` it is
+  the Token ↔ Host ↔ marker correlation key the backend ingests to attribute a
+  foreign signal. The revoke `details` echo `out_of_band.tracking_id` so the
+  backend can retire that registration. Markers are the fake attacker-facing
+  identifiers, never the bait content, so they are safe to publish.
 
 ## Policy Schemas
 

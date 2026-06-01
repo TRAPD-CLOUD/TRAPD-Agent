@@ -65,6 +65,27 @@ pub struct BreadcrumbSpec {
     pub append: bool,
 }
 
+/// Out-of-band canary declaration in a `DeployHoneytoken` command (issue #32,
+/// point 2): the second, independent signal channel that fires when the token is
+/// *used* off-host (a fake AWS key → CloudTrail alarm, a tracking DNS/HTTP domain,
+/// a kube/SSH credential aimed at honeypot infra). Recorded locally and
+/// republished in the deploy audit so the backend can correlate an inbound
+/// foreign signal (the CloudTrail event, the domain hit, the honeypot login)
+/// back to this token and host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutOfBandSpec {
+    /// Channel that fires on use — `aws_cloudtrail` / `dns` / `http` / `kube_api`
+    /// / `ssh_honeypot`. Validated by the agent before placement.
+    pub channel: String,
+    /// Stable id the backend assigned to this canary, echoed back in the foreign
+    /// signal so it can be matched to this registration.
+    pub tracking_id: String,
+    /// Observable token(s) in the bait that trip the channel (fake AWS key id,
+    /// tracking FQDN/URL, key fingerprint, kube endpoint).
+    #[serde(default)]
+    pub markers: Vec<String>,
+}
+
 /// Discriminated union of all response commands the backend can request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -118,6 +139,13 @@ pub enum CommandPayload {
         mimic_neighbor: bool,
         #[serde(default)]
         canary_marker: Option<String>,
+        /// Optional structured out-of-band canary — the second, independent
+        /// signal channel for this token (issue #32, point 2). Validated and
+        /// recorded; its registration is published so the backend can correlate
+        /// a foreign signal back to this token and host. Boxed so this rarely-set
+        /// field does not inflate every `CommandPayload` variant.
+        #[serde(default)]
+        out_of_band: Option<Box<OutOfBandSpec>>,
         /// Optional token family echoed back from the recon candidate. Named
         /// `token_kind` because `kind` is the enum's own serde tag.
         #[serde(default)]

@@ -247,6 +247,7 @@ impl Engine {
                 mode,
                 mimic_neighbor,
                 canary_marker,
+                out_of_band,
                 token_kind,
                 breadcrumbs,
             } => {
@@ -256,6 +257,7 @@ impl Engine {
                     *mode,
                     *mimic_neighbor,
                     canary_marker.clone(),
+                    out_of_band.clone(),
                     token_kind.clone(),
                     breadcrumbs,
                     &cmd_id,
@@ -275,6 +277,7 @@ impl Engine {
         mode: u32,
         mimic_neighbor: bool,
         canary_marker: Option<String>,
+        out_of_band: Option<Box<super::commands::OutOfBandSpec>>,
         kind: Option<String>,
         breadcrumbs: &[super::commands::BreadcrumbSpec],
         cmd_id: &str,
@@ -317,12 +320,25 @@ impl Engine {
             })
             .collect();
 
+        // Map the wire-level out-of-band spec into the deception model. The
+        // descriptor is validated inside `deploy`, so a malformed one fails the
+        // placement cleanly rather than planting an uncorrelatable canary.
+        let out_of_band = out_of_band.map(|o| {
+            let o = *o;
+            deception::OutOfBandCanary {
+                channel: o.channel,
+                tracking_id: o.tracking_id,
+                markers: o.markers,
+            }
+        });
+
         let req = DeployRequest {
             path: path.to_string(),
             content,
             mode,
             mimic_neighbor,
             canary_marker,
+            out_of_band,
             kind,
             command_id: Some(cmd_id.to_string()),
             breadcrumbs,
@@ -339,7 +355,14 @@ impl Engine {
                     format!("honeytoken '{}' deployed", record.kind),
                     None,
                     Some(cmd_id.into()),
-                    // Never echo the bait content — only safe metadata.
+                    // Never echo the bait content — only safe metadata. The
+                    // `out_of_band` block is the agent's registration of a
+                    // second-channel canary (issue #32, point 2): it binds this
+                    // token to its host (the event carries agent_id/hostname) and
+                    // to the channel/tracking_id/markers the backend needs to
+                    // correlate an inbound foreign signal. Markers are the *fake*
+                    // attacker-facing identifiers (key id, tracking domain), never
+                    // the bait content, so they are safe to publish.
                     json!({
                         "id": record.id,
                         "kind": record.kind,
@@ -350,6 +373,11 @@ impl Engine {
                         "neighbor_path": record.neighbor_path,
                         "has_canary": record.canary_marker.is_some(),
                         "breadcrumbs": record.breadcrumbs.len(),
+                        "out_of_band": record.out_of_band.as_ref().map(|o| json!({
+                            "channel": o.channel,
+                            "tracking_id": o.tracking_id,
+                            "markers": o.markers,
+                        })),
                     }),
                 );
             }
@@ -381,7 +409,16 @@ impl Engine {
                     format!("honeytoken '{}' revoked", record.kind),
                     None,
                     Some(cmd_id.into()),
-                    json!({ "id": record.id, "kind": record.kind }),
+                    // Echo the out-of-band tracking id on revoke so the backend can
+                    // retire the canary's correlation entry (issue #32, point 2).
+                    json!({
+                        "id": record.id,
+                        "kind": record.kind,
+                        "out_of_band": record.out_of_band.as_ref().map(|o| json!({
+                            "channel": o.channel,
+                            "tracking_id": o.tracking_id,
+                        })),
+                    }),
                 );
             }
             Err(e) => {

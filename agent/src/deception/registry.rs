@@ -51,8 +51,17 @@ pub struct HoneytokenRecord {
     /// domain). Stored so a second-channel hit can be correlated to this token
     /// even if the attacker exfiltrated it past the agent. `None` when the
     /// backend did not declare one.
+    ///
+    /// This is the *legacy*, single-string form. Richer second-channel canaries
+    /// are described by [`out_of_band`](Self::out_of_band); both are honoured for
+    /// marker-uniqueness so no fingerprint is ever shared across tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canary_marker: Option<String>,
+    /// Structured out-of-band canary registered alongside this token (issue #32,
+    /// point 2), when the backend declared a second, independent signal channel
+    /// for it. `None` for an on-host-only token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_of_band: Option<OutOfBandCanary>,
     /// When the token was placed.
     pub deployed_at: DateTime<Utc>,
     /// Id of the signed command that requested the deployment, if any.
@@ -62,6 +71,50 @@ pub struct HoneytokenRecord {
     /// 3), recorded so revoke can tear them down precisely.
     #[serde(default)]
     pub breadcrumbs: Vec<BreadcrumbRecord>,
+}
+
+/// Known out-of-band canary channels (issue #32, point 2).
+///
+/// A declared channel is validated against this set before placement, so a typo
+/// can never produce a canary whose foreign signal the backend silently fails to
+/// correlate. Each value maps to a *second, independent* signal source the
+/// attacker trips by **using** (not merely reading) the bait off-host:
+///
+///   * `aws_cloudtrail` — a fake AWS access key tied to a monitored honeypot
+///     account; any API call with it raises a CloudTrail alarm;
+///   * `dns` — a unique tracking hostname (Canarytokens-style) whose resolution
+///     is logged by an authoritative honeypot resolver;
+///   * `http` — a tracking/web-bug URL whose fetch is logged (e.g. a pixel in an
+///     Office/PDF lure, or a link in a `.env`);
+///   * `kube_api` — a kube-config pointing at a honeypot API server, so any
+///     `kubectl` against it is observed;
+///   * `ssh_honeypot` — an SSH key whose use against honeypot infra logs a login
+///     attempt.
+pub const CANARY_CHANNELS: &[&str] =
+    &["aws_cloudtrail", "dns", "http", "kube_api", "ssh_honeypot"];
+
+/// A second, independent signal channel attached to a honeytoken (issue #32,
+/// point 2).
+///
+/// The defining property of an out-of-band canary is that it fires when the bait
+/// is **used**, on infrastructure the agent does not control — regardless of
+/// whether the on-host eBPF detector ever saw the read. The agent therefore
+/// never observes this channel directly. Its job is to *register* the canary so
+/// the backend can correlate an inbound foreign signal (a CloudTrail event, a
+/// tracking-domain hit, a honeypot login) back to this exact token and host
+/// (Token ↔ Host ↔ Angreifer).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutOfBandCanary {
+    /// Which channel fires when the token is used — one of [`CANARY_CHANNELS`].
+    pub channel: String,
+    /// Stable id the backend assigned to this canary, echoed back inside the
+    /// foreign signal so it can be matched to this registration.
+    pub tracking_id: String,
+    /// The observable token(s) embedded in the bait that trip the channel: the
+    /// fake AWS key id, the tracking FQDN/URL, the honeypot SSH key fingerprint
+    /// or kube API endpoint. Recorded so the backend can correlate a foreign
+    /// signal even when it never saw the on-host read.
+    pub markers: Vec<String>,
 }
 
 /// A breadcrumb the agent placed to make a token discoverable, recorded so it
@@ -129,13 +182,43 @@ impl HoneytokenStore {
             .unwrap_or(false)
     }
 
-    /// True if `marker` is already the canary marker of some registered token.
-    /// Used to enforce that no marker is shared across tokens (anti-fingerprint).
+    /// True if `marker` is already in use by some registered token — either as
+    /// its legacy [`canary_marker`](HoneytokenRecord::canary_marker) or as one of
+    /// its out-of-band [`markers`](OutOfBandCanary::markers). Used to enforce that
+    /// no marker is shared across tokens (anti-fingerprint, issue #32 points 2/3):
+    /// a reused marker would let one foreign-signal hit — or one greppy attacker —
+    /// enumerate every bait at once.
     pub fn canary_in_use(&self, marker: &str) -> bool {
         self.inner
             .lock()
-            .map(|r| r.tokens.iter().any(|t| t.canary_marker.as_deref() == Some(marker)))
+            .map(|r| {
+                r.tokens.iter().any(|t| {
+                    t.canary_marker.as_deref() == Some(marker)
+                        || t.out_of_band
+                            .as_ref()
+                            .is_some_and(|o| o.markers.iter().any(|m| m == marker))
+                })
+            })
             .unwrap_or(false)
+    }
+
+    /// Find the token registered for an out-of-band `tracking_id`, if any. Lets a
+    /// caller (or a test) resolve a backend-reported foreign signal back to the
+    /// local token it belongs to. Part of the point-2 correlation contract; not
+    /// yet called from the binary (the backend owns foreign-signal ingestion).
+    #[allow(dead_code)]
+    pub fn find_by_tracking_id(&self, tracking_id: &str) -> Option<HoneytokenRecord> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|r| {
+                r.tokens
+                    .iter()
+                    .find(|t| {
+                        t.out_of_band.as_ref().is_some_and(|o| o.tracking_id == tracking_id)
+                    })
+                    .cloned()
+            })
     }
 
     /// Snapshot of all currently-registered tokens (used by the eBPF map
@@ -220,10 +303,15 @@ mod tests {
             mimic_neighbor: true,
             neighbor_path: Some("/home/u/.aws/config".into()),
             canary_marker: Some("AKIAEXAMPLECANARY".into()),
+            out_of_band: None,
             deployed_at: Utc::now(),
             command_id: None,
             breadcrumbs: Vec::new(),
         }
+    }
+
+    fn record_with_oob(path: &str, oob: OutOfBandCanary) -> HoneytokenRecord {
+        HoneytokenRecord { out_of_band: Some(oob), canary_marker: None, ..record(path) }
     }
 
     #[test]
@@ -252,6 +340,54 @@ mod tests {
         assert!(store.canary_in_use("AKIAEXAMPLECANARY"));
         assert!(!store.canary_in_use("SOME-OTHER-MARKER"));
         let _ = std::fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn canary_in_use_also_covers_out_of_band_markers() {
+        let store = tmp_registry();
+        let oob = OutOfBandCanary {
+            channel: "dns".into(),
+            tracking_id: "trk-1".into(),
+            markers: vec!["a1b2c3.canary.example.net".into()],
+        };
+        store.insert(record_with_oob("/home/u/.aws/credentials", oob)).unwrap();
+        // An out-of-band marker is just as "in use" as a legacy canary marker.
+        assert!(store.canary_in_use("a1b2c3.canary.example.net"));
+        assert!(!store.canary_in_use("other.canary.example.net"));
+        let _ = std::fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn find_by_tracking_id_resolves_token() {
+        let store = tmp_registry();
+        let oob = OutOfBandCanary {
+            channel: "aws_cloudtrail".into(),
+            tracking_id: "trk-aws-42".into(),
+            markers: vec!["AKIA2E0AABCDEFGHIJKL".into()],
+        };
+        store.insert(record_with_oob("/home/u/.aws/credentials", oob)).unwrap();
+        let found = store.find_by_tracking_id("trk-aws-42").expect("token resolved");
+        assert_eq!(found.path, "/home/u/.aws/credentials");
+        assert!(store.find_by_tracking_id("nope").is_none());
+        let _ = std::fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn out_of_band_survives_reload() {
+        let store = tmp_registry();
+        let path = store.path.clone();
+        let oob = OutOfBandCanary {
+            channel: "http".into(),
+            tracking_id: "trk-http".into(),
+            markers: vec!["https://x.canary.example.net/p.png".into()],
+        };
+        store.insert(record_with_oob("/srv/www/.env", oob.clone())).unwrap();
+        drop(store);
+
+        let reloaded = HoneytokenStore::load_from(path.clone());
+        let rec = reloaded.find_by_tracking_id("trk-http").expect("reloaded");
+        assert_eq!(rec.out_of_band, Some(oob));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
