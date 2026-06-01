@@ -16,11 +16,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::collections::HashSet;
 
+use base64::Engine as _;
 use serde_json::json;
 use tokio::sync::mpsc::Receiver;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::deception::{self, DeployRequest, HoneytokenStore};
 use crate::schema::{AgentEvent, EventData};
 
 use super::audit::AuditEmitter;
@@ -42,15 +44,23 @@ pub struct Engine {
     cfg:    EngineConfig,
     /// Set of currently-blocked IPs/CIDRs (string form for direct nft passthrough).
     blocked: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Register of honeytokens deployed on this host (deploy/revoke lifecycle).
+    honeytokens: Arc<HoneytokenStore>,
 }
 
 impl Engine {
-    pub fn new(policy: PolicyHandle, audit: AuditEmitter, cfg: EngineConfig) -> Self {
+    pub fn new(
+        policy: PolicyHandle,
+        audit: AuditEmitter,
+        cfg: EngineConfig,
+        honeytokens: Arc<HoneytokenStore>,
+    ) -> Self {
         Self {
             policy,
             audit,
             cfg,
             blocked: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            honeytokens,
         }
     }
 
@@ -118,6 +128,137 @@ impl Engine {
                     None => super::software::Operation::UpgradeAll,
                 };
                 self.cmd_package(op, &cmd_id);
+            }
+            CommandPayload::DeployHoneytoken {
+                path,
+                content_b64,
+                mode,
+                mimic_neighbor,
+                canary_marker,
+                token_kind,
+            } => {
+                self.cmd_deploy_honeytoken(
+                    path,
+                    content_b64,
+                    *mode,
+                    *mimic_neighbor,
+                    canary_marker.clone(),
+                    token_kind.clone(),
+                    &cmd_id,
+                );
+            }
+            CommandPayload::RevokeHoneytoken { path } => {
+                self.cmd_revoke_honeytoken(path, &cmd_id);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cmd_deploy_honeytoken(
+        &self,
+        path: &str,
+        content_b64: &str,
+        mode: u32,
+        mimic_neighbor: bool,
+        canary_marker: Option<String>,
+        kind: Option<String>,
+        cmd_id: &str,
+    ) {
+        let content = match base64::engine::general_purpose::STANDARD.decode(content_b64) {
+            Ok(c) => c,
+            Err(e) => {
+                self.audit.emit(
+                    crate::schema::EventAction::HoneytokenDeployed,
+                    crate::schema::Severity::Medium,
+                    "honeytoken_deploy",
+                    path.to_string(),
+                    false,
+                    format!("bad base64 content: {e}"),
+                    None,
+                    Some(cmd_id.into()),
+                    serde_json::Value::Null,
+                );
+                return;
+            }
+        };
+
+        let req = DeployRequest {
+            path: path.to_string(),
+            content,
+            mode,
+            mimic_neighbor,
+            canary_marker,
+            kind,
+            command_id: Some(cmd_id.to_string()),
+        };
+
+        match deception::deploy(&self.honeytokens, req) {
+            Ok(record) => {
+                self.audit.emit(
+                    crate::schema::EventAction::HoneytokenDeployed,
+                    crate::schema::Severity::Info,
+                    "honeytoken_deploy",
+                    record.path.clone(),
+                    true,
+                    format!("honeytoken '{}' deployed", record.kind),
+                    None,
+                    Some(cmd_id.into()),
+                    // Never echo the bait content — only safe metadata.
+                    json!({
+                        "id": record.id,
+                        "kind": record.kind,
+                        "mode": record.mode,
+                        "size_bytes": record.size_bytes,
+                        "sha256": record.sha256,
+                        "mimic_neighbor": record.mimic_neighbor,
+                        "neighbor_path": record.neighbor_path,
+                        "has_canary": record.canary_marker.is_some(),
+                    }),
+                );
+            }
+            Err(e) => {
+                self.audit.emit(
+                    crate::schema::EventAction::HoneytokenDeployed,
+                    crate::schema::Severity::Medium,
+                    "honeytoken_deploy",
+                    path.to_string(),
+                    false,
+                    format!("honeytoken deploy failed: {e:#}"),
+                    None,
+                    Some(cmd_id.into()),
+                    serde_json::Value::Null,
+                );
+            }
+        }
+    }
+
+    fn cmd_revoke_honeytoken(&self, path: &str, cmd_id: &str) {
+        match deception::revoke(&self.honeytokens, path) {
+            Ok(record) => {
+                self.audit.emit(
+                    crate::schema::EventAction::HoneytokenRevoked,
+                    crate::schema::Severity::Info,
+                    "honeytoken_revoke",
+                    record.path.clone(),
+                    true,
+                    format!("honeytoken '{}' revoked", record.kind),
+                    None,
+                    Some(cmd_id.into()),
+                    json!({ "id": record.id, "kind": record.kind }),
+                );
+            }
+            Err(e) => {
+                self.audit.emit(
+                    crate::schema::EventAction::HoneytokenRevoked,
+                    crate::schema::Severity::Medium,
+                    "honeytoken_revoke",
+                    path.to_string(),
+                    false,
+                    format!("honeytoken revoke failed: {e:#}"),
+                    None,
+                    Some(cmd_id.into()),
+                    serde_json::Value::Null,
+                );
             }
         }
     }

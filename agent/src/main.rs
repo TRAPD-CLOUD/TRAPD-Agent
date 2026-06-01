@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 mod collectors;
 mod config;
+mod deception;
 mod detection;
 mod enrollment;
 mod heartbeat;
@@ -362,7 +363,11 @@ async fn start_prevention(
         }
     };
 
-    let engine = Arc::new(Engine::new(policy.clone(), audit.clone(), engine_cfg));
+    // Register of honeytokens this host has deployed (deploy/revoke lifecycle).
+    let honeytokens = Arc::new(deception::HoneytokenStore::load());
+    info!(count = honeytokens.len(), "Honeytoken register loaded");
+
+    let engine = Arc::new(Engine::new(policy.clone(), audit.clone(), engine_cfg, honeytokens));
     engine.spawn_event_loop(event_rx);
 
     if let Some(v) = verifier {

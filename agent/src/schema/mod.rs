@@ -125,6 +125,11 @@ pub enum EventAction {
     PackageRemoved,
     /// A package (or all packages) were upgraded via a signed command.
     PackageUpgraded,
+    // ── Deception / honeytoken actions ──────────────────────────────────────
+    /// A honeytoken was placed on disk via a signed command.
+    HoneytokenDeployed,
+    /// A previously-deployed honeytoken was removed via a signed command.
+    HoneytokenRevoked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
