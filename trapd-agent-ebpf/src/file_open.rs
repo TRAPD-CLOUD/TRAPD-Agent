@@ -1,11 +1,11 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
+        bpf_probe_read_kernel, bpf_probe_read_user_str_bytes,
     },
-    macros::{map, tracepoint},
+    macros::{kprobe, map, tracepoint},
     maps::{HashMap, RingBuf},
-    programs::TracePointContext,
+    programs::{ProbeContext, TracePointContext},
 };
 
 use crate::{COMM_LEN, PATH_LEN};
@@ -28,7 +28,7 @@ pub struct FileOpenEvent {
 // read/exec is a full intrusion (confidence 100), while bare metadata recon
 // (stat/readlink) or an evasion attempt (hardlink) is a strong-but-softer lead.
 // The value travels in `HoneytokenAccessEvent::access_kind`.
-pub(crate) const ACCESS_OPENAT:   u32 = 0; // openat(2)            — content access
+pub(crate) const ACCESS_OPENAT:   u32 = 0; // open*/vfs_open        — content access
 pub(crate) const ACCESS_OPEN:     u32 = 1; // open(2)  (legacy)    — content access
 pub(crate) const ACCESS_OPENAT2:  u32 = 2; // openat2(2)           — content access
 pub(crate) const ACCESS_EXEC:     u32 = 3; // execve/execveat      — token executed
@@ -57,9 +57,12 @@ pub struct HoneytokenAccessEvent {
     pub uid:          u32,
     pub gid:          u32,
     pub _pad:         u32,
-    /// Token id the userspace side associated with this path.
+    /// Token id the userspace side associated with this path/inode.
     pub token_id:     u64,
-    /// open(2) flags the accessor used (0 for non-open syscalls).
+    /// Matched inode number for the `vfs_open` content-read path (0 for the
+    /// path-based syscall gates). Lets userspace re-verify token identity.
+    pub ino:          u64,
+    /// open(2) flags the accessor used (0 for non-open syscalls and vfs_open).
     pub flags:        u64,
     pub comm:         [u8; COMM_LEN],
     pub filename:     [u8; PATH_LEN],
@@ -74,24 +77,36 @@ static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 
 /// Honeytoken match table: absolute path (NUL-padded to `PATH_LEN`) → token id.
 ///
-/// Userspace owns this map and reconciles it from the on-disk honeytoken
-/// register. We match by the exact path string here rather than by inode: the
-/// codebase deliberately avoids dereferencing kernel structs in BPF (CO-RE is
-/// fragile across kernels — see `process_block.rs`), and the syscall tracepoints
-/// expose only the user path pointer, not a resolved inode. The userspace
-/// consumer re-verifies the hit against the token's recorded device+inode, so
-/// the authoritative identity check is inode-based even though the cheap
-/// in-kernel gate is path-based.
-///
-/// Path-gating cannot see a *content read through a pre-existing hardlink or
-/// copy* (a different path resolving to the same inode); that residual gap is
-/// closed by the out-of-band canary embedded in the token content (issue #32,
-/// point 2) and by kernel inode-matching (`HONEYTOKEN_INODES`, PR #31). We do,
-/// however, catch the moment a hardlink is *created* to a token — see
-/// `sys_enter_linkat` — so the evasion attempt itself is signal.
+/// Userspace owns this map and reconciles it from the on-disk register. It is
+/// the gate for the *path-bearing* syscalls that have no `vfs_open` to hang an
+/// inode check on: metadata recon (`stat`/`statx`/`readlink`), tamper
+/// (`unlinkat`/`renameat2`), hardlink creation (`linkat`), and the open-time fd
+/// stash that powers `mmap`/`getdents` correlation. Content *reads* are matched
+/// by inode in [`HONEYTOKEN_INODES`] via the `vfs_open` kprobe instead, which is
+/// robust against symlinks, relative paths and `..`.
 #[map]
 static HONEYTOKEN_PATHS: HashMap<[u8; PATH_LEN], u64> =
     HashMap::<[u8; PATH_LEN], u64>::with_max_entries(256, 0);
+
+/// Honeytoken match table: **inode number → token id**. Armed by userspace,
+/// which `stat()`s each deployed token to learn its inode. The `vfs_open` kprobe
+/// resolves the opened inode and matches here, so a content read fires
+/// **regardless of open flags and regardless of the path used** (symlink,
+/// relative, hardlink, bind-mount) — closing the residual gaps the path gate
+/// cannot see.
+#[map]
+static HONEYTOKEN_INODES: HashMap<u64, u64> = HashMap::<u64, u64>::with_max_entries(256, 0);
+
+// ── struct field offsets for the vfs_open inode walk (x86_64) ────────────────
+// The codebase reads kernel structs only by stable, documented offsets (see
+// dns.rs reading struct sock). `struct path` is two pointers, so `dentry` at +8
+// is rock-solid; `d_inode` / `i_ino` are the conventional x86_64 layout for
+// 4.x–6.x defconfig kernels. Every read is fail-safe: a wrong offset or bad
+// pointer yields a miss (no event), never a false positive. A BTF/CO-RE-driven
+// resolution is the portability hardening tracked for later.
+const PATH_DENTRY_OFFSET:   usize = 8;  // struct path { struct vfsmount *mnt; struct dentry *dentry; }
+const DENTRY_DINODE_OFFSET: usize = 48; // struct dentry.d_inode
+const INODE_IINO_OFFSET:    usize = 64; // struct inode.i_ino
 
 /// Dedicated low-volume channel for honeytoken accesses. Separate from
 /// `FILE_OPEN_EVENTS` so a hit is never lost in openat traffic and so the
@@ -155,6 +170,7 @@ pub(crate) fn emit_honeytoken_buf(
             ev.gid          = (uid_gid >> 32) as u32;
             ev._pad         = 0;
             ev.token_id     = token_id;
+            ev.ino          = 0;
             ev.flags        = flags;
             ev.comm         = comm;
             ev.filename     = *path;
@@ -182,22 +198,20 @@ pub(crate) fn check_honeytoken_user(path_uptr: u64, flags: u64, access_kind: u32
     emit_honeytoken_buf(&path, written as u32, flags, access_kind);
 }
 
-/// Honeytoken gate for the `open` family: emit the open access event *and*, if
-/// the path is a token file or a token's parent directory, remember it in
+/// Front half of `mmap`/`getdents64` correlation for the `open` family: if the
+/// path is a token file or a token's parent directory, remember it in
 /// [`HT_OPEN_PENDING`] so the matching `sys_exit_*` can bind the returned fd.
-/// This is the front half of `mmap`/`getdents64` correlation.
+/// The content-read *detection* itself is done by inode in the `vfs_open`
+/// kprobe, so this no longer emits an access event.
 #[inline(always)]
-pub(crate) fn check_open_honeytoken(path_uptr: u64, flags: u64, access_kind: u32) {
+pub(crate) fn track_open_for_fd(path_uptr: u64) {
     if path_uptr == 0 {
         return;
     }
     let mut path = [0u8; PATH_LEN];
-    let written = unsafe {
-        bpf_probe_read_user_str_bytes(path_uptr as *const u8, &mut path)
-            .map(|s| s.len())
-            .unwrap_or(0)
+    unsafe {
+        let _ = bpf_probe_read_user_str_bytes(path_uptr as *const u8, &mut path);
     };
-    emit_honeytoken_buf(&path, written as u32, flags, access_kind);
     stash_open_pending(&path);
 }
 
@@ -268,6 +282,7 @@ fn emit_honeytoken_token(token_id: u64, access_kind: u32) {
         ev.gid          = (uid_gid >> 32) as u32;
         ev._pad         = 0;
         ev.token_id     = token_id;
+        ev.ino          = 0;
         ev.flags        = 0;
         ev.comm         = comm;
         ev.filename     = [0u8; PATH_LEN];
@@ -340,9 +355,9 @@ fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
             .unwrap_or(0)
     };
 
-    // ── Honeytoken gate (fires regardless of flags) ──────────────────────────
-    emit_honeytoken_buf(&path, written as u32, flags, ACCESS_OPENAT);
-    // Remember a token file/dir open so the matching sys_exit_openat can bind
+    // The content-read detection for opens lives in the `vfs_open` kprobe, which
+    // matches by inode (robust against symlinks/relative/`..`). Here we only
+    // remember a token file/dir open so the matching `sys_exit_openat` can bind
     // the returned fd for mmap/getdents correlation.
     stash_open_pending(&path);
 
@@ -380,19 +395,19 @@ fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
 ///   offset 32 │ u64  arg2  mode
 ///
 /// `open(2)` does not exist on every architecture (arm64 routes everything
-/// through `openat`), so userspace attaches this best-effort.
+/// through `openat`), so userspace attaches this best-effort. Detection happens
+/// in `vfs_open`; here we only stash the fd binding for mmap/getdents.
 #[tracepoint]
 pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
     let filename_uptr: u64 = match unsafe { ctx.read_at(16) } {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    let flags: u64 = unsafe { ctx.read_at(24) }.unwrap_or(0);
-    check_open_honeytoken(filename_uptr, flags, ACCESS_OPEN);
+    track_open_for_fd(filename_uptr);
     0
 }
 
-// ── openat2(2) — modern open, flags live in a struct open_how ────────────────
+// ── openat2(2) — modern open (honeytoken fd stash only) ──────────────────────
 
 /// Tracepoint: syscalls/sys_enter_openat2
 ///
@@ -401,22 +416,15 @@ pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
 ///   offset 32 │ u64  arg2  how       ← user pointer to `struct open_how`
 ///   offset 40 │ u64  arg3  usize
 ///
-/// `struct open_how` begins with `__u64 flags`, so we read the first 8 bytes of
-/// `how` to recover the open flags. openat2 is kernel ≥ 5.6, so attach is
-/// best-effort.
+/// openat2 is kernel ≥ 5.6, so attach is best-effort. Detection happens in
+/// `vfs_open`; here we only stash the fd binding for mmap/getdents.
 #[tracepoint]
 pub fn sys_enter_openat2(ctx: TracePointContext) -> u32 {
     let filename_uptr: u64 = match unsafe { ctx.read_at(24) } {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    let how_uptr: u64 = unsafe { ctx.read_at(32) }.unwrap_or(0);
-    let flags: u64 = if how_uptr != 0 {
-        unsafe { bpf_probe_read_user(how_uptr as *const u64).unwrap_or(0) }
-    } else {
-        0
-    };
-    check_open_honeytoken(filename_uptr, flags, ACCESS_OPENAT2);
+    track_open_for_fd(filename_uptr);
     0
 }
 
@@ -543,4 +551,81 @@ pub fn sys_enter_close(ctx: TracePointContext) -> u32 {
     let key = (tgid << 32) | (fd_raw & 0xFFFF_FFFF);
     let _ = HONEYTOKEN_FDS.remove(&key);
     0
+}
+
+// ── Inode-based content-read detection (the canonical open gate) ─────────────
+
+/// kprobe: vfs_open(const struct path *path, struct file *file)
+///
+/// Runs after path resolution, so the dentry/inode is known. We resolve the
+/// opened inode and, if it is a deployed honeytoken, emit an access event
+/// **regardless of open flags** — this is the read-only detection, and it is
+/// robust against symlinks, relative paths, `..` and hardlinks (all of which
+/// resolve to the same inode). All struct reads are fail-safe (a miss on error),
+/// so this never produces a false positive even on a kernel whose layout differs
+/// from the assumed offsets.
+#[kprobe]
+pub fn vfs_open(ctx: ProbeContext) -> u32 {
+    match try_vfs_open(&ctx) {
+        Ok(_) => 0,
+        Err(_) => 0,
+    }
+}
+
+#[inline(always)]
+fn try_vfs_open(ctx: &ProbeContext) -> Result<(), i64> {
+    // arg0 = const struct path *path (kernel pointer)
+    let path: *const u8 = ctx.arg(0).ok_or(-1i64)?;
+    if path.is_null() {
+        return Ok(());
+    }
+    // path->dentry
+    let dentry: *const u8 = unsafe {
+        bpf_probe_read_kernel((path as usize + PATH_DENTRY_OFFSET) as *const *const u8)
+            .unwrap_or(core::ptr::null())
+    };
+    if dentry.is_null() {
+        return Ok(());
+    }
+    // dentry->d_inode
+    let inode: *const u8 = unsafe {
+        bpf_probe_read_kernel((dentry as usize + DENTRY_DINODE_OFFSET) as *const *const u8)
+            .unwrap_or(core::ptr::null())
+    };
+    if inode.is_null() {
+        return Ok(());
+    }
+    // inode->i_ino
+    let ino: u64 = unsafe {
+        bpf_probe_read_kernel((inode as usize + INODE_IINO_OFFSET) as *const u64).unwrap_or(0)
+    };
+    if ino == 0 {
+        return Ok(());
+    }
+
+    let token_id = match unsafe { HONEYTOKEN_INODES.get(&ino) } {
+        Some(&t) => t,
+        None => return Ok(()),
+    };
+
+    if let Some(mut entry) = HONEYTOKEN_ACCESS_EVENTS.reserve::<HoneytokenAccessEvent>(0) {
+        let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        let uid_gid = bpf_get_current_uid_gid();
+        let comm = [0u8; COMM_LEN];
+        let comm = bpf_get_current_comm().unwrap_or(comm);
+        let ev = unsafe { entry.assume_init_mut() };
+        ev.pid          = pid;
+        ev.uid          = (uid_gid & 0xFFFF_FFFF) as u32;
+        ev.gid          = (uid_gid >> 32) as u32;
+        ev._pad         = 0;
+        ev.token_id     = token_id;
+        ev.ino          = ino;
+        ev.flags        = 0; // vfs_open does not carry the syscall flags cheaply
+        ev.comm         = comm;
+        ev.filename     = [0u8; PATH_LEN];
+        ev.filename_len = 0;
+        ev.access_kind  = ACCESS_OPENAT;
+        entry.submit(0);
+    }
+    Ok(())
 }

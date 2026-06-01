@@ -31,19 +31,29 @@
 //! | sys_enter_unshare     | syscalls/sys_enter_unshare            | NsChange     |
 //! | sys_enter_setns       | syscalls/sys_enter_setns              | NsChange     |
 //! | kprobe__udp_sendmsg   | kprobe:udp_sendmsg                    | Dns          |
+//! | vfs_open*             | kprobe:vfs_open                       | Honeytoken   |
 //!
-//! Programs marked `*` are honeytoken-coverage tracepoints (issue #32, point 1)
-//! attached best-effort: they consult the same `HONEYTOKEN_PATHS` map as
-//! `sys_enter_openat` and emit `HoneytokenAccessEvent`s tagged with an
-//! `access_kind`. They are arch/kernel-specific (e.g. `open` is absent on arm64,
-//! `openat2` needs ≥ 5.6, `statx` needs ≥ 4.11), so a failed attach is logged
-//! and tolerated rather than aborting the collector. Token exec, delete and
-//! rename are gated inside the `sched_process_exec`, `sys_enter_unlinkat` and
-//! `sys_enter_renameat2` programs respectively. `mmap` (content read) and
-//! `getdents64` (directory recon) are correlated by binding the fd a token
-//! `open` returns (`sys_exit_open*`) and releasing it on `close`.
+//! Honeytoken detection spans several programs, all feeding
+//! `HoneytokenAccessEvent` tagged with an `access_kind`:
+//!
+//!   * **content read** — the `vfs_open` kprobe (issue #32, point 2a) resolves
+//!     the opened *inode* and matches `HONEYTOKEN_INODES`, firing regardless of
+//!     open flags and robust against symlinks, relative paths, `..` and
+//!     hardlinks. This is the canonical open detector; the `sys_enter_open*`
+//!     tracepoints no longer emit for opens, they only stash the returned fd.
+//!   * **metadata recon / tamper / hardlink** — the `sys_enter_{newfstatat,
+//!     statx,readlinkat,linkat,unlinkat,renameat2}` tracepoints match by path
+//!     via `HONEYTOKEN_PATHS`; token exec is gated in `sched_process_exec`.
+//!   * **mmap (content read) / getdents64 (directory recon)** — correlated by
+//!     binding the fd a token `open` returns (`sys_exit_open*`) and releasing it
+//!     on `close`.
+//!
+//! Programs marked `*` are attached best-effort: they are arch/kernel-specific
+//! (e.g. `open` is absent on arm64, `openat2` needs ≥ 5.6, `statx` needs ≥ 4.11),
+//! so a failed attach is logged and tolerated rather than aborting the collector.
 
 use std::collections::{HashMap as StdHashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, RwLock};
 use std::{fs, net::Ipv4Addr};
 
@@ -291,6 +301,7 @@ struct RawHoneytokenAccessEvent {
     gid:          u32,
     _pad:         u32,
     token_id:     u64,
+    ino:          u64,
     flags:        u64,
     comm:         [u8; COMM_LEN],
     filename:     [u8; PATH_LEN],
@@ -391,6 +402,17 @@ impl EbpfSyscallCollector {
                     None
                 }
             });
+        // Inode match table for the vfs_open content-read detector. Optional: an
+        // older eBPF binary without it falls back to path-only coverage.
+        let inodes_map: Option<BpfHashMap<MapData, u64, u64>> = bpf
+            .take_map("HONEYTOKEN_INODES")
+            .and_then(|raw| match BpfHashMap::try_from(raw) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    warn!(error = %e, "HONEYTOKEN_INODES not usable — inode content-read detection disabled");
+                    None
+                }
+            });
         let access_afd = match bpf.take_map("HONEYTOKEN_ACCESS_EVENTS") {
             Some(map) => match RingBuf::try_from(map).map_err(anyhow::Error::from).and_then(|rb| Ok(AsyncFd::new(rb)?)) {
                 Ok(afd) => afd,
@@ -417,9 +439,11 @@ impl EbpfSyscallCollector {
             let cfg = cfg.clone();
             let mut paths_map = paths_map;
             let mut dirs_map = dirs_map;
+            let mut inodes_map = inodes_map;
             tokio::spawn(async move {
                 let mut armed: HashSet<[u8; PATH_LEN]> = HashSet::new();
                 let mut armed_dirs: HashSet<[u8; PATH_LEN]> = HashSet::new();
+                let mut armed_inodes: HashSet<u64> = HashSet::new();
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
                 loop {
                     ticker.tick().await;
@@ -430,9 +454,11 @@ impl EbpfSyscallCollector {
                     reconcile_honeytokens(
                         &mut paths_map,
                         dirs_map.as_mut(),
+                        inodes_map.as_mut(),
                         &token_index,
                         &mut armed,
                         &mut armed_dirs,
+                        &mut armed_inodes,
                         enabled,
                     );
                 }
@@ -454,14 +480,22 @@ impl EbpfSyscallCollector {
                         let Some(ev) = (unsafe { read_raw::<RawHoneytokenAccessEvent>(&item) }) else {
                             continue;
                         };
-                        // Resolve the token; fall back to the kernel-reported
-                        // path if the index has not caught up to a fresh deploy.
+                        // Resolve the token from the index. Fall back to the
+                        // kernel-reported path (path-based gates) or the matched
+                        // inode (the vfs_open detector sends no path) if the index
+                        // has not caught up to a very fresh deploy.
                         let (tid, path, kind) = token_index
                             .read()
                             .ok()
                             .and_then(|idx| idx.get(&ev.token_id).cloned())
                             .unwrap_or_else(|| {
-                                (format!("0x{:x}", ev.token_id), cstr(&ev.filename).to_string(), "unknown".to_string())
+                                let fname = cstr(&ev.filename);
+                                let subject = if fname.is_empty() {
+                                    format!("inode:{}", ev.ino)
+                                } else {
+                                    fname.to_string()
+                                };
+                                (format!("0x{:x}", ev.token_id), subject, "unknown".to_string())
                             });
                         let comm = cstr(&ev.comm).to_string();
                         let extra: Vec<String> = cfg
@@ -552,20 +586,32 @@ fn path_key(path: &str) -> [u8; PATH_LEN] {
     key
 }
 
-/// Bring the in-kernel `HONEYTOKEN_PATHS` table in line with the on-disk
-/// register: add newly-deployed tokens, drop revoked ones, and rebuild the
-/// `token_id → (uuid, path, kind)` index used to enrich access events. When
-/// detection is disabled the table is fully cleared so nothing is armed.
+/// Bring the in-kernel honeytoken tables in line with the on-disk register:
+/// arm newly-deployed tokens (by path, by parent directory, and by inode), drop
+/// revoked ones, and rebuild the `token_id → (uuid, path, kind)` index used to
+/// enrich access events. When detection is disabled every table is cleared so
+/// nothing is armed.
+///
+/// Three kernel tables, each gating a different mechanism:
+///   * `HONEYTOKEN_PATHS` (by path) — recon/tamper/linkat gates + open-time fd
+///     stash for mmap/getdents;
+///   * `HONEYTOKEN_DIRS` (by parent dir) — getdents directory recon;
+///   * `HONEYTOKEN_INODES` (by inode) — the `vfs_open` content-read detector,
+///     robust against symlinks/relative/hardlinks.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_honeytokens(
     map: &mut BpfHashMap<MapData, [u8; PATH_LEN], u64>,
     mut dirs_map: Option<&mut BpfHashMap<MapData, [u8; PATH_LEN], u64>>,
+    mut inodes_map: Option<&mut BpfHashMap<MapData, u64, u64>>,
     token_index: &TokenIndex,
     armed: &mut HashSet<[u8; PATH_LEN]>,
     armed_dirs: &mut HashSet<[u8; PATH_LEN]>,
+    armed_inodes: &mut HashSet<u64>,
     enabled: bool,
 ) {
     let mut desired: StdHashMap<[u8; PATH_LEN], u64> = StdHashMap::new();
     let mut desired_dirs: StdHashMap<[u8; PATH_LEN], u64> = StdHashMap::new();
+    let mut desired_inodes: StdHashMap<u64, u64> = StdHashMap::new();
     let mut index: StdHashMap<u64, (String, String, String)> = StdHashMap::new();
 
     if enabled {
@@ -577,6 +623,12 @@ fn reconcile_honeytokens(
             // Arm the token's parent directory for getdents (directory) recon.
             if let Some(parent) = std::path::Path::new(&rec.path).parent().and_then(|p| p.to_str()) {
                 desired_dirs.entry(path_key(parent)).or_insert(tid);
+            }
+            // Arm the token's inode for the vfs_open content-read detector. The
+            // token must exist on disk to learn its inode; a vanished token is
+            // simply not armed here (and surfaces as a tamper signal elsewhere).
+            if let Ok(meta) = fs::metadata(&rec.path) {
+                desired_inodes.insert(meta.ino(), tid);
             }
         }
     }
@@ -607,6 +659,21 @@ fn reconcile_honeytokens(
         for key in stale_dirs {
             let _ = dirs.remove(&key);
             armed_dirs.remove(&key);
+        }
+    }
+
+    // Same arm/disarm dance for the inode table, when present.
+    if let Some(inodes) = inodes_map.as_mut() {
+        for (ino, tid) in &desired_inodes {
+            if !armed_inodes.contains(ino) && inodes.insert(ino, tid, 0).is_ok() {
+                armed_inodes.insert(*ino);
+            }
+        }
+        let stale_inodes: Vec<u64> =
+            armed_inodes.iter().filter(|k| !desired_inodes.contains_key(*k)).copied().collect();
+        for ino in stale_inodes {
+            let _ = inodes.remove(&ino);
+            armed_inodes.remove(&ino);
         }
     }
 
@@ -853,6 +920,27 @@ impl Collector for EbpfSyscallCollector {
             prog.load().context("BPF verifier rejected kprobe__udp_sendmsg")?;
             prog.attach("udp_sendmsg", 0)
                 .context("failed to attach kprobe on udp_sendmsg")?;
+        }
+
+        // ── Attach honeytoken inode kprobe (best-effort) ──────────────────────
+        // The vfs_open kprobe is the canonical content-read detector (matches by
+        // inode, robust against symlinks/relative/hardlinks). It is present only
+        // in newer eBPF binaries and its failure must never take down the rest of
+        // the telemetry, so we log and continue rather than bail.
+        match bpf.program_mut("vfs_open") {
+            Some(prog) => {
+                let attached = (|| -> Result<()> {
+                    let prog: &mut KProbe = prog.try_into().context("vfs_open is not a KProbe")?;
+                    prog.load().context("BPF verifier rejected vfs_open")?;
+                    prog.attach("vfs_open", 0).context("failed to attach kprobe on vfs_open")?;
+                    Ok(())
+                })();
+                match attached {
+                    Ok(()) => info!("eBPF honeytoken inode kprobe attached on vfs_open"),
+                    Err(e) => warn!(error = %e, "honeytoken vfs_open kprobe unavailable — inode content-read detection disabled"),
+                }
+            }
+            None => info!("eBPF binary has no vfs_open program — honeytoken inode detection unavailable"),
         }
 
         // ── Open ring buffer maps ─────────────────────────────────────────────
