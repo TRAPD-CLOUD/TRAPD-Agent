@@ -37,7 +37,9 @@ ProtectSystem=strict
 # read-only (not hidden): FIM and ransomware-watch must see /home and /root,
 # while the agent itself still cannot modify them.
 ProtectHome=read-only
-PrivateTmp=true
+# false: the agent must watch the REAL /tmp for ransomware/dropper activity. A
+# private tmpfs (own inodes) would hide all host /tmp writes.
+PrivateTmp=false
 # Explicit writable paths: agent state, config, logs.
 ReadWritePaths=-/etc/trapd -/var/lib/trapd -/var/log/trapd
 

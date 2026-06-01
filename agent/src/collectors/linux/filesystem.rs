@@ -9,7 +9,7 @@ use inotify::{EventMask, Inotify, WatchMask};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::Sender;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::collectors::Collector;
@@ -170,6 +170,13 @@ fn run_sync(
         .collect();
 
     for &path in &all_paths {
+        // Skip optional watch roots that don't exist on this host (e.g. /var/www,
+        // /backup on a minimal box) quietly — a missing root is not an error and
+        // shouldn't spam WARN. Real failures on existing paths still warn.
+        if !std::path::Path::new(path).exists() {
+            debug!("FilesystemCollector: watch path {path} absent, skipping");
+            continue;
+        }
         match inotify.watches().add(path, WATCH_MASK) {
             Ok(wd) => { wd_map.insert(wd, path); }
             Err(e) => warn!("FilesystemCollector: cannot watch {path}: {e}"),

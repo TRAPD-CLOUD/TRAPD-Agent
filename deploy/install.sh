@@ -207,7 +207,11 @@ ProtectSystem=strict
 # read-only (not hidden): FIM and ransomware-watch must see /home and /root,
 # while the agent itself still cannot modify them.
 ProtectHome=read-only
-PrivateTmp=true
+# false: the agent must watch the REAL /tmp for ransomware/dropper activity. A
+# private tmpfs is a separate filesystem (own inodes) and would hide all host
+# /tmp writes — unlike the bind-mounted, read-only /home above where inotify
+# still sees changes.
+PrivateTmp=false
 ReadWritePaths=-/etc/trapd -/var/lib/trapd -/var/log/trapd
 NoNewPrivileges=true
 # Capabilities for eBPF loading, network containment and file quarantine.
