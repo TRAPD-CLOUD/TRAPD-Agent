@@ -159,6 +159,13 @@ pub enum CommandPayload {
     /// that is present in its local register, so this can never remove a real
     /// file the agent did not plant.
     RevokeHoneytoken { path: String },
+    // ── Forensic response (issue #32, point 5) ───────────────────────────────
+    /// Freeze a process by SIGSTOP — suspend it (without killing) so it cannot
+    /// react or destroy evidence while it is investigated. A forensic snapshot is
+    /// captured and audited. Resume with `ThawPid` or terminate with `KillPid`.
+    FreezePid { pid: i32 },
+    /// Resume a previously-frozen process (SIGCONT).
+    ThawPid { pid: i32 },
 }
 
 /// Envelope signed by the backend.  All fields are part of the signed body.

@@ -22,6 +22,7 @@ fn default_command_poll_interval() -> u64 { 10 }
 fn default_inventory_enabled() -> bool { true }
 fn default_honeytoken_detection_enabled() -> bool { true }
 fn default_honeytoken_response() -> String { "alert".into() }
+fn default_honeytoken_deception_escalation() -> bool { false }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -57,14 +58,22 @@ pub struct AgentConfig {
     #[serde(default = "default_honeytoken_detection_enabled")]
     pub honeytoken_detection_enabled: bool,
     /// Automatic response to a honeytoken access, escalating:
-    /// `none` < `alert` < `kill` < `isolate`. Default `alert` (emit a critical
-    /// detection only); operators opt in to active response.
+    /// `none` < `alert` < `freeze` < `kill` < `isolate`. Default `alert` (emit a
+    /// critical detection only); operators opt in to active response. `freeze`
+    /// (alias `jail`) suspends the accessor with SIGSTOP and snapshots it instead
+    /// of killing — "freeze, snapshot, then decide" (issue #32, point 5).
     #[serde(default = "default_honeytoken_response")]
     pub honeytoken_response: String,
     /// Extra accessor comms to treat as benign sweepers, on top of the built-in
     /// indexer/AV/backup allowlist (false-positive hardening).
     #[serde(default)]
     pub honeytoken_accessor_allowlist: Vec<String>,
+    /// When `true`, a confirmed honeytoken hit also emits a `deception_escalation`
+    /// event — the agent's signal for the backend to deploy more bait, redirect
+    /// the session into a honeypot, or tarpit it (issue #32, point 5). Default
+    /// `false`; escalation is an opt-in, backend-coordinated action.
+    #[serde(default = "default_honeytoken_deception_escalation")]
+    pub honeytoken_deception_escalation: bool,
 }
 
 impl Default for AgentConfig {
@@ -80,6 +89,7 @@ impl Default for AgentConfig {
             honeytoken_detection_enabled: default_honeytoken_detection_enabled(),
             honeytoken_response: default_honeytoken_response(),
             honeytoken_accessor_allowlist: Vec::new(),
+            honeytoken_deception_escalation: default_honeytoken_deception_escalation(),
         }
     }
 }

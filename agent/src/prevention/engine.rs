@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::config::AgentConfig;
 use crate::deception::{self, DeployRequest, HoneytokenStore};
+use crate::forensics::{self, FlightRecorder};
 use crate::schema::{AgentEvent, EventData, HoneytokenAccessData};
 
 use super::audit::AuditEmitter;
@@ -46,6 +47,10 @@ enum ResponseLevel {
     None,
     /// Default: a critical prevention alert, no process action.
     Alert,
+    /// Alert + **freeze** the accessing process (SIGSTOP) and snapshot it,
+    /// leaving the decision (kill / thaw) to an operator — "freeze, snapshot,
+    /// then decide" (issue #32, point 5). The process is suspended, not killed.
+    Freeze,
     /// Alert + SIGKILL the accessing process.
     Kill,
     /// Alert + kill + full host network isolation.
@@ -56,8 +61,10 @@ impl ResponseLevel {
     fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "none" => ResponseLevel::None,
+            // "jail" semantically means *freeze the process*, not network isolate.
+            "freeze" | "jail" => ResponseLevel::Freeze,
             "kill" => ResponseLevel::Kill,
-            "isolate" | "isolate_network" | "jail" => ResponseLevel::Isolate,
+            "isolate" | "isolate_network" => ResponseLevel::Isolate,
             _ => ResponseLevel::Alert, // safe default for unknown values
         }
     }
@@ -66,6 +73,7 @@ impl ResponseLevel {
         match self {
             ResponseLevel::None => "none",
             ResponseLevel::Alert => "alert",
+            ResponseLevel::Freeze => "freeze",
             ResponseLevel::Kill => "kill",
             ResponseLevel::Isolate => "isolate",
         }
@@ -82,6 +90,9 @@ pub struct Engine {
     honeytokens: Arc<HoneytokenStore>,
     /// Live agent config — read for the policy-driven honeytoken response level.
     cfg_handle: Arc<RwLock<AgentConfig>>,
+    /// Bounded flight recorder of recent telemetry, pulled into a honeytoken
+    /// response as the accessor session's pre-history (issue #32, point 5).
+    recorder: Arc<FlightRecorder>,
 }
 
 impl Engine {
@@ -99,6 +110,7 @@ impl Engine {
             blocked: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             honeytokens,
             cfg_handle,
+            recorder: Arc::new(FlightRecorder::new(forensics::recorder::DEFAULT_CAPACITY)),
         }
     }
 
@@ -109,6 +121,10 @@ impl Engine {
     pub fn spawn_event_loop(self: Arc<Self>, mut rx: Receiver<AgentEvent>) {
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
+                // Flight recorder (issue #32, point 5): every event feeds the
+                // bounded ring so a later honeytoken hit can ship the session's
+                // pre-history. Cheap and lock-poison-tolerant.
+                self.recorder.record(&event);
                 match &event.data {
                     EventData::ProcessExec(exec) => {
                         let _ = process::enforce_exec(exec, &self.policy, &self.audit);
@@ -131,21 +147,51 @@ impl Engine {
         let pid = data.accessor.pid;
         let target = format!("{} (pid {})", data.path, pid);
 
-        // Above `alert`, terminate the accessing process. Best-effort: it may
-        // already have exited.
         let mut actions: Vec<&str> = vec!["alert"];
         let mut killed = false;
+        let mut frozen = false;
+        let mut isolated = false;
+        let mut snapshot: Option<forensics::ProcessSnapshot> = None;
+
+        // Freeze (SIGSTOP) + snapshot — suspend the intruder process without
+        // killing it, capture its state while it cannot react, and leave the
+        // kill/thaw decision to an operator (issue #32, point 5).
+        if matches!(level, ResponseLevel::Freeze) && pid > 0 {
+            frozen = process::freeze_pid(pid).is_ok();
+            actions.push(if frozen { "freeze" } else { "freeze_failed" });
+            // Snapshot regardless — a process that raced to exit is itself signal.
+            snapshot = Some(forensics::capture_snapshot(pid, frozen));
+        }
+
+        // Above `alert` (kill/isolate), terminate the accessing process.
         if matches!(level, ResponseLevel::Kill | ResponseLevel::Isolate) && pid > 0 {
             killed = process::kill_pid(pid).is_ok();
             actions.push(if killed { "kill" } else { "kill_failed" });
         }
-        let mut isolated = false;
         if matches!(level, ResponseLevel::Isolate) {
             let mut allow = self.cfg.default_isolation_allowlist.clone();
             allow.sort();
             allow.dedup();
             isolated = network::isolate(self.cfg.net_backend, &allow).is_ok();
             actions.push(if isolated { "isolate" } else { "isolate_failed" });
+        }
+
+        // Flight recorder: pull the buffered pre-history of the accessor and its
+        // ancestry, so the response ships the session's recent story.
+        let mut pids: Vec<i32> = Vec::with_capacity(1 + data.accessor.ancestors.len());
+        pids.push(pid);
+        pids.extend(data.accessor.ancestors.iter().map(|a| a.pid));
+        let history = self.recorder.history_for(&pids, 64);
+
+        // Session correlation: echo the detection-time context, filling the
+        // remote source IP from buffered logons when it was not already known.
+        let session = self.correlate_session(data);
+
+        // Deception escalation (config-gated): emit the agent's signal for the
+        // backend to deploy more bait / redirect into a honeypot / tarpit.
+        let escalate = self.deception_escalation_enabled();
+        if escalate {
+            self.emit_deception_escalation(data, session.as_ref(), &target);
         }
 
         let severity = match level {
@@ -175,7 +221,59 @@ impl Engine {
                 "response_level": level.as_str(),
                 "actions": actions,
                 "killed": killed,
+                "frozen": frozen,
                 "isolated": isolated,
+                "snapshot": snapshot,
+                "session": session,
+                "flight_recorder": history,
+                "escalation_triggered": escalate,
+            }),
+        );
+    }
+
+    /// Echo the detection-time session, correlating the remote source IP from
+    /// the flight recorder's buffered logons when it is not already populated.
+    fn correlate_session(&self, data: &HoneytokenAccessData) -> Option<crate::schema::SessionContext> {
+        let mut s = data.session.clone()?;
+        if s.remote_addr.is_none() {
+            if let Some((addr, port)) = self.recorder.correlate_remote(s.login_user.as_deref()) {
+                s.remote_addr = Some(addr);
+                s.remote_port = port;
+            }
+        }
+        Some(s)
+    }
+
+    /// Emit the deception-escalation signal: a prevention event carrying the
+    /// attacker context so the backend can deploy more bait, redirect the
+    /// session into a real honeypot, or tarpit it. The agent never mints bait or
+    /// reroutes traffic itself (that is backend/infra work) — it raises the
+    /// trigger with full context (issue #32, point 5).
+    fn emit_deception_escalation(
+        &self,
+        data: &HoneytokenAccessData,
+        session: Option<&crate::schema::SessionContext>,
+        target: &str,
+    ) {
+        self.audit.emit(
+            crate::schema::EventAction::DeceptionEscalation,
+            crate::schema::Severity::Critical,
+            "deception_escalation",
+            target.to_string(),
+            true,
+            format!(
+                "deception escalation triggered by honeytoken '{}' hit (pid {})",
+                data.kind, data.accessor.pid
+            ),
+            None,
+            None,
+            json!({
+                "token_id": data.token_id,
+                "path": data.path,
+                "kind": data.kind,
+                "accessor": data.accessor,
+                "session": session,
+                "recommended": ["deploy_additional_bait", "redirect_honeypot", "tarpit"],
             }),
         );
     }
@@ -187,6 +285,13 @@ impl Engine {
             .map(|c| c.honeytoken_response.clone())
             .unwrap_or_else(|_| "alert".to_string());
         ResponseLevel::parse(&raw)
+    }
+
+    fn deception_escalation_enabled(&self) -> bool {
+        self.cfg_handle
+            .read()
+            .map(|c| c.honeytoken_deception_escalation)
+            .unwrap_or(false)
     }
 
     /// Spawn the command-dispatch loop.
@@ -266,7 +371,57 @@ impl Engine {
             CommandPayload::RevokeHoneytoken { path } => {
                 self.cmd_revoke_honeytoken(path, &cmd_id);
             }
+            CommandPayload::FreezePid { pid } => {
+                self.cmd_freeze_pid(*pid, &cmd_id);
+            }
+            CommandPayload::ThawPid { pid } => {
+                self.cmd_thaw_pid(*pid, &cmd_id);
+            }
         }
+    }
+
+    /// Freeze a process (SIGSTOP) on operator command and audit a forensic
+    /// snapshot of it while it is suspended (issue #32, point 5).
+    fn cmd_freeze_pid(&self, pid: i32, cmd_id: &str) {
+        use crate::schema::{EventAction, Severity};
+        let frozen = process::freeze_pid(pid).is_ok();
+        let snapshot = forensics::capture_snapshot(pid, frozen);
+        self.audit.emit(
+            EventAction::ProcessFrozen,
+            if frozen { Severity::High } else { Severity::Medium },
+            "process_freeze",
+            pid.to_string(),
+            frozen,
+            if frozen {
+                format!("pid {pid} frozen (SIGSTOP) for forensic capture")
+            } else {
+                format!("freeze of pid {pid} failed (process may have exited)")
+            },
+            None,
+            Some(cmd_id.into()),
+            json!({ "pid": pid, "frozen": frozen, "snapshot": snapshot }),
+        );
+    }
+
+    /// Resume a previously-frozen process (SIGCONT) on operator command.
+    fn cmd_thaw_pid(&self, pid: i32, cmd_id: &str) {
+        use crate::schema::{EventAction, Severity};
+        let thawed = process::thaw_pid(pid).is_ok();
+        self.audit.emit(
+            EventAction::ProcessThawed,
+            if thawed { Severity::Info } else { Severity::Medium },
+            "process_thaw",
+            pid.to_string(),
+            thawed,
+            if thawed {
+                format!("pid {pid} resumed (SIGCONT)")
+            } else {
+                format!("thaw of pid {pid} failed (process may have exited)")
+            },
+            None,
+            Some(cmd_id.into()),
+            json!({ "pid": pid, "thawed": thawed }),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -711,5 +866,31 @@ impl Engine {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ResponseLevel;
+
+    #[test]
+    fn response_level_parses_escalation_ladder() {
+        assert_eq!(ResponseLevel::parse("none"), ResponseLevel::None);
+        assert_eq!(ResponseLevel::parse("alert"), ResponseLevel::Alert);
+        assert_eq!(ResponseLevel::parse("kill"), ResponseLevel::Kill);
+        assert_eq!(ResponseLevel::parse("isolate"), ResponseLevel::Isolate);
+        assert_eq!(ResponseLevel::parse("isolate_network"), ResponseLevel::Isolate);
+        // Unknown values fail safe to the non-destructive default.
+        assert_eq!(ResponseLevel::parse("wat"), ResponseLevel::Alert);
+        // Case/whitespace insensitive.
+        assert_eq!(ResponseLevel::parse("  KILL "), ResponseLevel::Kill);
+    }
+
+    #[test]
+    fn freeze_and_jail_both_mean_freeze_not_isolate() {
+        // "jail" is the process-freeze response (SIGSTOP), NOT network isolation.
+        assert_eq!(ResponseLevel::parse("freeze"), ResponseLevel::Freeze);
+        assert_eq!(ResponseLevel::parse("jail"), ResponseLevel::Freeze);
+        assert_eq!(ResponseLevel::Freeze.as_str(), "freeze");
     }
 }

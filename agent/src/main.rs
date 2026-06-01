@@ -10,6 +10,7 @@ mod config;
 mod deception;
 mod detection;
 mod enrollment;
+mod forensics;
 mod heartbeat;
 mod http;
 mod inventory;

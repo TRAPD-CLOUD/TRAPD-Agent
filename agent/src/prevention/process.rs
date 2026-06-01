@@ -41,6 +41,37 @@ pub fn kill_pid(_pid: i32) -> Result<()> {
     anyhow::bail!("process kill only implemented on Linux")
 }
 
+/// Freeze a process by sending SIGSTOP — the "jail" response. The process is
+/// suspended (not killed), so it cannot react or destroy evidence while a
+/// snapshot is taken and an operator decides what to do ("freeze, snapshot, then
+/// decide" — issue #32, point 5). Resume with [`thaw_pid`].
+#[cfg(target_os = "linux")]
+pub fn freeze_pid(pid: i32) -> Result<()> {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    kill(Pid::from_raw(pid), Signal::SIGSTOP)
+        .with_context(|| format!("SIGSTOP pid={pid} failed"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn freeze_pid(_pid: i32) -> Result<()> {
+    anyhow::bail!("process freeze only implemented on Linux")
+}
+
+/// Resume a previously-frozen process by sending SIGCONT.
+#[cfg(target_os = "linux")]
+pub fn thaw_pid(pid: i32) -> Result<()> {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    kill(Pid::from_raw(pid), Signal::SIGCONT)
+        .with_context(|| format!("SIGCONT pid={pid} failed"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn thaw_pid(_pid: i32) -> Result<()> {
+    anyhow::bail!("process thaw only implemented on Linux")
+}
+
 /// Best-effort SHA256 of a file.  Returns `None` if the file is unreadable
 /// (short-lived process, deleted between exec and our hash attempt, …).
 fn hash_file(path: &Path) -> Option<String> {
