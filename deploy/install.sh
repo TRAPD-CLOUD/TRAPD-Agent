@@ -228,6 +228,7 @@ EBPF_BINARY_NAME="${EBPF_BINARY_NAME}"
 INSTALL_BIN="${INSTALL_BIN}"
 EBPF_INSTALL_DIR="${EBPF_INSTALL_DIR}"
 EBPF_INSTALL_BIN="${EBPF_INSTALL_BIN}"
+CONFIG_DIR="${ENV_DIR}"
 
 log() { echo "\$(date -u +"%Y-%m-%dT%H:%M:%SZ") trapd-update: \$*"; }
 
@@ -262,7 +263,10 @@ if [[ -z "\$LATEST_TAG" ]]; then
     exit 1
 fi
 
-CURRENT_VERSION=\$("\$INSTALL_BIN" --version 2>/dev/null | awk '{print \$2}' || echo "unknown")
+# `trapd-agent --version` prints "trapd-agent v0.4.0"; take field 2 and strip the
+# leading "v" so it compares cleanly against the de-prefixed release tag below.
+# Without the strip, "v0.4.0" never equals "0.4.0" and the gate re-downloads daily.
+CURRENT_VERSION=\$("\$INSTALL_BIN" --version 2>/dev/null | awk '{print \$2}' | sed 's/^v//' || echo "unknown")
 LATEST_VERSION="\${LATEST_TAG#v}"
 
 if [[ "\$CURRENT_VERSION" == "\$LATEST_VERSION" ]]; then
@@ -278,6 +282,16 @@ curl -fL "\$DOWNLOAD_URL" -o "\$TMP_BINARY"
 verify_checksum "\$TMP_BINARY" "\${DOWNLOAD_URL}.sha256"
 chmod +x "\$TMP_BINARY"
 mv -f "\$TMP_BINARY" "\$INSTALL_BIN"
+
+# Refresh the self-integrity baseline to the freshly installed (and already
+# checksum-verified) binary. Without this, the agent's selfprotect::binary_integrity
+# check reads the OLD baseline at \${CONFIG_DIR}/binary.sha256, sees its own legit
+# update as a "BINARY INTEGRITY VIOLATION", and refuses to start (crash loop).
+# The download above is verified against the release .sha256, so this baseline is
+# anchored to a trusted artifact — it does not weaken tamper detection at rest.
+mkdir -p "\$CONFIG_DIR"
+echo "sha256:\$(sha256sum "\$INSTALL_BIN" | awk '{print \$1}')" > "\$CONFIG_DIR/binary.sha256"
+chmod 600 "\$CONFIG_DIR/binary.sha256"
 
 EBPF_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${EBPF_BINARY_NAME}"
 TMP_EBPF="\$(mktemp /tmp/trapd-agent-exec.XXXXXXXX)"

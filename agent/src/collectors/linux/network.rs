@@ -101,6 +101,9 @@ impl Collector for NetworkCollector {
         hostname: String,
     ) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(5));
+        // Self-exclusion: never report the agent's own sockets (e.g. its uplink
+        // to the backend) as host network activity.
+        let agent_pid = std::process::id() as i32;
 
         loop {
             ticker.tick().await;
@@ -139,6 +142,7 @@ impl Collector for NetworkCollector {
                 }
 
                 let (pid, process) = resolve_pid_name(entry.inode, &inode_map);
+                if pid == Some(agent_pid) { continue; } // self-exclusion
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),
@@ -188,6 +192,7 @@ impl Collector for NetworkCollector {
                 }
 
                 let (pid, process) = resolve_pid_name(entry.inode, &inode_map);
+                if pid == Some(agent_pid) { continue; } // self-exclusion
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),

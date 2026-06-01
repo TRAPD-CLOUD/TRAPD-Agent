@@ -1058,6 +1058,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawNetEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion (own uploads to backend)
                             let username = proc_username(ev.uid);
                             let (action, severity) = match ev.op {
                                 0 => (EventAction::Connection, Severity::Info),
@@ -1090,6 +1091,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawForkEvent>(&item) } {
+                            if ev.parent_pid == agent_pid || ev.child_pid == agent_pid { continue; } // self-exclusion
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
                                 EventClass::Process, EventAction::Fork,
@@ -1111,6 +1113,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawFileUnlinkEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1135,6 +1138,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawFileRenameEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1160,6 +1164,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawFileChmodEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1185,6 +1190,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawFileChownEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1211,6 +1217,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawMmapEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion
                             let username = proc_username(ev.uid);
                             let desc = mmap_description(ev.prot, ev.flags);
                             let event = AgentEvent::new(
@@ -1240,6 +1247,9 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawPtraceEvent>(&item) } {
+                            // self-exclusion for the agent AS tracer; an attacker
+                            // ptracing the agent (target_pid == us) still reports.
+                            if ev.pid == agent_pid { continue; }
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1265,6 +1275,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawModuleLoadEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1289,6 +1300,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawShmEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion
                             let username = proc_username(ev.uid);
                             let (action, op_str) = if ev.op == 0 {
                                 (EventAction::Shmget, "shmget")
@@ -1321,6 +1333,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawNsChangeEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion
                             let username = proc_username(ev.uid);
                             let op_str = if ev.op == 0 { "unshare" } else { "setns" };
                             let namespaces = ns_flags_to_string(ev.flags);
@@ -1349,6 +1362,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawDnsEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion (own backend lookups)
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1374,6 +1388,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawWriteRateEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion (own NDJSON log writes)
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1438,6 +1453,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawSetuidEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
                                 EventClass::Process, EventAction::Setuid,
@@ -1459,6 +1475,7 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawMemfdEvent>(&item) } {
+                            if ev.pid == agent_pid { continue; } // self-exclusion
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
                                 EventClass::Memory, EventAction::MemfdCreate,

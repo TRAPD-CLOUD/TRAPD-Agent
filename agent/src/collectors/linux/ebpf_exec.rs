@@ -282,6 +282,9 @@ impl Collector for EbpfExecCollector {
             "eBPF exec tracer attached to sched/sched_process_exec"
         );
 
+        // Self-exclusion: drop the agent's own exec events.
+        let agent_pid = std::process::id();
+
         loop {
             // Sleep until the kernel signals data in the ring buffer
             let mut guard = async_fd.readable_mut().await?;
@@ -304,6 +307,7 @@ impl Collector for EbpfExecCollector {
                     unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawExecEvent) };
 
                 let pid      = raw.pid;
+                if pid == agent_pid { continue; } // self-exclusion
                 let exe      = cstr(&raw.filename).to_string();
                 let comm     = cstr(&raw.comm).to_string();
 
