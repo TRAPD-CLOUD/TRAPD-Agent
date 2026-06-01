@@ -144,6 +144,10 @@ pub enum AccessKind {
     Unlink,
     /// renameat2 — the token was renamed away (tamper).
     Rename,
+    /// mmap — the token's contents were read through a memory mapping.
+    Mmap,
+    /// getdents64 — a token's parent directory was listed (directory recon).
+    Getdents,
     /// Unrecognised kind from a newer/older kernel build — treated as full access.
     Unknown,
 }
@@ -162,6 +166,8 @@ impl AccessKind {
             7 => Self::Link,
             8 => Self::Unlink,
             9 => Self::Rename,
+            10 => Self::Mmap,
+            11 => Self::Getdents,
             _ => Self::Unknown,
         }
     }
@@ -175,6 +181,7 @@ impl AccessKind {
             Self::Open => ("open_legacy", Severity::Critical, 100, "TA0006 Credential Access", "T1552.001"),
             Self::Openat2 => ("openat2", Severity::Critical, 100, "TA0006 Credential Access", "T1552.001"),
             Self::Unknown => ("unknown", Severity::Critical, 100, "TA0006 Credential Access", "T1552.001"),
+            Self::Mmap => ("mmap", Severity::Critical, 100, "TA0006 Credential Access", "T1552.001"),
             Self::Exec => ("exec", Severity::Critical, 100, "TA0002 Execution", "T1204.002"),
             // ── Evasion / tamper — deliberate, high-confidence ───────────────
             Self::Link => ("hardlink", Severity::Critical, 90, "TA0005 Defense Evasion", "T1564.001"),
@@ -184,6 +191,10 @@ impl AccessKind {
             Self::Stat => ("stat", Severity::High, 75, "TA0007 Discovery", "T1083"),
             Self::Statx => ("statx", Severity::High, 75, "TA0007 Discovery", "T1083"),
             Self::Readlink => ("readlink", Severity::High, 75, "TA0007 Discovery", "T1083"),
+            // Directory listing is inherently noisier (a user's own `ls` trips
+            // it), so it is scored as a soft lead — telemetry for the backend/ML
+            // rather than a high-severity alert.
+            Self::Getdents => ("getdents", Severity::Medium, 50, "TA0007 Discovery", "T1083"),
         }
     }
 }
@@ -479,8 +490,40 @@ mod tests {
         assert_eq!(AccessKind::from_u32(3), AccessKind::Exec);
         assert_eq!(AccessKind::from_u32(6), AccessKind::Readlink);
         assert_eq!(AccessKind::from_u32(9), AccessKind::Rename);
+        assert_eq!(AccessKind::from_u32(10), AccessKind::Mmap);
+        assert_eq!(AccessKind::from_u32(11), AccessKind::Getdents);
         // Out-of-range values fail safe to a full-access interpretation.
         assert_eq!(AccessKind::from_u32(42), AccessKind::Unknown);
+    }
+
+    #[test]
+    fn mmap_is_full_read_getdents_is_soft_recon() {
+        let al = Allowlist::new(999, &[]);
+        let mk = |k| AccessHit {
+            pid: 100, uid: 1000, gid: 1000, comm: "x", open_flags: 0,
+            token_id: "t", path: "/home/a/.aws/credentials", kind: "aws_credentials",
+            access_kind: k,
+        };
+        // mmap of a token reads its contents — same weight as an open.
+        let mm = build_access_event("a", "h", &mk(AccessKind::Mmap), &al, &fake()).unwrap();
+        assert!(matches!(mm.severity, Severity::Critical));
+        match mm.data {
+            EventData::HoneytokenAccess(d) => {
+                assert_eq!(d.access_kind, "mmap");
+                assert_eq!(d.confidence, 100);
+            }
+            _ => panic!("wrong payload"),
+        }
+        // getdents (directory listing) is a soft, noisy lead.
+        let gd = build_access_event("a", "h", &mk(AccessKind::Getdents), &al, &fake()).unwrap();
+        assert!(matches!(gd.severity, Severity::Medium));
+        match gd.data {
+            EventData::HoneytokenAccess(d) => {
+                assert_eq!(d.access_kind, "getdents");
+                assert_eq!(d.confidence, 50);
+            }
+            _ => panic!("wrong payload"),
+        }
     }
 
     #[test]

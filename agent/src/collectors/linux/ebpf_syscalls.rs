@@ -12,6 +12,9 @@
 //! | sys_enter_statx*      | syscalls/sys_enter_statx              | Honeytoken   |
 //! | sys_enter_readlinkat* | syscalls/sys_enter_readlinkat         | Honeytoken   |
 //! | sys_enter_linkat*     | syscalls/sys_enter_linkat             | Honeytoken   |
+//! | sys_exit_open{,at,at2}*| syscalls/sys_exit_open*              | (fd binding) |
+//! | sys_enter_getdents64* | syscalls/sys_enter_getdents64         | Honeytoken   |
+//! | sys_enter_close*      | syscalls/sys_enter_close              | (fd pruning) |
 //! | sys_enter_connect     | syscalls/sys_enter_connect            | NetworkSocket|
 //! | sys_enter_bind        | syscalls/sys_enter_bind               | NetworkSocket|
 //! | sys_enter_accept4     | syscalls/sys_enter_accept4            | NetworkSocket|
@@ -36,7 +39,9 @@
 //! `openat2` needs ≥ 5.6, `statx` needs ≥ 4.11), so a failed attach is logged
 //! and tolerated rather than aborting the collector. Token exec, delete and
 //! rename are gated inside the `sched_process_exec`, `sys_enter_unlinkat` and
-//! `sys_enter_renameat2` programs respectively.
+//! `sys_enter_renameat2` programs respectively. `mmap` (content read) and
+//! `getdents64` (directory recon) are correlated by binding the fd a token
+//! `open` returns (`sys_exit_open*`) and releasing it on `close`.
 
 use std::collections::{HashMap as StdHashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -375,6 +380,17 @@ impl EbpfSyscallCollector {
                 return;
             }
         };
+        // Parent-directory match table for getdents recon. Optional: an older
+        // eBPF binary without it simply means no directory-recon coverage.
+        let dirs_map: Option<BpfHashMap<MapData, [u8; PATH_LEN], u64>> = bpf
+            .take_map("HONEYTOKEN_DIRS")
+            .and_then(|raw| match BpfHashMap::try_from(raw) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    warn!(error = %e, "HONEYTOKEN_DIRS not usable — directory-recon coverage disabled");
+                    None
+                }
+            });
         let access_afd = match bpf.take_map("HONEYTOKEN_ACCESS_EVENTS") {
             Some(map) => match RingBuf::try_from(map).map_err(anyhow::Error::from).and_then(|rb| Ok(AsyncFd::new(rb)?)) {
                 Ok(afd) => afd,
@@ -400,8 +416,10 @@ impl EbpfSyscallCollector {
             let token_index = Arc::clone(&token_index);
             let cfg = cfg.clone();
             let mut paths_map = paths_map;
+            let mut dirs_map = dirs_map;
             tokio::spawn(async move {
                 let mut armed: HashSet<[u8; PATH_LEN]> = HashSet::new();
+                let mut armed_dirs: HashSet<[u8; PATH_LEN]> = HashSet::new();
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
                 loop {
                     ticker.tick().await;
@@ -409,7 +427,14 @@ impl EbpfSyscallCollector {
                         .as_ref()
                         .map(|c| c.read().map(|c| c.honeytoken_detection_enabled).unwrap_or(true))
                         .unwrap_or(false);
-                    reconcile_honeytokens(&mut paths_map, &token_index, &mut armed, enabled);
+                    reconcile_honeytokens(
+                        &mut paths_map,
+                        dirs_map.as_mut(),
+                        &token_index,
+                        &mut armed,
+                        &mut armed_dirs,
+                        enabled,
+                    );
                 }
             });
         }
@@ -533,11 +558,14 @@ fn path_key(path: &str) -> [u8; PATH_LEN] {
 /// detection is disabled the table is fully cleared so nothing is armed.
 fn reconcile_honeytokens(
     map: &mut BpfHashMap<MapData, [u8; PATH_LEN], u64>,
+    mut dirs_map: Option<&mut BpfHashMap<MapData, [u8; PATH_LEN], u64>>,
     token_index: &TokenIndex,
     armed: &mut HashSet<[u8; PATH_LEN]>,
+    armed_dirs: &mut HashSet<[u8; PATH_LEN]>,
     enabled: bool,
 ) {
     let mut desired: StdHashMap<[u8; PATH_LEN], u64> = StdHashMap::new();
+    let mut desired_dirs: StdHashMap<[u8; PATH_LEN], u64> = StdHashMap::new();
     let mut index: StdHashMap<u64, (String, String, String)> = StdHashMap::new();
 
     if enabled {
@@ -546,6 +574,10 @@ fn reconcile_honeytokens(
             let tid = honeytoken::token_id_u64(&rec.id);
             desired.insert(key, tid);
             index.insert(tid, (rec.id.to_string(), rec.path.clone(), rec.kind.clone()));
+            // Arm the token's parent directory for getdents (directory) recon.
+            if let Some(parent) = std::path::Path::new(&rec.path).parent().and_then(|p| p.to_str()) {
+                desired_dirs.entry(path_key(parent)).or_insert(tid);
+            }
         }
     }
 
@@ -561,6 +593,21 @@ fn reconcile_honeytokens(
     for key in stale {
         let _ = map.remove(&key);
         armed.remove(&key);
+    }
+
+    // Same arm/disarm dance for the parent-directory table, when present.
+    if let Some(dirs) = dirs_map.as_mut() {
+        for (key, tid) in &desired_dirs {
+            if !armed_dirs.contains(key) && dirs.insert(key, tid, 0).is_ok() {
+                armed_dirs.insert(*key);
+            }
+        }
+        let stale_dirs: Vec<[u8; PATH_LEN]> =
+            armed_dirs.iter().filter(|k| !desired_dirs.contains_key(*k)).copied().collect();
+        for key in stale_dirs {
+            let _ = dirs.remove(&key);
+            armed_dirs.remove(&key);
+        }
     }
 
     if let Ok(mut guard) = token_index.write() {
@@ -765,6 +812,13 @@ impl Collector for EbpfSyscallCollector {
         attach_tp_optional!("syscalls", "sys_enter_statx");
         attach_tp_optional!("syscalls", "sys_enter_readlinkat");
         attach_tp_optional!("syscalls", "sys_enter_linkat");
+        // fd correlation for mmap (content read) + getdents64 (directory recon):
+        // the exit hooks bind a token open's returned fd, close prunes it.
+        attach_tp_optional!("syscalls", "sys_exit_openat");
+        attach_tp_optional!("syscalls", "sys_exit_open");
+        attach_tp_optional!("syscalls", "sys_exit_openat2");
+        attach_tp_optional!("syscalls", "sys_enter_getdents64");
+        attach_tp_optional!("syscalls", "sys_enter_close");
         attach_tp!("syscalls", "sys_enter_connect");
         attach_tp!("syscalls", "sys_enter_bind");
         attach_tp!("syscalls", "sys_enter_accept4");
