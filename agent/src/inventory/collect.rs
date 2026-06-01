@@ -26,9 +26,13 @@ pub fn gather(agent_id: String, device_id: String, hostname: String) -> Inventor
 
     let software = gather_software();
     let users = gather_users();
+    let network = gather_network();
     // Condense the observed context into honeytoken candidates. Pure heuristics
     // over the data just gathered, plus cheap on-host stat()s for plausibility.
-    let recon_profile = crate::deception::build_profile(&users, &software);
+    // Host facts (hostname + network) feed the persona so generated bait stays
+    // internally consistent.
+    let recon_profile =
+        crate::deception::build_profile_with_host(&users, &software, &hostname, &network);
 
     InventorySnapshot {
         schema_version: SCHEMA_VERSION,
@@ -39,7 +43,7 @@ pub fn gather(agent_id: String, device_id: String, hostname: String) -> Inventor
         collected_at: chrono::Utc::now(),
         os: gather_os(),
         hardware: gather_hardware(&sys),
-        network: gather_network(),
+        network,
         software,
         users,
         recon_profile,

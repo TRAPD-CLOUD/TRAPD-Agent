@@ -58,6 +58,31 @@ pub struct HoneytokenRecord {
     /// Id of the signed command that requested the deployment, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_id: Option<String>,
+    /// Cross-linking breadcrumbs placed alongside this token (issue #32, point
+    /// 3), recorded so revoke can tear them down precisely.
+    #[serde(default)]
+    pub breadcrumbs: Vec<BreadcrumbRecord>,
+}
+
+/// A breadcrumb the agent placed to make a token discoverable, recorded so it
+/// can be cleaned up on revoke.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreadcrumbRecord {
+    /// Absolute path of the breadcrumb artefact.
+    pub path: String,
+    /// `true` if the breadcrumb was *appended* to an existing file (e.g. a shell
+    /// history line) rather than created as a new file.
+    pub appended: bool,
+    /// For an appended breadcrumb: byte offset at which our addition began.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    /// For an appended breadcrumb: length of the appended block in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub len: Option<u64>,
+    /// For an appended breadcrumb: SHA-256 of the appended block, so revoke can
+    /// confirm the file still ends with exactly our bytes before removing them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// JSON document persisted at `<state>/honeytokens.json`.
@@ -101,6 +126,15 @@ impl HoneytokenStore {
         self.inner
             .lock()
             .map(|r| r.tokens.iter().any(|t| t.path == path))
+            .unwrap_or(false)
+    }
+
+    /// True if `marker` is already the canary marker of some registered token.
+    /// Used to enforce that no marker is shared across tokens (anti-fingerprint).
+    pub fn canary_in_use(&self, marker: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|r| r.tokens.iter().any(|t| t.canary_marker.as_deref() == Some(marker)))
             .unwrap_or(false)
     }
 
@@ -188,6 +222,7 @@ mod tests {
             canary_marker: Some("AKIAEXAMPLECANARY".into()),
             deployed_at: Utc::now(),
             command_id: None,
+            breadcrumbs: Vec::new(),
         }
     }
 
@@ -206,6 +241,16 @@ mod tests {
 
         // Removing a path that is not registered is a no-op, not an error.
         assert!(store.remove_by_path("/nope").unwrap().is_none());
+        let _ = std::fs::remove_file(&store.path);
+    }
+
+    #[test]
+    fn canary_in_use_detects_shared_markers() {
+        let store = tmp_registry();
+        store.insert(record("/home/u/.aws/credentials")).unwrap();
+        // record() uses canary marker "AKIAEXAMPLECANARY".
+        assert!(store.canary_in_use("AKIAEXAMPLECANARY"));
+        assert!(!store.canary_in_use("SOME-OTHER-MARKER"));
         let _ = std::fs::remove_file(&store.path);
     }
 

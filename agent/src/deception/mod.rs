@@ -36,8 +36,10 @@
 
 pub mod profiler;
 pub mod registry;
+pub mod validate;
 
 use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -47,8 +49,9 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-pub use profiler::{build_profile, ReconProfile};
-pub use registry::{HoneytokenRecord, HoneytokenStore};
+pub use profiler::{build_profile_with_host, ReconProfile};
+pub use registry::{BreadcrumbRecord, HoneytokenRecord, HoneytokenStore};
+pub use validate::validate_bait;
 
 /// Everything needed to place one honeytoken. Built by the engine from a
 /// verified `deploy_honeytoken` command.
@@ -68,6 +71,27 @@ pub struct DeployRequest {
     pub kind: Option<String>,
     /// Id of the signed command requesting this deployment.
     pub command_id: Option<String>,
+    /// Optional cross-linking artefacts placed alongside the token so an
+    /// attacker *finds* it: a config that references the key, a `.bash_history`
+    /// line with a "forgotten" `mysql -u root -p…`, etc. (issue #32, point 3).
+    pub breadcrumbs: Vec<Breadcrumb>,
+}
+
+/// A breadcrumb that points an attacker at a token, raising its discoverability.
+///
+/// Two placement modes:
+///   * **create** (`append == false`) — written like the token itself, refusing
+///     to overwrite an existing file;
+///   * **append** (`append == true`) — appended *safely* to an existing (or new)
+///     file such as `~/.bash_history`, never truncating it and always starting
+///     on a fresh line. The exact bytes added are recorded so revoke can remove
+///     precisely our addition without corrupting the user's later writes.
+#[derive(Debug, Clone)]
+pub struct Breadcrumb {
+    pub path: String,
+    pub content: Vec<u8>,
+    pub mode: u32,
+    pub append: bool,
 }
 
 /// Place a honeytoken with camouflage and record it in the register.
@@ -76,6 +100,22 @@ pub struct DeployRequest {
 /// effects on the target) if a safety invariant is violated.
 pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenRecord> {
     let target = validate_target(&req.path)?;
+
+    // Quality gate (issue #32, point 3): a malformed token, or one carrying a
+    // tell-tale shared marker, is worse than no token — it reveals the trap. Run
+    // this *before* any filesystem mutation so a rejected deploy is a pure no-op.
+    let kind_str = req.kind.clone().unwrap_or_else(|| "unknown".to_string());
+    validate_bait(&kind_str, &req.content)
+        .map_err(|e| anyhow::anyhow!("refusing to deploy honeytoken: {e}"))?;
+
+    // Anti-fingerprinting: a canary marker must be unique to this token. The same
+    // marker reused across tokens would let one second-channel hit (or one greppy
+    // attacker) enumerate every bait at once.
+    if let Some(marker) = req.canary_marker.as_deref() {
+        if store.canary_in_use(marker) {
+            bail!("refusing to deploy honeytoken: canary marker is already in use by another token");
+        }
+    }
 
     // Hard safety rule: never clobber an existing file. `symlink_metadata`
     // (lstat) catches a symlink planted at the path too — we treat any
@@ -123,10 +163,24 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
     write_camouflaged(&target, &req.content, mode, owner, times)
         .with_context(|| format!("write honeytoken to {}", target.display()))?;
 
+    // Place cross-linking breadcrumbs that point at the token. A breadcrumb
+    // failure must not unwind a token that is already on disk, so failures are
+    // logged and skipped; only the breadcrumbs that landed are recorded.
+    let mut breadcrumbs: Vec<BreadcrumbRecord> = Vec::new();
+    for bc in &req.breadcrumbs {
+        match place_breadcrumb(bc) {
+            Ok(rec) => {
+                info!(path = %rec.path, appended = rec.appended, "honeytoken breadcrumb placed");
+                breadcrumbs.push(rec);
+            }
+            Err(e) => warn!(path = %bc.path, error = %e, "honeytoken breadcrumb placement failed — skipping"),
+        }
+    }
+
     let record = HoneytokenRecord {
         id: Uuid::new_v4(),
         path: target.to_string_lossy().into_owned(),
-        kind: req.kind.unwrap_or_else(|| "unknown".to_string()),
+        kind: kind_str,
         mode,
         size_bytes: size,
         sha256: sha,
@@ -135,6 +189,7 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
         canary_marker: req.canary_marker,
         deployed_at: Utc::now(),
         command_id: req.command_id,
+        breadcrumbs,
     };
 
     store.insert(record.clone()).context("record deployed honeytoken")?;
@@ -171,8 +226,176 @@ pub fn revoke(store: &HoneytokenStore, path: &str) -> Result<HoneytokenRecord> {
         .context("update honeytoken register")?
         .ok_or_else(|| anyhow::anyhow!("honeytoken vanished from register during revoke: {path}"))?;
 
+    // Tear down any breadcrumbs we planted alongside the token. Created files are
+    // removed; appended history lines are removed *only* if the file still ends
+    // with exactly our addition, so a user's later writes are never corrupted.
+    for bc in &record.breadcrumbs {
+        if let Err(e) = remove_breadcrumb(bc) {
+            warn!(path = %bc.path, error = %e, "honeytoken breadcrumb cleanup failed");
+        }
+    }
+
     info!(path, "honeytoken revoked");
     Ok(record)
+}
+
+// ── Breadcrumbs ───────────────────────────────────────────────────────────────
+
+/// Place one breadcrumb and return the record describing what was written.
+fn place_breadcrumb(bc: &Breadcrumb) -> Result<BreadcrumbRecord> {
+    let target = validate_target(&bc.path)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("breadcrumb has no parent dir: {}", target.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create breadcrumb parent dir {}", parent.display()))?;
+
+    if bc.append {
+        let (offset, written) = append_safe(&target, &bc.content, bc.mode)
+            .with_context(|| format!("append breadcrumb to {}", target.display()))?;
+        Ok(BreadcrumbRecord {
+            path: target.to_string_lossy().into_owned(),
+            appended: true,
+            offset: Some(offset),
+            len: Some(written.len() as u64),
+            sha256: Some(hex::encode(Sha256::digest(&written))),
+        })
+    } else {
+        create_breadcrumb_file(&target, &bc.content, bc.mode)
+            .with_context(|| format!("create breadcrumb {}", target.display()))?;
+        Ok(BreadcrumbRecord {
+            path: target.to_string_lossy().into_owned(),
+            appended: false,
+            offset: None,
+            len: None,
+            sha256: None,
+        })
+    }
+}
+
+/// Create a standalone breadcrumb file, refusing (like the token itself) to
+/// overwrite anything that already exists.
+fn create_breadcrumb_file(target: &Path, content: &[u8], mode: u32) -> Result<()> {
+    if target.symlink_metadata().is_ok() {
+        bail!("breadcrumb target already exists: {}", target.display());
+    }
+    let mut f = create_breadcrumb_handle(target, mode)?;
+    f.write_all(content).context("write breadcrumb content")?;
+    f.sync_all().ok();
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_breadcrumb_handle(target: &Path, mode: u32) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(if mode == 0 { 0o600 } else { mode })
+        .open(target)
+        .with_context(|| format!("create_new {}", target.display()))
+}
+
+#[cfg(not(unix))]
+fn create_breadcrumb_handle(target: &Path, _mode: u32) -> Result<fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .with_context(|| format!("create_new {}", target.display()))
+}
+
+/// Append `content` to `path` without ever truncating it: the file is opened in
+/// append mode (created at `mode` if absent), a leading newline is inserted when
+/// the existing file does not already end in one, and a trailing newline is
+/// guaranteed so the next genuine entry stays on its own line. Returns the
+/// pre-append offset and the exact bytes written, so revoke can later remove
+/// precisely this addition.
+fn append_safe(target: &Path, content: &[u8], mode: u32) -> Result<(u64, Vec<u8>)> {
+    let pre_len = fs::metadata(target).map(|m| m.len()).unwrap_or(0);
+
+    // Does the existing file already end with a newline?
+    let needs_leading_nl = if pre_len > 0 {
+        let mut f = fs::File::open(target).context("open breadcrumb file to inspect tail")?;
+        f.seek(SeekFrom::End(-1)).context("seek to tail")?;
+        let mut last = [0u8; 1];
+        f.read_exact(&mut last).context("read tail byte")?;
+        last[0] != b'\n'
+    } else {
+        false
+    };
+
+    let mut payload = Vec::with_capacity(content.len() + 2);
+    if needs_leading_nl {
+        payload.push(b'\n');
+    }
+    payload.extend_from_slice(content);
+    if !payload.ends_with(b"\n") {
+        payload.push(b'\n');
+    }
+
+    let mut f = open_append_handle(target, mode)?;
+    f.write_all(&payload).context("append breadcrumb bytes")?;
+    f.sync_all().ok();
+    Ok((pre_len, payload))
+}
+
+#[cfg(unix)]
+fn open_append_handle(target: &Path, mode: u32) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(if mode == 0 { 0o600 } else { mode })
+        .open(target)
+        .with_context(|| format!("open append {}", target.display()))
+}
+
+#[cfg(not(unix))]
+fn open_append_handle(target: &Path, _mode: u32) -> Result<fs::File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(target)
+        .with_context(|| format!("open append {}", target.display()))
+}
+
+/// Undo a breadcrumb. A created file is deleted; an appended block is removed
+/// only when the file still ends with exactly the bytes we added (verified by
+/// length and SHA-256), so concurrent/later writes are never clobbered.
+fn remove_breadcrumb(bc: &BreadcrumbRecord) -> Result<()> {
+    if !bc.appended {
+        return match fs::remove_file(&bc.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("remove breadcrumb {}", bc.path)),
+        };
+    }
+
+    let (Some(offset), Some(len), Some(sha)) = (bc.offset, bc.len, bc.sha256.as_ref()) else {
+        return Ok(()); // nothing recorded to remove
+    };
+    let Ok(meta) = fs::metadata(&bc.path) else {
+        return Ok(()); // file gone already
+    };
+    if meta.len() != offset + len {
+        warn!(path = %bc.path, "appended breadcrumb: file grew/shrank since placement — leaving it intact");
+        return Ok(());
+    }
+    let mut f = fs::File::open(&bc.path).with_context(|| format!("open {}", bc.path))?;
+    f.seek(SeekFrom::Start(offset)).context("seek to appended block")?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf).context("read appended block")?;
+    if hex::encode(Sha256::digest(&buf)) != *sha {
+        warn!(path = %bc.path, "appended breadcrumb: tail no longer matches — leaving it intact");
+        return Ok(());
+    }
+    let f = OpenOptions::new()
+        .write(true)
+        .open(&bc.path)
+        .with_context(|| format!("reopen {} to truncate", bc.path))?;
+    f.set_len(offset).context("truncate appended breadcrumb")?;
+    Ok(())
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────────
@@ -359,15 +582,20 @@ mod tests {
         HoneytokenStore::load_from(dir.join("honeytokens.json"))
     }
 
+    /// Structurally valid AWS credentials content (passes `validate_bait`).
+    const VALID_AWS: &str = "[default]\naws_access_key_id = AKIA2E0AABCDEFGHIJKL\n\
+                             aws_secret_access_key = wJalrXUtnFEMIabcdefGHIjklMNOpqrsTUVwxyz1\n";
+
     fn req(path: &str, content: &str) -> DeployRequest {
         DeployRequest {
             path: path.to_string(),
             content: content.as_bytes().to_vec(),
             mode: 0o600,
             mimic_neighbor: false,
-            canary_marker: Some("AKIACANARYEXAMPLE".into()),
+            canary_marker: Some("AKIACANARYTOKEN01".into()),
             kind: Some("aws_credentials".into()),
             command_id: Some("cmd-1".into()),
+            breadcrumbs: Vec::new(),
         }
     }
 
@@ -378,10 +606,10 @@ mod tests {
         let path = dir.join(".aws").join("credentials");
         let path_s = path.to_string_lossy().into_owned();
 
-        let rec = deploy(&store, req(&path_s, "[default]\naws_access_key_id=AKIA...\n")).unwrap();
+        let rec = deploy(&store, req(&path_s, VALID_AWS)).unwrap();
         assert!(path.exists());
         assert_eq!(rec.kind, "aws_credentials");
-        assert_eq!(rec.canary_marker.as_deref(), Some("AKIACANARYEXAMPLE"));
+        assert_eq!(rec.canary_marker.as_deref(), Some("AKIACANARYTOKEN01"));
         assert!(store.contains_path(&path_s));
 
         #[cfg(unix)]
@@ -405,7 +633,7 @@ mod tests {
         let path = dir.join("real_secret");
         fs::write(&path, b"do not touch").unwrap();
 
-        let err = deploy(&store, req(&path.to_string_lossy(), "bait")).unwrap_err();
+        let err = deploy(&store, req(&path.to_string_lossy(), VALID_AWS)).unwrap_err();
         assert!(err.to_string().contains("already exists"));
         // The real file is untouched.
         assert_eq!(fs::read(&path).unwrap(), b"do not touch");
@@ -447,13 +675,129 @@ mod tests {
         OpenOptions::new().write(true).open(&neighbor).unwrap().set_times(ft).unwrap();
 
         let target = dir.join("id_rsa_backup");
-        let mut r = req(&target.to_string_lossy(), "bait-key");
+        let mut r = req(&target.to_string_lossy(), VALID_AWS);
         r.mimic_neighbor = true;
         let rec = deploy(&store, r).unwrap();
 
         assert!(rec.neighbor_path.is_some());
         let placed = fs::metadata(&target).unwrap().modified().unwrap();
         assert_eq!(placed, old, "mtime should be aligned to the neighbour");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_malformed_bait_content() {
+        let dir = scratch_dir();
+        let store = store_in(&dir);
+        let path = dir.join(".aws").join("credentials");
+        // aws kind but the content is not shaped like AWS creds → refused, and
+        // crucially nothing is written.
+        let err = deploy(&store, req(&path.to_string_lossy(), "not aws shaped"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid 'aws_credentials'"), "got: {err}");
+        assert!(!path.exists(), "a rejected deploy must not touch the filesystem");
+        assert!(store.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_duplicate_canary_marker() {
+        let dir = scratch_dir();
+        let store = store_in(&dir);
+        let a = deploy(&store, req(&dir.join("a").to_string_lossy(), VALID_AWS));
+        assert!(a.is_ok());
+        // A second token reusing the same canary marker is refused — no shared
+        // watermark across tokens.
+        let err = deploy(&store, req(&dir.join("b").to_string_lossy(), VALID_AWS))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("canary marker is already in use"), "got: {err}");
+        assert!(!dir.join("b").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn breadcrumb_create_is_placed_and_revoked() {
+        let dir = scratch_dir();
+        let store = store_in(&dir);
+        let token = dir.join(".aws").join("credentials");
+        let crumb = dir.join("notes").join("deploy.txt");
+
+        let mut r = req(&token.to_string_lossy(), VALID_AWS);
+        r.breadcrumbs = vec![Breadcrumb {
+            path: crumb.to_string_lossy().into_owned(),
+            content: b"see ~/.aws/credentials for the prod key\n".to_vec(),
+            mode: 0o600,
+            append: false,
+        }];
+        let rec = deploy(&store, r).unwrap();
+        assert_eq!(rec.breadcrumbs.len(), 1);
+        assert!(crumb.exists(), "breadcrumb file must be created");
+
+        revoke(&store, &token.to_string_lossy()).unwrap();
+        assert!(!crumb.exists(), "revoke must remove the created breadcrumb");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn breadcrumb_append_is_safe_and_reversible() {
+        let dir = scratch_dir();
+        let store = store_in(&dir);
+        let token = dir.join(".aws").join("credentials");
+        let history = dir.join(".bash_history");
+        // Pre-existing history WITHOUT a trailing newline — append must not glue
+        // its line onto the last command.
+        fs::write(&history, b"ls -la\ncat /etc/passwd").unwrap();
+        let original = fs::read(&history).unwrap();
+
+        let mut r = req(&token.to_string_lossy(), VALID_AWS);
+        r.breadcrumbs = vec![Breadcrumb {
+            path: history.to_string_lossy().into_owned(),
+            content: b"mysql -u root -psup3rs3cret prod_db".to_vec(),
+            mode: 0o600,
+            append: true,
+        }];
+        let rec = deploy(&store, r).unwrap();
+
+        let after = fs::read_to_string(&history).unwrap();
+        assert!(after.starts_with("ls -la\ncat /etc/passwd\n"), "must not clobber prior history: {after:?}");
+        assert!(after.contains("mysql -u root -psup3rs3cret prod_db"));
+        assert!(rec.breadcrumbs[0].appended);
+
+        // Revoke removes exactly our appended block, restoring the original file.
+        revoke(&store, &token.to_string_lossy()).unwrap();
+        assert_eq!(fs::read(&history).unwrap(), original, "history must be restored byte-for-byte");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn breadcrumb_append_left_intact_if_file_changed() {
+        let dir = scratch_dir();
+        let store = store_in(&dir);
+        let token = dir.join(".aws").join("credentials");
+        let history = dir.join(".bash_history");
+        fs::write(&history, b"first\n").unwrap();
+
+        let mut r = req(&token.to_string_lossy(), VALID_AWS);
+        r.breadcrumbs = vec![Breadcrumb {
+            path: history.to_string_lossy().into_owned(),
+            content: b"leaked-cmd --token abc".to_vec(),
+            mode: 0o600,
+            append: true,
+        }];
+        deploy(&store, r).unwrap();
+        // The user writes more history after our breadcrumb.
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(&history).unwrap();
+            f.write_all(b"later-command\n").unwrap();
+        }
+        // Revoke must NOT corrupt the file: our block is no longer the tail.
+        revoke(&store, &token.to_string_lossy()).unwrap();
+        let after = fs::read_to_string(&history).unwrap();
+        assert!(after.contains("leaked-cmd --token abc"), "left intact when tail changed");
+        assert!(after.ends_with("later-command\n"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
