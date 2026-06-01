@@ -72,7 +72,7 @@ fn emit_setuid_event(ctx: &TracePointContext, new_uid: u32) {
     let comm = [0u8; COMM_LEN];
     let comm = bpf_get_current_comm().unwrap_or(comm);
 
-    let entry = match SETUID_EVENTS.reserve::<SetuidEvent>(0) {
+    let mut entry = match SETUID_EVENTS.reserve::<SetuidEvent>(0) {
         Some(e) => e,
         None => return,
     };

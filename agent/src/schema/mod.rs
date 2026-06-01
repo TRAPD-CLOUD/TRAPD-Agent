@@ -547,9 +547,15 @@ pub struct HoneytokenAccessData {
     pub path: String,
     /// Token family (`ssh_private_key`, `aws_credentials`, …).
     pub kind: String,
+    /// How the token was touched — `open`/`openat2`/`exec`/`stat`/`readlink`/
+    /// `hardlink`/`unlink`/`rename`. Lets the backend distinguish a content
+    /// read (intrusion) from metadata recon or a tamper/evasion attempt.
+    #[serde(default)]
+    pub access_kind: String,
     /// open(2) flags the accessor used (read-only access still fires).
     pub open_flags: u64,
-    /// Always 100 — a honeytoken access has no benign interpretation.
+    /// Confidence 0–100 that this is a true positive. Content access/execution
+    /// scores 100; metadata recon and tamper score below that.
     pub confidence: u8,
     pub mitre_tactic: String,
     pub mitre_technique: String,

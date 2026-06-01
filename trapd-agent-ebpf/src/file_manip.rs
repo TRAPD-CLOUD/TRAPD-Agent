@@ -141,6 +141,9 @@ fn try_unlink(ctx: &TracePointContext) -> Result<(), i64> {
         return Ok(());
     }
 
+    // ── Honeytoken tamper gate: a bait file is being deleted ─────────────────
+    crate::file_open::check_honeytoken_user(path_uptr, 0, crate::file_open::ACCESS_UNLINK);
+
     let (pid, uid, gid, comm) = current_task_info();
 
     let mut entry = UNLINK_EVENTS.reserve::<FileUnlinkEvent>(0).ok_or(-1i64)?;
@@ -169,6 +172,9 @@ fn try_rename(ctx: &TracePointContext) -> Result<(), i64> {
     if old_uptr == 0 || new_uptr == 0 {
         return Ok(());
     }
+
+    // ── Honeytoken tamper gate: a bait file is being renamed away ────────────
+    crate::file_open::check_honeytoken_user(old_uptr, 0, crate::file_open::ACCESS_RENAME);
 
     let (pid, uid, gid, comm) = current_task_info();
 

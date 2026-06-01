@@ -1,7 +1,7 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_probe_read_user_str_bytes,
+        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
     maps::{HashMap, RingBuf},
@@ -23,9 +23,26 @@ pub struct FileOpenEvent {
     pub filename_len: u32,
 }
 
-/// Honeytoken-access event — emitted whenever an open targets a path present in
-/// [`HONEYTOKEN_PATHS`], **regardless of open flags** (this is the read-only
-/// detection fix: a `cat ~/.aws/credentials` is the whole point and must fire).
+// ── Honeytoken access kinds ─────────────────────────────────────────────────
+// Discriminates *how* a token was touched so userspace can score it: a content
+// read/exec is a full intrusion (confidence 100), while bare metadata recon
+// (stat/readlink) or an evasion attempt (hardlink) is a strong-but-softer lead.
+// The value travels in `HoneytokenAccessEvent::access_kind`.
+pub(crate) const ACCESS_OPENAT:   u32 = 0; // openat(2)            — content access
+pub(crate) const ACCESS_OPEN:     u32 = 1; // open(2)  (legacy)    — content access
+pub(crate) const ACCESS_OPENAT2:  u32 = 2; // openat2(2)           — content access
+pub(crate) const ACCESS_EXEC:     u32 = 3; // execve/execveat      — token executed
+pub(crate) const ACCESS_STAT:     u32 = 4; // newfstatat           — metadata recon
+pub(crate) const ACCESS_STATX:    u32 = 5; // statx                — metadata recon
+pub(crate) const ACCESS_READLINK: u32 = 6; // readlinkat           — metadata recon
+pub(crate) const ACCESS_LINK:     u32 = 7; // linkat (oldpath)     — hardlink evasion
+pub(crate) const ACCESS_UNLINK:   u32 = 8; // unlinkat             — tamper (delete)
+pub(crate) const ACCESS_RENAME:   u32 = 9; // renameat2 (oldpath)  — tamper (rename)
+
+/// Honeytoken-access event — emitted whenever a syscall targets a path present in
+/// [`HONEYTOKEN_PATHS`], **regardless of open flags** (a `cat ~/.aws/credentials`
+/// is the whole point and must fire). `access_kind` records which syscall family
+/// tripped the gate (see the `ACCESS_*` constants).
 #[repr(C)]
 pub struct HoneytokenAccessEvent {
     pub pid:          u32,
@@ -34,12 +51,13 @@ pub struct HoneytokenAccessEvent {
     pub _pad:         u32,
     /// Token id the userspace side associated with this path.
     pub token_id:     u64,
-    /// open(2) flags the accessor used.
+    /// open(2) flags the accessor used (0 for non-open syscalls).
     pub flags:        u64,
     pub comm:         [u8; COMM_LEN],
     pub filename:     [u8; PATH_LEN],
     pub filename_len: u32,
-    pub _pad2:        u32,
+    /// Which syscall family tripped the gate — one of the `ACCESS_*` constants.
+    pub access_kind:  u32,
 }
 
 /// 512 KiB – openat is frequent; ring buffer drops gracefully under load.
@@ -51,11 +69,18 @@ static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 /// Userspace owns this map and reconciles it from the on-disk honeytoken
 /// register. We match by the exact path string here rather than by inode: the
 /// codebase deliberately avoids dereferencing kernel structs in BPF (CO-RE is
-/// fragile across kernels — see `process_block.rs`), and `sys_enter_openat`
-/// exposes only the user path pointer, not a resolved inode. The userspace
+/// fragile across kernels — see `process_block.rs`), and the syscall tracepoints
+/// expose only the user path pointer, not a resolved inode. The userspace
 /// consumer re-verifies the hit against the token's recorded device+inode, so
 /// the authoritative identity check is inode-based even though the cheap
 /// in-kernel gate is path-based.
+///
+/// Path-gating cannot see a *content read through a pre-existing hardlink or
+/// copy* (a different path resolving to the same inode); that residual gap is
+/// closed by the out-of-band canary embedded in the token content (issue #32,
+/// point 2) and by kernel inode-matching (`HONEYTOKEN_INODES`, PR #31). We do,
+/// however, catch the moment a hardlink is *created* to a token — see
+/// `sys_enter_linkat` — so the evasion attempt itself is signal.
 #[map]
 static HONEYTOKEN_PATHS: HashMap<[u8; PATH_LEN], u64> =
     HashMap::<[u8; PATH_LEN], u64>::with_max_entries(256, 0);
@@ -65,6 +90,61 @@ static HONEYTOKEN_PATHS: HashMap<[u8; PATH_LEN], u64> =
 /// read-only suppression on the main channel can stay exactly as it is.
 #[map]
 static HONEYTOKEN_ACCESS_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// ── Shared honeytoken gate ──────────────────────────────────────────────────
+
+/// Look `path` up in [`HONEYTOKEN_PATHS`] and, on a hit, emit a
+/// [`HoneytokenAccessEvent`]. `path` must already be a zero-padded buffer so it
+/// matches the NUL-padded key userspace inserts. Shared by every honeytoken
+/// tracepoint (open family, exec, recon, tamper) so the match+emit logic lives
+/// in exactly one place.
+#[inline(always)]
+pub(crate) fn emit_honeytoken_buf(
+    path: &[u8; PATH_LEN],
+    path_len: u32,
+    flags: u64,
+    access_kind: u32,
+) {
+    if let Some(&token_id) = unsafe { HONEYTOKEN_PATHS.get(path) } {
+        if let Some(mut entry) = HONEYTOKEN_ACCESS_EVENTS.reserve::<HoneytokenAccessEvent>(0) {
+            let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+            let uid_gid = bpf_get_current_uid_gid();
+            let comm = [0u8; COMM_LEN];
+            let comm = bpf_get_current_comm().unwrap_or(comm);
+            let ev = unsafe { entry.assume_init_mut() };
+            ev.pid          = pid;
+            ev.uid          = (uid_gid & 0xFFFF_FFFF) as u32;
+            ev.gid          = (uid_gid >> 32) as u32;
+            ev._pad         = 0;
+            ev.token_id     = token_id;
+            ev.flags        = flags;
+            ev.comm         = comm;
+            ev.filename     = *path;
+            ev.filename_len = path_len;
+            ev.access_kind  = access_kind;
+            entry.submit(0);
+        }
+    }
+}
+
+/// Read a user-space path string into a bounded, zero-initialised buffer and run
+/// it through the honeytoken gate. Used by tracepoints that only have a user
+/// pointer to the path (open/openat2/stat/statx/readlink/linkat/unlink/rename).
+#[inline(always)]
+pub(crate) fn check_honeytoken_user(path_uptr: u64, flags: u64, access_kind: u32) {
+    if path_uptr == 0 {
+        return;
+    }
+    let mut path = [0u8; PATH_LEN];
+    let written = unsafe {
+        bpf_probe_read_user_str_bytes(path_uptr as *const u8, &mut path)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    };
+    emit_honeytoken_buf(&path, written as u32, flags, access_kind);
+}
+
+// ── openat(2) — primary file-open telemetry + honeytoken gate ────────────────
 
 /// Tracepoint: syscalls/sys_enter_openat
 ///
@@ -111,22 +191,7 @@ fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
     };
 
     // ── Honeytoken gate (fires regardless of flags) ──────────────────────────
-    if let Some(&token_id) = unsafe { HONEYTOKEN_PATHS.get(&path) } {
-        if let Some(mut entry) = HONEYTOKEN_ACCESS_EVENTS.reserve::<HoneytokenAccessEvent>(0) {
-            let ev = unsafe { entry.assume_init_mut() };
-            ev.pid = pid;
-            ev.uid = uid;
-            ev.gid = gid;
-            ev._pad = 0;
-            ev.token_id = token_id;
-            ev.flags = flags;
-            ev.comm = comm;
-            ev.filename = path;
-            ev.filename_len = written as u32;
-            ev._pad2 = 0;
-            entry.submit(0);
-        }
-    }
+    emit_honeytoken_buf(&path, written as u32, flags, ACCESS_OPENAT);
 
     // ── Normal file-open telemetry (unchanged read-only suppression) ─────────
     // O_WRONLY=1, O_RDWR=2, O_CREAT=0x40, O_TRUNC=0x200 – skip pure read-only opens to
@@ -151,4 +216,121 @@ fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
 
     entry.submit(0);
     Ok(())
+}
+
+// ── open(2) — legacy open, no dirfd (honeytoken gate only) ───────────────────
+
+/// Tracepoint: syscalls/sys_enter_open
+///
+///   offset 16 │ u64  arg0  filename  ← user pointer
+///   offset 24 │ u64  arg1  flags
+///   offset 32 │ u64  arg2  mode
+///
+/// `open(2)` does not exist on every architecture (arm64 routes everything
+/// through `openat`), so userspace attaches this best-effort.
+#[tracepoint]
+pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
+    let filename_uptr: u64 = match unsafe { ctx.read_at(16) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let flags: u64 = unsafe { ctx.read_at(24) }.unwrap_or(0);
+    check_honeytoken_user(filename_uptr, flags, ACCESS_OPEN);
+    0
+}
+
+// ── openat2(2) — modern open, flags live in a struct open_how ────────────────
+
+/// Tracepoint: syscalls/sys_enter_openat2
+///
+///   offset 16 │ u64  arg0  dfd
+///   offset 24 │ u64  arg1  filename  ← user pointer
+///   offset 32 │ u64  arg2  how       ← user pointer to `struct open_how`
+///   offset 40 │ u64  arg3  usize
+///
+/// `struct open_how` begins with `__u64 flags`, so we read the first 8 bytes of
+/// `how` to recover the open flags. openat2 is kernel ≥ 5.6, so attach is
+/// best-effort.
+#[tracepoint]
+pub fn sys_enter_openat2(ctx: TracePointContext) -> u32 {
+    let filename_uptr: u64 = match unsafe { ctx.read_at(24) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let how_uptr: u64 = unsafe { ctx.read_at(32) }.unwrap_or(0);
+    let flags: u64 = if how_uptr != 0 {
+        unsafe { bpf_probe_read_user(how_uptr as *const u64).unwrap_or(0) }
+    } else {
+        0
+    };
+    check_honeytoken_user(filename_uptr, flags, ACCESS_OPENAT2);
+    0
+}
+
+// ── Metadata recon: stat / statx / readlink on a token path ──────────────────
+
+/// Tracepoint: syscalls/sys_enter_newfstatat (the syscall glibc `stat()`/`lstat()`
+/// and `ls -l` issue).
+///
+///   offset 16 │ u64  arg0  dfd
+///   offset 24 │ u64  arg1  pathname  ← user pointer
+#[tracepoint]
+pub fn sys_enter_newfstatat(ctx: TracePointContext) -> u32 {
+    let pathname_uptr: u64 = match unsafe { ctx.read_at(24) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    check_honeytoken_user(pathname_uptr, 0, ACCESS_STAT);
+    0
+}
+
+/// Tracepoint: syscalls/sys_enter_statx (kernel ≥ 4.11; newer glibc `stat`).
+///
+///   offset 16 │ u64  arg0  dfd
+///   offset 24 │ u64  arg1  pathname  ← user pointer
+#[tracepoint]
+pub fn sys_enter_statx(ctx: TracePointContext) -> u32 {
+    let pathname_uptr: u64 = match unsafe { ctx.read_at(24) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    check_honeytoken_user(pathname_uptr, 0, ACCESS_STATX);
+    0
+}
+
+/// Tracepoint: syscalls/sys_enter_readlinkat (the syscall `readlink()` uses).
+///
+///   offset 16 │ u64  arg0  dfd
+///   offset 24 │ u64  arg1  pathname  ← user pointer
+#[tracepoint]
+pub fn sys_enter_readlinkat(ctx: TracePointContext) -> u32 {
+    let pathname_uptr: u64 = match unsafe { ctx.read_at(24) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    check_honeytoken_user(pathname_uptr, 0, ACCESS_READLINK);
+    0
+}
+
+// ── Hardlink evasion: a hardlink is created *to* a token ──────────────────────
+
+/// Tracepoint: syscalls/sys_enter_linkat
+///
+///   offset 16 │ u64  arg0  olddfd
+///   offset 24 │ u64  arg1  oldname   ← user pointer (the existing token)
+///   offset 32 │ u64  arg2  newdfd
+///   offset 40 │ u64  arg3  newname   ← user pointer (the new link)
+///   offset 48 │ u64  arg4  flags
+///
+/// Creating a second name for the token's inode is a classic attempt to read its
+/// content later through a path our gate does not watch. We cannot see that
+/// later read by path, but we *can* flag the link creation itself.
+#[tracepoint]
+pub fn sys_enter_linkat(ctx: TracePointContext) -> u32 {
+    let oldname_uptr: u64 = match unsafe { ctx.read_at(24) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    check_honeytoken_user(oldname_uptr, 0, ACCESS_LINK);
+    0
 }

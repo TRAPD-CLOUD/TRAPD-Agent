@@ -6,6 +6,12 @@
 //! | Program               | Tracepoint / kprobe                   | Event type   |
 //! |-----------------------|---------------------------------------|--------------|
 //! | sys_enter_openat      | syscalls/sys_enter_openat             | FileOpen     |
+//! | sys_enter_open*       | syscalls/sys_enter_open               | Honeytoken   |
+//! | sys_enter_openat2*    | syscalls/sys_enter_openat2            | Honeytoken   |
+//! | sys_enter_newfstatat* | syscalls/sys_enter_newfstatat         | Honeytoken   |
+//! | sys_enter_statx*      | syscalls/sys_enter_statx              | Honeytoken   |
+//! | sys_enter_readlinkat* | syscalls/sys_enter_readlinkat         | Honeytoken   |
+//! | sys_enter_linkat*     | syscalls/sys_enter_linkat             | Honeytoken   |
 //! | sys_enter_connect     | syscalls/sys_enter_connect            | NetworkSocket|
 //! | sys_enter_bind        | syscalls/sys_enter_bind               | NetworkSocket|
 //! | sys_enter_accept4     | syscalls/sys_enter_accept4            | NetworkSocket|
@@ -22,6 +28,15 @@
 //! | sys_enter_unshare     | syscalls/sys_enter_unshare            | NsChange     |
 //! | sys_enter_setns       | syscalls/sys_enter_setns              | NsChange     |
 //! | kprobe__udp_sendmsg   | kprobe:udp_sendmsg                    | Dns          |
+//!
+//! Programs marked `*` are honeytoken-coverage tracepoints (issue #32, point 1)
+//! attached best-effort: they consult the same `HONEYTOKEN_PATHS` map as
+//! `sys_enter_openat` and emit `HoneytokenAccessEvent`s tagged with an
+//! `access_kind`. They are arch/kernel-specific (e.g. `open` is absent on arm64,
+//! `openat2` needs ≥ 5.6, `statx` needs ≥ 4.11), so a failed attach is logged
+//! and tolerated rather than aborting the collector. Token exec, delete and
+//! rename are gated inside the `sched_process_exec`, `sys_enter_unlinkat` and
+//! `sys_enter_renameat2` programs respectively.
 
 use std::collections::{HashMap as StdHashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -44,7 +59,7 @@ use tracing::{info, warn};
 
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
-use crate::detection::honeytoken::{self, AccessHit, Allowlist, RealProc};
+use crate::detection::honeytoken::{self, AccessHit, AccessKind, Allowlist, RealProc};
 use crate::schema::{
     AgentEvent, DnsData, EventAction, EventClass, EventData, FileChmodData, FileChownData,
     FileOpenData, FileRenameData, FileUnlinkData, ForkData, KillAttemptData, MemfdCreateData,
@@ -275,7 +290,7 @@ struct RawHoneytokenAccessEvent {
     comm:         [u8; COMM_LEN],
     filename:     [u8; PATH_LEN],
     filename_len: u32,
-    _pad2:        u32,
+    access_kind:  u32,
 }
 
 // ── Event validation ──────────────────────────────────────────────────────────
@@ -438,6 +453,7 @@ impl EbpfSyscallCollector {
                             token_id: &tid,
                             path: &path,
                             kind: &kind,
+                            access_kind: AccessKind::from_u32(ev.access_kind),
                         };
                         if let Some(event) =
                             honeytoken::build_access_event(&agent_id, &hostname, &hit, &allowlist, &RealProc)
@@ -711,7 +727,44 @@ impl Collector for EbpfSyscallCollector {
             }};
         }
 
+        // Best-effort attach: the program is loaded and attached, but a failure
+        // (e.g. the tracepoint does not exist on this arch/kernel, or the eBPF
+        // binary predates the program) is logged and tolerated instead of
+        // aborting the whole collector. Used for the honeytoken-coverage
+        // tracepoints, several of which are arch- or version-specific:
+        // `open` is absent on arm64, `openat2` needs ≥ 5.6, `statx` needs ≥ 4.11.
+        macro_rules! attach_tp_optional {
+            ($cat:expr, $name:expr) => {{
+                match bpf
+                    .program_mut($name)
+                    .and_then(|p| TryInto::<&mut TracePoint>::try_into(p).ok())
+                {
+                    Some(prog) => match prog.load().and_then(|_| prog.attach($cat, $name)) {
+                        Ok(_) => {}
+                        Err(e) => warn!(
+                            tracepoint = format!("{}/{}", $cat, $name),
+                            error = %e,
+                            "optional honeytoken tracepoint not attached — coverage reduced"
+                        ),
+                    },
+                    None => info!(
+                        tracepoint = format!("{}/{}", $cat, $name),
+                        "optional honeytoken tracepoint absent in eBPF binary — skipping"
+                    ),
+                }
+            }};
+        }
+
         attach_tp!("syscalls", "sys_enter_openat");
+        // ── Honeytoken coverage: additional access paths (issue #32, point 1) ──
+        // open/openat2 round out file-open coverage; the stat/statx/readlink
+        // tracepoints catch metadata recon; linkat catches hardlink evasion.
+        attach_tp_optional!("syscalls", "sys_enter_open");
+        attach_tp_optional!("syscalls", "sys_enter_openat2");
+        attach_tp_optional!("syscalls", "sys_enter_newfstatat");
+        attach_tp_optional!("syscalls", "sys_enter_statx");
+        attach_tp_optional!("syscalls", "sys_enter_readlinkat");
+        attach_tp_optional!("syscalls", "sys_enter_linkat");
         attach_tp!("syscalls", "sys_enter_connect");
         attach_tp!("syscalls", "sys_enter_bind");
         attach_tp!("syscalls", "sys_enter_accept4");
@@ -809,7 +862,10 @@ impl Collector for EbpfSyscallCollector {
         // eBPF binary that lacks these maps.
         self.spawn_honeytoken_tasks(&mut bpf, tx.clone(), agent_id.clone(), hostname.clone());
 
-        info!("eBPF syscall tracer attached: 25 programs (24 tracepoints + 1 kprobe)");
+        info!(
+            "eBPF syscall tracer attached: 24 core tracepoints + 1 kprobe + \
+             up to 6 best-effort honeytoken-coverage tracepoints"
+        );
 
         loop {
             tokio::select! {

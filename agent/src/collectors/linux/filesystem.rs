@@ -107,6 +107,22 @@ impl Collector for FilesystemCollector {
         let db_path = self.db_path.clone();
         let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel::<AgentEvent>(512);
 
+        // Honeytoken FIM (issue #32, point 1): watch every deployed bait file for
+        // tamper (content/attribute change) on a dedicated inotify instance, so a
+        // read-then-modify against a token is caught even if the eBPF gate missed
+        // it. Deletion/rename tamper is covered with full lineage by the eBPF
+        // unlink/rename honeytoken gates, so this layer deliberately alerts only
+        // on MODIFY/ATTRIB — that also sidesteps a false positive when the agent
+        // itself revokes (deletes) a token.
+        {
+            let tok_tx = fs_tx.clone();
+            let aid = agent_id.clone();
+            let host = hostname.clone();
+            std::thread::spawn(move || {
+                run_token_fim(tok_tx, aid, host);
+            });
+        }
+
         std::thread::spawn(move || {
             run_sync(fs_tx, agent_id, hostname, db_path);
         });
@@ -328,6 +344,154 @@ fn run_sync(
 #[inline]
 fn send(tx: &tokio::sync::mpsc::Sender<AgentEvent>, event: AgentEvent) -> bool {
     tx.blocking_send(event).is_err()
+}
+
+// ── Honeytoken FIM ──────────────────────────────────────────────────────────
+
+/// How often the token-FIM watcher re-reads the honeytoken register to pick up
+/// newly-deployed (or revoked) tokens.
+const TOKEN_FIM_RELOAD_SECS: u64 = 15;
+
+/// inotify events that mean a *third party* altered a token in place. We watch
+/// only MODIFY/ATTRIB: a deployed bait is never modified by the agent again, so
+/// either is a tamper signal. Deletion/rename is left to the eBPF unlink/rename
+/// honeytoken gates (which carry full process lineage and exclude the agent).
+fn token_fim_mask() -> WatchMask {
+    WatchMask::MODIFY.union(WatchMask::ATTRIB)
+}
+
+/// Read the on-disk honeytoken register (read-only) and return the token paths.
+/// We deliberately parse the file directly rather than going through
+/// [`crate::deception::HoneytokenStore`], whose `Drop` re-flushes the registry —
+/// a side effect we must not trigger from a read-only poller.
+fn current_token_paths() -> Vec<String> {
+    let path = crate::deception::registry::registry_path();
+    std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<crate::deception::registry::HoneytokenRegistry>(&b).ok())
+        .map(|r| r.tokens.into_iter().map(|t| t.path).collect())
+        .unwrap_or_default()
+}
+
+/// Dedicated watcher that keeps an inotify watch on every deployed honeytoken
+/// file and emits a `deception.honeytoken_tamper` detection when one is modified
+/// or has its attributes changed. Runs on its own thread for the agent's
+/// lifetime, reconciling the watch set from the register every
+/// [`TOKEN_FIM_RELOAD_SECS`].
+fn run_token_fim(
+    tx:       tokio::sync::mpsc::Sender<AgentEvent>,
+    agent_id: String,
+    hostname: String,
+) {
+    let mut inotify = match Inotify::init() {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("FilesystemCollector: token-FIM inotify init failed: {e}");
+            return;
+        }
+    };
+
+    // wd → token path, and the set of paths currently watched (for reconcile).
+    let mut wd_map: std::collections::HashMap<inotify::WatchDescriptor, String> =
+        std::collections::HashMap::new();
+    let mut watched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_reload = Instant::now()
+        .checked_sub(Duration::from_secs(TOKEN_FIM_RELOAD_SECS + 1))
+        .unwrap_or_else(Instant::now);
+
+    let mut buf = [0u8; 4096];
+    loop {
+        // ── Reconcile the watch set from the register ────────────────────────
+        if last_reload.elapsed() >= Duration::from_secs(TOKEN_FIM_RELOAD_SECS) {
+            last_reload = Instant::now();
+            let desired: std::collections::HashSet<String> =
+                current_token_paths().into_iter().collect();
+            for p in desired.difference(&watched.clone()) {
+                match inotify.watches().add(p, token_fim_mask()) {
+                    Ok(wd) => {
+                        wd_map.insert(wd, p.clone());
+                        watched.insert(p.clone());
+                    }
+                    // The token file may not exist yet, or be unreadable — retry
+                    // on the next reconcile rather than giving up.
+                    Err(e) => {
+                        tracing::debug!("token-FIM: cannot watch {p}: {e}");
+                    }
+                }
+            }
+            // Drop watches for paths no longer registered (revoked).
+            let stale: std::collections::HashSet<String> =
+                watched.difference(&desired).cloned().collect();
+            if !stale.is_empty() {
+                let to_remove: Vec<inotify::WatchDescriptor> = wd_map
+                    .iter()
+                    .filter(|(_, v)| stale.contains(*v))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for wd in to_remove {
+                    let _ = inotify.watches().remove(wd.clone());
+                    wd_map.remove(&wd);
+                }
+                for p in &stale {
+                    watched.remove(p);
+                }
+            }
+        }
+
+        // ── Drain any pending events (non-blocking) ──────────────────────────
+        match inotify.read_events(&mut buf) {
+            Ok(events) => {
+                for event in events {
+                    // The kernel auto-removes a watch when the file disappears and
+                    // delivers IGNORED — forget it so a re-deploy can re-arm.
+                    if event.mask.contains(EventMask::IGNORED) {
+                        if let Some(p) = wd_map.remove(&event.wd) {
+                            watched.remove(&p);
+                        }
+                        continue;
+                    }
+                    let Some(path) = wd_map.get(&event.wd).cloned() else { continue };
+
+                    let (indicator, technique, tactic) = if event.mask.contains(EventMask::ATTRIB) {
+                        ("attribute_change", "T1070.006", "TA0005 Defense Evasion")
+                    } else {
+                        ("content_modified", "T1565.001", "TA0040 Impact")
+                    };
+
+                    if send(&tx, AgentEvent::new(
+                        agent_id.clone(), hostname.clone(),
+                        EventClass::Detection, EventAction::Detected, Severity::Critical,
+                        EventData::Detection(DetectionData {
+                            rule_id:         "deception.honeytoken_tamper".to_string(),
+                            title:           "Honeytoken file tampered".to_string(),
+                            category:        "deception".to_string(),
+                            mitre_tactic:    Some(tactic.to_string()),
+                            mitre_technique: Some(technique.to_string()),
+                            confidence:      90,
+                            subject:         path.clone(),
+                            detail:          format!(
+                                "Deployed honeytoken {path} was altered in place ({indicator}); \
+                                 the agent never modifies a placed token, so this is tamper."
+                            ),
+                            evidence:        serde_json::json!({
+                                "indicator": indicator,
+                                "inotify_mask": format!("{:?}", event.mask),
+                            }),
+                        }),
+                    )) { return; }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                warn!("FilesystemCollector: token-FIM read error: {e}");
+                return;
+            }
+        }
+
+        // Poll cadence: tamper is rare, sub-second latency is plenty and keeps
+        // the thread near-idle.
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 // ── SQLite baseline ───────────────────────────────────────────────────────────
