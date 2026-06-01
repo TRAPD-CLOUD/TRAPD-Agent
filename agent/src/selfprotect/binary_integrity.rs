@@ -81,13 +81,12 @@ pub fn check() -> Result<()> {
 }
 
 fn write_baseline(hash_file: &Path, hash_str: &str) -> Result<()> {
-    if let Some(parent) = hash_file.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {} for binary hash storage", parent.display()))?;
-    }
-    std::fs::write(hash_file, hash_str)
-        .with_context(|| format!("write binary hash baseline to {}", hash_file.display()))?;
-    Ok(())
+    // Use the shared atomic writer (write to a temp sibling, then rename) at
+    // mode 0600. A crash or SIGKILL mid-write can never leave a half-written or
+    // empty baseline that would trigger a false integrity violation on the next
+    // start, and the baseline is never left world-readable.
+    paths::write_atomic(hash_file, hash_str.as_bytes(), 0o600)
+        .with_context(|| format!("write binary hash baseline to {}", hash_file.display()))
 }
 
 fn verify_ed25519_signature(hash_bytes: &[u8]) -> Result<()> {

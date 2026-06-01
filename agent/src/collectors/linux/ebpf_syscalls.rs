@@ -254,6 +254,39 @@ struct RawMemfdEvent {
     _pad:     u32,
 }
 
+// ── Event validation ──────────────────────────────────────────────────────────
+// Each event exposes its primary PID field so `read_raw` can reject records
+// whose decoded layout is implausible (see `RawEbpfEvent`).
+
+macro_rules! impl_raw_event_pid {
+    ($($ty:ty => $field:ident),+ $(,)?) => {
+        $(impl RawEbpfEvent for $ty {
+            #[inline]
+            fn primary_pid(&self) -> u32 { self.$field }
+        })+
+    };
+}
+
+impl_raw_event_pid! {
+    RawFileOpenEvent    => pid,
+    RawNetEvent         => pid,
+    RawFileUnlinkEvent  => pid,
+    RawFileRenameEvent  => pid,
+    RawFileChmodEvent   => pid,
+    RawFileChownEvent   => pid,
+    RawMmapEvent        => pid,
+    RawPtraceEvent      => pid,
+    RawModuleLoadEvent  => pid,
+    RawShmEvent         => pid,
+    RawNsChangeEvent    => pid,
+    RawDnsEvent         => pid,
+    RawWriteRateEvent   => pid,
+    RawForkEvent        => parent_pid,
+    RawKillSignalEvent  => sender_pid,
+    RawSetuidEvent      => pid,
+    RawMemfdEvent       => pid,
+}
+
 // ── Collector ─────────────────────────────────────────────────────────────────
 
 pub struct EbpfSyscallCollector {
@@ -399,11 +432,40 @@ fn mmap_description(prot: u32, flags: u32) -> String {
 
 // ── safe read helper ──────────────────────────────────────────────────────────
 
-unsafe fn read_raw<T>(bytes: &[u8]) -> Option<T> {
+/// Upper bound for a plausible PID. The kernel caps PIDs at
+/// `/proc/sys/kernel/pid_max`, which itself cannot exceed 2^22 (4194304) on
+/// 64-bit Linux. A value of 0 or above this bound after casting a ring-buffer
+/// record indicates the kernel/userspace struct layouts have drifted (an ABI
+/// change, a padding difference, or a partial-update deployment), so the bytes
+/// are semantically garbage and the event must be dropped rather than shipped.
+const PID_MAX: u32 = 4_194_304;
+
+/// Implemented by every `Raw*Event` so [`read_raw`] can sanity-check a defining
+/// field after the unaligned cast. We validate the primary PID field because it
+/// is present in every event and its plausible range is tightly bounded, making
+/// it a reliable canary for struct-layout mismatch.
+trait RawEbpfEvent {
+    fn primary_pid(&self) -> u32;
+}
+
+#[inline]
+fn plausible_pid(pid: u32) -> bool {
+    (1..=PID_MAX).contains(&pid)
+}
+
+/// Cast `bytes` into a `repr(C)` `Raw*Event`, then validate it. Returns `None`
+/// when the buffer is too short *or* the decoded event fails its sanity check,
+/// so a layout mismatch surfaces as a dropped event instead of garbage —
+/// including potentially uninitialised kernel bytes — reaching the backend.
+unsafe fn read_raw<T: RawEbpfEvent>(bytes: &[u8]) -> Option<T> {
     if bytes.len() < std::mem::size_of::<T>() {
         return None;
     }
-    Some(std::ptr::read_unaligned(bytes.as_ptr() as *const T))
+    let ev: T = std::ptr::read_unaligned(bytes.as_ptr() as *const T);
+    if !plausible_pid(ev.primary_pid()) {
+        return None;
+    }
+    Some(ev)
 }
 
 // ── Collector impl ────────────────────────────────────────────────────────────

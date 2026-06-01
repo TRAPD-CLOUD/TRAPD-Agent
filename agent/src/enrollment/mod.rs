@@ -95,6 +95,17 @@ pub async fn load_or_enroll(
              (and TRAPD_BACKEND_URL=<url>) and restart.",
         )?;
 
+    // The one-time enrollment token has now been captured into a local. Remove
+    // it from the process environment so it is no longer exposed via
+    // /proc/self/environ for the (potentially long) lifetime of the agent. A
+    // leaked token would let an attacker enroll a rogue agent against the same
+    // project. We hold the copy we need for the retry loop below.
+    //
+    // SAFETY: called before any collectors/worker tasks are spawned, while the
+    // agent is still single-threaded, so no other thread can be reading the
+    // environment concurrently.
+    unsafe { std::env::remove_var("TRAPD_ENROLL_TOKEN") };
+
     let base = crate::http::normalize_base_url(backend_url);
     let enroll_url = format!("{base}/api/v1/agents/enroll");
     let client = crate::http::control_client();
@@ -260,15 +271,27 @@ fn max_attempts_from_env() -> Option<u32> {
     }
 }
 
-/// Capped exponential backoff with deterministic-but-spread jitter.
+/// Capped exponential backoff with CSPRNG jitter.
 fn backoff(attempt: u32) -> Duration {
     let exp = BACKOFF_BASE
         .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1).min(16)));
     let capped = exp.min(BACKOFF_MAX);
-    // Add up to ~1s of jitter derived from the wall clock so a fleet of agents
-    // restarting together does not hammer the backend in lockstep.
-    let jitter_ms = (now_nanos() % 1000) as u64;
-    capped + Duration::from_millis(jitter_ms)
+    // Add up to ~1s of jitter so a fleet of agents restarting together (e.g.
+    // after a power event) does not clump into the same sub-second retry
+    // window. Drawn from the OS CSPRNG rather than the wall clock, which would
+    // be near-identical across machines that boot together.
+    capped + Duration::from_millis(jitter_ms())
+}
+
+/// Uniform-ish jitter in `[0, 1000)` ms from the OS CSPRNG, falling back to the
+/// wall clock if the RNG is somehow unavailable (never fails the backoff).
+fn jitter_ms() -> u64 {
+    let mut buf = [0u8; 8];
+    let raw = match getrandom::fill(&mut buf) {
+        Ok(()) => u64::from_le_bytes(buf),
+        Err(_) => now_nanos() as u64,
+    };
+    raw % 1000
 }
 
 fn now_nanos() -> u128 {

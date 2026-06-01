@@ -244,6 +244,10 @@ impl NonceStore {
 }
 
 /// Write a file atomically — write to a sibling temp file, fsync, rename.
+///
+/// The temp file is created owner-only (`0600`) before any bytes are written so
+/// the nonce store is never momentarily world-readable: a local attacker must
+/// not be able to learn which command nonces have been processed.
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
@@ -251,11 +255,27 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("tmp");
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = create_owner_only(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(unix)]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
 }
 
 #[cfg(test)]

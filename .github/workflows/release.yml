@@ -43,10 +43,22 @@ jobs:
           # trapd-agent-ebpf/.cargo/config.toml, so the artifact lands here:
           cp target/bpfel-unknown-none/release/trapd-agent-exec trapd-agent-exec
 
+      - name: Generate SHA256 checksums
+        run: |
+          # Per-artifact checksum files consumed by install.sh / trapd-update,
+          # plus an aggregate SHA256SUMS for manual `sha256sum --check`.
+          sha256sum trapd-agent-linux-x86_64 > trapd-agent-linux-x86_64.sha256
+          sha256sum trapd-agent-exec         > trapd-agent-exec.sha256
+          sha256sum trapd-agent-linux-x86_64 trapd-agent-exec > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             trapd-agent-linux-x86_64
+            trapd-agent-linux-x86_64.sha256
             trapd-agent-exec
+            trapd-agent-exec.sha256
+            SHA256SUMS
           generate_release_notes: true

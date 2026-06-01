@@ -337,6 +337,11 @@ fn open_db(db_path: &Path) -> Result<Connection> {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(db_path)?;
+    // WAL gives crash-consistent reads/writes; restrict the DB (and its WAL/SHM
+    // sidecars) to owner-only so a non-root reader cannot lift the pre-computed
+    // map of monitored file hashes to help evade FIM detection.
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    restrict_db_perms(db_path);
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS baseline (
             path       TEXT PRIMARY KEY,
@@ -347,6 +352,28 @@ fn open_db(db_path: &Path) -> Result<Connection> {
     )?;
     Ok(conn)
 }
+
+/// Best-effort `0600` on the SQLite database and its WAL/SHM sidecars.
+#[cfg(target_os = "linux")]
+fn restrict_db_perms(db_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    for suffix in ["", "-wal", "-shm"] {
+        let p = if suffix.is_empty() {
+            db_path.to_path_buf()
+        } else {
+            let mut s = db_path.as_os_str().to_os_string();
+            s.push(suffix);
+            PathBuf::from(s)
+        };
+        if p.exists() {
+            let _ = std::fs::set_permissions(&p, perms.clone());
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn restrict_db_perms(_db_path: &Path) {}
 
 /// Load existing baseline from DB; rebuild if empty or older than BASELINE_MAX_AGE_SECS.
 fn load_or_build_baseline(conn: &Connection) -> usize {

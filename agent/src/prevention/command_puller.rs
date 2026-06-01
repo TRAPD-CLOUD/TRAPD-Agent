@@ -17,6 +17,10 @@ use tracing::{debug, warn};
 use super::audit::AuditEmitter;
 use super::commands::{SignedCommand, Verdict, Verifier, CommandEnvelope};
 
+/// Number of consecutive failed polls before the puller emits a tamper-evident
+/// audit event that the command channel may be severed.
+const POLL_FAILURE_ALERT_THRESHOLD: u32 = 5;
+
 pub struct CommandPuller {
     client:    reqwest::Client,
     url:       String,
@@ -51,13 +55,47 @@ impl CommandPuller {
 
     pub async fn run(self) {
         let mut ticker = interval(self.interval);
+        let mut consecutive_failures: u32 = 0;
         loop {
             ticker.tick().await;
-            self.poll_once().await;
+            if self.poll_once().await {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
+                // Escalate exactly once when crossing the threshold. A sustained
+                // command-channel outage — e.g. an attacker severing it to block
+                // an isolate_network command during an active incident — must
+                // leave a tamper-evident audit record instead of being silently
+                // swallowed at debug level.
+                if consecutive_failures == POLL_FAILURE_ALERT_THRESHOLD {
+                    warn!(
+                        failures = consecutive_failures,
+                        "command channel unreachable for {consecutive_failures} consecutive polls"
+                    );
+                    self.audit.emit(
+                        crate::schema::EventAction::AgentTamper,
+                        crate::schema::Severity::High,
+                        "command_channel_unreachable",
+                        self.url.clone(),
+                        false,
+                        format!(
+                            "{consecutive_failures} consecutive command-poll failures — \
+                             control channel may be severed"
+                        ),
+                        None,
+                        None,
+                        serde_json::json!({ "consecutive_failures": consecutive_failures }),
+                    );
+                }
+            }
         }
     }
 
-    async fn poll_once(&self) {
+    /// Perform one poll round-trip. Returns `true` only when the backend was
+    /// reached and returned a success status (commands, if any, dispatched);
+    /// `false` on any transport error or non-2xx response so the caller can
+    /// count consecutive failures.
+    async fn poll_once(&self) -> bool {
         let resp = match self.client
             .get(&self.url)
             .bearer_auth(&self.token)
@@ -65,19 +103,19 @@ impl CommandPuller {
             .await
         {
             Ok(r)  => r,
-            Err(e) => { debug!("command poll failed: {e}"); return; }
+            Err(e) => { warn!("command poll failed: {e}"); return false; }
         };
 
         if !resp.status().is_success() {
             if resp.status().is_server_error() {
                 warn!(status = %resp.status(), "backend command endpoint error");
             }
-            return;
+            return false;
         }
 
         let commands: Vec<SignedCommand> = match resp.json().await {
             Ok(v)  => v,
-            Err(e) => { warn!("malformed command payload: {e}"); return; }
+            Err(e) => { warn!("malformed command payload: {e}"); return false; }
         };
 
         for cmd in commands {
@@ -86,7 +124,7 @@ impl CommandPuller {
                     debug!(command_id = %envelope.command_id, "command verified");
                     if self.out.send(envelope).await.is_err() {
                         warn!("engine channel closed — dropping command");
-                        return;
+                        return true;
                     }
                 }
                 Verdict::Rejected(reason) => {
@@ -104,5 +142,6 @@ impl CommandPuller {
                 }
             }
         }
+        true
     }
 }
