@@ -25,7 +25,7 @@ LOG_DIR="/var/log/trapd"
 STATE_DIR="/var/lib/trapd"
 
 # ── Preflight checks ────────────────────────────────────────────────────────
-for cmd in curl systemctl; do
+for cmd in curl systemctl sha256sum; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: '$cmd' is required but not installed." >&2
         exit 1
@@ -36,6 +36,35 @@ if [[ $EUID -ne 0 ]]; then
     echo "ERROR: This script must be run as root (sudo)." >&2
     exit 1
 fi
+
+# ── Integrity verification ───────────────────────────────────────────────────
+# Download the published SHA256 for an artifact and verify the local copy
+# *before* it is installed as root.  A missing or mismatching checksum aborts
+# the install — an unverified root binary is never trusted.  This closes the
+# supply-chain window where a MITM/CDN/registry compromise could swap the
+# binary for malicious code (the download uses HTTPS, but TLS alone does not
+# protect against a rogue CA or a tampered release asset).
+verify_checksum() {
+    local file="$1" sums_url="$2" sums_file
+    sums_file="$(mktemp)"
+    if ! curl -fsSL "$sums_url" -o "$sums_file"; then
+        rm -f "$sums_file"
+        echo "ERROR: could not download checksum ($sums_url)." >&2
+        echo "       Refusing to install an unverified binary." >&2
+        exit 1
+    fi
+    local expected actual
+    expected="$(awk '{print $1}' "$sums_file" | head -1)"
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+    rm -f "$sums_file"
+    if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+        echo "ERROR: SHA256 mismatch for ${file##*/} — binary may have been tampered with." >&2
+        echo "       expected: ${expected:-<empty>}" >&2
+        echo "       actual:   ${actual}" >&2
+        exit 1
+    fi
+    echo "Checksum verified (${actual})."
+}
 
 # ── Fetch latest release tag ────────────────────────────────────────────────
 echo "Fetching latest release..."
@@ -57,6 +86,7 @@ TMP_BINARY="/tmp/trapd-agent-${LATEST_TAG}"
 
 echo "Downloading ${BINARY_NAME}..."
 curl -fL "$DOWNLOAD_URL" -o "$TMP_BINARY"
+verify_checksum "$TMP_BINARY" "${DOWNLOAD_URL}.sha256"
 chmod +x "$TMP_BINARY"
 mv -f "$TMP_BINARY" "$INSTALL_BIN"
 echo "Installed to ${INSTALL_BIN}"
@@ -68,6 +98,7 @@ TMP_EBPF="/tmp/trapd-agent-exec-${LATEST_TAG}"
 echo "Downloading ${EBPF_BINARY_NAME}..."
 mkdir -p "$EBPF_INSTALL_DIR"
 if curl -fL "$EBPF_URL" -o "$TMP_EBPF" 2>/dev/null; then
+    verify_checksum "$TMP_EBPF" "${EBPF_URL}.sha256"
     chmod 644 "$TMP_EBPF"
     mv -f "$TMP_EBPF" "$EBPF_INSTALL_BIN"
     echo "eBPF program installed to ${EBPF_INSTALL_BIN}"
@@ -182,6 +213,27 @@ EBPF_INSTALL_BIN="${EBPF_INSTALL_BIN}"
 
 log() { echo "\$(date -u +"%Y-%m-%dT%H:%M:%SZ") trapd-update: \$*"; }
 
+# Verify a downloaded artifact against its published SHA256 before installing it
+# as root.  A missing or mismatching checksum aborts the update so a tampered
+# release asset can never replace the running agent binary.
+verify_checksum() {
+    local file="\$1" sums_url="\$2" sums_file
+    sums_file="\$(mktemp)"
+    if ! curl -fsSL "\$sums_url" -o "\$sums_file"; then
+        rm -f "\$sums_file"
+        log "ERROR: could not download checksum (\$sums_url) — refusing unverified binary." >&2
+        exit 1
+    fi
+    local expected actual
+    expected="\$(awk '{print \$1}' "\$sums_file" | head -1)"
+    actual="\$(sha256sum "\$file" | awk '{print \$1}')"
+    rm -f "\$sums_file"
+    if [[ -z "\$expected" || "\$expected" != "\$actual" ]]; then
+        log "ERROR: SHA256 mismatch for \${file##*/} — binary may have been tampered with." >&2
+        exit 1
+    fi
+}
+
 LATEST_TAG=\$(curl -sf "https://api.github.com/repos/\${REPO}/releases/latest" \\
     | grep '"tag_name"' \\
     | head -1 \\
@@ -205,12 +257,14 @@ log "Updating \$CURRENT_VERSION → \$LATEST_TAG..."
 DOWNLOAD_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${BINARY_NAME}"
 TMP_BINARY="/tmp/trapd-agent-new"
 curl -fL "\$DOWNLOAD_URL" -o "\$TMP_BINARY"
+verify_checksum "\$TMP_BINARY" "\${DOWNLOAD_URL}.sha256"
 chmod +x "\$TMP_BINARY"
 mv -f "\$TMP_BINARY" "\$INSTALL_BIN"
 
 EBPF_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${EBPF_BINARY_NAME}"
 TMP_EBPF="/tmp/trapd-agent-exec-new"
 if curl -fL "\$EBPF_URL" -o "\$TMP_EBPF" 2>/dev/null; then
+    verify_checksum "\$TMP_EBPF" "\${EBPF_URL}.sha256"
     chmod 644 "\$TMP_EBPF"
     mkdir -p "\$EBPF_INSTALL_DIR"
     mv -f "\$TMP_EBPF" "\$EBPF_INSTALL_BIN"
