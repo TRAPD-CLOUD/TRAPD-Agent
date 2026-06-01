@@ -64,7 +64,7 @@ what it does in seconds, with no backend at all.
 | **Telemetry** | Process, network, system, filesystem, user-logon and (with eBPF) rich syscall-level events — exec, fork, file open/unlink/rename/chmod/chown, mmap, ptrace, kernel-module load, setuid, DNS, IPC/shm, namespace changes, kill attempts. |
 | **Detection** | A userspace, platform-neutral analytics engine: IOC matching (hashes/IPs/domains), ATT&CK-mapped behavioural heuristics, C2 **beaconing** detection, **DNS-tunnelling** detection, port-scan / lateral-movement / cloud-metadata recon detection. Each finding is a first-class event. |
 | **Prevention** | Active response driven by **Ed25519-signed** backend commands or local IoC rules: kill PID, quarantine/restore file, isolate/de-isolate host network, block/unblock IP, hot-reload policy, manage packages. Every action is reversible and audited. |
-| **Deception** | Builds a per-host **recon profile** of plausible secret locations (SSH keys, AWS creds, `.kube/config`, …), deploys backend-generated **honeytokens** with camouflage, and (with eBPF) fires a `critical` detection the instant one is touched — with the accessor's full process lineage. |
+| **Deception** | Builds a per-host **recon profile** of plausible secret locations (SSH keys, AWS creds, `.kube/config`, …), deploys backend-generated **honeytokens** with camouflage, breadcrumbs and an optional **out-of-band canary** second channel. With eBPF it fires a `critical` detection the instant a token is read, copied, `stat`-ed, `exec`-ed or `mmap`-ed — with the accessor's full process lineage and session context — and can **freeze** (SIGSTOP + snapshot), kill or isolate the accessor on policy. |
 | **Self-protection** | Watchdog subprocess (auto-restart), anti-ptrace detection, binary self-integrity verification (optionally Ed25519-signed), kernel-hardening audit, plus a self-tamper collector. |
 | **Fleet management** | First-run enrollment, heartbeat metrics, remote config pull with ETag, signed command pull, asset inventory, and a daily self-updater. |
 
@@ -169,35 +169,71 @@ Supported actions (`CommandPayload.kind`): `kill_pid`, `quarantine_file` /
 `restore_file`, `isolate_network` / `deisolate_network` (iptables/nftables, with a
 backend allowlist so the host can still reach TRAPD), `block_ip` / `unblock_ip`
 (optional TTL), `update_policy` (hot-reload IoC rules), `install_package` /
-`remove_package` / `upgrade_package`, and `deploy_honeytoken` / `revoke_honeytoken`.
+`remove_package` / `upgrade_package`, `deploy_honeytoken` / `revoke_honeytoken`, and
+the forensic-response verbs `freeze_pid` / `thaw_pid` (SIGSTOP/SIGCONT).
 An optional LSM loader (`lsm_loader.rs`) syncs policy into a kernel enforcement layer.
 
 ### 4. Deception (honeytokens)
 
-`agent/src/deception/` — plant believable bait and catch whoever reads it.
+`agent/src/deception/` — plant believable bait and catch whoever touches it. The
+agent owns *what is physically on the host*; the backend owns *intent, content and
+correlation*. The two reconcile over the signed-command and event channels.
 
 - **Profiling** (`profiler.rs`) — condenses the asset inventory into a
   **recon profile**: the secret artefacts an attacker would expect on *this*
   host (MITRE **T1552** Unsecured Credentials / **T1083** Discovery), e.g.
   `~/.aws/credentials` only if `awscli` is installed, `~/.kube/config`,
   `.pgpass`, `.my.cnf`, `id_rsa`, web-root `.env`, `passwords.kdbx`, shell
-  history. Candidates are scored and sent to the backend.
-- **Placement** (`mod.rs`) — the backend's LLM generates host-specific content
+  history, `.git-credentials`, browser stores, fake `/etc/shadow`. Candidates
+  carry an evidence-gated score and a **host persona** (consistent internal
+  hostname/domain/subnet so all tokens on a host look like one coherent
+  environment); both are sent to the backend on the inventory channel.
+- **Placement** (`mod.rs`) — the backend generates host-specific content
   (no LLM ever runs on the endpoint) and issues a signed `deploy_honeytoken`.
-  The agent writes it with **camouflage**: explicit file mode, and with
-  `mimic_neighbor` it copies a sibling's owner/group and atime/mtime so the bait
-  doesn't look freshly planted. Safety invariants: paths must be absolute with no
-  `..`, it **never overwrites** an existing file, and **revoke only removes what
-  the agent itself planted** (tracked in `<state>/honeytokens.json`).
-- **Detection & response** — an eBPF map (`HONEYTOKEN_PATHS`) is armed from the
-  on-disk register every 15 s. Any open of a token — **even read-only** — fires a
-  `class=detection, action=honeytoken_access`, `severity=critical` event
-  (confidence always 100, since no legitimate workflow reads a honeytoken),
-  enriched with the accessor's full `/proc` **process lineage**. The prevention
-  engine then reacts per the `honeytoken_response` policy: `none` < `alert` <
-  `kill` (SIGKILL the accessor) < `isolate` (full network isolation). A built-in
-  allowlist suppresses benign sweepers (mlocate/updatedb, AV, backup tools, the
-  agent itself).
+  The agent writes it with **camouflage**: atomic temp-write + rename, explicit
+  file mode, and with `mimic_neighbor` it copies a sibling's owner/group and
+  atime/mtime so the bait doesn't look freshly planted. It can also lay
+  **breadcrumbs** — create-mode files and byte-exact, append-safe history lines
+  (the "forgotten `mysql -u root -p…`") that cross-link to the token to make it
+  findable — all reversibly removed on revoke. Safety invariants: paths must be
+  absolute with no `..`, it **never overwrites** an existing file, and **revoke
+  only removes what the agent itself planted** (tracked in
+  `<state>/honeytokens.json`).
+- **Bait hygiene & anti-fingerprinting** (`validate.rs`) — every payload is
+  validated *before* it ever hits disk: per-kind structural checks (AWS `AKIA…`
+  INI, JWT, kubeconfig, `.pgpass`, PEM SSH key, magic bytes for PDF/OOXML/KDBX,
+  …), a **forbidden-watermark guard** so no shared `trapd`/`honeytoken` tell can
+  leak across the fleet, and enforced uniqueness of the canary marker. A bad
+  deploy fails fast instead of revealing the trap.
+- **Detection** (`detection/honeytoken.rs` + `trapd-agent-ebpf/src/file_open.rs`)
+  — eBPF maps (`HONEYTOKEN_PATHS`, `HONEYTOKEN_DIRS`, `HONEYTOKEN_INODES`) are
+  armed from the on-disk register every 15 s. Coverage goes well beyond a plain
+  open: a `vfs_open` kprobe catches an **inode-level content read** (even through
+  a hardlink or `mmap`), and tracepoints catch `open`/`openat2`, `stat`/`statx`/
+  `readlink`/`getdents` (directory recon), `execve`, `linkat`, `unlinkat`/
+  `renameat2` (tamper). Each hit becomes a `class=detection,
+  action=honeytoken_access`, `severity=critical` event scored per access kind,
+  with MITRE mapping and enriched with the accessor's full `/proc` **process
+  lineage** and **session context** (loginuid, tty, cwd, cgroup, container id +
+  runtime, namespaces, and the correlated remote login IP). A built-in,
+  config-extendable allowlist suppresses benign sweepers (mlocate/updatedb, AV,
+  backup tools, the agent itself).
+- **Response & forensics** (`prevention/engine.rs`, `forensics/`) — the
+  prevention engine reacts per the `honeytoken_response` policy on an escalating
+  scale: `none` < `alert` < **`freeze`** (SIGSTOP the accessor and capture a
+  process **snapshot** — state/exe/cwd/cmdline/open-fds — so you can triage
+  before deciding) < `kill` (SIGKILL) < `isolate` (full network isolation). A
+  **flight recorder** bundles the buffered pre-history of the offending
+  session/PID with the trigger event, and with `honeytoken_deception_escalation`
+  enabled a hit can raise further deception/escalation. An operator can later
+  release a frozen process with the signed `thaw_pid` command.
+- **Out-of-band canary** (`registry.rs`) — a token can carry a second,
+  independent channel (`aws_cloudtrail`, `dns`, `http`, `kube_api`,
+  `ssh_honeypot`): the agent records the `tracking_id`/markers in the deploy
+  audit, and if the bait is ever *used off-host* the backend correlates the
+  foreign signal (CloudTrail alarm, tracking-domain hit, …) back to this token,
+  host and accessor — a high-confidence "the credential left the building" signal
+  that survives even if on-host detection is evaded.
 
 ### 5. Self-protection
 
@@ -286,9 +322,12 @@ RUST_LOG=info
 ```
 
 Most behaviour (poll intervals, enabled collectors, watched FS paths, prevention
-toggle, honeytoken response level, isolation allowlist) is delivered at runtime
-by the backend via the config-pull endpoint (`AgentConfig`) and can change
-without a restart.
+toggle, isolation allowlist) is delivered at runtime by the backend via the
+config-pull endpoint (`AgentConfig`) and can change without a restart. The
+deception subsystem is likewise backend-controlled:
+`honeytoken_detection_enabled`, `honeytoken_response` (`none`/`alert`/`freeze`/
+`kill`/`isolate`), `honeytoken_accessor_allowlist` (extra benign accessors) and
+`honeytoken_deception_escalation`.
 
 ### Filesystem layout
 
@@ -526,7 +565,7 @@ agent/                     Main trapd-agent binary (workspace member)
     collectors/linux/      Telemetry collectors (polling + eBPF)
     detection/             IOC + behavioural + beaconing/DNS/recon engine
     prevention/            Active response: kill, quarantine, isolate, block
-    deception/             Honeytoken profiling, placement, registry
+    deception/             Honeytoken profiling, placement, bait validation, registry, OOB canary
     selfprotect/           Watchdog, anti-ptrace, integrity, hardening
     enrollment/ http/ transport/ heartbeat/ config/ inventory/ output/ paths/
 trapd-agent-ebpf/          Kernel-side eBPF programs (separate toolchain)
