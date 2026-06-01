@@ -248,6 +248,7 @@ impl Engine {
                 mimic_neighbor,
                 canary_marker,
                 token_kind,
+                breadcrumbs,
             } => {
                 self.cmd_deploy_honeytoken(
                     path,
@@ -256,6 +257,7 @@ impl Engine {
                     *mimic_neighbor,
                     canary_marker.clone(),
                     token_kind.clone(),
+                    breadcrumbs,
                     &cmd_id,
                 );
             }
@@ -274,6 +276,7 @@ impl Engine {
         mimic_neighbor: bool,
         canary_marker: Option<String>,
         kind: Option<String>,
+        breadcrumbs: &[super::commands::BreadcrumbSpec],
         cmd_id: &str,
     ) {
         let content = match base64::engine::general_purpose::STANDARD.decode(content_b64) {
@@ -294,6 +297,26 @@ impl Engine {
             }
         };
 
+        // Decode breadcrumbs; a single bad one is skipped (logged) rather than
+        // failing the whole deployment.
+        let breadcrumbs: Vec<deception::Breadcrumb> = breadcrumbs
+            .iter()
+            .filter_map(|b| {
+                match base64::engine::general_purpose::STANDARD.decode(&b.content_b64) {
+                    Ok(content) => Some(deception::Breadcrumb {
+                        path: b.path.clone(),
+                        content,
+                        mode: b.mode,
+                        append: b.append,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(path = %b.path, error = %e, "skipping breadcrumb with bad base64");
+                        None
+                    }
+                }
+            })
+            .collect();
+
         let req = DeployRequest {
             path: path.to_string(),
             content,
@@ -302,6 +325,7 @@ impl Engine {
             canary_marker,
             kind,
             command_id: Some(cmd_id.to_string()),
+            breadcrumbs,
         };
 
         match deception::deploy(&self.honeytokens, req) {
@@ -325,6 +349,7 @@ impl Engine {
                         "mimic_neighbor": record.mimic_neighbor,
                         "neighbor_path": record.neighbor_path,
                         "has_canary": record.canary_marker.is_some(),
+                        "breadcrumbs": record.breadcrumbs.len(),
                     }),
                 );
             }

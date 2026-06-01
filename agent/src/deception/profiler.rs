@@ -26,18 +26,48 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::inventory::{SoftwareInventory, UserAccount};
+use crate::inventory::{NetInterface, SoftwareInventory, UserAccount};
 
 /// Schema version of the recon profile, independent of the inventory schema so
 /// the candidate contract can evolve on its own.
-pub const RECON_PROFILE_SCHEMA: u32 = 1;
+///
+/// v2 adds the [`HostPersona`] so the backend can generate content that is
+/// *consistent* across every token on a host (same internal hostname, domain,
+/// subnet and usernames a real artefact would reference).
+pub const RECON_PROFILE_SCHEMA: u32 = 2;
 
 /// The condensed recon view derived from inventory, sent to the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconProfile {
     pub schema_version: u32,
+    /// The host's identity facts, so generated bait references real internal
+    /// names/addresses instead of giveaway invented ones (issue #32, point 3).
+    pub persona: HostPersona,
     /// Token candidates, sorted by descending [`TokenCandidate::score`].
     pub candidates: Vec<TokenCandidate>,
+}
+
+/// Stable, host-wide facts the backend should weave into every token so the
+/// whole set tells one coherent story. Derived deterministically from inventory;
+/// contains only data already collected elsewhere in the snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostPersona {
+    /// The host's reported hostname (may be short or an FQDN).
+    pub hostname: String,
+    /// Domain part of an FQDN hostname, when present (e.g. `corp.example.com`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Primary interactive user (lowest-uid human), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_user: Option<String>,
+    /// All human/login usernames on the host.
+    pub human_users: Vec<String>,
+    /// Primary private IPv4 address, if one is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_ipv4: Option<String>,
+    /// /24 CIDR derived from [`Self::internal_ipv4`] (e.g. `10.0.12.0/24`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subnet_cidr: Option<String>,
 }
 
 /// One plausible honeytoken placement derived from observed host context.
@@ -66,12 +96,15 @@ pub struct TokenCandidate {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Build the recon profile from the gathered users + software inventory.
-///
-/// Filesystem existence checks run against the live host (cheap `stat`s) so a
-/// candidate is only proposed where its real counterpart is plausible.
-pub fn build_profile(users: &[UserAccount], software: &SoftwareInventory) -> ReconProfile {
-    build_profile_with(users, software, &RealFs)
+/// Build the recon profile *with* host identity, deriving the [`HostPersona`]
+/// from the hostname and network interfaces so generated bait stays consistent.
+pub fn build_profile_with_host(
+    users: &[UserAccount],
+    software: &SoftwareInventory,
+    hostname: &str,
+    interfaces: &[NetInterface],
+) -> ReconProfile {
+    build_profile_full(users, software, hostname, interfaces, &RealFs)
 }
 
 /// Abstraction over filesystem probing so the heuristics are unit-testable
@@ -91,9 +124,23 @@ impl FsProbe for RealFs {
     }
 }
 
+/// Test entry: build candidates against an injected [`FsProbe`] with no host
+/// facts (empty persona).
+#[cfg(test)]
 pub fn build_profile_with(
     users: &[UserAccount],
     software: &SoftwareInventory,
+    fs: &dyn FsProbe,
+) -> ReconProfile {
+    build_profile_full(users, software, "", &[], fs)
+}
+
+/// Full builder: candidates (via `fs`) plus the derived persona.
+pub fn build_profile_full(
+    users: &[UserAccount],
+    software: &SoftwareInventory,
+    hostname: &str,
+    interfaces: &[NetInterface],
     fs: &dyn FsProbe,
 ) -> ReconProfile {
     let mut candidates: Vec<TokenCandidate> = Vec::new();
@@ -106,6 +153,7 @@ pub fn build_profile_with(
     let has_kube = pkg_present(software, &["kubectl", "kubernetes-cli", "kubeadm", "kubelet"]);
     let has_nginx = pkg_present(software, &["nginx", "nginx-core", "nginx-full", "nginx-light"]);
     let has_apache = pkg_present(software, &["apache2", "httpd", "apache2-bin"]);
+    let has_git = pkg_present(software, &["git", "git-core"]);
 
     // ── Per-user, home-rooted candidates ────────────────────────────────────
     // Only humans with a real login shell get personal credential bait; service
@@ -214,6 +262,66 @@ pub fn build_profile_with(
                 mimic_neighbor: true,
             });
         }
+
+        // git is installed or the user has a ~/.gitconfig → a ~/.git-credentials
+        // store with a plaintext HTTPS token is a classic, high-value leak.
+        if has_git || fs.exists(&format!("{home}/.gitconfig")) {
+            candidates.push(TokenCandidate {
+                kind: "git_credentials".into(),
+                path: format!("{home}/.git-credentials"),
+                mitre_technique: "T1552.001".into(),
+                rationale: "git is present — ~/.git-credentials stores plaintext HTTPS tokens".into(),
+                context: vec![format!("user:{}", user.username), "pkg:git".into()],
+                score: score(78, 1.0),
+                mode: 0o600,
+                mimic_neighbor: fs.exists(&format!("{home}/.gitconfig")),
+            });
+        }
+
+        // Browser credential stores — only proposed where the browser's own
+        // profile directory already exists, so the placement is never a tell.
+        let firefox_dir = format!("{home}/.mozilla/firefox");
+        if fs.is_dir(&firefox_dir) {
+            candidates.push(TokenCandidate {
+                kind: "browser_logins".into(),
+                path: format!("{firefox_dir}/logins.json"),
+                mitre_technique: "T1555.003".into(),
+                rationale: "a Firefox profile exists — logins.json holds saved site credentials".into(),
+                context: vec![format!("user:{}", user.username), "dir:~/.mozilla/firefox".into()],
+                score: score(72, 1.0),
+                mode: 0o600,
+                mimic_neighbor: true,
+            });
+        }
+        let chrome_dir = format!("{home}/.config/google-chrome/Default");
+        if fs.is_dir(&chrome_dir) {
+            candidates.push(TokenCandidate {
+                kind: "browser_logins".into(),
+                path: format!("{chrome_dir}/Login Data"),
+                mitre_technique: "T1555.003".into(),
+                rationale: "a Chrome profile exists — 'Login Data' holds saved site credentials".into(),
+                context: vec![format!("user:{}", user.username), "dir:~/.config/google-chrome".into()],
+                score: score(72, 1.0),
+                mode: 0o600,
+                mimic_neighbor: true,
+            });
+        }
+
+        // A password-bearing Office document is bait that doubles as an
+        // out-of-band canary: opening it fetches a remote tracking pixel.
+        let documents = format!("{home}/Documents");
+        if fs.is_dir(&documents) {
+            candidates.push(TokenCandidate {
+                kind: "office_doc".into(),
+                path: format!("{documents}/Passwords.docx"),
+                mitre_technique: "T1552.001".into(),
+                rationale: "user keeps a ~/Documents folder — a 'Passwords.docx' is irresistible loot and can carry a tracking pixel".into(),
+                context: vec![format!("user:{}", user.username), "dir:~/Documents".into()],
+                score: score(60, 1.0),
+                mode: 0o600,
+                mimic_neighbor: true,
+            });
+        }
     }
 
     // ── Webroot .env ─────────────────────────────────────────────────────────
@@ -266,10 +374,92 @@ pub fn build_profile_with(
         }
     }
 
+    // A "backup" of /etc/shadow is loot an attacker hunts after escalation. We
+    // never touch the real /etc/shadow — the bait is a copy in a backup dir.
+    for shadow_dir in ["/var/backups", "/opt/backups", "/root"] {
+        if fs.is_dir(shadow_dir) {
+            candidates.push(TokenCandidate {
+                kind: "shadow_backup".into(),
+                path: format!("{shadow_dir}/shadow.bak"),
+                mitre_technique: "T1003.008".into(),
+                rationale: format!("{shadow_dir} exists — a copied /etc/shadow with crackable hashes is prime post-escalation loot"),
+                context: vec![format!("dir:{shadow_dir}")],
+                score: score(86, 1.0),
+                mode: 0o600,
+                mimic_neighbor: true,
+            });
+            break; // one shadow backup is enough
+        }
+    }
+
     // Highest score first; stable tie-break on path for deterministic output.
     candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
 
-    ReconProfile { schema_version: RECON_PROFILE_SCHEMA, candidates }
+    ReconProfile {
+        schema_version: RECON_PROFILE_SCHEMA,
+        persona: derive_persona(users, hostname, interfaces),
+        candidates,
+    }
+}
+
+/// Derive the host persona from already-collected inventory facts.
+fn derive_persona(users: &[UserAccount], hostname: &str, interfaces: &[NetInterface]) -> HostPersona {
+    let human_users: Vec<String> =
+        users.iter().filter(|u| u.is_human).map(|u| u.username.clone()).collect();
+
+    // Primary interactive user = lowest-uid human (root is uid 0 but is rarely
+    // "the" desktop user; prefer the lowest uid >= 1000, else any human).
+    let primary_user = users
+        .iter()
+        .filter(|u| u.is_human && u.uid >= 1000)
+        .min_by_key(|u| u.uid)
+        .or_else(|| users.iter().find(|u| u.is_human))
+        .map(|u| u.username.clone());
+
+    let domain = hostname
+        .split_once('.')
+        .map(|(_, d)| d.to_string())
+        .filter(|d| !d.is_empty());
+
+    let internal_ipv4 = first_private_ipv4(interfaces);
+    let subnet_cidr = internal_ipv4.as_deref().and_then(slash24_cidr);
+
+    HostPersona {
+        hostname: hostname.to_string(),
+        domain,
+        primary_user,
+        human_users,
+        internal_ipv4,
+        subnet_cidr,
+    }
+}
+
+/// First non-loopback RFC-1918 IPv4 across the up interfaces.
+fn first_private_ipv4(interfaces: &[NetInterface]) -> Option<String> {
+    interfaces
+        .iter()
+        .flat_map(|i| i.ipv4.iter())
+        .find(|ip| is_private_ipv4(ip))
+        .cloned()
+}
+
+fn is_private_ipv4(ip: &str) -> bool {
+    let o: Vec<u8> = ip.split('.').filter_map(|p| p.parse().ok()).collect();
+    if o.len() != 4 {
+        return false;
+    }
+    match (o[0], o[1]) {
+        (10, _) => true,
+        (172, b) if (16..=31).contains(&b) => true,
+        (192, 168) => true,
+        _ => false,
+    }
+}
+
+/// `a.b.c.d` → `a.b.c.0/24`.
+fn slash24_cidr(ip: &str) -> Option<String> {
+    let o: Vec<&str> = ip.split('.').collect();
+    (o.len() == 4).then(|| format!("{}.{}.{}.0/24", o[0], o[1], o[2]))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -413,5 +603,85 @@ mod tests {
         // Web server but no webroot on disk -> nothing (no implausible placement).
         let p2 = build_profile_with(&[], &software(&["nginx"]), &FakeFs::new(&[], &[]));
         assert!(!p2.candidates.iter().any(|c| c.kind == "webroot_env"));
+    }
+
+    #[test]
+    fn git_credentials_gated_on_git_presence() {
+        let users = vec![user("alice", "/home/alice")];
+        // No git, no ~/.gitconfig -> not proposed.
+        let none = build_profile_with(&users, &software(&[]), &FakeFs::new(&[], &[]));
+        assert!(!none.candidates.iter().any(|c| c.kind == "git_credentials"));
+        // git installed -> proposed at ~/.git-credentials.
+        let with = build_profile_with(&users, &software(&["git"]), &FakeFs::new(&[], &[]));
+        let gc = with.candidates.iter().find(|c| c.kind == "git_credentials").expect("git candidate");
+        assert_eq!(gc.path, "/home/alice/.git-credentials");
+        assert_eq!(gc.mitre_technique, "T1552.001");
+    }
+
+    #[test]
+    fn browser_and_office_and_shadow_archetypes() {
+        let users = vec![user("alice", "/home/alice")];
+        let fs = FakeFs::new(
+            &[
+                "/home/alice/.mozilla/firefox",
+                "/home/alice/.config/google-chrome/Default",
+                "/home/alice/Documents",
+                "/var/backups",
+            ],
+            &[],
+        );
+        let p = build_profile_with(&users, &software(&[]), &fs);
+        let kinds: HashSet<&str> = p.candidates.iter().map(|c| c.kind.as_str()).collect();
+        assert!(kinds.contains("browser_logins"), "firefox/chrome stores proposed");
+        assert!(kinds.contains("office_doc"), "office tracking doc proposed");
+        assert!(kinds.contains("shadow_backup"), "shadow backup proposed");
+        // Two browser_logins candidates (firefox + chrome).
+        assert_eq!(p.candidates.iter().filter(|c| c.kind == "browser_logins").count(), 2);
+        let shadow = p.candidates.iter().find(|c| c.kind == "shadow_backup").unwrap();
+        assert_eq!(shadow.path, "/var/backups/shadow.bak");
+        assert_eq!(shadow.mitre_technique, "T1003.008");
+    }
+
+    #[test]
+    fn persona_is_derived_from_host_facts() {
+        let mut admin = user("root", "/root");
+        admin.uid = 0;
+        let alice = UserAccount { uid: 1000, ..user("alice", "/home/alice") };
+        let bob = UserAccount { uid: 1001, ..user("bob", "/home/bob") };
+        let ifaces = vec![
+            NetInterface { name: "lo".into(), mac: None, ipv4: vec!["127.0.0.1".into()], ipv6: vec![], up: true },
+            NetInterface { name: "eth0".into(), mac: None, ipv4: vec!["10.0.12.34".into()], ipv6: vec![], up: true },
+        ];
+        let p = build_profile_full(
+            &[admin, alice, bob],
+            &software(&[]),
+            "web01.corp.example.com",
+            &ifaces,
+            &FakeFs::new(&[], &[]),
+        );
+        let persona = &p.persona;
+        assert_eq!(persona.hostname, "web01.corp.example.com");
+        assert_eq!(persona.domain.as_deref(), Some("corp.example.com"));
+        // Lowest-uid human >= 1000 is the primary user (not root).
+        assert_eq!(persona.primary_user.as_deref(), Some("alice"));
+        assert!(persona.human_users.contains(&"bob".to_string()));
+        // Loopback skipped; first private IPv4 wins, /24 derived.
+        assert_eq!(persona.internal_ipv4.as_deref(), Some("10.0.12.34"));
+        assert_eq!(persona.subnet_cidr.as_deref(), Some("10.0.12.0/24"));
+    }
+
+    #[test]
+    fn persona_handles_short_hostname_and_no_private_ip() {
+        let p = build_profile_full(
+            &[user("alice", "/home/alice")],
+            &software(&[]),
+            "laptop",
+            &[NetInterface { name: "eth0".into(), mac: None, ipv4: vec!["8.8.8.8".into()], ipv6: vec![], up: true }],
+            &FakeFs::new(&[], &[]),
+        );
+        assert_eq!(p.persona.hostname, "laptop");
+        assert_eq!(p.persona.domain, None, "short hostname has no domain");
+        assert_eq!(p.persona.internal_ipv4, None, "public IP is not an internal address");
+        assert_eq!(p.persona.subnet_cidr, None);
     }
 }

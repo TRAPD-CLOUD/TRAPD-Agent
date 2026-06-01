@@ -47,6 +47,24 @@ use uuid::Uuid;
 
 use super::policy::IocRule;
 
+/// One cross-linking breadcrumb in a `DeployHoneytoken` command: an artefact
+/// placed next to the token to make it discoverable (a config that names the
+/// key, a "forgotten" `.bash_history` line, …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreadcrumbSpec {
+    /// Absolute path of the breadcrumb artefact.
+    pub path: String,
+    /// Base64 of the breadcrumb's bytes.
+    pub content_b64: String,
+    /// Octal file mode applied when the breadcrumb is *created* (0 → 0o600).
+    #[serde(default)]
+    pub mode: u32,
+    /// When true, append to an existing file (e.g. shell history) instead of
+    /// creating a new one — done safely, without truncation.
+    #[serde(default)]
+    pub append: bool,
+}
+
 /// Discriminated union of all response commands the backend can request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -104,6 +122,10 @@ pub enum CommandPayload {
         /// `token_kind` because `kind` is the enum's own serde tag.
         #[serde(default)]
         token_kind: Option<String>,
+        /// Optional cross-linking breadcrumbs placed alongside the token to make
+        /// it discoverable (issue #32, point 3).
+        #[serde(default)]
+        breadcrumbs: Vec<BreadcrumbSpec>,
     },
     /// Remove a previously-deployed honeytoken. The agent only deletes a path
     /// that is present in its local register, so this can never remove a real
