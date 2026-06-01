@@ -8,12 +8,14 @@ mod file_manip;
 mod file_open;
 mod fork;
 mod kill;
+mod memfd;
 mod mmap;
 mod module_load;
 mod namespace;
 mod network;
 mod process_block;
 mod ptrace;
+mod setuid;
 mod shm;
 mod write;
 

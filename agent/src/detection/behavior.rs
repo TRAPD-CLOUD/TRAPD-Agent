@@ -224,6 +224,21 @@ pub fn inspect_process(comm: &str, exe: &str, cmdline: &str) -> Option<Detection
     None
 }
 
+/// Alert when a process was launched with LD_PRELOAD set (shared-library injection).
+pub fn inspect_ld_preload(comm: &str, exe: &str, ld_preload: &str) -> Option<DetectionData> {
+    Some(DetectionData {
+        rule_id:         "injection.ld_preload".into(),
+        title:           "LD_PRELOAD set — shared library injection".into(),
+        category:        "defense_evasion".into(),
+        mitre_tactic:    Some("TA0005 Defense Evasion".into()),
+        mitre_technique: Some("T1574.006".into()),
+        confidence:      85,
+        subject:         exe.to_string(),
+        detail:          format!("{comm} launched with {ld_preload}"),
+        evidence:        serde_json::json!({ "ld_preload": ld_preload, "comm": comm }),
+    })
+}
+
 /// Return the final path component (works for both `/usr/bin/bash` and `bash`).
 fn basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
@@ -303,5 +318,13 @@ mod tests {
         assert!(inspect_process("curl", "/usr/bin/curl", "curl https://example.com -o page.html").is_none());
         assert!(inspect_process("find", "/usr/bin/find", "find . -name '*.rs'").is_none());
         assert!(inspect_process("cat", "/usr/bin/cat", "cat README.md").is_none());
+    }
+
+    #[test]
+    fn detects_ld_preload_injection() {
+        let d = inspect_ld_preload("ls", "/usr/bin/ls", "LD_PRELOAD=/evil.so").unwrap();
+        assert_eq!(d.rule_id, "injection.ld_preload");
+        assert_eq!(d.category, "defense_evasion");
+        assert_eq!(d.mitre_technique.as_deref(), Some("T1574.006"));
     }
 }

@@ -23,8 +23,12 @@
 
 mod beaconing;
 mod behavior;
+mod dns_tunnel;
 mod ioc;
 mod netscan;
+
+#[cfg(feature = "yara")]
+pub mod yara_scanner;
 
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
@@ -32,7 +36,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use crate::schema::{
-    AgentEvent, DetectionData, EventAction, EventClass, EventData, Severity,
+    AgentEvent, DetectionData, EventAction, EventClass, EventData, Severity, SetuidData,
 };
 
 pub use ioc::IocSet;
@@ -45,6 +49,7 @@ pub struct DetectionEngine {
     iocs: RwLock<IocSet>,
     beacons: Mutex<beaconing::BeaconTracker>,
     netscan: Mutex<netscan::NetScanTracker>,
+    dns_tunnel: Mutex<dns_tunnel::DnsTunnelTracker>,
     started: Instant,
 }
 
@@ -67,6 +72,7 @@ impl DetectionEngine {
             iocs: RwLock::new(iocs),
             beacons: Mutex::new(beaconing::BeaconTracker::new()),
             netscan: Mutex::new(netscan::NetScanTracker::new()),
+            dns_tunnel: Mutex::new(dns_tunnel::DnsTunnelTracker::new()),
             started: Instant::now(),
         }
     }
@@ -121,6 +127,15 @@ impl DetectionEngine {
             }
             EventData::ProcessExec(p) => {
                 self.inspect_process(&p.comm, &p.exe, &p.cmdline, None, &mut out);
+                if let Some(ref ld_preload) = p.ld_preload {
+                    if let Some(d) = behavior::inspect_ld_preload(&p.comm, &p.exe, ld_preload) {
+                        let sev = severity_for(d.confidence);
+                        out.push(self.detection(sev, d));
+                    }
+                }
+            }
+            EventData::Setuid(s) => {
+                self.inspect_setuid(s, &mut out);
             }
             EventData::NetworkConnection(n) => {
                 self.inspect_network(&n.dst_addr, n.dst_port, &mut out);
@@ -132,6 +147,9 @@ impl DetectionEngine {
                 // The eBPF DNS event carries the resolver address; treat the
                 // destination as a domain candidate when it is non-numeric.
                 self.inspect_domain(&d.dst_addr, &mut out);
+            }
+            EventData::FileOpen(f) => {
+                self.inspect_file_open(&f.path, &f.comm, &mut out);
             }
             _ => {}
         }
@@ -173,6 +191,33 @@ impl DetectionEngine {
         if let Some(d) = behavior::inspect_process(comm, exe, cmdline) {
             let sev = severity_for(d.confidence);
             out.push(self.detection(sev, d));
+        }
+    }
+
+    fn inspect_setuid(&self, s: &SetuidData, out: &mut Vec<AgentEvent>) {
+        if s.new_uid == 0 && s.old_uid != 0 {
+            out.push(self.detection(
+                Severity::High,
+                DetectionData {
+                    rule_id:         "privesc.setuid_root".into(),
+                    title:           "Privilege escalation via setuid(0)".into(),
+                    category:        "privilege_escalation".into(),
+                    mitre_tactic:    Some("TA0004 Privilege Escalation".into()),
+                    mitre_technique: Some("T1548.001".into()),
+                    confidence:      90,
+                    subject:         s.comm.clone(),
+                    detail:          format!(
+                        "PID {} ({}) set effective UID to 0 (was UID {})",
+                        s.pid, s.comm, s.old_uid
+                    ),
+                    evidence: serde_json::json!({
+                        "pid":     s.pid,
+                        "old_uid": s.old_uid,
+                        "new_uid": s.new_uid,
+                        "comm":    s.comm,
+                    }),
+                },
+            ));
         }
     }
 
@@ -290,6 +335,15 @@ impl DetectionEngine {
         self.detection(severity, data)
     }
 
+    fn inspect_file_open(&self, path: &str, comm: &str, out: &mut Vec<AgentEvent>) {
+        // Sensitive credential-store access (logic + lists live in the
+        // filesystem collector, mirroring how `behavior` owns its heuristics).
+        if let Some(d) = crate::collectors::linux::filesystem::inspect_sensitive_access(path, comm) {
+            let sev = severity_for(d.confidence);
+            out.push(self.detection(sev, d));
+        }
+    }
+
     fn inspect_domain(&self, domain: &str, out: &mut Vec<AgentEvent>) {
         let matched = self.iocs.read().ok().and_then(|i| i.match_domain(domain));
         if let Some(matched) = matched {
@@ -305,6 +359,38 @@ impl DetectionEngine {
                     subject: domain.to_string(),
                     detail: format!("Resolved {domain}, matching threat-intel domain {matched}"),
                     evidence: serde_json::json!({ "domain": domain, "matched": matched }),
+                },
+            ));
+        }
+
+        // DNS-tunneling cadence / label-length analysis.
+        let now = self.started.elapsed().as_secs_f64();
+        let verdict = self
+            .dns_tunnel
+            .lock()
+            .ok()
+            .and_then(|mut t| t.observe(domain, now));
+        if let Some(v) = verdict {
+            out.push(self.detection(
+                Severity::High,
+                DetectionData {
+                    rule_id: "dns_tunnel.anomalous_query_volume".into(),
+                    title: "Possible DNS tunneling".into(),
+                    category: "exfiltration".into(),
+                    mitre_tactic: Some("TA0011 Command and Control".into()),
+                    mitre_technique: Some("T1071.004".into()),
+                    confidence: 75,
+                    subject: v.domain.clone(),
+                    detail: format!(
+                        "DNS tunneling indicators for {}: {} queries/min, avg label length {:.1} ({})",
+                        v.domain, v.queries_per_min, v.avg_label_length, v.reason,
+                    ),
+                    evidence: serde_json::json!({
+                        "domain": v.domain,
+                        "queries_per_min": v.queries_per_min,
+                        "avg_label_length": v.avg_label_length,
+                        "reason": v.reason,
+                    }),
                 },
             ));
         }
@@ -362,6 +448,7 @@ mod tests {
             ),
             beacons: Mutex::new(beaconing::BeaconTracker::new()),
             netscan: Mutex::new(netscan::NetScanTracker::new()),
+            dns_tunnel: Mutex::new(dns_tunnel::DnsTunnelTracker::new()),
             started: Instant::now(),
         }
     }

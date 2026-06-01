@@ -14,7 +14,7 @@ use walkdir::WalkDir;
 
 use crate::collectors::Collector;
 use crate::schema::{
-    AgentEvent, AgentTamperData, EventAction, EventClass, EventData, FileEventData,
+    AgentEvent, AgentTamperData, DetectionData, EventAction, EventClass, EventData, FileEventData,
     IntegrityViolationData, RansomwareIndicatorData, Severity,
 };
 
@@ -34,6 +34,15 @@ const BACKUP_PATHS: &[&str] = &["/backup", "/var/backup", "/var/backups"];
 
 /// Agent-owned config paths — any change is severity: critical.
 const AGENT_CONFIG_PATHS: &[&str] = &["/etc/trapd"];
+
+/// Credential / secret stores.  A file-open of any of these by an unexpected
+/// process is treated as credential theft (MITRE T1555 / T1552.004).
+const SENSITIVE_PATHS: &[&str] = &[
+    "/etc/shadow", "/etc/gshadow", ".ssh/", ".aws/credentials", ".kube/config",
+];
+
+/// Processes legitimately expected to open the sensitive paths above.
+const ALLOWED_PROCS: &[&str] = &["sshd", "sudo", "passwd"];
 
 const WATCH_MASK: WatchMask = WatchMask::CREATE
     .union(WatchMask::DELETE)
@@ -150,6 +159,10 @@ fn run_sync(
             Err(e) => warn!("FilesystemCollector: cannot watch {path}: {e}"),
         }
     }
+
+    // Optional YARA scanner — loads *.yar rules once; inert if none present.
+    #[cfg(feature = "yara")]
+    let yara_scanner = crate::detection::yara_scanner::YaraScanner::load();
 
     // Sliding window for mass-modification (ransomware) detection.
     let mut mod_window: VecDeque<Instant> = VecDeque::new();
@@ -286,6 +299,18 @@ fn run_sync(
                     }),
                 ))
             { return; }
+
+            // ── YARA: scan newly-created files (feature `yara`) ───────────────
+            #[cfg(feature = "yara")]
+            if mask.contains(EventMask::CREATE) {
+                if let Some((sev, data)) = yara_scanner.scan_file(&path) {
+                    if send(&tx, AgentEvent::new(
+                        agent_id.clone(), hostname.clone(),
+                        EventClass::Detection, EventAction::Detected, sev,
+                        EventData::Detection(data),
+                    )) { return; }
+                }
+            }
 
             // ── Basic inotify event (always emitted) ──────────────────────────
             if let Some(action) = mask_to_action(mask) {
@@ -477,6 +502,40 @@ fn has_ransom_extension(path: &str) -> bool {
     RANSOM_EXTENSIONS.iter().any(|&ext| lower.ends_with(ext))
 }
 
+// ── Sensitive file-access detection ───────────────────────────────────────────
+
+/// Inspect a file-open against the sensitive credential-store list.
+///
+/// Returns a [`DetectionData`] when `path` is one of [`SENSITIVE_PATHS`] and the
+/// accessing process `comm` is **not** in [`ALLOWED_PROCS`].  Pure and
+/// unit-testable, mirroring the heuristics in `detection::behavior`; the
+/// confidence (95) maps to `Severity::Critical` in the detection engine.
+pub fn inspect_sensitive_access(path: &str, comm: &str) -> Option<DetectionData> {
+    let matched = SENSITIVE_PATHS.iter().find(|&&p| path.contains(p))?;
+    let base = comm.rsplit('/').next().unwrap_or(comm);
+    if ALLOWED_PROCS.contains(&base) {
+        return None;
+    }
+    Some(DetectionData {
+        rule_id: "creds.sensitive_file_access".into(),
+        title: "Sensitive credential store accessed by an unexpected process".into(),
+        category: "credential_access".into(),
+        mitre_tactic: Some("TA0006 Credential Access".into()),
+        mitre_technique: Some("T1555".into()),
+        confidence: 95,
+        subject: path.to_string(),
+        detail: format!(
+            "Process {base} opened sensitive path {path} (not in allow-list {ALLOWED_PROCS:?})"
+        ),
+        evidence: serde_json::json!({
+            "path": path,
+            "comm": comm,
+            "matched": matched,
+            "techniques": ["T1555", "T1552.004"],
+        }),
+    })
+}
+
 fn mask_to_action(mask: EventMask) -> Option<EventAction> {
     if mask.contains(EventMask::CREATE) || mask.contains(EventMask::MOVED_TO) {
         Some(EventAction::Create)
@@ -486,5 +545,39 @@ fn mask_to_action(mask: EventMask) -> Option<EventAction> {
         Some(EventAction::Modify)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flags_shadow_read_by_unexpected_proc() {
+        let d = inspect_sensitive_access("/etc/shadow", "cat").unwrap();
+        assert_eq!(d.category, "credential_access");
+        assert_eq!(d.mitre_technique.as_deref(), Some("T1555"));
+        assert_eq!(d.confidence, 95); // → Severity::Critical
+    }
+
+    #[test]
+    fn allows_expected_procs() {
+        assert!(inspect_sensitive_access("/etc/shadow", "sshd").is_none());
+        assert!(inspect_sensitive_access("/home/u/.ssh/id_rsa", "sudo").is_none());
+        assert!(inspect_sensitive_access("/etc/shadow", "/usr/bin/passwd").is_none());
+    }
+
+    #[test]
+    fn flags_ssh_and_cloud_credentials() {
+        assert!(inspect_sensitive_access("/home/u/.ssh/id_ed25519", "scp").is_some());
+        assert!(inspect_sensitive_access("/home/u/.aws/credentials", "curl").is_some());
+        assert!(inspect_sensitive_access("/root/.kube/config", "python3").is_some());
+        assert!(inspect_sensitive_access("/etc/gshadow", "tail").is_some());
+    }
+
+    #[test]
+    fn ignores_non_sensitive_paths() {
+        assert!(inspect_sensitive_access("/etc/hostname", "cat").is_none());
+        assert!(inspect_sensitive_access("/home/u/notes.txt", "vim").is_none());
     }
 }

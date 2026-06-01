@@ -1,34 +1,74 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
-use tracing::warn;
+use tracing::{info, warn};
+use walkdir::WalkDir;
 
 use crate::collectors::Collector;
 use crate::schema::{
-    AgentEvent, EventAction, EventClass, EventData, ProcessCreateData, ProcessTerminateData,
-    Severity,
+    AgentEvent, DetectionData, EventAction, EventClass, EventData, MemoryAnomalyData,
+    ProcessCreateData, ProcessTerminateData, Severity,
 };
 
 pub struct ProcessCollector {
-    initialized:  bool,
-    known_pids:   HashSet<i32>,
-    known_names:  HashMap<i32, String>,
-    uid_to_user:  HashMap<u32, String>,
+    initialized:   bool,
+    known_pids:    HashSet<i32>,
+    known_names:   HashMap<i32, String>,
+    uid_to_user:   HashMap<u32, String>,
+    /// Baseline of every SUID binary present on the host at agent start.  An
+    /// exec of a SUID binary *not* in this set is suspicious (MITRE T1548.001).
+    suid_baseline: HashSet<PathBuf>,
 }
 
 impl ProcessCollector {
     pub fn new() -> Self {
+        let suid_baseline = scan_suid_baseline();
+        info!("ProcessCollector: SUID baseline ready — {} binaries", suid_baseline.len());
         Self {
-            initialized:  false,
-            known_pids:   HashSet::new(),
-            known_names:  HashMap::new(),
-            uid_to_user:  load_passwd().unwrap_or_default(),
+            initialized:   false,
+            known_pids:    HashSet::new(),
+            known_names:   HashMap::new(),
+            uid_to_user:   load_passwd().unwrap_or_default(),
+            suid_baseline,
         }
     }
+}
+
+/// True if `path` currently has its SUID bit set.  `stat()`s the binary.
+fn is_suid_path(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o4000 != 0)
+        .unwrap_or(false)
+}
+
+/// One-time scan of all SUID binaries on the host — the userspace equivalent of
+/// `find / -xdev -perm -4000 -type f`.  Stays on the root filesystem (so the
+/// `/proc`, `/sys` and `/dev` pseudo-mounts are skipped) and never follows
+/// symlinks.  Errors on individual entries are ignored — a best-effort baseline.
+fn scan_suid_baseline() -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    for entry in WalkDir::new("/")
+        .same_file_system(true)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if meta.permissions().mode() & 0o4000 != 0 {
+                set.insert(entry.path().to_path_buf());
+            }
+        }
+    }
+    set
 }
 
 impl Default for ProcessCollector {
@@ -49,6 +89,33 @@ fn load_passwd() -> Result<HashMap<u32, String>> {
         }
     }
     Ok(map)
+}
+
+/// Parse /proc/{pid}/maps and return (region, perms) pairs for rwx anonymous mappings.
+fn check_rwx_maps(pid: i32) -> Vec<(String, String)> {
+    let content = match fs::read_to_string(format!("/proc/{pid}/maps")) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut results = Vec::new();
+    for line in content.lines() {
+        let mut fields = line.split_whitespace();
+        let region     = match fields.next() { Some(r) => r, None => continue };
+        let perms      = match fields.next() { Some(p) => p, None => continue };
+        let _offset    = fields.next();
+        let _dev       = fields.next();
+        let inode_str  = match fields.next() { Some(i) => i, None => continue };
+        let pathname   = fields.next();
+
+        let inode: u64 = inode_str.parse().unwrap_or(1);
+        let is_rwx = perms.contains('r') && perms.contains('w') && perms.contains('x');
+        let is_anon = inode == 0 && pathname.is_none();
+
+        if is_rwx && is_anon {
+            results.push((region.to_string(), perms.to_string()));
+        }
+    }
+    results
 }
 
 fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCreateData> {
@@ -150,6 +217,64 @@ impl Collector for ProcessCollector {
                         return Ok(());
                     }
                     self.known_names.insert(pid, info.name.clone());
+
+                    // Check for rwx anonymous memory mappings (fileless shellcode indicator).
+                    for (region, perms) in check_rwx_maps(pid) {
+                        let anomaly = AgentEvent::new(
+                            agent_id.clone(),
+                            hostname.clone(),
+                            EventClass::Memory,
+                            EventAction::MemoryAnomaly,
+                            Severity::High,
+                            EventData::MemoryAnomaly(MemoryAnomalyData {
+                                pid,
+                                region,
+                                perms,
+                            }),
+                        );
+                        if tx.send(anomaly).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+
+                    // ── SUID-binary tracking (MITRE T1548.001) ──────────────
+                    // Flag execution of a SUID binary that was not present in
+                    // the startup baseline (e.g. a freshly-planted setuid root
+                    // backdoor used for privilege escalation).
+                    if !info.exe.is_empty() {
+                        let exe_path = PathBuf::from(&info.exe);
+                        if is_suid_path(&exe_path) && !self.suid_baseline.contains(&exe_path) {
+                            let det = AgentEvent::new(
+                                agent_id.clone(),
+                                hostname.clone(),
+                                EventClass::Detection,
+                                EventAction::Detected,
+                                Severity::High,
+                                EventData::Detection(DetectionData {
+                                    rule_id: "privesc.untracked_suid_exec".into(),
+                                    title: "Execution of a SUID binary not in the startup baseline".into(),
+                                    category: "privilege_escalation".into(),
+                                    mitre_tactic: Some("TA0004 Privilege Escalation".into()),
+                                    mitre_technique: Some("T1548.001".into()),
+                                    confidence: 75,
+                                    subject: info.exe.clone(),
+                                    detail: format!(
+                                        "Process {} (pid {}) executed SUID binary {} which is not in the baseline",
+                                        info.name, info.pid, info.exe,
+                                    ),
+                                    evidence: serde_json::json!({
+                                        "exe": info.exe,
+                                        "pid": info.pid,
+                                        "uid": info.uid,
+                                        "comm": info.name,
+                                    }),
+                                }),
+                            );
+                            if tx.send(det).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
             }
 

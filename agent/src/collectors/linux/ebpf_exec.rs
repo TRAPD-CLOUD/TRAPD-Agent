@@ -44,18 +44,21 @@ use crate::schema::{
 // ── Kernel↔Userspace struct layout ───────────────────────────────────────────
 // Must be kept in sync with `ExecEvent` in trapd-agent-ebpf/src/main.rs.
 
-const COMM_LEN: usize = 16;
+const COMM_LEN:    usize = 16;
 const FILENAME_LEN: usize = 256;
+const PRELOAD_LEN:  usize = 256;
 
 #[repr(C)]
 struct RawExecEvent {
-    pid:          u32,
-    ppid:         u32,
-    uid:          u32,
-    gid:          u32,
-    comm:         [u8; COMM_LEN],
-    filename:     [u8; FILENAME_LEN],
-    filename_len: u32,
+    pid:            u32,
+    ppid:           u32,
+    uid:            u32,
+    gid:            u32,
+    comm:           [u8; COMM_LEN],
+    filename:       [u8; FILENAME_LEN],
+    filename_len:   u32,
+    ld_preload_len: u32,
+    ld_preload:     [u8; PRELOAD_LEN],
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
@@ -239,17 +242,31 @@ impl Collector for EbpfExecCollector {
             "failed to load eBPF program — requires Linux ≥ 5.8 and CAP_BPF (run as root)",
         )?;
 
-        // Load + attach the tracepoint program
-        let prog: &mut TracePoint = bpf
-            .program_mut("sched_process_exec")
-            .context("sched_process_exec not found in eBPF binary")?
-            .try_into()
-            .context("program is not a TracePoint")?;
-        prog.load().context("BPF verifier rejected the program")?;
-        prog.attach("sched", "sched_process_exec")
-            .context("failed to attach to sched/sched_process_exec")?;
+        // Load + attach sched_process_exec (fires after successful exec)
+        {
+            let prog: &mut TracePoint = bpf
+                .program_mut("sched_process_exec")
+                .context("sched_process_exec not found in eBPF binary")?
+                .try_into()
+                .context("sched_process_exec is not a TracePoint")?;
+            prog.load().context("BPF verifier rejected sched_process_exec")?;
+            prog.attach("sched", "sched_process_exec")
+                .context("failed to attach to sched/sched_process_exec")?;
+        }
 
-        // Open the ring buffer map
+        // Load + attach sys_enter_execve (fires before exec; scans envp for LD_PRELOAD)
+        {
+            let prog: &mut TracePoint = bpf
+                .program_mut("sys_enter_execve")
+                .context("sys_enter_execve not found in eBPF binary")?
+                .try_into()
+                .context("sys_enter_execve is not a TracePoint")?;
+            prog.load().context("BPF verifier rejected sys_enter_execve")?;
+            prog.attach("syscalls", "sys_enter_execve")
+                .context("failed to attach to syscalls/sys_enter_execve")?;
+        }
+
+        // Open the ring buffer map (shared by both tracepoints above)
         let ring_buf = RingBuf::try_from(
             bpf.map_mut("EXEC_EVENTS")
                 .context("EXEC_EVENTS map not found in eBPF binary")?,
@@ -298,6 +315,12 @@ impl Collector for EbpfExecCollector {
                 let container_id = proc_container_id(pid);
                 let username     = proc_username(raw.uid);
 
+                let ld_preload = if raw.ld_preload_len > 0 {
+                    Some(cstr(&raw.ld_preload).to_string())
+                } else {
+                    None
+                };
+
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),
@@ -315,6 +338,7 @@ impl Collector for EbpfExecCollector {
                         cmdline,
                         cwd,
                         container_id,
+                        ld_preload,
                     }),
                 );
 
