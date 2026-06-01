@@ -1009,6 +1009,10 @@ impl Collector for EbpfSyscallCollector {
              up to 6 best-effort honeytoken-coverage tracepoints"
         );
 
+        // Our own PID, used to drop the agent's self-generated file opens (see
+        // the FILE_OPEN_EVENTS arm below) and break the events.ndjson loop.
+        let agent_pid = std::process::id();
+
         loop {
             tokio::select! {
                 _ = tx.closed() => {
@@ -1019,6 +1023,16 @@ impl Collector for EbpfSyscallCollector {
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawFileOpenEvent>(&item) } {
+                            // Self-exclusion: the agent's own file opens are pure
+                            // monitor noise and, for its telemetry sink
+                            // (`/var/log/trapd/events.ndjson`), a runaway feedback
+                            // loop — every append opens the file, which emits an
+                            // open event, which is appended to the file, which
+                            // opens it again. Drop opens by our own process; this
+                            // mirrors the honeytoken `Allowlist` self-exclusion.
+                            if ev.pid == agent_pid {
+                                continue;
+                            }
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
