@@ -95,6 +95,17 @@ pub async fn load_or_enroll(
              (and TRAPD_BACKEND_URL=<url>) and restart.",
         )?;
 
+    // The one-time enrollment token has now been captured into a local. Remove
+    // it from the process environment so it is no longer exposed via
+    // /proc/self/environ for the (potentially long) lifetime of the agent. A
+    // leaked token would let an attacker enroll a rogue agent against the same
+    // project. We hold the copy we need for the retry loop below.
+    //
+    // SAFETY: called before any collectors/worker tasks are spawned, while the
+    // agent is still single-threaded, so no other thread can be reading the
+    // environment concurrently.
+    unsafe { std::env::remove_var("TRAPD_ENROLL_TOKEN") };
+
     let base = crate::http::normalize_base_url(backend_url);
     let enroll_url = format!("{base}/api/v1/agents/enroll");
     let client = crate::http::control_client();
