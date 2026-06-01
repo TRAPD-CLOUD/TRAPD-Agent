@@ -271,15 +271,27 @@ fn max_attempts_from_env() -> Option<u32> {
     }
 }
 
-/// Capped exponential backoff with deterministic-but-spread jitter.
+/// Capped exponential backoff with CSPRNG jitter.
 fn backoff(attempt: u32) -> Duration {
     let exp = BACKOFF_BASE
         .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1).min(16)));
     let capped = exp.min(BACKOFF_MAX);
-    // Add up to ~1s of jitter derived from the wall clock so a fleet of agents
-    // restarting together does not hammer the backend in lockstep.
-    let jitter_ms = (now_nanos() % 1000) as u64;
-    capped + Duration::from_millis(jitter_ms)
+    // Add up to ~1s of jitter so a fleet of agents restarting together (e.g.
+    // after a power event) does not clump into the same sub-second retry
+    // window. Drawn from the OS CSPRNG rather than the wall clock, which would
+    // be near-identical across machines that boot together.
+    capped + Duration::from_millis(jitter_ms())
+}
+
+/// Uniform-ish jitter in `[0, 1000)` ms from the OS CSPRNG, falling back to the
+/// wall clock if the RNG is somehow unavailable (never fails the backoff).
+fn jitter_ms() -> u64 {
+    let mut buf = [0u8; 8];
+    let raw = match getrandom::fill(&mut buf) {
+        Ok(()) => u64::from_le_bytes(buf),
+        Err(_) => now_nanos() as u64,
+    };
+    raw % 1000
 }
 
 fn now_nanos() -> u128 {

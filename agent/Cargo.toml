@@ -30,6 +30,7 @@ ed25519-dalek      = { version = "2", features = ["pkcs8", "pem"] }
 base64             = "0.22"
 globset            = "0.4"
 ipnet              = { version = "2", features = ["serde"] }
+getrandom          = "0.3"
 
 # Optional YARA file-scanning support — enable with `--features yara`.
 # Requires the libyara C library + headers at build time; off by default so the
