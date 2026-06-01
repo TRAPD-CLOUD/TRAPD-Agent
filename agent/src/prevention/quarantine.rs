@@ -200,7 +200,10 @@ fn chown(_p: &Path, _u: u32, _g: u32) -> Result<()> { Ok(()) }
 /// Toggle the ext-family `i` (immutable) attribute via `chattr(1)`.
 fn chattr_immutable(p: &Path, set: bool) -> Result<()> {
     let flag = if set { "+i" } else { "-i" };
-    let out  = std::process::Command::new("chattr")
+    // Resolve chattr by absolute path rather than via $PATH: a tampered $PATH
+    // or a shadowed `chattr` earlier in the search order could otherwise make
+    // quarantine appear to succeed while the immutable flag is never set.
+    let out  = std::process::Command::new(chattr_bin())
         .arg(flag)
         .arg(p)
         .output()
@@ -210,4 +213,15 @@ fn chattr_immutable(p: &Path, set: bool) -> Result<()> {
               String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
+}
+
+/// First existing well-known absolute path to `chattr`, defaulting to the most
+/// common location so a clear "not found" error surfaces if it is truly absent.
+fn chattr_bin() -> &'static str {
+    const CANDIDATES: &[&str] = &["/usr/bin/chattr", "/bin/chattr", "/usr/sbin/chattr"];
+    CANDIDATES
+        .iter()
+        .copied()
+        .find(|p| Path::new(p).exists())
+        .unwrap_or("/usr/bin/chattr")
 }
