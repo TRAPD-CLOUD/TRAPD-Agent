@@ -24,6 +24,8 @@
 
 use std::fmt;
 
+use super::registry::{OutOfBandCanary, CANARY_CHANNELS};
+
 /// Why a piece of bait content was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaitError {
@@ -118,6 +120,73 @@ pub fn reject_shared_watermark(kind: &str, text: &str) -> Result<(), BaitError> 
         }
     }
     Ok(())
+}
+
+/// Validate an out-of-band canary descriptor before its token is placed
+/// (issue #32, point 2).
+///
+/// A second-channel canary the backend cannot correlate is dead weight that
+/// still risks fingerprinting, so — exactly like content validation — we refuse
+/// the deployment up front rather than placing an uncorrelatable trap. We
+/// require:
+///
+///   * a **known channel** (one of [`CANARY_CHANNELS`]);
+///   * a **non-empty tracking id** (the correlation key the foreign signal
+///     echoes back), carrying no shared TRAPD tell;
+///   * at least one **marker**, each non-empty and free of forbidden watermarks;
+///   * a light **channel ↔ marker shape** check, so an obviously-wrong descriptor
+///     (an `aws_cloudtrail` canary with no AWS-key-shaped marker, a `dns`/`http`
+///     canary with no hostname/URL) is caught at the agent instead of surfacing
+///     later as a foreign signal nothing can be matched against.
+pub fn validate_out_of_band(oob: &OutOfBandCanary) -> Result<(), BaitError> {
+    let kind = "out_of_band_canary";
+    require(
+        CANARY_CHANNELS.contains(&oob.channel.as_str()),
+        kind,
+        &format!("unknown canary channel '{}'", oob.channel),
+    )?;
+    require(!oob.tracking_id.trim().is_empty(), kind, "empty tracking_id")?;
+    reject_shared_watermark(kind, &oob.tracking_id)?;
+    require(!oob.markers.is_empty(), kind, "no canary markers")?;
+    for m in &oob.markers {
+        require(!m.trim().is_empty(), kind, "empty canary marker")?;
+        reject_shared_watermark(kind, m)?;
+    }
+
+    match oob.channel.as_str() {
+        "aws_cloudtrail" => require(
+            oob.markers.iter().any(|m| has_access_key_id(m)),
+            kind,
+            "aws_cloudtrail canary carries no AWS-key-shaped marker",
+        )?,
+        "dns" | "http" => require(
+            oob.markers.iter().any(|m| looks_like_host_or_url(m)),
+            kind,
+            "dns/http canary carries no hostname/URL marker",
+        )?,
+        // kube_api / ssh_honeypot markers (endpoints, key fingerprints) are too
+        // free-form to shape-check beyond the non-empty + watermark guards above.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// True if `s` looks like a DNS hostname or an http(s) URL — a dotted label of
+/// alphanumerics/`-`/`_`/`.` with at least one dot, optionally URL-prefixed.
+fn looks_like_host_or_url(s: &str) -> bool {
+    let host = s
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| s.trim().strip_prefix("http://"))
+        .unwrap_or_else(|| s.trim());
+    // Take the authority component up to the first path/query/port separator.
+    let host = host.split(['/', '?', '#', ':']).next().unwrap_or("");
+    host.contains('.')
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
 }
 
 // ── Per-kind validators ───────────────────────────────────────────────────────
@@ -454,5 +523,57 @@ mod tests {
     #[test]
     fn unknown_kind_passes_structurally_but_is_guarded() {
         assert!(validate_bait("some_future_kind", b"arbitrary plausible content").is_ok());
+    }
+
+    fn oob(channel: &str, tracking_id: &str, markers: &[&str]) -> OutOfBandCanary {
+        OutOfBandCanary {
+            channel: channel.into(),
+            tracking_id: tracking_id.into(),
+            markers: markers.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn out_of_band_accepts_well_formed_channels() {
+        assert!(validate_out_of_band(&oob("aws_cloudtrail", "trk-1", &["AKIA2E0AABCDEFGHIJKL"])).is_ok());
+        assert!(validate_out_of_band(&oob("dns", "trk-2", &["a1b2.canary.example.net"])).is_ok());
+        assert!(validate_out_of_band(&oob("http", "trk-3", &["https://c.example.net/p.png"])).is_ok());
+        // Free-form channels only need a non-empty, untainted marker.
+        assert!(validate_out_of_band(&oob("kube_api", "trk-4", &["https://10.0.0.1:6443"])).is_ok());
+        assert!(validate_out_of_band(&oob("ssh_honeypot", "trk-5", &["SHA256:abcdef"])).is_ok());
+    }
+
+    #[test]
+    fn out_of_band_rejects_unknown_channel_and_empty_fields() {
+        assert!(validate_out_of_band(&oob("smtp_callback", "t", &["x.example.net"])).is_err());
+        assert!(validate_out_of_band(&oob("dns", "  ", &["x.example.net"])).is_err());
+        assert!(validate_out_of_band(&oob("dns", "t", &[])).is_err());
+        assert!(validate_out_of_band(&oob("dns", "t", &["  "])).is_err());
+    }
+
+    #[test]
+    fn out_of_band_enforces_channel_marker_shape() {
+        // aws_cloudtrail needs an AWS-key-shaped marker.
+        assert!(validate_out_of_band(&oob("aws_cloudtrail", "t", &["not-a-key"])).is_err());
+        // dns/http need a hostname/URL.
+        assert!(validate_out_of_band(&oob("dns", "t", &["plainstring"])).is_err());
+        assert!(validate_out_of_band(&oob("http", "t", &["nodothere"])).is_err());
+    }
+
+    #[test]
+    fn out_of_band_rejects_shared_watermark_in_marker_or_tracking_id() {
+        assert!(validate_out_of_band(&oob("dns", "t", &["canarytoken.example.net"])).is_err());
+        assert!(validate_out_of_band(&oob("dns", "trapd-1", &["ok.example.net"])).is_err());
+    }
+
+    #[test]
+    fn host_or_url_shape() {
+        assert!(looks_like_host_or_url("a.b.example.net"));
+        assert!(looks_like_host_or_url("https://x.example.net/path?q=1"));
+        assert!(looks_like_host_or_url("http://host.example.net:8080/p"));
+        assert!(!looks_like_host_or_url("nodot"));
+        assert!(!looks_like_host_or_url(".leadingdot.net"));
+        assert!(!looks_like_host_or_url("trailingdot."));
+        assert!(!looks_like_host_or_url("has space.net"));
     }
 }

@@ -24,6 +24,17 @@
 //!     monitored honeypot) is embedded in the *content* by the backend; the
 //!     agent only records that a marker exists for later correlation.
 //!
+//! ## Out-of-band canaries (issue #32, point 2)
+//!
+//! A token may carry a [`OutOfBandCanary`]: a *second, independent* signal that
+//! fires when the bait is **used** off-host — a fake AWS key whose use trips
+//! CloudTrail, a tracking DNS/HTTP domain (Canarytokens-style), or a kube/SSH
+//! credential pointed at honeypot infra. The agent never sees that channel
+//! itself; it [validates](validate::validate_out_of_band) the descriptor, refuses
+//! to share a marker across tokens, records it, and (via the engine's deploy
+//! audit) *publishes the registration* so the backend can correlate an inbound
+//! foreign signal back to this token and host (Token ↔ Host ↔ attacker).
+//!
 //! ## Safety invariants
 //!
 //!   * **never overwrite** an existing file — placement refuses if the target
@@ -50,8 +61,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 pub use profiler::{build_profile_with_host, ReconProfile};
-pub use registry::{BreadcrumbRecord, HoneytokenRecord, HoneytokenStore};
-pub use validate::validate_bait;
+pub use registry::{BreadcrumbRecord, HoneytokenRecord, HoneytokenStore, OutOfBandCanary};
+pub use validate::{validate_bait, validate_out_of_band};
 
 /// Everything needed to place one honeytoken. Built by the engine from a
 /// verified `deploy_honeytoken` command.
@@ -66,7 +77,13 @@ pub struct DeployRequest {
     /// Copy owner/group + atime/mtime from a neighbouring file for blend-in.
     pub mimic_neighbor: bool,
     /// Optional out-of-band canary marker embedded in `content` by the backend.
+    /// Legacy single-string form; prefer [`out_of_band`](Self::out_of_band).
     pub canary_marker: Option<String>,
+    /// Optional structured out-of-band canary — the second, independent signal
+    /// channel that fires when the bait is *used* off-host (issue #32, point 2).
+    /// Validated and recorded so the backend can correlate a foreign signal back
+    /// to this token and host.
+    pub out_of_band: Option<OutOfBandCanary>,
     /// Token family from the recon candidate, if the backend echoed it back.
     pub kind: Option<String>,
     /// Id of the signed command requesting this deployment.
@@ -108,12 +125,28 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
     validate_bait(&kind_str, &req.content)
         .map_err(|e| anyhow::anyhow!("refusing to deploy honeytoken: {e}"))?;
 
-    // Anti-fingerprinting: a canary marker must be unique to this token. The same
-    // marker reused across tokens would let one second-channel hit (or one greppy
-    // attacker) enumerate every bait at once.
+    // Out-of-band canary (issue #32, point 2): validate the second-channel
+    // descriptor before any mutation, so a malformed/uncorrelatable canary is a
+    // pure no-op rather than a planted trap nothing can attribute later.
+    if let Some(oob) = req.out_of_band.as_ref() {
+        validate_out_of_band(oob)
+            .map_err(|e| anyhow::anyhow!("refusing to deploy honeytoken: {e}"))?;
+    }
+
+    // Anti-fingerprinting: every canary marker — the legacy single string and
+    // each out-of-band marker — must be unique to this token. A marker reused
+    // across tokens would let one foreign-signal hit (or one greppy attacker)
+    // enumerate every bait at once.
     if let Some(marker) = req.canary_marker.as_deref() {
         if store.canary_in_use(marker) {
             bail!("refusing to deploy honeytoken: canary marker is already in use by another token");
+        }
+    }
+    if let Some(oob) = req.out_of_band.as_ref() {
+        for marker in &oob.markers {
+            if store.canary_in_use(marker) {
+                bail!("refusing to deploy honeytoken: out-of-band canary marker '{marker}' is already in use by another token");
+            }
         }
     }
 
@@ -187,6 +220,7 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
         mimic_neighbor: req.mimic_neighbor,
         neighbor_path,
         canary_marker: req.canary_marker,
+        out_of_band: req.out_of_band,
         deployed_at: Utc::now(),
         command_id: req.command_id,
         breadcrumbs,
@@ -593,6 +627,7 @@ mod tests {
             mode: 0o600,
             mimic_neighbor: false,
             canary_marker: Some("AKIACANARYTOKEN01".into()),
+            out_of_band: None,
             kind: Some("aws_credentials".into()),
             command_id: Some("cmd-1".into()),
             breadcrumbs: Vec::new(),
@@ -713,6 +748,64 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("canary marker is already in use"), "got: {err}");
+        assert!(!dir.join("b").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn oob(channel: &str, tracking_id: &str, marker: &str) -> OutOfBandCanary {
+        OutOfBandCanary {
+            channel: channel.into(),
+            tracking_id: tracking_id.into(),
+            markers: vec![marker.into()],
+        }
+    }
+
+    #[test]
+    fn deploy_records_out_of_band_canary() {
+        let dir = scratch_dir();
+        let store = store_in(&dir);
+        let path = dir.join(".aws").join("credentials");
+        let mut r = req(&path.to_string_lossy(), VALID_AWS);
+        // Distinct from the content's legacy marker so uniqueness holds.
+        r.out_of_band = Some(oob("aws_cloudtrail", "trk-1", "AKIA2E0AOOBCDEFGHIJK"));
+        let rec = deploy(&store, r).unwrap();
+        let stored = rec.out_of_band.expect("oob recorded");
+        assert_eq!(stored.channel, "aws_cloudtrail");
+        assert_eq!(stored.tracking_id, "trk-1");
+        // The token is resolvable from its tracking id for foreign-signal correlation.
+        assert!(store.find_by_tracking_id("trk-1").is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_malformed_out_of_band_canary() {
+        let dir = scratch_dir();
+        let store = store_in(&dir);
+        let path = dir.join(".aws").join("credentials");
+        let mut r = req(&path.to_string_lossy(), VALID_AWS);
+        // dns channel with a non-host marker → refused, and nothing is written.
+        r.out_of_band = Some(oob("dns", "trk-x", "not-a-hostname"));
+        let err = deploy(&store, r).unwrap_err().to_string();
+        assert!(err.contains("out_of_band_canary"), "got: {err}");
+        assert!(!path.exists(), "a rejected oob deploy must not touch the filesystem");
+        assert!(store.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_duplicate_out_of_band_marker() {
+        let dir = scratch_dir();
+        let store = store_in(&dir);
+        let mut a = req(&dir.join("a").to_string_lossy(), VALID_AWS);
+        a.canary_marker = None; // isolate the oob-marker uniqueness path
+        a.out_of_band = Some(oob("dns", "trk-a", "shared.canary.example.net"));
+        assert!(deploy(&store, a).is_ok());
+
+        let mut b = req(&dir.join("b").to_string_lossy(), VALID_AWS);
+        b.canary_marker = None;
+        b.out_of_band = Some(oob("dns", "trk-b", "shared.canary.example.net"));
+        let err = deploy(&store, b).unwrap_err().to_string();
+        assert!(err.contains("out-of-band canary marker"), "got: {err}");
         assert!(!dir.join("b").exists());
         let _ = fs::remove_dir_all(&dir);
     }
