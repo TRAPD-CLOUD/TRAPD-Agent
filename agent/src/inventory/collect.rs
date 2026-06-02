@@ -143,8 +143,7 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
     }
 
     suid.sort_by(|a, b| a.path.cmp(&b.path));
-    caps.sort_by(|a, b| a.path.cmp(&b.path));
-    (suid, caps)
+    caps.sort_by(|a, b| a.path.cmp(&b.path));    (suid, caps)
 }
 
 /// SHA256 of a file, formatted `sha256:<hex>`; `None` on any IO error.
@@ -335,7 +334,7 @@ fn gather_listening_ports() -> Vec<ListeningPort> {
         push_udp(v, "udp6");
     }
 
-    out.sort_by(|a, b| (a.port, a.protocol.clone()).cmp(&(b.port, b.protocol.clone())));
+    out.sort_by_key(|a| (a.port, a.protocol.clone()));
     out.dedup_by(|a, b| {
         a.port == b.port && a.protocol == b.protocol && a.address == b.address
     });
