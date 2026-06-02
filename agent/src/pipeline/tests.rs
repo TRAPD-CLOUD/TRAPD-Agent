@@ -1,6 +1,8 @@
+use std::path::PathBuf;
+
 use uuid::Uuid;
 
-use super::RingBuffer;
+use super::Spool;
 use crate::schema::{
     AgentEvent, EventAction, EventClass, EventData, Severity, SystemSnapshotData,
 };
@@ -27,56 +29,119 @@ fn dummy_event() -> AgentEvent {
     )
 }
 
-#[test]
-fn test_ring_buffer_drops_oldest_when_full() {
-    let mut buf = RingBuffer::with_max(3);
-    buf.push(dummy_event()); // slot 1
-    buf.push(dummy_event()); // slot 2
-    buf.push(dummy_event()); // slot 3  — buffer now full
-    buf.push(dummy_event()); // slot 4  — oldest (slot 1) must be dropped
-    assert_eq!(buf.len(), 3, "buffer must not exceed max capacity");
+fn tmp_journal(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "trapd_spool_{}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        tag,
+    ));
+    dir.join("queue.ndjson")
 }
 
+// ── In-memory semantics (parity with the previous ring buffer) ────────────────
+
 #[test]
-fn test_peek_batch_returns_correct_count_without_consuming() {
-    let mut buf = RingBuffer::new();
-    for _ in 0..5 {
-        buf.push(dummy_event());
+fn drops_oldest_when_full() {
+    let mut s = Spool::in_memory(3);
+    for _ in 0..4 {
+        s.push(dummy_event());
     }
-
-    let batch = buf.peek_batch(3);
-    assert_eq!(batch.len(), 3, "peek_batch must return exactly n events");
-    assert_eq!(buf.len(), 5, "peek_batch must not consume events");
+    assert_eq!(s.len(), 3, "must not exceed capacity");
+    assert_eq!(s.dropped_total(), 1, "one oldest event must have been dropped");
 }
 
 #[test]
-fn test_peek_batch_capped_at_buffer_size() {
-    let mut buf = RingBuffer::new();
-    buf.push(dummy_event());
-    buf.push(dummy_event());
-
-    let batch = buf.peek_batch(100);
-    assert_eq!(batch.len(), 2, "peek_batch must return at most buf.len() events");
-    assert_eq!(buf.len(), 2);
-}
-
-#[test]
-fn test_drain_removes_correct_number_of_items() {
-    let mut buf = RingBuffer::new();
+fn peek_batch_does_not_consume_and_is_capped() {
+    let mut s = Spool::in_memory(100);
     for _ in 0..5 {
-        buf.push(dummy_event());
+        s.push(dummy_event());
     }
-
-    buf.drain(3);
-    assert_eq!(buf.len(), 2, "drain(3) on 5-item buffer must leave 2 items");
+    assert_eq!(s.peek_batch(3).len(), 3);
+    assert_eq!(s.len(), 5, "peek must not consume");
+    assert_eq!(s.peek_batch(100).len(), 5, "peek is capped at len");
 }
 
 #[test]
-fn test_drain_does_not_underflow() {
-    let mut buf = RingBuffer::new();
-    buf.push(dummy_event());
-    buf.push(dummy_event());
+fn drain_removes_n_and_does_not_underflow() {
+    let mut s = Spool::in_memory(100);
+    for _ in 0..5 {
+        s.push(dummy_event());
+    }
+    s.drain(3);
+    assert_eq!(s.len(), 2);
+    s.drain(10);
+    assert_eq!(s.len(), 0, "drain beyond len empties the spool");
+}
 
-    buf.drain(10); // more than available
-    assert_eq!(buf.len(), 0, "drain beyond len must empty the buffer");
+// ── Durability ────────────────────────────────────────────────────────────────
+
+#[test]
+fn durable_spool_survives_reopen() {
+    let path = tmp_journal("reopen");
+    {
+        let mut s = Spool::durable_at(path.clone(), 100);
+        s.push(dummy_event());
+        s.push(dummy_event());
+        s.push(dummy_event());
+    } // handle dropped — simulates a restart
+
+    let s2 = Spool::durable_at(path.clone(), 100);
+    assert_eq!(s2.len(), 3, "persisted events must be replayed after a restart");
+
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn unsent_events_are_replayed_at_least_once() {
+    // Drain (ship) without an intervening compaction, then "restart": the
+    // drained events are replayed — the documented at-least-once trade-off.
+    let path = tmp_journal("atleastonce");
+    {
+        let mut s = Spool::durable_at(path.clone(), 100);
+        s.push(dummy_event());
+        s.push(dummy_event());
+        s.drain(1); // shipped, but journal not yet compacted
+    }
+    let s2 = Spool::durable_at(path.clone(), 100);
+    assert_eq!(s2.len(), 2, "without compaction, shipped events replay (at-least-once)");
+
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn compaction_reconciles_shipped_events() {
+    let path = tmp_journal("compact");
+    let mut s = Spool::durable_at(path.clone(), 100);
+    s.push(dummy_event());
+    s.push(dummy_event());
+    s.push(dummy_event());
+    s.drain(2);          // ship two
+    s.compact();         // reconcile the journal to the live set
+    drop(s);
+
+    let s2 = Spool::durable_at(path.clone(), 100);
+    assert_eq!(s2.len(), 1, "after compaction only the un-shipped event remains");
+
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn durable_spool_enforces_cap_across_reload() {
+    let path = tmp_journal("cap");
+    {
+        let mut s = Spool::durable_at(path.clone(), 2);
+        for _ in 0..5 {
+            s.push(dummy_event());
+        }
+        assert_eq!(s.len(), 2);
+    }
+    // Reload also enforces the cap on the replayed journal.
+    let s2 = Spool::durable_at(path.clone(), 2);
+    assert_eq!(s2.len(), 2, "cap is enforced when replaying a journal");
+
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }

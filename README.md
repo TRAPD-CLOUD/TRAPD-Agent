@@ -20,7 +20,7 @@ what it does in seconds, with no backend at all.
   /proc   ─ poll ──────► │  (telemetry) │                                │
   auth.log ────────────► │              ▼                                │
   inotify  ────────────► │        event pipeline ──► detection engine    │
-                         │              │  (ring buffer)   │ (findings)   │
+                         │              │ (durable spool)  │ (findings)   │
                          │              ▼                  ▼              │
                          │   local NDJSON / backend     prevention engine │
                          │        ingest                 (active response)│
@@ -84,8 +84,13 @@ The agent is a single Tokio async binary (`trapd-agent`). On startup
    if the compiled eBPF object is present; otherwise the agent degrades gracefully
    to `/proc` polling.
 4. **Consumes the pipeline** — a single consumer task:
-   - writes each event locally (NDJSON to stdout or file) and into a **ring
-     buffer** for backend ingest;
+   - writes each event locally (NDJSON to stdout or file) and into a **durable
+     spool** for backend ingest — online the spool is disk-backed
+     (`<state>/spool/queue.ndjson`), so a backend outage or an agent restart no
+     longer loses telemetry: events accumulate (bounded) and are replayed on the
+     next run (at-least-once; the backend dedupes on `event_id`). Offline it is
+     in-memory only (the NDJSON file is the record). Capacity overrides with
+     `TRAPD_SPOOL_MAX`;
    - runs each event through the **detection engine**; findings are re-injected as
      new events;
    - **tees** both raw events and findings into the **prevention engine**.

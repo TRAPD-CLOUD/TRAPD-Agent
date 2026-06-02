@@ -34,7 +34,7 @@ use collectors::Collector;
 use config::{AgentConfig, ConfigPuller};
 use heartbeat::Heartbeat;
 use output::{write_event, OutputMode};
-use pipeline::{create_pipeline, RingBuffer};
+use pipeline::{create_pipeline, Spool};
 use transport::Transport;
 
 #[tokio::main]
@@ -128,7 +128,15 @@ async fn main() -> Result<()> {
     );
 
     let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(AgentConfig::default()));
-    let ring_buffer: Arc<Mutex<RingBuffer>>    = Arc::new(Mutex::new(RingBuffer::new()));
+    // Backend outbox. Online it is disk-backed (survives crash/restart, replays
+    // on the next run); offline it is purely in-memory (the NDJSON output is the
+    // system of record).
+    let spool = if offline {
+        Spool::in_memory(pipeline::SPOOL_MAX_MEMORY)
+    } else {
+        Spool::durable(pipeline::spool_max_from_env())
+    };
+    let ring_buffer: Arc<Mutex<Spool>>         = Arc::new(Mutex::new(spool));
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
 
@@ -299,7 +307,7 @@ async fn main() -> Result<()> {
 async fn handle_event(
     event: &schema::AgentEvent,
     mode:  &OutputMode,
-    buf:   &Arc<Mutex<RingBuffer>>,
+    buf:   &Arc<Mutex<Spool>>,
 ) {
     if let Err(err) = write_event(event, mode).await {
         error!("Failed to write event: {err}");
