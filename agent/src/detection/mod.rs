@@ -25,6 +25,7 @@ mod beaconing;
 mod behavior;
 mod dns_tunnel;
 pub mod honeytoken;
+mod ioa;
 mod ioc;
 mod netscan;
 
@@ -51,6 +52,8 @@ pub struct DetectionEngine {
     beacons: Mutex<beaconing::BeaconTracker>,
     netscan: Mutex<netscan::NetScanTracker>,
     dns_tunnel: Mutex<dns_tunnel::DnsTunnelTracker>,
+    /// Stateful attack-chain correlation over the process tree (IOA).
+    ioa: Mutex<ioa::IoaEngine>,
     started: Instant,
 }
 
@@ -74,6 +77,7 @@ impl DetectionEngine {
             beacons: Mutex::new(beaconing::BeaconTracker::new()),
             netscan: Mutex::new(netscan::NetScanTracker::new()),
             dns_tunnel: Mutex::new(dns_tunnel::DnsTunnelTracker::new()),
+            ioa: Mutex::new(ioa::IoaEngine::new()),
             started: Instant::now(),
         }
     }
@@ -154,6 +158,27 @@ impl DetectionEngine {
             }
             _ => {}
         }
+
+        // Stateful IOA correlation. Updates the process tree from this event,
+        // then (a) enriches the per-event findings above with the actor's
+        // process lineage and (b) emits any attack chains that just completed.
+        let ioa = self
+            .ioa
+            .lock()
+            .map(|mut e| e.observe(event, Instant::now()))
+            .unwrap_or_default();
+        if let Some(lineage) = &ioa.lineage {
+            for ev in out.iter_mut() {
+                if let EventData::Detection(d) = &mut ev.data {
+                    inject_lineage(&mut d.evidence, lineage);
+                }
+            }
+        }
+        for data in ioa.findings {
+            let sev = severity_for(data.confidence);
+            out.push(self.detection(sev, data));
+        }
+
         out
     }
 
@@ -411,6 +436,18 @@ impl DetectionEngine {
     }
 }
 
+/// Merge a process-lineage array into a detection's structured evidence so
+/// every finding answers "how did the acting process come to exist". A `null`
+/// evidence is promoted to an object; a non-object evidence is left untouched.
+fn inject_lineage(evidence: &mut serde_json::Value, lineage: &serde_json::Value) {
+    if evidence.is_null() {
+        *evidence = serde_json::json!({});
+    }
+    if let Some(obj) = evidence.as_object_mut() {
+        obj.insert("process_lineage".to_string(), lineage.clone());
+    }
+}
+
 fn severity_for(confidence: u8) -> Severity {
     match confidence {
         0..=39 => Severity::Low,
@@ -450,6 +487,7 @@ mod tests {
             beacons: Mutex::new(beaconing::BeaconTracker::new()),
             netscan: Mutex::new(netscan::NetScanTracker::new()),
             dns_tunnel: Mutex::new(dns_tunnel::DnsTunnelTracker::new()),
+            ioa: Mutex::new(ioa::IoaEngine::new()),
             started: Instant::now(),
         }
     }
