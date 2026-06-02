@@ -107,6 +107,23 @@ pub struct Engine {
     auto_cooldown: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
 }
 
+/// Whether `pid` is a legitimate *single-process* target for a destructive,
+/// PID-directed action (`kill` / `freeze` / `collect-memory`).
+///
+/// This rejects the `kill(2)` wildcard / process-group semantics that would
+/// otherwise let one command take down the whole host:
+///   * `pid <= 0` — `-1` signals *every* process the caller may signal, `0` the
+///     caller's whole process group, other negatives a specific group.
+///   * `pid == 1` — init / the container entrypoint.
+///   * `pid == own_pid` — the agent must never signal itself.
+///
+/// It is the same guard the auto-response path applies in [`Engine::execute_auto`];
+/// the signed-command handlers reuse it so both channels behave identically.
+fn valid_target_pid(pid: i32) -> bool {
+    let own_pid = std::process::id() as i32;
+    pid > 1 && pid != own_pid
+}
+
 impl Engine {
     pub fn new(
         policy: PolicyHandle,
@@ -342,7 +359,6 @@ impl Engine {
         targets: &Targets,
         decision: &response::Decision,
     ) {
-        let own_pid = std::process::id() as i32;
         let mut actions: Vec<&str> = Vec::new();
         let mut killed = false;
         let mut quarantined = false;
@@ -354,7 +370,7 @@ impl Engine {
         );
         if wants_kill {
             if let Some(pid) = targets.pid {
-                if pid > 1 && pid != own_pid {
+                if valid_target_pid(pid) {
                     killed = process::kill_pid(pid).is_ok();
                     actions.push(if killed { "kill" } else { "kill_failed" });
                 } else {
@@ -775,11 +791,35 @@ impl Engine {
         }
     }
 
+    /// Audit a PID-directed command that was refused because its target PID is
+    /// not a legitimate single-process target (see [`valid_target_pid`]). No
+    /// signal / read is performed — the command is dropped after this event.
+    fn reject_invalid_pid(&self, kind: &str, pid: i32, cmd_id: &str) {
+        self.audit.emit(
+            crate::schema::EventAction::CommandRejected,
+            crate::schema::Severity::High,
+            kind,
+            pid.to_string(),
+            false,
+            format!(
+                "refused {kind}: pid {pid} is not a valid single-process target \
+                 (pid must be > 1 and not the agent's own pid)"
+            ),
+            None,
+            Some(cmd_id.into()),
+            json!({ "pid": pid, "rejected": "invalid_target_pid" }),
+        );
+    }
+
     /// Dump a process's readable memory (anonymous-executable regions first) as
     /// a capped base64 artifact. Requires CAP_SYS_PTRACE / root to read
     /// `/proc/<pid>/mem`; partial reads are returned best-effort.
     fn cmd_collect_process_memory(&self, pid: i32, max_bytes: Option<u64>, cmd_id: &str) {
         use std::io::{Read, Seek, SeekFrom};
+
+        if !valid_target_pid(pid) {
+            return self.reject_invalid_pid("rtr_collect_memory", pid, cmd_id);
+        }
 
         let (enabled, default_max) = self.rtr_settings();
         if !enabled {
@@ -836,6 +876,9 @@ impl Engine {
     /// snapshot of it while it is suspended (issue #32, point 5).
     fn cmd_freeze_pid(&self, pid: i32, cmd_id: &str) {
         use crate::schema::{EventAction, Severity};
+        if !valid_target_pid(pid) {
+            return self.reject_invalid_pid("process_freeze", pid, cmd_id);
+        }
         let frozen = process::freeze_pid(pid).is_ok();
         let snapshot = forensics::capture_snapshot(pid, frozen);
         self.audit.emit(
@@ -1074,6 +1117,9 @@ impl Engine {
     }
 
     fn cmd_kill_pid(&self, pid: i32, cmd_id: &str) {
+        if !valid_target_pid(pid) {
+            return self.reject_invalid_pid("process_block", pid, cmd_id);
+        }
         let res = process::kill_pid(pid);
         let success = res.is_ok();
         let reason = match res {
@@ -1323,7 +1369,33 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::ResponseLevel;
+    use super::{valid_target_pid, ResponseLevel};
+
+    #[test]
+    fn pid_guard_rejects_wildcard_group_and_init() {
+        // kill(2) wildcard / process-group semantics that must never reach a
+        // signal: -1 = all permitted processes, 0 = caller's process group,
+        // other negatives = a specific group, 1 = init.
+        assert!(!valid_target_pid(-1), "pid -1 (all processes) must be rejected");
+        assert!(!valid_target_pid(0), "pid 0 (process group) must be rejected");
+        assert!(!valid_target_pid(-12345), "negative pid (group) must be rejected");
+        assert!(!valid_target_pid(1), "pid 1 (init) must be rejected");
+    }
+
+    #[test]
+    fn pid_guard_rejects_own_pid() {
+        let own = std::process::id() as i32;
+        assert!(!valid_target_pid(own), "the agent must never target its own pid");
+    }
+
+    #[test]
+    fn pid_guard_accepts_real_single_process_targets() {
+        // A normal, non-init, non-self PID is a legitimate target.
+        let own = std::process::id() as i32;
+        let other = if own == 4242 { 4243 } else { 4242 };
+        assert!(valid_target_pid(other));
+        assert!(valid_target_pid(2));
+    }
 
     #[test]
     fn response_level_parses_escalation_ladder() {
