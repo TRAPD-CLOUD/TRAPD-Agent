@@ -115,7 +115,13 @@ fn try_dns(ctx: &ProbeContext) -> Result<(), i64> {
     let comm = [0u8; COMM_LEN];
     let comm = bpf_get_current_comm().unwrap_or(comm);
 
-    let mut entry = DNS_EVENTS.reserve::<DnsEvent>(0).ok_or(-1i64)?;
+    let mut entry = match DNS_EVENTS.reserve::<DnsEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_DNS);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid      = pid;
     ev.uid      = uid;

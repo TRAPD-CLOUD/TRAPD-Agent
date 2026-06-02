@@ -51,7 +51,13 @@ fn try_module_load(ctx: &TracePointContext) -> Result<(), i64> {
     let uid = (uid_gid & 0xFFFF_FFFF) as u32;
     let gid = (uid_gid >> 32) as u32;
 
-    let mut entry = MODULE_LOAD_EVENTS.reserve::<ModuleLoadEvent>(0).ok_or(-1i64)?;
+    let mut entry = match MODULE_LOAD_EVENTS.reserve::<ModuleLoadEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_MODULE_LOAD);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid    = pid;
     ev.uid    = uid;

@@ -3,6 +3,7 @@
 #![allow(nonstandard_style, dead_code)]
 
 mod dns;
+mod dropcount;
 mod exec;
 mod file_manip;
 mod file_open;
