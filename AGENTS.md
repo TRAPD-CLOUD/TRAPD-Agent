@@ -48,7 +48,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 ## Filesystem Layout
 
-- State dir: default `/var/lib/trapd`, override `TRAPD_STATE_DIR`; contains `device_id`, `credentials.json`, nonces, baselines, `honeytokens.json` (deployed-honeytoken register, `0600`).
+- State dir: default `/var/lib/trapd`, override `TRAPD_STATE_DIR`; contains `device_id`, `credentials.json`, nonces (`command_nonces.json`), `config_issued_at.json` (signed-config `issued_at` high-water mark, `0600`), `agent_config.json` (last verified config, kept across restarts, `0600`), baselines, `honeytokens.json` (deployed-honeytoken register, `0600`).
 - Config dir: default `/etc/trapd`, override `TRAPD_CONFIG_DIR`; contains `agent.env`, `policy.json`, `ca.crt`, `agent.crt`, `agent.key`, `command_signing.pub`.
 - Log dir: default `/var/log/trapd`, override `TRAPD_LOG_DIR`; contains `events.ndjson`.
 - State dir is hardened to `0700`; credentials are atomically written as `0600`.
@@ -93,12 +93,16 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 - Auth: bearer `agent_secret`.
 - Request headers: optional `If-None-Match` with previous ETag.
-- Success responses: `200` with a **`SignedConfig`** (signed `ConfigEnvelope`), or `304`.
-- The config is security-critical (it toggles `prevention_enabled`, the `auto_response_*` switches, `fim_paths`, `honeytoken_response`, `isolation_allowlist_ips`), so it is signed and verified exactly like a response command. The agent **rejects any unsigned/invalid/mis-addressed/rolled-back config** and keeps its last-good config.
+- Success responses: `200` with a **`SignedConfig`** (a signed `ConfigEnvelope`), or `304`.
+- The config is security-critical (it toggles `prevention_enabled`, the `auto_response_*` switches, `fim_paths`, `honeytoken_response`, `isolation_allowlist_ips`), so it is signed and verified exactly like a response command — the two channels share one verify routine (`load_verifying_key` / `verify_canonical` in `prevention/commands.rs`). The agent **rejects any unsigned/invalid/mis-addressed/rolled-back config** and keeps its last-known-good config.
 - Signature: base64 Ed25519 over `canonical_json(ConfigEnvelope)`, verified with the same raw 32-byte key as commands (`<config>/command_signing.pub`).
-- Envelope is rejected when: signature invalid, `agent_id` is not this agent, `issued_at` is more than 5 minutes in the future, or `issued_at` is older than the last applied config (rollback protection).
-- The `ETag` is cached only after a config is successfully verified+applied, so a rejected payload is re-fetched and re-evaluated rather than masked by a later `304`.
+- Envelope is rejected when: signature invalid, `agent_id` is not this agent, `issued_at` is more than 5 minutes in the future, or `issued_at` is not strictly greater than the last applied config's (replay/rollback protection). The high-water mark is persisted to `<state>/config_issued_at.json`, so rollback is refused across restarts too.
+- The `ETag` is cached **only after a config is successfully verified+applied**, so a rejected (unsigned/tampered) payload is re-fetched and re-evaluated rather than masked behind a later `304`.
 - Poll cadence: every 60 seconds.
+- The agent now **requires** the body to be a signed `SignedConfig` envelope —
+  a bare `AgentConfig` is rejected and the last-known-good config is kept. The
+  backend MUST emit `SignedConfig`. See *Backend Implementation Notes* →
+  "Signed config delivery".
 
 ### `GET /api/v1/agents/{agent_id}/commands`
 
@@ -1116,3 +1120,64 @@ Discriminated by `type`.
 - Config endpoint must return a `SignedConfig`: wrap the `AgentConfig` in a `ConfigEnvelope` (`agent_id`, `issued_at`, `config`) and sign `canonical_json(envelope)` with the same Ed25519 key used for response commands (`command_signing.pub`). Do not return unsigned config — the agent rejects it. Bump `issued_at` monotonically so the agent's rollback guard accepts updates.
 - Config endpoint should support `ETag` and `304 Not Modified`.
 - Enrollment should never return empty `agent_id` or `agent_secret` on 2xx.
+
+### Signed config delivery
+
+`GET /api/v1/agents/{agent_id}/config` returns a **signed** config envelope
+instead of a bare `AgentConfig`, closing the gap that an attacker able to
+impersonate the control plane (e.g. via a TLS-stripping proxy or a compromised
+intermediate) could push a permissive config to weaken the agent. The
+**agent already enforces this** (`agent/src/config/mod.rs`: `ConfigVerifier`);
+the backend MUST emit `SignedConfig`. Two requirements:
+
+1. **Sign the envelope with the command-signing key.** The backend wraps the
+   config in a `SignedConfig` and signs it with the **same** operator-held
+   Ed25519 key the agent already pins for commands — the raw 32-byte public
+   key at `<config>/command_signing.pub`. No new key material is introduced.
+   The agent verifies the signature exactly as it does for `SignedCommand`
+   (re-serialise the deserialised envelope with `serde_json::to_vec` to the
+   canonical byte sequence and `verify_strict` against the pinned key) and
+   **rejects an unsigned or badly-signed config**, keeping its last-known-good
+   config. If no signing key is provisioned the agent ignores config updates
+   entirely (fail-closed).
+2. **`issued_at` must increase monotonically.** Each issued envelope carries
+   an `issued_at` that is strictly greater than the previous one for that
+   agent. The agent persists the highest `issued_at` it has accepted (in
+   `<state>/config_issued_at.json`) and refuses any envelope whose `issued_at`
+   is not greater, which defeats replay and rollback (re-serving a stale,
+   more-permissive config) — even across restarts. This is the config-channel
+   analogue of the command nonce store.
+
+The `ETag` / `304 Not Modified` flow is unchanged, except the agent caches the
+returned `ETag` **only after the body verifies**, so a bad/unsigned response
+cannot latch it into `304`s and block a later good update.
+
+This is independent of, and must not be conflated with, **#30**
+(release-artifact / `install.sh` supply-chain signing): #30 anchors trust in
+the *binary* shipped to a host, whereas this note anchors trust in the
+*runtime configuration* delivered to an already-running agent. They use
+different trust roots and protect different stages.
+
+#### `SignedConfig`
+
+Mirrors `SignedCommand`:
+
+```json
+{
+  "envelope": "ConfigEnvelope",
+  "signature": "base64 string; 64-byte Ed25519 signature over canonical_json(envelope)"
+}
+```
+
+#### `ConfigEnvelope`
+
+Field order is significant — the canonical signing bytes are
+`serde_json::to_vec` of this struct in declaration order:
+
+```json
+{
+  "issued_at": "RFC3339 UTC datetime (strictly increasing per agent)",
+  "agent_id": "string (must match this agent)",
+  "config": "AgentConfig"
+}
+```

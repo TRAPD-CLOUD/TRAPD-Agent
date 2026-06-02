@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -7,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
-use crate::prevention::{command_pubkey_path, commands::{load_verifying_key, verify_canonical}};
+use crate::prevention::{
+    command_pubkey_path,
+    commands::{load_verifying_key, verify_canonical},
+};
 
 fn default_poll_interval() -> u64 { 60 }
 fn default_fs_watch_paths() -> Vec<String> {
@@ -193,95 +197,190 @@ impl Default for AgentConfig {
     }
 }
 
-/// Signed remote-config envelope. The backend MUST wrap the live [`AgentConfig`]
-/// in this envelope and sign `canonical_json(envelope)` with the **same** Ed25519
-/// key it uses for response commands (`<config>/command_signing.pub`). The agent
-/// rejects any config whose signature, target `agent_id` or freshness does not
-/// check out: the config controls `prevention_enabled`, the `auto_response_*`
-/// switches, `fim_paths`, `honeytoken_response` and `isolation_allowlist_ips`,
-/// so it is at least as security-critical as a signed command and must not be
-/// applied unsigned (issue #47, H-A).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfigEnvelope {
-    /// Agent this config is addressed to; rejected if it is not us.
-    pub agent_id:  String,
-    /// When the backend issued this config. Used to reject rollback (an old,
-    /// validly-signed config replayed to silently re-enable a weaker posture).
-    pub issued_at: DateTime<Utc>,
-    /// The configuration to apply once the envelope verifies.
-    pub config:    AgentConfig,
-}
+// ── Signed config delivery ──────────────────────────────────────────────────
+//
+// The backend wraps `AgentConfig` in a `ConfigEnvelope` and signs it with the
+// *same* operator-held Ed25519 key the agent already pins for response commands
+// (`<config>/command_signing.pub`). The agent re-serialises the deserialised
+// envelope to canonical JSON, verifies the signature against that pinned key,
+// and rejects anything unsigned or badly-signed — keeping its last-known-good
+// config rather than trusting a control plane it cannot authenticate. The
+// envelope's `issued_at` MUST increase strictly monotonically per agent, so a
+// stale or replayed envelope (a rollback to an older, more-permissive config)
+// is refused. This is the config-channel analogue of the command nonce store
+// and is documented in AGENTS.md → Backend Implementation Notes → "Signed
+// config delivery". It is deliberately distinct from release-artifact signing
+// (#30): that anchors trust in the shipped binary, this in the runtime config.
 
-/// Wire-level signed config: an envelope plus its detached signature.
+/// Signed body returned by `GET /api/v1/agents/{agent_id}/config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedConfig {
-    pub envelope:  ConfigEnvelope,
+    pub envelope: ConfigEnvelope,
     /// Base64-encoded 64-byte Ed25519 signature over `canonical_json(envelope)`.
     pub signature: String,
 }
 
-/// Verify a [`SignedConfig`] against the provisioned key, the expected
-/// `agent_id`, and freshness/rollback rules. Pure (no I/O, no locks) so the
-/// accept/reject decision is unit-testable. Returns the rejection reason on
-/// failure; `Ok(())` means the envelope's `config` is safe to apply.
-fn evaluate_config(
-    key:               Option<&VerifyingKey>,
-    expected_agent_id: &str,
-    last_issued_at:    Option<DateTime<Utc>>,
-    signed:            &SignedConfig,
-    now:               DateTime<Utc>,
-) -> std::result::Result<(), String> {
-    // Fail-closed: with no provisioned signing key we cannot verify anything,
-    // so no remote config is ever applied.
-    let key = key.ok_or_else(|| {
-        format!(
-            "no signing key provisioned at {} — cannot verify remote config (fail-closed)",
-            command_pubkey_path().display()
-        )
-    })?;
+/// Everything the backend signs. All fields are part of the signed body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigEnvelope {
+    /// Issue time; MUST be strictly greater than the previously accepted value.
+    pub issued_at: DateTime<Utc>,
+    /// Agent this config is addressed to; MUST match the local agent id.
+    pub agent_id: String,
+    /// The delivered configuration.
+    pub config: AgentConfig,
+}
 
-    verify_canonical(key, &signed.envelope, &signed.signature)?;
+/// Verifies `SignedConfig` envelopes against the pinned command-signing key and
+/// enforces a strictly increasing `issued_at` high-water mark.
+pub struct ConfigVerifier {
+    key:       VerifyingKey,
+    agent_id:  String,
+    watermark: IssuedAtStore,
+}
 
-    if signed.envelope.agent_id != expected_agent_id {
-        return Err(format!(
-            "config addressed to {}, not us ({expected_agent_id})",
-            signed.envelope.agent_id
-        ));
+impl ConfigVerifier {
+    /// Load the Ed25519 verifying key (raw 32 bytes) and the persisted
+    /// `issued_at` high-water mark. Fails only when the key cannot be read or is
+    /// malformed — the caller then keeps its last-known-good config rather than
+    /// trusting an unauthenticatable channel.
+    pub fn new(pubkey_path: &Path, agent_id: String, watermark_path: &Path) -> Result<Self> {
+        // Reuse the response-command key loader so both channels trust the exact
+        // same raw 32-byte key provisioned at `<config>/command_signing.pub`.
+        let key = load_verifying_key(pubkey_path)?;
+        let watermark = IssuedAtStore::load(watermark_path);
+        info!(path = %pubkey_path.display(), "Signed-config verifier loaded");
+        Ok(Self { key, agent_id, watermark })
     }
 
-    // Guard against an absurd future timestamp (clock skew tolerance: 5 min).
-    if signed.envelope.issued_at > now + chrono::Duration::minutes(5) {
-        return Err(format!(
-            "config issued in the future ({})",
-            signed.envelope.issued_at
-        ));
-    }
+    /// Verify a signed config end-to-end. Returns the inner `AgentConfig` only
+    /// when the signature, recipient and monotonic `issued_at` all check out;
+    /// the `Err` string explains the rejection for the caller's log.
+    pub fn verify(&mut self, signed: &SignedConfig) -> std::result::Result<AgentConfig, String> {
+        // Signature check (canonical-JSON, re-serialised) is shared verbatim with
+        // the response-command channel via `verify_canonical`, so an unsigned or
+        // tampered config is rejected identically to an unsigned/tampered command.
+        verify_canonical(&self.key, &signed.envelope, &signed.signature)?;
 
-    // Rollback protection: never apply a config older than the last one applied.
-    if let Some(prev) = last_issued_at {
-        if signed.envelope.issued_at < prev {
+        if signed.envelope.agent_id != self.agent_id {
             return Err(format!(
-                "config issued_at {} is older than last applied {prev} (rollback)",
-                signed.envelope.issued_at
+                "config addressed to {}, not us ({})",
+                signed.envelope.agent_id, self.agent_id
             ));
         }
+
+        let issued_at = signed.envelope.issued_at;
+        // Guard against an absurd future timestamp (clock-skew tolerance: 5 min),
+        // mirroring the response-command freshness check.
+        if issued_at > Utc::now() + chrono::Duration::minutes(5) {
+            return Err(format!("config issued in the future ({issued_at})"));
+        }
+
+        // Monotonic issued_at: reject stale / replayed (rollback) envelopes.
+        if let Some(last) = self.watermark.last() {
+            if issued_at <= last {
+                return Err(format!(
+                    "stale config: issued_at {issued_at} not newer than last accepted {last}"
+                ));
+            }
+        }
+        self.watermark.advance(issued_at);
+
+        debug!(%issued_at, "signed config verified");
+        Ok(signed.envelope.config.clone())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct IssuedAtRecord {
+    issued_at: DateTime<Utc>,
+}
+
+/// Persisted high-water mark of the most recent `issued_at` accepted, so a
+/// restart cannot be tricked into re-accepting a stale config (rollback).
+struct IssuedAtStore {
+    path: PathBuf,
+    last: Option<DateTime<Utc>>,
+}
+
+impl IssuedAtStore {
+    fn load(path: &Path) -> Self {
+        let last = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<IssuedAtRecord>(&b).ok())
+            .map(|r| r.issued_at);
+        Self { path: path.to_path_buf(), last }
     }
 
-    Ok(())
+    fn last(&self) -> Option<DateTime<Utc>> {
+        self.last
+    }
+
+    fn advance(&mut self, issued_at: DateTime<Utc>) {
+        self.last = Some(issued_at);
+        let rec = IssuedAtRecord { issued_at };
+        if let Ok(bytes) = serde_json::to_vec(&rec) {
+            if let Err(e) = crate::paths::write_atomic(&self.path, &bytes, 0o600) {
+                warn!(error = %e, "cannot persist config issued_at high-water mark");
+            }
+        }
+    }
+}
+
+/// State file holding the accepted-config `issued_at` high-water mark.
+fn config_watermark_path() -> PathBuf {
+    crate::paths::state_dir().join("config_issued_at.json")
+}
+
+/// State file holding the last verified config, so the agent keeps its
+/// real configuration across restarts.
+fn persisted_config_path() -> PathBuf {
+    crate::paths::state_dir().join("agent_config.json")
+}
+
+/// Load the last verified config from disk, falling back to defaults. Loading
+/// the persisted config (rather than starting from defaults) is what makes the
+/// strictly-monotonic `issued_at` rule safe across restarts: the backend
+/// re-serves the *current* config with the same `issued_at` the agent already
+/// accepted, which the verifier correctly refuses as a replay — but because the
+/// agent already holds that config from disk, refusing the re-delivery does not
+/// strand it on compiled defaults.
+pub fn load_persisted() -> AgentConfig {
+    match std::fs::read(persisted_config_path()) {
+        Ok(bytes) => match serde_json::from_slice::<AgentConfig>(&bytes) {
+            Ok(cfg) => {
+                info!("Loaded last-known-good config from disk");
+                cfg
+            }
+            Err(e) => {
+                warn!(error = %e, "persisted config is unreadable — using defaults");
+                AgentConfig::default()
+            }
+        },
+        Err(_) => AgentConfig::default(),
+    }
+}
+
+/// Persist the accepted config to disk (`0600`, atomic). Best-effort: a failure
+/// here only costs us the last-known-good cache on the next restart.
+fn persist_config(cfg: &AgentConfig) {
+    match serde_json::to_vec(cfg) {
+        Ok(bytes) => {
+            if let Err(e) = crate::paths::write_atomic(&persisted_config_path(), &bytes, 0o600) {
+                warn!(error = %e, "cannot persist last-known-good config");
+            }
+        }
+        Err(e) => warn!(error = %e, "cannot serialise config for persistence"),
+    }
 }
 
 pub struct ConfigPuller {
-    config:         Arc<RwLock<AgentConfig>>,
-    client:         reqwest::Client,
-    config_url:     String,
-    agent_id:       String,
-    token:          String,
-    etag:           Option<String>,
-    /// Ed25519 verifying key (`<config>/command_signing.pub`). `None` when no key
-    /// is provisioned — in which case every remote config is rejected.
-    key:            Option<VerifyingKey>,
-    /// `issued_at` of the last successfully-applied config (rollback guard).
-    last_issued_at: Option<DateTime<Utc>>,
+    config:     Arc<RwLock<AgentConfig>>,
+    client:     reqwest::Client,
+    config_url: String,
+    token:      String,
+    etag:       Option<String>,
+    verifier:   Option<ConfigVerifier>,
 }
 
 impl ConfigPuller {
@@ -292,28 +391,33 @@ impl ConfigPuller {
         token:       String,
     ) -> Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
-        // Reuse the response-command signing key for the config channel.
-        let key = match load_verifying_key(&command_pubkey_path()) {
-            Ok(k) => Some(k),
+        // Config updates must be signed with the pinned command-signing key. If
+        // the key is absent/malformed we keep last-known-good rather than trust
+        // an unauthenticatable channel — matching the response-command path.
+        let verifier = match ConfigVerifier::new(
+            &command_pubkey_path(),
+            agent_id.to_string(),
+            &config_watermark_path(),
+        ) {
+            Ok(v) => Some(v),
             Err(e) => {
                 warn!(
                     error = %e,
-                    "config signing key unavailable — remote config will be rejected (fail-closed). \
-                     Provision {}",
-                    command_pubkey_path().display()
+                    "signed-config verifier unavailable — backend config updates will be \
+                     ignored (keeping last-known-good)"
                 );
                 None
             }
         };
         Ok(Self {
             config,
-            client:         crate::http::control_client()?,
-            config_url:     format!("{base}/api/v1/agents/{agent_id}/config"),
-            agent_id:       agent_id.to_string(),
+            // Fail-closed TLS-pinned control client (#47, H-B): refuses to build
+            // without a provisioned `<config>/ca.crt`.
+            client:     crate::http::control_client()?,
+            config_url: format!("{base}/api/v1/agents/{agent_id}/config"),
             token,
-            etag:           None,
-            key,
-            last_issued_at: None,
+            etag:       None,
+            verifier,
         })
     }
 
@@ -345,49 +449,57 @@ impl ConfigPuller {
                 debug!("Config unchanged (304 Not Modified)");
             }
             200 => {
-                // Only cache the ETag once a config is *applied*, so a rejected
-                // (unsigned/tampered) payload is re-fetched and re-evaluated
-                // rather than masked behind a 304 forever.
-                let etag = resp
+                // Capture (but don't yet cache) the ETag: it is only adopted
+                // once the body verifies, so a transiently bad/unsigned config
+                // can't latch us into 304s and block a later good update.
+                let new_etag = resp
                     .headers()
                     .get("etag")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
-                match resp.json::<SignedConfig>().await {
-                    Ok(signed) => {
-                        if self.accept(signed) {
-                            self.etag = etag;
-                        }
-                    }
-                    Err(e) => warn!("Failed to parse signed config response: {e}"),
+                let body = match resp.bytes().await {
+                    Ok(b)  => b,
+                    Err(e) => { warn!("Failed to read config response body: {e}"); return; }
+                };
+                if self.apply_body(&body) {
+                    self.etag = new_etag;
                 }
             }
             s => warn!("Config pull returned unexpected status {s}"),
         }
     }
 
-    /// Verify and apply a signed config. Returns `true` only when it was applied.
-    fn accept(&mut self, signed: SignedConfig) -> bool {
-        if let Err(reason) = evaluate_config(
-            self.key.as_ref(),
-            &self.agent_id,
-            self.last_issued_at,
-            &signed,
-            Utc::now(),
-        ) {
-            warn!(reason = %reason, "remote config rejected");
-            return false;
-        }
-
-        match self.config.write() {
-            Ok(mut cfg) => {
-                *cfg = signed.envelope.config;
-                self.last_issued_at = Some(signed.envelope.issued_at);
-                info!("Agent config updated from backend (signature verified)");
-                true
+    /// Verify and apply a config response body. Returns `true` only when a new
+    /// config was actually adopted, so the caller knows whether to cache the
+    /// ETag.
+    fn apply_body(&mut self, body: &[u8]) -> bool {
+        let verifier = match self.verifier.as_mut() {
+            Some(v) => v,
+            None => {
+                warn!(
+                    "received config update but no signing key is provisioned — ignoring \
+                     (keeping last-known-good)"
+                );
+                return false;
             }
-            Err(e) => {
-                warn!("Config RwLock poisoned: {e}");
+        };
+        let signed: SignedConfig = match serde_json::from_slice(body) {
+            Ok(s)  => s,
+            Err(e) => { warn!("Failed to parse signed config response: {e}"); return false; }
+        };
+        match verifier.verify(&signed) {
+            Ok(new_cfg) => match self.config.write() {
+                Ok(mut cfg) => {
+                    *cfg = new_cfg.clone();
+                    drop(cfg);
+                    persist_config(&new_cfg);
+                    info!("Agent config updated from backend (signature + issued_at verified)");
+                    true
+                }
+                Err(e) => { warn!("Config RwLock poisoned: {e}"); false }
+            },
+            Err(why) => {
+                warn!("Rejected backend config: {why} — keeping last-known-good");
                 false
             }
         }
@@ -396,106 +508,169 @@ impl ConfigPuller {
 
 #[cfg(test)]
 mod signed_config_tests {
+    //! Exercises the agent-side `SignedConfig` contract: an Ed25519-signed
+    //! `ConfigEnvelope` is accepted only when the signature verifies against the
+    //! pinned key, is addressed to this agent, and carries a strictly increasing
+    //! `issued_at`. The signing here mirrors what the backend must do
+    //! (`serde_json::to_vec(envelope)` → Ed25519 sign), proving both ends agree
+    //! on the canonical byte sequence.
     use super::*;
     use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
 
-    const AGENT_ID: &str = "agent-under-test";
+    fn tmp(suffix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("trapd_cfg_{nanos}_{suffix}"))
+    }
 
     fn signing_key() -> SigningKey {
-        // Fixed seed → deterministic key; no rng feature required.
-        let seed: [u8; 32] = [7u8; 32];
-        SigningKey::from_bytes(&seed)
+        SigningKey::from_bytes(&[7u8; 32])
     }
 
-    fn sign(envelope: &ConfigEnvelope, sk: &SigningKey) -> String {
-        let canonical = serde_json::to_vec(envelope).unwrap();
-        let sig = sk.sign(&canonical);
-        base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
-    }
-
-    fn envelope(issued_at: DateTime<Utc>) -> ConfigEnvelope {
-        ConfigEnvelope {
-            agent_id:  AGENT_ID.to_string(),
+    fn make_signed(key: &SigningKey, agent_id: &str, issued_at: DateTime<Utc>) -> SignedConfig {
+        let envelope = ConfigEnvelope {
             issued_at,
-            config:    AgentConfig::default(),
+            agent_id: agent_id.into(),
+            config: AgentConfig::default(),
+        };
+        let canonical = serde_json::to_vec(&envelope).unwrap();
+        let signature = base64::engine::general_purpose::STANDARD.encode(key.sign(&canonical).to_bytes());
+        SignedConfig { envelope, signature }
+    }
+
+    fn verifier(key: &SigningKey, agent_id: &str) -> (ConfigVerifier, PathBuf, PathBuf) {
+        let pub_path = tmp("pub");
+        let wm_path = tmp("issued.json");
+        std::fs::write(&pub_path, key.verifying_key().to_bytes()).unwrap();
+        let v = ConfigVerifier::new(&pub_path, agent_id.into(), &wm_path).unwrap();
+        (v, pub_path, wm_path)
+    }
+
+    fn cleanup(p: PathBuf, w: PathBuf) {
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(w);
+    }
+
+    #[test]
+    fn accepts_valid_signed_config() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let signed = make_signed(&key, "agent-1", Utc::now());
+        assert!(v.verify(&signed).is_ok(), "valid signed config rejected");
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn rejects_tampered_config() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let mut signed = make_signed(&key, "agent-1", Utc::now());
+        // Flip a field after signing — the signature must no longer verify.
+        signed.envelope.config.prevention_enabled = false;
+        signed.envelope.config.poll_interval_secs = 999_999;
+        assert!(v.verify(&signed).is_err(), "tampered config accepted");
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn rejects_wrong_signing_key() {
+        let key = signing_key();
+        let attacker = SigningKey::from_bytes(&[9u8; 32]);
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let signed = make_signed(&attacker, "agent-1", Utc::now());
+        assert!(v.verify(&signed).is_err(), "config signed by wrong key accepted");
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn rejects_wrong_recipient() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let signed = make_signed(&key, "another-agent", Utc::now());
+        assert!(v.verify(&signed).is_err(), "config for another agent accepted");
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn rejects_future_issued_at() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        // Beyond the 5-minute clock-skew tolerance → rejected.
+        let signed = make_signed(&key, "agent-1", Utc::now() + chrono::Duration::minutes(10));
+        assert!(v.verify(&signed).is_err(), "config issued far in the future accepted");
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn enforces_monotonic_issued_at() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let t1 = Utc::now();
+        assert!(v.verify(&make_signed(&key, "agent-1", t1)).is_ok());
+        // Older issue time -> rollback, rejected.
+        assert!(v.verify(&make_signed(&key, "agent-1", t1 - chrono::Duration::seconds(60))).is_err());
+        // Same issue time -> replay, rejected.
+        assert!(v.verify(&make_signed(&key, "agent-1", t1)).is_err());
+        // Strictly newer -> accepted.
+        assert!(v.verify(&make_signed(&key, "agent-1", t1 + chrono::Duration::seconds(1))).is_ok());
+        cleanup(p, w);
+    }
+
+    // ── Cross-language vector ────────────────────────────────────────────────
+    // Proves the TypeScript signer in the backend
+    // (`services/web/lib/api/config/sign.ts`) produces a `SignedConfig` this
+    // verifier accepts — i.e. both ends agree on the canonical byte sequence for
+    // the *full* default `AgentConfig`. Generated by signing the canonical
+    // envelope with the fixed Ed25519 seed (bytes 0x01..=0x20), the same seed the
+    // command cross-lang vectors use (hence the identical PUB_HEX). A mismatch
+    // here means the backend's `canonicalConfig` field order/contents drifted
+    // from the Rust `AgentConfig` re-serialisation — the exact bug to catch.
+    const XLANG_PUB_HEX: &str = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
+    const XLANG_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768}}"#;
+    const XLANG_SIG: &str = "Jpxbj4CJOr0lggAdW8eprocKJtYBd7+B9IP2K9FBFapaojsWryehd/hMgki+jjHdCH/WD4aV1qK53cfg7bQlCA==";
+
+    #[test]
+    fn accepts_ts_signed_default_config() {
+        let pub_path = tmp("xlang_pub");
+        let wm_path = tmp("xlang_issued.json");
+        std::fs::write(&pub_path, hex::decode(XLANG_PUB_HEX).unwrap()).unwrap();
+        let mut v = ConfigVerifier::new(&pub_path, "agent-test".into(), &wm_path).unwrap();
+        let signed: SignedConfig =
+            serde_json::from_str(&format!(r#"{{"envelope":{XLANG_ENV},"signature":"{XLANG_SIG}"}}"#))
+                .unwrap();
+        match v.verify(&signed) {
+            Ok(cfg) => {
+                // Spot-check a few fields, incl. ones not stored in the DB and
+                // only present via Rust defaults (rtr_*, memory_scan_*).
+                assert_eq!(cfg.poll_interval_secs, 60);
+                assert_eq!(cfg.honeytoken_response, "alert");
+                assert_eq!(cfg.rtr_max_artifact_bytes, 32_768);
+                assert_eq!(cfg.memory_scan_interval_secs, 120);
+            }
+            Err(why) => panic!("TS-signed default config rejected: {why}"),
         }
-    }
-
-    fn now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-06-02T10:00:00Z").unwrap().with_timezone(&Utc)
+        cleanup(pub_path, wm_path);
     }
 
     #[test]
-    fn accepts_a_valid_signed_config() {
-        let sk = signing_key();
-        let env = envelope(now());
-        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
-        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, None, &signed, now()).is_ok());
-    }
-
-    #[test]
-    fn rejects_when_no_key_provisioned() {
-        let sk = signing_key();
-        let env = envelope(now());
-        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
-        // Fail-closed: a perfectly-signed config is still rejected with no key.
-        assert!(evaluate_config(None, AGENT_ID, None, &signed, now()).is_err());
-    }
-
-    #[test]
-    fn rejects_unsigned_or_garbage_signature() {
-        let sk = signing_key();
-        let env = envelope(now());
-        let signed = SignedConfig { envelope: env, signature: "not-a-signature".into() };
-        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, None, &signed, now()).is_err());
-    }
-
-    #[test]
-    fn rejects_tampered_config_after_signing() {
-        let sk = signing_key();
-        let env = envelope(now());
-        let signature = sign(&env, &sk);
-        // Flip a security-critical switch *after* signing → signature must fail.
-        let mut tampered = env.clone();
-        tampered.config.prevention_enabled = false;
-        tampered.config.auto_response_enabled = true;
-        let signed = SignedConfig { envelope: tampered, signature };
-        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, None, &signed, now()).is_err());
-    }
-
-    #[test]
-    fn rejects_config_addressed_to_another_agent() {
-        let sk = signing_key();
-        let mut env = envelope(now());
-        env.agent_id = "some-other-agent".into();
-        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
-        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, None, &signed, now()).is_err());
-    }
-
-    #[test]
-    fn rejects_future_dated_config() {
-        let sk = signing_key();
-        let env = envelope(now() + chrono::Duration::minutes(30));
-        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
-        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, None, &signed, now()).is_err());
-    }
-
-    #[test]
-    fn rejects_rollback_to_older_config() {
-        let sk = signing_key();
-        let last = now();
-        let env = envelope(now() - chrono::Duration::hours(1));
-        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
-        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, Some(last), &signed, now()).is_err());
-    }
-
-    #[test]
-    fn accepts_reapplying_same_issued_at() {
-        // Idempotent re-pull of the current config (equal issued_at) is allowed.
-        let sk = signing_key();
-        let env = envelope(now());
-        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
-        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, Some(now()), &signed, now()).is_ok());
+    fn watermark_persists_across_reload() {
+        let key = signing_key();
+        let pub_path = tmp("pub");
+        let wm_path = tmp("issued.json");
+        std::fs::write(&pub_path, key.verifying_key().to_bytes()).unwrap();
+        let t1 = Utc::now();
+        {
+            let mut v = ConfigVerifier::new(&pub_path, "agent-1".into(), &wm_path).unwrap();
+            assert!(v.verify(&make_signed(&key, "agent-1", t1)).is_ok());
+        }
+        // A fresh verifier must load the persisted high-water mark and still
+        // refuse a replay of the same issue time.
+        let mut v2 = ConfigVerifier::new(&pub_path, "agent-1".into(), &wm_path).unwrap();
+        assert!(v2.verify(&make_signed(&key, "agent-1", t1)).is_err(), "watermark not persisted");
+        assert!(v2.verify(&make_signed(&key, "agent-1", t1 + chrono::Duration::seconds(1))).is_ok());
+        cleanup(pub_path, wm_path);
     }
 }
