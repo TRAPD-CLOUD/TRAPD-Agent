@@ -209,6 +209,7 @@ async fn main() -> Result<()> {
     spawn_collector!(FilesystemCollector::new());
     spawn_collector!(AgentProtectCollector::new());
     spawn_collector!(collectors::linux::fim::FimCollector::new(Arc::clone(&agent_config)));
+    spawn_collector!(collectors::linux::memscan::MemScanCollector::new(Arc::clone(&agent_config)));
 
     {
         let tx_ap = tx.clone();
