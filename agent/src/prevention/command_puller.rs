@@ -40,17 +40,17 @@ impl CommandPuller {
         audit:       AuditEmitter,
         out:         Sender<CommandEnvelope>,
         poll_secs:   u64,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
-        Self {
-            client:   crate::http::control_client(),
+        Ok(Self {
+            client:   crate::http::control_client()?,
             url:      format!("{base}/api/v1/agents/{agent_id}/commands"),
             token,
             verifier,
             audit,
             out,
             interval: Duration::from_secs(poll_secs.max(2)),
-        }
+        })
     }
 
     pub async fn run(self) {

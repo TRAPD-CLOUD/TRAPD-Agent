@@ -1,13 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Context, Result};
-use base64::Engine as _;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
+
+use crate::prevention::{
+    command_pubkey_path,
+    commands::{load_verifying_key, verify_canonical},
+};
 
 fn default_poll_interval() -> u64 { 60 }
 fn default_fs_watch_paths() -> Vec<String> {
@@ -241,15 +245,9 @@ impl ConfigVerifier {
     /// malformed — the caller then keeps its last-known-good config rather than
     /// trusting an unauthenticatable channel.
     pub fn new(pubkey_path: &Path, agent_id: String, watermark_path: &Path) -> Result<Self> {
-        let raw = std::fs::read(pubkey_path).with_context(|| {
-            format!("cannot read config signing pubkey from {}", pubkey_path.display())
-        })?;
-        let key_bytes: [u8; 32] = raw.try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "config signing pubkey must be exactly 32 raw bytes (Ed25519 verifying key)"
-            )
-        })?;
-        let key = VerifyingKey::from_bytes(&key_bytes).context("invalid Ed25519 verifying key")?;
+        // Reuse the response-command key loader so both channels trust the exact
+        // same raw 32-byte key provisioned at `<config>/command_signing.pub`.
+        let key = load_verifying_key(pubkey_path)?;
         let watermark = IssuedAtStore::load(watermark_path);
         info!(path = %pubkey_path.display(), "Signed-config verifier loaded");
         Ok(Self { key, agent_id, watermark })
@@ -259,21 +257,10 @@ impl ConfigVerifier {
     /// when the signature, recipient and monotonic `issued_at` all check out;
     /// the `Err` string explains the rejection for the caller's log.
     pub fn verify(&mut self, signed: &SignedConfig) -> std::result::Result<AgentConfig, String> {
-        let sig_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&signed.signature)
-            .map_err(|e| format!("bad base64 signature: {e}"))?;
-        let sig_arr: [u8; 64] = sig_bytes
-            .try_into()
-            .map_err(|_| "signature must be 64 bytes".to_string())?;
-        let signature = Signature::from_bytes(&sig_arr);
-
-        // Re-serialise canonically so extra wire fields cannot smuggle past the
-        // signature: the verifier sees exactly the bytes the signer produced.
-        let canonical = serde_json::to_vec(&signed.envelope)
-            .map_err(|e| format!("canonicalisation failed: {e}"))?;
-        self.key
-            .verify_strict(&canonical, &signature)
-            .map_err(|e| format!("Ed25519 verification failed: {e}"))?;
+        // Signature check (canonical-JSON, re-serialised) is shared verbatim with
+        // the response-command channel via `verify_canonical`, so an unsigned or
+        // tampered config is rejected identically to an unsigned/tampered command.
+        verify_canonical(&self.key, &signed.envelope, &signed.signature)?;
 
         if signed.envelope.agent_id != self.agent_id {
             return Err(format!(
@@ -282,8 +269,14 @@ impl ConfigVerifier {
             ));
         }
 
-        // Monotonic issued_at: reject stale / replayed (rollback) envelopes.
         let issued_at = signed.envelope.issued_at;
+        // Guard against an absurd future timestamp (clock-skew tolerance: 5 min),
+        // mirroring the response-command freshness check.
+        if issued_at > Utc::now() + chrono::Duration::minutes(5) {
+            return Err(format!("config issued in the future ({issued_at})"));
+        }
+
+        // Monotonic issued_at: reject stale / replayed (rollback) envelopes.
         if let Some(last) = self.watermark.last() {
             if issued_at <= last {
                 return Err(format!(
@@ -396,13 +389,13 @@ impl ConfigPuller {
         backend_url: &str,
         agent_id:    &str,
         token:       String,
-    ) -> Self {
+    ) -> Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
         // Config updates must be signed with the pinned command-signing key. If
         // the key is absent/malformed we keep last-known-good rather than trust
         // an unauthenticatable channel — matching the response-command path.
         let verifier = match ConfigVerifier::new(
-            &crate::prevention::command_pubkey_path(),
+            &command_pubkey_path(),
             agent_id.to_string(),
             &config_watermark_path(),
         ) {
@@ -416,14 +409,16 @@ impl ConfigPuller {
                 None
             }
         };
-        Self {
+        Ok(Self {
             config,
-            client:     crate::http::control_client(),
+            // Fail-closed TLS-pinned control client (#47, H-B): refuses to build
+            // without a provisioned `<config>/ca.crt`.
+            client:     crate::http::control_client()?,
             config_url: format!("{base}/api/v1/agents/{agent_id}/config"),
             token,
             etag:       None,
             verifier,
-        }
+        })
     }
 
     pub async fn run(mut self) {
@@ -520,6 +515,7 @@ mod signed_config_tests {
     //! (`serde_json::to_vec(envelope)` → Ed25519 sign), proving both ends agree
     //! on the canonical byte sequence.
     use super::*;
+    use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
 
     fn tmp(suffix: &str) -> PathBuf {
@@ -595,6 +591,16 @@ mod signed_config_tests {
         let (mut v, p, w) = verifier(&key, "agent-1");
         let signed = make_signed(&key, "another-agent", Utc::now());
         assert!(v.verify(&signed).is_err(), "config for another agent accepted");
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn rejects_future_issued_at() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        // Beyond the 5-minute clock-skew tolerance → rejected.
+        let signed = make_signed(&key, "agent-1", Utc::now() + chrono::Duration::minutes(10));
+        assert!(v.verify(&signed).is_err(), "config issued far in the future accepted");
         cleanup(p, w);
     }
 

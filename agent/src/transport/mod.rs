@@ -23,11 +23,17 @@ pub struct Transport {
 }
 
 impl Transport {
-    pub fn new(buffer: Arc<Mutex<Spool>>, backend_url: String, token: String) -> Self {
+    pub fn new(
+        buffer: Arc<Mutex<Spool>>,
+        backend_url: String,
+        token: String,
+    ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(&backend_url);
         let ingest_url = format!("{base}/api/v1/ingest/events");
-        let client = crate::http::streaming_client();
-        Self { buffer, client, ingest_url, token }
+        // Fail-closed: ingest shares the control channel's pinned-TLS posture;
+        // no plain-client fall-back.
+        let client = crate::http::streaming_client()?;
+        Ok(Self { buffer, client, ingest_url, token })
     }
 
     pub async fn run(self) {

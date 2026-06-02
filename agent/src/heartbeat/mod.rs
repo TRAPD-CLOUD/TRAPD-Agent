@@ -63,16 +63,16 @@ impl Heartbeat {
         agent_id:    String,
         token:       String,
         hostname:    String,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
-        Self {
-            client:        crate::http::control_client(),
+        Ok(Self {
+            client:        crate::http::control_client()?,
             heartbeat_url: format!("{base}/api/v1/agents/{agent_id}/heartbeat"),
             token,
             agent_id,
             hostname,
             sys:           Mutex::new(System::new()),
-        }
+        })
     }
 
     pub async fn run(self) {

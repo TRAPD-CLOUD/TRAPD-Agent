@@ -57,7 +57,9 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 - Backend base URL is normalized by trimming whitespace and trailing slashes.
 - Online authenticated endpoints use `Authorization: Bearer <agent_secret>`.
-- HTTP client uses rustls, bounded timeouts, optional CA pinning from `<config>/ca.crt`, optional mTLS from `<config>/agent.crt` + `<config>/agent.key`.
+- HTTP client uses rustls, bounded timeouts, **fail-closed** CA pinning from `<config>/ca.crt`, optional mTLS from `<config>/agent.crt` + `<config>/agent.key`.
+- TLS pinning is mandatory for the control channel: with no `<config>/ca.crt` provisioned the agent **refuses to build any backend client** (enrollment, ingest, heartbeat, config-pull, command-pull all fail) rather than trusting the host system root store — a remote-control agent receiving `kill_pid`/`isolate_network`/`install_package` must not be MITM-able by any host-trusted CA. A present-but-unreadable/unparseable `ca.crt` is also a hard error (never a silent system-root fall-back), and a TLS build error fails closed (no plain-client fall-back).
+- Opt-out: set `TRAPD_TLS_ALLOW_SYSTEM_ROOTS=1` (`true`/`yes`/`on`) to deliberately accept the host system trust store when the backend is fronted by a publicly-trusted CA. Logged as a loud warning on every client build. Offline mode never builds a control-channel client, so it is unaffected by pinning.
 - Control-plane timeout: 30s total, 10s connect.
 - Streaming ingest timeout: 60s total, 10s connect.
 - User-Agent: `trapd-agent/<package_version>`.
@@ -91,9 +93,11 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 - Auth: bearer `agent_secret`.
 - Request headers: optional `If-None-Match` with previous ETag.
-- Success responses: `200` with a `SignedConfig` (signed `AgentConfig`), or `304`.
-- Response `ETag` is cached by the agent **only after the body verifies**, so a
-  transiently bad/unsigned config can't latch the agent into `304`s.
+- Success responses: `200` with a **`SignedConfig`** (a signed `ConfigEnvelope`), or `304`.
+- The config is security-critical (it toggles `prevention_enabled`, the `auto_response_*` switches, `fim_paths`, `honeytoken_response`, `isolation_allowlist_ips`), so it is signed and verified exactly like a response command — the two channels share one verify routine (`load_verifying_key` / `verify_canonical` in `prevention/commands.rs`). The agent **rejects any unsigned/invalid/mis-addressed/rolled-back config** and keeps its last-known-good config.
+- Signature: base64 Ed25519 over `canonical_json(ConfigEnvelope)`, verified with the same raw 32-byte key as commands (`<config>/command_signing.pub`).
+- Envelope is rejected when: signature invalid, `agent_id` is not this agent, `issued_at` is more than 5 minutes in the future, or `issued_at` is not strictly greater than the last applied config's (replay/rollback protection). The high-water mark is persisted to `<state>/config_issued_at.json`, so rollback is refused across restarts too.
+- The `ETag` is cached **only after a config is successfully verified+applied**, so a rejected (unsigned/tampered) payload is re-fetched and re-evaluated rather than masked behind a later `304`.
 - Poll cadence: every 60 seconds.
 - The agent now **requires** the body to be a signed `SignedConfig` envelope —
   a bare `AgentConfig` is rejected and the last-known-good config is kept. The
@@ -917,6 +921,24 @@ should:
 
 ## Config Schema
 
+### `SignedConfig` / `ConfigEnvelope`
+
+The config-pull endpoint returns the `AgentConfig` wrapped in a signed envelope.
+The agent verifies it with `<config>/command_signing.pub` (the response-command
+key) and rejects anything unsigned, tampered, mis-addressed, future-dated, or
+older than the last applied config.
+
+```json
+{
+  "envelope": {
+    "agent_id":  "this-agent",
+    "issued_at": "RFC3339",
+    "config":    { "...AgentConfig..." }
+  },
+  "signature": "base64(ed25519(canonical_json(envelope)))"
+}
+```
+
 ### `AgentConfig`
 
 ```json
@@ -1095,6 +1117,7 @@ Discriminated by `type`.
 - Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=prevention` -> `PreventionEventData` (incl. `action=process_frozen`/`process_thawed`/`deception_escalation`); `class=detection, action=detected` -> `DetectionData`; `class=detection, action=honeytoken_access` -> `HoneytokenAccessData` (carries the optional `session` forensics).
 - For command responses, return `[]` when no commands are pending.
 - Do not return unsigned commands. The agent rejects commands without a valid Ed25519 signature, matching `agent_id`, unexpired window, and fresh nonce.
+- Config endpoint must return a `SignedConfig`: wrap the `AgentConfig` in a `ConfigEnvelope` (`agent_id`, `issued_at`, `config`) and sign `canonical_json(envelope)` with the same Ed25519 key used for response commands (`command_signing.pub`). Do not return unsigned config — the agent rejects it. Bump `issued_at` monotonically so the agent's rollback guard accepts updates.
 - Config endpoint should support `ETag` and `304 Not Modified`.
 - Enrollment should never return empty `agent_id` or `agent_secret` on 2xx.
 
