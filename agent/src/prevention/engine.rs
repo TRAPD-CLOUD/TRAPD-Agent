@@ -122,6 +122,23 @@ pub struct Engine {
     auto_cooldown: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
 }
 
+/// Whether `pid` is a legitimate *single-process* target for a destructive,
+/// PID-directed action (`kill` / `freeze` / `collect-memory`).
+///
+/// This rejects the `kill(2)` wildcard / process-group semantics that would
+/// otherwise let one command take down the whole host:
+///   * `pid <= 0` — `-1` signals *every* process the caller may signal, `0` the
+///     caller's whole process group, other negatives a specific group.
+///   * `pid == 1` — init / the container entrypoint.
+///   * `pid == own_pid` — the agent must never signal itself.
+///
+/// It is the same guard the auto-response path applies in [`Engine::execute_auto`];
+/// the signed-command handlers reuse it so both channels behave identically.
+fn valid_target_pid(pid: i32) -> bool {
+    let own_pid = std::process::id() as i32;
+    pid > 1 && pid != own_pid
+}
+
 impl Engine {
     pub fn new(
         policy: PolicyHandle,
@@ -357,7 +374,6 @@ impl Engine {
         targets: &Targets,
         decision: &response::Decision,
     ) {
-        let own_pid = std::process::id() as i32;
         let mut actions: Vec<&str> = Vec::new();
         let mut killed = false;
         let mut quarantined = false;
