@@ -11,3 +11,23 @@ jobs:
       - run: cargo build --release --manifest-path agent/Cargo.toml
       - run: cargo clippy --manifest-path agent/Cargo.toml -- -D warnings
       - run: cargo test --manifest-path agent/Cargo.toml
+
+  # Dependency-vulnerability scan (RustSec advisory DB). Kept non-blocking for
+  # now (continue-on-error) so a freshly disclosed CVE surfaces in the logs
+  # without breaking unrelated PRs; flip to blocking once the advisory backlog
+  # is triaged. Covers BOTH lockfiles: the agent workspace (agent + xtask) and
+  # the separate eBPF crate.
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit (agent workspace)
+        run: cargo audit --file Cargo.lock
+      - name: cargo audit (eBPF crate)
+        run: cargo audit --file trapd-agent-ebpf/Cargo.lock
