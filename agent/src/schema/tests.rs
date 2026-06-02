@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 use super::{
-    AgentEvent, DnsData, EventAction, EventClass, EventData, FileOpenData, ForkData,
+    AgentEvent, DnsData, EbpfDropsData, EventAction, EventClass, EventData, FileOpenData, ForkData,
     HoneytokenAccessData, MmapData, ModuleLoadData, NamespaceIds, NetworkSocketData, NsChangeData,
     ProcessCreateData, ProcessLineage, PtraceData, SessionContext, Severity, ShmData,
     SystemSnapshotData,
@@ -382,6 +382,35 @@ fn test_shm_event_roundtrip() {
     assert_eq!(val["action"],       "shmget");
     assert_eq!(val["data"]["key"],  12345);
     assert_eq!(val["data"]["size"], 65536);
+}
+
+#[test]
+fn test_ebpf_drops_event_roundtrip() {
+    // The eBPF ring-buffer drop report (issue #52): a System-class observability
+    // event carrying per-program cumulative drop counts plus the interval delta.
+    let mut per_program = std::collections::BTreeMap::new();
+    per_program.insert("exec".to_string(), 42u64);
+    per_program.insert("dns".to_string(), 7u64);
+    let event = AgentEvent::new(
+        Uuid::new_v4().to_string(),
+        "host".to_string(),
+        EventClass::System,
+        EventAction::EbpfDrops,
+        Severity::Medium,
+        EventData::EbpfDrops(EbpfDropsData {
+            per_program,
+            total: 49,
+            delta: 5,
+        }),
+    );
+    let json = serde_json::to_string(&event).expect("must serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+    assert_eq!(val["class"], "system");
+    assert_eq!(val["action"], "ebpf_drops");
+    assert_eq!(val["data"]["total"], 49);
+    assert_eq!(val["data"]["delta"], 5);
+    assert_eq!(val["data"]["per_program"]["exec"], 42);
+    assert_eq!(val["data"]["per_program"]["dns"], 7);
 }
 
 #[test]

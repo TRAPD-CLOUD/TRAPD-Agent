@@ -48,7 +48,13 @@ fn try_fork(ctx: &TracePointContext) -> Result<(), i64> {
     parent_comm.copy_from_slice(&parent_comm_raw);
     child_comm.copy_from_slice(&child_comm_raw);
 
-    let mut entry = FORK_EVENTS.reserve::<ForkEvent>(0).ok_or(-1i64)?;
+    let mut entry = match FORK_EVENTS.reserve::<ForkEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_FORK);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.parent_pid  = parent_pid as u32;
     ev.child_pid   = child_pid  as u32;

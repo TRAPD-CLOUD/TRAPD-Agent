@@ -46,7 +46,13 @@ fn try_memfd(ctx: &TracePointContext) -> Result<(), i64> {
     let comm = [0u8; COMM_LEN];
     let comm = bpf_get_current_comm().unwrap_or(comm);
 
-    let mut entry = MEMFD_EVENTS.reserve::<MemfdEvent>(0).ok_or(-1i64)?;
+    let mut entry = match MEMFD_EVENTS.reserve::<MemfdEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_MEMFD);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid   = pid;
     ev.flags = flags as u32;

@@ -82,7 +82,13 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
         crate::file_open::ACCESS_EXEC,
     );
 
-    let mut entry = EXEC_EVENTS.reserve::<ExecEvent>(0).ok_or(-1i64)?;
+    let mut entry = match EXEC_EVENTS.reserve::<ExecEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_EXEC);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid            = pid;
     ev.ppid           = 0;
@@ -167,7 +173,13 @@ fn try_execve_ld_preload(ctx: &TracePointContext) -> Result<(), i64> {
     let comm = [0u8; COMM_LEN];
     let comm = bpf_get_current_comm().unwrap_or(comm);
 
-    let mut entry = EXEC_EVENTS.reserve::<ExecEvent>(0).ok_or(-1i64)?;
+    let mut entry = match EXEC_EVENTS.reserve::<ExecEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_EXEC);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid  = pid;
     ev.ppid = 0;
