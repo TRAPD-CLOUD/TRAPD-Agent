@@ -35,6 +35,10 @@ fn default_inventory_enabled() -> bool { true }
 fn default_honeytoken_detection_enabled() -> bool { true }
 fn default_honeytoken_response() -> String { "alert".into() }
 fn default_honeytoken_deception_escalation() -> bool { false }
+fn default_auto_response_enabled() -> bool { false }
+fn default_auto_response_action() -> String { "alert".into() }
+fn default_auto_response_min_severity() -> String { "critical".into() }
+fn default_auto_response_min_confidence() -> u8 { 90 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -98,6 +102,33 @@ pub struct AgentConfig {
     /// `false`; escalation is an opt-in, backend-coordinated action.
     #[serde(default = "default_honeytoken_deception_escalation")]
     pub honeytoken_deception_escalation: bool,
+
+    // ── Automated response to local detections (P0 response playbooks) ──────
+    /// Master opt-in for automatically responding to *local detections* — IOC
+    /// hash hits, reverse shells, IOA attack-chains, ransomware indicators,
+    /// `setuid(0)` privilege escalation and credential-store access. Off by
+    /// default: operators opt in so a false positive cannot kill a legitimate
+    /// process unattended. Honeytoken hits keep their own `honeytoken_response`.
+    #[serde(default = "default_auto_response_enabled")]
+    pub auto_response_enabled: bool,
+    /// Action when a detection clears the thresholds, escalating:
+    /// `none` < `alert` < `kill` < `quarantine` < `isolate`. `kill` SIGKILLs the
+    /// offending process; `quarantine` also locks the offending file; `isolate`
+    /// additionally cuts host networking. Degrades safely when no target is
+    /// known (e.g. `kill` without a PID becomes `alert`). Default `alert`.
+    #[serde(default = "default_auto_response_action")]
+    pub auto_response_action: String,
+    /// Minimum event severity that may trigger an action:
+    /// `info` < `low` < `medium` < `high` < `critical`. Default `critical`.
+    #[serde(default = "default_auto_response_min_severity")]
+    pub auto_response_min_severity: String,
+    /// Minimum detection confidence (0–100) required to act. Default `90`.
+    #[serde(default = "default_auto_response_min_confidence")]
+    pub auto_response_min_confidence: u8,
+    /// Detection `rule_id`s or `category`s that are never auto-actioned
+    /// (false-positive guard, matched case-insensitively).
+    #[serde(default)]
+    pub auto_response_allowlist: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -117,6 +148,11 @@ impl Default for AgentConfig {
             honeytoken_response: default_honeytoken_response(),
             honeytoken_accessor_allowlist: Vec::new(),
             honeytoken_deception_escalation: default_honeytoken_deception_escalation(),
+            auto_response_enabled: default_auto_response_enabled(),
+            auto_response_action: default_auto_response_action(),
+            auto_response_min_severity: default_auto_response_min_severity(),
+            auto_response_min_confidence: default_auto_response_min_confidence(),
+            auto_response_allowlist: Vec::new(),
         }
     }
 }

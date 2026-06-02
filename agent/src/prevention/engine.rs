@@ -14,7 +14,8 @@
 
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::json;
@@ -25,7 +26,10 @@ use uuid::Uuid;
 use crate::config::AgentConfig;
 use crate::deception::{self, DeployRequest, HoneytokenStore};
 use crate::forensics::{self, FlightRecorder};
-use crate::schema::{AgentEvent, EventData, HoneytokenAccessData};
+use crate::schema::{
+    AgentEvent, DetectionData, EventAction, EventData, HoneytokenAccessData,
+    RansomwareIndicatorData, Severity,
+};
 
 use super::audit::AuditEmitter;
 use super::commands::{CommandEnvelope, CommandPayload};
@@ -33,6 +37,11 @@ use super::network::{self, Backend};
 use super::policy::{IocRule, PolicyHandle, PolicyStore};
 use super::process;
 use super::quarantine;
+use super::response::{self, AutoAction, Targets};
+
+/// Per-(rule, pid) cooldown so a looping attacker (or a chatty detector) cannot
+/// trigger an auto-response storm of the same action.
+const AUTO_RESPONSE_COOLDOWN: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct EngineConfig {
@@ -93,6 +102,8 @@ pub struct Engine {
     /// Bounded flight recorder of recent telemetry, pulled into a honeytoken
     /// response as the accessor session's pre-history (issue #32, point 5).
     recorder: Arc<FlightRecorder>,
+    /// Cooldown register for automated detection-response, keyed `rule_id:pid`.
+    auto_cooldown: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
 }
 
 impl Engine {
@@ -111,6 +122,7 @@ impl Engine {
             honeytokens,
             cfg_handle,
             recorder: Arc::new(FlightRecorder::new(forensics::recorder::DEFAULT_CAPACITY)),
+            auto_cooldown: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -131,6 +143,15 @@ impl Engine {
                     }
                     EventData::HoneytokenAccess(data) => {
                         self.respond_honeytoken(data).await;
+                    }
+                    // Policy-driven auto-response to the local detection stream
+                    // (opt-in; off by default). Honeytoken hits are handled
+                    // above by their own escalation, so they are not double-acted.
+                    EventData::Detection(det) => {
+                        self.auto_respond_detection(&event, det).await;
+                    }
+                    EventData::RansomwareIndicator(r) => {
+                        self.auto_respond_ransomware(&event, r).await;
                     }
                     _ => {}
                 }
@@ -228,6 +249,180 @@ impl Engine {
                 "flight_recorder": history,
                 "escalation_triggered": escalate,
             }),
+        );
+    }
+
+    /// Auto-respond to a generic local detection (config-gated, off by default).
+    async fn auto_respond_detection(&self, event: &AgentEvent, det: &DetectionData) {
+        let targets = response::targets_from_detection(&det.subject, &det.evidence);
+        self.auto_respond(event, &det.rule_id, &det.category, det.confidence, &det.subject, targets)
+            .await;
+    }
+
+    /// Auto-respond to a ransomware indicator. Its payload carries the writer
+    /// pid and the file under encryption directly, so kill + quarantine act
+    /// precisely on the source.
+    async fn auto_respond_ransomware(&self, event: &AgentEvent, r: &RansomwareIndicatorData) {
+        let targets = Targets {
+            pid: r.pid.filter(|p| *p > 1),
+            file_path: r.path.clone(),
+        };
+        let subject = r
+            .path
+            .clone()
+            .or_else(|| r.comm.clone())
+            .unwrap_or_else(|| "ransomware".to_string());
+        self.auto_respond(
+            event,
+            &format!("ransomware.{}", r.indicator_type),
+            "ransomware",
+            90,
+            &subject,
+            targets,
+        )
+        .await;
+    }
+
+    /// Shared auto-response core: snapshot policy, decide (pure), de-dupe via a
+    /// per-(rule,pid) cooldown, then execute and audit. The decision logic lives
+    /// in [`super::response`] so the "should we kill this?" call is unit-tested.
+    async fn auto_respond(
+        &self,
+        event: &AgentEvent,
+        rule_id: &str,
+        category: &str,
+        confidence: u8,
+        subject: &str,
+        targets: Targets,
+    ) {
+        let (enabled, action, min_sev, min_conf, allow) = match self.cfg_handle.read() {
+            Ok(c) => (
+                c.auto_response_enabled,
+                AutoAction::parse(&c.auto_response_action),
+                response::parse_severity(&c.auto_response_min_severity),
+                c.auto_response_min_confidence,
+                c.auto_response_allowlist.clone(),
+            ),
+            Err(_) => return,
+        };
+
+        let decision = response::decide(
+            enabled, action, min_sev, min_conf, &allow,
+            event.severity, rule_id, category, confidence, &targets,
+        );
+        if matches!(decision.action, AutoAction::None) {
+            return;
+        }
+
+        // Cooldown so a repeating detection cannot storm the same action.
+        let key = format!("{rule_id}:{}", targets.pid.unwrap_or(0));
+        {
+            let mut cd = self.auto_cooldown.lock().await;
+            let now = Instant::now();
+            if let Some(prev) = cd.get(&key) {
+                if now.duration_since(*prev) < AUTO_RESPONSE_COOLDOWN {
+                    return;
+                }
+            }
+            cd.insert(key, now);
+            cd.retain(|_, t| now.duration_since(*t) < AUTO_RESPONSE_COOLDOWN);
+        }
+
+        self.execute_auto(rule_id, category, subject, &targets, &decision);
+    }
+
+    /// Execute a decided auto-response: kill / quarantine / isolate. Never the
+    /// agent itself or pid ≤ 1. Best-effort — failures are audited, never fatal.
+    fn execute_auto(
+        &self,
+        rule_id: &str,
+        category: &str,
+        subject: &str,
+        targets: &Targets,
+        decision: &response::Decision,
+    ) {
+        let own_pid = std::process::id() as i32;
+        let mut actions: Vec<&str> = Vec::new();
+        let mut killed = false;
+        let mut quarantined = false;
+        let mut isolated = false;
+
+        let wants_kill = matches!(
+            decision.action,
+            AutoAction::Kill | AutoAction::Quarantine | AutoAction::Isolate
+        );
+        if wants_kill {
+            if let Some(pid) = targets.pid {
+                if pid > 1 && pid != own_pid {
+                    killed = process::kill_pid(pid).is_ok();
+                    actions.push(if killed { "kill" } else { "kill_failed" });
+                } else {
+                    actions.push("kill_skipped_self");
+                }
+            }
+        }
+
+        if matches!(decision.action, AutoAction::Quarantine) {
+            if let Some(path) = &targets.file_path {
+                quarantined = quarantine::quarantine(Path::new(path)).is_ok();
+                actions.push(if quarantined { "quarantine" } else { "quarantine_failed" });
+            }
+        }
+
+        if matches!(decision.action, AutoAction::Isolate) {
+            let mut allow = self.cfg.default_isolation_allowlist.clone();
+            allow.sort();
+            allow.dedup();
+            isolated = network::isolate(self.cfg.net_backend, &allow).is_ok();
+            actions.push(if isolated { "isolate" } else { "isolate_failed" });
+        }
+
+        if actions.is_empty() {
+            actions.push("alert");
+        }
+
+        let event_action = match decision.action {
+            AutoAction::Isolate => EventAction::NetworkIsolated,
+            AutoAction::Quarantine => EventAction::FileQuarantined,
+            AutoAction::Kill => EventAction::ProcessBlocked,
+            _ => EventAction::Detected,
+        };
+        let success =
+            killed || quarantined || isolated || matches!(decision.action, AutoAction::Alert);
+
+        self.audit.emit(
+            event_action,
+            Severity::Critical,
+            "auto_response",
+            subject.to_string(),
+            success,
+            format!(
+                "auto-response '{}' to detection '{}' ({})",
+                decision.action.as_str(),
+                rule_id,
+                decision.reason
+            ),
+            Some(rule_id.to_string()),
+            None,
+            json!({
+                "rule_id": rule_id,
+                "category": category,
+                "action": decision.action.as_str(),
+                "reason": decision.reason,
+                "target_pid": targets.pid,
+                "target_path": targets.file_path,
+                "actions": actions,
+                "killed": killed,
+                "quarantined": quarantined,
+                "isolated": isolated,
+            }),
+        );
+
+        info!(
+            rule_id,
+            action = decision.action.as_str(),
+            target_pid = ?targets.pid,
+            "auto-response executed"
         );
     }
 

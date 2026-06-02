@@ -19,7 +19,7 @@ CrowdStrike Falcon-Niveau zu bringen. Jede Kategorie entspricht einem GitHub Iss
 - [ ] **File Quarantine**: Automatisches Verschieben/Sperren von als malicious klassifizierten Dateien (`O_NOATIME`, `chattr +i`)
 - [ ] **IoC-basiertes Blocking**: Konfigurierbare Block-Rules für Prozess-Hashes, IPs, Domains
 - [ ] **Memory Injection Prevention**: LSM-Hooks auf `ptrace`, `process_vm_writev`, `memfd_create` zum Blockieren von Code-Injection
-- [ ] **Automated Response Playbooks**: Backend-gesteuerte Aktionen (kill, isolate, quarantine) über Response-Commands in der API
+- [x] **Automated Response Playbooks**: policy-/severity-gesteuerte **lokale Auto-Response** auf den gesamten Detection-Stream (IOC-Hash, Reverse-Shell, IOA-Chain, Ransomware-Indicator, `setuid(0)`-Privesc, Credential-Access) — `kill`/`quarantine`/`isolate`, opt-in (`auto_response_enabled`, default aus), Severity- + Confidence-Thresholds, Allowlist, Cooldown, voll auditiert. Reine Entscheidungslogik in `agent/src/prevention/response.rs`, Executor in `prevention/engine.rs`. (Ergänzt die bestehenden signierten Backend-Response-Commands.)
 
 ---
 

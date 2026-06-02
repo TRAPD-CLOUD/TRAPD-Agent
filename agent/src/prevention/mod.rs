@@ -23,6 +23,7 @@ pub mod network;
 pub mod policy;
 pub mod process;
 pub mod quarantine;
+pub mod response;
 pub mod software;
 
 use std::path::PathBuf;
