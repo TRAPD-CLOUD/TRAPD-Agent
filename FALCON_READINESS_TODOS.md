@@ -42,6 +42,7 @@ CrowdStrike Falcon-Niveau zu bringen. Jede Kategorie entspricht einem GitHub Iss
 - [ ] **Sigma Rule Support**: Sigma-Regeln in lokale Erkennungslogik übersetzen
 - [ ] **MITRE ATT&CK Mapping**: Erkannte Events automatisch ATT&CK-Techniken zuordnen (Tactic, Technique, Sub-Technique)
 - [ ] **Heuristische LOLBin-Erkennung**: Whitelist bekannter Binaries mit Verhaltens-Baseline (z. B. `bash` startet `curl` → verdächtig)
+- [x] **Stateful IOA-Engine (Attack-Chain-Korrelation)**: persistenter Prozessbaum (PID→Lineage, Exec-SHA256) + Sliding-Window-Zustandsautomaten pro Attack-Chain; korreliert Sequenzen über den Prozess-Subtree statt Einzelevents (`agent/src/detection/ioa/`). Reichert zudem jede Detection mit der Prozess-Lineage an. Backend-Migration: `migrations/{postgres,clickhouse}/0001_ioa_findings.sql`
 
 ---
 

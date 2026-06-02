@@ -150,6 +150,24 @@ findings (each carrying a MITRE ATT&CK mapping, a confidence score and evidence)
 - **Honeytoken access** (`honeytoken.rs`) — see [Deception](#4-deception-honeytokens).
 - **YARA** (`yara_scanner.rs`, optional `--features yara`) — file scanning when
   the `libyara` C library is available at build time.
+- **Stateful IOA correlation** (`ioa/`) — the layer *above* the stateless
+  heuristics. Where the above ask "is this one event bad?", the IOA engine asks
+  "do these events, **in this process lineage**, **in this order**, **within
+  this window**, form an attack?" — the way CrowdStrike's Indicators of Attack
+  work. It keeps a **persistent process tree** (PID→lineage, with cached exec
+  SHA256 hashes) fed from the `exec`/`fork`/`create`/`terminate` events, and
+  runs **sliding-window state machines** (one declarative chain per pattern)
+  that advance only when the next stage is seen in the *same session subtree*.
+  Built-in chains: `download_and_execute` (shell → downloader → payload exec
+  from a temp dir), `privilege_escalation_activity` (unprivileged → `setuid(0)`
+  → post-escalation action) and `credential_access_exfil` (secret-store read →
+  outbound connection). A completed chain fires one high-confidence
+  `category=ioa.*` detection carrying the full stage trail, timings and the
+  accessor's lineage. The tree **also enriches every other detection** with the
+  acting process's `process_lineage`, so each finding shows *how the process
+  came to exist*. Bounded (capped nodes + tombstone GC) and never blocks the
+  consumer. Toggle with `TRAPD_IOA=off` (whole engine) and `TRAPD_IOA_HASH=off`
+  (exec hashing only).
 
 ### 3. Prevention / active response
 
