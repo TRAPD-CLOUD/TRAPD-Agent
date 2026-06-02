@@ -6,6 +6,7 @@ pub mod ebpf_syscalls;
 pub mod exehash;
 pub mod filesystem;
 pub mod fim;
+pub mod memscan;
 pub mod inet_diag;
 pub mod network;
 pub mod packet_capture;

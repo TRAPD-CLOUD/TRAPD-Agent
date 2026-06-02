@@ -371,6 +371,19 @@ escalation and credential-store access — degrades safely when no concrete targ
 is known, de-dupes via a per-(rule, pid) cooldown, and audits every action as a
 `prevention` event. This complements the signed backend response commands.
 
+**Process-memory scanning** (`memory_scan_enabled`, default on;
+`memory_scan_interval_secs`) periodically sweeps every process's
+`/proc/<pid>/maps` + `environ` and raises detections for anonymous-executable
+(RWX), memfd-backed and deleted-image code regions and runtime `LD_PRELOAD`
+injection — feeding the same auto-response path. It reads only `maps`/`environ`,
+so it is cheap.
+
+**Real-Time Response (RTR)** rides the existing Ed25519-signed command channel
+(no new auth surface, no mTLS dependency) and is **opt-in** via `rtr_enabled`
+(default off). Signed commands `RunScript` (remediation script execution with a
+timeout), `CollectFile`, `ListDirectory` and `CollectProcessMemory` return their
+(capped, `rtr_max_artifact_bytes`) output as base64 in the audited event stream.
+
 ### Filesystem layout
 
 The agent keeps state, config and logs in fixed, `$HOME`-independent locations

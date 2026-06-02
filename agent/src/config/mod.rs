@@ -39,6 +39,10 @@ fn default_auto_response_enabled() -> bool { false }
 fn default_auto_response_action() -> String { "alert".into() }
 fn default_auto_response_min_severity() -> String { "critical".into() }
 fn default_auto_response_min_confidence() -> u8 { 90 }
+fn default_memory_scan_enabled() -> bool { true }
+fn default_memory_scan_interval_secs() -> u64 { 120 }
+fn default_rtr_enabled() -> bool { false }
+fn default_rtr_max_artifact_bytes() -> u64 { 32_768 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -129,6 +133,29 @@ pub struct AgentConfig {
     /// (false-positive guard, matched case-insensitively).
     #[serde(default)]
     pub auto_response_allowlist: Vec<String>,
+
+    // ── Process-memory scanning ─────────────────────────────────────────────
+    /// Master switch for the periodic `/proc/<pid>/maps` + `environ` scan that
+    /// flags anonymous-executable / memfd / deleted-image execution and runtime
+    /// `LD_PRELOAD` injection. Reads only `maps`/`environ` (cheap), default on.
+    #[serde(default = "default_memory_scan_enabled")]
+    pub memory_scan_enabled: bool,
+    /// Seconds between memory sweeps (floored at 30).
+    #[serde(default = "default_memory_scan_interval_secs")]
+    pub memory_scan_interval_secs: u64,
+
+    // ── Real-Time Response (RTR) ────────────────────────────────────────────
+    /// Master opt-in for RTR commands (signed remediation script execution and
+    /// artifact collection: file read, directory listing, process-memory dump).
+    /// Off by default; every RTR command is still Ed25519-signed by the backend
+    /// like any other response command. Operators opt in to live response.
+    #[serde(default = "default_rtr_enabled")]
+    pub rtr_enabled: bool,
+    /// Maximum bytes returned per RTR artifact (file/memory dump). Larger
+    /// payloads are truncated; the result records the original length. Keeps a
+    /// single audit event within the backend's per-event size cap.
+    #[serde(default = "default_rtr_max_artifact_bytes")]
+    pub rtr_max_artifact_bytes: u64,
 }
 
 impl Default for AgentConfig {
@@ -153,6 +180,10 @@ impl Default for AgentConfig {
             auto_response_min_severity: default_auto_response_min_severity(),
             auto_response_min_confidence: default_auto_response_min_confidence(),
             auto_response_allowlist: Vec::new(),
+            memory_scan_enabled: default_memory_scan_enabled(),
+            memory_scan_interval_secs: default_memory_scan_interval_secs(),
+            rtr_enabled: default_rtr_enabled(),
+            rtr_max_artifact_bytes: default_rtr_max_artifact_bytes(),
         }
     }
 }

@@ -80,12 +80,12 @@ CrowdStrike Falcon-Niveau zu bringen. Jede Kategorie entspricht einem GitHub Iss
 
 **Ziel:** Erkennung von Process Hollowing, Reflective Loading, Heap Spray.
 
-- [ ] **Process Memory Scanning**: Regelmäßiges Scannen von Prozess-Speicher auf Shellcode-Signaturen (YARA)
+- [~] **Process Memory Scanning**: periodischer `MemScanCollector` (`collectors/linux/memscan.rs`) scannt jeden Prozess. Struktur-/Mapping-basiert aktiv; YARA-über-Speicher noch offen (RTR-Memory-Dump liefert die Bytes bereits für Offline-Analyse).
 - [ ] **ptrace-Missbrauch erkennen**: Alle ptrace-Aufrufe auf fremde Prozesse überwachen und melden
-- [ ] **`/proc/PID/maps` Analyse**: Anomale Speicher-Mappings erkennen (ausführbare anonyme Regionen)
-- [ ] **`memfd_create` Monitoring**: Dateisystem-lose ausführbare Bereiche erkennen (Fileless Malware)
+- [x] **`/proc/PID/maps` Analyse**: erkennt **anonyme ausführbare** (RWX/anon-exec), **memfd-backed** und **deleted-image** Code-Regionen als Detection (`memory.anon_exec`/`memory.memfd_exec`/`memory.deleted_exec`, MITRE T1055/T1620)
+- [x] **`memfd_create` Monitoring**: zur eBPF-Erfassung kommt nun die Laufzeit-Erkennung memfd-backed ausführbarer Mappings im Maps-Scan (`memory.memfd_exec`)
 - [ ] **Shellcode-Entropie-Check**: Hohe Entropie in ausführbaren Speicherbereichen als IOC werten
-- [ ] **LD_PRELOAD Hijacking Detection**: Erkennen von `LD_PRELOAD`-Injection in Prozess-Umgebungsvariablen
+- [x] **LD_PRELOAD Hijacking Detection**: zusätzlich zur Exec-Zeit-Erkennung prüft der Maps-Scan `/proc/<pid>/environ` zur Laufzeit auf `LD_PRELOAD` aus nicht-Standard-Pfaden (`injection.ld_preload_runtime`, T1574.006)
 
 ---
 
@@ -135,12 +135,12 @@ CrowdStrike Falcon-Niveau zu bringen. Jede Kategorie entspricht einem GitHub Iss
 
 **Ziel:** Remote-Forensik und Remediation direkt aus dem Backend.
 
-- [ ] **Remote Shell / RTR-Channel**: Bidirektionaler WebSocket/gRPC-Kanal für Remote-Befehle vom Backend
-- [ ] **Artifact Collection**: Prozess-Speicher-Dump, Log-Archive, Datei-Upload an Backend auf Anfrage
-- [ ] **File Download/Upload API**: Beliebige Dateien vom Host abrufen oder deployen
-- [ ] **Prozess-Terminierung via API**: Remote-`SIGKILL` auf beliebige PIDs
-- [ ] **Netzwerk-Isolation Command**: Auf Backend-Befehl alle Verbindungen außer dem Management-Channel sperren
-- [ ] **Custom Script Execution**: Signierte Remediation-Skripte sicher ausführen
+- [~] **Remote Shell / RTR-Channel**: RTR läuft über den bestehenden **Ed25519-signierten Command-Kanal** (pull-basiert, `rtr_enabled`-gegated) statt eines ungesicherten Remote-Shells — `RunScript` führt signierte Remediation-Skripte mit Timeout aus. Persistenter bidirektionaler WebSocket/gRPC-Transport noch offen.
+- [x] **Artifact Collection**: `CollectFile` (Datei), `CollectProcessMemory` (Speicher-Dump readbarer/anon-exec-Regionen), `ListDirectory` — Ergebnisse (gekappt, base64) im auditierten Event-Stream
+- [~] **File Download/Upload API**: Download (Host→Backend) via `CollectFile` vorhanden; Push/Deploy + Streaming großer Artefakte (über die per-Event-Größengrenze hinaus) noch offen
+- [x] **Prozess-Terminierung via API**: Remote-`SIGKILL` via signiertem `KillPid` (bestehend)
+- [x] **Netzwerk-Isolation Command**: signiertes `IsolateNetwork`/`DeisolateNetwork` (bestehend)
+- [x] **Custom Script Execution**: `RunScript` — base64-Skript, wählbarer Interpreter (`/bin/sh -c` default), Timeout, Output gekappt & auditiert; Ed25519-signiert + `rtr_enabled`-gegated
 - [ ] **Forensics Timeline Export**: Vollständige Event-History als JSONL-Export für IR-Workflows
 
 ---

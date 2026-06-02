@@ -38,6 +38,7 @@ use super::policy::{IocRule, PolicyHandle, PolicyStore};
 use super::process;
 use super::quarantine;
 use super::response::{self, AutoAction, Targets};
+use super::rtr as response_rtr;
 
 /// Per-(rule, pid) cooldown so a looping attacker (or a chatty detector) cannot
 /// trigger an auto-response storm of the same action.
@@ -572,7 +573,263 @@ impl Engine {
             CommandPayload::ThawPid { pid } => {
                 self.cmd_thaw_pid(*pid, &cmd_id);
             }
+            CommandPayload::RunScript { interpreter, script_b64, timeout_secs } => {
+                self.cmd_run_script(interpreter.as_deref(), script_b64, *timeout_secs, &cmd_id)
+                    .await;
+            }
+            CommandPayload::CollectFile { path, max_bytes } => {
+                self.cmd_collect_file(path, *max_bytes, &cmd_id);
+            }
+            CommandPayload::ListDirectory { path } => {
+                self.cmd_list_directory(path, &cmd_id);
+            }
+            CommandPayload::CollectProcessMemory { pid, max_bytes } => {
+                self.cmd_collect_process_memory(*pid, *max_bytes, &cmd_id);
+            }
         }
+    }
+
+    // ── RTR (Real-Time Response) ─────────────────────────────────────────────
+
+    /// Read `(rtr_enabled, rtr_max_artifact_bytes)` from the live config.
+    fn rtr_settings(&self) -> (bool, u64) {
+        self.cfg_handle
+            .read()
+            .map(|c| (c.rtr_enabled, c.rtr_max_artifact_bytes))
+            .unwrap_or((false, 0))
+    }
+
+    /// Audit an RTR command that was refused because RTR is disabled.
+    fn rtr_refuse(&self, kind: &str, target: impl Into<String>, cmd_id: &str) {
+        self.audit.emit(
+            EventAction::CommandRejected,
+            Severity::Medium,
+            kind,
+            target,
+            false,
+            "RTR is disabled (set rtr_enabled=true to allow)",
+            None,
+            Some(cmd_id.into()),
+            serde_json::Value::Null,
+        );
+    }
+
+    /// Execute a signed remediation script with a timeout, returning capped
+    /// stdout/stderr in the audited result.
+    async fn cmd_run_script(
+        &self,
+        interpreter: Option<&str>,
+        script_b64: &str,
+        timeout_secs: Option<u64>,
+        cmd_id: &str,
+    ) {
+        let (enabled, max_bytes) = self.rtr_settings();
+        if !enabled {
+            return self.rtr_refuse("rtr_run_script", "script", cmd_id);
+        }
+        let script = match base64::engine::general_purpose::STANDARD.decode(script_b64) {
+            Ok(b) => match String::from_utf8(b) {
+                Ok(s) => s,
+                Err(_) => return self.rtr_refuse("rtr_run_script", "script", cmd_id),
+            },
+            Err(_) => return self.rtr_refuse("rtr_run_script", "script", cmd_id),
+        };
+
+        let (prog, flag) = response_rtr::shell_invocation(interpreter);
+        let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 300));
+
+        let run = tokio::process::Command::new(&prog)
+            .arg(flag)
+            .arg(&script)
+            .stdin(std::process::Stdio::null())
+            .output();
+
+        let (success, code, stdout, stderr, note) =
+            match tokio::time::timeout(timeout, run).await {
+                Ok(Ok(out)) => (
+                    out.status.success(),
+                    out.status.code(),
+                    out.stdout,
+                    out.stderr,
+                    String::new(),
+                ),
+                Ok(Err(e)) => (false, None, Vec::new(), Vec::new(), format!("spawn failed: {e}")),
+                Err(_) => (false, None, Vec::new(), Vec::new(), "timed out".to_string()),
+            };
+
+        let max = max_bytes as usize;
+        let out_art = response_rtr::cap_and_encode(&stdout, max);
+        let err_art = response_rtr::cap_and_encode(&stderr, max.saturating_sub(out_art.b64.len()).max(1));
+
+        self.audit.emit(
+            EventAction::CommandAccepted,
+            if success { Severity::Info } else { Severity::Medium },
+            "rtr_run_script",
+            prog.clone(),
+            success,
+            format!(
+                "ran script via {prog} (exit {}{})",
+                code.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                if note.is_empty() { String::new() } else { format!(", {note}") }
+            ),
+            None,
+            Some(cmd_id.into()),
+            json!({
+                "interpreter": prog,
+                "exit_code": code,
+                "note": note,
+                "stdout_b64": out_art.b64,
+                "stdout_len": out_art.total_len,
+                "stdout_truncated": out_art.truncated,
+                "stderr_b64": err_art.b64,
+                "stderr_len": err_art.total_len,
+                "stderr_truncated": err_art.truncated,
+            }),
+        );
+    }
+
+    /// Read a file and return its capped contents as a base64 artifact.
+    fn cmd_collect_file(&self, path: &str, max_bytes: Option<u64>, cmd_id: &str) {
+        let (enabled, default_max) = self.rtr_settings();
+        if !enabled {
+            return self.rtr_refuse("rtr_collect_file", path.to_string(), cmd_id);
+        }
+        let cap = max_bytes.unwrap_or(default_max).min(default_max) as usize;
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let art = response_rtr::cap_and_encode(&bytes, cap);
+                self.audit.emit(
+                    EventAction::CommandAccepted,
+                    Severity::Info,
+                    "rtr_collect_file",
+                    path.to_string(),
+                    true,
+                    format!("collected {} of {} bytes from {path}", art.returned_len, art.total_len),
+                    None,
+                    Some(cmd_id.into()),
+                    json!({
+                        "path": path,
+                        "content_b64": art.b64,
+                        "total_len": art.total_len,
+                        "truncated": art.truncated,
+                    }),
+                );
+            }
+            Err(e) => self.audit.emit(
+                EventAction::CommandRejected,
+                Severity::Medium,
+                "rtr_collect_file",
+                path.to_string(),
+                false,
+                format!("collect_file failed: {e}"),
+                None,
+                Some(cmd_id.into()),
+                serde_json::Value::Null,
+            ),
+        }
+    }
+
+    /// List a directory (names, types, sizes) for triage.
+    fn cmd_list_directory(&self, path: &str, cmd_id: &str) {
+        let (enabled, _) = self.rtr_settings();
+        if !enabled {
+            return self.rtr_refuse("rtr_list_directory", path.to_string(), cmd_id);
+        }
+        match std::fs::read_dir(path) {
+            Ok(rd) => {
+                let entries: Vec<serde_json::Value> = rd
+                    .flatten()
+                    .take(4096)
+                    .map(|e| {
+                        let md = e.metadata().ok();
+                        json!({
+                            "name": e.file_name().to_string_lossy(),
+                            "dir": md.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+                            "size": md.as_ref().map(|m| m.len()).unwrap_or(0),
+                        })
+                    })
+                    .collect();
+                self.audit.emit(
+                    EventAction::CommandAccepted,
+                    Severity::Info,
+                    "rtr_list_directory",
+                    path.to_string(),
+                    true,
+                    format!("listed {} entries in {path}", entries.len()),
+                    None,
+                    Some(cmd_id.into()),
+                    json!({ "path": path, "entries": entries }),
+                );
+            }
+            Err(e) => self.audit.emit(
+                EventAction::CommandRejected,
+                Severity::Medium,
+                "rtr_list_directory",
+                path.to_string(),
+                false,
+                format!("list_directory failed: {e}"),
+                None,
+                Some(cmd_id.into()),
+                serde_json::Value::Null,
+            ),
+        }
+    }
+
+    /// Dump a process's readable memory (anonymous-executable regions first) as
+    /// a capped base64 artifact. Requires CAP_SYS_PTRACE / root to read
+    /// `/proc/<pid>/mem`; partial reads are returned best-effort.
+    fn cmd_collect_process_memory(&self, pid: i32, max_bytes: Option<u64>, cmd_id: &str) {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let (enabled, default_max) = self.rtr_settings();
+        if !enabled {
+            return self.rtr_refuse("rtr_collect_memory", format!("pid {pid}"), cmd_id);
+        }
+        let cap = max_bytes.unwrap_or(default_max).min(default_max);
+
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+        let regions = response_rtr::dumpable_regions(&maps, cap);
+
+        let mut buf = Vec::new();
+        let mut mem = std::fs::File::open(format!("/proc/{pid}/mem"));
+        if let Ok(f) = mem.as_mut() {
+            for (start, end) in &regions {
+                if f.seek(SeekFrom::Start(*start)).is_err() {
+                    continue;
+                }
+                let mut chunk = vec![0u8; (end - start) as usize];
+                // Reads can short-read or fail per region (guard pages, races);
+                // keep whatever we got and move on.
+                if let Ok(n) = f.read(&mut chunk) {
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
+
+        let art = response_rtr::cap_and_encode(&buf, cap as usize);
+        let success = !buf.is_empty();
+        self.audit.emit(
+            if success { EventAction::CommandAccepted } else { EventAction::CommandRejected },
+            if success { Severity::Info } else { Severity::Medium },
+            "rtr_collect_memory",
+            format!("pid {pid}"),
+            success,
+            format!(
+                "dumped {} bytes from {} region(s) of pid {pid}{}",
+                art.returned_len,
+                regions.len(),
+                if mem.is_err() { " (/proc/<pid>/mem unreadable — need CAP_SYS_PTRACE)" } else { "" }
+            ),
+            None,
+            Some(cmd_id.into()),
+            json!({
+                "pid": pid,
+                "regions": regions.len(),
+                "memory_b64": art.b64,
+                "total_len": art.total_len,
+                "truncated": art.truncated,
+            }),
+        );
     }
 
     /// Freeze a process (SIGSTOP) on operator command and audit a forensic

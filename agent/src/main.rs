@@ -209,6 +209,7 @@ async fn main() -> Result<()> {
     spawn_collector!(FilesystemCollector::new());
     spawn_collector!(AgentProtectCollector::new());
     spawn_collector!(collectors::linux::fim::FimCollector::new(Arc::clone(&agent_config)));
+    spawn_collector!(collectors::linux::memscan::MemScanCollector::new(Arc::clone(&agent_config)));
     // Passive DNS-response + TLS-handshake capture (AF_PACKET). Best-effort:
     // needs CAP_NET_RAW; logs and exits cleanly without it while the rest run.
     spawn_collector!(collectors::linux::packet_capture::PacketCaptureCollector::new());

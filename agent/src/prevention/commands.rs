@@ -166,6 +166,32 @@ pub enum CommandPayload {
     FreezePid { pid: i32 },
     /// Resume a previously-frozen process (SIGCONT).
     ThawPid { pid: i32 },
+    // ── Real-Time Response (RTR) ─────────────────────────────────────────────
+    /// Execute a signed remediation script. `script_b64` is base64 of the script
+    /// body, run via `interpreter` (default `/bin/sh -c`). Gated by `rtr_enabled`.
+    /// Output (capped) is returned in the audited result event.
+    RunScript {
+        #[serde(default)]
+        interpreter: Option<String>,
+        script_b64: String,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    /// Read a file and return its (capped) contents as a base64 artifact.
+    CollectFile {
+        path: String,
+        #[serde(default)]
+        max_bytes: Option<u64>,
+    },
+    /// List a directory for triage (names, types, sizes).
+    ListDirectory { path: String },
+    /// Dump a process's readable memory regions (anonymous-executable first) as
+    /// a capped base64 artifact, for offline analysis.
+    CollectProcessMemory {
+        pid: i32,
+        #[serde(default)]
+        max_bytes: Option<u64>,
+    },
 }
 
 /// Envelope signed by the backend.  All fields are part of the signed body.
