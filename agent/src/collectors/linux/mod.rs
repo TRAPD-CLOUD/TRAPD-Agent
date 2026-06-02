@@ -2,6 +2,7 @@ pub mod agent_protect;
 pub mod authlog;
 pub mod ebpf_exec;
 pub mod ebpf_syscalls;
+pub mod exehash;
 pub mod filesystem;
 pub mod network;
 pub mod process;

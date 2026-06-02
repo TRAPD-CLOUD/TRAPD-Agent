@@ -297,7 +297,7 @@ mod tests {
 
     /// Build a tree where 200 is a bash and 301/302 are its children.
     fn tree() -> ProcessTree {
-        let mut t = ProcessTree::new(false);
+        let mut t = ProcessTree::new();
         let now = Instant::now();
         t.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", now);
         t.on_exec(301, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl", now);

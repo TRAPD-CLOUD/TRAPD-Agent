@@ -22,6 +22,7 @@ fn process_create_event() -> AgentEvent {
             cmdline:  "nginx -g daemon off;".to_string(),
             uid:      33,
             username: "www-data".to_string(),
+            exe_sha256: None,
         }),
     )
 }

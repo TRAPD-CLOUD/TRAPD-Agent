@@ -325,6 +325,9 @@ impl Collector for EbpfExecCollector {
                     None
                 };
 
+                // Hash the executed image at exec time (cached, size-capped).
+                let exe_sha256 = super::exehash::hash_executable(&exe);
+
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),
@@ -343,6 +346,7 @@ impl Collector for EbpfExecCollector {
                         cwd,
                         container_id,
                         ld_preload,
+                        exe_sha256,
                     }),
                 );
 
