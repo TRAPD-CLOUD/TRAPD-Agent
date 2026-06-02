@@ -207,6 +207,10 @@ pub struct ProcessCreateData {
     pub cmdline:  String,
     pub uid:      u32,
     pub username: String,
+    /// SHA256 of the executable image, hashed at collection time.  `None` when
+    /// hashing is disabled or the image is not a hashable regular file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +234,11 @@ pub struct ExecEventData {
     pub container_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ld_preload: Option<String>,
+    /// SHA256 of the executable image, hashed at collection time.  `None` when
+    /// hashing is disabled or the image is not a hashable regular file (memfd,
+    /// deleted, too large).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

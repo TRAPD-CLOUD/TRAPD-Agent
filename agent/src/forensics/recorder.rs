@@ -192,6 +192,7 @@ mod tests {
                 cwd: "/home/alice".into(),
                 container_id: None,
                 ld_preload: None,
+                exe_sha256: None,
             }),
         )
     }

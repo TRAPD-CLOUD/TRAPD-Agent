@@ -18,6 +18,18 @@ fn default_enabled_collectors() -> Vec<String> {
     ]
 }
 fn default_prevention_enabled() -> bool { true }
+fn default_fim_enabled() -> bool { true }
+fn default_fim_interval() -> u64 { 900 }
+fn default_fim_paths() -> Vec<String> {
+    vec![
+        "/etc".into(),
+        "/usr/bin".into(),
+        "/usr/sbin".into(),
+        "/bin".into(),
+        "/sbin".into(),
+        "/boot".into(),
+    ]
+}
 fn default_command_poll_interval() -> u64 { 10 }
 fn default_inventory_enabled() -> bool { true }
 fn default_honeytoken_detection_enabled() -> bool { true }
@@ -45,6 +57,18 @@ pub struct AgentConfig {
     /// mode (the management channel is always on the allow-list).
     #[serde(default)]
     pub isolation_allowlist_ips: Vec<String>,
+
+    // ── File Integrity Monitoring (SHA256 FIM) ──────────────────────────────
+    /// Master switch for SHA256-based file-integrity monitoring.
+    #[serde(default = "default_fim_enabled")]
+    pub fim_enabled: bool,
+    /// Roots (files or directories) whose contents are baselined and watched
+    /// for cryptographic changes.
+    #[serde(default = "default_fim_paths")]
+    pub fim_paths: Vec<String>,
+    /// Seconds between FIM rescans (floored at 60).
+    #[serde(default = "default_fim_interval")]
+    pub fim_interval_secs: u64,
 
     // ── Asset inventory ─────────────────────────────────────────────────────
     /// Master switch for periodic asset-inventory reporting (hardware, OS,
@@ -85,6 +109,9 @@ impl Default for AgentConfig {
             prevention_enabled: default_prevention_enabled(),
             command_poll_interval_secs: default_command_poll_interval(),
             isolation_allowlist_ips:    Vec::new(),
+            fim_enabled:        default_fim_enabled(),
+            fim_paths:          default_fim_paths(),
+            fim_interval_secs:  default_fim_interval(),
             inventory_enabled:  default_inventory_enabled(),
             honeytoken_detection_enabled: default_honeytoken_detection_enabled(),
             honeytoken_response: default_honeytoken_response(),

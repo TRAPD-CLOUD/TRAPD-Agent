@@ -157,6 +157,7 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
 
         let uid = status.ruid;
         let username = uid_map.get(&uid).cloned().unwrap_or_default();
+        let exe_sha256 = super::exehash::hash_executable(&exe);
 
         let data = ProcessCreateData {
             pid:     stat.pid,
@@ -166,6 +167,7 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
             cmdline,
             uid,
             username,
+            exe_sha256,
         };
         out.insert(stat.pid, data);
     }

@@ -50,7 +50,7 @@ CrowdStrike Falcon-Niveau zu bringen. Jede Kategorie entspricht einem GitHub Iss
 
 **Ziel:** Lokal oder via Feed IOCs erkennen.
 
-- [ ] **Hash-basiertes IOC-Matching**: SHA256-Hashes von Prozessen/Dateien gegen Threat-Feed prüfen
+- [x] **Hash-basiertes IOC-Matching**: jeder Exec wird bei Erfassung SHA256-gehasht (`collectors/linux/exehash.rs`, `exe_sha256`) und gegen den IOC-Feed geprüft (`ioc.process_hash`)
 - [ ] **IP/Domain Reputation Lookup**: Ausgehende Verbindungen gegen Threat-Intelligence-Feeds matchen
 - [ ] **Lokale IOC-Datenbank**: SQLite-basierte lokale IOC-Datenbank mit regelmäßigem Feed-Update
 - [ ] **STIX/TAXII Feed Consumer**: Standardisierte Threat-Intelligence-Feeds konsumieren
@@ -62,8 +62,8 @@ CrowdStrike Falcon-Niveau zu bringen. Jede Kategorie entspricht einem GitHub Iss
 
 **Ziel:** FIM mit Baseline und Ransomware-Frühwarnung.
 
-- [ ] **SHA256-basiertes FIM**: Kryptographische Checksums für alle überwachten Dateien – Baseline erstellen und Abweichungen melden
-- [ ] **Erweitertes FIM-Monitoring**: Kritische Pfade ausweiten (`/usr/bin`, `/usr/sbin`, `/lib`, `/boot`, `/etc`, `/root`)
+- [x] **SHA256-basiertes FIM**: Kryptographische Checksums für überwachte Dateien – persistente Baseline (`<state>/fim_baseline.json`), meldet Modify/Add/Remove (`agent/src/collectors/linux/fim.rs`)
+- [x] **Erweitertes FIM-Monitoring**: Standard-Pfade `/etc`, `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/boot` (konfigurierbar via `fim_paths`)
 - [ ] **Ransomware-Behavior Detection**: Massenhafte Datei-Verschlüsselungsoperationen via eBPF erkennen (viele `write`-Calls mit Entropie-Änderung)
 - [ ] **Datei-Entropie-Analyse**: Entropie-Messung bei `write`-Events zur Erkennung von Verschlüsselung
 - [ ] **Shadow Copy / Backup-Schutz**: Erkennen von Löschversuchen auf Backup-Directories

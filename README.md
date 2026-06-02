@@ -20,7 +20,7 @@ what it does in seconds, with no backend at all.
   /proc   ─ poll ──────► │  (telemetry) │                                │
   auth.log ────────────► │              ▼                                │
   inotify  ────────────► │        event pipeline ──► detection engine    │
-                         │              │  (ring buffer)   │ (findings)   │
+                         │              │ (durable spool)  │ (findings)   │
                          │              ▼                  ▼              │
                          │   local NDJSON / backend     prevention engine │
                          │        ingest                 (active response)│
@@ -84,8 +84,13 @@ The agent is a single Tokio async binary (`trapd-agent`). On startup
    if the compiled eBPF object is present; otherwise the agent degrades gracefully
    to `/proc` polling.
 4. **Consumes the pipeline** — a single consumer task:
-   - writes each event locally (NDJSON to stdout or file) and into a **ring
-     buffer** for backend ingest;
+   - writes each event locally (NDJSON to stdout or file) and into a **durable
+     spool** for backend ingest — online the spool is disk-backed
+     (`<state>/spool/queue.ndjson`), so a backend outage or an agent restart no
+     longer loses telemetry: events accumulate (bounded) and are replayed on the
+     next run (at-least-once; the backend dedupes on `event_id`). Offline it is
+     in-memory only (the NDJSON file is the record). Capacity overrides with
+     `TRAPD_SPOOL_MAX`;
    - runs each event through the **detection engine**; findings are re-injected as
      new events;
    - **tees** both raw events and findings into the **prevention engine**.
@@ -114,19 +119,26 @@ Collectors live in `agent/src/collectors/linux/`. Two tiers:
 | `AuthLogCollector` | `/var/log/auth.log` | `user/logon`, `user/logon_failed`, `user/session_open`, `user/session_close` |
 | `FilesystemCollector` | `inotify` | `filesystem/create|delete|modify` under watched paths (`/etc`, `/bin`, `/tmp` by default) |
 | `AgentProtectCollector` | agent's own files | `agent_tamper` events |
+| `FimCollector` | SHA256 baseline of `fim_paths` (`/etc`, `/usr/bin`, `/boot`, … by default) | `filesystem/integrity_violation` (modified / added / removed) — every `fim_interval_secs`; baseline persists across restarts |
 
 **eBPF collectors (when the eBPF object is built & installed; see
 [Building from source](#building-from-source)):**
 
 | Collector | Kernel hooks | Emits |
 |-----------|--------------|-------|
-| `EbpfExecCollector` | `sched_process_exec` | rich `process/exec` (uid/gid, cwd, full cmdline, container id) |
+| `EbpfExecCollector` | `sched_process_exec` | rich `process/exec` (uid/gid, cwd, full cmdline, container id, **exe SHA256**) |
 | `EbpfSyscallCollector` | many tracepoints | `fork`, `file open/unlink/rename/chmod/chown`, `mmap`, `ptrace`, `module_load`, `setuid`, `dns_query`, `shm`, `ns_change`, `kill_attempt`, `memfd`, and honeytoken-access detection |
 
 The kernel-side programs are in the standalone `trapd-agent-ebpf` crate
 (`exec`, `fork`, `network`, `dns`, `file_open`, `file_manip`, `write`, `mmap`,
 `ptrace`, `kill`, `module_load`, `setuid`, `shm`, `memfd`, `namespace`,
 `process_block`).
+
+**Executable hashing.** Every exec (both the eBPF tracer and the `/proc`
+poller) is SHA256-hashed once at collection time (`collectors/linux/exehash.rs`)
+and carried on the event as `exe_sha256`. The hash is cached by path+mtime and
+size-capped, feeds the detection engine's **IOC hash matching** and the IOA
+process-tree lineage, and can be disabled with `TRAPD_EXEC_HASH=off`.
 
 ### 2. Detection engine
 
@@ -165,9 +177,9 @@ findings (each carrying a MITRE ATT&CK mapping, a confidence score and evidence)
   `category=ioa.*` detection carrying the full stage trail, timings and the
   accessor's lineage. The tree **also enriches every other detection** with the
   acting process's `process_lineage`, so each finding shows *how the process
-  came to exist*. Bounded (capped nodes + tombstone GC) and never blocks the
-  consumer. Toggle with `TRAPD_IOA=off` (whole engine) and `TRAPD_IOA_HASH=off`
-  (exec hashing only).
+  came to exist*. Bounded (capped nodes + tombstone GC), I/O-free and never
+  blocks the consumer. Toggle the whole engine with `TRAPD_IOA=off`. Executable
+  hashes are computed once at collection (see below) and flow into the lineage.
 
 ### 3. Prevention / active response
 
