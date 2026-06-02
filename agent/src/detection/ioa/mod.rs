@@ -284,7 +284,7 @@ mod tests {
             EventClass::Process,
             EventAction::Exec,
             Severity::Info,
-            EventData::ProcessExec(ExecEventData {
+            EventData::ProcessExec(Box::new(ExecEventData {
                 pid,
                 ppid,
                 uid,
@@ -297,7 +297,14 @@ mod tests {
                 container_id: None,
                 ld_preload: None,
                 exe_sha256: None,
-            }),
+                loaded_libraries: Vec::new(),
+                env: Default::default(),
+                interpreter: None,
+                container_runtime: None,
+                container_image: None,
+                container_image_digest: None,
+                k8s: None,
+            })),
         )
     }
 
@@ -328,6 +335,12 @@ mod tests {
                 state: "established".into(),
                 pid: Some(pid),
                 process: None,
+                duration_ms: None,
+                bytes_sent: None,
+                bytes_recv: None,
+                packets_sent: None,
+                packets_recv: None,
+                rtt_us: None,
             }),
         )
     }

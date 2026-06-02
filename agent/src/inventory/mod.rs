@@ -51,10 +51,74 @@ pub struct InventorySnapshot {
     pub network: Vec<NetInterface>,
     pub software: SoftwareInventory,
     pub users: Vec<UserAccount>,
+    /// Security posture baseline: SUID/SGID binaries, file capabilities,
+    /// listening ports and loaded kernel modules — the attack-surface snapshot a
+    /// Falcon-class sensor maintains so the backend can diff against it.
+    pub security_posture: SecurityPosture,
     /// Deception recon profile: honeytoken candidates derived deterministically
     /// from the observed context above. The backend turns these into believable
     /// content and ranks them before issuing `deploy_honeytoken` commands.
     pub recon_profile: crate::deception::ReconProfile,
+}
+
+/// Host attack-surface baseline. Every field is a point-in-time inventory the
+/// backend can diff: a new SUID binary, a freshly-opened listening port or an
+/// unsigned kernel module appearing between snapshots is a high-value signal.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SecurityPosture {
+    /// Binaries carrying the setuid / setgid bit (privilege-escalation surface).
+    pub suid_sgid: Vec<SuidSgidBinary>,
+    /// Files carrying Linux file capabilities (`security.capability` xattr).
+    pub file_capabilities: Vec<FileCapability>,
+    /// Sockets in the LISTEN state (TCP) or bound (UDP) — the network surface.
+    pub listening_ports: Vec<ListeningPort>,
+    /// Loaded kernel modules with their taint/signature status (rootkit surface).
+    pub kernel_modules: Vec<KernelModule>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SuidSgidBinary {
+    pub path: String,
+    /// Octal mode string, e.g. `"4755"`.
+    pub mode: String,
+    pub setuid: bool,
+    pub setgid: bool,
+    pub owner_uid: u32,
+    pub owner_gid: u32,
+    pub size: u64,
+    /// SHA256 of the binary (`sha256:<hex>`), for reputation matching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileCapability {
+    pub path: String,
+    /// Human-readable capability set, e.g. `"cap_net_raw,cap_net_admin+ep"`.
+    pub capabilities: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListeningPort {
+    pub protocol: String, // "tcp" | "tcp6" | "udp" | "udp6"
+    pub address: String,
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KernelModule {
+    pub name: String,
+    /// Memory size in bytes (from `/proc/modules`).
+    pub size: u64,
+    /// Module load state (`Live`, `Loading`, `Unloading`).
+    pub state: String,
+    /// Signature status derived from the kernel taint flags / sysfs:
+    /// `signed`, `unsigned`, or `unknown`.
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

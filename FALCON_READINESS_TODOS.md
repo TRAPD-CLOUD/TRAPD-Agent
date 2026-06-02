@@ -3,6 +3,11 @@
 Dieses Dokument listet alle Aufgaben, die notwendig sind, um den TRAPD-Agent auf
 CrowdStrike Falcon-Niveau zu bringen. Jede Kategorie entspricht einem GitHub Issue.
 
+> **Telemetrie-Tiefe (P1):** Status der „Daten, die noch fehlen“-Liste (Image-
+> SHA256 beim Exec, Loaded-Library-Inventory, Env/Interpreter-Script, Security-
+> Posture-Baseline, Container/K8s-Kontext sowie die offenen eBPF-/DPI-Punkte
+> DNS-Responses und Netflow-Tiefe) ist in **`TELEMETRY_DEPTH.md`** dokumentiert.
+
 ---
 
 ## 1. Prävention & Aktive Response
@@ -62,8 +67,8 @@ CrowdStrike Falcon-Niveau zu bringen. Jede Kategorie entspricht einem GitHub Iss
 
 **Ziel:** FIM mit Baseline und Ransomware-Frühwarnung.
 
-- [x] **SHA256-basiertes FIM**: Kryptographische Checksums für überwachte Dateien – persistente Baseline (`<state>/fim_baseline.json`), meldet Modify/Add/Remove (`agent/src/collectors/linux/fim.rs`)
-- [x] **Erweitertes FIM-Monitoring**: Standard-Pfade `/etc`, `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/boot` (konfigurierbar via `fim_paths`)
+- [x] **SHA256-basiertes FIM**: Kryptographische Checksums für überwachte Dateien – persistente Baseline (`<state>/fim_baseline.json`), meldet Modify/Add/Remove (`agent/src/collectors/linux/fim.rs`); zusätzlich SQLite-Baseline + Integritätsprüfung in `filesystem.rs`
+- [x] **Erweitertes FIM-Monitoring**: Standard-Pfade `/etc`, `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/boot`, `/lib`, `/root` (konfigurierbar via `fim_paths`)
 - [ ] **Ransomware-Behavior Detection**: Massenhafte Datei-Verschlüsselungsoperationen via eBPF erkennen (viele `write`-Calls mit Entropie-Änderung)
 - [ ] **Datei-Entropie-Analyse**: Entropie-Messung bei `write`-Events zur Erkennung von Verschlüsselung
 - [ ] **Shadow Copy / Backup-Schutz**: Erkennen von Löschversuchen auf Backup-Directories

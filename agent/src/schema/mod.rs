@@ -86,6 +86,10 @@ pub enum EventAction {
     Shmat,
     NsChange,
     DnsQuery,
+    /// A DNS *response* observed on the wire (resolved IPs for correlation).
+    DnsResponse,
+    /// A TLS ClientHello observed on the wire (SNI + JA3 fingerprint).
+    TlsHandshake,
     IntegrityViolation,
     RansomwareIndicator,
     AgentTamper,
@@ -158,7 +162,10 @@ pub enum Severity {
 pub enum EventData {
     ProcessCreate(ProcessCreateData),
     ProcessTerminate(ProcessTerminateData),
-    ProcessExec(ExecEventData),
+    // Boxed: with the P1 telemetry-depth fields (image hash, library inventory,
+    // env, decoded scripts, K8s context) this is by far the largest variant;
+    // boxing keeps `EventData` compact (clippy::large_enum_variant).
+    ProcessExec(Box<ExecEventData>),
     NetworkConnection(NetworkConnectionData),
     SystemSnapshot(SystemSnapshotData),
     UserLogon(UserLogonData),
@@ -178,6 +185,8 @@ pub enum EventData {
     Shm(ShmData),
     NsChange(NsChangeData),
     Dns(DnsData),
+    DnsResolution(DnsResolutionData),
+    TlsHandshake(TlsHandshakeData),
     IntegrityViolation(IntegrityViolationData),
     RansomwareIndicator(RansomwareIndicatorData),
     AgentTamper(AgentTamperData),
@@ -234,11 +243,80 @@ pub struct ExecEventData {
     pub container_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ld_preload: Option<String>,
-    /// SHA256 of the executable image, hashed at collection time.  `None` when
-    /// hashing is disabled or the image is not a hashable regular file (memfd,
-    /// deleted, too large).
+    /// SHA256 of the executed binary image, hashed at collection time.  `None`
+    /// when hashing is disabled or the image is not a hashable regular file
+    /// (memfd, deleted, too large). Anchors IOC / reputation matching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exe_sha256: Option<String>,
+    // ── Telemetry-depth enrichment (P1) ──────────────────────────────────────
+    /// Shared objects mapped into the process (the Linux "loaded module"
+    /// inventory; the DLL-equivalent), from `/proc/<pid>/maps`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_libraries: Vec<String>,
+    /// Curated, secret-redacted environment of the process.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Decoded interpreter script context (`python -c`, base64 chains, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<InterpreterContext>,
+    /// Container runtime (`docker`/`containerd`/`crio`/`podman`/`kubepods`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_runtime: Option<String>,
+    /// Container image reference (`registry/name:tag`), from the runtime state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_image: Option<String>,
+    /// Container image content digest (`sha256:…`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_image_digest: Option<String>,
+    /// Kubernetes pod context, when the process runs in a pod.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k8s: Option<K8sContext>,
+}
+
+/// Aggregated process-enrichment payload produced by
+/// [`crate::collectors::linux::proc_enrich`]; flattened into [`ExecEventData`].
+#[derive(Debug, Clone, Default)]
+pub struct ExecEnrichment {
+    pub loaded_libraries: Vec<String>,
+    pub interpreter:      Option<InterpreterContext>,
+    pub env:              std::collections::BTreeMap<String, String>,
+    pub container_id:     Option<String>,
+    pub container_runtime: Option<String>,
+    pub container_image:  Option<String>,
+    pub container_image_digest: Option<String>,
+    pub k8s:              Option<K8sContext>,
+}
+
+/// Decoded view of a script interpreter invocation — the inline program body
+/// and any base64 payloads recovered from the command line, tagged with
+/// suspicious-pattern indicators.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterpreterContext {
+    /// Interpreter language (`python`/`bash`/`perl`/`node`/…).
+    pub lang: String,
+    /// Inline script passed via `-c`/`-e`, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_script: Option<String>,
+    /// Base64 blobs decoded out of the command line (obfuscation chains).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decoded_payloads: Vec<String>,
+    /// Matched suspicious-pattern tags (`base64_decode`, `reverse_shell`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indicators: Vec<String>,
+}
+
+/// Kubernetes pod context for a process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct K8sContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_uid:   Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_name:  Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Orchestration labels (`io.kubernetes.*`, custom pod labels).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,9 +326,30 @@ pub struct NetworkConnectionData {
     pub src_port: u16,
     pub dst_addr: String,
     pub dst_port: u16,
+    /// `established` / `open` on flow start; `closed` on the flow-end record.
     pub state:    String,
     pub pid:      Option<i32>,
     pub process:  Option<String>,
+    /// Flow lifetime in milliseconds, measured from first observation to the
+    /// flow-close record (set only on the `closed` event).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    // ── Netflow depth (INET_DIAG / tcp_info) ─────────────────────────────────
+    /// Bytes acknowledged as sent on the connection (`tcpi_bytes_acked`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_sent: Option<u64>,
+    /// Bytes received on the connection (`tcpi_bytes_received`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_recv: Option<u64>,
+    /// Segments sent (`tcpi_segs_out`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packets_sent: Option<u64>,
+    /// Segments received (`tcpi_segs_in`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packets_recv: Option<u64>,
+    /// Smoothed round-trip time in microseconds (`tcpi_rtt`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_us: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,6 +530,52 @@ pub struct DnsData {
     pub comm:     String,
     pub dst_addr: String,
     pub dst_port: u16,
+}
+
+/// A DNS *response* observed on the wire — the resolved answer set that lets the
+/// backend correlate a later outbound connection back to the domain that
+/// produced its IP (the data the query-only `DnsData` was missing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsResolutionData {
+    /// Queried name (e.g. `example.com`).
+    pub qname: String,
+    /// Query type as text (`A`, `AAAA`, `CNAME`, `TXT`, …).
+    pub qtype: String,
+    /// Resolved A / AAAA addresses from the answer section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_ips: Vec<String>,
+    /// CNAME chain from the answer section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cnames: Vec<String>,
+    /// DNS server that produced the answer.
+    pub server_addr: String,
+    /// Client that issued the query.
+    pub client_addr: String,
+    /// DNS transaction id (lets query/response be paired).
+    pub transaction_id: u16,
+    /// Response code as text (`NOERROR`, `NXDOMAIN`, …).
+    pub rcode: String,
+}
+
+/// A TLS ClientHello observed on the wire — SNI plus the JA3 fingerprint, the
+/// pivot for C2-over-TLS and malware-family attribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsHandshakeData {
+    pub src_addr: String,
+    pub dst_addr: String,
+    pub dst_port: u16,
+    /// Server Name Indication from the ClientHello, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Negotiated/offered TLS version as text (`TLS 1.2`, `TLS 1.3`, …).
+    pub tls_version: String,
+    /// Raw JA3 string (`version,ciphers,exts,groups,formats`).
+    pub ja3: String,
+    /// MD5 hash of the JA3 string (the canonical JA3 fingerprint).
+    pub ja3_hash: String,
+    /// ALPN protocols offered (`h2`, `http/1.1`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alpn: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
