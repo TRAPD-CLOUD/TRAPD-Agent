@@ -303,7 +303,15 @@ impl Verifier {
             ));
         }
 
-        let mut store = self.nonces.lock().expect("nonce store poisoned");
+        // Recover from a poisoned lock instead of panicking: the nonce store
+        // only records already-seen nonces, so it stays internally consistent
+        // even if another thread panicked while holding the guard. Crashing the
+        // command path here would let an attacker who can provoke a panic in a
+        // neighbouring thread disable the self-defence command/response channel.
+        let mut store = self
+            .nonces
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !store.try_insert(cmd.envelope.nonce, cmd.envelope.expires_at) {
             return Verdict::Rejected(format!(
                 "replay: nonce {} already seen", cmd.envelope.nonce
@@ -515,6 +523,33 @@ mod cross_lang_tests {
     // kill_pid
     const ENV8: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"99999999-9999-9999-9999-999999999999","payload":{"kind":"kill_pid","pid":4242}}"#;
     const SIG8: &str = "6ysMGbqRLHq5NmtBrKiWLOJjIyyFxM/2pFsk3HfhopTLRdd4Gh395DkZydPWzbuQ3FkPG22QJjCO8ee0JpxaAg==";
+
+    #[test]
+    fn verifies_after_nonce_store_lock_poisoned() {
+        // Poison the nonce-store mutex by panicking while holding the guard,
+        // then prove command verification still succeeds (recovers the guard)
+        // instead of panicking itself.
+        let (v, p, n) = verifier();
+        let poisoned = std::panic::catch_unwind({
+            let nonces = Arc::clone(&v.nonces);
+            move || {
+                let _guard = nonces.lock().unwrap();
+                panic!("intentional panic to poison the nonce store");
+            }
+        });
+        assert!(poisoned.is_err(), "the closure was expected to panic");
+        assert!(v.nonces.is_poisoned(), "nonce store should now be poisoned");
+
+        let cmd: SignedCommand =
+            serde_json::from_str(&format!(r#"{{"envelope":{ENV1},"signature":"{SIG1}"}}"#))
+                .unwrap();
+        match v.verify(&cmd) {
+            Verdict::Ok(env) => assert_eq!(env.agent_id, "agent-test"),
+            Verdict::Rejected(why) => panic!("verification failed after poisoning: {why}"),
+        }
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(n);
+    }
 
     #[test]
     fn accepts_ts_signed_deception_and_forensic_vectors() {
