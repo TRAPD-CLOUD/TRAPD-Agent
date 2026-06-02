@@ -12,22 +12,34 @@ jobs:
       - run: cargo clippy --manifest-path agent/Cargo.toml -- -D warnings
       - run: cargo test --manifest-path agent/Cargo.toml
 
-  # Dependency-vulnerability scan (RustSec advisory DB). Kept non-blocking for
-  # now (continue-on-error) so a freshly disclosed CVE surfaces in the logs
-  # without breaking unrelated PRs; flip to blocking once the advisory backlog
-  # is triaged. Covers BOTH lockfiles: the agent workspace (agent + xtask) and
-  # the separate eBPF crate.
-  audit:
+  # The kernel-side detection lives entirely in the trapd-agent-ebpf crate,
+  # which is a SEPARATE workspace built with a pinned nightly + bpf-linker for
+  # the bpfel-unknown-none target (see xtask/src/main.rs). The `build` job above
+  # never touches it, so a change that breaks an eBPF program (compile error,
+  # bad map/struct layout, invalid verifier construct) would otherwise sail
+  # through CI green and only surface at release/load time. This job compiles
+  # the eBPF crate on every push/PR so such breakage is caught and blocking.
+  ebpf:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-      - name: cargo audit (agent workspace)
-        run: cargo audit --file Cargo.lock
-      - name: cargo audit (eBPF crate)
-        run: cargo audit --file trapd-agent-ebpf/Cargo.lock
+
+      # The eBPF crate pins its own nightly (+ rust-src component) via
+      # trapd-agent-ebpf/rust-toolchain.toml. Touching the crate dir makes
+      # rustup auto-install that toolchain up front, so the download cost is
+      # paid before the build step and rust-cache can pick it up.
+      - name: Install pinned nightly toolchain + rust-src (eBPF build)
+        working-directory: trapd-agent-ebpf
+        run: |
+          rustup show active-toolchain
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
+      # Blocking: a verifier/compile failure in any eBPF program fails the PR.
+      - name: Build eBPF programs (release)
+        run: cargo xtask build-ebpf --release

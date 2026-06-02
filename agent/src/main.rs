@@ -127,7 +127,11 @@ async fn main() -> Result<()> {
         "TRAPD Agent started"
     );
 
-    let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(AgentConfig::default()));
+    // Start from the last verified config on disk (defaults on first run), so a
+    // restart keeps the real configuration even though the signed-config channel
+    // re-serves it with an already-accepted (and thus replay-rejected) issued_at.
+    let agent_config: Arc<RwLock<AgentConfig>> =
+        Arc::new(RwLock::new(config::load_persisted()));
     // Backend outbox. Online it is disk-backed (survives crash/restart, replays
     // on the next run); offline it is purely in-memory (the NDJSON output is the
     // system of record).
@@ -269,14 +273,17 @@ async fn main() -> Result<()> {
             hostname.clone(),
             offline,
             Arc::clone(&agent_config),
-        );
+        )?;
         tokio::spawn(async move { inv.run().await });
     }
 
     // Backend channels only run when connected; offline = pure local telemetry.
     if !offline {
+        // All three open the (fail-closed) pinned control channel; a pinning
+        // misconfig surfaces here as a hard error rather than a silent
+        // fall-back to the system trust store.
         let transport =
-            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone());
+            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
         tokio::spawn(async move { transport.run().await });
 
         let config_puller = ConfigPuller::new(
@@ -284,10 +291,10 @@ async fn main() -> Result<()> {
             &backend_url,
             &agent_id,
             token.clone(),
-        );
+        )?;
         tokio::spawn(async move { config_puller.run().await });
 
-        let heartbeat = Heartbeat::new(&backend_url, agent_id.clone(), token, hostname.clone());
+        let heartbeat = Heartbeat::new(&backend_url, agent_id.clone(), token, hostname.clone())?;
         tokio::spawn(async move { heartbeat.run().await });
     }
 
@@ -402,7 +409,7 @@ async fn start_prevention(
             audit.clone(),
             cmd_tx,
             poll_secs,
-        );
+        )?;
         tokio::spawn(async move { puller.run().await });
         Arc::clone(&engine).spawn_command_loop(cmd_rx);
     }

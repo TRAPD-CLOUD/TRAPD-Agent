@@ -74,7 +74,10 @@ fn emit_setuid_event(ctx: &TracePointContext, new_uid: u32) {
 
     let mut entry = match SETUID_EVENTS.reserve::<SetuidEvent>(0) {
         Some(e) => e,
-        None => return,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_SETUID);
+            return;
+        }
     };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid     = pid;

@@ -44,6 +44,21 @@ use super::rtr as response_rtr;
 /// trigger an auto-response storm of the same action.
 const AUTO_RESPONSE_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Whether `pid` is a legitimate target for a PID-directed action.
+///
+/// A signed PID-targeted command (`kill` / `freeze` / `thaw` / `collect-memory`)
+/// must name one real, individual process. It must never be a `kill(2)` broadcast
+/// selector — `pid == -1` signals *every* process the caller may signal, `pid == 0`
+/// the *whole process group* — and never init (`pid == 1`) or the agent's own PID
+/// (which would let a command take the self-defense agent down via its own channel).
+///
+/// This is the single guard shared by both the auto-response path
+/// ([`Engine::execute_auto`]) and the command handlers, so a target rejected by one
+/// is rejected by the other (issue #59).
+fn is_valid_target_pid(pid: i32, own_pid: i32) -> bool {
+    pid > 1 && pid != own_pid
+}
+
 #[derive(Clone)]
 pub struct EngineConfig {
     pub net_backend: Backend,
@@ -105,6 +120,23 @@ pub struct Engine {
     recorder: Arc<FlightRecorder>,
     /// Cooldown register for automated detection-response, keyed `rule_id:pid`.
     auto_cooldown: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+}
+
+/// Whether `pid` is a legitimate *single-process* target for a destructive,
+/// PID-directed action (`kill` / `freeze` / `collect-memory`).
+///
+/// This rejects the `kill(2)` wildcard / process-group semantics that would
+/// otherwise let one command take down the whole host:
+///   * `pid <= 0` — `-1` signals *every* process the caller may signal, `0` the
+///     caller's whole process group, other negatives a specific group.
+///   * `pid == 1` — init / the container entrypoint.
+///   * `pid == own_pid` — the agent must never signal itself.
+///
+/// It is the same guard the auto-response path applies in [`Engine::execute_auto`];
+/// the signed-command handlers reuse it so both channels behave identically.
+fn valid_target_pid(pid: i32) -> bool {
+    let own_pid = std::process::id() as i32;
+    pid > 1 && pid != own_pid
 }
 
 impl Engine {
@@ -342,7 +374,6 @@ impl Engine {
         targets: &Targets,
         decision: &response::Decision,
     ) {
-        let own_pid = std::process::id() as i32;
         let mut actions: Vec<&str> = Vec::new();
         let mut killed = false;
         let mut quarantined = false;
@@ -354,7 +385,7 @@ impl Engine {
         );
         if wants_kill {
             if let Some(pid) = targets.pid {
-                if pid > 1 && pid != own_pid {
+                if is_valid_target_pid(pid, own_pid) {
                     killed = process::kill_pid(pid).is_ok();
                     actions.push(if killed { "kill" } else { "kill_failed" });
                 } else {
@@ -775,11 +806,42 @@ impl Engine {
         }
     }
 
+    /// Gate a PID-directed command on a sane target. Returns `true` if `pid`
+    /// names a single real process that may be acted on; otherwise emits a
+    /// `CommandRejected` audit event and returns `false` so the caller bails
+    /// out **before** any signal is sent. Rejects broadcast selectors
+    /// (`pid <= 0`), init (`pid == 1`) and the agent's own PID (issue #59).
+    fn accept_target_pid(&self, pid: i32, kind: &str, cmd_id: &str) -> bool {
+        let own_pid = std::process::id() as i32;
+        if is_valid_target_pid(pid, own_pid) {
+            return true;
+        }
+        self.audit.emit(
+            EventAction::CommandRejected,
+            Severity::Medium,
+            kind,
+            pid.to_string(),
+            false,
+            format!(
+                "refusing PID-targeted command: pid {pid} is not a valid single \
+                 target (must be > 1 and not the agent's own pid {own_pid})"
+            ),
+            None,
+            Some(cmd_id.into()),
+            json!({ "pid": pid, "rejected": "invalid_target_pid" }),
+        );
+        false
+    }
+
     /// Dump a process's readable memory (anonymous-executable regions first) as
     /// a capped base64 artifact. Requires CAP_SYS_PTRACE / root to read
     /// `/proc/<pid>/mem`; partial reads are returned best-effort.
     fn cmd_collect_process_memory(&self, pid: i32, max_bytes: Option<u64>, cmd_id: &str) {
         use std::io::{Read, Seek, SeekFrom};
+
+        if !self.accept_target_pid(pid, "rtr_collect_memory", cmd_id) {
+            return;
+        }
 
         let (enabled, default_max) = self.rtr_settings();
         if !enabled {
@@ -836,6 +898,9 @@ impl Engine {
     /// snapshot of it while it is suspended (issue #32, point 5).
     fn cmd_freeze_pid(&self, pid: i32, cmd_id: &str) {
         use crate::schema::{EventAction, Severity};
+        if !self.accept_target_pid(pid, "process_freeze", cmd_id) {
+            return;
+        }
         let frozen = process::freeze_pid(pid).is_ok();
         let snapshot = forensics::capture_snapshot(pid, frozen);
         self.audit.emit(
@@ -858,6 +923,9 @@ impl Engine {
     /// Resume a previously-frozen process (SIGCONT) on operator command.
     fn cmd_thaw_pid(&self, pid: i32, cmd_id: &str) {
         use crate::schema::{EventAction, Severity};
+        if !self.accept_target_pid(pid, "process_thaw", cmd_id) {
+            return;
+        }
         let thawed = process::thaw_pid(pid).is_ok();
         self.audit.emit(
             EventAction::ProcessThawed,
@@ -1074,6 +1142,9 @@ impl Engine {
     }
 
     fn cmd_kill_pid(&self, pid: i32, cmd_id: &str) {
+        if !self.accept_target_pid(pid, "process_block", cmd_id) {
+            return;
+        }
         let res = process::kill_pid(pid);
         let success = res.is_ok();
         let reason = match res {
@@ -1323,7 +1394,97 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::ResponseLevel;
+    use super::{is_valid_target_pid, Engine, EngineConfig, ResponseLevel};
+    use crate::config::AgentConfig;
+    use crate::deception::HoneytokenStore;
+    use crate::prevention::audit::AuditEmitter;
+    use crate::prevention::network::Backend;
+    use crate::prevention::policy::{PolicyHandle, PolicyStore};
+    use crate::schema::{AgentEvent, EventAction, EventData};
+    use std::sync::{Arc, RwLock};
+    use tokio::sync::mpsc;
+
+    /// Build an `Engine` wired to an in-memory audit channel for command-path
+    /// tests. The honeytoken store points at a throwaway temp path (missing →
+    /// starts empty) and the network backend is `None` so nothing touches the
+    /// host firewall.
+    fn test_engine() -> (Engine, mpsc::Receiver<AgentEvent>) {
+        let (tx, rx) = mpsc::channel(16);
+        let audit = AuditEmitter::new(tx, "test-agent".into(), "test-host".into());
+        let ht_path = std::env::temp_dir()
+            .join(format!("trapd-test-ht-{}-{:p}.json", std::process::id(), &rx));
+        let engine = Engine::new(
+            PolicyHandle::new(PolicyStore::default()),
+            audit,
+            EngineConfig {
+                net_backend: Backend::None,
+                default_isolation_allowlist: vec![],
+            },
+            Arc::new(HoneytokenStore::load_from(ht_path)),
+            Arc::new(RwLock::new(AgentConfig::default())),
+        );
+        (engine, rx)
+    }
+
+    #[test]
+    fn valid_target_pid_rejects_broadcast_init_and_self() {
+        let own = 4242;
+        // kill(2) broadcast / process-group selectors and init are never valid.
+        assert!(!is_valid_target_pid(-1, own), "pid -1 (all processes)");
+        assert!(!is_valid_target_pid(0, own), "pid 0 (process group)");
+        assert!(!is_valid_target_pid(1, own), "pid 1 (init)");
+        // The agent must never target itself via the command channel.
+        assert!(!is_valid_target_pid(own, own), "own pid");
+        // A real, individual, foreign PID is accepted.
+        assert!(is_valid_target_pid(2, own));
+        assert!(is_valid_target_pid(31337, own));
+    }
+
+    /// A signed `KillPid` whose target is a broadcast selector / init / the
+    /// agent itself must be rejected with a `CommandRejected` audit event and
+    /// must NOT reach `process::kill_pid` (which would SIGKILL every process the
+    /// root agent can signal). Issue #59.
+    #[test]
+    fn cmd_kill_pid_rejects_dangerous_targets_without_killing() {
+        let own = std::process::id() as i32;
+        for &pid in &[-1, 0, 1, own] {
+            let (engine, mut rx) = test_engine();
+            engine.cmd_kill_pid(pid, "cmd-1");
+
+            let ev = rx.try_recv().expect("a rejection event must be emitted");
+            assert!(
+                matches!(ev.action, EventAction::CommandRejected),
+                "pid {pid} must be rejected, not killed"
+            );
+            match ev.data {
+                EventData::Prevention(p) => {
+                    assert!(!p.success);
+                    assert_eq!(p.kind, "process_block");
+                    assert_eq!(p.command_id.as_deref(), Some("cmd-1"));
+                }
+                other => panic!("expected a prevention event, got {other:?}"),
+            }
+            // Exactly one event (the rejection) — no ProcessBlocked follow-up.
+            assert!(rx.try_recv().is_err(), "no further events for pid {pid}");
+        }
+    }
+
+    /// The same guard protects the freeze (SIGSTOP) and thaw (SIGCONT) paths,
+    /// which would otherwise suspend/resume every process on `pid <= 0`.
+    #[test]
+    fn cmd_freeze_and_thaw_reject_dangerous_targets() {
+        for &pid in &[-1, 0, 1] {
+            let (engine, mut rx) = test_engine();
+            engine.cmd_freeze_pid(pid, "cmd-f");
+            let ev = rx.try_recv().expect("freeze rejection event");
+            assert!(matches!(ev.action, EventAction::CommandRejected));
+
+            let (engine, mut rx) = test_engine();
+            engine.cmd_thaw_pid(pid, "cmd-t");
+            let ev = rx.try_recv().expect("thaw rejection event");
+            assert!(matches!(ev.action, EventAction::CommandRejected));
+        }
+    }
 
     #[test]
     fn response_level_parses_escalation_ladder() {

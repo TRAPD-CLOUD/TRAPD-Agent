@@ -67,12 +67,14 @@ use aya::{
 // MapData is the owned map type returned by Ebpf::take_map; importing it here
 // ensures the TryFrom<Map> → RingBuf<MapData> conversion is unambiguous.
 use aya::maps::HashMap as BpfHashMap;
-use aya::maps::MapData;
+use aya::maps::{MapData, PerCpuArray};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::Sender;
+use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{info, warn};
 
 use crate::collectors::Collector;
+use crate::collectors::linux::ebpf_drops::DropMonitor;
 use crate::config::AgentConfig;
 use crate::detection::honeytoken::{self, AccessHit, AccessKind, Allowlist, RealProc};
 use crate::schema::{
@@ -81,6 +83,9 @@ use crate::schema::{
     MmapData, ModuleLoadData, NetworkSocketData, NsChangeData, PtraceData, Severity,
     SetuidData, ShmData, WriteRateAnomalyData,
 };
+
+/// How often the eBPF ring-buffer drop counters are polled and exported (#52).
+const DROP_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 // ── Kernel ↔ Userspace struct layouts ────────────────────────────────────────
 // Every struct here must be repr(C) and match its counterpart in
@@ -1013,10 +1018,47 @@ impl Collector for EbpfSyscallCollector {
         // the FILE_OPEN_EVENTS arm below) and break the events.ndjson loop.
         let agent_pid = std::process::id();
 
+        // ── eBPF ring-buffer drop counters (issue #52) ──────────────────────
+        // The kernel side bumps a per-program counter in the shared `DROPPED`
+        // per-CPU map whenever a ring buffer is full and an event is dropped.
+        // Poll it on an interval, log sustained drops and export them as an
+        // event. Gracefully no-ops on an older eBPF binary that lacks the map.
+        let mut drop_monitor = match bpf.take_map("DROPPED") {
+            Some(map) => match PerCpuArray::<_, u64>::try_from(map) {
+                Ok(arr) => Some(DropMonitor::new(arr)),
+                Err(e) => {
+                    warn!(error = %e, "DROPPED map not usable — eBPF drop metrics disabled");
+                    None
+                }
+            },
+            None => {
+                info!("eBPF binary has no DROPPED map — ring-buffer drop metrics unavailable");
+                None
+            }
+        };
+        let mut drop_ticker = interval(DROP_POLL_INTERVAL);
+        // Don't burst-catch-up missed ticks (e.g. after the loop was busy); a
+        // single delayed poll is enough since the counters are cumulative.
+        drop_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 _ = tx.closed() => {
                     return Ok(());
+                }
+
+                // Periodic eBPF ring-buffer drop report (issue #52). Emits an
+                // event only when new drops occurred since the last poll.
+                _ = drop_ticker.tick() => {
+                    if let Some(data) = drop_monitor.as_mut().and_then(DropMonitor::poll) {
+                        let event = AgentEvent::new(
+                            agent_id.clone(), hostname.clone(),
+                            EventClass::System, EventAction::EbpfDrops,
+                            Severity::Medium,
+                            EventData::EbpfDrops(data),
+                        );
+                        if tx.send(event).await.is_err() { return Ok(()); }
+                    }
                 }
 
                 Ok(mut guard) = afd_file_open.readable_mut() => {

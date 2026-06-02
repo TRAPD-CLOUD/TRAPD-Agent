@@ -145,6 +145,11 @@ pub enum EventAction {
     /// signal for the backend to deploy more bait / redirect into a honeypot /
     /// tarpit (issue #32, point 5).
     DeceptionEscalation,
+    // ── Observability ────────────────────────────────────────────────────────
+    /// Periodic report of eBPF ring-buffer drops (events lost because a kernel
+    /// ring buffer was full). A non-zero count is a detection blind-spot under
+    /// load (issue #52).
+    EbpfDrops,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,9 +208,28 @@ pub enum EventData {
     // Boxed: the forensic session/lineage payload is much larger than the other
     // variants, so boxing keeps `EventData` compact (clippy::large_enum_variant).
     HoneytokenAccess(Box<HoneytokenAccessData>),
+    // ── Observability ────────────────────────────────────────────────────────
+    EbpfDrops(EbpfDropsData),
 }
 
 // ── Existing data structs ────────────────────────────────────────────────────────────────────────
+
+/// Periodic eBPF ring-buffer drop report (issue #52).
+///
+/// Each event-emitting eBPF program submits into its own ring buffer; when that
+/// buffer is full the event is dropped in-kernel. The kernel side counts those
+/// drops per program in a shared per-CPU map, and the userspace collector reads
+/// and exports them here so a detection blind-spot under load is observable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EbpfDropsData {
+    /// Cumulative drop count per program since agent start (only programs with a
+    /// non-zero count are included), keyed by program name (e.g. "exec", "dns").
+    pub per_program: std::collections::BTreeMap<String, u64>,
+    /// Total drops across all programs since agent start.
+    pub total: u64,
+    /// New drops since the previous report (delta over the report interval).
+    pub delta: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessCreateData {
