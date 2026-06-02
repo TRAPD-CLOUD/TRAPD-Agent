@@ -381,22 +381,71 @@ fn script_indicators(
 
 // ── Container / Kubernetes context ──────────────────────────────────────────────
 
-/// Best-effort container + Kubernetes context for a process, parsed from its
-/// cgroup and (for pod name/namespace) its environment.
-///
-/// Returns `(container_id, runtime, k8s)`. `container_id` is the full id from the
-/// cgroup path; `runtime` is `docker`/`containerd`/`crio`/`podman`/`kubepods`;
-/// `k8s` carries the pod uid (from the cgroup) plus pod name / namespace when the
-/// workload exposes them via the downward API / standard env vars.
-pub fn container_context(
-    pid: u32,
-    env: &BTreeMap<String, String>,
-) -> (Option<String>, Option<String>, Option<K8sContext>) {
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
-    let (container_id, runtime, pod_uid) = parse_cgroup(&cgroup);
+/// Resolved container facts for a process.
+#[derive(Default)]
+pub struct ContainerFacts {
+    pub container_id:    Option<String>,
+    pub runtime:         Option<String>,
+    pub image:           Option<String>,
+    pub image_digest:    Option<String>,
+    pub k8s:             Option<K8sContext>,
+}
 
-    let k8s = build_k8s_context(pod_uid, env);
-    (container_id, runtime, k8s)
+/// Best-effort container + Kubernetes context for a process.
+///
+/// The container id + runtime + pod uid come from the cgroup; the image name /
+/// digest and orchestration labels (pod name / namespace) are resolved from the
+/// runtime state files (see [`super::container`]), falling back to the process
+/// environment / downward API when the runtime metadata is unreadable.
+pub fn container_context(pid: u32, env: &BTreeMap<String, String>) -> ContainerFacts {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    let (container_id, runtime, mut pod_uid) = parse_cgroup(&cgroup);
+
+    // Enrich from the runtime state: image name/digest + k8s labels.
+    let img = container_id
+        .as_deref()
+        .map(super::container::resolve)
+        .unwrap_or_default();
+
+    let (mut pod_name, mut namespace, label_uid) = super::container::k8s_labels(&img.labels);
+    pod_uid = pod_uid.or(label_uid);
+
+    // Env / downward-API fallbacks when labels are absent (non-root read, etc.).
+    if pod_name.is_none() {
+        pod_name = env.get("POD_NAME").or_else(|| env.get("HOSTNAME")).cloned();
+    }
+    if namespace.is_none() {
+        namespace = env
+            .get("POD_NAMESPACE")
+            .or_else(|| env.get("KUBERNETES_NAMESPACE"))
+            .cloned();
+    }
+
+    let in_k8s = pod_uid.is_some()
+        || pod_name.is_some()
+        || namespace.is_some()
+        || env.contains_key("KUBERNETES_SERVICE_HOST")
+        || img.labels.keys().any(|k| k.starts_with("io.kubernetes."));
+
+    let k8s = in_k8s.then(|| K8sContext {
+        pod_uid,
+        pod_name,
+        namespace,
+        labels: img
+            .labels
+            .iter()
+            .filter(|(k, _)| k.starts_with("io.kubernetes.") || !k.contains('.'))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    });
+
+    ContainerFacts {
+        container_id,
+        runtime,
+        image: img.image,
+        image_digest: img.image_digest,
+        k8s,
+    }
 }
 
 /// Parse the cgroup file into `(container_id, runtime, pod_uid)`.
@@ -488,31 +537,6 @@ fn extract_pod_uid(path: &str) -> Option<String> {
     None
 }
 
-fn build_k8s_context(
-    pod_uid: Option<String>,
-    env: &BTreeMap<String, String>,
-) -> Option<K8sContext> {
-    let in_k8s = pod_uid.is_some() || env.contains_key("KUBERNETES_SERVICE_HOST");
-    if !in_k8s {
-        return None;
-    }
-    // The downward API conventionally surfaces these; HOSTNAME == pod name is the
-    // de-facto default for a pod's containers.
-    let pod_name = env
-        .get("POD_NAME")
-        .or_else(|| env.get("HOSTNAME"))
-        .map(|s| s.to_string());
-    let namespace = env
-        .get("POD_NAMESPACE")
-        .or_else(|| env.get("KUBERNETES_NAMESPACE"))
-        .map(|s| s.to_string());
-    Some(K8sContext {
-        pod_uid,
-        pod_name,
-        namespace,
-    })
-}
-
 // ── Top-level enrichment ─────────────────────────────────────────────────────────
 
 /// Build the full [`ExecEnrichment`] for a freshly-exec'd process. All fields
@@ -520,15 +544,17 @@ fn build_k8s_context(
 /// hash filled (from the event's exe path, if still present) and the rest empty.
 pub fn enrich_exec(pid: u32, comm: &str, exe: &str, cmdline: &str) -> ExecEnrichment {
     let env = curated_env(pid);
-    let (container_id, container_runtime, k8s) = container_context(pid, &env);
+    let c = container_context(pid, &env);
     ExecEnrichment {
         sha256: image_sha256(pid, exe),
         loaded_libraries: loaded_libraries(pid),
         interpreter: interpreter_context(comm, exe, cmdline),
         env,
-        container_id,
-        container_runtime,
-        k8s,
+        container_id: c.container_id,
+        container_runtime: c.runtime,
+        container_image: c.image,
+        container_image_digest: c.image_digest,
+        k8s: c.k8s,
     }
 }
 

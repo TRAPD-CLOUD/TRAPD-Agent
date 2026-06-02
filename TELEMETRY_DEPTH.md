@@ -10,11 +10,11 @@ Legende: ✅ implementiert · 🟡 teilweise · ⏳ offen (Begründung + Plan)
 |---|----------|--------|------------|
 | 1 | **SHA256 beim Exec** (Image-Hash fürs IOC/Reputation-Matching) | ✅ | `collectors/linux/proc_enrich.rs` → `image_sha256` |
 | 2 | **Shared-Library-Loads / LD_PRELOAD** | 🟡 | LD_PRELOAD (eBPF) + Loaded-Library-Inventory (`proc_enrich::loaded_libraries`); dlopen-Live-Tracing offen |
-| 3 | **DNS-Responses (resolved IPs)** | ⏳ | nur Query-Ziel (`ebpf/dns.rs`); Response-Parsing offen |
-| 4 | **Netflow-Tiefe** (Bytes/Pakete/Dauer/JA3) | ⏳ | offen (INET_DIAG / DPI) |
+| 3 | **DNS-Responses (resolved IPs)** | ⏳ | nur Query-Ziel (`ebpf/dns.rs`); Response-Parsing offen (eBPF) |
+| 4 | **Netflow-Tiefe** (Bytes/Pakete/Dauer/JA3) | 🟡 | **Dauer + Flow-Close ✅** (`network.rs`); Byte-/Paket-Zähler (INET_DIAG) + JA3/SNI (DPI) offen |
 | 5 | **SHA256-FIM mit Baseline** (`/usr/bin`,`/lib`,`/boot`,`/etc` …) | ✅ | `collectors/linux/filesystem.rs` (SQLite-Baseline, war bereits vorhanden) |
 | 6 | **SUID/SGID + Capabilities, Listening-Ports, Kernel-Module + Signatur** | ✅ | `inventory/collect.rs` → `gather_security_posture` |
-| 7 | **Container/K8s-Enrichment** (Runtime, Pod/Namespace) | 🟡 | `proc_enrich::container_context`; Image-Digest/Labels brauchen CRI-API |
+| 7 | **Container/K8s-Enrichment** (Image/Digest, Pod/Namespace/Labels) | ✅ | `proc_enrich::container_context` + `collectors/linux/container.rs` |
 | 8 | **Env-Variablen + Interpreter-Script-Content** | ✅ | `proc_enrich::curated_env` / `interpreter_context` |
 
 ---
@@ -54,11 +54,23 @@ zwischen zwei Snapshots ist ein hochwertiges Signal.
 
 ### 7 · Container/K8s-Enrichment
 `ExecEventData.container_runtime` (`docker`/`containerd`/`crio`/`podman`/
-`kubepods`) und `k8s` (Pod-UID aus dem cgroup-Pfad — beide Treiber: systemd
-`_`-kodiert und cgroupfs `-`-kodiert — plus Pod-Name/Namespace best-effort aus
-der Downward-API / Standard-Env). `cri-containerd-<hash>`-Segmente werden korrekt
-als Container-ID erkannt. **Offen:** Image-Name/-Digest und Pod-Labels — die
-liegen nur in der CRI-/containerd-API, nicht im cgroup/Proc.
+`kubepods`), `container_image` + `container_image_digest` sowie `k8s`
+(Pod-UID/Name/Namespace + Labels). Container-ID + Runtime + Pod-UID kommen aus
+dem cgroup-Pfad (beide Treiber: systemd `_`-kodiert und cgroupfs `-`-kodiert,
+`cri-containerd-<hash>`-Segmente korrekt erkannt). **Image-Name/-Digest +
+Labels** werden aus den Runtime-State-Files gelesen (kein Daemon-Socket nötig):
+Docker `…/containers/<id>/config.v2.json` (`Image`-Digest, `Config.Image`,
+`Config.Labels`) bzw. containerd/CRI OCI-`config.json` (`annotations`). Pod-
+Name/Namespace stammen aus den `io.kubernetes.pod.*`-Labels, mit Fallback auf
+Downward-API/Env (`collectors/linux/container.rs`). **Offen:** Live-
+CRI/containerd-Lifecycle-Events (Create/Start/Stop) — erfordern einen CRI-/
+containerd-Event-Stream-Client.
+
+### 4 (teilweise) · Netflow-Tiefe — Verbindungsdauer + Flow-Close
+Der `NetworkCollector` führt jetzt einen Flow-Lebenszyklus: pro 4-Tupel wird der
+First-Seen-Zeitpunkt gehalten, beim Verschwinden einer Verbindung wird ein
+`state: "closed"`-Record mit `duration_ms` (gemessene Lebensdauer) emittiert. Der
+Flow-Key ist IPv6-sicher (Feld-basiert, kein naives Colon-Split).
 
 ### 8 · Env + Interpreter-Script-Content
 * **Curated Env** aus `/proc/<pid>/environ`: kuratierte, sicherheitsrelevante
@@ -91,13 +103,15 @@ Für die **Antworten** (aufgelöste A/AAAA-Records → Korrelation Domain↔IP):
   den Verifier), Events um `qname` + `resolved_ips[]` erweitern
   (`schema::DnsData`). Korreliert dann ausgehende Connections mit der Domain.
 
-### 4 · Netflow-Tiefe (Bytes/Pakete/Dauer, TLS-SNI/JA3)
-`/proc/net/tcp` liefert keine Byte-/Paket-Totals.
-* **Bytes/Pakete/Dauer — Plan (Userspace, ohne eBPF):** `INET_DIAG`/`sock_diag`
+### 4 (Rest) · Netflow-Tiefe — Byte-/Paket-Zähler + TLS-SNI/JA3
+Verbindungsdauer + Flow-Close sind implementiert (siehe oben). Offen bleiben:
+* **Bytes/Pakete — Plan (Userspace, ohne eBPF):** `INET_DIAG`/`sock_diag`
   über Netlink abfragen → `tcp_info` (`bytes_acked`, `bytes_received`, `segs_in/
-  out`, `rtt`, `last_data_*` → Verbindungsdauer). `NetworkConnectionData` um
-  `bytes_sent/recv`, `packets_*`, `duration_ms` erweitern. (Benötigt einen
-  Netlink-Helper; aktuell keine Netlink-Crate im Dependency-Set.)
+  out`, `rtt`). `NetworkConnectionData` um `bytes_sent/recv`, `packets_*`
+  erweitern. Bewusst **nicht** per Hand-gerolltem `tcp_info`-Offset-Parsing
+  umgesetzt — die ABI ist kernel-versions-/bitfield-abhängig und ohne echten
+  Kernel-Host nicht verifizierbar; korrekt wäre eine vetted Netlink-Crate
+  (`neli` / `netlink-packet-sock-diag`) als neue Dependency.
 * **TLS-SNI/JA3 — Plan (DPI):** ClientHello aus den ersten TX-Bytes der
   Verbindung parsen (TC-eBPF oder AF_PACKET), SNI extrahieren und JA3 über
   Cipher-Suites/Extensions/EC-Kurven hashen.

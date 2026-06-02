@@ -252,6 +252,12 @@ pub struct ExecEventData {
     /// Container runtime (`docker`/`containerd`/`crio`/`podman`/`kubepods`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_runtime: Option<String>,
+    /// Container image reference (`registry/name:tag`), from the runtime state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_image: Option<String>,
+    /// Container image content digest (`sha256:…`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_image_digest: Option<String>,
     /// Kubernetes pod context, when the process runs in a pod.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub k8s: Option<K8sContext>,
@@ -267,6 +273,8 @@ pub struct ExecEnrichment {
     pub env:              std::collections::BTreeMap<String, String>,
     pub container_id:     Option<String>,
     pub container_runtime: Option<String>,
+    pub container_image:  Option<String>,
+    pub container_image_digest: Option<String>,
     pub k8s:              Option<K8sContext>,
 }
 
@@ -297,6 +305,9 @@ pub struct K8sContext {
     pub pod_name:  Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// Orchestration labels (`io.kubernetes.*`, custom pod labels).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,9 +317,14 @@ pub struct NetworkConnectionData {
     pub src_port: u16,
     pub dst_addr: String,
     pub dst_port: u16,
+    /// `established` / `open` on flow start; `closed` on the flow-end record.
     pub state:    String,
     pub pid:      Option<i32>,
     pub process:  Option<String>,
+    /// Flow lifetime in milliseconds, measured from first observation to the
+    /// flow-close record (set only on the `closed` event).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

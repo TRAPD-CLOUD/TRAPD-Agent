@@ -296,6 +296,8 @@ mod tests {
                 env: Default::default(),
                 interpreter: None,
                 container_runtime: None,
+                container_image: None,
+                container_image_digest: None,
                 k8s: None,
             })),
         )
@@ -328,6 +330,7 @@ mod tests {
                 state: "established".into(),
                 pid: Some(pid),
                 process: None,
+                duration_ms: None,
             }),
         )
     }

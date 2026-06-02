@@ -527,6 +527,7 @@ mod tests {
                 state: "established".into(),
                 pid: None,
                 process: None,
+                duration_ms: None,
             }),
         )
     }

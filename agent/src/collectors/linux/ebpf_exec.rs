@@ -367,6 +367,8 @@ impl Collector for EbpfExecCollector {
                         env: enrich.env,
                         interpreter: enrich.interpreter,
                         container_runtime: enrich.container_runtime,
+                        container_image: enrich.container_image,
+                        container_image_digest: enrich.container_image_digest,
                         k8s: enrich.k8s,
                     })),
                 );
