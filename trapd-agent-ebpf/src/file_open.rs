@@ -177,6 +177,8 @@ pub(crate) fn emit_honeytoken_buf(
             ev.filename_len = path_len;
             ev.access_kind  = access_kind;
             entry.submit(0);
+        } else {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);
         }
     }
 }
@@ -289,6 +291,8 @@ fn emit_honeytoken_token(token_id: u64, access_kind: u32) {
         ev.filename_len = 0;
         ev.access_kind  = access_kind;
         entry.submit(0);
+    } else {
+        crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);
     }
 }
 
@@ -372,7 +376,13 @@ fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
         return Ok(());
     }
 
-    let mut entry = FILE_OPEN_EVENTS.reserve::<FileOpenEvent>(0).ok_or(-1i64)?;
+    let mut entry = match FILE_OPEN_EVENTS.reserve::<FileOpenEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_FILE_OPEN);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid = pid;
     ev.uid = uid;
@@ -626,6 +636,8 @@ fn try_vfs_open(ctx: &ProbeContext) -> Result<(), i64> {
         ev.filename_len = 0;
         ev.access_kind  = ACCESS_OPENAT;
         entry.submit(0);
+    } else {
+        crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);
     }
     Ok(())
 }

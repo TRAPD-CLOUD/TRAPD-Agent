@@ -146,7 +146,13 @@ fn try_unlink(ctx: &TracePointContext) -> Result<(), i64> {
 
     let (pid, uid, gid, comm) = current_task_info();
 
-    let mut entry = UNLINK_EVENTS.reserve::<FileUnlinkEvent>(0).ok_or(-1i64)?;
+    let mut entry = match UNLINK_EVENTS.reserve::<FileUnlinkEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_UNLINK);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid  = pid;
     ev.uid  = uid;
@@ -178,7 +184,13 @@ fn try_rename(ctx: &TracePointContext) -> Result<(), i64> {
 
     let (pid, uid, gid, comm) = current_task_info();
 
-    let mut entry = RENAME_EVENTS.reserve::<FileRenameEvent>(0).ok_or(-1i64)?;
+    let mut entry = match RENAME_EVENTS.reserve::<FileRenameEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_RENAME);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid  = pid;
     ev.uid  = uid;
@@ -214,7 +226,13 @@ fn try_chmod(ctx: &TracePointContext) -> Result<(), i64> {
 
     let (pid, uid, gid, comm) = current_task_info();
 
-    let mut entry = CHMOD_EVENTS.reserve::<FileChmodEvent>(0).ok_or(-1i64)?;
+    let mut entry = match CHMOD_EVENTS.reserve::<FileChmodEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_CHMOD);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid  = pid;
     ev.uid  = uid;
@@ -244,7 +262,13 @@ fn try_chown(ctx: &TracePointContext) -> Result<(), i64> {
 
     let (pid, uid, gid, comm) = current_task_info();
 
-    let mut entry = CHOWN_EVENTS.reserve::<FileChownEvent>(0).ok_or(-1i64)?;
+    let mut entry = match CHOWN_EVENTS.reserve::<FileChownEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_CHOWN);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid     = pid;
     ev.uid     = uid;

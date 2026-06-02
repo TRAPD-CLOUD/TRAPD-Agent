@@ -89,7 +89,13 @@ fn emit_ns(op: u8, flags: u64, nstype: u32) -> Result<(), i64> {
     let comm = [0u8; COMM_LEN];
     let comm = bpf_get_current_comm().unwrap_or(comm);
 
-    let mut entry = NS_CHANGE_EVENTS.reserve::<NsChangeEvent>(0).ok_or(-1i64)?;
+    let mut entry = match NS_CHANGE_EVENTS.reserve::<NsChangeEvent>(0) {
+        Some(e) => e,
+        None => {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_NS);
+            return Err(-1i64);
+        }
+    };
     let ev = unsafe { entry.assume_init_mut() };
     ev.pid    = pid;
     ev.uid    = uid;
