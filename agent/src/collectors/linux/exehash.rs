@@ -88,6 +88,17 @@ pub fn hash_executable(path: &str) -> Option<String> {
     hash
 }
 
+/// Uncached SHA256 (hex) of an arbitrary file's contents.  Used by the FIM
+/// collector, which keeps its own on-disk baseline and must not pollute (or be
+/// served stale data by) the exec-hash cache.  Returns `None` on read error.
+pub fn sha256_file(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(hex::encode(hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

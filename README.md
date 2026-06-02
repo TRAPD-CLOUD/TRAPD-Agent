@@ -114,6 +114,7 @@ Collectors live in `agent/src/collectors/linux/`. Two tiers:
 | `AuthLogCollector` | `/var/log/auth.log` | `user/logon`, `user/logon_failed`, `user/session_open`, `user/session_close` |
 | `FilesystemCollector` | `inotify` | `filesystem/create|delete|modify` under watched paths (`/etc`, `/bin`, `/tmp` by default) |
 | `AgentProtectCollector` | agent's own files | `agent_tamper` events |
+| `FimCollector` | SHA256 baseline of `fim_paths` (`/etc`, `/usr/bin`, `/boot`, … by default) | `filesystem/integrity_violation` (modified / added / removed) — every `fim_interval_secs`; baseline persists across restarts |
 
 **eBPF collectors (when the eBPF object is built & installed; see
 [Building from source](#building-from-source)):**

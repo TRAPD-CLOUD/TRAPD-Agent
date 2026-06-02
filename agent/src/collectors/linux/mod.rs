@@ -4,6 +4,7 @@ pub mod ebpf_exec;
 pub mod ebpf_syscalls;
 pub mod exehash;
 pub mod filesystem;
+pub mod fim;
 pub mod network;
 pub mod process;
 pub mod system;
