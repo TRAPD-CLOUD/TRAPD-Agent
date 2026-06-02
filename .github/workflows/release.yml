@@ -36,6 +36,36 @@ jobs:
       - name: Build eBPF binary (release)
         run: cargo xtask build-ebpf --release
 
+      - name: Install SBOM + audit tooling
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo install cargo-audit --locked
+
+      - name: Generate SBOM (CycloneDX) for agent + eBPF crate
+        run: |
+          # CycloneDX SBOM for the shipped userspace binary (agent workspace;
+          # xtask shares the lockfile but is a build-only helper). cargo-cyclonedx
+          # writes <pkg>.cdx.json next to the manifest, so locate it by name
+          # (robust to the exact output directory across tool versions).
+          cargo cyclonedx --manifest-path agent/Cargo.toml --format json
+          mv "$(find . -path ./target -prune -o -name 'trapd-agent.cdx.json' -print | head -n1)" \
+             sbom-trapd-agent.cdx.json
+          # CycloneDX SBOM for the kernel-side eBPF crate (separate workspace
+          # and toolchain) — so the SBOM set covers BOTH shipped artefacts.
+          cargo cyclonedx --manifest-path trapd-agent-ebpf/Cargo.toml --format json
+          mv "$(find . -path ./target -prune -o -name 'trapd-agent-ebpf.cdx.json' -print | head -n1)" \
+             sbom-trapd-agent-ebpf.cdx.json
+          ls -l sbom-trapd-agent.cdx.json sbom-trapd-agent-ebpf.cdx.json
+
+      - name: Dependency vulnerability scan (cargo audit)
+        # Non-blocking: a freshly disclosed CVE should not silently block a
+        # release, but it is recorded in the release logs for triage. Scans
+        # both lockfiles (agent workspace + eBPF crate).
+        continue-on-error: true
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file trapd-agent-ebpf/Cargo.lock
+
       - name: Stage release assets
         run: |
           cp target/release/trapd-agent trapd-agent-linux-x86_64
@@ -46,10 +76,16 @@ jobs:
       - name: Generate SHA256 checksums
         run: |
           # Per-artifact checksum files consumed by install.sh / trapd-update,
-          # plus an aggregate SHA256SUMS for manual `sha256sum --check`.
+          # plus an aggregate SHA256SUMS for manual `sha256sum --check`. The
+          # SBOMs are covered too so their integrity can be verified alongside
+          # the binaries.
           sha256sum trapd-agent-linux-x86_64 > trapd-agent-linux-x86_64.sha256
           sha256sum trapd-agent-exec         > trapd-agent-exec.sha256
-          sha256sum trapd-agent-linux-x86_64 trapd-agent-exec > SHA256SUMS
+          sha256sum \
+            trapd-agent-linux-x86_64 \
+            trapd-agent-exec \
+            sbom-trapd-agent.cdx.json \
+            sbom-trapd-agent-ebpf.cdx.json > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create GitHub Release
@@ -60,5 +96,7 @@ jobs:
             trapd-agent-linux-x86_64.sha256
             trapd-agent-exec
             trapd-agent-exec.sha256
+            sbom-trapd-agent.cdx.json
+            sbom-trapd-agent-ebpf.cdx.json
             SHA256SUMS
           generate_release_notes: true
