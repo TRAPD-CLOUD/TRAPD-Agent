@@ -221,10 +221,19 @@ impl InventoryReporter {
         hostname: String,
         offline: bool,
         config: Arc<RwLock<AgentConfig>>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
-        Self {
-            client: crate::http::control_client(),
+        // The inventory reporter runs in BOTH modes; offline it only writes a
+        // local snapshot and never touches `client`. Build a fail-closed,
+        // pinned control client only when online — so a pinning misconfig never
+        // breaks pure-offline telemetry, while online stays fail-closed.
+        let client = if offline {
+            reqwest::Client::new()
+        } else {
+            crate::http::control_client()?
+        };
+        Ok(Self {
+            client,
             url: format!("{base}/api/v1/agents/{agent_id}/inventory"),
             token,
             agent_id,
@@ -232,7 +241,7 @@ impl InventoryReporter {
             hostname,
             offline,
             config,
-        }
+        })
     }
 
     pub async fn run(self) {

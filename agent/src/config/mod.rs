@@ -1,8 +1,13 @@
 use std::sync::{Arc, RwLock};
 
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
+
+use crate::prevention::{command_pubkey_path, commands::{load_verifying_key, verify_canonical}};
 
 fn default_poll_interval() -> u64 { 60 }
 fn default_fs_watch_paths() -> Vec<String> {
@@ -188,12 +193,95 @@ impl Default for AgentConfig {
     }
 }
 
+/// Signed remote-config envelope. The backend MUST wrap the live [`AgentConfig`]
+/// in this envelope and sign `canonical_json(envelope)` with the **same** Ed25519
+/// key it uses for response commands (`<config>/command_signing.pub`). The agent
+/// rejects any config whose signature, target `agent_id` or freshness does not
+/// check out: the config controls `prevention_enabled`, the `auto_response_*`
+/// switches, `fim_paths`, `honeytoken_response` and `isolation_allowlist_ips`,
+/// so it is at least as security-critical as a signed command and must not be
+/// applied unsigned (issue #47, H-A).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigEnvelope {
+    /// Agent this config is addressed to; rejected if it is not us.
+    pub agent_id:  String,
+    /// When the backend issued this config. Used to reject rollback (an old,
+    /// validly-signed config replayed to silently re-enable a weaker posture).
+    pub issued_at: DateTime<Utc>,
+    /// The configuration to apply once the envelope verifies.
+    pub config:    AgentConfig,
+}
+
+/// Wire-level signed config: an envelope plus its detached signature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedConfig {
+    pub envelope:  ConfigEnvelope,
+    /// Base64-encoded 64-byte Ed25519 signature over `canonical_json(envelope)`.
+    pub signature: String,
+}
+
+/// Verify a [`SignedConfig`] against the provisioned key, the expected
+/// `agent_id`, and freshness/rollback rules. Pure (no I/O, no locks) so the
+/// accept/reject decision is unit-testable. Returns the rejection reason on
+/// failure; `Ok(())` means the envelope's `config` is safe to apply.
+fn evaluate_config(
+    key:               Option<&VerifyingKey>,
+    expected_agent_id: &str,
+    last_issued_at:    Option<DateTime<Utc>>,
+    signed:            &SignedConfig,
+    now:               DateTime<Utc>,
+) -> std::result::Result<(), String> {
+    // Fail-closed: with no provisioned signing key we cannot verify anything,
+    // so no remote config is ever applied.
+    let key = key.ok_or_else(|| {
+        format!(
+            "no signing key provisioned at {} — cannot verify remote config (fail-closed)",
+            command_pubkey_path().display()
+        )
+    })?;
+
+    verify_canonical(key, &signed.envelope, &signed.signature)?;
+
+    if signed.envelope.agent_id != expected_agent_id {
+        return Err(format!(
+            "config addressed to {}, not us ({expected_agent_id})",
+            signed.envelope.agent_id
+        ));
+    }
+
+    // Guard against an absurd future timestamp (clock skew tolerance: 5 min).
+    if signed.envelope.issued_at > now + chrono::Duration::minutes(5) {
+        return Err(format!(
+            "config issued in the future ({})",
+            signed.envelope.issued_at
+        ));
+    }
+
+    // Rollback protection: never apply a config older than the last one applied.
+    if let Some(prev) = last_issued_at {
+        if signed.envelope.issued_at < prev {
+            return Err(format!(
+                "config issued_at {} is older than last applied {prev} (rollback)",
+                signed.envelope.issued_at
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub struct ConfigPuller {
-    config:     Arc<RwLock<AgentConfig>>,
-    client:     reqwest::Client,
-    config_url: String,
-    token:      String,
-    etag:       Option<String>,
+    config:         Arc<RwLock<AgentConfig>>,
+    client:         reqwest::Client,
+    config_url:     String,
+    agent_id:       String,
+    token:          String,
+    etag:           Option<String>,
+    /// Ed25519 verifying key (`<config>/command_signing.pub`). `None` when no key
+    /// is provisioned — in which case every remote config is rejected.
+    key:            Option<VerifyingKey>,
+    /// `issued_at` of the last successfully-applied config (rollback guard).
+    last_issued_at: Option<DateTime<Utc>>,
 }
 
 impl ConfigPuller {
@@ -202,15 +290,31 @@ impl ConfigPuller {
         backend_url: &str,
         agent_id:    &str,
         token:       String,
-    ) -> Self {
+    ) -> Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
-        Self {
+        // Reuse the response-command signing key for the config channel.
+        let key = match load_verifying_key(&command_pubkey_path()) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "config signing key unavailable — remote config will be rejected (fail-closed). \
+                     Provision {}",
+                    command_pubkey_path().display()
+                );
+                None
+            }
+        };
+        Ok(Self {
             config,
-            client:     crate::http::control_client(),
-            config_url: format!("{base}/api/v1/agents/{agent_id}/config"),
+            client:         crate::http::control_client()?,
+            config_url:     format!("{base}/api/v1/agents/{agent_id}/config"),
+            agent_id:       agent_id.to_string(),
             token,
-            etag:       None,
-        }
+            etag:           None,
+            key,
+            last_issued_at: None,
+        })
     }
 
     pub async fn run(mut self) {
@@ -241,21 +345,157 @@ impl ConfigPuller {
                 debug!("Config unchanged (304 Not Modified)");
             }
             200 => {
-                if let Some(val) = resp.headers().get("etag") {
-                    self.etag = val.to_str().ok().map(str::to_string);
-                }
-                match resp.json::<AgentConfig>().await {
-                    Ok(new_cfg) => match self.config.write() {
-                        Ok(mut cfg) => {
-                            *cfg = new_cfg;
-                            info!("Agent config updated from backend");
+                // Only cache the ETag once a config is *applied*, so a rejected
+                // (unsigned/tampered) payload is re-fetched and re-evaluated
+                // rather than masked behind a 304 forever.
+                let etag = resp
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                match resp.json::<SignedConfig>().await {
+                    Ok(signed) => {
+                        if self.accept(signed) {
+                            self.etag = etag;
                         }
-                        Err(e) => warn!("Config RwLock poisoned: {e}"),
-                    },
-                    Err(e) => warn!("Failed to parse config response: {e}"),
+                    }
+                    Err(e) => warn!("Failed to parse signed config response: {e}"),
                 }
             }
             s => warn!("Config pull returned unexpected status {s}"),
         }
+    }
+
+    /// Verify and apply a signed config. Returns `true` only when it was applied.
+    fn accept(&mut self, signed: SignedConfig) -> bool {
+        if let Err(reason) = evaluate_config(
+            self.key.as_ref(),
+            &self.agent_id,
+            self.last_issued_at,
+            &signed,
+            Utc::now(),
+        ) {
+            warn!(reason = %reason, "remote config rejected");
+            return false;
+        }
+
+        match self.config.write() {
+            Ok(mut cfg) => {
+                *cfg = signed.envelope.config;
+                self.last_issued_at = Some(signed.envelope.issued_at);
+                info!("Agent config updated from backend (signature verified)");
+                true
+            }
+            Err(e) => {
+                warn!("Config RwLock poisoned: {e}");
+                false
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod signed_config_tests {
+    use super::*;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const AGENT_ID: &str = "agent-under-test";
+
+    fn signing_key() -> SigningKey {
+        // Fixed seed → deterministic key; no rng feature required.
+        let seed: [u8; 32] = [7u8; 32];
+        SigningKey::from_bytes(&seed)
+    }
+
+    fn sign(envelope: &ConfigEnvelope, sk: &SigningKey) -> String {
+        let canonical = serde_json::to_vec(envelope).unwrap();
+        let sig = sk.sign(&canonical);
+        base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
+    }
+
+    fn envelope(issued_at: DateTime<Utc>) -> ConfigEnvelope {
+        ConfigEnvelope {
+            agent_id:  AGENT_ID.to_string(),
+            issued_at,
+            config:    AgentConfig::default(),
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-02T10:00:00Z").unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn accepts_a_valid_signed_config() {
+        let sk = signing_key();
+        let env = envelope(now());
+        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
+        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, None, &signed, now()).is_ok());
+    }
+
+    #[test]
+    fn rejects_when_no_key_provisioned() {
+        let sk = signing_key();
+        let env = envelope(now());
+        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
+        // Fail-closed: a perfectly-signed config is still rejected with no key.
+        assert!(evaluate_config(None, AGENT_ID, None, &signed, now()).is_err());
+    }
+
+    #[test]
+    fn rejects_unsigned_or_garbage_signature() {
+        let sk = signing_key();
+        let env = envelope(now());
+        let signed = SignedConfig { envelope: env, signature: "not-a-signature".into() };
+        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, None, &signed, now()).is_err());
+    }
+
+    #[test]
+    fn rejects_tampered_config_after_signing() {
+        let sk = signing_key();
+        let env = envelope(now());
+        let signature = sign(&env, &sk);
+        // Flip a security-critical switch *after* signing → signature must fail.
+        let mut tampered = env.clone();
+        tampered.config.prevention_enabled = false;
+        tampered.config.auto_response_enabled = true;
+        let signed = SignedConfig { envelope: tampered, signature };
+        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, None, &signed, now()).is_err());
+    }
+
+    #[test]
+    fn rejects_config_addressed_to_another_agent() {
+        let sk = signing_key();
+        let mut env = envelope(now());
+        env.agent_id = "some-other-agent".into();
+        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
+        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, None, &signed, now()).is_err());
+    }
+
+    #[test]
+    fn rejects_future_dated_config() {
+        let sk = signing_key();
+        let env = envelope(now() + chrono::Duration::minutes(30));
+        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
+        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, None, &signed, now()).is_err());
+    }
+
+    #[test]
+    fn rejects_rollback_to_older_config() {
+        let sk = signing_key();
+        let last = now();
+        let env = envelope(now() - chrono::Duration::hours(1));
+        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
+        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, Some(last), &signed, now()).is_err());
+    }
+
+    #[test]
+    fn accepts_reapplying_same_issued_at() {
+        // Idempotent re-pull of the current config (equal issued_at) is allowed.
+        let sk = signing_key();
+        let env = envelope(now());
+        let signed = SignedConfig { signature: sign(&env, &sk), envelope: env };
+        assert!(evaluate_config(Some(&sk.verifying_key()), AGENT_ID, Some(now()), &signed, now()).is_ok());
     }
 }

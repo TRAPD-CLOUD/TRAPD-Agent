@@ -19,11 +19,15 @@
 //! | `agent.crt`  | PEM client certificate for **mTLS**        |
 //! | `agent.key`  | PEM private key for the client certificate |
 //!
-//! All three are optional; absent any of them the agent falls back to the
-//! system trust store and bearer-token-only auth.
+//! `agent.crt`/`agent.key` (mTLS) are optional. `ca.crt` is **not**: the
+//! control channel is *fail-closed*. Without a pinned `ca.crt` the agent
+//! refuses to build a client (any CA the host trusts could otherwise MITM the
+//! kill/isolate/install command channel) unless the operator explicitly accepts
+//! the system trust store via `TRAPD_TLS_ALLOW_SYSTEM_ROOTS=1`.
 
 use std::time::Duration;
 
+use anyhow::{anyhow, Context, Result};
 use reqwest::ClientBuilder;
 use tracing::{info, warn};
 
@@ -31,79 +35,112 @@ use crate::paths;
 
 const USER_AGENT: &str = concat!("trapd-agent/", env!("CARGO_PKG_VERSION"));
 
+/// Opt-out that lets the control channel fall back to the host's **system trust
+/// store** when no `<config>/ca.crt` is provisioned. Unset by default so the
+/// agent is fail-closed: a remote-control agent that receives `kill_pid` /
+/// `isolate_network` / `install_package` must not trust every CA the host does.
+/// Set to `1`/`true`/`yes`/`on` only when the backend is fronted by a
+/// publicly-trusted CA and pinning is deliberately not used.
+const ALLOW_SYSTEM_ROOTS_ENV: &str = "TRAPD_TLS_ALLOW_SYSTEM_ROOTS";
+
 /// Client tuned for the **enrollment / control plane**: short, bounded timeouts
 /// so a stalled backend never hangs startup indefinitely.
-pub fn control_client() -> reqwest::Client {
+///
+/// Fail-closed: returns `Err` when the control channel cannot be secured (no
+/// pinned `ca.crt` and no explicit opt-out, or a TLS build error). Callers must
+/// not silently fall back to an unpinned/plain client.
+pub fn control_client() -> Result<reqwest::Client> {
     build_client(Duration::from_secs(30), Duration::from_secs(10))
 }
 
 /// Client tuned for **event streaming**: a more generous request timeout to
 /// accommodate large batches, still bounded so a flush can never hang forever.
-pub fn streaming_client() -> reqwest::Client {
+/// Fail-closed identically to [`control_client`].
+pub fn streaming_client() -> Result<reqwest::Client> {
     build_client(Duration::from_secs(60), Duration::from_secs(10))
+}
+
+/// Whether the operator has explicitly opted into the system trust store.
+fn system_roots_opt_in() -> bool {
+    std::env::var(ALLOW_SYSTEM_ROOTS_ENV)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 /// Build a `reqwest::Client` with:
 ///   - rustls TLS backend (memory-safe, no OpenSSL dependency)
-///   - optional CA certificate pinning (`<config>/ca.crt`)
+///   - **mandatory** CA certificate pinning (`<config>/ca.crt`), unless the
+///     operator opts into the system trust store via `TRAPD_TLS_ALLOW_SYSTEM_ROOTS`
 ///   - optional mTLS client identity (`<config>/agent.{crt,key}`)
 ///   - bounded total + connect timeouts
 ///   - a stable `User-Agent` carrying the agent version
 ///
-/// Falls back to a plain client on any TLS configuration error so the agent can
-/// still ship events even on a misconfigured deployment.
-pub fn build_client(total_timeout: Duration, connect_timeout: Duration) -> reqwest::Client {
+/// Fail-closed: any unrecoverable TLS-configuration problem returns `Err`
+/// instead of degrading to a plain `reqwest::Client::new()`. A remote-control
+/// agent must never ship commands/telemetry over a channel it could not pin.
+pub fn build_client(total_timeout: Duration, connect_timeout: Duration) -> Result<reqwest::Client> {
     let builder = ClientBuilder::new()
         .use_rustls_tls()
         .user_agent(USER_AGENT)
         .timeout(total_timeout)
         .connect_timeout(connect_timeout);
 
-    let builder = apply_ca_pinning(builder);
+    let builder = apply_ca_pinning(builder)?;
     let builder = apply_mtls_identity(builder);
 
-    builder.build().unwrap_or_else(|e| {
-        warn!("http: failed to build TLS client ({e}) — falling back to default");
-        reqwest::Client::new()
-    })
+    builder.build().context("http: failed to build TLS client")
 }
 
 /// Add `<config>/ca.crt` as the *only* trusted root certificate, pinning the
 /// backend to that CA (equivalent to HPKP without the header mechanism).
-fn apply_ca_pinning(builder: ClientBuilder) -> ClientBuilder {
+///
+/// Fail-closed: a missing `ca.crt` is an error unless `TRAPD_TLS_ALLOW_SYSTEM_ROOTS`
+/// is set; a present-but-unreadable/unparseable `ca.crt` is *always* an error
+/// (never a silent fall-back to system roots, which would defeat pinning).
+fn apply_ca_pinning(builder: ClientBuilder) -> Result<ClientBuilder> {
     let path = paths::config_dir().join("ca.crt");
-    if !path.exists() {
-        // No pinned CA: the agent — which receives remote commands such as
-        // kill_pid, isolate_network and install_package — falls back to the OS
-        // trust store, so *any* CA trusted by the host (a corporate proxy CA, a
-        // rogue CA planted by malware) could MITM the control channel. Emit a
-        // persistent warning so an operator running without pinning is doing so
-        // knowingly. Deploy a `<config>/ca.crt` to pin the backend.
+    if !pin_required(path.exists(), system_roots_opt_in()).with_context(|| {
+        format!(
+            "TLS: no pinned CA at {} — refusing to open the control channel over the system \
+             trust store (any host-trusted CA could MITM kill/isolate/install commands). \
+             Provision a pinned CA at that path, or set {}=1 to explicitly accept system roots.",
+            path.display(),
+            ALLOW_SYSTEM_ROOTS_ENV,
+        )
+    })? {
+        // Operator has explicitly accepted the system trust store. Still
+        // INSECURE for a remote-control agent, so warn loudly every build.
         warn!(
             expected = %path.display(),
-            "TLS: no pinned CA — trusting the system root store for the command \
-             channel. This is INSECURE for a remote-control agent; provision ca.crt to pin."
+            env = ALLOW_SYSTEM_ROOTS_ENV,
+            "TLS: no pinned CA — {ALLOW_SYSTEM_ROOTS_ENV} is set, trusting the system root \
+             store for the command channel. This is INSECURE; provision ca.crt to pin."
         );
-        return builder;
+        return Ok(builder);
     }
 
-    match std::fs::read(&path) {
-        Ok(pem) => match reqwest::Certificate::from_pem(&pem) {
-            Ok(cert) => {
-                info!(ca = %path.display(), "TLS: pinning backend to custom CA");
-                builder
-                    .tls_built_in_root_certs(false)
-                    .add_root_certificate(cert)
-            }
-            Err(e) => {
-                warn!("TLS: cannot parse {}: {e} — using system roots", path.display());
-                builder
-            }
-        },
-        Err(e) => {
-            warn!("TLS: cannot read {}: {e} — using system roots", path.display());
-            builder
-        }
+    let pem = std::fs::read(&path)
+        .with_context(|| format!("TLS: cannot read pinned CA {}", path.display()))?;
+    let cert = reqwest::Certificate::from_pem(&pem)
+        .with_context(|| format!("TLS: cannot parse pinned CA {}", path.display()))?;
+    info!(ca = %path.display(), "TLS: pinning backend to custom CA");
+    Ok(builder
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(cert))
+}
+
+/// Pure pinning decision (factored out so it is testable without touching the
+/// global config dir or process environment):
+///   - `ca_exists`         → pin to the provisioned CA (`Ok(true)`).
+///   - else `opt_in`       → system trust store is explicitly allowed (`Ok(false)`).
+///   - else                → fail-closed (`Err`): no pin, no opt-out.
+fn pin_required(ca_exists: bool, opt_in: bool) -> Result<bool> {
+    if ca_exists {
+        Ok(true)
+    } else if opt_in {
+        Ok(false)
+    } else {
+        Err(anyhow!("control channel is unpinned and system roots are not opted in"))
     }
 }
 
@@ -162,7 +199,28 @@ pub fn normalize_base_url(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_base_url;
+    use super::{normalize_base_url, pin_required};
+
+    #[test]
+    fn pins_when_ca_present() {
+        // A provisioned CA is always pinned, regardless of the opt-out.
+        assert!(pin_required(true, false).unwrap());
+        assert!(pin_required(true, true).unwrap());
+    }
+
+    #[test]
+    fn fail_closed_without_ca_and_without_optout() {
+        // The crux of H-B: no pinned CA and no explicit opt-out must refuse to
+        // build a control-channel client (no silent system-root fall-back).
+        assert!(pin_required(false, false).is_err());
+    }
+
+    #[test]
+    fn system_roots_allowed_only_with_explicit_optout() {
+        // System roots are used only when the operator opted in; the decision is
+        // "do not pin" (Ok(false)), never an error.
+        assert!(!pin_required(false, true).unwrap());
+    }
 
     #[test]
     fn trims_trailing_slash() {

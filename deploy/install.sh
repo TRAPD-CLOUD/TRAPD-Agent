@@ -137,6 +137,14 @@ chmod 700 "$STATE_DIR"
 # user cannot even enumerate which sensitive files are present.
 chmod 700 "$ENV_DIR"
 
+# Control-channel hardening (fail-closed). Provision BEFORE first start:
+#   - ${ENV_DIR}/ca.crt              PEM CA that pins the backend. REQUIRED unless
+#                                    TRAPD_TLS_ALLOW_SYSTEM_ROOTS=1 is set; without
+#                                    it the agent refuses to connect at all.
+#   - ${ENV_DIR}/command_signing.pub raw 32-byte Ed25519 public key used to verify
+#                                    BOTH signed response-commands AND the remote
+#                                    config; without it remote config is rejected.
+
 # ── Write agent.env (from env vars if provided) ──────────────────────────────
 ENV_FILE="${ENV_DIR}/agent.env"
 

@@ -108,7 +108,11 @@ pub async fn load_or_enroll(
 
     let base = crate::http::normalize_base_url(backend_url);
     let enroll_url = format!("{base}/api/v1/agents/enroll");
-    let client = crate::http::control_client();
+    // Fail-closed: if the control channel cannot be pinned (no ca.crt and no
+    // explicit opt-out) we refuse to enroll over the system trust store rather
+    // than send the one-time token to a potentially MITM'd endpoint.
+    let client = crate::http::control_client()
+        .context("cannot build a secured control-channel client for enrollment")?;
     let max_attempts = max_attempts_from_env();
 
     info!(backend = %base, "Enrolling agent");

@@ -228,17 +228,48 @@ pub struct Verifier {
     nonces: Arc<Mutex<NonceStore>>,
 }
 
+/// Load the operator-provisioned **raw 32-byte** Ed25519 verifying key from
+/// `path`. Shared by the response-command channel and the (equally
+/// security-critical) remote-config channel so both trust the exact same key
+/// provisioned at `<config>/command_signing.pub`.
+pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("cannot read signing pubkey from {}", path.display()))?;
+    let key_bytes: [u8; 32] = raw.try_into().map_err(|_| {
+        anyhow::anyhow!("signing pubkey must be exactly 32 raw bytes (Ed25519 verifying key)")
+    })?;
+    VerifyingKey::from_bytes(&key_bytes).context("invalid Ed25519 verifying key")
+}
+
+/// Verify a **detached** base64 Ed25519 signature over the *canonical* JSON
+/// serialisation of `value` (sorted-key, whitespace-free `serde_json::to_vec`),
+/// returning the rejection reason on failure so the caller can audit it.
+///
+/// This is the exact canonicalise-then-`verify_strict` routine the command
+/// channel uses; the config channel reuses it so an unsigned/tampered config is
+/// rejected identically to an unsigned/tampered command. Re-serialising `value`
+/// here (rather than verifying received bytes) discards any extra wire fields an
+/// attacker might smuggle in — the verifier sees exactly what the signer signed.
+pub fn verify_canonical<T: Serialize>(
+    key: &VerifyingKey,
+    value: &T,
+    signature_b64: &str,
+) -> std::result::Result<(), String> {
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64)
+        .map_err(|e| format!("bad base64 signature: {e}"))?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| "signature must be 64 bytes".to_string())?;
+    let signature = Signature::from_bytes(&sig_arr);
+    let canonical = serde_json::to_vec(value).map_err(|e| format!("canonicalisation failed: {e}"))?;
+    key.verify_strict(&canonical, &signature)
+        .map_err(|e| format!("Ed25519 verification failed: {e}"))
+}
+
 impl Verifier {
     pub fn new(pubkey_path: &Path, agent_id: String, nonce_store_path: &Path) -> Result<Self> {
-        let raw = std::fs::read(pubkey_path)
-            .with_context(|| format!("cannot read command signing pubkey from {}", pubkey_path.display()))?;
-        let key_bytes: [u8; 32] = raw
-            .try_into()
-            .map_err(|_| anyhow::anyhow!(
-                "command signing pubkey must be exactly 32 raw bytes (Ed25519 verifying key)"
-            ))?;
-        let key = VerifyingKey::from_bytes(&key_bytes)
-            .context("invalid Ed25519 verifying key")?;
+        let key = load_verifying_key(pubkey_path)?;
         let nonces = Arc::new(Mutex::new(NonceStore::load(nonce_store_path)));
         info!(path = %pubkey_path.display(), "Response-command verifier loaded");
         Ok(Self { key, agent_id, nonces })
@@ -247,25 +278,10 @@ impl Verifier {
     /// Verify a `SignedCommand` end-to-end.  Failure reasons are returned so
     /// the caller can emit a `CommandRejected` audit event with context.
     pub fn verify(&self, cmd: &SignedCommand) -> Verdict {
-        let sig_bytes = match base64::engine::general_purpose::STANDARD.decode(&cmd.signature) {
-            Ok(b)  => b,
-            Err(e) => return Verdict::Rejected(format!("bad base64 signature: {e}")),
-        };
-        let sig_arr: [u8; 64] = match sig_bytes.try_into() {
-            Ok(a)  => a,
-            Err(_) => return Verdict::Rejected("signature must be 64 bytes".into()),
-        };
-        let signature = Signature::from_bytes(&sig_arr);
-
-        // Re-serialise canonically: discard whatever extra fields the wire
-        // may have carried so the verifier sees exactly the same bytes the
-        // signer produced.
-        let canonical = match serde_json::to_vec(&cmd.envelope) {
-            Ok(v)  => v,
-            Err(e) => return Verdict::Rejected(format!("canonicalisation failed: {e}")),
-        };
-        if let Err(e) = self.key.verify_strict(&canonical, &signature) {
-            return Verdict::Rejected(format!("Ed25519 verification failed: {e}"));
+        // Signature check (canonical-JSON, re-serialised) is shared with the
+        // remote-config channel via `verify_canonical`.
+        if let Err(reason) = verify_canonical(&self.key, &cmd.envelope, &cmd.signature) {
+            return Verdict::Rejected(reason);
         }
 
         if cmd.envelope.agent_id != self.agent_id {
