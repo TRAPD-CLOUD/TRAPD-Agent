@@ -69,6 +69,30 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 RemoveIPC=true
 ProtectControlGroups=true
+# The agent only reads the clock and the hostname — it never sets them.
+ProtectClock=yes
+ProtectHostname=yes
+# The agent's self-defence watchdog re-execs the binary with a plain fork(); no
+# code path creates, joins or unshares namespaces (container/cgroup/namespace
+# IDs are *read* from /proc, not entered). Deny all namespace creation.
+RestrictNamespaces=true
+# Restrict the socket families the agent (and the nft/iptables children it
+# spawns) may use. This is intentionally wider than a typical service:
+#   AF_UNIX            — local IPC / syslog
+#   AF_INET, AF_INET6  — cloud channel (HTTPS), DNS
+#   AF_NETLINK         — NETLINK_SOCK_DIAG flow stats (inet_diag.rs) AND the
+#                        netlink sockets nft/iptables open for containment
+#   AF_PACKET          — passive DNS/TLS capture (packet_capture.rs, CAP_NET_RAW)
+# Dropping AF_NETLINK or AF_PACKET would silently break network containment and
+# passive capture, so they must stay in the allowlist.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+# Deliberately NOT set — would break core functionality:
+#   PrivateDevices=yes      hides /dev/kmsg, but ProtectKernelLogs=false grants
+#                           the agent /dev/kmsg for security telemetry.
+#   ProtectProc=invisible / hidepid would risk silently hiding other processes'
+#   ProcSubset=pid          /proc entries from the agent, whose core sensor must
+#                           enumerate every process in /proc; the EDR must not be
+#                           blinded for a marginal hardening gain.
 # Allow reading kernel logs (/dev/kmsg) for security telemetry.
 ProtectKernelLogs=false
 # Allow changing kernel tunables only when needed (set to true to harden further).
