@@ -279,7 +279,7 @@ mod tests {
             EventClass::Process,
             EventAction::Exec,
             Severity::Info,
-            EventData::ProcessExec(ExecEventData {
+            EventData::ProcessExec(Box::new(ExecEventData {
                 pid,
                 ppid,
                 uid,
@@ -291,7 +291,13 @@ mod tests {
                 cwd: "/".into(),
                 container_id: None,
                 ld_preload: None,
-            }),
+                sha256: None,
+                loaded_libraries: Vec::new(),
+                env: Default::default(),
+                interpreter: None,
+                container_runtime: None,
+                k8s: None,
+            })),
         )
     }
 

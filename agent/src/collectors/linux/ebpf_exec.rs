@@ -325,13 +325,32 @@ impl Collector for EbpfExecCollector {
                     None
                 };
 
+                // Telemetry-depth enrichment (P1): image SHA256, loaded-library
+                // inventory, curated environment, decoded interpreter scripts and
+                // container/K8s context — all best-effort from /proc. Runs on the
+                // blocking pool so hashing a binary never stalls the ring-buffer
+                // drain. The eBPF-supplied container_id is kept as a fallback for
+                // the (rare) case the process exited before /proc could be read.
+                let enrich = {
+                    let comm = comm.clone();
+                    let exe = exe.clone();
+                    let cmdline = cmdline.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::collectors::linux::proc_enrich::enrich_exec(
+                            pid, &comm, &exe, &cmdline,
+                        )
+                    })
+                    .await
+                    .unwrap_or_default()
+                };
+
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),
                     EventClass::Process,
                     EventAction::Exec,
                     Severity::Info,
-                    EventData::ProcessExec(ExecEventData {
+                    EventData::ProcessExec(Box::new(ExecEventData {
                         pid: pid as i32,
                         ppid: ppid as i32,
                         uid: raw.uid,
@@ -341,9 +360,15 @@ impl Collector for EbpfExecCollector {
                         exe,
                         cmdline,
                         cwd,
-                        container_id,
+                        container_id: enrich.container_id.or(container_id),
                         ld_preload,
-                    }),
+                        sha256: enrich.sha256,
+                        loaded_libraries: enrich.loaded_libraries,
+                        env: enrich.env,
+                        interpreter: enrich.interpreter,
+                        container_runtime: enrich.container_runtime,
+                        k8s: enrich.k8s,
+                    })),
                 );
 
                 if tx.send(event).await.is_err() {

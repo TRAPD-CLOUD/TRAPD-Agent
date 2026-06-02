@@ -158,7 +158,10 @@ pub enum Severity {
 pub enum EventData {
     ProcessCreate(ProcessCreateData),
     ProcessTerminate(ProcessTerminateData),
-    ProcessExec(ExecEventData),
+    // Boxed: with the P1 telemetry-depth fields (image hash, library inventory,
+    // env, decoded scripts, K8s context) this is by far the largest variant;
+    // boxing keeps `EventData` compact (clippy::large_enum_variant).
+    ProcessExec(Box<ExecEventData>),
     NetworkConnection(NetworkConnectionData),
     SystemSnapshot(SystemSnapshotData),
     UserLogon(UserLogonData),
@@ -230,6 +233,70 @@ pub struct ExecEventData {
     pub container_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ld_preload: Option<String>,
+    // ── Telemetry-depth enrichment (P1) ──────────────────────────────────────
+    /// SHA256 of the executed binary image (`sha256:<hex>`) — the Falcon-style
+    /// image hash that anchors IOC / reputation matching. `None` when the binary
+    /// could not be read (process exited, oversize, permission).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Shared objects mapped into the process (the Linux "loaded module"
+    /// inventory; the DLL-equivalent), from `/proc/<pid>/maps`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_libraries: Vec<String>,
+    /// Curated, secret-redacted environment of the process.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Decoded interpreter script context (`python -c`, base64 chains, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<InterpreterContext>,
+    /// Container runtime (`docker`/`containerd`/`crio`/`podman`/`kubepods`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_runtime: Option<String>,
+    /// Kubernetes pod context, when the process runs in a pod.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k8s: Option<K8sContext>,
+}
+
+/// Aggregated process-enrichment payload produced by
+/// [`crate::collectors::linux::proc_enrich`]; flattened into [`ExecEventData`].
+#[derive(Debug, Clone, Default)]
+pub struct ExecEnrichment {
+    pub sha256:           Option<String>,
+    pub loaded_libraries: Vec<String>,
+    pub interpreter:      Option<InterpreterContext>,
+    pub env:              std::collections::BTreeMap<String, String>,
+    pub container_id:     Option<String>,
+    pub container_runtime: Option<String>,
+    pub k8s:              Option<K8sContext>,
+}
+
+/// Decoded view of a script interpreter invocation — the inline program body
+/// and any base64 payloads recovered from the command line, tagged with
+/// suspicious-pattern indicators.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterpreterContext {
+    /// Interpreter language (`python`/`bash`/`perl`/`node`/…).
+    pub lang: String,
+    /// Inline script passed via `-c`/`-e`, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_script: Option<String>,
+    /// Base64 blobs decoded out of the command line (obfuscation chains).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decoded_payloads: Vec<String>,
+    /// Matched suspicious-pattern tags (`base64_decode`, `reverse_shell`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indicators: Vec<String>,
+}
+
+/// Kubernetes pod context for a process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct K8sContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_uid:   Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_name:  Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3,6 +3,11 @@
 Dieses Dokument listet alle Aufgaben, die notwendig sind, um den TRAPD-Agent auf
 CrowdStrike Falcon-Niveau zu bringen. Jede Kategorie entspricht einem GitHub Issue.
 
+> **Telemetrie-Tiefe (P1):** Status der „Daten, die noch fehlen“-Liste (Image-
+> SHA256 beim Exec, Loaded-Library-Inventory, Env/Interpreter-Script, Security-
+> Posture-Baseline, Container/K8s-Kontext sowie die offenen eBPF-/DPI-Punkte
+> DNS-Responses und Netflow-Tiefe) ist in **`TELEMETRY_DEPTH.md`** dokumentiert.
+
 ---
 
 ## 1. Prävention & Aktive Response
@@ -62,8 +67,8 @@ CrowdStrike Falcon-Niveau zu bringen. Jede Kategorie entspricht einem GitHub Iss
 
 **Ziel:** FIM mit Baseline und Ransomware-Frühwarnung.
 
-- [ ] **SHA256-basiertes FIM**: Kryptographische Checksums für alle überwachten Dateien – Baseline erstellen und Abweichungen melden
-- [ ] **Erweitertes FIM-Monitoring**: Kritische Pfade ausweiten (`/usr/bin`, `/usr/sbin`, `/lib`, `/boot`, `/etc`, `/root`)
+- [x] **SHA256-basiertes FIM**: Kryptographische Checksums für alle überwachten Dateien – Baseline erstellen und Abweichungen melden (`agent/src/collectors/linux/filesystem.rs`, SQLite-Baseline)
+- [x] **Erweitertes FIM-Monitoring**: Kritische Pfade ausweiten (`/usr/bin`, `/usr/sbin`, `/lib`, `/boot`, `/etc`, `/root`)
 - [ ] **Ransomware-Behavior Detection**: Massenhafte Datei-Verschlüsselungsoperationen via eBPF erkennen (viele `write`-Calls mit Entropie-Änderung)
 - [ ] **Datei-Entropie-Analyse**: Entropie-Messung bei `write`-Events zur Erkennung von Verschlüsselung
 - [ ] **Shadow Copy / Backup-Schutz**: Erkennen von Löschversuchen auf Backup-Directories
