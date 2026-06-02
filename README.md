@@ -359,6 +359,18 @@ deception subsystem is likewise backend-controlled:
 `kill`/`isolate`), `honeytoken_accessor_allowlist` (extra benign accessors) and
 `honeytoken_deception_escalation`.
 
+**Automated response to local detections** is likewise config-driven and
+**opt-in** (off by default, so a false positive cannot kill a legitimate process
+unattended): `auto_response_enabled` arms it; `auto_response_action`
+(`none`/`alert`/`kill`/`quarantine`/`isolate`) sets the action; it fires only
+above `auto_response_min_severity` (`info`…`critical`) **and**
+`auto_response_min_confidence` (0–100); `auto_response_allowlist` exempts
+`rule_id`s/categories. It covers the whole detection stream — IOC hash hits,
+reverse shells, IOA attack-chains, ransomware indicators, `setuid(0)` privilege
+escalation and credential-store access — degrades safely when no concrete target
+is known, de-dupes via a per-(rule, pid) cooldown, and audits every action as a
+`prevention` event. This complements the signed backend response commands.
+
 ### Filesystem layout
 
 The agent keeps state, config and logs in fixed, `$HOME`-independent locations
