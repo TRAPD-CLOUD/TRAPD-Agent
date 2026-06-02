@@ -104,6 +104,9 @@ struct FlowInfo {
     dst_port:   u16,
     pid:        Option<i32>,
     process:    Option<String>,
+    /// Cumulative byte/packet/rtt counters from the most recent INET_DIAG poll
+    /// (joined by socket inode at observation time; empty for UDP).
+    stats:      super::inet_diag::FlowStats,
 }
 
 impl FlowInfo {
@@ -118,6 +121,11 @@ impl FlowInfo {
             pid: self.pid,
             process: self.process.clone(),
             duration_ms,
+            bytes_sent: self.stats.bytes_sent,
+            bytes_recv: self.stats.bytes_recv,
+            packets_sent: self.stats.packets_sent,
+            packets_recv: self.stats.packets_recv,
+            rtt_us: self.stats.rtt_us,
         }
     }
 }
@@ -143,6 +151,12 @@ impl Collector for NetworkCollector {
             ticker.tick().await;
 
             let inode_map = tokio::task::spawn_blocking(build_inode_pid_map)
+                .await
+                .unwrap_or_default();
+
+            // Per-socket byte/packet/rtt counters (best-effort; empty without
+            // privilege). Keyed by socket inode, joined onto TCP flows below.
+            let diag = tokio::task::spawn_blocking(super::inet_diag::query_tcp)
                 .await
                 .unwrap_or_default();
 
@@ -175,6 +189,7 @@ impl Collector for NetworkCollector {
                     dst_port: entry.remote_address.port(),
                     pid,
                     process,
+                    stats: diag.get(&entry.inode).copied().unwrap_or_default(),
                 };
                 let key = flow_key(&flow);
                 new_tcp.insert(key, flow);
@@ -212,6 +227,7 @@ impl Collector for NetworkCollector {
                     dst_port: entry.remote_address.port(),
                     pid,
                     process,
+                    stats: super::inet_diag::FlowStats::default(),
                 };
                 let key = flow_key(&flow);
                 new_udp.insert(key, flow);
@@ -311,6 +327,7 @@ mod tests {
             dst_port: port,
             pid: Some(42),
             process: Some("curl".into()),
+            stats: super::super::inet_diag::FlowStats::default(),
         }
     }
 

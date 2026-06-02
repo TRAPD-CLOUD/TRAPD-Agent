@@ -200,6 +200,9 @@ async fn main() -> Result<()> {
     spawn_collector!(AuthLogCollector::new());
     spawn_collector!(FilesystemCollector::new());
     spawn_collector!(AgentProtectCollector::new());
+    // Passive DNS-response + TLS-handshake capture (AF_PACKET). Best-effort:
+    // needs CAP_NET_RAW; logs and exits cleanly without it while the rest run.
+    spawn_collector!(collectors::linux::packet_capture::PacketCaptureCollector::new());
 
     {
         let tx_ap = tx.clone();

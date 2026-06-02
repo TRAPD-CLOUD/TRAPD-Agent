@@ -528,6 +528,11 @@ mod tests {
                 pid: None,
                 process: None,
                 duration_ms: None,
+                bytes_sent: None,
+                bytes_recv: None,
+                packets_sent: None,
+                packets_recv: None,
+                rtt_us: None,
             }),
         )
     }

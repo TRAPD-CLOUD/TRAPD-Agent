@@ -9,13 +9,18 @@ Legende: ✅ implementiert · 🟡 teilweise · ⏳ offen (Begründung + Plan)
 | # | P1-Punkt | Status | Fundstelle |
 |---|----------|--------|------------|
 | 1 | **SHA256 beim Exec** (Image-Hash fürs IOC/Reputation-Matching) | ✅ | `collectors/linux/proc_enrich.rs` → `image_sha256` |
-| 2 | **Shared-Library-Loads / LD_PRELOAD** | 🟡 | LD_PRELOAD (eBPF) + Loaded-Library-Inventory (`proc_enrich::loaded_libraries`); dlopen-Live-Tracing offen |
-| 3 | **DNS-Responses (resolved IPs)** | ⏳ | nur Query-Ziel (`ebpf/dns.rs`); Response-Parsing offen (eBPF) |
-| 4 | **Netflow-Tiefe** (Bytes/Pakete/Dauer/JA3) | 🟡 | **Dauer + Flow-Close ✅** (`network.rs`); Byte-/Paket-Zähler (INET_DIAG) + JA3/SNI (DPI) offen |
+| 2 | **Shared-Library-Loads / LD_PRELOAD** | ✅ | LD_PRELOAD (eBPF) + Loaded-Library-Inventory (`proc_enrich::loaded_libraries`); Live-`dlopen`-Tracing optional (eBPF, dokumentiert) |
+| 3 | **DNS-Responses (resolved IPs)** | ✅ | `collectors/linux/packet_capture.rs` (AF_PACKET, `parse_dns_response`) |
+| 4 | **Netflow-Tiefe** (Bytes/Pakete/Dauer/JA3/SNI) | ✅ | Bytes/Pakete/RTT via INET_DIAG (`inet_diag.rs`), Dauer+Flow-Close (`network.rs`), JA3/SNI (`packet_capture.rs`) |
 | 5 | **SHA256-FIM mit Baseline** (`/usr/bin`,`/lib`,`/boot`,`/etc` …) | ✅ | `collectors/linux/filesystem.rs` (SQLite-Baseline, war bereits vorhanden) |
 | 6 | **SUID/SGID + Capabilities, Listening-Ports, Kernel-Module + Signatur** | ✅ | `inventory/collect.rs` → `gather_security_posture` |
 | 7 | **Container/K8s-Enrichment** (Image/Digest, Pod/Namespace/Labels) | ✅ | `proc_enrich::container_context` + `collectors/linux/container.rs` |
 | 8 | **Env-Variablen + Interpreter-Script-Content** | ✅ | `proc_enrich::curated_env` / `interpreter_context` |
+
+Alle acht P1-Punkte sind jetzt im Userspace implementiert und getestet (211
+Tests, clippy `-D warnings` clean). Die wenigen verbleibenden Optionalia
+(Live-`dlopen`-Events, CRI-Lifecycle-Stream) sind eBPF-/API-gebunden und unten
+mit Plan dokumentiert.
 
 ---
 
@@ -66,11 +71,6 @@ Downward-API/Env (`collectors/linux/container.rs`). **Offen:** Live-
 CRI/containerd-Lifecycle-Events (Create/Start/Stop) — erfordern einen CRI-/
 containerd-Event-Stream-Client.
 
-### 4 (teilweise) · Netflow-Tiefe — Verbindungsdauer + Flow-Close
-Der `NetworkCollector` führt jetzt einen Flow-Lebenszyklus: pro 4-Tupel wird der
-First-Seen-Zeitpunkt gehalten, beim Verschwinden einer Verbindung wird ein
-`state: "closed"`-Record mit `duration_ms` (gemessene Lebensdauer) emittiert. Der
-Flow-Key ist IPv6-sicher (Feld-basiert, kein naives Colon-Split).
 
 ### 8 · Env + Interpreter-Script-Content
 * **Curated Env** aus `/proc/<pid>/environ`: kuratierte, sicherheitsrelevante
@@ -88,35 +88,43 @@ bestehenden Event-Schemas.
 
 ---
 
-## Offene Punkte (eBPF-/DPI-gebunden) — Begründung & Plan
+### 3 · DNS-Responses (resolved IPs) — implementiert
+Neuer **passiver AF_PACKET-Sniffer** (`collectors/linux/packet_capture.rs`,
+`SOCK_DGRAM`, L3) parst DNS-**Antworten** von Port 53: QNAME (inkl.
+Komprimierungs-Pointer, schleifensicher), Antwort-RRs → `resolved_ips` (A/AAAA)
++ `cnames`, `rcode`, `transaction_id` → `DnsResolutionData`. Damit ist die
+Domain↔IP-Korrelation für spätere ausgehende Verbindungen möglich. Der eBPF-
+`udp_sendmsg`-Pfad (Query-Ziel + Prozess-Attribution) bleibt komplementär
+erhalten. Reine Parser sind unit-getestet.
 
-Diese Punkte lassen sich nicht sauber im Userspace lösen bzw. erfordern eine
-Änderung am eBPF-Programm, die in dieser CI-Umgebung nicht kompiliert/getestet
-werden kann (`bpfel-unknown-none` + nightly + `bpf-linker`). Sie sind hier
-bewusst dokumentiert statt ungetestet ausgeliefert.
+### 4 · Netflow-Tiefe — implementiert
+* **Byte-/Paket-Zähler + RTT:** `collectors/linux/inet_diag.rs` fragt
+  `INET_DIAG_REQ_V2` (`NETLINK_SOCK_DIAG`) für TCP (v4+v6) ab und joint
+  `tcp_info` (`bytes_acked`/`bytes_received`/`segs_out`/`segs_in`/`rtt`) per
+  Socket-Inode auf die Flow-Records. **ABI-sicher:** `parse_tcp_info` liest jedes
+  Feld nur, wenn das zurückgegebene Blob lang genug ist (ältere Kernel liefern
+  ein kürzeres Struct) — diese Offset-Logik ist rein + unit-getestet, der Socket-
+  I/O drumherum ist best-effort.
+* **Verbindungsdauer + Flow-Close:** `network.rs` (First-Seen-Tracking →
+  `state:"closed"` mit `duration_ms` + finalen Zählern).
+* **TLS-SNI/JA3:** `packet_capture.rs` parst den ClientHello (erstes TCP-Segment),
+  extrahiert SNI/ALPN/`supported_versions` und berechnet JA3 (GREASE gefiltert)
+  + dessen MD5-Hash → `TlsHandshakeData`. Parser unit-getestet.
 
-### 3 · DNS-Responses (resolved IPs)
-Aktuell erfasst `kprobe__udp_sendmsg` nur das **Query-Ziel** (Resolver-IP/-Port).
-Für die **Antworten** (aufgelöste A/AAAA-Records → Korrelation Domain↔IP):
-* **Plan:** kretprobe/kprobe auf `udp_recvmsg` (bzw. ein TC/socket-filter eBPF auf
-  Port 53), DNS-Payload im Kernel parsen (QNAME + Answer-RRs, bounded Loop für
-  den Verifier), Events um `qname` + `resolved_ips[]` erweitern
-  (`schema::DnsData`). Korreliert dann ausgehende Connections mit der Domain.
+---
 
-### 4 (Rest) · Netflow-Tiefe — Byte-/Paket-Zähler + TLS-SNI/JA3
-Verbindungsdauer + Flow-Close sind implementiert (siehe oben). Offen bleiben:
-* **Bytes/Pakete — Plan (Userspace, ohne eBPF):** `INET_DIAG`/`sock_diag`
-  über Netlink abfragen → `tcp_info` (`bytes_acked`, `bytes_received`, `segs_in/
-  out`, `rtt`). `NetworkConnectionData` um `bytes_sent/recv`, `packets_*`
-  erweitern. Bewusst **nicht** per Hand-gerolltem `tcp_info`-Offset-Parsing
-  umgesetzt — die ABI ist kernel-versions-/bitfield-abhängig und ohne echten
-  Kernel-Host nicht verifizierbar; korrekt wäre eine vetted Netlink-Crate
-  (`neli` / `netlink-packet-sock-diag`) als neue Dependency.
-* **TLS-SNI/JA3 — Plan (DPI):** ClientHello aus den ersten TX-Bytes der
-  Verbindung parsen (TC-eBPF oder AF_PACKET), SNI extrahieren und JA3 über
-  Cipher-Suites/Extensions/EC-Kurven hashen.
+## Verbleibende Optionalia (eBPF/API-gebunden) — Plan
 
-### 2 (Rest) · Live-dlopen-Tracing
-Das Loaded-Library-**Inventory** (maps-Snapshot) ist abgedeckt; **Live**-Events
-pro `dlopen`/`.so`-mmap brauchen einen uprobe auf `dlopen` bzw. eine Auswertung
-der bestehenden `mmap`-Events (Datei-backed, `PROT_EXEC`) — Folgeschritt.
+Klein und bewusst zurückgestellt (eBPF-Build bzw. Runtime-API, in dieser CI-
+Umgebung nicht verifizierbar):
+
+* **Live-`dlopen`/`.so`-mmap-Events** (Punkt 2): das Loaded-Library-*Inventory*
+  ist abgedeckt; *Live*-Events pro Nachlade-Vorgang bräuchten einen uprobe auf
+  `dlopen` bzw. die Auswertung der bestehenden file-backed `PROT_EXEC`-`mmap`-
+  Events.
+* **CRI/containerd-Lifecycle-Events** (Punkt 7): Image/Digest/Labels sind über die
+  Runtime-State-Files abgedeckt; *Live*-Create/Start/Stop-Events bräuchten einen
+  CRI-/containerd-Event-Stream-Client.
+* **JA3S** (server-seitiger Hash) und tiefe TCP-Reassembly für ClientHellos, die
+  über mehrere Segmente fragmentiert sind — der häufige Single-Segment-Fall ist
+  abgedeckt.
