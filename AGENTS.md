@@ -94,6 +94,9 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - Success responses: `200` with `AgentConfig`, or `304`.
 - Response `ETag` is cached by the agent.
 - Poll cadence: every 60 seconds.
+- Planned hardening: the body becomes a signed `SignedConfig` envelope rather
+  than a bare `AgentConfig`. See *Backend Implementation Notes* → "Signed
+  config delivery".
 
 ### `GET /api/v1/agents/{agent_id}/commands`
 
@@ -1092,3 +1095,56 @@ Discriminated by `type`.
 - Do not return unsigned commands. The agent rejects commands without a valid Ed25519 signature, matching `agent_id`, unexpired window, and fresh nonce.
 - Config endpoint should support `ETag` and `304 Not Modified`.
 - Enrollment should never return empty `agent_id` or `agent_secret` on 2xx.
+
+### Signed config delivery (planned)
+
+`GET /api/v1/agents/{agent_id}/config` must evolve to return a **signed**
+config envelope instead of a bare `AgentConfig`, closing the gap that an
+attacker able to impersonate the control plane (e.g. via a TLS-stripping
+proxy or a compromised intermediate) could push a permissive config to weaken
+the agent. Two requirements:
+
+1. **Sign the envelope with the command-signing key.** The backend wraps the
+   config in a `SignedConfig` and signs it with the **same** operator-held
+   Ed25519 key the agent already pins for commands — the raw 32-byte public
+   key at `<config>/command_signing.pub`. No new key material is introduced.
+   The agent verifies the signature exactly as it does for `SignedCommand`
+   (re-serialise the deserialised envelope to canonical JSON — sorted keys, no
+   whitespace — and verify against the pinned key) and **rejects an
+   unsigned or badly-signed config**, keeping its last-known-good config.
+2. **`issued_at` must increase monotonically.** Each issued envelope carries
+   an `issued_at` that is strictly greater than the previous one for that
+   agent. The agent persists the highest `issued_at` it has accepted and
+   refuses any envelope whose `issued_at` is not greater, which defeats replay
+   and rollback (re-serving a stale, more-permissive config). This is the
+   config-channel analogue of the command nonce store.
+
+This is independent of, and must not be conflated with, **#30**
+(release-artifact / `install.sh` supply-chain signing): #30 anchors trust in
+the *binary* shipped to a host, whereas this note anchors trust in the
+*runtime configuration* delivered to an already-running agent. They use
+different trust roots and protect different stages.
+
+#### `SignedConfig` (planned wire format)
+
+Mirrors `SignedCommand`:
+
+```json
+{
+  "envelope": "ConfigEnvelope",
+  "signature": "base64 string; 64-byte Ed25519 signature over canonical_json(envelope)"
+}
+```
+
+#### `ConfigEnvelope` (planned)
+
+```json
+{
+  "issued_at": "RFC3339 UTC datetime (strictly increasing per agent)",
+  "agent_id": "string (must match this agent)",
+  "config": "AgentConfig"
+}
+```
+
+The `ETag` / `304 Not Modified` flow is unchanged; the cached value is the
+`SignedConfig` body.
