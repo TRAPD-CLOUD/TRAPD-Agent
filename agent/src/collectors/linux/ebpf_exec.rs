@@ -325,7 +325,26 @@ impl Collector for EbpfExecCollector {
                     None
                 };
 
-                // Hash the executed image at exec time (cached, size-capped).
+                // Telemetry-depth enrichment (P1): loaded-library inventory,
+                // curated environment, decoded interpreter scripts and
+                // container/K8s context — best-effort from /proc, on the blocking
+                // pool. The eBPF-supplied container_id is a fallback if the
+                // process exited before /proc could be read.
+                let enrich = {
+                    let comm = comm.clone();
+                    let exe = exe.clone();
+                    let cmdline = cmdline.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::collectors::linux::proc_enrich::enrich_exec(
+                            pid, &comm, &exe, &cmdline,
+                        )
+                    })
+                    .await
+                    .unwrap_or_default()
+                };
+
+                // Canonical image hash (cached, size-capped) — also feeds IOC
+                // hash-matching and the IOA process-tree lineage.
                 let exe_sha256 = super::exehash::hash_executable(&exe);
 
                 let event = AgentEvent::new(
@@ -334,7 +353,7 @@ impl Collector for EbpfExecCollector {
                     EventClass::Process,
                     EventAction::Exec,
                     Severity::Info,
-                    EventData::ProcessExec(ExecEventData {
+                    EventData::ProcessExec(Box::new(ExecEventData {
                         pid: pid as i32,
                         ppid: ppid as i32,
                         uid: raw.uid,
@@ -344,10 +363,17 @@ impl Collector for EbpfExecCollector {
                         exe,
                         cmdline,
                         cwd,
-                        container_id,
+                        container_id: enrich.container_id.or(container_id),
                         ld_preload,
                         exe_sha256,
-                    }),
+                        loaded_libraries: enrich.loaded_libraries,
+                        env: enrich.env,
+                        interpreter: enrich.interpreter,
+                        container_runtime: enrich.container_runtime,
+                        container_image: enrich.container_image,
+                        container_image_digest: enrich.container_image_digest,
+                        k8s: enrich.k8s,
+                    })),
                 );
 
                 if tx.send(event).await.is_err() {
