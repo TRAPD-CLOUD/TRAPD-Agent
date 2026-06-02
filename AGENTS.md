@@ -48,7 +48,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 ## Filesystem Layout
 
-- State dir: default `/var/lib/trapd`, override `TRAPD_STATE_DIR`; contains `device_id`, `credentials.json`, nonces (`command_nonces.json`), `config_issued_at.json` (signed-config `issued_at` high-water mark, `0600`), baselines, `honeytokens.json` (deployed-honeytoken register, `0600`).
+- State dir: default `/var/lib/trapd`, override `TRAPD_STATE_DIR`; contains `device_id`, `credentials.json`, nonces (`command_nonces.json`), `config_issued_at.json` (signed-config `issued_at` high-water mark, `0600`), `agent_config.json` (last verified config, kept across restarts, `0600`), baselines, `honeytokens.json` (deployed-honeytoken register, `0600`).
 - Config dir: default `/etc/trapd`, override `TRAPD_CONFIG_DIR`; contains `agent.env`, `policy.json`, `ca.crt`, `agent.crt`, `agent.key`, `command_signing.pub`.
 - Log dir: default `/var/log/trapd`, override `TRAPD_LOG_DIR`; contains `events.ndjson`.
 - State dir is hardened to `0700`; credentials are atomically written as `0600`.
