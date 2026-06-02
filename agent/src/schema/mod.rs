@@ -216,6 +216,10 @@ pub struct ProcessCreateData {
     pub cmdline:  String,
     pub uid:      u32,
     pub username: String,
+    /// SHA256 of the executable image, hashed at collection time.  `None` when
+    /// hashing is disabled or the image is not a hashable regular file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,12 +243,12 @@ pub struct ExecEventData {
     pub container_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ld_preload: Option<String>,
+    /// SHA256 of the executed binary image, hashed at collection time.  `None`
+    /// when hashing is disabled or the image is not a hashable regular file
+    /// (memfd, deleted, too large). Anchors IOC / reputation matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe_sha256: Option<String>,
     // ── Telemetry-depth enrichment (P1) ──────────────────────────────────────
-    /// SHA256 of the executed binary image (`sha256:<hex>`) — the Falcon-style
-    /// image hash that anchors IOC / reputation matching. `None` when the binary
-    /// could not be read (process exited, oversize, permission).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
     /// Shared objects mapped into the process (the Linux "loaded module"
     /// inventory; the DLL-equivalent), from `/proc/<pid>/maps`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -273,7 +277,6 @@ pub struct ExecEventData {
 /// [`crate::collectors::linux::proc_enrich`]; flattened into [`ExecEventData`].
 #[derive(Debug, Clone, Default)]
 pub struct ExecEnrichment {
-    pub sha256:           Option<String>,
     pub loaded_libraries: Vec<String>,
     pub interpreter:      Option<InterpreterContext>,
     pub env:              std::collections::BTreeMap<String, String>,

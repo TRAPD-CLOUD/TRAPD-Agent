@@ -128,10 +128,10 @@ impl DetectionEngine {
         let mut out = Vec::new();
         match &event.data {
             EventData::ProcessCreate(p) => {
-                self.inspect_process(&p.name, &p.exe, &p.cmdline, None, &mut out);
+                self.inspect_process(&p.name, &p.exe, &p.cmdline, p.exe_sha256.as_deref(), &mut out);
             }
             EventData::ProcessExec(p) => {
-                self.inspect_process(&p.comm, &p.exe, &p.cmdline, None, &mut out);
+                self.inspect_process(&p.comm, &p.exe, &p.cmdline, p.exe_sha256.as_deref(), &mut out);
                 if let Some(ref ld_preload) = p.ld_preload {
                     if let Some(d) = behavior::inspect_ld_preload(&p.comm, &p.exe, ld_preload) {
                         let sev = severity_for(d.confidence);
@@ -472,7 +472,7 @@ fn is_routable(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{NetworkConnectionData, ProcessCreateData};
+    use crate::schema::{ExecEventData, NetworkConnectionData, ProcessCreateData};
 
     fn engine() -> DetectionEngine {
         DetectionEngine {
@@ -507,6 +507,7 @@ mod tests {
                 cmdline: cmd.into(),
                 uid: 0,
                 username: "root".into(),
+                exe_sha256: None,
             }),
         )
     }
@@ -550,6 +551,47 @@ mod tests {
         let e = engine();
         let out = e.inspect(&net_event("203.0.113.5", 443));
         assert!(out.iter().any(|ev| matches!(&ev.data, EventData::Detection(d) if d.category == "ioc")));
+    }
+
+    #[test]
+    fn flags_ioc_process_hash() {
+        // A process whose collected exe_sha256 matches a threat-intel hash must
+        // raise an ioc.process_hash detection (the hash now flows from the
+        // collector through the event into the matcher).
+        let e = engine();
+        let ev = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Process,
+            EventAction::Exec,
+            Severity::Info,
+            EventData::ProcessExec(Box::new(ExecEventData {
+                pid: 1,
+                ppid: 0,
+                uid: 0,
+                gid: 0,
+                username: "root".into(),
+                comm: "x".into(),
+                exe: "/tmp/x".into(),
+                cmdline: "/tmp/x".into(),
+                cwd: "/".into(),
+                container_id: None,
+                ld_preload: None,
+                exe_sha256: Some("deadbeef".into()),
+                loaded_libraries: Vec::new(),
+                env: Default::default(),
+                interpreter: None,
+                container_runtime: None,
+                container_image: None,
+                container_image_digest: None,
+                k8s: None,
+            })),
+        );
+        let out = e.inspect(&ev);
+        assert!(
+            out.iter().any(|d| matches!(&d.data, EventData::Detection(dd) if dd.rule_id == "ioc.process_hash")),
+            "a known-bad exe hash should fire ioc.process_hash"
+        );
     }
 
     #[test]

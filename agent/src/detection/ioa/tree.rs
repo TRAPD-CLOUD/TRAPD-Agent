@@ -18,8 +18,8 @@
 //!     long-lived agent can never grow it without limit.
 //!   * **Tombstoned** — a terminated process is kept briefly so the lineage of
 //!     its still-living children stays resolvable.
-//!   * **Cheap** — exec hashing is cached by path+mtime and size-capped, and is
-//!     the only thing here that can touch the disk.
+//!   * **I/O-free** — the tree never touches the disk; executable hashes are
+//!     computed once at collection time and attached via `set_exe_hash`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -36,10 +36,6 @@ const MAX_DEPTH: usize = 32;
 /// [`ProcessTree::related`].  Bounded so unrelated processes that merely share
 /// `init`/`systemd` as a distant ancestor are *not* correlated.
 const RELATE_DEPTH: usize = 10;
-/// Executables larger than this are not hashed (cost bound on the hot path).
-const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
-/// Cap on the exe-hash cache before it is cleared wholesale.
-const HASH_CACHE_CAP: usize = 4_096;
 
 /// One process in the tree.  After an `exec` the image fields (`exe`,
 /// `cmdline`, `exe_hash`) describe the *current* image; a `fork`ed child
@@ -65,19 +61,18 @@ pub struct ProcNode {
 
 /// The process tree.  Not `Sync` on its own — the engine guards it behind a
 /// `Mutex`, matching the other stateful trackers in this crate.
+///
+/// The tree never touches the disk: executable hashes are computed once at
+/// collection time (see `collectors::linux::exehash`) and attached via
+/// [`set_exe_hash`](Self::set_exe_hash), so detection stays allocation-light
+/// and I/O-free.
 pub struct ProcessTree {
-    nodes:            HashMap<i32, ProcNode>,
-    hash_cache:       HashMap<String, (u64, Option<String>)>,
-    hash_executables: bool,
+    nodes: HashMap<i32, ProcNode>,
 }
 
 impl ProcessTree {
-    pub fn new(hash_executables: bool) -> Self {
-        Self {
-            nodes: HashMap::new(),
-            hash_cache: HashMap::new(),
-            hash_executables,
-        }
+    pub fn new() -> Self {
+        Self { nodes: HashMap::new() }
     }
 
     #[cfg(test)]
@@ -101,7 +96,8 @@ impl ProcessTree {
         cmdline: &str,
         now: Instant,
     ) {
-        let exe_hash = self.compute_hash(exe);
+        // Preserve any hash already attached for this pid across a re-exec until
+        // the collector attaches the new image's hash via `set_exe_hash`.
         let start = self.nodes.get(&pid).map(|n| n.start).unwrap_or(now);
         self.nodes.insert(
             pid,
@@ -114,7 +110,7 @@ impl ProcessTree {
                 uid,
                 gid,
                 username: username.to_string(),
-                exe_hash,
+                exe_hash: None,
                 start,
                 exited: None,
             },
@@ -139,7 +135,6 @@ impl ProcessTree {
         if self.nodes.contains_key(&pid) {
             return;
         }
-        let exe_hash = self.compute_hash(exe);
         self.nodes.insert(
             pid,
             ProcNode {
@@ -151,11 +146,19 @@ impl ProcessTree {
                 uid,
                 gid: 0,
                 username: username.to_string(),
-                exe_hash,
+                exe_hash: None,
                 start: now,
                 exited: None,
             },
         );
+    }
+
+    /// Attach the executable's SHA256 (computed once at collection time) to a
+    /// node.  No-op when the hash is `None` or the pid is unknown.
+    pub fn set_exe_hash(&mut self, pid: i32, hash: Option<&str>) {
+        if let (Some(h), Some(node)) = (hash, self.nodes.get_mut(&pid)) {
+            node.exe_hash = Some(h.to_string());
+        }
     }
 
     /// Record a `fork`: the child inherits the parent's image until it execs.
@@ -354,41 +357,11 @@ impl ProcessTree {
         }
     }
 
-    // ── Internals ─────────────────────────────────────────────────────────────
+}
 
-    /// SHA256 the executable at `path`, cached by path+mtime and size-capped.
-    /// Returns `None` when hashing is disabled, the path is not an absolute
-    /// regular file, it is too large, or the read fails.
-    fn compute_hash(&mut self, path: &str) -> Option<String> {
-        if !self.hash_executables || !path.starts_with('/') {
-            return None;
-        }
-        let meta = std::fs::metadata(path).ok()?;
-        if !meta.is_file() || meta.len() > MAX_HASH_BYTES {
-            return None;
-        }
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if let Some((cached_mtime, hash)) = self.hash_cache.get(path) {
-            if *cached_mtime == mtime {
-                return hash.clone();
-            }
-        }
-        let hash = std::fs::read(path).ok().map(|bytes| {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&bytes);
-            hex::encode(hasher.finalize())
-        });
-        if self.hash_cache.len() >= HASH_CACHE_CAP {
-            self.hash_cache.clear();
-        }
-        self.hash_cache.insert(path.to_string(), (mtime, hash.clone()));
-        hash
+impl Default for ProcessTree {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -397,7 +370,7 @@ mod tests {
     use super::*;
 
     fn t() -> ProcessTree {
-        ProcessTree::new(false)
+        ProcessTree::new()
     }
 
     #[test]
@@ -458,6 +431,19 @@ mod tests {
         let later = now + TOMBSTONE_TTL + Duration::from_secs(1);
         tree.gc(later);
         assert!(tree.node(200).is_none());
+    }
+
+    #[test]
+    fn set_exe_hash_surfaces_in_lineage() {
+        let mut tree = t();
+        let now = Instant::now();
+        tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", now);
+        tree.set_exe_hash(200, Some("abc123"));
+        // Unknown pid / None are no-ops.
+        tree.set_exe_hash(999, Some("nope"));
+        tree.set_exe_hash(200, None);
+        let lin = tree.lineage_json(200).unwrap();
+        assert_eq!(lin.as_array().unwrap()[0]["exe_sha256"], "abc123");
     }
 
     #[test]

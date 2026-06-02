@@ -10,20 +10,20 @@ use std::sync::{Arc, Mutex};
 use tokio::time::{interval, Duration};
 use tracing::{debug, warn};
 
-use crate::pipeline::RingBuffer;
+use crate::pipeline::Spool;
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const BATCH_SIZE: usize = 100;
 
 pub struct Transport {
-    buffer:     Arc<Mutex<RingBuffer>>,
+    buffer:     Arc<Mutex<Spool>>,
     client:     reqwest::Client,
     ingest_url: String,
     token:      String,
 }
 
 impl Transport {
-    pub fn new(buffer: Arc<Mutex<RingBuffer>>, backend_url: String, token: String) -> Self {
+    pub fn new(buffer: Arc<Mutex<Spool>>, backend_url: String, token: String) -> Self {
         let base = crate::http::normalize_base_url(&backend_url);
         let ingest_url = format!("{base}/api/v1/ingest/events");
         let client = crate::http::streaming_client();
@@ -65,11 +65,17 @@ impl Transport {
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                match self.buffer.lock() {
-                    Ok(mut buf) => buf.drain(n),
-                    Err(e) => warn!("Transport: ring buffer mutex poisoned on drain: {e}"),
-                }
-                debug!("Transport: flushed {n} events to backend");
+                let dropped = match self.buffer.lock() {
+                    Ok(mut buf) => {
+                        buf.drain(n);
+                        buf.dropped_total()
+                    }
+                    Err(e) => {
+                        warn!("Transport: spool mutex poisoned on drain: {e}");
+                        0
+                    }
+                };
+                debug!("Transport: flushed {n} events to backend (spool dropped_total={dropped})");
             }
             Ok(resp) => {
                 warn!(

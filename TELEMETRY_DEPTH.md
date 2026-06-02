@@ -8,7 +8,7 @@ Legende: ✅ implementiert · 🟡 teilweise · ⏳ offen (Begründung + Plan)
 
 | # | P1-Punkt | Status | Fundstelle |
 |---|----------|--------|------------|
-| 1 | **SHA256 beim Exec** (Image-Hash fürs IOC/Reputation-Matching) | ✅ | `collectors/linux/proc_enrich.rs` → `image_sha256` |
+| 1 | **SHA256 beim Exec** (Image-Hash fürs IOC/Reputation-Matching) | ✅ | `collectors/linux/exehash.rs` (cached, IOC-/IOA-integriert) |
 | 2 | **Shared-Library-Loads / LD_PRELOAD** | ✅ | LD_PRELOAD (eBPF) + Loaded-Library-Inventory (`proc_enrich::loaded_libraries`); Live-`dlopen`-Tracing optional (eBPF, dokumentiert) |
 | 3 | **DNS-Responses (resolved IPs)** | ✅ | `collectors/linux/packet_capture.rs` (AF_PACKET, `parse_dns_response`) |
 | 4 | **Netflow-Tiefe** (Bytes/Pakete/Dauer/JA3/SNI) | ✅ | Bytes/Pakete/RTT via INET_DIAG (`inet_diag.rs`), Dauer+Flow-Close (`network.rs`), JA3/SNI (`packet_capture.rs`) |
@@ -27,11 +27,11 @@ mit Plan dokumentiert.
 ## Was in diesem Durchlauf implementiert wurde
 
 ### 1 · Image-SHA256 bei jedem Exec
-`ExecEventData.sha256` (`sha256:<hex>`). Gehasht wird bevorzugt `/proc/<pid>/exe`
-(echter Inode, auch bei entlinktem/„self-deleting“ Dropper auflösbar), Fallback
-auf den Exec-Pfad. **Cache** nach `(dev, inode, mtime, size)` — ein heißes Binary
-(`bash`, `python3`) wird einmal gehasht, nicht pro Exec. Binaries > 512 MiB werden
-übersprungen (Kostenschutz), alle übrigen Felder bleiben erhalten.
+`ExecEventData.exe_sha256` über die gemeinsame, gecachte
+`collectors/linux/exehash.rs` (Cache nach Pfad+mtime; ein heißes Binary wie
+`bash`/`python3` wird einmal gehasht, nicht pro Exec; size-capped). Derselbe
+Digest speist auch das IOC-Hash-Matching der Detection-Engine und die IOA-
+Prozessbaum-Lineage — eine kanonische Hash-Quelle für den ganzen Agenten.
 
 ### 2 · Loaded-Library-Inventory (DLL-Äquivalent)
 `ExecEventData.loaded_libraries` aus `/proc/<pid>/maps`: alle distinct file-backed

@@ -325,12 +325,11 @@ impl Collector for EbpfExecCollector {
                     None
                 };
 
-                // Telemetry-depth enrichment (P1): image SHA256, loaded-library
-                // inventory, curated environment, decoded interpreter scripts and
-                // container/K8s context — all best-effort from /proc. Runs on the
-                // blocking pool so hashing a binary never stalls the ring-buffer
-                // drain. The eBPF-supplied container_id is kept as a fallback for
-                // the (rare) case the process exited before /proc could be read.
+                // Telemetry-depth enrichment (P1): loaded-library inventory,
+                // curated environment, decoded interpreter scripts and
+                // container/K8s context — best-effort from /proc, on the blocking
+                // pool. The eBPF-supplied container_id is a fallback if the
+                // process exited before /proc could be read.
                 let enrich = {
                     let comm = comm.clone();
                     let exe = exe.clone();
@@ -343,6 +342,10 @@ impl Collector for EbpfExecCollector {
                     .await
                     .unwrap_or_default()
                 };
+
+                // Canonical image hash (cached, size-capped) — also feeds IOC
+                // hash-matching and the IOA process-tree lineage.
+                let exe_sha256 = super::exehash::hash_executable(&exe);
 
                 let event = AgentEvent::new(
                     agent_id.clone(),
@@ -362,7 +365,7 @@ impl Collector for EbpfExecCollector {
                         cwd,
                         container_id: enrich.container_id.or(container_id),
                         ld_preload,
-                        sha256: enrich.sha256,
+                        exe_sha256,
                         loaded_libraries: enrich.loaded_libraries,
                         env: enrich.env,
                         interpreter: enrich.interpreter,

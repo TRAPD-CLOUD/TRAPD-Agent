@@ -86,9 +86,8 @@ pub struct IoaEngine {
 impl IoaEngine {
     pub fn new() -> Self {
         let enabled = !env_off("TRAPD_IOA");
-        let hash_executables = !env_off("TRAPD_IOA_HASH");
         Self {
-            tree:       ProcessTree::new(hash_executables),
+            tree:       ProcessTree::new(),
             correlator: Correlator::new(),
             enabled,
             counter:    0,
@@ -126,12 +125,18 @@ impl IoaEngine {
 
     fn update_tree(&mut self, event: &AgentEvent, now: Instant) {
         match &event.data {
-            EventData::ProcessExec(p) => self.tree.on_exec(
-                p.pid, p.ppid, p.uid, p.gid, &p.username, &p.comm, &p.exe, &p.cmdline, now,
-            ),
-            EventData::ProcessCreate(p) => self.tree.on_create(
-                p.pid, p.ppid, p.uid, &p.username, &p.name, &p.exe, &p.cmdline, now,
-            ),
+            EventData::ProcessExec(p) => {
+                self.tree.on_exec(
+                    p.pid, p.ppid, p.uid, p.gid, &p.username, &p.comm, &p.exe, &p.cmdline, now,
+                );
+                self.tree.set_exe_hash(p.pid, p.exe_sha256.as_deref());
+            }
+            EventData::ProcessCreate(p) => {
+                self.tree.on_create(
+                    p.pid, p.ppid, p.uid, &p.username, &p.name, &p.exe, &p.cmdline, now,
+                );
+                self.tree.set_exe_hash(p.pid, p.exe_sha256.as_deref());
+            }
             EventData::Fork(f) => {
                 self.tree
                     .on_fork(f.parent_pid, f.child_pid, &f.parent_comm, &f.child_comm, now)
@@ -291,7 +296,7 @@ mod tests {
                 cwd: "/".into(),
                 container_id: None,
                 ld_preload: None,
-                sha256: None,
+                exe_sha256: None,
                 loaded_libraries: Vec::new(),
                 env: Default::default(),
                 interpreter: None,
@@ -411,7 +416,7 @@ mod tests {
     fn disabled_via_env_is_inert() {
         // Construct directly with enabled=false to avoid global env races.
         let mut e = IoaEngine {
-            tree: ProcessTree::new(false),
+            tree: ProcessTree::new(),
             correlator: Correlator::new(),
             enabled: false,
             counter: 0,

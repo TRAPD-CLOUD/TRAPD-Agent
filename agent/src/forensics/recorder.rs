@@ -192,7 +192,7 @@ mod tests {
                 cwd: "/home/alice".into(),
                 container_id: None,
                 ld_preload: None,
-                sha256: None,
+                exe_sha256: None,
                 loaded_libraries: Vec::new(),
                 env: Default::default(),
                 interpreter: None,

@@ -4,10 +4,10 @@
 //! to carry on every process event, all sourced from `/proc` (no eBPF program
 //! change required):
 //!
-//!   * **Image hash** — SHA256 of the executed binary (`sha256:<hex>`), the
-//!     primary key for IOC / reputation matching. Hashing is cached by
-//!     `(dev, inode, mtime, size)` so a hot binary (`bash`, `python3`) is hashed
-//!     once, not on every exec.
+//! The executable image hash (the IOC/reputation key) is produced by the shared,
+//! cached [`super::exehash`] and filled in by the caller; this module adds the
+//! complementary depth:
+//!
 //!   * **Loaded-library inventory** — the shared objects mapped into the process
 //!     image (the Linux "loaded module" list, the DLL-equivalent), parsed from
 //!     `/proc/<pid>/maps`.
@@ -25,21 +25,14 @@
 //! `None` / an empty collection rather than failing the event.
 
 use std::collections::BTreeMap;
-use std::io::Read as _;
-use std::sync::{Mutex, OnceLock};
-
-use sha2::{Digest, Sha256};
 
 use crate::schema::{ExecEnrichment, InterpreterContext, K8sContext};
 
+// The executable image hash is produced by the shared, cached
+// `super::exehash::hash_executable` (it also feeds IOC matching + IOA lineage),
+// so this module deliberately does not hash — it adds the *other* depth fields.
+
 // ── Tunables ──────────────────────────────────────────────────────────────────
-
-/// Binaries larger than this are not hashed (avoids pathological cost on a
-/// multi-GB image); the event still carries every other field.
-const MAX_HASH_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Upper bound on entries kept in the image-hash cache before it is cleared.
-const HASH_CACHE_CAP: usize = 8192;
 
 /// Maximum shared libraries reported per process (deduplicated).
 const MAX_LIBS: usize = 128;
@@ -49,77 +42,6 @@ const MAX_SCRIPT_LEN: usize = 4096;
 
 /// Environment values longer than this are truncated (with an ellipsis marker).
 const MAX_ENV_VAL: usize = 512;
-
-// ── Image hash (SHA256) ─────────────────────────────────────────────────────────
-
-/// Cache key for a binary image: the filesystem identity tuple. If any of these
-/// change the file is considered different and is re-hashed.
-type HashKey = (u64, u64, i64, u64); // (dev, inode, mtime_nanos, size)
-
-fn hash_cache() -> &'static Mutex<BTreeMap<HashKey, String>> {
-    static CACHE: OnceLock<Mutex<BTreeMap<HashKey, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-/// SHA256 of the executed binary image, formatted as `sha256:<hex>`.
-///
-/// Prefers `/proc/<pid>/exe` (the real on-disk inode, resolved even when the
-/// path was unlinked — e.g. a self-deleting dropper), falling back to the exec
-/// path from the event when the process has already exited. Results are cached
-/// by `(dev, inode, mtime, size)`.
-pub fn image_sha256(pid: u32, exe_path: &str) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-
-    let proc_exe = format!("/proc/{pid}/exe");
-    // Stat the inode behind /proc/<pid>/exe (follows the symlink to the real
-    // file). Fall back to the event's exe path if the process is already gone.
-    let (open_target, meta) = match std::fs::metadata(&proc_exe) {
-        Ok(m) => (proc_exe.clone(), m),
-        Err(_) => match std::fs::metadata(exe_path) {
-            Ok(m) => (exe_path.to_string(), m),
-            Err(_) => return None,
-        },
-    };
-
-    let size = meta.len();
-    let key: HashKey = (meta.dev(), meta.ino(), meta.mtime_nsec(), size);
-
-    if let Ok(cache) = hash_cache().lock() {
-        if let Some(h) = cache.get(&key) {
-            return Some(h.clone());
-        }
-    }
-
-    if size > MAX_HASH_BYTES {
-        return None;
-    }
-
-    let digest = hash_file(&open_target)?;
-
-    if let Ok(mut cache) = hash_cache().lock() {
-        // Crude bound: clear wholesale when the cache grows past the cap. The
-        // hot working set (common system binaries) re-populates immediately.
-        if cache.len() >= HASH_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(key, digest.clone());
-    }
-    Some(digest)
-}
-
-fn hash_file(path: &str) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65_536];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buf[..n]),
-            Err(_) => return None,
-        }
-    }
-    Some(format!("sha256:{}", hex::encode(hasher.finalize())))
-}
 
 // ── Loaded-library inventory ──────────────────────────────────────────────────
 
@@ -546,7 +468,7 @@ pub fn enrich_exec(pid: u32, comm: &str, exe: &str, cmdline: &str) -> ExecEnrich
     let env = curated_env(pid);
     let c = container_context(pid, &env);
     ExecEnrichment {
-        sha256: image_sha256(pid, exe),
+        // The image hash is filled by the caller from the shared exehash cache.
         loaded_libraries: loaded_libraries(pid),
         interpreter: interpreter_context(comm, exe, cmdline),
         env,
@@ -686,16 +608,5 @@ mod tests {
         assert!(t.ends_with('…'));
         // Must not panic and must be valid UTF-8 (implicit by String).
         assert!(t.len() <= s.len() + 3);
-    }
-
-    #[test]
-    fn hashes_a_real_binary() {
-        // /bin/sh exists on every CI host; hash should be stable + cached.
-        if std::path::Path::new("/bin/sh").exists() {
-            let h1 = image_sha256(u32::MAX, "/bin/sh");
-            assert!(h1.as_deref().map(|h| h.starts_with("sha256:")).unwrap_or(false));
-            let h2 = image_sha256(u32::MAX, "/bin/sh");
-            assert_eq!(h1, h2);
-        }
     }
 }
