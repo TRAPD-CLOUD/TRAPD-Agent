@@ -15,8 +15,8 @@
 //! See `engine.rs` for the orchestration loop.
 
 pub mod audit;
-pub mod commands;
 pub mod command_puller;
+pub mod commands;
 pub mod engine;
 pub mod lsm_loader;
 pub mod network;

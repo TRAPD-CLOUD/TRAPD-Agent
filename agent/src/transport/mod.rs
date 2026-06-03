@@ -16,10 +16,10 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const BATCH_SIZE: usize = 100;
 
 pub struct Transport {
-    buffer:     Arc<Mutex<Spool>>,
-    client:     reqwest::Client,
+    buffer: Arc<Mutex<Spool>>,
+    client: reqwest::Client,
     ingest_url: String,
-    token:      String,
+    token: String,
 }
 
 impl Transport {
@@ -33,7 +33,12 @@ impl Transport {
         // Fail-closed: ingest shares the control channel's pinned-TLS posture;
         // no plain-client fall-back.
         let client = crate::http::streaming_client()?;
-        Ok(Self { buffer, client, ingest_url, token })
+        Ok(Self {
+            buffer,
+            client,
+            ingest_url,
+            token,
+        })
     }
 
     pub async fn run(self) {

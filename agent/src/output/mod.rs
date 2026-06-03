@@ -8,7 +8,9 @@ use tracing::info;
 
 use crate::schema::AgentEvent;
 
-const MAX_FILE_BYTES:   u64 = 100 * 1024 * 1024; // 100 MB
+pub mod siem;
+
+const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 const MAX_ROTATED_FILES: u32 = 3;
 
 /// Absolute path to the NDJSON event log, resolved via [`crate::paths`] so it
@@ -27,7 +29,7 @@ impl OutputMode {
     pub fn from_env() -> Self {
         match env::var("TRAPD_OUTPUT").as_deref() {
             Ok("file") => OutputMode::File,
-            _          => OutputMode::Stdout,
+            _ => OutputMode::Stdout,
         }
     }
 }

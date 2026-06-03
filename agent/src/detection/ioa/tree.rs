@@ -42,21 +42,21 @@ const RELATE_DEPTH: usize = 10;
 /// inherits its parent's image until it execs.
 #[derive(Clone, Debug)]
 pub struct ProcNode {
-    pub pid:      i32,
-    pub ppid:     i32,
-    pub comm:     String,
-    pub exe:      String,
-    pub cmdline:  String,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub ppid: i32,
+    pub comm: String,
+    pub exe: String,
+    pub cmdline: String,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
     /// SHA256 of the executable image, when hashing is enabled and the file is
     /// a regular, size-bounded file.  `None` otherwise (memfd, too large, gone).
     pub exe_hash: Option<String>,
     /// When this node was first observed.
-    pub start:    Instant,
+    pub start: Instant,
     /// Set when a `terminate` is seen; the node becomes a GC-able tombstone.
-    pub exited:   Option<Instant>,
+    pub exited: Option<Instant>,
 }
 
 /// The process tree.  Not `Sync` on its own — the engine guards it behind a
@@ -72,7 +72,9 @@ pub struct ProcessTree {
 
 impl ProcessTree {
     pub fn new() -> Self {
-        Self { nodes: HashMap::new() }
+        Self {
+            nodes: HashMap::new(),
+        }
     }
 
     #[cfg(test)]
@@ -356,7 +358,6 @@ impl ProcessTree {
             }
         }
     }
-
 }
 
 impl Default for ProcessTree {
@@ -379,8 +380,21 @@ mod tests {
         let now = Instant::now();
         tree.on_exec(100, 1, 0, 0, "root", "sshd", "/usr/sbin/sshd", "sshd", now);
         tree.on_exec(200, 100, 0, 0, "root", "bash", "/bin/bash", "bash", now);
-        tree.on_exec(300, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl http://x", now);
-        assert!(tree.is_ancestor(100, 300), "sshd should be an ancestor of curl");
+        tree.on_exec(
+            300,
+            200,
+            0,
+            0,
+            "root",
+            "curl",
+            "/usr/bin/curl",
+            "curl http://x",
+            now,
+        );
+        assert!(
+            tree.is_ancestor(100, 300),
+            "sshd should be an ancestor of curl"
+        );
         assert!(tree.is_ancestor(200, 300));
         assert!(!tree.is_ancestor(300, 200));
     }
@@ -392,9 +406,22 @@ mod tests {
         tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", now);
         // two children of the same shell — not ancestors of each other
         tree.on_exec(301, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl", now);
-        tree.on_exec(302, 200, 0, 0, "root", "evil", "/tmp/evil", "/tmp/evil", now);
+        tree.on_exec(
+            302,
+            200,
+            0,
+            0,
+            "root",
+            "evil",
+            "/tmp/evil",
+            "/tmp/evil",
+            now,
+        );
         assert!(!tree.is_ancestor(301, 302));
-        assert!(tree.related(301, 302), "siblings under one bash share a session");
+        assert!(
+            tree.related(301, 302),
+            "siblings under one bash share a session"
+        );
     }
 
     #[test]
@@ -402,7 +429,17 @@ mod tests {
         let mut tree = t();
         let now = Instant::now();
         // Two independent daemons whose only common ancestor is init (pid 1).
-        tree.on_exec(10, 1, 0, 0, "root", "nginx", "/usr/sbin/nginx", "nginx", now);
+        tree.on_exec(
+            10,
+            1,
+            0,
+            0,
+            "root",
+            "nginx",
+            "/usr/sbin/nginx",
+            "nginx",
+            now,
+        );
         tree.on_exec(20, 1, 0, 0, "root", "cron", "/usr/sbin/cron", "cron", now);
         assert!(!tree.related(10, 20));
     }
@@ -413,9 +450,27 @@ mod tests {
         let now = Instant::now();
         tree.on_exec(200, 1, 1000, 1000, "u", "bash", "/bin/bash", "bash", now);
         tree.on_fork(200, 201, "bash", "bash", now);
-        assert_eq!(tree.node(201).unwrap().exe, "/bin/bash", "child inherits parent image");
-        tree.on_exec(201, 200, 1000, 1000, "u", "curl", "/usr/bin/curl", "curl", now);
-        assert_eq!(tree.node(201).unwrap().exe, "/usr/bin/curl", "exec replaces image");
+        assert_eq!(
+            tree.node(201).unwrap().exe,
+            "/bin/bash",
+            "child inherits parent image"
+        );
+        tree.on_exec(
+            201,
+            200,
+            1000,
+            1000,
+            "u",
+            "curl",
+            "/usr/bin/curl",
+            "curl",
+            now,
+        );
+        assert_eq!(
+            tree.node(201).unwrap().exe,
+            "/usr/bin/curl",
+            "exec replaces image"
+        );
     }
 
     #[test]

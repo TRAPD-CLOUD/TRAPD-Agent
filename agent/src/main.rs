@@ -99,7 +99,12 @@ async fn main() -> Result<()> {
         } else {
             warn!("TRAPD_OFFLINE set — backend communication disabled (telemetry is local only).");
         }
-        (String::new(), device_id.clone(), String::new(), "offline".to_string())
+        (
+            String::new(),
+            device_id.clone(),
+            String::new(),
+            "offline".to_string(),
+        )
     } else {
         let backend_url =
             http::normalize_base_url(&std::env::var("TRAPD_BACKEND_URL").unwrap_or_default());
@@ -111,10 +116,10 @@ async fn main() -> Result<()> {
         (backend_url, agent_id, token, creds.project_id)
     };
 
-    let output_mode  = OutputMode::from_env();
+    let output_mode = OutputMode::from_env();
     let output_label = match output_mode {
         OutputMode::Stdout => "stdout",
-        OutputMode::File   => "file",
+        OutputMode::File => "file",
     };
 
     info!(
@@ -130,8 +135,7 @@ async fn main() -> Result<()> {
     // Start from the last verified config on disk (defaults on first run), so a
     // restart keeps the real configuration even though the signed-config channel
     // re-serves it with an already-accepted (and thus replay-rejected) issued_at.
-    let agent_config: Arc<RwLock<AgentConfig>> =
-        Arc::new(RwLock::new(config::load_persisted()));
+    let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()));
     // Backend outbox. Online it is disk-backed (survives crash/restart, replays
     // on the next run); offline it is purely in-memory (the NDJSON output is the
     // system of record).
@@ -140,14 +144,16 @@ async fn main() -> Result<()> {
     } else {
         Spool::durable(pipeline::spool_max_from_env())
     };
-    let ring_buffer: Arc<Mutex<Spool>>         = Arc::new(Mutex::new(spool));
+    let ring_buffer: Arc<Mutex<Spool>> = Arc::new(Mutex::new(spool));
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
 
     // ── Prevention subsystem (active response) ────────────────────────────────
     // Requires the backend (signed command channel), so it is skipped offline.
     let prevention_enabled = agent_config
-        .read().map(|c| c.prevention_enabled).unwrap_or(true);
+        .read()
+        .map(|c| c.prevention_enabled)
+        .unwrap_or(true);
     let prev_event_tx = if prevention_enabled && !offline {
         match start_prevention(
             &backend_url,
@@ -156,7 +162,9 @@ async fn main() -> Result<()> {
             &hostname,
             tx.clone(),
             Arc::clone(&agent_config),
-        ).await {
+        )
+        .await
+        {
             Ok(tx) => {
                 info!("Prevention subsystem started");
                 Some(tx)
@@ -177,11 +185,11 @@ async fn main() -> Result<()> {
 
     macro_rules! spawn_collector {
         ($collector:expr) => {{
-            let mut c  = $collector;
-            let tx2    = tx.clone();
-            let aid    = agent_id.clone();
-            let host   = hostname.clone();
-            let cname  = c.name();
+            let mut c = $collector;
+            let tx2 = tx.clone();
+            let aid = agent_id.clone();
+            let host = hostname.clone();
+            let cname = c.name();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = c.run(tx2, aid, host).await {
                     error!("{cname} exited with error: {e:#}");
@@ -212,16 +220,20 @@ async fn main() -> Result<()> {
     spawn_collector!(AuthLogCollector::new());
     spawn_collector!(FilesystemCollector::new());
     spawn_collector!(AgentProtectCollector::new());
-    spawn_collector!(collectors::linux::fim::FimCollector::new(Arc::clone(&agent_config)));
-    spawn_collector!(collectors::linux::memscan::MemScanCollector::new(Arc::clone(&agent_config)));
+    spawn_collector!(collectors::linux::fim::FimCollector::new(Arc::clone(
+        &agent_config
+    )));
+    spawn_collector!(collectors::linux::memscan::MemScanCollector::new(
+        Arc::clone(&agent_config)
+    ));
     // Passive DNS-response + TLS-handshake capture (AF_PACKET). Best-effort:
     // needs CAP_NET_RAW; logs and exits cleanly without it while the rest run.
     spawn_collector!(collectors::linux::packet_capture::PacketCaptureCollector::new());
 
     {
         let tx_ap = tx.clone();
-        let aid   = agent_id.clone();
-        let host  = hostname.clone();
+        let aid = agent_id.clone();
+        let host = hostname.clone();
         tokio::spawn(async move {
             selfprotect::anti_ptrace::run(tx_ap, aid, host).await;
         });
@@ -235,20 +247,55 @@ async fn main() -> Result<()> {
         agent_id.clone(),
         hostname.clone(),
     ));
-    info!(iocs = engine.ioc_count(), "Detection engine started");
+    // Compile Sigma rules = on-disk `<config>/sigma/` baseline + any inline
+    // rules carried in the (last-known-good) config, so detections are active
+    // from boot before the first backend config pull.
+    {
+        let (docs, anomaly) = agent_config
+            .read()
+            .map(|c| (c.sigma_rules.clone(), c.anomaly_detection_enabled))
+            .unwrap_or_default();
+        engine.reload_sigma(&docs);
+        engine.set_anomaly_enabled(anomaly);
+    }
+    info!(
+        iocs = engine.ioc_count(),
+        sigma = engine.sigma_count(),
+        "Detection engine started"
+    );
     // Pick up threat-intel feed updates without a restart.
     Arc::clone(&engine).spawn_ioc_reloader(300);
+
+    // SIEM forwarder — best-effort export of every event (and detection) to
+    // external syslog/HEC infrastructure, in parallel with backend ingest.
+    let siem = {
+        let cfg = agent_config.read().ok();
+        let fwd = cfg
+            .map(|c| output::siem::SiemForwarder::from_config(&c, env!("CARGO_PKG_VERSION")))
+            .unwrap_or_else(|| {
+                output::siem::SiemForwarder::from_config(
+                    &AgentConfig::default(),
+                    env!("CARGO_PKG_VERSION"),
+                )
+            });
+        if fwd.is_active() {
+            info!("SIEM forwarding active");
+        }
+        fwd
+    };
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
     let mode = output_mode;
     let prev_tx = prev_event_tx.clone();
     let det_engine = Arc::clone(&engine);
+    let siem_fwd = siem.clone();
     let mut consumer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             if let Some(p) = &prev_tx {
                 let _ = p.try_send(event.clone());
             }
             handle_event(&event, &mode, &buf_for_consumer).await;
+            siem_fwd.forward(&event).await;
 
             // Run detections and treat each finding as a first-class event:
             // persisted, buffered for the backend, and forwarded to prevention.
@@ -257,6 +304,7 @@ async fn main() -> Result<()> {
                     let _ = p.try_send(det.clone());
                 }
                 handle_event(&det, &mode, &buf_for_consumer).await;
+                siem_fwd.forward(&det).await;
             }
         }
     });
@@ -286,12 +334,19 @@ async fn main() -> Result<()> {
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
         tokio::spawn(async move { transport.run().await });
 
+        // Recompile Sigma rules whenever a freshly-signed config is applied, so
+        // the backend can ship detections over the config channel live.
+        let sigma_engine = Arc::clone(&engine);
         let config_puller = ConfigPuller::new(
             Arc::clone(&agent_config),
             &backend_url,
             &agent_id,
             token.clone(),
-        )?;
+        )?
+        .with_apply_hook(std::sync::Arc::new(move |cfg: &AgentConfig| {
+            sigma_engine.reload_sigma(&cfg.sigma_rules);
+            sigma_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
+        }));
         tokio::spawn(async move { config_puller.run().await });
 
         let heartbeat = Heartbeat::new(&backend_url, agent_id.clone(), token, hostname.clone())?;
@@ -315,17 +370,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_event(
-    event: &schema::AgentEvent,
-    mode:  &OutputMode,
-    buf:   &Arc<Mutex<Spool>>,
-) {
+async fn handle_event(event: &schema::AgentEvent, mode: &OutputMode, buf: &Arc<Mutex<Spool>>) {
     if let Err(err) = write_event(event, mode).await {
         error!("Failed to write event: {err}");
     }
     match buf.lock() {
         Ok(mut b) => b.push(event.clone()),
-        Err(e)    => error!("Ring buffer mutex poisoned: {e}"),
+        Err(e) => error!("Ring buffer mutex poisoned: {e}"),
     }
 }
 
@@ -333,31 +384,31 @@ async fn handle_event(
 /// tee in the main consumer to forward events to the enforcement engine.
 async fn start_prevention(
     backend_url: &str,
-    agent_id:    &str,
-    token:       &str,
-    hostname:    &str,
+    agent_id: &str,
+    token: &str,
+    hostname: &str,
     pipeline_tx: tokio::sync::mpsc::Sender<schema::AgentEvent>,
-    cfg_handle:  Arc<RwLock<AgentConfig>>,
+    cfg_handle: Arc<RwLock<AgentConfig>>,
 ) -> Result<tokio::sync::mpsc::Sender<schema::AgentEvent>> {
     use prevention::{
         audit::AuditEmitter,
+        command_pubkey_path,
         command_puller::CommandPuller,
         commands::Verifier,
         engine::{Engine, EngineConfig},
+        local_policy_path,
         network::{detect_backend, ensure_chains},
+        nonce_store,
         policy::{load_local_policy, PolicyHandle},
-        command_pubkey_path, local_policy_path, nonce_store,
     };
 
     prevention::ensure_state_dirs();
 
-    let (event_tx, event_rx) =
-        tokio::sync::mpsc::channel::<schema::AgentEvent>(1024);
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<schema::AgentEvent>(1024);
 
     let audit = AuditEmitter::new(pipeline_tx.clone(), agent_id.into(), hostname.into());
 
-    let store = load_local_policy(&local_policy_path())
-        .context("load /etc/trapd/policy.json")?;
+    let store = load_local_policy(&local_policy_path()).context("load /etc/trapd/policy.json")?;
     let policy = PolicyHandle::new(store);
 
     let backend = detect_backend();
@@ -372,11 +423,8 @@ async fn start_prevention(
         default_isolation_allowlist: allowlist,
     };
 
-    let verifier = match Verifier::new(
-        &command_pubkey_path(),
-        agent_id.to_string(),
-        &nonce_store(),
-    ) {
+    let verifier = match Verifier::new(&command_pubkey_path(), agent_id.to_string(), &nonce_store())
+    {
         Ok(v) => Some(Arc::new(v)),
         Err(e) => {
             warn!(error = %e, "command verifier unavailable — backend commands will not be processed");
@@ -400,7 +448,9 @@ async fn start_prevention(
     if let Some(v) = verifier {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
         let poll_secs = cfg_handle
-            .read().map(|c| c.command_poll_interval_secs).unwrap_or(10);
+            .read()
+            .map(|c| c.command_poll_interval_secs)
+            .unwrap_or(10);
         let puller = CommandPuller::new(
             backend_url,
             agent_id,
@@ -422,24 +472,26 @@ async fn start_prevention(
 
 fn build_isolation_allowlist(
     backend_url: &str,
-    cfg:         &Arc<RwLock<AgentConfig>>,
+    cfg: &Arc<RwLock<AgentConfig>>,
 ) -> Vec<std::net::IpAddr> {
     let mut out: Vec<std::net::IpAddr> = Vec::new();
 
     if let Some(host) = backend_host(backend_url) {
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             out.push(ip);
-        } else if let Ok(addrs) =
-            std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:443"))
-        {
-            for a in addrs { out.push(a.ip()); }
+        } else if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:443")) {
+            for a in addrs {
+                out.push(a.ip());
+            }
         }
     }
 
     if let Ok(c) = cfg.read() {
         for raw in &c.isolation_allowlist_ips {
             if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
-                if !out.contains(&ip) { out.push(ip); }
+                if !out.contains(&ip) {
+                    out.push(ip);
+                }
             }
         }
     }
@@ -451,14 +503,23 @@ fn backend_host(url: &str) -> Option<String> {
     let s = url.split("://").nth(1).unwrap_or(url);
     let s = s.split('/').next().unwrap_or(s);
     let s = s.split(':').next().unwrap_or(s);
-    if s.is_empty() { None } else { Some(s.to_string()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// Interpret an environment variable as a boolean flag.
 /// True for `1`, `true`, `yes`, `on` (case-insensitive); false otherwise.
 fn env_truthy(key: &str) -> bool {
     std::env::var(key)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -471,7 +532,9 @@ async fn load_or_create_device_id() -> Result<String> {
     let file = paths::device_id_file();
 
     if file.exists() {
-        let raw = fs::read_to_string(&file).await.context("Failed to read device_id file")?;
+        let raw = fs::read_to_string(&file)
+            .await
+            .context("Failed to read device_id file")?;
         let trimmed = raw.trim();
         if Uuid::parse_str(trimmed).is_ok() {
             return Ok(trimmed.to_string());
@@ -507,7 +570,10 @@ mod tests {
     fn env_truthy_recognises_false_values() {
         for v in ["0", "false", "no", "off", ""] {
             std::env::set_var("TRAPD_TEST_FLAG2", v);
-            assert!(!env_truthy("TRAPD_TEST_FLAG2"), "expected {v:?} to be falsy");
+            assert!(
+                !env_truthy("TRAPD_TEST_FLAG2"),
+                "expected {v:?} to be falsy"
+            );
         }
         std::env::remove_var("TRAPD_TEST_FLAG2");
         assert!(!env_truthy("TRAPD_DEFINITELY_UNSET_VAR_XYZ"));
@@ -515,9 +581,18 @@ mod tests {
 
     #[test]
     fn backend_host_extracts_hostname() {
-        assert_eq!(backend_host("https://api.example.com/path"), Some("api.example.com".into()));
-        assert_eq!(backend_host("https://api.example.com:8443"), Some("api.example.com".into()));
-        assert_eq!(backend_host("http://10.0.0.1:9000"), Some("10.0.0.1".into()));
+        assert_eq!(
+            backend_host("https://api.example.com/path"),
+            Some("api.example.com".into())
+        );
+        assert_eq!(
+            backend_host("https://api.example.com:8443"),
+            Some("api.example.com".into())
+        );
+        assert_eq!(
+            backend_host("http://10.0.0.1:9000"),
+            Some("10.0.0.1".into())
+        );
         assert_eq!(backend_host(""), None);
     }
 }

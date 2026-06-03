@@ -34,48 +34,81 @@ pub enum RuleAction {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IocRule {
     /// SHA256 of the executable on disk (lower-case hex, no "sha256:" prefix).
-    Sha256       { id: String, value: String, action: RuleAction },
+    Sha256 {
+        id: String,
+        value: String,
+        action: RuleAction,
+    },
     /// Shell-style glob against the absolute exe path (e.g. `/tmp/**/*.sh`).
-    PathGlob     { id: String, value: String, action: RuleAction },
+    PathGlob {
+        id: String,
+        value: String,
+        action: RuleAction,
+    },
     /// Exact match against the kernel `comm` field (max 15 chars + NUL).
-    Comm         { id: String, value: String, action: RuleAction },
+    Comm {
+        id: String,
+        value: String,
+        action: RuleAction,
+    },
     /// Parent comm + child comm pair (e.g. word/excel → bash).
-    ParentChild  { id: String, parent: String, child: String, action: RuleAction },
+    ParentChild {
+        id: String,
+        parent: String,
+        child: String,
+        action: RuleAction,
+    },
     /// Single IP literal (v4 or v6).
-    Ip           { id: String, value: IpAddr, action: RuleAction },
+    Ip {
+        id: String,
+        value: IpAddr,
+        action: RuleAction,
+    },
     /// IP network in CIDR form (e.g. `185.220.101.0/24`).
-    Cidr         { id: String, value: IpNet, action: RuleAction },
+    Cidr {
+        id: String,
+        value: IpNet,
+        action: RuleAction,
+    },
     /// Destination port (TCP/UDP).
-    Port         { id: String, value: u16, action: RuleAction },
+    Port {
+        id: String,
+        value: u16,
+        action: RuleAction,
+    },
     /// Fully-qualified domain (case-insensitive, exact match on DNS qname).
-    Domain       { id: String, value: String, action: RuleAction },
+    Domain {
+        id: String,
+        value: String,
+        action: RuleAction,
+    },
 }
 
 #[allow(dead_code)]
 impl IocRule {
     pub fn id(&self) -> &str {
         match self {
-            IocRule::Sha256      { id, .. }
-            | IocRule::PathGlob  { id, .. }
-            | IocRule::Comm      { id, .. }
+            IocRule::Sha256 { id, .. }
+            | IocRule::PathGlob { id, .. }
+            | IocRule::Comm { id, .. }
             | IocRule::ParentChild { id, .. }
-            | IocRule::Ip        { id, .. }
-            | IocRule::Cidr      { id, .. }
-            | IocRule::Port      { id, .. }
-            | IocRule::Domain    { id, .. } => id,
+            | IocRule::Ip { id, .. }
+            | IocRule::Cidr { id, .. }
+            | IocRule::Port { id, .. }
+            | IocRule::Domain { id, .. } => id,
         }
     }
 
     pub fn action(&self) -> RuleAction {
         match self {
-            IocRule::Sha256      { action, .. }
-            | IocRule::PathGlob  { action, .. }
-            | IocRule::Comm      { action, .. }
+            IocRule::Sha256 { action, .. }
+            | IocRule::PathGlob { action, .. }
+            | IocRule::Comm { action, .. }
             | IocRule::ParentChild { action, .. }
-            | IocRule::Ip        { action, .. }
-            | IocRule::Cidr      { action, .. }
-            | IocRule::Port      { action, .. }
-            | IocRule::Domain    { action, .. } => *action,
+            | IocRule::Ip { action, .. }
+            | IocRule::Cidr { action, .. }
+            | IocRule::Port { action, .. }
+            | IocRule::Domain { action, .. } => *action,
         }
     }
 }
@@ -84,23 +117,23 @@ impl IocRule {
 #[derive(Debug, Clone)]
 pub struct Match {
     pub rule_id: String,
-    pub action:  RuleAction,
-    pub reason:  String,
+    pub action: RuleAction,
+    pub reason: String,
 }
 
 /// Snapshot of the in-memory rule index.  Designed for read-mostly access:
 /// rebuilt wholesale on policy update, read lock-free on every event.
 #[derive(Default, Debug, Clone)]
 pub struct PolicyStore {
-    sha256:    HashSet<String>,
-    comm:      HashSet<String>,
+    sha256: HashSet<String>,
+    comm: HashSet<String>,
     parent_child: Vec<(String, String, String, RuleAction)>,
-    path_globs:   Vec<(String, GlobMatcher, RuleAction)>,
-    ips:       Vec<(String, IpAddr, RuleAction)>,
-    cidrs:     Vec<(String, IpNet,  RuleAction)>,
-    ports:     Vec<(String, u16,    RuleAction)>,
-    domains:   HashSet<String>,
-    raw:       Vec<IocRule>,
+    path_globs: Vec<(String, GlobMatcher, RuleAction)>,
+    ips: Vec<(String, IpAddr, RuleAction)>,
+    cidrs: Vec<(String, IpNet, RuleAction)>,
+    ports: Vec<(String, u16, RuleAction)>,
+    domains: HashSet<String>,
+    raw: Vec<IocRule>,
 }
 
 impl PolicyStore {
@@ -121,7 +154,12 @@ impl PolicyStore {
             IocRule::Comm { value, .. } => {
                 self.comm.insert(value.clone());
             }
-            IocRule::ParentChild { parent, child, id, action } => {
+            IocRule::ParentChild {
+                parent,
+                child,
+                id,
+                action,
+            } => {
                 self.parent_child
                     .push((parent.clone(), child.clone(), id.clone(), *action));
             }
@@ -131,7 +169,7 @@ impl PolicyStore {
                     .compile_matcher();
                 self.path_globs.push((id.clone(), g, *action));
             }
-            IocRule::Ip   { id, value, action } => self.ips  .push((id.clone(), *value, *action)),
+            IocRule::Ip { id, value, action } => self.ips.push((id.clone(), *value, *action)),
             IocRule::Cidr { id, value, action } => self.cidrs.push((id.clone(), *value, *action)),
             IocRule::Port { id, value, action } => self.ports.push((id.clone(), *value, *action)),
             IocRule::Domain { value, .. } => {
@@ -141,57 +179,73 @@ impl PolicyStore {
         Ok(())
     }
 
-    pub fn rules(&self) -> &[IocRule] { &self.raw }
+    pub fn rules(&self) -> &[IocRule] {
+        &self.raw
+    }
     #[allow(dead_code)]
-    pub fn comm_set(&self) -> &HashSet<String> { &self.comm }
+    pub fn comm_set(&self) -> &HashSet<String> {
+        &self.comm
+    }
 
     /// Match a process exec event.  Returns the highest-severity match
     /// (`Block` wins over `Alert`).
     pub fn match_exec(
         &self,
-        exe_path:    &str,
-        comm:        &str,
+        exe_path: &str,
+        comm: &str,
         parent_comm: Option<&str>,
-        sha256_hex:  Option<&str>,
+        sha256_hex: Option<&str>,
     ) -> Option<Match> {
         let mut best: Option<Match> = None;
 
         if let Some(h) = sha256_hex {
             if self.sha256.contains(&h.to_ascii_lowercase()) {
-                best = upgrade(best, Match {
-                    rule_id: format!("sha256:{h}"),
-                    action:  RuleAction::Block,
-                    reason:  format!("SHA256 match: {h}"),
-                });
+                best = upgrade(
+                    best,
+                    Match {
+                        rule_id: format!("sha256:{h}"),
+                        action: RuleAction::Block,
+                        reason: format!("SHA256 match: {h}"),
+                    },
+                );
             }
         }
 
         if self.comm.contains(comm) {
-            best = upgrade(best, Match {
-                rule_id: format!("comm:{comm}"),
-                action:  RuleAction::Block,
-                reason:  format!("comm match: {comm}"),
-            });
+            best = upgrade(
+                best,
+                Match {
+                    rule_id: format!("comm:{comm}"),
+                    action: RuleAction::Block,
+                    reason: format!("comm match: {comm}"),
+                },
+            );
         }
 
         for (id, glob, action) in &self.path_globs {
             if glob.is_match(exe_path) {
-                best = upgrade(best, Match {
-                    rule_id: id.clone(),
-                    action:  *action,
-                    reason:  format!("path glob {} matched {}", glob.glob().glob(), exe_path),
-                });
+                best = upgrade(
+                    best,
+                    Match {
+                        rule_id: id.clone(),
+                        action: *action,
+                        reason: format!("path glob {} matched {}", glob.glob().glob(), exe_path),
+                    },
+                );
             }
         }
 
         if let Some(parent) = parent_comm {
             for (p, c, id, action) in &self.parent_child {
                 if p == parent && c == comm {
-                    best = upgrade(best, Match {
-                        rule_id: id.clone(),
-                        action:  *action,
-                        reason:  format!("parent/child pair {parent}/{comm}"),
-                    });
+                    best = upgrade(
+                        best,
+                        Match {
+                            rule_id: id.clone(),
+                            action: *action,
+                            reason: format!("parent/child pair {parent}/{comm}"),
+                        },
+                    );
                 }
             }
         }
@@ -205,29 +259,38 @@ impl PolicyStore {
         let mut best: Option<Match> = None;
         for (id, ip, action) in &self.ips {
             if *ip == addr {
-                best = upgrade(best, Match {
-                    rule_id: id.clone(),
-                    action:  *action,
-                    reason:  format!("IP match: {addr}"),
-                });
+                best = upgrade(
+                    best,
+                    Match {
+                        rule_id: id.clone(),
+                        action: *action,
+                        reason: format!("IP match: {addr}"),
+                    },
+                );
             }
         }
         for (id, cidr, action) in &self.cidrs {
             if cidr.contains(&addr) {
-                best = upgrade(best, Match {
-                    rule_id: id.clone(),
-                    action:  *action,
-                    reason:  format!("CIDR match: {addr} ∈ {cidr}"),
-                });
+                best = upgrade(
+                    best,
+                    Match {
+                        rule_id: id.clone(),
+                        action: *action,
+                        reason: format!("CIDR match: {addr} ∈ {cidr}"),
+                    },
+                );
             }
         }
         for (id, p, action) in &self.ports {
             if *p == port {
-                best = upgrade(best, Match {
-                    rule_id: id.clone(),
-                    action:  *action,
-                    reason:  format!("port match: {port}"),
-                });
+                best = upgrade(
+                    best,
+                    Match {
+                        rule_id: id.clone(),
+                        action: *action,
+                        reason: format!("port match: {port}"),
+                    },
+                );
             }
         }
         best
@@ -240,8 +303,8 @@ impl PolicyStore {
         if self.domains.contains(&q) {
             Some(Match {
                 rule_id: format!("domain:{q}"),
-                action:  RuleAction::Block,
-                reason:  format!("domain match: {q}"),
+                action: RuleAction::Block,
+                reason: format!("domain match: {q}"),
             })
         } else {
             None
@@ -271,7 +334,9 @@ pub struct PolicyHandle {
 
 impl PolicyHandle {
     pub fn new(store: PolicyStore) -> Self {
-        Self { inner: Arc::new(RwLock::new(store)) }
+        Self {
+            inner: Arc::new(RwLock::new(store)),
+        }
     }
 
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, PolicyStore> {
@@ -301,8 +366,7 @@ pub fn load_local_policy(path: &Path) -> Result<PolicyStore> {
         info!(path = %path.display(), "no local IoC policy file — starting empty");
         return Ok(PolicyStore::default());
     }
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
     let file: PolicyFile = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid JSON in {}", path.display()))?;
     let n = file.rules.len();

@@ -40,35 +40,43 @@ use super::super::Collector;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapRegion {
     pub start: u64,
-    pub end:   u64,
+    pub end: u64,
     /// Raw permission string, e.g. `r-xp`, `rwxp`.
     pub perms: String,
     /// Pathname column: empty for anonymous, `[heap]`/`[stack]`/`[vdso]` for
     /// special regions, a path (optionally suffixed ` (deleted)`) otherwise.
-    pub path:  String,
+    pub path: String,
 }
 
 impl MapRegion {
-    fn is_exec(&self) -> bool { self.perms.contains('x') }
-    fn is_write(&self) -> bool { self.perms.contains('w') }
+    fn is_exec(&self) -> bool {
+        self.perms.contains('x')
+    }
+    fn is_write(&self) -> bool {
+        self.perms.contains('w')
+    }
     /// Anonymous: no backing path and not one of the kernel pseudo-regions.
     fn is_anon(&self) -> bool {
         self.path.is_empty()
     }
-    fn is_deleted(&self) -> bool { self.path.ends_with(" (deleted)") }
-    fn is_memfd(&self) -> bool { self.path.starts_with("/memfd:") }
+    fn is_deleted(&self) -> bool {
+        self.path.ends_with(" (deleted)")
+    }
+    fn is_memfd(&self) -> bool {
+        self.path.starts_with("/memfd:")
+    }
 }
 
 /// A classified memory finding (rule + scoring), independent of any I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemFinding {
-    pub rule_id:    &'static str,
-    pub title:      &'static str,
-    pub technique:  &'static str,
+    pub rule_id: &'static str,
+    pub title: &'static str,
+    pub technique: &'static str,
     pub confidence: u8,
-    pub severity:   Severity,
+    pub severity: Severity,
     /// Human description of the offending region.
-    pub region:     String,
+    pub region: String,
 }
 
 /// Parse `/proc/<pid>/maps` content into regions. Malformed lines are skipped.
@@ -89,7 +97,12 @@ pub fn parse_maps_line(line: &str) -> Option<MapRegion> {
     let _dev = cols.next()?;
     let _inode = cols.next()?;
     let path = cols.collect::<Vec<_>>().join(" ");
-    Some(MapRegion { start, end, perms: perms.to_string(), path })
+    Some(MapRegion {
+        start,
+        end,
+        perms: perms.to_string(),
+        path,
+    })
 }
 
 /// Classify one region. Returns `None` for benign regions and the kernel
@@ -114,10 +127,18 @@ pub fn classify_region(r: &MapRegion) -> Option<MemFinding> {
     if r.is_anon() {
         // Anonymous executable memory. RWX is the strongest single-region
         // injection signal; plain anon r-x is still abnormal for most code.
-        let (confidence, severity) = if r.is_write() { (88, Severity::High) } else { (78, Severity::High) };
+        let (confidence, severity) = if r.is_write() {
+            (88, Severity::High)
+        } else {
+            (78, Severity::High)
+        };
         return Some(MemFinding {
             rule_id: "memory.anon_exec",
-            title: if r.is_write() { "Writable+executable anonymous memory (RWX)" } else { "Executable anonymous memory" },
+            title: if r.is_write() {
+                "Writable+executable anonymous memory (RWX)"
+            } else {
+                "Executable anonymous memory"
+            },
             technique: "T1055",
             confidence,
             severity,
@@ -143,8 +164,13 @@ pub fn classify_region(r: &MapRegion) -> Option<MemFinding> {
 }
 
 /// Standard library roots a legitimate `LD_PRELOAD` is expected to live under.
-const TRUSTED_LIB_PREFIXES: &[&str] =
-    &["/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/", "/usr/local/lib/"];
+const TRUSTED_LIB_PREFIXES: &[&str] = &[
+    "/lib/",
+    "/lib64/",
+    "/usr/lib/",
+    "/usr/lib64/",
+    "/usr/local/lib/",
+];
 
 /// Extract `LD_PRELOAD` from raw `/proc/<pid>/environ` (NUL-separated).
 pub fn ld_preload_from_environ(environ: &[u8]) -> Option<String> {
@@ -190,13 +216,18 @@ pub struct MemScanCollector {
 
 impl MemScanCollector {
     pub fn new(cfg: Arc<RwLock<AgentConfig>>) -> Self {
-        Self { cfg, seen: HashSet::new() }
+        Self {
+            cfg,
+            seen: HashSet::new(),
+        }
     }
 }
 
 #[async_trait]
 impl Collector for MemScanCollector {
-    fn name(&self) -> &'static str { "memscan" }
+    fn name(&self) -> &'static str {
+        "memscan"
+    }
 
     async fn run(
         &mut self,
@@ -219,7 +250,12 @@ impl Collector for MemScanCollector {
             ticker.tick().await;
 
             // Re-check the toggle so a hot config reload can switch us off.
-            if !self.cfg.read().map(|c| c.memory_scan_enabled).unwrap_or(false) {
+            if !self
+                .cfg
+                .read()
+                .map(|c| c.memory_scan_enabled)
+                .unwrap_or(false)
+            {
                 continue;
             }
 
@@ -303,7 +339,11 @@ fn live_pids() -> Vec<i32> {
     let mut pids = Vec::new();
     if let Ok(rd) = std::fs::read_dir("/proc") {
         for entry in rd.flatten() {
-            if let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
+            if let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<i32>().ok())
+            {
                 pids.push(pid);
             }
         }
@@ -317,15 +357,17 @@ mod tests {
 
     #[test]
     fn parses_a_normal_maps_line() {
-        let r = parse_maps_line(
-            "55a1b2c00000-55a1b2c21000 r-xp 00001000 08:01 1311056 /usr/bin/bash",
-        )
-        .unwrap();
+        let r =
+            parse_maps_line("55a1b2c00000-55a1b2c21000 r-xp 00001000 08:01 1311056 /usr/bin/bash")
+                .unwrap();
         assert_eq!(r.start, 0x55a1b2c00000);
         assert_eq!(r.end, 0x55a1b2c21000);
         assert_eq!(r.perms, "r-xp");
         assert_eq!(r.path, "/usr/bin/bash");
-        assert!(classify_region(&r).is_none(), "a file-backed r-x text segment is benign");
+        assert!(
+            classify_region(&r).is_none(),
+            "a file-backed r-x text segment is benign"
+        );
     }
 
     #[test]
@@ -358,10 +400,9 @@ mod tests {
 
     #[test]
     fn flags_deleted_binary_execution_at_medium() {
-        let r = parse_maps_line(
-            "55a000000000-55a000021000 r-xp 00000000 08:01 99 /tmp/x (deleted)",
-        )
-        .unwrap();
+        let r =
+            parse_maps_line("55a000000000-55a000021000 r-xp 00000000 08:01 99 /tmp/x (deleted)")
+                .unwrap();
         let f = classify_region(&r).unwrap();
         assert_eq!(f.rule_id, "memory.deleted_exec");
         assert_eq!(f.severity, Severity::Medium);
@@ -369,9 +410,14 @@ mod tests {
 
     #[test]
     fn ignores_kernel_pseudo_regions_and_non_exec() {
-        let vdso = parse_maps_line("7fffabc00000-7fffabc01000 r-xp 00000000 00:00 0 [vdso]").unwrap();
-        assert!(classify_region(&vdso).is_none(), "[vdso] is legitimately executable");
-        let heap = parse_maps_line("55a000000000-55a000021000 rw-p 00000000 00:00 0 [heap]").unwrap();
+        let vdso =
+            parse_maps_line("7fffabc00000-7fffabc01000 r-xp 00000000 00:00 0 [vdso]").unwrap();
+        assert!(
+            classify_region(&vdso).is_none(),
+            "[vdso] is legitimately executable"
+        );
+        let heap =
+            parse_maps_line("55a000000000-55a000021000 rw-p 00000000 00:00 0 [heap]").unwrap();
         assert!(classify_region(&heap).is_none(), "non-exec heap is fine");
     }
 
@@ -383,7 +429,9 @@ mod tests {
         assert!(is_suspicious_preload(&v));
 
         // A legit preload under a system lib path is not flagged.
-        assert!(!is_suspicious_preload("/usr/lib/x86_64-linux-gnu/libfoo.so"));
+        assert!(!is_suspicious_preload(
+            "/usr/lib/x86_64-linux-gnu/libfoo.so"
+        ));
         // Missing var → None.
         assert!(ld_preload_from_environ(b"PATH=/usr/bin\0").is_none());
     }

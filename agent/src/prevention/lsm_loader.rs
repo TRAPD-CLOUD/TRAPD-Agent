@@ -29,8 +29,8 @@ pub struct LsmHandle {
 
 #[cfg(target_os = "linux")]
 struct LsmState {
-    _bpf:           aya::Ebpf,
-    blocked_comms:  aya::maps::HashMap<aya::maps::MapData, [u8; 16], u8>,
+    _bpf: aya::Ebpf,
+    blocked_comms: aya::maps::HashMap<aya::maps::MapData, [u8; 16], u8>,
     blocked_inodes: aya::maps::HashMap<aya::maps::MapData, u64, u8>,
 }
 
@@ -48,17 +48,15 @@ impl LsmHandle {
             );
             None
         });
-        Self { state: Arc::new(Mutex::new(inner)) }
+        Self {
+            state: Arc::new(Mutex::new(inner)),
+        }
     }
 
     #[cfg(target_os = "linux")]
     fn do_load() -> anyhow::Result<Option<LsmState>> {
         use anyhow::Context;
-        use aya::{
-            maps::HashMap as BpfHashMap,
-            programs::TracePoint,
-            Ebpf,
-        };
+        use aya::{maps::HashMap as BpfHashMap, programs::TracePoint, Ebpf};
 
         let candidates = [
             std::env::var("TRAPD_EBPF_PATH").ok(),
@@ -66,12 +64,13 @@ impl LsmHandle {
             Some("/usr/local/lib/trapd-agent/trapd-agent-exec".into()),
             Some("../../target/bpfel-unknown-none/release/trapd-agent-exec".into()),
         ];
-        let path = candidates.into_iter().flatten()
+        let path = candidates
+            .into_iter()
+            .flatten()
             .find(|p| Path::new(p).exists())
             .ok_or_else(|| anyhow::anyhow!("eBPF binary not installed"))?;
 
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("read eBPF binary: {path}"))?;
+        let bytes = std::fs::read(&path).with_context(|| format!("read eBPF binary: {path}"))?;
         let mut bpf = Ebpf::load(&bytes).context("load eBPF binary")?;
 
         let prog = match bpf.program_mut("process_block_exec") {
@@ -82,21 +81,32 @@ impl LsmHandle {
                 ));
             }
         };
-        let prog: &mut TracePoint = prog.try_into()
+        let prog: &mut TracePoint = prog
+            .try_into()
             .context("process_block_exec is not a tracepoint")?;
-        prog.load().context("BPF verifier rejected process_block_exec")?;
+        prog.load()
+            .context("BPF verifier rejected process_block_exec")?;
         prog.attach("sched", "sched_process_exec")
             .context("attach process_block_exec to sched/sched_process_exec")?;
 
         let blocked_comms: BpfHashMap<_, [u8; 16], u8> = BpfHashMap::try_from(
-            bpf.take_map("BLOCKED_COMMS").context("BLOCKED_COMMS map missing")?,
+            bpf.take_map("BLOCKED_COMMS")
+                .context("BLOCKED_COMMS map missing")?,
         )?;
         let blocked_inodes: BpfHashMap<_, u64, u8> = BpfHashMap::try_from(
-            bpf.take_map("BLOCKED_INODES").context("BLOCKED_INODES map missing")?,
+            bpf.take_map("BLOCKED_INODES")
+                .context("BLOCKED_INODES map missing")?,
         )?;
 
-        info!(path, "kernel-side exec blocker loaded — sched_process_exec attached");
-        Ok(Some(LsmState { _bpf: bpf, blocked_comms, blocked_inodes }))
+        info!(
+            path,
+            "kernel-side exec blocker loaded — sched_process_exec attached"
+        );
+        Ok(Some(LsmState {
+            _bpf: bpf,
+            blocked_comms,
+            blocked_inodes,
+        }))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -109,7 +119,7 @@ impl LsmHandle {
         let mut guard = self.state.lock().await;
         let state = match guard.as_mut() {
             Some(s) => s,
-            None    => return,
+            None => return,
         };
         #[cfg(target_os = "linux")]
         {

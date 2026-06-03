@@ -133,7 +133,10 @@ pub struct Decision {
 
 impl Decision {
     fn skip(reason: impl Into<String>) -> Self {
-        Decision { action: AutoAction::None, reason: reason.into() }
+        Decision {
+            action: AutoAction::None,
+            reason: reason.into(),
+        }
     }
 }
 
@@ -222,7 +225,10 @@ mod tests {
     use serde_json::json;
 
     fn t(pid: Option<i32>, path: Option<&str>) -> Targets {
-        Targets { pid, file_path: path.map(String::from) }
+        Targets {
+            pid,
+            file_path: path.map(String::from),
+        }
     }
 
     #[test]
@@ -237,8 +243,16 @@ mod tests {
     #[test]
     fn disabled_never_acts() {
         let d = decide(
-            false, AutoAction::Kill, Severity::Critical, 90, &[],
-            Severity::Critical, "ioc.process_hash", "ioc", 95, &t(Some(42), None),
+            false,
+            AutoAction::Kill,
+            Severity::Critical,
+            90,
+            &[],
+            Severity::Critical,
+            "ioc.process_hash",
+            "ioc",
+            95,
+            &t(Some(42), None),
         );
         assert_eq!(d.action, AutoAction::None);
     }
@@ -246,8 +260,16 @@ mod tests {
     #[test]
     fn below_severity_threshold_skips() {
         let d = decide(
-            true, AutoAction::Kill, Severity::Critical, 90, &[],
-            Severity::High, "x", "y", 99, &t(Some(42), None),
+            true,
+            AutoAction::Kill,
+            Severity::Critical,
+            90,
+            &[],
+            Severity::High,
+            "x",
+            "y",
+            99,
+            &t(Some(42), None),
         );
         assert_eq!(d.action, AutoAction::None);
     }
@@ -255,8 +277,16 @@ mod tests {
     #[test]
     fn below_confidence_threshold_skips() {
         let d = decide(
-            true, AutoAction::Kill, Severity::High, 90, &[],
-            Severity::Critical, "x", "y", 80, &t(Some(42), None),
+            true,
+            AutoAction::Kill,
+            Severity::High,
+            90,
+            &[],
+            Severity::Critical,
+            "x",
+            "y",
+            80,
+            &t(Some(42), None),
         );
         assert_eq!(d.action, AutoAction::None);
     }
@@ -264,14 +294,30 @@ mod tests {
     #[test]
     fn allowlist_by_rule_id_or_category_skips() {
         let by_rule = decide(
-            true, AutoAction::Kill, Severity::High, 0, &["lolbin.shell".into()],
-            Severity::Critical, "lolbin.shell", "lolbin", 99, &t(Some(42), None),
+            true,
+            AutoAction::Kill,
+            Severity::High,
+            0,
+            &["lolbin.shell".into()],
+            Severity::Critical,
+            "lolbin.shell",
+            "lolbin",
+            99,
+            &t(Some(42), None),
         );
         assert_eq!(by_rule.action, AutoAction::None);
 
         let by_cat = decide(
-            true, AutoAction::Kill, Severity::High, 0, &["IOC".into()],
-            Severity::Critical, "ioc.process_hash", "ioc", 99, &t(Some(42), None),
+            true,
+            AutoAction::Kill,
+            Severity::High,
+            0,
+            &["IOC".into()],
+            Severity::Critical,
+            "ioc.process_hash",
+            "ioc",
+            99,
+            &t(Some(42), None),
         );
         assert_eq!(by_cat.action, AutoAction::None);
     }
@@ -279,14 +325,30 @@ mod tests {
     #[test]
     fn kill_requires_pid_else_alerts() {
         let with_pid = decide(
-            true, AutoAction::Kill, Severity::Critical, 90, &[],
-            Severity::Critical, "x", "y", 95, &t(Some(42), None),
+            true,
+            AutoAction::Kill,
+            Severity::Critical,
+            90,
+            &[],
+            Severity::Critical,
+            "x",
+            "y",
+            95,
+            &t(Some(42), None),
         );
         assert_eq!(with_pid.action, AutoAction::Kill);
 
         let no_pid = decide(
-            true, AutoAction::Kill, Severity::Critical, 90, &[],
-            Severity::Critical, "x", "y", 95, &t(None, None),
+            true,
+            AutoAction::Kill,
+            Severity::Critical,
+            90,
+            &[],
+            Severity::Critical,
+            "x",
+            "y",
+            95,
+            &t(None, None),
         );
         assert_eq!(no_pid.action, AutoAction::Alert);
     }
@@ -294,8 +356,15 @@ mod tests {
     #[test]
     fn quarantine_without_path_degrades_to_kill() {
         let d = decide(
-            true, AutoAction::Quarantine, Severity::Critical, 90, &[],
-            Severity::Critical, "ransomware.high_entropy", "ransomware", 95,
+            true,
+            AutoAction::Quarantine,
+            Severity::Critical,
+            90,
+            &[],
+            Severity::Critical,
+            "ransomware.high_entropy",
+            "ransomware",
+            95,
             &t(Some(42), None),
         );
         assert_eq!(d.action, AutoAction::Kill);
@@ -304,8 +373,15 @@ mod tests {
     #[test]
     fn quarantine_with_path_stays_quarantine() {
         let d = decide(
-            true, AutoAction::Quarantine, Severity::Critical, 90, &[],
-            Severity::Critical, "ransomware.high_entropy", "ransomware", 95,
+            true,
+            AutoAction::Quarantine,
+            Severity::Critical,
+            90,
+            &[],
+            Severity::Critical,
+            "ransomware.high_entropy",
+            "ransomware",
+            95,
             &t(Some(42), Some("/tmp/evil")),
         );
         assert_eq!(d.action, AutoAction::Quarantine);
@@ -314,8 +390,16 @@ mod tests {
     #[test]
     fn isolate_keeps_even_without_target() {
         let d = decide(
-            true, AutoAction::Isolate, Severity::Critical, 90, &[],
-            Severity::Critical, "ioc.network_ip", "ioc", 95, &t(None, None),
+            true,
+            AutoAction::Isolate,
+            Severity::Critical,
+            90,
+            &[],
+            Severity::Critical,
+            "ioc.network_ip",
+            "ioc",
+            95,
+            &t(None, None),
         );
         assert_eq!(d.action, AutoAction::Isolate);
     }

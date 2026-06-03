@@ -69,15 +69,21 @@ impl PackageManager {
     fn install_args(self, pkg: &str) -> Vec<String> {
         match self {
             PackageManager::Apt => vec!["install".into(), "-y".into(), pkg.into()],
-            PackageManager::Dnf | PackageManager::Yum => vec!["install".into(), "-y".into(), pkg.into()],
-            PackageManager::Zypper => vec!["--non-interactive".into(), "install".into(), pkg.into()],
+            PackageManager::Dnf | PackageManager::Yum => {
+                vec!["install".into(), "-y".into(), pkg.into()]
+            }
+            PackageManager::Zypper => {
+                vec!["--non-interactive".into(), "install".into(), pkg.into()]
+            }
         }
     }
 
     fn remove_args(self, pkg: &str) -> Vec<String> {
         match self {
             PackageManager::Apt => vec!["remove".into(), "-y".into(), pkg.into()],
-            PackageManager::Dnf | PackageManager::Yum => vec!["remove".into(), "-y".into(), pkg.into()],
+            PackageManager::Dnf | PackageManager::Yum => {
+                vec!["remove".into(), "-y".into(), pkg.into()]
+            }
             PackageManager::Zypper => vec!["--non-interactive".into(), "remove".into(), pkg.into()],
         }
     }
@@ -86,8 +92,15 @@ impl PackageManager {
     /// `install --only-upgrade`).
     fn upgrade_one_args(self, pkg: &str) -> Vec<String> {
         match self {
-            PackageManager::Apt => vec!["install".into(), "--only-upgrade".into(), "-y".into(), pkg.into()],
-            PackageManager::Dnf | PackageManager::Yum => vec!["upgrade".into(), "-y".into(), pkg.into()],
+            PackageManager::Apt => vec![
+                "install".into(),
+                "--only-upgrade".into(),
+                "-y".into(),
+                pkg.into(),
+            ],
+            PackageManager::Dnf | PackageManager::Yum => {
+                vec!["upgrade".into(), "-y".into(), pkg.into()]
+            }
             PackageManager::Zypper => vec!["--non-interactive".into(), "update".into(), pkg.into()],
         }
     }
@@ -222,9 +235,8 @@ pub fn is_valid_package_name(name: &str) -> bool {
     if !first.is_ascii_alphanumeric() {
         return false;
     }
-    name.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.' | ':' | '_' | '~' | '=')
-    })
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.' | ':' | '_' | '~' | '='))
 }
 
 fn which(bin: &str) -> bool {
@@ -255,16 +267,38 @@ mod tests {
 
     #[test]
     fn accepts_real_package_names() {
-        for n in ["curl", "nginx", "python3", "lib32z1", "g++", "ca-certificates",
-                  "docker.io", "gcc-12", "nginx=1.24.0-1", "libssl3:amd64"] {
+        for n in [
+            "curl",
+            "nginx",
+            "python3",
+            "lib32z1",
+            "g++",
+            "ca-certificates",
+            "docker.io",
+            "gcc-12",
+            "nginx=1.24.0-1",
+            "libssl3:amd64",
+        ] {
             assert!(is_valid_package_name(n), "{n} should be valid");
         }
     }
 
     #[test]
     fn rejects_injection_and_flags() {
-        for n in ["", "curl; rm -rf /", "a b", "$(reboot)", "`id`", "pkg|cat",
-                  "--option", "-rf", "../etc/passwd", "pkg\nrm", "a&&b", "pkg>file"] {
+        for n in [
+            "",
+            "curl; rm -rf /",
+            "a b",
+            "$(reboot)",
+            "`id`",
+            "pkg|cat",
+            "--option",
+            "-rf",
+            "../etc/passwd",
+            "pkg\nrm",
+            "a&&b",
+            "pkg>file",
+        ] {
             assert!(!is_valid_package_name(n), "{n:?} should be rejected");
         }
     }

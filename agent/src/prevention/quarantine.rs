@@ -27,14 +27,14 @@ use super::{quarantine_dir, quarantine_index};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuarantineRecord {
-    pub id:            Uuid,
+    pub id: Uuid,
     pub original_path: String,
-    pub stored_path:   String,
-    pub sha256:        String,
-    pub size_bytes:    u64,
-    pub mode:          u32,
-    pub uid:           u32,
-    pub gid:           u32,
+    pub stored_path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
     pub quarantined_at: DateTime<Utc>,
 }
 
@@ -48,9 +48,11 @@ impl QuarantineIndex {
     pub fn load() -> Self {
         let index = quarantine_index();
         let path = index.as_path();
-        if !path.exists() { return Self::default(); }
+        if !path.exists() {
+            return Self::default();
+        }
         match fs::read(path) {
-            Ok(b)  => serde_json::from_slice(&b).unwrap_or_default(),
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
@@ -75,8 +77,8 @@ pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
     }
     let size = meta.len();
     let mode = meta.mode();
-    let uid  = meta.uid();
-    let gid  = meta.gid();
+    let uid = meta.uid();
+    let gid = meta.gid();
 
     let sha = sha256_of(path)?;
 
@@ -95,11 +97,11 @@ pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
     }
 
     let record = QuarantineRecord {
-        id:            Uuid::new_v4(),
+        id: Uuid::new_v4(),
         original_path: path.to_string_lossy().into_owned(),
-        stored_path:   stored.to_string_lossy().into_owned(),
-        sha256:        sha,
-        size_bytes:    size,
+        stored_path: stored.to_string_lossy().into_owned(),
+        sha256: sha,
+        size_bytes: size,
         mode,
         uid,
         gid,
@@ -123,7 +125,10 @@ pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
 /// Reverse quarantine.  Identified by the `QuarantineRecord::id`.
 pub fn restore(quarantine_id: &Uuid) -> Result<QuarantineRecord> {
     let mut idx = QuarantineIndex::load();
-    let pos = idx.records.iter().position(|r| r.id == *quarantine_id)
+    let pos = idx
+        .records
+        .iter()
+        .position(|r| r.id == *quarantine_id)
         .ok_or_else(|| anyhow!("no quarantine record with id {quarantine_id}"))?;
     let record = idx.records.remove(pos);
 
@@ -156,7 +161,9 @@ fn sha256_of(path: &Path) -> Result<String> {
     let mut buf = [0u8; 65_536];
     loop {
         let n = f.read(&mut buf).context("read for hashing")?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Ok(hex::encode(hasher.finalize()))
@@ -165,7 +172,8 @@ fn sha256_of(path: &Path) -> Result<String> {
 fn move_or_copy(src: &Path, dst: &Path) -> Result<()> {
     if let Err(e) = fs::rename(src, dst) {
         if e.raw_os_error() == Some(libc_exdev()) || cfg!(test) {
-            fs::copy(src, dst).with_context(|| format!("copy {} → {}", src.display(), dst.display()))?;
+            fs::copy(src, dst)
+                .with_context(|| format!("copy {} → {}", src.display(), dst.display()))?;
             fs::remove_file(src).with_context(|| format!("remove {}", src.display()))?;
         } else {
             return Err(e).with_context(|| format!("rename {} → {}", src.display(), dst.display()));
@@ -174,7 +182,9 @@ fn move_or_copy(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn libc_exdev() -> i32 { 18 } // EXDEV
+fn libc_exdev() -> i32 {
+    18
+} // EXDEV
 
 #[cfg(target_os = "linux")]
 fn set_mode(p: &Path, mode: u32) -> std::io::Result<()> {
@@ -185,17 +195,20 @@ fn set_mode(p: &Path, mode: u32) -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_mode(_p: &Path, _m: u32) -> std::io::Result<()> { Ok(()) }
+fn set_mode(_p: &Path, _m: u32) -> std::io::Result<()> {
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 fn chown(p: &Path, uid: u32, gid: u32) -> Result<()> {
     use nix::unistd::{chown as nix_chown, Gid, Uid};
-    nix_chown(p, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
-        .context("chown failed")
+    nix_chown(p, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).context("chown failed")
 }
 
 #[cfg(not(target_os = "linux"))]
-fn chown(_p: &Path, _u: u32, _g: u32) -> Result<()> { Ok(()) }
+fn chown(_p: &Path, _u: u32, _g: u32) -> Result<()> {
+    Ok(())
+}
 
 /// Toggle the ext-family `i` (immutable) attribute via `chattr(1)`.
 fn chattr_immutable(p: &Path, set: bool) -> Result<()> {
@@ -203,14 +216,17 @@ fn chattr_immutable(p: &Path, set: bool) -> Result<()> {
     // Resolve chattr by absolute path rather than via $PATH: a tampered $PATH
     // or a shadowed `chattr` earlier in the search order could otherwise make
     // quarantine appear to succeed while the immutable flag is never set.
-    let out  = std::process::Command::new(chattr_bin())
+    let out = std::process::Command::new(chattr_bin())
         .arg(flag)
         .arg(p)
         .output()
         .context("spawn chattr")?;
     if !out.status.success() {
-        bail!("chattr {flag} {} failed: {}", p.display(),
-              String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "chattr {flag} {} failed: {}",
+            p.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }

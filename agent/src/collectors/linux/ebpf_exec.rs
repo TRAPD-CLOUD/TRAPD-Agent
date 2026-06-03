@@ -27,38 +27,32 @@ use std::fs;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use aya::{
-    maps::RingBuf,
-    programs::TracePoint,
-    Ebpf,
-};
+use aya::{maps::RingBuf, programs::TracePoint, Ebpf};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
 use crate::collectors::Collector;
-use crate::schema::{
-    AgentEvent, EventAction, EventClass, EventData, ExecEventData, Severity,
-};
+use crate::schema::{AgentEvent, EventAction, EventClass, EventData, ExecEventData, Severity};
 
 // ── Kernel↔Userspace struct layout ───────────────────────────────────────────
 // Must be kept in sync with `ExecEvent` in trapd-agent-ebpf/src/main.rs.
 
-const COMM_LEN:    usize = 16;
+const COMM_LEN: usize = 16;
 const FILENAME_LEN: usize = 256;
-const PRELOAD_LEN:  usize = 256;
+const PRELOAD_LEN: usize = 256;
 
 #[repr(C)]
 struct RawExecEvent {
-    pid:            u32,
-    ppid:           u32,
-    uid:            u32,
-    gid:            u32,
-    comm:           [u8; COMM_LEN],
-    filename:       [u8; FILENAME_LEN],
-    filename_len:   u32,
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    gid: u32,
+    comm: [u8; COMM_LEN],
+    filename: [u8; FILENAME_LEN],
+    filename_len: u32,
     ld_preload_len: u32,
-    ld_preload:     [u8; PRELOAD_LEN],
+    ld_preload: [u8; PRELOAD_LEN],
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
@@ -208,8 +202,8 @@ fn proc_username(uid: u32) -> String {
         .find_map(|line| {
             let mut fields = line.splitn(7, ':');
             let name = fields.next()?;
-            let _    = fields.next(); // password
-            let u    = fields.next()?.parse::<u32>().ok()?;
+            let _ = fields.next(); // password
+            let u = fields.next()?.parse::<u32>().ok()?;
             (u == uid).then(|| name.to_string())
         })
         .unwrap_or_else(|| format!("uid:{uid}"))
@@ -234,8 +228,7 @@ impl Collector for EbpfExecCollector {
             .as_deref()
             .context("eBPF binary not found — run `cargo xtask build-ebpf --release` and copy to /usr/lib/trapd-agent/")?;
 
-        let bytes = fs::read(path)
-            .with_context(|| format!("cannot read eBPF binary: {path}"))?;
+        let bytes = fs::read(path).with_context(|| format!("cannot read eBPF binary: {path}"))?;
 
         // Load ELF bytecode into the kernel
         let mut bpf = Ebpf::load(&bytes).context(
@@ -249,7 +242,8 @@ impl Collector for EbpfExecCollector {
                 .context("sched_process_exec not found in eBPF binary")?
                 .try_into()
                 .context("sched_process_exec is not a TracePoint")?;
-            prog.load().context("BPF verifier rejected sched_process_exec")?;
+            prog.load()
+                .context("BPF verifier rejected sched_process_exec")?;
             prog.attach("sched", "sched_process_exec")
                 .context("failed to attach to sched/sched_process_exec")?;
         }
@@ -261,7 +255,8 @@ impl Collector for EbpfExecCollector {
                 .context("sys_enter_execve not found in eBPF binary")?
                 .try_into()
                 .context("sys_enter_execve is not a TracePoint")?;
-            prog.load().context("BPF verifier rejected sys_enter_execve")?;
+            prog.load()
+                .context("BPF verifier rejected sys_enter_execve")?;
             prog.attach("syscalls", "sys_enter_execve")
                 .context("failed to attach to syscalls/sys_enter_execve")?;
         }
@@ -295,7 +290,7 @@ impl Collector for EbpfExecCollector {
 
                 if bytes.len() < std::mem::size_of::<RawExecEvent>() {
                     warn!(
-                        got  = bytes.len(),
+                        got = bytes.len(),
                         want = std::mem::size_of::<RawExecEvent>(),
                         "short eBPF event — skipping"
                     );
@@ -306,18 +301,20 @@ impl Collector for EbpfExecCollector {
                 let raw: RawExecEvent =
                     unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawExecEvent) };
 
-                let pid      = raw.pid;
-                if pid == agent_pid { continue; } // self-exclusion
-                let exe      = cstr(&raw.filename).to_string();
-                let comm     = cstr(&raw.comm).to_string();
+                let pid = raw.pid;
+                if pid == agent_pid {
+                    continue;
+                } // self-exclusion
+                let exe = cstr(&raw.filename).to_string();
+                let comm = cstr(&raw.comm).to_string();
 
                 // Enrich from /proc — best-effort; short-lived processes may
                 // already be gone, in which case these return empty strings.
-                let ppid         = proc_ppid(pid);
-                let cmdline      = proc_cmdline(pid);
-                let cwd          = proc_cwd(pid);
+                let ppid = proc_ppid(pid);
+                let cmdline = proc_cmdline(pid);
+                let cwd = proc_cwd(pid);
                 let container_id = proc_container_id(pid);
-                let username     = proc_username(raw.uid);
+                let username = proc_username(raw.uid);
 
                 let ld_preload = if raw.ld_preload_len > 0 {
                     Some(cstr(&raw.ld_preload).to_string())

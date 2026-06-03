@@ -13,7 +13,9 @@ use crate::prevention::{
     commands::{load_verifying_key, verify_canonical},
 };
 
-fn default_poll_interval() -> u64 { 60 }
+fn default_poll_interval() -> u64 {
+    60
+}
 fn default_fs_watch_paths() -> Vec<String> {
     vec!["/etc".into(), "/bin".into(), "/tmp".into()]
 }
@@ -26,9 +28,15 @@ fn default_enabled_collectors() -> Vec<String> {
         "filesystem".into(),
     ]
 }
-fn default_prevention_enabled() -> bool { true }
-fn default_fim_enabled() -> bool { true }
-fn default_fim_interval() -> u64 { 900 }
+fn default_prevention_enabled() -> bool {
+    true
+}
+fn default_fim_enabled() -> bool {
+    true
+}
+fn default_fim_interval() -> u64 {
+    900
+}
 fn default_fim_paths() -> Vec<String> {
     vec![
         "/etc".into(),
@@ -39,34 +47,75 @@ fn default_fim_paths() -> Vec<String> {
         "/boot".into(),
     ]
 }
-fn default_command_poll_interval() -> u64 { 10 }
-fn default_inventory_enabled() -> bool { true }
-fn default_honeytoken_detection_enabled() -> bool { true }
-fn default_honeytoken_response() -> String { "alert".into() }
-fn default_honeytoken_deception_escalation() -> bool { false }
-fn default_auto_response_enabled() -> bool { false }
-fn default_auto_response_action() -> String { "alert".into() }
-fn default_auto_response_min_severity() -> String { "critical".into() }
-fn default_auto_response_min_confidence() -> u8 { 90 }
-fn default_memory_scan_enabled() -> bool { true }
-fn default_memory_scan_interval_secs() -> u64 { 120 }
-fn default_rtr_enabled() -> bool { false }
-fn default_rtr_max_artifact_bytes() -> u64 { 32_768 }
+fn default_command_poll_interval() -> u64 {
+    10
+}
+fn default_inventory_enabled() -> bool {
+    true
+}
+fn default_honeytoken_detection_enabled() -> bool {
+    true
+}
+fn default_honeytoken_response() -> String {
+    "alert".into()
+}
+fn default_honeytoken_deception_escalation() -> bool {
+    false
+}
+fn default_auto_response_enabled() -> bool {
+    false
+}
+fn default_auto_response_action() -> String {
+    "alert".into()
+}
+fn default_auto_response_min_severity() -> String {
+    "critical".into()
+}
+fn default_auto_response_min_confidence() -> u8 {
+    90
+}
+fn default_memory_scan_enabled() -> bool {
+    true
+}
+fn default_memory_scan_interval_secs() -> u64 {
+    120
+}
+fn default_rtr_enabled() -> bool {
+    false
+}
+fn default_rtr_max_artifact_bytes() -> u64 {
+    32_768
+}
+fn default_sigma_enabled() -> bool {
+    true
+}
+fn default_anomaly_enabled() -> bool {
+    true
+}
+fn default_vuln_scan_enabled() -> bool {
+    true
+}
+fn default_cis_enabled() -> bool {
+    true
+}
+fn default_siem_format() -> String {
+    "cef".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default = "default_poll_interval")]
-    pub poll_interval_secs:   u64,
+    pub poll_interval_secs: u64,
     #[serde(default = "default_enabled_collectors")]
-    pub enabled_collectors:   Vec<String>,
+    pub enabled_collectors: Vec<String>,
     #[serde(default = "default_fs_watch_paths")]
-    pub fs_watch_paths:       Vec<String>,
+    pub fs_watch_paths: Vec<String>,
 
     // ── Prevention (active response) ────────────────────────────────────────────────────────────────────
     /// Master switch for the prevention subsystem.  When `false` the engine
     /// never spawns and the agent behaves as pure telemetry.
     #[serde(default = "default_prevention_enabled")]
-    pub prevention_enabled:   bool,
+    pub prevention_enabled: bool,
     /// Interval between calls to `GET /api/v1/agents/{id}/commands`.
     #[serde(default = "default_command_poll_interval")]
     pub command_poll_interval_secs: u64,
@@ -165,6 +214,65 @@ pub struct AgentConfig {
     /// single audit event within the backend's per-event size cap.
     #[serde(default = "default_rtr_max_artifact_bytes")]
     pub rtr_max_artifact_bytes: u64,
+
+    // ── Sigma detection rules ───────────────────────────────────────────────
+    /// Master switch for the local Sigma detection engine. Default on; the
+    /// engine is a no-op until rules are provided (disk `<config>/sigma/` or
+    /// the inline `sigma_rules` below).
+    #[serde(default = "default_sigma_enabled")]
+    pub sigma_enabled: bool,
+    /// Inline Sigma rule documents (YAML), delivered over the signed config
+    /// channel. Merged with the on-disk `<config>/sigma/` baseline and
+    /// recompiled whenever a new config is applied — the backend can ship
+    /// detections without an agent restart. Bad rules are skipped, not fatal.
+    #[serde(default)]
+    pub sigma_rules: Vec<String>,
+
+    // ── Behavioural anomaly baseline ────────────────────────────────────────
+    /// Master switch for the statistical anomaly baseline (per-process/user
+    /// rolling profiles + z-score scoring). Default on; learns silently and
+    /// only scores once a baseline has formed.
+    #[serde(default = "default_anomaly_enabled")]
+    pub anomaly_detection_enabled: bool,
+
+    // ── Vulnerability & compliance ──────────────────────────────────────────
+    /// Correlate the installed-package inventory against the local CVE feed
+    /// (`<config>/cve_feed.json`) and emit an SBOM (CycloneDX) in the inventory
+    /// snapshot. Default on.
+    #[serde(default = "default_vuln_scan_enabled")]
+    pub vuln_scan_enabled: bool,
+    /// Run the built-in CIS-style host-hardening checks in the inventory
+    /// snapshot. Default on.
+    #[serde(default = "default_cis_enabled")]
+    pub cis_benchmark_enabled: bool,
+
+    // ── SIEM forwarding ─────────────────────────────────────────────────────
+    /// Master switch for forwarding every event to external SIEM
+    /// infrastructure (in parallel with native backend ingest). Default off.
+    #[serde(default)]
+    pub siem_enabled: bool,
+    /// Wire format: `cef` (ArcSight), `leef` (QRadar) or `json`. Default `cef`.
+    #[serde(default = "default_siem_format")]
+    pub siem_format: String,
+    /// Syslog destination: `unix:///dev/log`, `/dev/log` or `udp://host:514`.
+    /// Empty disables the syslog sink.
+    #[serde(default)]
+    pub siem_syslog_address: String,
+    /// Splunk HEC collector URL (e.g. `https://splunk:8088/services/collector`).
+    /// Empty disables the HEC sink.
+    #[serde(default)]
+    pub siem_hec_url: String,
+    /// Splunk HEC authentication token. Empty disables the HEC sink.
+    #[serde(default)]
+    pub siem_hec_token: String,
+
+    // ── Vulnerability feed ──────────────────────────────────────────────────
+    /// CVE feed entries delivered over the signed config channel, merged with
+    /// the on-disk `<config>/cve_feed.json` for the inventory CVE correlation.
+    /// Lets the backend (e.g. the `cve-sync` service) drive the feed without
+    /// writing to the host filesystem.
+    #[serde(default)]
+    pub cve_feed: Vec<crate::inventory::compliance::CveEntry>,
 }
 
 impl Default for AgentConfig {
@@ -172,14 +280,14 @@ impl Default for AgentConfig {
         Self {
             poll_interval_secs: default_poll_interval(),
             enabled_collectors: default_enabled_collectors(),
-            fs_watch_paths:     default_fs_watch_paths(),
+            fs_watch_paths: default_fs_watch_paths(),
             prevention_enabled: default_prevention_enabled(),
             command_poll_interval_secs: default_command_poll_interval(),
-            isolation_allowlist_ips:    Vec::new(),
-            fim_enabled:        default_fim_enabled(),
-            fim_paths:          default_fim_paths(),
-            fim_interval_secs:  default_fim_interval(),
-            inventory_enabled:  default_inventory_enabled(),
+            isolation_allowlist_ips: Vec::new(),
+            fim_enabled: default_fim_enabled(),
+            fim_paths: default_fim_paths(),
+            fim_interval_secs: default_fim_interval(),
+            inventory_enabled: default_inventory_enabled(),
             honeytoken_detection_enabled: default_honeytoken_detection_enabled(),
             honeytoken_response: default_honeytoken_response(),
             honeytoken_accessor_allowlist: Vec::new(),
@@ -193,6 +301,17 @@ impl Default for AgentConfig {
             memory_scan_interval_secs: default_memory_scan_interval_secs(),
             rtr_enabled: default_rtr_enabled(),
             rtr_max_artifact_bytes: default_rtr_max_artifact_bytes(),
+            sigma_enabled: default_sigma_enabled(),
+            sigma_rules: Vec::new(),
+            anomaly_detection_enabled: default_anomaly_enabled(),
+            vuln_scan_enabled: default_vuln_scan_enabled(),
+            cis_benchmark_enabled: default_cis_enabled(),
+            siem_enabled: false,
+            siem_format: default_siem_format(),
+            siem_syslog_address: String::new(),
+            siem_hec_url: String::new(),
+            siem_hec_token: String::new(),
+            cve_feed: Vec::new(),
         }
     }
 }
@@ -234,8 +353,8 @@ pub struct ConfigEnvelope {
 /// Verifies `SignedConfig` envelopes against the pinned command-signing key and
 /// enforces a strictly increasing `issued_at` high-water mark.
 pub struct ConfigVerifier {
-    key:       VerifyingKey,
-    agent_id:  String,
+    key: VerifyingKey,
+    agent_id: String,
     watermark: IssuedAtStore,
 }
 
@@ -250,7 +369,11 @@ impl ConfigVerifier {
         let key = load_verifying_key(pubkey_path)?;
         let watermark = IssuedAtStore::load(watermark_path);
         info!(path = %pubkey_path.display(), "Signed-config verifier loaded");
-        Ok(Self { key, agent_id, watermark })
+        Ok(Self {
+            key,
+            agent_id,
+            watermark,
+        })
     }
 
     /// Verify a signed config end-to-end. Returns the inner `AgentConfig` only
@@ -309,7 +432,10 @@ impl IssuedAtStore {
             .ok()
             .and_then(|b| serde_json::from_slice::<IssuedAtRecord>(&b).ok())
             .map(|r| r.issued_at);
-        Self { path: path.to_path_buf(), last }
+        Self {
+            path: path.to_path_buf(),
+            last,
+        }
     }
 
     fn last(&self) -> Option<DateTime<Utc>> {
@@ -374,21 +500,27 @@ fn persist_config(cfg: &AgentConfig) {
     }
 }
 
+/// Callback invoked with the freshly-adopted config after every successful
+/// apply. Used to recompile config-delivered artifacts (e.g. Sigma rules) the
+/// moment a signed config is verified, without coupling the puller to them.
+type ApplyHook = Arc<dyn Fn(&AgentConfig) + Send + Sync>;
+
 pub struct ConfigPuller {
-    config:     Arc<RwLock<AgentConfig>>,
-    client:     reqwest::Client,
+    config: Arc<RwLock<AgentConfig>>,
+    client: reqwest::Client,
     config_url: String,
-    token:      String,
-    etag:       Option<String>,
-    verifier:   Option<ConfigVerifier>,
+    token: String,
+    etag: Option<String>,
+    verifier: Option<ConfigVerifier>,
+    on_apply: Option<ApplyHook>,
 }
 
 impl ConfigPuller {
     pub fn new(
-        config:      Arc<RwLock<AgentConfig>>,
+        config: Arc<RwLock<AgentConfig>>,
         backend_url: &str,
-        agent_id:    &str,
-        token:       String,
+        agent_id: &str,
+        token: String,
     ) -> Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
         // Config updates must be signed with the pinned command-signing key. If
@@ -413,12 +545,19 @@ impl ConfigPuller {
             config,
             // Fail-closed TLS-pinned control client (#47, H-B): refuses to build
             // without a provisioned `<config>/ca.crt`.
-            client:     crate::http::control_client()?,
+            client: crate::http::control_client()?,
             config_url: format!("{base}/api/v1/agents/{agent_id}/config"),
             token,
-            etag:       None,
+            etag: None,
             verifier,
+            on_apply: None,
         })
+    }
+
+    /// Register a hook run with the new config after every successful apply.
+    pub fn with_apply_hook(mut self, hook: ApplyHook) -> Self {
+        self.on_apply = Some(hook);
+        self
     }
 
     pub async fn run(mut self) {
@@ -430,18 +569,18 @@ impl ConfigPuller {
     }
 
     async fn pull(&mut self) {
-        let mut req = self
-            .client
-            .get(&self.config_url)
-            .bearer_auth(&self.token);
+        let mut req = self.client.get(&self.config_url).bearer_auth(&self.token);
 
         if let Some(etag) = &self.etag {
             req = req.header("If-None-Match", etag.as_str());
         }
 
         let resp = match req.send().await {
-            Ok(r)  => r,
-            Err(e) => { warn!("Config pull failed: {e}"); return; }
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Config pull failed: {e}");
+                return;
+            }
         };
 
         match resp.status().as_u16() {
@@ -458,8 +597,11 @@ impl ConfigPuller {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 let body = match resp.bytes().await {
-                    Ok(b)  => b,
-                    Err(e) => { warn!("Failed to read config response body: {e}"); return; }
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("Failed to read config response body: {e}");
+                        return;
+                    }
                 };
                 if self.apply_body(&body) {
                     self.etag = new_etag;
@@ -484,8 +626,11 @@ impl ConfigPuller {
             }
         };
         let signed: SignedConfig = match serde_json::from_slice(body) {
-            Ok(s)  => s,
-            Err(e) => { warn!("Failed to parse signed config response: {e}"); return false; }
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to parse signed config response: {e}");
+                return false;
+            }
         };
         match verifier.verify(&signed) {
             Ok(new_cfg) => match self.config.write() {
@@ -493,10 +638,16 @@ impl ConfigPuller {
                     *cfg = new_cfg.clone();
                     drop(cfg);
                     persist_config(&new_cfg);
+                    if let Some(hook) = &self.on_apply {
+                        hook(&new_cfg);
+                    }
                     info!("Agent config updated from backend (signature + issued_at verified)");
                     true
                 }
-                Err(e) => { warn!("Config RwLock poisoned: {e}"); false }
+                Err(e) => {
+                    warn!("Config RwLock poisoned: {e}");
+                    false
+                }
             },
             Err(why) => {
                 warn!("Rejected backend config: {why} — keeping last-known-good");
@@ -537,8 +688,12 @@ mod signed_config_tests {
             config: AgentConfig::default(),
         };
         let canonical = serde_json::to_vec(&envelope).unwrap();
-        let signature = base64::engine::general_purpose::STANDARD.encode(key.sign(&canonical).to_bytes());
-        SignedConfig { envelope, signature }
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(key.sign(&canonical).to_bytes());
+        SignedConfig {
+            envelope,
+            signature,
+        }
     }
 
     fn verifier(key: &SigningKey, agent_id: &str) -> (ConfigVerifier, PathBuf, PathBuf) {
@@ -581,7 +736,10 @@ mod signed_config_tests {
         let attacker = SigningKey::from_bytes(&[9u8; 32]);
         let (mut v, p, w) = verifier(&key, "agent-1");
         let signed = make_signed(&attacker, "agent-1", Utc::now());
-        assert!(v.verify(&signed).is_err(), "config signed by wrong key accepted");
+        assert!(
+            v.verify(&signed).is_err(),
+            "config signed by wrong key accepted"
+        );
         cleanup(p, w);
     }
 
@@ -590,7 +748,10 @@ mod signed_config_tests {
         let key = signing_key();
         let (mut v, p, w) = verifier(&key, "agent-1");
         let signed = make_signed(&key, "another-agent", Utc::now());
-        assert!(v.verify(&signed).is_err(), "config for another agent accepted");
+        assert!(
+            v.verify(&signed).is_err(),
+            "config for another agent accepted"
+        );
         cleanup(p, w);
     }
 
@@ -600,7 +761,10 @@ mod signed_config_tests {
         let (mut v, p, w) = verifier(&key, "agent-1");
         // Beyond the 5-minute clock-skew tolerance → rejected.
         let signed = make_signed(&key, "agent-1", Utc::now() + chrono::Duration::minutes(10));
-        assert!(v.verify(&signed).is_err(), "config issued far in the future accepted");
+        assert!(
+            v.verify(&signed).is_err(),
+            "config issued far in the future accepted"
+        );
         cleanup(p, w);
     }
 
@@ -611,11 +775,23 @@ mod signed_config_tests {
         let t1 = Utc::now();
         assert!(v.verify(&make_signed(&key, "agent-1", t1)).is_ok());
         // Older issue time -> rollback, rejected.
-        assert!(v.verify(&make_signed(&key, "agent-1", t1 - chrono::Duration::seconds(60))).is_err());
+        assert!(v
+            .verify(&make_signed(
+                &key,
+                "agent-1",
+                t1 - chrono::Duration::seconds(60)
+            ))
+            .is_err());
         // Same issue time -> replay, rejected.
         assert!(v.verify(&make_signed(&key, "agent-1", t1)).is_err());
         // Strictly newer -> accepted.
-        assert!(v.verify(&make_signed(&key, "agent-1", t1 + chrono::Duration::seconds(1))).is_ok());
+        assert!(v
+            .verify(&make_signed(
+                &key,
+                "agent-1",
+                t1 + chrono::Duration::seconds(1)
+            ))
+            .is_ok());
         cleanup(p, w);
     }
 
@@ -629,8 +805,9 @@ mod signed_config_tests {
     // here means the backend's `canonicalConfig` field order/contents drifted
     // from the Rust `AgentConfig` re-serialisation — the exact bug to catch.
     const XLANG_PUB_HEX: &str = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
-    const XLANG_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768}}"#;
-    const XLANG_SIG: &str = "Jpxbj4CJOr0lggAdW8eprocKJtYBd7+B9IP2K9FBFapaojsWryehd/hMgki+jjHdCH/WD4aV1qK53cfg7bQlCA==";
+    const XLANG_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768,"sigma_enabled":true,"sigma_rules":[],"anomaly_detection_enabled":true,"vuln_scan_enabled":true,"cis_benchmark_enabled":true,"siem_enabled":false,"siem_format":"cef","siem_syslog_address":"","siem_hec_url":"","siem_hec_token":"","cve_feed":[]}}"#;
+    const XLANG_SIG: &str =
+        "clI4e2yqhhEHlm7znPKIQPfFRY4AQoPVkrvnk0zTPkYXJ1Rq4qInLzFNeZhZ7UUW8AH9XfzpuLvhb1toeShVCw==";
 
     #[test]
     fn accepts_ts_signed_default_config() {
@@ -638,9 +815,10 @@ mod signed_config_tests {
         let wm_path = tmp("xlang_issued.json");
         std::fs::write(&pub_path, hex::decode(XLANG_PUB_HEX).unwrap()).unwrap();
         let mut v = ConfigVerifier::new(&pub_path, "agent-test".into(), &wm_path).unwrap();
-        let signed: SignedConfig =
-            serde_json::from_str(&format!(r#"{{"envelope":{XLANG_ENV},"signature":"{XLANG_SIG}"}}"#))
-                .unwrap();
+        let signed: SignedConfig = serde_json::from_str(&format!(
+            r#"{{"envelope":{XLANG_ENV},"signature":"{XLANG_SIG}"}}"#
+        ))
+        .unwrap();
         match v.verify(&signed) {
             Ok(cfg) => {
                 // Spot-check a few fields, incl. ones not stored in the DB and
@@ -669,8 +847,17 @@ mod signed_config_tests {
         // A fresh verifier must load the persisted high-water mark and still
         // refuse a replay of the same issue time.
         let mut v2 = ConfigVerifier::new(&pub_path, "agent-1".into(), &wm_path).unwrap();
-        assert!(v2.verify(&make_signed(&key, "agent-1", t1)).is_err(), "watermark not persisted");
-        assert!(v2.verify(&make_signed(&key, "agent-1", t1 + chrono::Duration::seconds(1))).is_ok());
+        assert!(
+            v2.verify(&make_signed(&key, "agent-1", t1)).is_err(),
+            "watermark not persisted"
+        );
+        assert!(v2
+            .verify(&make_signed(
+                &key,
+                "agent-1",
+                t1 + chrono::Duration::seconds(1)
+            ))
+            .is_ok());
         cleanup(pub_path, wm_path);
     }
 }

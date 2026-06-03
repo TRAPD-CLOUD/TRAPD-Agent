@@ -57,13 +57,16 @@ struct EnrollResponse {
 
 // ── Backoff tuning ──────────────────────────────────────────────────────────
 const BACKOFF_BASE: Duration = Duration::from_secs(2);
-const BACKOFF_MAX:  Duration = Duration::from_secs(60);
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Outcome of a single enrollment attempt, used to drive the retry loop.
 enum AttemptError {
     /// Worth retrying (network/timeout/5xx/429/parse).  Carries an optional
     /// server-suggested delay (from `Retry-After`).
-    Transient { reason: String, retry_after: Option<Duration> },
+    Transient {
+        reason: String,
+        retry_after: Option<Duration>,
+    },
     /// Not worth retrying (bad token, malformed request, etc.).
     Permanent(String),
 }
@@ -135,7 +138,10 @@ pub async fn load_or_enroll(
                 error!("Enrollment rejected (will not retry): {msg}");
                 anyhow::bail!("Enrollment failed permanently: {msg}");
             }
-            Err(AttemptError::Transient { reason, retry_after }) => {
+            Err(AttemptError::Transient {
+                reason,
+                retry_after,
+            }) => {
                 if let Some(max) = max_attempts {
                     if attempt >= max {
                         anyhow::bail!(
@@ -226,7 +232,9 @@ async fn try_enroll(
             retry_after,
         })
     } else {
-        Err(AttemptError::Permanent(format!("HTTP {status} — {snippet}")))
+        Err(AttemptError::Permanent(format!(
+            "HTTP {status} — {snippet}"
+        )))
     }
 }
 
@@ -277,8 +285,7 @@ fn max_attempts_from_env() -> Option<u32> {
 
 /// Capped exponential backoff with CSPRNG jitter.
 fn backoff(attempt: u32) -> Duration {
-    let exp = BACKOFF_BASE
-        .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1).min(16)));
+    let exp = BACKOFF_BASE.saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1).min(16)));
     let capped = exp.min(BACKOFF_MAX);
     // Add up to ~1s of jitter so a fleet of agents restarting together (e.g.
     // after a power event) does not clump into the same sub-second retry

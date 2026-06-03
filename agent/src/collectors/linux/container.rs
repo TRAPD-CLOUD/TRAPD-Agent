@@ -104,7 +104,11 @@ pub fn parse_docker_config(json: &str) -> ContainerImage {
         })
         .unwrap_or_default();
 
-    ContainerImage { image, image_digest, labels }
+    ContainerImage {
+        image,
+        image_digest,
+        labels,
+    }
 }
 
 /// Parse the relevant fields out of an OCI runtime `config.json` (containerd /
@@ -131,7 +135,11 @@ pub fn parse_oci_config(json: &str) -> ContainerImage {
         .or_else(|| labels.get("io.kubernetes.image.name"))
         .cloned();
 
-    ContainerImage { image, image_digest: None, labels }
+    ContainerImage {
+        image,
+        image_digest: None,
+        labels,
+    }
 }
 
 /// Extract the Kubernetes pod name / namespace / uid from container labels, if
@@ -165,12 +173,18 @@ mod tests {
         }"#;
         let info = parse_docker_config(json);
         assert_eq!(info.image.as_deref(), Some("registry.io/nginx:1.25"));
-        assert_eq!(info.image_digest.as_deref(), Some("sha256:abc123def4567890"));
+        assert_eq!(
+            info.image_digest.as_deref(),
+            Some("sha256:abc123def4567890")
+        );
         let (name, ns, uid) = k8s_labels(&info.labels);
         assert_eq!(name.as_deref(), Some("web-7d9"));
         assert_eq!(ns.as_deref(), Some("prod"));
         assert_eq!(uid.as_deref(), Some("1234-5678"));
-        assert_eq!(info.labels.get("maintainer").map(String::as_str), Some("team"));
+        assert_eq!(
+            info.labels.get("maintainer").map(String::as_str),
+            Some("team")
+        );
     }
 
     #[test]

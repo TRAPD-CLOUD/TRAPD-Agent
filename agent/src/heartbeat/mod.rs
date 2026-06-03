@@ -22,56 +22,56 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Serialize)]
 struct HeartbeatPayload {
-    agent_id:  String,
-    hostname:  String,
+    agent_id: String,
+    hostname: String,
     agent_version: String,
     timestamp: chrono::DateTime<Utc>,
-    metrics:   Metrics,
+    metrics: Metrics,
 }
 
 /// Live host resource utilisation sampled at beat time.
 #[derive(Serialize, Default)]
 struct Metrics {
-    cpu_usage_pct:    f32,
+    cpu_usage_pct: f32,
     cpu_logical_cores: usize,
-    memory_total_mb:  u64,
-    memory_used_mb:   u64,
-    memory_used_pct:  f32,
-    swap_total_mb:    u64,
-    swap_used_mb:     u64,
-    disk_total_mb:    u64,
-    disk_used_mb:     u64,
-    disk_used_pct:    f32,
-    load_avg:         [f64; 3],
-    uptime_secs:      u64,
-    process_count:    usize,
+    memory_total_mb: u64,
+    memory_used_mb: u64,
+    memory_used_pct: f32,
+    swap_total_mb: u64,
+    swap_used_mb: u64,
+    disk_total_mb: u64,
+    disk_used_mb: u64,
+    disk_used_pct: f32,
+    load_avg: [f64; 3],
+    uptime_secs: u64,
+    process_count: usize,
 }
 
 pub struct Heartbeat {
-    client:        reqwest::Client,
+    client: reqwest::Client,
     heartbeat_url: String,
-    token:         String,
-    agent_id:      String,
-    hostname:      String,
+    token: String,
+    agent_id: String,
+    hostname: String,
     /// `System` is reused across beats so CPU deltas are meaningful.
-    sys:           Mutex<System>,
+    sys: Mutex<System>,
 }
 
 impl Heartbeat {
     pub fn new(
         backend_url: &str,
-        agent_id:    String,
-        token:       String,
-        hostname:    String,
+        agent_id: String,
+        token: String,
+        hostname: String,
     ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
         Ok(Self {
-            client:        crate::http::control_client()?,
+            client: crate::http::control_client()?,
             heartbeat_url: format!("{base}/api/v1/agents/{agent_id}/heartbeat"),
             token,
             agent_id,
             hostname,
-            sys:           Mutex::new(System::new()),
+            sys: Mutex::new(System::new()),
         })
     }
 
@@ -86,8 +86,8 @@ impl Heartbeat {
     async fn send(&self) {
         let metrics = self.sample_metrics();
         let payload = HeartbeatPayload {
-            agent_id:  self.agent_id.clone(),
-            hostname:  self.hostname.clone(),
+            agent_id: self.agent_id.clone(),
+            hostname: self.hostname.clone(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             timestamp: Utc::now(),
             metrics,

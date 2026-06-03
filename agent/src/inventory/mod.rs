@@ -19,6 +19,7 @@
 //! only the gathering helpers in this module are Linux-specific.
 
 mod collect;
+pub mod compliance;
 
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -59,6 +60,9 @@ pub struct InventorySnapshot {
     /// from the observed context above. The backend turns these into believable
     /// content and ranks them before issuing `deploy_honeytoken` commands.
     pub recon_profile: crate::deception::ReconProfile,
+    /// Vulnerability & compliance assessment: CycloneDX SBOM, CVE correlation
+    /// against the local feed, and CIS-style host-hardening checks.
+    pub compliance: compliance::ComplianceReport,
 }
 
 /// Host attack-surface baseline. Every field is a point-in-time inventory the
@@ -123,12 +127,12 @@ pub struct KernelModule {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OsInfo {
-    pub family: String,           // "linux"
-    pub name: String,             // "Ubuntu"
-    pub version: String,          // "24.04.3 LTS"
-    pub pretty_name: String,      // "Ubuntu 24.04.3 LTS"
-    pub kernel: String,           // "6.6.87.2-microsoft-standard-WSL2"
-    pub arch: String,             // "x86_64"
+    pub family: String,      // "linux"
+    pub name: String,        // "Ubuntu"
+    pub version: String,     // "24.04.3 LTS"
+    pub pretty_name: String, // "Ubuntu 24.04.3 LTS"
+    pub kernel: String,      // "6.6.87.2-microsoft-standard-WSL2"
+    pub arch: String,        // "x86_64"
     pub machine_id: Option<String>,
     pub timezone: Option<String>,
     pub boot_time_unix: u64,
@@ -142,7 +146,7 @@ pub struct HardwareInfo {
     pub serial: Option<String>,
     pub bios_vendor: Option<String>,
     pub bios_version: Option<String>,
-    pub chassis: Option<String>,    // "vm" / "laptop" / "desktop" / "server"
+    pub chassis: Option<String>, // "vm" / "laptop" / "desktop" / "server"
     pub virtualization: Option<String>, // "wsl" / "kvm" / "none" …
     pub cpu_model: String,
     pub cpu_physical_cores: usize,
@@ -266,8 +270,21 @@ impl InventoryReporter {
         let agent_id = self.agent_id.clone();
         let device_id = self.device_id.clone();
         let hostname = self.hostname.clone();
+        let (flags, cve_feed) = self
+            .config
+            .read()
+            .map(|c| {
+                (
+                    compliance::ComplianceFlags {
+                        vuln_scan: c.vuln_scan_enabled,
+                        cis: c.cis_benchmark_enabled,
+                    },
+                    c.cve_feed.clone(),
+                )
+            })
+            .unwrap_or_default();
         let snapshot = match tokio::task::spawn_blocking(move || {
-            collect::gather(agent_id, device_id, hostname)
+            collect::gather_with_flags(agent_id, device_id, hostname, flags, &cve_feed)
         })
         .await
         {
@@ -293,7 +310,10 @@ impl InventoryReporter {
     }
 
     fn inventory_enabled(&self) -> bool {
-        self.config.read().map(|c| c.inventory_enabled).unwrap_or(true)
+        self.config
+            .read()
+            .map(|c| c.inventory_enabled)
+            .unwrap_or(true)
     }
 
     async fn post(&self, snapshot: &InventorySnapshot) {
@@ -308,7 +328,10 @@ impl InventoryReporter {
             Ok(resp) if resp.status().is_success() => {
                 info!("inventory: snapshot sent to backend");
             }
-            Ok(resp) => warn!("inventory: backend rejected snapshot: HTTP {}", resp.status()),
+            Ok(resp) => warn!(
+                "inventory: backend rejected snapshot: HTTP {}",
+                resp.status()
+            ),
             Err(e) => warn!("inventory: send failed: {e}"),
         }
     }
@@ -317,7 +340,9 @@ impl InventoryReporter {
         let path = crate::paths::state_dir().join("inventory.json");
         match serde_json::to_vec_pretty(snapshot) {
             Ok(bytes) => match crate::paths::write_atomic(&path, &bytes, 0o600) {
-                Ok(()) => info!(path = %path.display(), "inventory: snapshot written locally (offline)"),
+                Ok(()) => {
+                    info!(path = %path.display(), "inventory: snapshot written locally (offline)")
+                }
                 Err(e) => warn!("inventory: local write failed: {e}"),
             },
             Err(e) => warn!("inventory: serialize failed: {e}"),

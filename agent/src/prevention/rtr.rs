@@ -95,7 +95,9 @@ mod tests {
         assert_eq!(a.total_len, 12);
         assert_eq!(a.returned_len, 4);
         assert!(a.truncated);
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&a.b64).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&a.b64)
+            .unwrap();
         assert_eq!(decoded, b"AAAA");
     }
 
@@ -111,7 +113,10 @@ mod tests {
     fn shell_invocation_defaults_to_sh() {
         assert_eq!(shell_invocation(None), ("/bin/sh".to_string(), "-c"));
         assert_eq!(shell_invocation(Some("  ")), ("/bin/sh".to_string(), "-c"));
-        assert_eq!(shell_invocation(Some("/usr/bin/python3")), ("/usr/bin/python3".to_string(), "-c"));
+        assert_eq!(
+            shell_invocation(Some("/usr/bin/python3")),
+            ("/usr/bin/python3".to_string(), "-c")
+        );
     }
 
     #[test]

@@ -35,7 +35,11 @@ pub struct BaitError {
 
 impl fmt::Display for BaitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid '{}' honeytoken content: {}", self.kind, self.reason)
+        write!(
+            f,
+            "invalid '{}' honeytoken content: {}",
+            self.kind, self.reason
+        )
     }
 }
 
@@ -145,7 +149,11 @@ pub fn validate_out_of_band(oob: &OutOfBandCanary) -> Result<(), BaitError> {
         kind,
         &format!("unknown canary channel '{}'", oob.channel),
     )?;
-    require(!oob.tracking_id.trim().is_empty(), kind, "empty tracking_id")?;
+    require(
+        !oob.tracking_id.trim().is_empty(),
+        kind,
+        "empty tracking_id",
+    )?;
     reject_shared_watermark(kind, &oob.tracking_id)?;
     require(!oob.markers.is_empty(), kind, "no canary markers")?;
     for m in &oob.markers {
@@ -197,8 +205,16 @@ fn looks_like_host_or_url(s: &str) -> bool {
 /// `EXAMPLE` suffix is itself a fingerprint.
 fn validate_aws(c: &str) -> Result<(), BaitError> {
     let kind = "aws_credentials";
-    require(c.contains("aws_access_key_id"), kind, "missing aws_access_key_id")?;
-    require(c.contains("aws_secret_access_key"), kind, "missing aws_secret_access_key")?;
+    require(
+        c.contains("aws_access_key_id"),
+        kind,
+        "missing aws_access_key_id",
+    )?;
+    require(
+        c.contains("aws_secret_access_key"),
+        kind,
+        "missing aws_secret_access_key",
+    )?;
     require(
         has_access_key_id(c),
         kind,
@@ -210,7 +226,10 @@ fn validate_aws(c: &str) -> Result<(), BaitError> {
         "aws_secret_access_key is not a 40-char secret",
     )?;
     if c.to_ascii_uppercase().contains("EXAMPLE") {
-        return Err(err(kind, "contains the 'EXAMPLE' placeholder (documentation tell)"));
+        return Err(err(
+            kind,
+            "contains the 'EXAMPLE' placeholder (documentation tell)",
+        ));
     }
     Ok(())
 }
@@ -243,7 +262,11 @@ fn validate_jwt(c: &str) -> Result<(), BaitError> {
 fn validate_kubeconfig(c: &str) -> Result<(), BaitError> {
     let kind = "kube_config";
     for needle in ["apiVersion", "clusters", "contexts", "users"] {
-        require(c.contains(needle), kind, &format!("missing '{needle}:' section"))?;
+        require(
+            c.contains(needle),
+            kind,
+            &format!("missing '{needle}:' section"),
+        )?;
     }
     require(
         c.contains("kind: Config") || c.contains("kind:Config"),
@@ -256,10 +279,13 @@ fn validate_kubeconfig(c: &str) -> Result<(), BaitError> {
 /// `.pgpass`: at least one `host:port:db:user:password` line (5 colon fields).
 fn validate_pgpass(c: &str) -> Result<(), BaitError> {
     let kind = "pgpass";
-    let ok = c.lines().filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty()).any(|l| {
-        // Fields may contain '\:' escapes; count unescaped colons.
-        unescaped_colon_fields(l) == 5
-    });
+    let ok = c
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .any(|l| {
+            // Fields may contain '\:' escapes; count unescaped colons.
+            unescaped_colon_fields(l) == 5
+        });
     require(ok, kind, "no host:port:db:user:password line")
 }
 
@@ -275,7 +301,11 @@ fn validate_my_cnf(c: &str) -> Result<(), BaitError> {
 /// SSH private key: a PEM envelope.
 fn validate_ssh_key(c: &str) -> Result<(), BaitError> {
     let kind = "ssh_private_key";
-    require(c.contains("-----BEGIN") && c.contains("PRIVATE KEY-----"), kind, "no PEM BEGIN PRIVATE KEY header")?;
+    require(
+        c.contains("-----BEGIN") && c.contains("PRIVATE KEY-----"),
+        kind,
+        "no PEM BEGIN PRIVATE KEY header",
+    )?;
     require(c.contains("-----END"), kind, "no PEM END footer")
 }
 
@@ -283,13 +313,25 @@ fn validate_ssh_key(c: &str) -> Result<(), BaitError> {
 fn validate_docker_config(c: &str) -> Result<(), BaitError> {
     let kind = "docker_config";
     let v: serde_json::Value = serde_json::from_str(c).map_err(|_| err(kind, "not valid JSON"))?;
-    require(v.get("auths").map(|a| a.is_object()).unwrap_or(false), kind, "no 'auths' object")
+    require(
+        v.get("auths").map(|a| a.is_object()).unwrap_or(false),
+        kind,
+        "no 'auths' object",
+    )
 }
 
 /// Webroot `.env`: at least one secret-bearing `KEY=value` assignment.
 fn validate_env(c: &str) -> Result<(), BaitError> {
     let kind = "webroot_env";
-    let secrety = ["PASSWORD", "SECRET", "KEY", "TOKEN", "DSN", "DATABASE_URL", "PASSWD"];
+    let secrety = [
+        "PASSWORD",
+        "SECRET",
+        "KEY",
+        "TOKEN",
+        "DSN",
+        "DATABASE_URL",
+        "PASSWD",
+    ];
     let ok = c.lines().filter_map(|l| l.split_once('=')).any(|(k, v)| {
         let ku = k.trim().to_ascii_uppercase();
         !v.trim().is_empty() && secrety.iter().any(|s| ku.contains(s))
@@ -305,7 +347,10 @@ fn validate_git_credentials(c: &str) -> Result<(), BaitError> {
         if let Some((scheme, rest)) = l.split_once("://") {
             !scheme.is_empty()
                 && rest.contains('@')
-                && rest.split('@').next().is_some_and(|userinfo| userinfo.contains(':'))
+                && rest
+                    .split('@')
+                    .next()
+                    .is_some_and(|userinfo| userinfo.contains(':'))
         } else {
             false
         }
@@ -340,18 +385,29 @@ fn validate_browser_logins(c: &str) -> Result<(), BaitError> {
 
 /// Office Open XML (docx/xlsx/pptx) is a ZIP — magic `PK\x03\x04`.
 fn validate_office(c: &[u8]) -> Result<(), BaitError> {
-    require(c.starts_with(b"PK\x03\x04"), "office_doc", "not a ZIP/OOXML container (PK header)")
+    require(
+        c.starts_with(b"PK\x03\x04"),
+        "office_doc",
+        "not a ZIP/OOXML container (PK header)",
+    )
 }
 
 /// PDF magic `%PDF-`.
 fn validate_pdf(c: &[u8]) -> Result<(), BaitError> {
-    require(c.starts_with(b"%PDF-"), "pdf_doc", "not a PDF (%PDF- header)")
+    require(
+        c.starts_with(b"%PDF-"),
+        "pdf_doc",
+        "not a PDF (%PDF- header)",
+    )
 }
 
 /// KeePass KDBX magic (`0x9AA2D903`).
 fn validate_kdbx(c: &[u8]) -> Result<(), BaitError> {
-    require(c.len() >= 4 && c[0] == 0x03 && c[1] == 0xD9 && c[2] == 0xA2 && c[3] == 0x9A,
-        "passwords_kdbx", "not a KDBX container (magic mismatch)")
+    require(
+        c.len() >= 4 && c[0] == 0x03 && c[1] == 0xD9 && c[2] == 0xA2 && c[3] == 0x9A,
+        "passwords_kdbx",
+        "not a KDBX container (magic mismatch)",
+    )
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -359,9 +415,20 @@ fn validate_kdbx(c: &[u8]) -> Result<(), BaitError> {
 fn is_text_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "aws_credentials" | "jwt" | "jwt_token" | "kube_config" | "pgpass" | "my_cnf"
-            | "ssh_private_key" | "docker_config" | "webroot_env" | "git_credentials"
-            | "shadow_backup" | "browser_logins" | "root_backup_keys" | "shell_history"
+        "aws_credentials"
+            | "jwt"
+            | "jwt_token"
+            | "kube_config"
+            | "pgpass"
+            | "my_cnf"
+            | "ssh_private_key"
+            | "docker_config"
+            | "webroot_env"
+            | "git_credentials"
+            | "shadow_backup"
+            | "browser_logins"
+            | "root_backup_keys"
+            | "shell_history"
     )
 }
 
@@ -371,11 +438,18 @@ fn finish(kind: &str, content: &[u8], structural: Result<(), BaitError>) -> Resu
 }
 
 fn require(cond: bool, kind: &str, reason: &str) -> Result<(), BaitError> {
-    if cond { Ok(()) } else { Err(err(kind, reason)) }
+    if cond {
+        Ok(())
+    } else {
+        Err(err(kind, reason))
+    }
 }
 
 fn err(kind: &str, reason: &str) -> BaitError {
-    BaitError { kind: kind.to_string(), reason: reason.to_string() }
+    BaitError {
+        kind: kind.to_string(),
+        reason: reason.to_string(),
+    }
 }
 
 /// Value to the right of `key=` or `key =` on the first matching line.
@@ -400,7 +474,9 @@ fn has_access_key_id(c: &str) -> bool {
             let end = start + pl + 16;
             if before_ok && end <= bytes.len() {
                 let body = &bytes[start + pl..end];
-                let body_ok = body.iter().all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit());
+                let body_ok = body
+                    .iter()
+                    .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit());
                 let after_ok = end == bytes.len() || !is_key_char(bytes[end]);
                 if body_ok && after_ok {
                     return true;
@@ -418,7 +494,9 @@ fn is_key_char(b: u8) -> bool {
 
 /// AWS secret access keys are 40 chars of base64 alphabet (`A-Za-z0-9/+`).
 fn is_aws_secret(v: &str) -> bool {
-    v.len() == 40 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'+')
+    v.len() == 40
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'+')
 }
 
 /// Count colon-separated fields, honouring `\:` escapes (as in `.pgpass`).
@@ -444,7 +522,11 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
         .ok()
-        .or_else(|| base64::engine::general_purpose::STANDARD_NO_PAD.decode(s).ok())
+        .or_else(|| {
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(s)
+                .ok()
+        })
 }
 
 #[cfg(test)]
@@ -458,7 +540,11 @@ mod tests {
         assert!(validate_bait("aws_credentials", good.as_bytes()).is_ok());
 
         // Truncated key id.
-        assert!(validate_bait("aws_credentials", b"[default]\naws_access_key_id=AKIA...\naws_secret_access_key=x\n").is_err());
+        assert!(validate_bait(
+            "aws_credentials",
+            b"[default]\naws_access_key_id=AKIA...\naws_secret_access_key=x\n"
+        )
+        .is_err());
         // The documentation placeholder must be rejected (it is a fingerprint).
         let example = "[default]\naws_access_key_id=AKIAIOSFODNN7EXAMPLE\n\
                        aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n";
@@ -475,7 +561,8 @@ mod tests {
 
     #[test]
     fn kubeconfig_needs_all_sections() {
-        let kc = "apiVersion: v1\nkind: Config\nclusters:\n- cluster: {}\ncontexts: []\nusers: []\n";
+        let kc =
+            "apiVersion: v1\nkind: Config\nclusters:\n- cluster: {}\ncontexts: []\nusers: []\n";
         assert!(validate_bait("kube_config", kc.as_bytes()).is_ok());
         assert!(validate_bait("kube_config", b"apiVersion: v1\nclusters: []\n").is_err());
     }
@@ -484,13 +571,21 @@ mod tests {
     fn pgpass_and_git_credentials_shape() {
         assert!(validate_bait("pgpass", b"db.internal:5432:appdb:appuser:s3cr3tpw\n").is_ok());
         assert!(validate_bait("pgpass", b"justonefield\n").is_err());
-        assert!(validate_bait("git_credentials", b"https://deploy:ghp_abc123@git.internal\n").is_ok());
+        assert!(validate_bait(
+            "git_credentials",
+            b"https://deploy:ghp_abc123@git.internal\n"
+        )
+        .is_ok());
         assert!(validate_bait("git_credentials", b"https://git.internal\n").is_err());
     }
 
     #[test]
     fn ssh_and_shadow_and_env() {
-        assert!(validate_bait("ssh_private_key", b"-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n").is_ok());
+        assert!(validate_bait(
+            "ssh_private_key",
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n"
+        )
+        .is_ok());
         assert!(validate_bait("shadow_backup", b"root:$6$abc$def:19000:0:99999:7:::\n").is_ok());
         assert!(validate_bait("webroot_env", b"DB_PASSWORD=hunter2\nAPP_ENV=prod\n").is_ok());
         assert!(validate_bait("webroot_env", b"APP_ENV=prod\n").is_err());
@@ -509,7 +604,11 @@ mod tests {
         let c = "[default]\naws_access_key_id=AKIA2E0AABCDEFGHIJKL\n\
                  aws_secret_access_key=wJalrXUtnFEMIabcdefGHIjklMNOpqrsTUVwxyz1\n# trapd honeytoken\n";
         let e = validate_bait("aws_credentials", c.as_bytes()).unwrap_err();
-        assert!(e.reason.contains("forbidden shared marker"), "got: {}", e.reason);
+        assert!(
+            e.reason.contains("forbidden shared marker"),
+            "got: {}",
+            e.reason
+        );
         // Free-form kind also guarded.
         assert!(validate_bait("root_backup_keys", b"this is a HONEYTOKEN").is_err());
     }
@@ -535,11 +634,18 @@ mod tests {
 
     #[test]
     fn out_of_band_accepts_well_formed_channels() {
-        assert!(validate_out_of_band(&oob("aws_cloudtrail", "trk-1", &["AKIA2E0AABCDEFGHIJKL"])).is_ok());
+        assert!(
+            validate_out_of_band(&oob("aws_cloudtrail", "trk-1", &["AKIA2E0AABCDEFGHIJKL"]))
+                .is_ok()
+        );
         assert!(validate_out_of_band(&oob("dns", "trk-2", &["a1b2.canary.example.net"])).is_ok());
-        assert!(validate_out_of_band(&oob("http", "trk-3", &["https://c.example.net/p.png"])).is_ok());
+        assert!(
+            validate_out_of_band(&oob("http", "trk-3", &["https://c.example.net/p.png"])).is_ok()
+        );
         // Free-form channels only need a non-empty, untainted marker.
-        assert!(validate_out_of_band(&oob("kube_api", "trk-4", &["https://10.0.0.1:6443"])).is_ok());
+        assert!(
+            validate_out_of_band(&oob("kube_api", "trk-4", &["https://10.0.0.1:6443"])).is_ok()
+        );
         assert!(validate_out_of_band(&oob("ssh_honeypot", "trk-5", &["SHA256:abcdef"])).is_ok());
     }
 

@@ -31,7 +31,12 @@ fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let enabled = !std::env::var("TRAPD_EXEC_HASH")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
             .unwrap_or(false);
         Mutex::new(Cache {
             enabled,
@@ -83,7 +88,9 @@ pub fn hash_executable(path: &str) -> Option<String> {
         if guard.entries.len() >= CACHE_CAP {
             guard.entries.clear();
         }
-        guard.entries.insert(path.to_string(), (mtime, hash.clone()));
+        guard
+            .entries
+            .insert(path.to_string(), (mtime, hash.clone()));
     }
     hash
 }

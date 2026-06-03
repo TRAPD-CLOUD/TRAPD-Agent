@@ -32,8 +32,7 @@ use super::policy::{Match, PolicyHandle, RuleAction};
 pub fn kill_pid(pid: i32) -> Result<()> {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
-    kill(Pid::from_raw(pid), Signal::SIGKILL)
-        .with_context(|| format!("SIGKILL pid={pid} failed"))
+    kill(Pid::from_raw(pid), Signal::SIGKILL).with_context(|| format!("SIGKILL pid={pid} failed"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -49,8 +48,7 @@ pub fn kill_pid(_pid: i32) -> Result<()> {
 pub fn freeze_pid(pid: i32) -> Result<()> {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
-    kill(Pid::from_raw(pid), Signal::SIGSTOP)
-        .with_context(|| format!("SIGSTOP pid={pid} failed"))
+    kill(Pid::from_raw(pid), Signal::SIGSTOP).with_context(|| format!("SIGSTOP pid={pid} failed"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -63,8 +61,7 @@ pub fn freeze_pid(_pid: i32) -> Result<()> {
 pub fn thaw_pid(pid: i32) -> Result<()> {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
-    kill(Pid::from_raw(pid), Signal::SIGCONT)
-        .with_context(|| format!("SIGCONT pid={pid} failed"))
+    kill(Pid::from_raw(pid), Signal::SIGCONT).with_context(|| format!("SIGCONT pid={pid} failed"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -81,7 +78,9 @@ fn hash_file(path: &Path) -> Option<String> {
     let mut buf = [0u8; 65536];
     loop {
         let n = f.read(&mut buf).ok()?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Some(hex::encode(hasher.finalize()))
@@ -89,7 +88,9 @@ fn hash_file(path: &Path) -> Option<String> {
 
 /// Look up the parent's comm by PPID.
 fn parent_comm(ppid: i32) -> Option<String> {
-    if ppid <= 0 { return None; }
+    if ppid <= 0 {
+        return None;
+    }
     let raw = std::fs::read_to_string(format!("/proc/{ppid}/comm")).ok()?;
     Some(raw.trim().to_string())
 }
@@ -97,9 +98,9 @@ fn parent_comm(ppid: i32) -> Option<String> {
 /// Enforce the current policy against a freshly-execed process.  Returns
 /// `Some(rule_id)` if the process was killed.
 pub fn enforce_exec(
-    exec:    &ExecEventData,
-    policy:  &PolicyHandle,
-    audit:   &AuditEmitter,
+    exec: &ExecEventData,
+    policy: &PolicyHandle,
+    audit: &AuditEmitter,
 ) -> Option<String> {
     let needs_hash = !policy.read().rules().is_empty();
     let sha = if needs_hash {
@@ -110,12 +111,10 @@ pub fn enforce_exec(
 
     let parent = parent_comm(exec.ppid);
 
-    let m: Option<Match> = policy.read().match_exec(
-        &exec.exe,
-        &exec.comm,
-        parent.as_deref(),
-        sha.as_deref(),
-    );
+    let m: Option<Match> =
+        policy
+            .read()
+            .match_exec(&exec.exe, &exec.comm, parent.as_deref(), sha.as_deref());
 
     let m = m?;
 
@@ -140,7 +139,11 @@ pub fn enforce_exec(
             }
             audit.emit(
                 crate::schema::EventAction::ProcessBlocked,
-                if killed { crate::schema::Severity::High } else { crate::schema::Severity::Medium },
+                if killed {
+                    crate::schema::Severity::High
+                } else {
+                    crate::schema::Severity::Medium
+                },
                 "process_block",
                 exec.pid.to_string(),
                 killed,

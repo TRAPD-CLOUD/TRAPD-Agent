@@ -83,8 +83,7 @@ pub struct Allowlist {
 
 impl Allowlist {
     pub fn new(agent_pid: u32, extra: &[String]) -> Self {
-        let mut comms: HashSet<String> =
-            DEFAULT_ALLOWLIST.iter().map(|s| s.to_string()).collect();
+        let mut comms: HashSet<String> = DEFAULT_ALLOWLIST.iter().map(|s| s.to_string()).collect();
         for c in extra {
             let c = c.trim();
             if !c.is_empty() {
@@ -177,15 +176,63 @@ impl AccessKind {
     pub fn describe(self) -> (&'static str, Severity, u8, &'static str, &'static str) {
         match self {
             // ── Content access / execution — unambiguous intrusion ───────────
-            Self::Openat => ("open", Severity::Critical, 100, "TA0006 Credential Access", "T1552.001"),
-            Self::Open => ("open_legacy", Severity::Critical, 100, "TA0006 Credential Access", "T1552.001"),
-            Self::Openat2 => ("openat2", Severity::Critical, 100, "TA0006 Credential Access", "T1552.001"),
-            Self::Unknown => ("unknown", Severity::Critical, 100, "TA0006 Credential Access", "T1552.001"),
-            Self::Mmap => ("mmap", Severity::Critical, 100, "TA0006 Credential Access", "T1552.001"),
-            Self::Exec => ("exec", Severity::Critical, 100, "TA0002 Execution", "T1204.002"),
+            Self::Openat => (
+                "open",
+                Severity::Critical,
+                100,
+                "TA0006 Credential Access",
+                "T1552.001",
+            ),
+            Self::Open => (
+                "open_legacy",
+                Severity::Critical,
+                100,
+                "TA0006 Credential Access",
+                "T1552.001",
+            ),
+            Self::Openat2 => (
+                "openat2",
+                Severity::Critical,
+                100,
+                "TA0006 Credential Access",
+                "T1552.001",
+            ),
+            Self::Unknown => (
+                "unknown",
+                Severity::Critical,
+                100,
+                "TA0006 Credential Access",
+                "T1552.001",
+            ),
+            Self::Mmap => (
+                "mmap",
+                Severity::Critical,
+                100,
+                "TA0006 Credential Access",
+                "T1552.001",
+            ),
+            Self::Exec => (
+                "exec",
+                Severity::Critical,
+                100,
+                "TA0002 Execution",
+                "T1204.002",
+            ),
             // ── Evasion / tamper — deliberate, high-confidence ───────────────
-            Self::Link => ("hardlink", Severity::Critical, 90, "TA0005 Defense Evasion", "T1564.001"),
-            Self::Unlink => ("unlink", Severity::Critical, 90, "TA0040 Impact", "T1070.004"),
+            Self::Link => (
+                "hardlink",
+                Severity::Critical,
+                90,
+                "TA0005 Defense Evasion",
+                "T1564.001",
+            ),
+            Self::Unlink => (
+                "unlink",
+                Severity::Critical,
+                90,
+                "TA0040 Impact",
+                "T1070.004",
+            ),
             Self::Rename => ("rename", Severity::High, 85, "TA0040 Impact", "T1070.004"),
             // ── Metadata recon — strong lead, scored below content access ────
             Self::Stat => ("stat", Severity::High, 75, "TA0007 Discovery", "T1083"),
@@ -194,7 +241,13 @@ impl AccessKind {
             // Directory listing is inherently noisier (a user's own `ls` trips
             // it), so it is scored as a soft lead — telemetry for the backend/ML
             // rather than a high-severity alert.
-            Self::Getdents => ("getdents", Severity::Medium, 50, "TA0007 Discovery", "T1083"),
+            Self::Getdents => (
+                "getdents",
+                Severity::Medium,
+                50,
+                "TA0007 Discovery",
+                "T1083",
+            ),
         }
     }
 }
@@ -265,7 +318,9 @@ fn build_ancestry(pid: i32, proc: &dyn ProcInfo) -> Vec<ProcessAncestor> {
     let mut out = Vec::new();
     let mut current = pid;
     for _ in 0..MAX_LINEAGE_DEPTH {
-        let Some(ppid) = proc.ppid(current) else { break };
+        let Some(ppid) = proc.ppid(current) else {
+            break;
+        };
         if ppid <= 0 || ppid == current {
             break;
         }
@@ -388,8 +443,14 @@ mod tests {
         assert!(al.is_allowed(999, "anything"), "agent pid is self-excluded");
         assert!(al.is_allowed(5, "trapd-agent"), "agent comm excluded");
         assert!(al.is_allowed(5, "updatedb"), "indexer excluded");
-        assert!(al.is_allowed(5, "custombackup"), "configured extra excluded");
-        assert!(!al.is_allowed(5, "cat"), "an interactive read is NOT excluded");
+        assert!(
+            al.is_allowed(5, "custombackup"),
+            "configured extra excluded"
+        );
+        assert!(
+            !al.is_allowed(5, "cat"),
+            "an interactive read is NOT excluded"
+        );
         assert!(!al.is_allowed(5, "python3"), "a script is NOT excluded");
     }
 
@@ -489,7 +550,10 @@ mod tests {
                 assert_eq!(d.token_id, "tok-123");
                 assert_eq!(d.accessor.comm, "cat");
                 // ancestry resolved from the fake /proc
-                assert_eq!(d.accessor.ancestors.first().map(|a| a.comm.as_str()), Some("bash"));
+                assert_eq!(
+                    d.accessor.ancestors.first().map(|a| a.comm.as_str()),
+                    Some("bash")
+                );
             }
             _ => panic!("wrong payload"),
         }
@@ -512,8 +576,14 @@ mod tests {
     fn mmap_is_full_read_getdents_is_soft_recon() {
         let al = Allowlist::new(999, &[]);
         let mk = |k| AccessHit {
-            pid: 100, uid: 1000, gid: 1000, comm: "x", open_flags: 0,
-            token_id: "t", path: "/home/a/.aws/credentials", kind: "aws_credentials",
+            pid: 100,
+            uid: 1000,
+            gid: 1000,
+            comm: "x",
+            open_flags: 0,
+            token_id: "t",
+            path: "/home/a/.aws/credentials",
+            kind: "aws_credentials",
             access_kind: k,
         };
         // mmap of a token reads its contents — same weight as an open.
@@ -553,7 +623,10 @@ mod tests {
             access_kind: AccessKind::Stat, // bare metadata recon
         };
         let ev = build_access_event("a", "h", &hit, &al, &fake()).expect("event");
-        assert!(matches!(ev.severity, Severity::High), "recon is High, not Critical");
+        assert!(
+            matches!(ev.severity, Severity::High),
+            "recon is High, not Critical"
+        );
         match ev.data {
             EventData::HoneytokenAccess(d) => {
                 assert_eq!(d.confidence, 75, "recon scores below content access");

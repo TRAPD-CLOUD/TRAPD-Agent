@@ -41,7 +41,9 @@ pub const WATCHDOG_ARG: &str = "--watchdog-for";
 pub fn detect() -> Option<u32> {
     let args: Vec<String> = std::env::args().collect();
     args.windows(2).find_map(|pair| {
-        (pair[0] == WATCHDOG_ARG).then(|| pair[1].parse::<u32>().ok()).flatten()
+        (pair[0] == WATCHDOG_ARG)
+            .then(|| pair[1].parse::<u32>().ok())
+            .flatten()
     })
 }
 
@@ -51,8 +53,11 @@ pub fn detect() -> Option<u32> {
 /// without a watchdog (systemd's `Restart=always` provides a fallback).
 pub fn spawn_detached() {
     let exe = match std::env::current_exe() {
-        Ok(p)  => p,
-        Err(e) => { warn!("Watchdog: cannot locate current binary: {e}"); return; }
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Watchdog: cannot locate current binary: {e}");
+            return;
+        }
     };
 
     let my_pid = process::id();
@@ -76,8 +81,12 @@ pub fn spawn_detached() {
         }
 
         match cmd.spawn() {
-            Ok(child) => info!(watchdog_pid = child.id(), agent_pid = my_pid, "Watchdog spawned"),
-            Err(e)    => warn!("Watchdog: spawn failed: {e} — agent runs without watchdog"),
+            Ok(child) => info!(
+                watchdog_pid = child.id(),
+                agent_pid = my_pid,
+                "Watchdog spawned"
+            ),
+            Err(e) => warn!("Watchdog: spawn failed: {e} — agent runs without watchdog"),
         }
     }
 
@@ -92,8 +101,7 @@ pub fn spawn_detached() {
 pub fn run_watchdog(monitored_pid: u32) -> ! {
     info!(monitored_pid, "Watchdog mode: monitoring agent process");
 
-    let exe = std::env::current_exe()
-        .expect("Watchdog: cannot resolve current executable path");
+    let exe = std::env::current_exe().expect("Watchdog: cannot resolve current executable path");
 
     let proc_dir = format!("/proc/{monitored_pid}");
 
@@ -117,8 +125,7 @@ pub fn run_watchdog(monitored_pid: u32) -> ! {
             Ok(child) => {
                 info!(
                     new_pid = child.id(),
-                    attempt,
-                    "Watchdog: agent restarted successfully — exiting watchdog"
+                    attempt, "Watchdog: agent restarted successfully — exiting watchdog"
                 );
                 // The new agent instance will spawn its own watchdog.
                 // Drop the child handle so it is detached and runs independently.
@@ -126,7 +133,11 @@ pub fn run_watchdog(monitored_pid: u32) -> ! {
                 process::exit(0);
             }
             Err(e) => {
-                warn!(attempt, max = MAX_RESTART_ATTEMPTS, "Watchdog: restart attempt failed: {e}");
+                warn!(
+                    attempt,
+                    max = MAX_RESTART_ATTEMPTS,
+                    "Watchdog: restart attempt failed: {e}"
+                );
             }
         }
     }

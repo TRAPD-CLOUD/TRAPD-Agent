@@ -46,9 +46,9 @@ pub const SLOT_NAMES: [&str; SLOT_COUNT] = [
 
 /// Reads and tracks the shared `DROPPED` per-CPU drop-counter map.
 pub struct DropMonitor {
-    map:           PerCpuArray<MapData, u64>,
+    map: PerCpuArray<MapData, u64>,
     prev_per_slot: [u64; SLOT_COUNT],
-    prev_total:    u64,
+    prev_total: u64,
 }
 
 impl DropMonitor {
@@ -56,7 +56,7 @@ impl DropMonitor {
         Self {
             map,
             prev_per_slot: [0; SLOT_COUNT],
-            prev_total:    0,
+            prev_total: 0,
         }
     }
 

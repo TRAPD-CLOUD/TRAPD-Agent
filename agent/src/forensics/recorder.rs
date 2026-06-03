@@ -82,7 +82,9 @@ impl FlightRecorder {
             }
         }
 
-        let Some((pid, summary)) = extract(&event.data) else { return };
+        let Some((pid, summary)) = extract(&event.data) else {
+            return;
+        };
         let fe = FlightEvent {
             timestamp: event.timestamp,
             class: label(&event.class),
@@ -98,7 +100,9 @@ impl FlightRecorder {
     /// Recent buffered history for any of `pids` (the accessor + its ancestry),
     /// oldest first, capped to `max` entries.
     pub fn history_for(&self, pids: &[i32], max: usize) -> Vec<FlightEvent> {
-        let Ok(buf) = self.events.lock() else { return Vec::new() };
+        let Ok(buf) = self.events.lock() else {
+            return Vec::new();
+        };
         let mut hits: Vec<FlightEvent> = buf
             .iter()
             .filter(|e| e.pid.is_some_and(|p| pids.contains(&p)))
@@ -151,17 +155,25 @@ fn extract(data: &EventData) -> Option<(i32, String)> {
         EventData::FileUnlink(d) => (d.pid, format!("unlink {}", d.path)),
         EventData::FileRename(d) => (d.pid, format!("rename {} -> {}", d.old_path, d.new_path)),
         EventData::FileChmod(d) => (d.pid, format!("chmod {:o} {}", d.mode, d.path)),
-        EventData::FileChown(d) => (d.pid, format!("chown {}:{} {}", d.new_uid, d.new_gid, d.path)),
+        EventData::FileChown(d) => (
+            d.pid,
+            format!("chown {}:{} {}", d.new_uid, d.new_gid, d.path),
+        ),
         EventData::Mmap(d) => (d.pid, format!("mmap {}", d.comm)),
         EventData::Setuid(d) => (d.pid, format!("setuid {} -> {}", d.old_uid, d.new_uid)),
         EventData::MemfdCreate(d) => (d.pid, format!("memfd_create {}", d.name)),
-        EventData::NetworkSocket(d) => {
-            (d.pid, format!("{} {}:{}", d.op, d.addr, d.port))
-        }
-        EventData::NetworkConnection(d) => {
-            (d.pid?, format!("connect {}:{} -> {}:{}", d.src_addr, d.src_port, d.dst_addr, d.dst_port))
-        }
-        EventData::Fork(d) => (d.child_pid, format!("fork {} -> {}", d.parent_comm, d.child_comm)),
+        EventData::NetworkSocket(d) => (d.pid, format!("{} {}:{}", d.op, d.addr, d.port)),
+        EventData::NetworkConnection(d) => (
+            d.pid?,
+            format!(
+                "connect {}:{} -> {}:{}",
+                d.src_addr, d.src_port, d.dst_addr, d.dst_port
+            ),
+        ),
+        EventData::Fork(d) => (
+            d.child_pid,
+            format!("fork {} -> {}", d.parent_comm, d.child_comm),
+        ),
         _ => return None,
     })
 }

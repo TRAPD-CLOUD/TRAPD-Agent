@@ -139,7 +139,9 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
     // enumerate every bait at once.
     if let Some(marker) = req.canary_marker.as_deref() {
         if store.canary_in_use(marker) {
-            bail!("refusing to deploy honeytoken: canary marker is already in use by another token");
+            bail!(
+                "refusing to deploy honeytoken: canary marker is already in use by another token"
+            );
         }
     }
     if let Some(oob) = req.out_of_band.as_ref() {
@@ -154,7 +156,10 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
     // (lstat) catches a symlink planted at the path too — we treat any
     // existing entry, symlink included, as "occupied" and refuse.
     if target.symlink_metadata().is_ok() {
-        bail!("refusing to deploy honeytoken: {} already exists", target.display());
+        bail!(
+            "refusing to deploy honeytoken: {} already exists",
+            target.display()
+        );
     }
 
     let parent = target
@@ -206,7 +211,9 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
                 info!(path = %rec.path, appended = rec.appended, "honeytoken breadcrumb placed");
                 breadcrumbs.push(rec);
             }
-            Err(e) => warn!(path = %bc.path, error = %e, "honeytoken breadcrumb placement failed — skipping"),
+            Err(e) => {
+                warn!(path = %bc.path, error = %e, "honeytoken breadcrumb placement failed — skipping")
+            }
         }
     }
 
@@ -226,7 +233,9 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
         breadcrumbs,
     };
 
-    store.insert(record.clone()).context("record deployed honeytoken")?;
+    store
+        .insert(record.clone())
+        .context("record deployed honeytoken")?;
 
     info!(
         path = %record.path,
@@ -258,7 +267,9 @@ pub fn revoke(store: &HoneytokenStore, path: &str) -> Result<HoneytokenRecord> {
     let record = store
         .remove_by_path(path)
         .context("update honeytoken register")?
-        .ok_or_else(|| anyhow::anyhow!("honeytoken vanished from register during revoke: {path}"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("honeytoken vanished from register during revoke: {path}")
+        })?;
 
     // Tear down any breadcrumbs we planted alongside the token. Created files are
     // removed; appended history lines are removed *only* if the file still ends
@@ -417,7 +428,8 @@ fn remove_breadcrumb(bc: &BreadcrumbRecord) -> Result<()> {
         return Ok(());
     }
     let mut f = fs::File::open(&bc.path).with_context(|| format!("open {}", bc.path))?;
-    f.seek(SeekFrom::Start(offset)).context("seek to appended block")?;
+    f.seek(SeekFrom::Start(offset))
+        .context("seek to appended block")?;
     let mut buf = vec![0u8; len as usize];
     f.read_exact(&mut buf).context("read appended block")?;
     if hex::encode(Sha256::digest(&buf)) != *sha {
@@ -461,7 +473,10 @@ fn write_camouflaged(
     let parent = target.parent().expect("validated target has a parent");
     let tmp = parent.join(format!(
         ".{}.htk.{}",
-        target.file_name().and_then(|s| s.to_str()).unwrap_or("token"),
+        target
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("token"),
         std::process::id()
     ));
 
@@ -693,8 +708,14 @@ mod tests {
     fn rejects_relative_and_traversal_paths() {
         let dir = scratch_dir();
         let store = store_in(&dir);
-        assert!(deploy(&store, req("relative/path", "x")).unwrap_err().to_string().contains("absolute"));
-        assert!(deploy(&store, req("/tmp/../etc/x", "x")).unwrap_err().to_string().contains(".."));
+        assert!(deploy(&store, req("relative/path", "x"))
+            .unwrap_err()
+            .to_string()
+            .contains("absolute"));
+        assert!(deploy(&store, req("/tmp/../etc/x", "x"))
+            .unwrap_err()
+            .to_string()
+            .contains(".."));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -707,7 +728,12 @@ mod tests {
         fs::write(&neighbor, b"-----BEGIN-----").unwrap();
         let old = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
         let ft = fs::FileTimes::new().set_accessed(old).set_modified(old);
-        OpenOptions::new().write(true).open(&neighbor).unwrap().set_times(ft).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&neighbor)
+            .unwrap()
+            .set_times(ft)
+            .unwrap();
 
         let target = dir.join("id_rsa_backup");
         let mut r = req(&target.to_string_lossy(), VALID_AWS);
@@ -731,7 +757,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid 'aws_credentials'"), "got: {err}");
-        assert!(!path.exists(), "a rejected deploy must not touch the filesystem");
+        assert!(
+            !path.exists(),
+            "a rejected deploy must not touch the filesystem"
+        );
         assert!(store.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -747,7 +776,10 @@ mod tests {
         let err = deploy(&store, req(&dir.join("b").to_string_lossy(), VALID_AWS))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("canary marker is already in use"), "got: {err}");
+        assert!(
+            err.contains("canary marker is already in use"),
+            "got: {err}"
+        );
         assert!(!dir.join("b").exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -787,7 +819,10 @@ mod tests {
         r.out_of_band = Some(oob("dns", "trk-x", "not-a-hostname"));
         let err = deploy(&store, r).unwrap_err().to_string();
         assert!(err.contains("out_of_band_canary"), "got: {err}");
-        assert!(!path.exists(), "a rejected oob deploy must not touch the filesystem");
+        assert!(
+            !path.exists(),
+            "a rejected oob deploy must not touch the filesystem"
+        );
         assert!(store.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -854,13 +889,20 @@ mod tests {
         let rec = deploy(&store, r).unwrap();
 
         let after = fs::read_to_string(&history).unwrap();
-        assert!(after.starts_with("ls -la\ncat /etc/passwd\n"), "must not clobber prior history: {after:?}");
+        assert!(
+            after.starts_with("ls -la\ncat /etc/passwd\n"),
+            "must not clobber prior history: {after:?}"
+        );
         assert!(after.contains("mysql -u root -psup3rs3cret prod_db"));
         assert!(rec.breadcrumbs[0].appended);
 
         // Revoke removes exactly our appended block, restoring the original file.
         revoke(&store, &token.to_string_lossy()).unwrap();
-        assert_eq!(fs::read(&history).unwrap(), original, "history must be restored byte-for-byte");
+        assert_eq!(
+            fs::read(&history).unwrap(),
+            original,
+            "history must be restored byte-for-byte"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -889,7 +931,10 @@ mod tests {
         // Revoke must NOT corrupt the file: our block is no longer the tail.
         revoke(&store, &token.to_string_lossy()).unwrap();
         let after = fs::read_to_string(&history).unwrap();
-        assert!(after.contains("leaked-cmd --token abc"), "left intact when tail changed");
+        assert!(
+            after.contains("leaked-cmd --token abc"),
+            "left intact when tail changed"
+        );
         assert!(after.ends_with("later-command\n"));
         let _ = fs::remove_dir_all(&dir);
     }

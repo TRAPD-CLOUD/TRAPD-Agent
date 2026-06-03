@@ -147,11 +147,42 @@ pub fn build_profile_full(
 
     // Software context, resolved once.
     let has_aws = pkg_present(software, &["awscli", "aws-cli", "awscli-plugin-endpoint"]);
-    let has_pg = pkg_present(software, &["postgresql-client", "postgresql-client-common", "postgresql", "libpq5"]);
-    let has_mysql = pkg_present(software, &["mysql-client", "default-mysql-client", "mariadb-client", "mysql-client-core"]);
-    let has_docker = pkg_present(software, &["docker.io", "docker-ce", "docker-ce-cli", "containerd", "podman"]);
-    let has_kube = pkg_present(software, &["kubectl", "kubernetes-cli", "kubeadm", "kubelet"]);
-    let has_nginx = pkg_present(software, &["nginx", "nginx-core", "nginx-full", "nginx-light"]);
+    let has_pg = pkg_present(
+        software,
+        &[
+            "postgresql-client",
+            "postgresql-client-common",
+            "postgresql",
+            "libpq5",
+        ],
+    );
+    let has_mysql = pkg_present(
+        software,
+        &[
+            "mysql-client",
+            "default-mysql-client",
+            "mariadb-client",
+            "mysql-client-core",
+        ],
+    );
+    let has_docker = pkg_present(
+        software,
+        &[
+            "docker.io",
+            "docker-ce",
+            "docker-ce-cli",
+            "containerd",
+            "podman",
+        ],
+    );
+    let has_kube = pkg_present(
+        software,
+        &["kubectl", "kubernetes-cli", "kubeadm", "kubelet"],
+    );
+    let has_nginx = pkg_present(
+        software,
+        &["nginx", "nginx-core", "nginx-full", "nginx-light"],
+    );
     let has_apache = pkg_present(software, &["apache2", "httpd", "apache2-bin"]);
     let has_git = pkg_present(software, &["git", "git-core"]);
 
@@ -197,8 +228,12 @@ pub fn build_profile_full(
                 kind: "pgpass".into(),
                 path: format!("{home}/.pgpass"),
                 mitre_technique: "T1552.001".into(),
-                rationale: "a PostgreSQL client is installed — ~/.pgpass holds connection secrets".into(),
-                context: vec![format!("user:{}", user.username), "pkg:postgresql-client".into()],
+                rationale: "a PostgreSQL client is installed — ~/.pgpass holds connection secrets"
+                    .into(),
+                context: vec![
+                    format!("user:{}", user.username),
+                    "pkg:postgresql-client".into(),
+                ],
                 score: score(70, 1.0),
                 mode: 0o600,
                 mimic_neighbor: true,
@@ -210,7 +245,8 @@ pub fn build_profile_full(
                 kind: "my_cnf".into(),
                 path: format!("{home}/.my.cnf"),
                 mitre_technique: "T1552.001".into(),
-                rationale: "a MySQL/MariaDB client is installed — ~/.my.cnf holds DB credentials".into(),
+                rationale: "a MySQL/MariaDB client is installed — ~/.my.cnf holds DB credentials"
+                    .into(),
                 context: vec![format!("user:{}", user.username), "pkg:mysql-client".into()],
                 score: score(70, 1.0),
                 mode: 0o600,
@@ -236,7 +272,8 @@ pub fn build_profile_full(
                 kind: "kube_config".into(),
                 path: format!("{home}/.kube/config"),
                 mitre_technique: "T1552.001".into(),
-                rationale: "kubectl is installed — cluster credentials live in ~/.kube/config".into(),
+                rationale: "kubectl is installed — cluster credentials live in ~/.kube/config"
+                    .into(),
                 context: vec![format!("user:{}", user.username), "pkg:kubectl".into()],
                 score: score(80, 1.0),
                 mode: 0o600,
@@ -270,7 +307,8 @@ pub fn build_profile_full(
                 kind: "git_credentials".into(),
                 path: format!("{home}/.git-credentials"),
                 mitre_technique: "T1552.001".into(),
-                rationale: "git is present — ~/.git-credentials stores plaintext HTTPS tokens".into(),
+                rationale: "git is present — ~/.git-credentials stores plaintext HTTPS tokens"
+                    .into(),
                 context: vec![format!("user:{}", user.username), "pkg:git".into()],
                 score: score(78, 1.0),
                 mode: 0o600,
@@ -286,8 +324,12 @@ pub fn build_profile_full(
                 kind: "browser_logins".into(),
                 path: format!("{firefox_dir}/logins.json"),
                 mitre_technique: "T1555.003".into(),
-                rationale: "a Firefox profile exists — logins.json holds saved site credentials".into(),
-                context: vec![format!("user:{}", user.username), "dir:~/.mozilla/firefox".into()],
+                rationale: "a Firefox profile exists — logins.json holds saved site credentials"
+                    .into(),
+                context: vec![
+                    format!("user:{}", user.username),
+                    "dir:~/.mozilla/firefox".into(),
+                ],
                 score: score(72, 1.0),
                 mode: 0o600,
                 mimic_neighbor: true,
@@ -299,8 +341,12 @@ pub fn build_profile_full(
                 kind: "browser_logins".into(),
                 path: format!("{chrome_dir}/Login Data"),
                 mitre_technique: "T1555.003".into(),
-                rationale: "a Chrome profile exists — 'Login Data' holds saved site credentials".into(),
-                context: vec![format!("user:{}", user.username), "dir:~/.config/google-chrome".into()],
+                rationale: "a Chrome profile exists — 'Login Data' holds saved site credentials"
+                    .into(),
+                context: vec![
+                    format!("user:{}", user.username),
+                    "dir:~/.config/google-chrome".into(),
+                ],
                 score: score(72, 1.0),
                 mode: 0o600,
                 mimic_neighbor: true,
@@ -329,8 +375,12 @@ pub fn build_profile_full(
     if has_nginx || has_apache {
         if let Some(webroot) = webroot(fs) {
             let mut ctx = vec![format!("dir:{webroot}")];
-            if has_nginx { ctx.push("pkg:nginx".into()); }
-            if has_apache { ctx.push("pkg:apache2".into()); }
+            if has_nginx {
+                ctx.push("pkg:nginx".into());
+            }
+            if has_apache {
+                ctx.push("pkg:apache2".into());
+            }
             candidates.push(TokenCandidate {
                 kind: "webroot_env".into(),
                 path: format!("{webroot}/.env"),
@@ -351,7 +401,9 @@ pub fn build_profile_full(
             kind: "root_backup_keys".into(),
             path: "/root/backup_keys.txt".into(),
             mitre_technique: "T1552.001".into(),
-            rationale: "/root exists — a plaintext key dump is loot an attacker expects post-escalation".into(),
+            rationale:
+                "/root exists — a plaintext key dump is loot an attacker expects post-escalation"
+                    .into(),
             context: vec!["dir:/root".into()],
             score: score(88, 1.0),
             mode: 0o600,
@@ -364,7 +416,9 @@ pub fn build_profile_full(
                 kind: "passwords_kdbx".into(),
                 path: format!("{backup_dir}/passwords.kdbx"),
                 mitre_technique: "T1083".into(),
-                rationale: format!("{backup_dir} exists — a KeePass vault in a backup dir is prime loot"),
+                rationale: format!(
+                    "{backup_dir} exists — a KeePass vault in a backup dir is prime loot"
+                ),
                 context: vec![format!("dir:{backup_dir}")],
                 score: score(92, 1.0),
                 mode: 0o600,
@@ -403,9 +457,16 @@ pub fn build_profile_full(
 }
 
 /// Derive the host persona from already-collected inventory facts.
-fn derive_persona(users: &[UserAccount], hostname: &str, interfaces: &[NetInterface]) -> HostPersona {
-    let human_users: Vec<String> =
-        users.iter().filter(|u| u.is_human).map(|u| u.username.clone()).collect();
+fn derive_persona(
+    users: &[UserAccount],
+    hostname: &str,
+    interfaces: &[NetInterface],
+) -> HostPersona {
+    let human_users: Vec<String> = users
+        .iter()
+        .filter(|u| u.is_human)
+        .map(|u| u.username.clone())
+        .collect();
 
     // Primary interactive user = lowest-uid human (root is uid 0 but is rarely
     // "the" desktop user; prefer the lowest uid >= 1000, else any human).
@@ -475,14 +536,20 @@ fn score(attacker_weight: u32, context_confidence: f32) -> u8 {
 /// insensitive). Exact matching avoids the false positives a substring scan
 /// would hit (e.g. "docker-doc" or a package merely *mentioning* aws).
 fn pkg_present(software: &SoftwareInventory, names: &[&str]) -> bool {
-    software.packages.iter().any(|p| {
-        names.iter().any(|n| p.name.eq_ignore_ascii_case(n))
-    })
+    software
+        .packages
+        .iter()
+        .any(|p| names.iter().any(|n| p.name.eq_ignore_ascii_case(n)))
 }
 
 /// First conventional webroot that actually exists.
 fn webroot(fs: &dyn FsProbe) -> Option<String> {
-    for candidate in ["/var/www/html", "/var/www", "/srv/www", "/usr/share/nginx/html"] {
+    for candidate in [
+        "/var/www/html",
+        "/var/www",
+        "/srv/www",
+        "/usr/share/nginx/html",
+    ] {
         if fs.is_dir(candidate) {
             return Some(candidate.to_string());
         }
@@ -532,9 +599,17 @@ mod tests {
     fn software(pkgs: &[&str]) -> SoftwareInventory {
         let packages = pkgs
             .iter()
-            .map(|n| SoftwarePackage { name: n.to_string(), version: "1".into(), architecture: None })
+            .map(|n| SoftwarePackage {
+                name: n.to_string(),
+                version: "1".into(),
+                architecture: None,
+            })
             .collect::<Vec<_>>();
-        SoftwareInventory { source: "dpkg".into(), package_count: packages.len(), packages }
+        SoftwareInventory {
+            source: "dpkg".into(),
+            package_count: packages.len(),
+            packages,
+        }
     }
 
     #[test]
@@ -544,13 +619,20 @@ mod tests {
         let fs = FakeFs::new(&["/home/alice/.ssh"], &[]);
         let profile = build_profile_with(&users, &software(&["vim", "curl"]), &fs);
         assert!(
-            !profile.candidates.iter().any(|c| c.kind == "aws_credentials"),
+            !profile
+                .candidates
+                .iter()
+                .any(|c| c.kind == "aws_credentials"),
             "must not place AWS creds without AWS footprint"
         );
 
         // With awscli installed it appears, in correct format/path.
         let profile = build_profile_with(&users, &software(&["awscli"]), &fs);
-        let aws = profile.candidates.iter().find(|c| c.kind == "aws_credentials").expect("aws candidate");
+        let aws = profile
+            .candidates
+            .iter()
+            .find(|c| c.kind == "aws_credentials")
+            .expect("aws candidate");
         assert_eq!(aws.path, "/home/alice/.aws/credentials");
         assert_eq!(aws.mode, 0o600);
         assert_eq!(aws.mitre_technique, "T1552.001");
@@ -560,10 +642,21 @@ mod tests {
     fn ssh_candidate_only_when_ssh_dir_exists() {
         let users = vec![user("bob", "/home/bob")];
         let without = build_profile_with(&users, &software(&[]), &FakeFs::new(&[], &[]));
-        assert!(!without.candidates.iter().any(|c| c.kind == "ssh_private_key"));
+        assert!(!without
+            .candidates
+            .iter()
+            .any(|c| c.kind == "ssh_private_key"));
 
-        let with = build_profile_with(&users, &software(&[]), &FakeFs::new(&["/home/bob/.ssh"], &[]));
-        let ssh = with.candidates.iter().find(|c| c.kind == "ssh_private_key").expect("ssh candidate");
+        let with = build_profile_with(
+            &users,
+            &software(&[]),
+            &FakeFs::new(&["/home/bob/.ssh"], &[]),
+        );
+        let ssh = with
+            .candidates
+            .iter()
+            .find(|c| c.kind == "ssh_private_key")
+            .expect("ssh candidate");
         assert_eq!(ssh.path, "/home/bob/.ssh/id_rsa_backup");
         assert_eq!(ssh.mitre_technique, "T1552.004");
     }
@@ -575,7 +668,10 @@ mod tests {
         let fs = FakeFs::new(&["/var/www/.ssh"], &[]);
         let profile = build_profile_with(&[svc], &software(&["awscli"]), &fs);
         assert!(
-            profile.candidates.iter().all(|c| !c.context.contains(&"user:www-data".to_string())),
+            profile
+                .candidates
+                .iter()
+                .all(|c| !c.context.contains(&"user:www-data".to_string())),
             "non-human accounts must not receive personal credential bait"
         );
     }
@@ -584,10 +680,17 @@ mod tests {
     fn candidates_are_sorted_by_score_desc() {
         let users = vec![user("alice", "/home/alice")];
         let fs = FakeFs::new(&["/home/alice/.ssh", "/root", "/var/www/html"], &[]);
-        let profile = build_profile_with(&users, &software(&["awscli", "nginx", "postgresql-client"]), &fs);
+        let profile = build_profile_with(
+            &users,
+            &software(&["awscli", "nginx", "postgresql-client"]),
+            &fs,
+        );
         assert!(profile.candidates.len() >= 4);
         for w in profile.candidates.windows(2) {
-            assert!(w[0].score >= w[1].score, "candidates must be ranked by descending score");
+            assert!(
+                w[0].score >= w[1].score,
+                "candidates must be ranked by descending score"
+            );
         }
     }
 
@@ -596,7 +699,11 @@ mod tests {
         let fs = FakeFs::new(&["/var/www/html"], &[]);
         // Web server pkg + existing webroot -> candidate.
         let p = build_profile_with(&[], &software(&["nginx"]), &fs);
-        let env = p.candidates.iter().find(|c| c.kind == "webroot_env").expect("webroot candidate");
+        let env = p
+            .candidates
+            .iter()
+            .find(|c| c.kind == "webroot_env")
+            .expect("webroot candidate");
         assert_eq!(env.path, "/var/www/html/.env");
         assert_eq!(env.mode, 0o640);
 
@@ -613,7 +720,11 @@ mod tests {
         assert!(!none.candidates.iter().any(|c| c.kind == "git_credentials"));
         // git installed -> proposed at ~/.git-credentials.
         let with = build_profile_with(&users, &software(&["git"]), &FakeFs::new(&[], &[]));
-        let gc = with.candidates.iter().find(|c| c.kind == "git_credentials").expect("git candidate");
+        let gc = with
+            .candidates
+            .iter()
+            .find(|c| c.kind == "git_credentials")
+            .expect("git candidate");
         assert_eq!(gc.path, "/home/alice/.git-credentials");
         assert_eq!(gc.mitre_technique, "T1552.001");
     }
@@ -632,12 +743,25 @@ mod tests {
         );
         let p = build_profile_with(&users, &software(&[]), &fs);
         let kinds: HashSet<&str> = p.candidates.iter().map(|c| c.kind.as_str()).collect();
-        assert!(kinds.contains("browser_logins"), "firefox/chrome stores proposed");
+        assert!(
+            kinds.contains("browser_logins"),
+            "firefox/chrome stores proposed"
+        );
         assert!(kinds.contains("office_doc"), "office tracking doc proposed");
         assert!(kinds.contains("shadow_backup"), "shadow backup proposed");
         // Two browser_logins candidates (firefox + chrome).
-        assert_eq!(p.candidates.iter().filter(|c| c.kind == "browser_logins").count(), 2);
-        let shadow = p.candidates.iter().find(|c| c.kind == "shadow_backup").unwrap();
+        assert_eq!(
+            p.candidates
+                .iter()
+                .filter(|c| c.kind == "browser_logins")
+                .count(),
+            2
+        );
+        let shadow = p
+            .candidates
+            .iter()
+            .find(|c| c.kind == "shadow_backup")
+            .unwrap();
         assert_eq!(shadow.path, "/var/backups/shadow.bak");
         assert_eq!(shadow.mitre_technique, "T1003.008");
     }
@@ -646,11 +770,29 @@ mod tests {
     fn persona_is_derived_from_host_facts() {
         let mut admin = user("root", "/root");
         admin.uid = 0;
-        let alice = UserAccount { uid: 1000, ..user("alice", "/home/alice") };
-        let bob = UserAccount { uid: 1001, ..user("bob", "/home/bob") };
+        let alice = UserAccount {
+            uid: 1000,
+            ..user("alice", "/home/alice")
+        };
+        let bob = UserAccount {
+            uid: 1001,
+            ..user("bob", "/home/bob")
+        };
         let ifaces = vec![
-            NetInterface { name: "lo".into(), mac: None, ipv4: vec!["127.0.0.1".into()], ipv6: vec![], up: true },
-            NetInterface { name: "eth0".into(), mac: None, ipv4: vec!["10.0.12.34".into()], ipv6: vec![], up: true },
+            NetInterface {
+                name: "lo".into(),
+                mac: None,
+                ipv4: vec!["127.0.0.1".into()],
+                ipv6: vec![],
+                up: true,
+            },
+            NetInterface {
+                name: "eth0".into(),
+                mac: None,
+                ipv4: vec!["10.0.12.34".into()],
+                ipv6: vec![],
+                up: true,
+            },
         ];
         let p = build_profile_full(
             &[admin, alice, bob],
@@ -676,12 +818,21 @@ mod tests {
             &[user("alice", "/home/alice")],
             &software(&[]),
             "laptop",
-            &[NetInterface { name: "eth0".into(), mac: None, ipv4: vec!["8.8.8.8".into()], ipv6: vec![], up: true }],
+            &[NetInterface {
+                name: "eth0".into(),
+                mac: None,
+                ipv4: vec!["8.8.8.8".into()],
+                ipv6: vec![],
+                up: true,
+            }],
             &FakeFs::new(&[], &[]),
         );
         assert_eq!(p.persona.hostname, "laptop");
         assert_eq!(p.persona.domain, None, "short hostname has no domain");
-        assert_eq!(p.persona.internal_ipv4, None, "public IP is not an internal address");
+        assert_eq!(
+            p.persona.internal_ipv4, None,
+            "public IP is not an internal address"
+        );
         assert_eq!(p.persona.subnet_cidr, None);
     }
 }

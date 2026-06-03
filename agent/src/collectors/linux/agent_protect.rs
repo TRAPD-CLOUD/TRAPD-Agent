@@ -39,16 +39,20 @@ impl AgentProtectCollector {
 }
 
 impl Default for AgentProtectCollector {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait]
 impl Collector for AgentProtectCollector {
-    fn name(&self) -> &'static str { "AgentProtectCollector" }
+    fn name(&self) -> &'static str {
+        "AgentProtectCollector"
+    }
 
     async fn run(
         &mut self,
-        tx:       Sender<AgentEvent>,
+        tx: Sender<AgentEvent>,
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
@@ -69,17 +73,20 @@ impl Collector for AgentProtectCollector {
 }
 
 fn run_protect_sync(
-    tx:         tokio::sync::mpsc::Sender<AgentEvent>,
-    agent_id:   String,
-    hostname:   String,
+    tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    agent_id: String,
+    hostname: String,
     home_trapd: PathBuf,
 ) {
     // Apply chattr +i to critical agent files.
     apply_immutable_flags();
 
     let mut inotify = match Inotify::init() {
-        Ok(i)  => i,
-        Err(e) => { warn!("AgentProtectCollector: inotify init failed: {e}"); return; }
+        Ok(i) => i,
+        Err(e) => {
+            warn!("AgentProtectCollector: inotify init failed: {e}");
+            return;
+        }
     };
 
     let mut wd_map: HashMap<inotify::WatchDescriptor, String> = HashMap::new();
@@ -88,7 +95,9 @@ fn run_protect_sync(
     let home_str = home_trapd.to_string_lossy().into_owned();
     if home_trapd.exists() {
         match inotify.watches().add(&home_trapd, WATCH_MASK) {
-            Ok(wd) => { wd_map.insert(wd, home_str.clone()); }
+            Ok(wd) => {
+                wd_map.insert(wd, home_str.clone());
+            }
             Err(e) => warn!("AgentProtectCollector: cannot watch {home_str}: {e}"),
         }
         info!("AgentProtectCollector: watching {home_str} for tampering");
@@ -97,40 +106,50 @@ fn run_protect_sync(
     let mut buf = [0u8; 4096];
     loop {
         let events = match inotify.read_events_blocking(&mut buf) {
-            Ok(e)  => e,
-            Err(e) => { warn!("AgentProtectCollector: inotify read error: {e}"); break; }
+            Ok(e) => e,
+            Err(e) => {
+                warn!("AgentProtectCollector: inotify read error: {e}");
+                break;
+            }
         };
 
         for event in events {
             let dir = match wd_map.get(&event.wd) {
                 Some(d) => d.clone(),
-                None    => continue,
+                None => continue,
             };
             let path = match &event.name {
                 Some(name) => format!("{dir}/{}", name.to_string_lossy()),
-                None       => dir.clone(),
+                None => dir.clone(),
             };
             let mask = event.mask;
 
-            let action_str = if mask.contains(EventMask::DELETE) || mask.contains(EventMask::MOVED_FROM) {
-                "delete"
-            } else if mask.contains(EventMask::CREATE) || mask.contains(EventMask::MOVED_TO) {
-                "create"
-            } else if mask.contains(EventMask::ATTRIB) {
-                // chattr removal detected
-                "modify"
-            } else {
-                "modify"
-            };
+            let action_str =
+                if mask.contains(EventMask::DELETE) || mask.contains(EventMask::MOVED_FROM) {
+                    "delete"
+                } else if mask.contains(EventMask::CREATE) || mask.contains(EventMask::MOVED_TO) {
+                    "create"
+                } else if mask.contains(EventMask::ATTRIB) {
+                    // chattr removal detected
+                    "modify"
+                } else {
+                    "modify"
+                };
 
             let ev = AgentEvent::new(
-                agent_id.clone(), hostname.clone(),
-                EventClass::Filesystem, EventAction::AgentTamper, Severity::Critical,
+                agent_id.clone(),
+                hostname.clone(),
+                EventClass::Filesystem,
+                EventAction::AgentTamper,
+                Severity::Critical,
                 EventData::AgentTamper(AgentTamperData {
-                    path: path.clone(), action: action_str.to_string(),
+                    path: path.clone(),
+                    action: action_str.to_string(),
                 }),
             );
-            if tx.blocking_send(ev).is_err() { return; }
+            if tx.blocking_send(ev).is_err() {
+                return;
+            }
 
             // Re-apply immutable flag if an immutable file was tampered with.
             if (mask.contains(EventMask::ATTRIB) || mask.contains(EventMask::MODIFY))
@@ -153,15 +172,17 @@ fn apply_immutable_flags() {
 }
 
 fn apply_chattr_immutable(path: &str) {
-    match std::process::Command::new("chattr").args(["+i", path]).output() {
-        Ok(out) if out.status.success() =>
-            info!("AgentProtectCollector: chattr +i applied to {path}"),
-        Ok(out) =>
-            warn!(
-                "AgentProtectCollector: chattr +i failed for {path}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        Err(e) =>
-            warn!("AgentProtectCollector: cannot run chattr: {e}"),
+    match std::process::Command::new("chattr")
+        .args(["+i", path])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            info!("AgentProtectCollector: chattr +i applied to {path}")
+        }
+        Ok(out) => warn!(
+            "AgentProtectCollector: chattr +i failed for {path}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => warn!("AgentProtectCollector: cannot run chattr: {e}"),
     }
 }
