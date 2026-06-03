@@ -270,16 +270,21 @@ impl InventoryReporter {
         let agent_id = self.agent_id.clone();
         let device_id = self.device_id.clone();
         let hostname = self.hostname.clone();
-        let flags = self
+        let (flags, cve_feed) = self
             .config
             .read()
-            .map(|c| compliance::ComplianceFlags {
-                vuln_scan: c.vuln_scan_enabled,
-                cis: c.cis_benchmark_enabled,
+            .map(|c| {
+                (
+                    compliance::ComplianceFlags {
+                        vuln_scan: c.vuln_scan_enabled,
+                        cis: c.cis_benchmark_enabled,
+                    },
+                    c.cve_feed.clone(),
+                )
             })
             .unwrap_or_default();
         let snapshot = match tokio::task::spawn_blocking(move || {
-            collect::gather_with_flags(agent_id, device_id, hostname, flags)
+            collect::gather_with_flags(agent_id, device_id, hostname, flags, &cve_feed)
         })
         .await
         {

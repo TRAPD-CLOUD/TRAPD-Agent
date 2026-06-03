@@ -125,8 +125,10 @@ pub struct VulnFinding {
     pub fixed_in: String,
 }
 
-/// One entry in `<config>/cve_feed.json`.
-#[derive(Debug, Clone, serde::Deserialize)]
+/// One entry in `<config>/cve_feed.json` or in the backend-delivered
+/// `AgentConfig.cve_feed`. `Serialize` is required because it rides the signed
+/// config envelope, whose canonical bytes the agent re-serialises to verify.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CveEntry {
     pub product: String,
     /// Versions strictly below this are vulnerable.
@@ -419,17 +421,23 @@ fn load_cve_feed() -> CveFeed {
     }
 }
 
-/// Produce the full compliance report for a snapshot.
+/// Produce the full compliance report for a snapshot. `config_cve` are CVE
+/// entries delivered over the signed config channel (`AgentConfig.cve_feed`),
+/// merged with the on-disk `<config>/cve_feed.json` so the backend can drive the
+/// feed without touching the host filesystem.
 pub fn assess(
     packages: &[SoftwarePackage],
     source: &str,
     _os: &OsInfo,
     flags: ComplianceFlags,
+    config_cve: &[CveEntry],
 ) -> ComplianceReport {
     let sbom = build_sbom(packages, purl_type(source));
 
     let vulnerabilities = if flags.vuln_scan {
-        correlate_cves(packages, &load_cve_feed())
+        let mut feed = load_cve_feed();
+        feed.entries.extend(config_cve.iter().cloned());
+        correlate_cves(packages, &feed)
     } else {
         Vec::new()
     };

@@ -265,6 +265,14 @@ pub struct AgentConfig {
     /// Splunk HEC authentication token. Empty disables the HEC sink.
     #[serde(default)]
     pub siem_hec_token: String,
+
+    // ── Vulnerability feed ──────────────────────────────────────────────────
+    /// CVE feed entries delivered over the signed config channel, merged with
+    /// the on-disk `<config>/cve_feed.json` for the inventory CVE correlation.
+    /// Lets the backend (e.g. the `cve-sync` service) drive the feed without
+    /// writing to the host filesystem.
+    #[serde(default)]
+    pub cve_feed: Vec<crate::inventory::compliance::CveEntry>,
 }
 
 impl Default for AgentConfig {
@@ -303,6 +311,7 @@ impl Default for AgentConfig {
             siem_syslog_address: String::new(),
             siem_hec_url: String::new(),
             siem_hec_token: String::new(),
+            cve_feed: Vec::new(),
         }
     }
 }
@@ -796,9 +805,9 @@ mod signed_config_tests {
     // here means the backend's `canonicalConfig` field order/contents drifted
     // from the Rust `AgentConfig` re-serialisation — the exact bug to catch.
     const XLANG_PUB_HEX: &str = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
-    const XLANG_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768,"sigma_enabled":true,"sigma_rules":[],"anomaly_detection_enabled":true,"vuln_scan_enabled":true,"cis_benchmark_enabled":true,"siem_enabled":false,"siem_format":"cef","siem_syslog_address":"","siem_hec_url":"","siem_hec_token":""}}"#;
+    const XLANG_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768,"sigma_enabled":true,"sigma_rules":[],"anomaly_detection_enabled":true,"vuln_scan_enabled":true,"cis_benchmark_enabled":true,"siem_enabled":false,"siem_format":"cef","siem_syslog_address":"","siem_hec_url":"","siem_hec_token":"","cve_feed":[]}}"#;
     const XLANG_SIG: &str =
-        "t1iNE0DrZvk+8SXF4drD2iLoKcWMen+aC29aZ7ugYP0MPty/i962Lm1ZM1GNHT6N3q26se4zLLe/siSEItJdAw==";
+        "clI4e2yqhhEHlm7znPKIQPfFRY4AQoPVkrvnk0zTPkYXJ1Rq4qInLzFNeZhZ7UUW8AH9XfzpuLvhb1toeShVCw==";
 
     #[test]
     fn accepts_ts_signed_default_config() {

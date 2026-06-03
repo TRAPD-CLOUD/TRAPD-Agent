@@ -30,15 +30,18 @@ pub fn gather(agent_id: String, device_id: String, hostname: String) -> Inventor
         device_id,
         hostname,
         super::compliance::ComplianceFlags::default(),
+        &[],
     )
 }
 
 /// Build a snapshot, gating the vulnerability/CIS work on the supplied flags.
+/// `config_cve` are backend-delivered CVE entries merged with the on-disk feed.
 pub fn gather_with_flags(
     agent_id: String,
     device_id: String,
     hostname: String,
     flags: super::compliance::ComplianceFlags,
+    config_cve: &[super::compliance::CveEntry],
 ) -> InventorySnapshot {
     let mut sys = System::new();
     sys.refresh_memory();
@@ -55,7 +58,8 @@ pub fn gather_with_flags(
         crate::deception::build_profile_with_host(&users, &software, &hostname, &network);
 
     let os = gather_os();
-    let compliance = super::compliance::assess(&software.packages, &software.source, &os, flags);
+    let compliance =
+        super::compliance::assess(&software.packages, &software.source, &os, flags, config_cve);
 
     InventorySnapshot {
         schema_version: SCHEMA_VERSION,
