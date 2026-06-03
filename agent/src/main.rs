@@ -239,11 +239,12 @@ async fn main() -> Result<()> {
     // rules carried in the (last-known-good) config, so detections are active
     // from boot before the first backend config pull.
     {
-        let docs = agent_config
+        let (docs, anomaly) = agent_config
             .read()
-            .map(|c| c.sigma_rules.clone())
+            .map(|c| (c.sigma_rules.clone(), c.anomaly_detection_enabled))
             .unwrap_or_default();
         engine.reload_sigma(&docs);
+        engine.set_anomaly_enabled(anomaly);
     }
     info!(
         iocs = engine.ioc_count(),
@@ -329,6 +330,7 @@ async fn main() -> Result<()> {
         )?
         .with_apply_hook(std::sync::Arc::new(move |cfg: &AgentConfig| {
             sigma_engine.reload_sigma(&cfg.sigma_rules);
+            sigma_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
         }));
         tokio::spawn(async move { config_puller.run().await });
 

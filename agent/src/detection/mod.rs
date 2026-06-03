@@ -21,6 +21,7 @@
 //! It never blocks the consumer: inspection is synchronous, allocation-light
 //! and lock-scoped to the beacon tracker only.
 
+mod baseline;
 mod beaconing;
 mod behavior;
 mod dns_tunnel;
@@ -57,6 +58,10 @@ pub struct DetectionEngine {
     ioa: Mutex<ioa::IoaEngine>,
     /// Compiled Sigma ruleset (disk baseline + backend-pushed), hot-swappable.
     sigma: RwLock<sigma::SigmaEngine>,
+    /// Statistical behavioural baseline (process-lineage novelty + exec-rate).
+    baseline: Mutex<baseline::BaselineEngine>,
+    /// Runtime switch for the anomaly baseline (config `anomaly_detection_enabled`).
+    anomaly_enabled: std::sync::atomic::AtomicBool,
     started: Instant,
 }
 
@@ -82,8 +87,16 @@ impl DetectionEngine {
             dns_tunnel: Mutex::new(dns_tunnel::DnsTunnelTracker::new()),
             ioa: Mutex::new(ioa::IoaEngine::new()),
             sigma: RwLock::new(Self::load_sigma_from_disk()),
+            baseline: Mutex::new(baseline::BaselineEngine::new()),
+            anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             started: Instant::now(),
         }
+    }
+
+    /// Toggle the statistical anomaly baseline at runtime (config-driven).
+    pub fn set_anomaly_enabled(&self, on: bool) {
+        self.anomaly_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Number of loaded IOCs (diagnostics / tests).
@@ -176,6 +189,16 @@ impl DetectionEngine {
                     if let Some(d) = behavior::inspect_ld_preload(&p.comm, &p.exe, ld_preload) {
                         let sev = severity_for(d.confidence);
                         out.push(self.detection(sev, d));
+                    }
+                }
+                // Statistical behavioural baseline (config-gated): per-user
+                // binary novelty + exec-rate z-score, learned online.
+                if self.anomaly_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(mut b) = self.baseline.lock() {
+                        if let Some(d) = b.observe_exec(&p.username, &p.exe, Instant::now()) {
+                            let sev = severity_for(d.confidence);
+                            out.push(self.detection(sev, d));
+                        }
                     }
                 }
             }
@@ -595,6 +618,8 @@ mod tests {
             dns_tunnel: Mutex::new(dns_tunnel::DnsTunnelTracker::new()),
             ioa: Mutex::new(ioa::IoaEngine::new()),
             sigma: RwLock::new(sigma::SigmaEngine::empty()),
+            baseline: Mutex::new(baseline::BaselineEngine::new()),
+            anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             started: Instant::now(),
         }
     }
