@@ -52,6 +52,7 @@ fn default_memory_scan_enabled() -> bool { true }
 fn default_memory_scan_interval_secs() -> u64 { 120 }
 fn default_rtr_enabled() -> bool { false }
 fn default_rtr_max_artifact_bytes() -> u64 { 32_768 }
+fn default_sigma_enabled() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -165,6 +166,19 @@ pub struct AgentConfig {
     /// single audit event within the backend's per-event size cap.
     #[serde(default = "default_rtr_max_artifact_bytes")]
     pub rtr_max_artifact_bytes: u64,
+
+    // ── Sigma detection rules ───────────────────────────────────────────────
+    /// Master switch for the local Sigma detection engine. Default on; the
+    /// engine is a no-op until rules are provided (disk `<config>/sigma/` or
+    /// the inline `sigma_rules` below).
+    #[serde(default = "default_sigma_enabled")]
+    pub sigma_enabled: bool,
+    /// Inline Sigma rule documents (YAML), delivered over the signed config
+    /// channel. Merged with the on-disk `<config>/sigma/` baseline and
+    /// recompiled whenever a new config is applied — the backend can ship
+    /// detections without an agent restart. Bad rules are skipped, not fatal.
+    #[serde(default)]
+    pub sigma_rules: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -193,6 +207,8 @@ impl Default for AgentConfig {
             memory_scan_interval_secs: default_memory_scan_interval_secs(),
             rtr_enabled: default_rtr_enabled(),
             rtr_max_artifact_bytes: default_rtr_max_artifact_bytes(),
+            sigma_enabled: default_sigma_enabled(),
+            sigma_rules: Vec::new(),
         }
     }
 }
@@ -374,6 +390,11 @@ fn persist_config(cfg: &AgentConfig) {
     }
 }
 
+/// Callback invoked with the freshly-adopted config after every successful
+/// apply. Used to recompile config-delivered artifacts (e.g. Sigma rules) the
+/// moment a signed config is verified, without coupling the puller to them.
+type ApplyHook = Arc<dyn Fn(&AgentConfig) + Send + Sync>;
+
 pub struct ConfigPuller {
     config:     Arc<RwLock<AgentConfig>>,
     client:     reqwest::Client,
@@ -381,6 +402,7 @@ pub struct ConfigPuller {
     token:      String,
     etag:       Option<String>,
     verifier:   Option<ConfigVerifier>,
+    on_apply:   Option<ApplyHook>,
 }
 
 impl ConfigPuller {
@@ -418,7 +440,14 @@ impl ConfigPuller {
             token,
             etag:       None,
             verifier,
+            on_apply:   None,
         })
+    }
+
+    /// Register a hook run with the new config after every successful apply.
+    pub fn with_apply_hook(mut self, hook: ApplyHook) -> Self {
+        self.on_apply = Some(hook);
+        self
     }
 
     pub async fn run(mut self) {
@@ -493,6 +522,9 @@ impl ConfigPuller {
                     *cfg = new_cfg.clone();
                     drop(cfg);
                     persist_config(&new_cfg);
+                    if let Some(hook) = &self.on_apply {
+                        hook(&new_cfg);
+                    }
                     info!("Agent config updated from backend (signature + issued_at verified)");
                     true
                 }
@@ -629,8 +661,8 @@ mod signed_config_tests {
     // here means the backend's `canonicalConfig` field order/contents drifted
     // from the Rust `AgentConfig` re-serialisation — the exact bug to catch.
     const XLANG_PUB_HEX: &str = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
-    const XLANG_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768}}"#;
-    const XLANG_SIG: &str = "Jpxbj4CJOr0lggAdW8eprocKJtYBd7+B9IP2K9FBFapaojsWryehd/hMgki+jjHdCH/WD4aV1qK53cfg7bQlCA==";
+    const XLANG_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768,"sigma_enabled":true,"sigma_rules":[]}}"#;
+    const XLANG_SIG: &str = "J/SzmyeeWjrGXg6B16GMwPJ/2ivvUpCUPjqL5ZaQblaP0I6tD47dvRy57ASvxILnVXXkxXqhnoD2b2X8ojxaDA==";
 
     #[test]
     fn accepts_ts_signed_default_config() {

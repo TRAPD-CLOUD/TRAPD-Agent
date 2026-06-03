@@ -39,6 +39,8 @@ getrandom          = "0.3"
 # yara-rust project is named `yara`; the dependency key keeps the `yara-rust`
 # name used throughout the codebase.)
 yara-rust          = { version = "0.28", package = "yara", optional = true }
+serde_yaml_ng = "0.10"
+regex = "1.12.3"
 
 [features]
 # Compile the optional YARA scanner (agent/src/detection/yara_scanner.rs).

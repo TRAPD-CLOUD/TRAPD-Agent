@@ -235,7 +235,21 @@ async fn main() -> Result<()> {
         agent_id.clone(),
         hostname.clone(),
     ));
-    info!(iocs = engine.ioc_count(), "Detection engine started");
+    // Compile Sigma rules = on-disk `<config>/sigma/` baseline + any inline
+    // rules carried in the (last-known-good) config, so detections are active
+    // from boot before the first backend config pull.
+    {
+        let docs = agent_config
+            .read()
+            .map(|c| c.sigma_rules.clone())
+            .unwrap_or_default();
+        engine.reload_sigma(&docs);
+    }
+    info!(
+        iocs = engine.ioc_count(),
+        sigma = engine.sigma_count(),
+        "Detection engine started"
+    );
     // Pick up threat-intel feed updates without a restart.
     Arc::clone(&engine).spawn_ioc_reloader(300);
 
@@ -286,12 +300,18 @@ async fn main() -> Result<()> {
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
         tokio::spawn(async move { transport.run().await });
 
+        // Recompile Sigma rules whenever a freshly-signed config is applied, so
+        // the backend can ship detections over the config channel live.
+        let sigma_engine = Arc::clone(&engine);
         let config_puller = ConfigPuller::new(
             Arc::clone(&agent_config),
             &backend_url,
             &agent_id,
             token.clone(),
-        )?;
+        )?
+        .with_apply_hook(std::sync::Arc::new(move |cfg: &AgentConfig| {
+            sigma_engine.reload_sigma(&cfg.sigma_rules);
+        }));
         tokio::spawn(async move { config_puller.run().await });
 
         let heartbeat = Heartbeat::new(&backend_url, agent_id.clone(), token, hostname.clone())?;
