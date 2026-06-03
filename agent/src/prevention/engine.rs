@@ -27,14 +27,14 @@ use crate::config::AgentConfig;
 use crate::deception::{self, DeployRequest, HoneytokenStore};
 use crate::forensics::{self, FlightRecorder};
 use crate::schema::{
-    AgentEvent, DetectionData, EventAction, EventData, HoneytokenAccessData,
-    RansomwareIndicatorData, Severity,
+    AgentEvent, DetectionData, DnsResolutionData, EventAction, EventData, HoneytokenAccessData,
+    NetworkConnectionData, RansomwareIndicatorData, Severity,
 };
 
 use super::audit::AuditEmitter;
 use super::commands::{CommandEnvelope, CommandPayload};
 use super::network::{self, Backend};
-use super::policy::{IocRule, PolicyHandle, PolicyStore};
+use super::policy::{IocRule, Match, PolicyHandle, PolicyStore, RuleAction};
 use super::process;
 use super::quarantine;
 use super::response::{self, AutoAction, Targets};
@@ -156,6 +156,16 @@ impl Engine {
                 match &event.data {
                     EventData::ProcessExec(exec) => {
                         let _ = process::enforce_exec(exec, &self.policy, &self.audit);
+                    }
+                    // Inline IoC enforcement on the network plane (Phase 0): a
+                    // backend-pushed Ip/Cidr/Port/Domain rule now actively drops
+                    // the destination and kills the connecting process, not just
+                    // alerts. Closes the "detect-but-don't-prevent" gap for C2.
+                    EventData::NetworkConnection(net) => {
+                        self.enforce_network(net).await;
+                    }
+                    EventData::DnsResolution(dns) => {
+                        self.enforce_dns_resolution(dns).await;
                     }
                     EventData::HoneytokenAccess(data) => {
                         self.respond_honeytoken(data).await;
@@ -439,6 +449,127 @@ impl Engine {
             action = decision.action.as_str(),
             target_pid = ?targets.pid,
             "auto-response executed"
+        );
+    }
+
+    /// Inline IoC enforcement on an observed network flow. A backend-pushed
+    /// `Ip`/`Cidr`/`Port` rule with action `Block` installs a firewall drop for
+    /// the destination and (best-effort) SIGKILLs the connecting process;
+    /// `Alert` audits only. The network analogue of [`process::enforce_exec`].
+    async fn enforce_network(&self, data: &NetworkConnectionData) {
+        // Only act on flow *start* records, never the synthetic close event.
+        if data.state.eq_ignore_ascii_case("closed") {
+            return;
+        }
+        let addr = match data.dst_addr.parse::<std::net::IpAddr>() {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let m = match self.policy.read().match_network(addr, data.dst_port) {
+            Some(m) => m,
+            None => return,
+        };
+        self.enforce_net_match(addr, data.dst_port, data.pid, m, "flow", None)
+            .await;
+    }
+
+    /// Inline IoC enforcement on a resolved DNS answer. A backend-pushed
+    /// `Domain` rule (Block-only) drops every resolved A/AAAA address so the
+    /// follow-up connection cannot complete, even though the resolution itself
+    /// carries no originating PID.
+    async fn enforce_dns_resolution(&self, data: &DnsResolutionData) {
+        let m = match self.policy.read().match_domain(&data.qname) {
+            Some(m) => m,
+            None => return,
+        };
+        for ip in &data.resolved_ips {
+            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                self.enforce_net_match(addr, 0, None, m.clone(), "dns", Some(&data.qname))
+                    .await;
+            }
+        }
+    }
+
+    /// Shared network-enforcement core: install a deduplicated firewall drop for
+    /// `addr` on `Block`, optionally SIGKILL the connecting `pid`, and audit the
+    /// outcome. Best-effort — a missing firewall backend or a vanished process
+    /// is recorded, never fatal.
+    async fn enforce_net_match(
+        &self,
+        addr: std::net::IpAddr,
+        port: u16,
+        pid: Option<i32>,
+        m: Match,
+        source: &str,
+        qname: Option<&str>,
+    ) {
+        let block = matches!(m.action, RuleAction::Block);
+
+        // Deduplicate firewall installs per destination so a chatty flow does
+        // not spam `nft`/`iptables` with identical drop rules.
+        let mut blocked_now = false;
+        if block {
+            let key = addr.to_string();
+            let mut set = self.blocked.lock().await;
+            if set.contains(&key) {
+                blocked_now = true;
+            } else {
+                match network::block_ip(self.cfg.net_backend, &key) {
+                    Ok(handle) => {
+                        info!(%addr, rule = %m.rule_id, %handle, "network IoC blocked");
+                        set.insert(key);
+                        blocked_now = true;
+                    }
+                    Err(e) => warn!(%addr, rule = %m.rule_id, error = %e, "network block failed"),
+                }
+            }
+        }
+
+        // Terminate the connecting process (Block only, valid single target).
+        let mut killed = false;
+        if block {
+            if let Some(pid) = pid {
+                let own_pid = std::process::id() as i32;
+                if is_valid_target_pid(pid, own_pid) {
+                    killed = process::kill_pid(pid).is_ok();
+                }
+            }
+        }
+
+        let (event_action, kind, severity) = if block {
+            (EventAction::IpBlocked, "network_block", Severity::High)
+        } else {
+            (EventAction::Detected, "network_alert", Severity::Medium)
+        };
+        // On Block the action succeeds if either the drop installed or the
+        // process was killed; an Alert always "succeeds" (it only records).
+        let success = if block { blocked_now || killed } else { true };
+
+        self.audit.emit(
+            event_action,
+            severity,
+            kind,
+            addr.to_string(),
+            success,
+            format!(
+                "network IoC {} on {addr} ({}) — {}",
+                if block { "block" } else { "alert" },
+                m.rule_id,
+                m.reason
+            ),
+            Some(m.rule_id.clone()),
+            None,
+            json!({
+                "addr": addr.to_string(),
+                "port": port,
+                "source": source,
+                "qname": qname,
+                "rule_id": m.rule_id,
+                "action": if block { "block" } else { "alert" },
+                "blocked": blocked_now,
+                "killed": killed,
+                "target_pid": pid,
+            }),
         );
     }
 
@@ -1468,6 +1599,117 @@ mod tests {
             let ev = rx.try_recv().expect("thaw rejection event");
             assert!(matches!(ev.action, EventAction::CommandRejected));
         }
+    }
+
+    /// A backend `Ip` Block rule must drive an inline `IpBlocked` enforcement
+    /// audit on a matching outbound flow (Phase 0 network enforcement). With the
+    /// `None` firewall backend nothing touches the host, but the decision still
+    /// fires and is audited — proving the wiring, not the side effect.
+    #[tokio::test]
+    async fn enforce_network_blocks_matching_ip_rule() {
+        use crate::prevention::policy::{IocRule, RuleAction};
+        use crate::schema::NetworkConnectionData;
+
+        let (engine, mut rx) = test_engine();
+        let rules = vec![IocRule::Ip {
+            id: "ioc-c2".into(),
+            value: "203.0.113.7".parse().unwrap(),
+            action: RuleAction::Block,
+        }];
+        engine
+            .policy
+            .replace(PolicyStore::from_rules(rules).unwrap());
+
+        let flow = NetworkConnectionData {
+            protocol: "tcp".into(),
+            src_addr: "10.0.0.5".into(),
+            src_port: 44321,
+            dst_addr: "203.0.113.7".into(),
+            dst_port: 443,
+            state: "established".into(),
+            pid: Some(424242),
+            process: Some("curl".into()),
+            duration_ms: None,
+            bytes_sent: None,
+            bytes_recv: None,
+            packets_sent: None,
+            packets_recv: None,
+            rtt_us: None,
+        };
+        engine.enforce_network(&flow).await;
+
+        let ev = rx.try_recv().expect("an enforcement event must be emitted");
+        assert!(matches!(ev.action, EventAction::IpBlocked));
+        match ev.data {
+            EventData::Prevention(p) => {
+                assert_eq!(p.kind, "network_block");
+                assert_eq!(p.rule_id.as_deref(), Some("ioc-c2"));
+            }
+            other => panic!("expected a prevention event, got {other:?}"),
+        }
+    }
+
+    /// A non-matching destination must produce no enforcement event at all.
+    #[tokio::test]
+    async fn enforce_network_ignores_unmatched_flow() {
+        use crate::schema::NetworkConnectionData;
+        let (engine, mut rx) = test_engine();
+        let flow = NetworkConnectionData {
+            protocol: "tcp".into(),
+            src_addr: "10.0.0.5".into(),
+            src_port: 5000,
+            dst_addr: "93.184.216.34".into(),
+            dst_port: 443,
+            state: "established".into(),
+            pid: Some(1234),
+            process: Some("firefox".into()),
+            duration_ms: None,
+            bytes_sent: None,
+            bytes_recv: None,
+            packets_sent: None,
+            packets_recv: None,
+            rtt_us: None,
+        };
+        engine.enforce_network(&flow).await;
+        assert!(rx.try_recv().is_err(), "no rule → no enforcement event");
+    }
+
+    /// A `Domain` Block rule must drop every resolved A/AAAA from a matching DNS
+    /// answer (one enforcement audit per resolved address).
+    #[tokio::test]
+    async fn enforce_dns_resolution_blocks_resolved_ips() {
+        use crate::prevention::policy::{IocRule, RuleAction};
+        use crate::schema::DnsResolutionData;
+
+        let (engine, mut rx) = test_engine();
+        let rules = vec![IocRule::Domain {
+            id: "ioc-evil-domain".into(),
+            value: "evil.example".into(),
+            action: RuleAction::Block,
+        }];
+        engine
+            .policy
+            .replace(PolicyStore::from_rules(rules).unwrap());
+
+        let answer = DnsResolutionData {
+            qname: "evil.example".into(),
+            qtype: "A".into(),
+            resolved_ips: vec!["198.51.100.9".into(), "198.51.100.10".into()],
+            cnames: vec![],
+            server_addr: "10.0.0.1".into(),
+            client_addr: "10.0.0.5".into(),
+            transaction_id: 4242,
+            rcode: "NOERROR".into(),
+        };
+        engine.enforce_dns_resolution(&answer).await;
+
+        let mut blocked = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev.action, EventAction::IpBlocked) {
+                blocked += 1;
+            }
+        }
+        assert_eq!(blocked, 2, "both resolved IPs must be blocked");
     }
 
     #[test]
