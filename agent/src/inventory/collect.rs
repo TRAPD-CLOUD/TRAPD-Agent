@@ -19,10 +19,22 @@ use super::{
 // v2 adds the deception `recon_profile` field derived from users + software.
 // v3 adds the `security_posture` baseline (SUID/SGID, capabilities, listening
 // ports, kernel modules + signature status).
-const SCHEMA_VERSION: u32 = 3;
+// v4 adds the `compliance` report (CycloneDX SBOM, CVE correlation, CIS checks).
+const SCHEMA_VERSION: u32 = 4;
 
-/// Build a full inventory snapshot for this host.
+/// Build a full inventory snapshot for this host (all compliance checks on).
+#[allow(dead_code)] // convenience wrapper retained for tests/external callers
 pub fn gather(agent_id: String, device_id: String, hostname: String) -> InventorySnapshot {
+    gather_with_flags(agent_id, device_id, hostname, super::compliance::ComplianceFlags::default())
+}
+
+/// Build a snapshot, gating the vulnerability/CIS work on the supplied flags.
+pub fn gather_with_flags(
+    agent_id: String,
+    device_id: String,
+    hostname: String,
+    flags: super::compliance::ComplianceFlags,
+) -> InventorySnapshot {
     let mut sys = System::new();
     sys.refresh_memory();
     sys.refresh_cpu();
@@ -37,6 +49,9 @@ pub fn gather(agent_id: String, device_id: String, hostname: String) -> Inventor
     let recon_profile =
         crate::deception::build_profile_with_host(&users, &software, &hostname, &network);
 
+    let os = gather_os();
+    let compliance = super::compliance::assess(&software.packages, &software.source, &os, flags);
+
     InventorySnapshot {
         schema_version: SCHEMA_VERSION,
         agent_id,
@@ -44,13 +59,14 @@ pub fn gather(agent_id: String, device_id: String, hostname: String) -> Inventor
         hostname,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         collected_at: chrono::Utc::now(),
-        os: gather_os(),
+        os,
         hardware: gather_hardware(&sys),
         network,
         software,
         users,
         security_posture: gather_security_posture(),
         recon_profile,
+        compliance,
     }
 }
 
@@ -799,7 +815,9 @@ mod tests {
     #[test]
     fn snapshot_includes_security_posture() {
         let s = gather("aid".into(), "did".into(), "host".into());
-        assert_eq!(s.schema_version, 3);
+        assert_eq!(s.schema_version, 4);
+        // Compliance assessment is always populated (SBOM at minimum).
+        assert_eq!(s.compliance.sbom.bom_format, "CycloneDX");
         // On a real Linux host /proc/modules + listening ports are usually
         // present, but the scan is best-effort, so we only assert the field
         // exists and is internally consistent.

@@ -19,6 +19,7 @@
 //! only the gathering helpers in this module are Linux-specific.
 
 mod collect;
+pub mod compliance;
 
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -59,6 +60,9 @@ pub struct InventorySnapshot {
     /// from the observed context above. The backend turns these into believable
     /// content and ranks them before issuing `deploy_honeytoken` commands.
     pub recon_profile: crate::deception::ReconProfile,
+    /// Vulnerability & compliance assessment: CycloneDX SBOM, CVE correlation
+    /// against the local feed, and CIS-style host-hardening checks.
+    pub compliance: compliance::ComplianceReport,
 }
 
 /// Host attack-surface baseline. Every field is a point-in-time inventory the
@@ -266,8 +270,16 @@ impl InventoryReporter {
         let agent_id = self.agent_id.clone();
         let device_id = self.device_id.clone();
         let hostname = self.hostname.clone();
+        let flags = self
+            .config
+            .read()
+            .map(|c| compliance::ComplianceFlags {
+                vuln_scan: c.vuln_scan_enabled,
+                cis: c.cis_benchmark_enabled,
+            })
+            .unwrap_or_default();
         let snapshot = match tokio::task::spawn_blocking(move || {
-            collect::gather(agent_id, device_id, hostname)
+            collect::gather_with_flags(agent_id, device_id, hostname, flags)
         })
         .await
         {
