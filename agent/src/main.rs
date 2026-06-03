@@ -253,16 +253,33 @@ async fn main() -> Result<()> {
     // Pick up threat-intel feed updates without a restart.
     Arc::clone(&engine).spawn_ioc_reloader(300);
 
+    // SIEM forwarder — best-effort export of every event (and detection) to
+    // external syslog/HEC infrastructure, in parallel with backend ingest.
+    let siem = {
+        let cfg = agent_config.read().ok();
+        let fwd = cfg
+            .map(|c| output::siem::SiemForwarder::from_config(&c, env!("CARGO_PKG_VERSION")))
+            .unwrap_or_else(|| {
+                output::siem::SiemForwarder::from_config(&AgentConfig::default(), env!("CARGO_PKG_VERSION"))
+            });
+        if fwd.is_active() {
+            info!("SIEM forwarding active");
+        }
+        fwd
+    };
+
     let buf_for_consumer = Arc::clone(&ring_buffer);
     let mode = output_mode;
     let prev_tx = prev_event_tx.clone();
     let det_engine = Arc::clone(&engine);
+    let siem_fwd = siem.clone();
     let mut consumer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             if let Some(p) = &prev_tx {
                 let _ = p.try_send(event.clone());
             }
             handle_event(&event, &mode, &buf_for_consumer).await;
+            siem_fwd.forward(&event).await;
 
             // Run detections and treat each finding as a first-class event:
             // persisted, buffered for the backend, and forwarded to prevention.
@@ -271,6 +288,7 @@ async fn main() -> Result<()> {
                     let _ = p.try_send(det.clone());
                 }
                 handle_event(&det, &mode, &buf_for_consumer).await;
+                siem_fwd.forward(&det).await;
             }
         }
     });
