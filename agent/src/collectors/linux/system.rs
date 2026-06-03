@@ -47,28 +47,28 @@ fn collect_system_info() -> Result<SystemSnapshotData> {
     sys.refresh_cpu();
     sys.refresh_memory();
 
-    let cpu_count    = sys.cpus().len();
-    let cpu_usage    = sys.global_cpu_info().cpu_usage();
+    let cpu_count = sys.cpus().len();
+    let cpu_usage = sys.global_cpu_info().cpu_usage();
     let total_mem_mb = sys.total_memory() / (1024 * 1024);
-    let used_mem_mb  = sys.used_memory() / (1024 * 1024);
-    let free_mem_mb  = sys.free_memory() / (1024 * 1024);
-    let uptime_secs  = System::uptime();
-    let load         = System::load_average();
-    let kernel       = System::kernel_version().unwrap_or_default();
-    let os_name      = System::name().unwrap_or_else(|| "Linux".to_string());
-    let distro       = read_distro();
+    let used_mem_mb = sys.used_memory() / (1024 * 1024);
+    let free_mem_mb = sys.free_memory() / (1024 * 1024);
+    let uptime_secs = System::uptime();
+    let load = System::load_average();
+    let kernel = System::kernel_version().unwrap_or_default();
+    let os_name = System::name().unwrap_or_else(|| "Linux".to_string());
+    let distro = read_distro();
 
     Ok(SystemSnapshotData {
-        os:              os_name,
+        os: os_name,
         kernel,
         distro,
         cpu_count,
-        cpu_usage_pct:   cpu_usage,
+        cpu_usage_pct: cpu_usage,
         memory_total_mb: total_mem_mb,
-        memory_used_mb:  used_mem_mb,
-        memory_free_mb:  free_mem_mb,
+        memory_used_mb: used_mem_mb,
+        memory_free_mb: free_mem_mb,
         uptime_secs,
-        load_avg:        [load.one, load.five, load.fifteen],
+        load_avg: [load.one, load.five, load.fifteen],
     })
 }
 
@@ -80,7 +80,7 @@ impl Collector for SystemCollector {
 
     async fn run(
         &mut self,
-        tx:       Sender<AgentEvent>,
+        tx: Sender<AgentEvent>,
         agent_id: String,
         hostname: String,
     ) -> Result<()> {

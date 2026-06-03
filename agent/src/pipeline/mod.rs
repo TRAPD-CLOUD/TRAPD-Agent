@@ -65,7 +65,7 @@ pub struct Spool {
 }
 
 struct SpoolFile {
-    path:   PathBuf,
+    path: PathBuf,
     handle: File,
 }
 
@@ -101,12 +101,18 @@ impl Spool {
         let replayed = spool.load(&path);
         match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(handle) => {
-                spool.file = Some(SpoolFile { path: path.clone(), handle });
+                spool.file = Some(SpoolFile {
+                    path: path.clone(),
+                    handle,
+                });
                 // Rewrite the journal from the (capped) replayed set, dropping
                 // any torn/over-cap lines so we start from a clean file.
                 spool.compact();
                 if replayed > 0 {
-                    info!(events = replayed, "spool: replayed persisted events from a previous run");
+                    info!(
+                        events = replayed,
+                        "spool: replayed persisted events from a previous run"
+                    );
                 }
             }
             Err(e) => warn!(

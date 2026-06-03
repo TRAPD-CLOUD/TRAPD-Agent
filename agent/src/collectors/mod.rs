@@ -10,7 +10,7 @@ pub trait Collector: Send + Sync + 'static {
 
     async fn run(
         &mut self,
-        tx:       Sender<AgentEvent>,
+        tx: Sender<AgentEvent>,
         agent_id: String,
         hostname: String,
     ) -> Result<()>;

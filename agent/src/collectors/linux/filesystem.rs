@@ -22,8 +22,15 @@ use crate::schema::{
 
 /// Paths subject to SHA256 integrity baseline (FIM).
 const FIM_PATHS: &[&str] = &[
-    "/usr/bin", "/usr/sbin", "/lib", "/lib64", "/boot", "/sbin", "/root",
-    "/etc", "/bin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/lib",
+    "/lib64",
+    "/boot",
+    "/sbin",
+    "/root",
+    "/etc",
+    "/bin",
 ];
 
 /// Paths monitored for ransomware-style mass writes / high-entropy content.
@@ -38,7 +45,11 @@ const AGENT_CONFIG_PATHS: &[&str] = &["/etc/trapd"];
 /// Credential / secret stores.  A file-open of any of these by an unexpected
 /// process is treated as credential theft (MITRE T1555 / T1552.004).
 const SENSITIVE_PATHS: &[&str] = &[
-    "/etc/shadow", "/etc/gshadow", ".ssh/", ".aws/credentials", ".kube/config",
+    "/etc/shadow",
+    "/etc/gshadow",
+    ".ssh/",
+    ".aws/credentials",
+    ".kube/config",
 ];
 
 /// Processes legitimately expected to open the sensitive paths above.
@@ -68,10 +79,25 @@ const MASS_MOD_WINDOW: Duration = Duration::from_secs(10);
 
 /// Ransomware-associated file extension suffixes (lower-case).
 const RANSOM_EXTENSIONS: &[&str] = &[
-    ".locked", ".encrypted", ".crypt", ".crypted", ".crypto",
-    ".enc", ".locky", ".wannacry", ".ryuk", ".maze",
-    ".sodinokibi", ".revil", ".darkside", ".conti", ".lockbit",
-    ".babuk", ".blackcat", ".hive", ".alphv",
+    ".locked",
+    ".encrypted",
+    ".crypt",
+    ".crypted",
+    ".crypto",
+    ".enc",
+    ".locky",
+    ".wannacry",
+    ".ryuk",
+    ".maze",
+    ".sodinokibi",
+    ".revil",
+    ".darkside",
+    ".conti",
+    ".lockbit",
+    ".babuk",
+    ".blackcat",
+    ".hive",
+    ".alphv",
 ];
 
 // ── Collector struct ──────────────────────────────────────────────────────────
@@ -91,16 +117,20 @@ impl FilesystemCollector {
 }
 
 impl Default for FilesystemCollector {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait]
 impl Collector for FilesystemCollector {
-    fn name(&self) -> &'static str { "FilesystemCollector" }
+    fn name(&self) -> &'static str {
+        "FilesystemCollector"
+    }
 
     async fn run(
         &mut self,
-        tx:       Sender<AgentEvent>,
+        tx: Sender<AgentEvent>,
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
@@ -139,14 +169,17 @@ impl Collector for FilesystemCollector {
 // ── Sync thread ───────────────────────────────────────────────────────────────
 
 fn run_sync(
-    tx:       tokio::sync::mpsc::Sender<AgentEvent>,
+    tx: tokio::sync::mpsc::Sender<AgentEvent>,
     agent_id: String,
     hostname: String,
-    db_path:  PathBuf,
+    db_path: PathBuf,
 ) {
     let conn = match open_db(&db_path) {
-        Ok(c)  => c,
-        Err(e) => { warn!("FilesystemCollector: SQLite init failed: {e}"); return; }
+        Ok(c) => c,
+        Err(e) => {
+            warn!("FilesystemCollector: SQLite init failed: {e}");
+            return;
+        }
     };
 
     // Build or refresh the SHA256 baseline.
@@ -154,15 +187,19 @@ fn run_sync(
     info!("FilesystemCollector: baseline ready — {baseline_count} files indexed");
 
     let mut inotify = match Inotify::init() {
-        Ok(i)  => i,
-        Err(e) => { warn!("FilesystemCollector: inotify init failed: {e}"); return; }
+        Ok(i) => i,
+        Err(e) => {
+            warn!("FilesystemCollector: inotify init failed: {e}");
+            return;
+        }
     };
 
     let mut wd_map: std::collections::HashMap<inotify::WatchDescriptor, &'static str> =
         std::collections::HashMap::new();
 
     // Combine all path groups into a single watch list (deduplicated by inotify itself).
-    let all_paths: Vec<&'static str> = FIM_PATHS.iter()
+    let all_paths: Vec<&'static str> = FIM_PATHS
+        .iter()
         .chain(RANSOM_WATCH_PATHS.iter())
         .chain(BACKUP_PATHS.iter())
         .chain(AGENT_CONFIG_PATHS.iter())
@@ -178,7 +215,9 @@ fn run_sync(
             continue;
         }
         match inotify.watches().add(path, WATCH_MASK) {
-            Ok(wd) => { wd_map.insert(wd, path); }
+            Ok(wd) => {
+                wd_map.insert(wd, path);
+            }
             Err(e) => warn!("FilesystemCollector: cannot watch {path}: {e}"),
         }
     }
@@ -193,44 +232,56 @@ fn run_sync(
     let mut buf = [0u8; 4096];
     loop {
         let events = match inotify.read_events_blocking(&mut buf) {
-            Ok(e)  => e,
-            Err(e) => { warn!("FilesystemCollector: inotify read error: {e}"); break; }
+            Ok(e) => e,
+            Err(e) => {
+                warn!("FilesystemCollector: inotify read error: {e}");
+                break;
+            }
         };
 
         for event in events {
             let dir = match wd_map.get(&event.wd).copied() {
                 Some(d) => d,
-                None    => continue,
+                None => continue,
             };
             let path = match &event.name {
                 Some(name) => format!("{dir}/{}", name.to_string_lossy()),
-                None       => dir.to_string(),
+                None => dir.to_string(),
             };
             let mask = event.mask;
 
             // ── Agent-config tampering (severity: critical) ───────────────────
             if is_agent_config_path(&path) {
-                let action_str = if mask.contains(EventMask::DELETE) || mask.contains(EventMask::MOVED_FROM) {
+                let action_str = if mask.contains(EventMask::DELETE)
+                    || mask.contains(EventMask::MOVED_FROM)
+                {
                     "delete"
                 } else if mask.contains(EventMask::CREATE) || mask.contains(EventMask::MOVED_TO) {
                     "create"
                 } else {
                     "modify"
                 };
-                if send(&tx, AgentEvent::new(
-                    agent_id.clone(), hostname.clone(),
-                    EventClass::Filesystem, EventAction::AgentTamper, Severity::Critical,
-                    EventData::AgentTamper(AgentTamperData {
-                        path: path.clone(), action: action_str.to_string(),
-                    }),
-                )) { return; }
+                if send(
+                    &tx,
+                    AgentEvent::new(
+                        agent_id.clone(),
+                        hostname.clone(),
+                        EventClass::Filesystem,
+                        EventAction::AgentTamper,
+                        Severity::Critical,
+                        EventData::AgentTamper(AgentTamperData {
+                            path: path.clone(),
+                            action: action_str.to_string(),
+                        }),
+                    ),
+                ) {
+                    return;
+                }
             }
 
             // ── FIM: SHA256 integrity check on MODIFY ─────────────────────────
             if mask.contains(EventMask::MODIFY) && is_fim_path(&path) {
-                if let Err(e) = check_fim_integrity(
-                    &conn, &path, &agent_id, &hostname, &tx,
-                ) {
+                if let Err(e) = check_fim_integrity(&conn, &path, &agent_id, &hostname, &tx) {
                     warn!("FilesystemCollector: FIM check error for {path}: {e}");
                 }
             }
@@ -260,88 +311,132 @@ fn run_sync(
                 // Track modification rate across the sliding window.
                 let now = Instant::now();
                 mod_window.push_back(now);
-                while mod_window.front().is_some_and(|t| now.duration_since(*t) > MASS_MOD_WINDOW) {
+                while mod_window
+                    .front()
+                    .is_some_and(|t| now.duration_since(*t) > MASS_MOD_WINDOW)
+                {
                     mod_window.pop_front();
                 }
                 if mod_window.len() >= MASS_MOD_THRESHOLD {
                     let rate = mod_window.len() as u64;
                     mod_window.clear(); // reset to avoid alert flooding
-                    if send(&tx, AgentEvent::new(
-                        agent_id.clone(), hostname.clone(),
-                        EventClass::Filesystem, EventAction::RansomwareIndicator, Severity::High,
-                        EventData::RansomwareIndicator(RansomwareIndicatorData {
-                            indicator_type: "high_write_rate".to_string(),
-                            path:           None,
-                            pid:            None,
-                            comm:           None,
-                            entropy:        None,
-                            write_rate:     Some(rate),
-                            details:        format!(
-                                "{rate} file modifications in {}s (threshold {})",
-                                MASS_MOD_WINDOW.as_secs(), MASS_MOD_THRESHOLD,
-                            ),
-                        }),
-                    )) { return; }
+                    if send(
+                        &tx,
+                        AgentEvent::new(
+                            agent_id.clone(),
+                            hostname.clone(),
+                            EventClass::Filesystem,
+                            EventAction::RansomwareIndicator,
+                            Severity::High,
+                            EventData::RansomwareIndicator(RansomwareIndicatorData {
+                                indicator_type: "high_write_rate".to_string(),
+                                path: None,
+                                pid: None,
+                                comm: None,
+                                entropy: None,
+                                write_rate: Some(rate),
+                                details: format!(
+                                    "{rate} file modifications in {}s (threshold {})",
+                                    MASS_MOD_WINDOW.as_secs(),
+                                    MASS_MOD_THRESHOLD,
+                                ),
+                            }),
+                        ),
+                    ) {
+                        return;
+                    }
                 }
             }
 
             // ── Ransomware: suspicious extension on CREATE / RENAME ───────────
             if (mask.contains(EventMask::MOVED_TO) || mask.contains(EventMask::CREATE))
                 && has_ransom_extension(&path)
-                && send(&tx, AgentEvent::new(
-                    agent_id.clone(), hostname.clone(),
-                    EventClass::Filesystem, EventAction::RansomwareIndicator, Severity::High,
-                    EventData::RansomwareIndicator(RansomwareIndicatorData {
-                        indicator_type: "suspicious_extension".to_string(),
-                        path:           Some(path.clone()),
-                        pid:            None,
-                        comm:           None,
-                        entropy:        None,
-                        write_rate:     None,
-                        details:        format!(
-                            "File appeared with ransomware-associated extension: {path}"
-                        ),
-                    }),
-                ))
-            { return; }
+                && send(
+                    &tx,
+                    AgentEvent::new(
+                        agent_id.clone(),
+                        hostname.clone(),
+                        EventClass::Filesystem,
+                        EventAction::RansomwareIndicator,
+                        Severity::High,
+                        EventData::RansomwareIndicator(RansomwareIndicatorData {
+                            indicator_type: "suspicious_extension".to_string(),
+                            path: Some(path.clone()),
+                            pid: None,
+                            comm: None,
+                            entropy: None,
+                            write_rate: None,
+                            details: format!(
+                                "File appeared with ransomware-associated extension: {path}"
+                            ),
+                        }),
+                    ),
+                )
+            {
+                return;
+            }
 
             // ── Ransomware: backup directory deletion ─────────────────────────
             if (mask.contains(EventMask::DELETE) || mask.contains(EventMask::MOVED_FROM))
                 && is_backup_path(&path)
-                && send(&tx, AgentEvent::new(
-                    agent_id.clone(), hostname.clone(),
-                    EventClass::Filesystem, EventAction::RansomwareIndicator, Severity::High,
-                    EventData::RansomwareIndicator(RansomwareIndicatorData {
-                        indicator_type: "backup_deletion".to_string(),
-                        path:           Some(path.clone()),
-                        pid:            None,
-                        comm:           None,
-                        entropy:        None,
-                        write_rate:     None,
-                        details:        format!("Backup path deleted or moved: {path}"),
-                    }),
-                ))
-            { return; }
+                && send(
+                    &tx,
+                    AgentEvent::new(
+                        agent_id.clone(),
+                        hostname.clone(),
+                        EventClass::Filesystem,
+                        EventAction::RansomwareIndicator,
+                        Severity::High,
+                        EventData::RansomwareIndicator(RansomwareIndicatorData {
+                            indicator_type: "backup_deletion".to_string(),
+                            path: Some(path.clone()),
+                            pid: None,
+                            comm: None,
+                            entropy: None,
+                            write_rate: None,
+                            details: format!("Backup path deleted or moved: {path}"),
+                        }),
+                    ),
+                )
+            {
+                return;
+            }
 
             // ── YARA: scan newly-created files (feature `yara`) ───────────────
             #[cfg(feature = "yara")]
             if mask.contains(EventMask::CREATE) {
                 if let Some((sev, data)) = yara_scanner.scan_file(&path) {
-                    if send(&tx, AgentEvent::new(
-                        agent_id.clone(), hostname.clone(),
-                        EventClass::Detection, EventAction::Detected, sev,
-                        EventData::Detection(data),
-                    )) { return; }
+                    if send(
+                        &tx,
+                        AgentEvent::new(
+                            agent_id.clone(),
+                            hostname.clone(),
+                            EventClass::Detection,
+                            EventAction::Detected,
+                            sev,
+                            EventData::Detection(data),
+                        ),
+                    ) {
+                        return;
+                    }
                 }
             }
 
             // ── Basic inotify event (always emitted) ──────────────────────────
             if let Some(action) = mask_to_action(mask) {
-                if send(&tx, AgentEvent::new(
-                    agent_id.clone(), hostname.clone(),
-                    EventClass::Filesystem, action, Severity::Info,
-                    EventData::FileEvent(FileEventData { path }),
-                )) { return; }
+                if send(
+                    &tx,
+                    AgentEvent::new(
+                        agent_id.clone(),
+                        hostname.clone(),
+                        EventClass::Filesystem,
+                        action,
+                        Severity::Info,
+                        EventData::FileEvent(FileEventData { path }),
+                    ),
+                ) {
+                    return;
+                }
             }
         }
     }
@@ -375,7 +470,9 @@ fn current_token_paths() -> Vec<String> {
     let path = crate::deception::registry::registry_path();
     std::fs::read(&path)
         .ok()
-        .and_then(|b| serde_json::from_slice::<crate::deception::registry::HoneytokenRegistry>(&b).ok())
+        .and_then(|b| {
+            serde_json::from_slice::<crate::deception::registry::HoneytokenRegistry>(&b).ok()
+        })
         .map(|r| r.tokens.into_iter().map(|t| t.path).collect())
         .unwrap_or_default()
 }
@@ -385,11 +482,7 @@ fn current_token_paths() -> Vec<String> {
 /// or has its attributes changed. Runs on its own thread for the agent's
 /// lifetime, reconciling the watch set from the register every
 /// [`TOKEN_FIM_RELOAD_SECS`].
-fn run_token_fim(
-    tx:       tokio::sync::mpsc::Sender<AgentEvent>,
-    agent_id: String,
-    hostname: String,
-) {
+fn run_token_fim(tx: tokio::sync::mpsc::Sender<AgentEvent>, agent_id: String, hostname: String) {
     let mut inotify = match Inotify::init() {
         Ok(i) => i,
         Err(e) => {
@@ -457,7 +550,9 @@ fn run_token_fim(
                         }
                         continue;
                     }
-                    let Some(path) = wd_map.get(&event.wd).cloned() else { continue };
+                    let Some(path) = wd_map.get(&event.wd).cloned() else {
+                        continue;
+                    };
 
                     let (indicator, technique, tactic) = if event.mask.contains(EventMask::ATTRIB) {
                         ("attribute_change", "T1070.006", "TA0005 Defense Evasion")
@@ -465,27 +560,35 @@ fn run_token_fim(
                         ("content_modified", "T1565.001", "TA0040 Impact")
                     };
 
-                    if send(&tx, AgentEvent::new(
-                        agent_id.clone(), hostname.clone(),
-                        EventClass::Detection, EventAction::Detected, Severity::Critical,
-                        EventData::Detection(DetectionData {
-                            rule_id:         "deception.honeytoken_tamper".to_string(),
-                            title:           "Honeytoken file tampered".to_string(),
-                            category:        "deception".to_string(),
-                            mitre_tactic:    Some(tactic.to_string()),
-                            mitre_technique: Some(technique.to_string()),
-                            confidence:      90,
-                            subject:         path.clone(),
-                            detail:          format!(
+                    if send(
+                        &tx,
+                        AgentEvent::new(
+                            agent_id.clone(),
+                            hostname.clone(),
+                            EventClass::Detection,
+                            EventAction::Detected,
+                            Severity::Critical,
+                            EventData::Detection(DetectionData {
+                                rule_id: "deception.honeytoken_tamper".to_string(),
+                                title: "Honeytoken file tampered".to_string(),
+                                category: "deception".to_string(),
+                                mitre_tactic: Some(tactic.to_string()),
+                                mitre_technique: Some(technique.to_string()),
+                                confidence: 90,
+                                subject: path.clone(),
+                                detail: format!(
                                 "Deployed honeytoken {path} was altered in place ({indicator}); \
                                  the agent never modifies a placed token, so this is tamper."
                             ),
-                            evidence:        serde_json::json!({
-                                "indicator": indicator,
-                                "inotify_mask": format!("{:?}", event.mask),
+                                evidence: serde_json::json!({
+                                    "indicator": indicator,
+                                    "inotify_mask": format!("{:?}", event.mask),
+                                }),
                             }),
-                        }),
-                    )) { return; }
+                        ),
+                    ) {
+                        return;
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -557,7 +660,7 @@ fn load_or_build_baseline(conn: &Connection) -> usize {
         .flatten();
 
     let needs_rebuild = match oldest {
-        None    => true,
+        None => true,
         Some(t) => (now - t) > BASELINE_MAX_AGE_SECS,
     };
 
@@ -565,8 +668,10 @@ fn load_or_build_baseline(conn: &Connection) -> usize {
         info!("FilesystemCollector: (re)building SHA256 baseline for FIM paths …");
         build_baseline(conn)
     } else {
-        conn.query_row("SELECT COUNT(*) FROM baseline", [], |r| r.get::<_, usize>(0))
-            .unwrap_or(0)
+        conn.query_row("SELECT COUNT(*) FROM baseline", [], |r| {
+            r.get::<_, usize>(0)
+        })
+        .unwrap_or(0)
     }
 }
 
@@ -575,9 +680,13 @@ fn build_baseline(conn: &Connection) -> usize {
     let mut count = 0usize;
 
     for &root in FIM_PATHS {
-        if !Path::new(root).exists() { continue; }
+        if !Path::new(root).exists() {
+            continue;
+        }
         for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
-            if !entry.file_type().is_file() { continue; }
+            if !entry.file_type().is_file() {
+                continue;
+            }
             let path = entry.path().to_string_lossy().into_owned();
             match sha256_file(&path) {
                 Ok((hash, size)) => {
@@ -598,14 +707,14 @@ fn build_baseline(conn: &Connection) -> usize {
 /// Check whether a modified file's hash matches the baseline and emit an event if not.
 /// The baseline is intentionally NOT updated here — it stays stable until explicitly rebuilt.
 fn check_fim_integrity(
-    conn:     &Connection,
-    path:     &str,
+    conn: &Connection,
+    path: &str,
     agent_id: &str,
     hostname: &str,
-    tx:       &tokio::sync::mpsc::Sender<AgentEvent>,
+    tx: &tokio::sync::mpsc::Sender<AgentEvent>,
 ) -> Result<()> {
     let (new_hash, new_size) = match sha256_file(path) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(_) => return Ok(()), // file gone / unreadable — DELETE event will cover it
     };
 
@@ -630,12 +739,15 @@ fn check_fim_integrity(
         Some((expected_hash, old_size)) if expected_hash != new_hash => {
             let size_delta = new_size as i64 - old_size;
             tx.blocking_send(AgentEvent::new(
-                agent_id.to_string(), hostname.to_string(),
-                EventClass::Filesystem, EventAction::IntegrityViolation, Severity::High,
+                agent_id.to_string(),
+                hostname.to_string(),
+                EventClass::Filesystem,
+                EventAction::IntegrityViolation,
+                Severity::High,
                 EventData::IntegrityViolation(IntegrityViolationData {
-                    path:          path.to_string(),
+                    path: path.to_string(),
                     expected_hash,
-                    actual_hash:   new_hash,
+                    actual_hash: new_hash,
                     size_delta,
                 }),
             ))?;
@@ -656,7 +768,9 @@ fn sha256_file(path: &str) -> Result<(String, u64)> {
     let mut buf = [0u8; 65_536];
     loop {
         let n = file.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Ok((format!("sha256:{}", hex::encode(hasher.finalize())), size))
@@ -665,20 +779,30 @@ fn sha256_file(path: &str) -> Result<(String, u64)> {
 fn compute_file_entropy(path: &str) -> Option<f64> {
     let meta = std::fs::metadata(path).ok()?;
     let len = meta.len();
-    if len == 0 || len > MAX_ENTROPY_BYTES { return None; }
+    if len == 0 || len > MAX_ENTROPY_BYTES {
+        return None;
+    }
     let data = std::fs::read(path).ok()?;
     Some(shannon_entropy(&data))
 }
 
 fn shannon_entropy(data: &[u8]) -> f64 {
-    if data.is_empty() { return 0.0; }
+    if data.is_empty() {
+        return 0.0;
+    }
     let mut counts = [0u64; 256];
-    for &b in data { counts[b as usize] += 1; }
+    for &b in data {
+        counts[b as usize] += 1;
+    }
     let len = data.len() as f64;
-    counts.iter().filter(|&&c| c > 0).map(|&c| {
-        let p = c as f64 / len;
-        -p * p.log2()
-    }).sum()
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 // ── Path classification helpers ───────────────────────────────────────────────

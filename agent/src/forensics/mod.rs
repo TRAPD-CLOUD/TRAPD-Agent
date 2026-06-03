@@ -124,11 +124,14 @@ impl snapshot::SnapshotProc for RealProc {
 
 /// Resolve a username from `/etc/passwd` (shared by the readers).
 fn username_for_uid(uid: u32) -> Option<String> {
-    std::fs::read_to_string("/etc/passwd").ok()?.lines().find_map(|line| {
-        let mut f = line.splitn(7, ':');
-        let name = f.next()?;
-        let _ = f.next();
-        let u = f.next()?.parse::<u32>().ok()?;
-        (u == uid).then(|| name.to_string())
-    })
+    std::fs::read_to_string("/etc/passwd")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let mut f = line.splitn(7, ':');
+            let name = f.next()?;
+            let _ = f.next();
+            let u = f.next()?.parse::<u32>().ok()?;
+            (u == uid).then(|| name.to_string())
+        })
 }

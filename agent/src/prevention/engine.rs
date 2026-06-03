@@ -12,9 +12,9 @@
 //! Errors are audited but never propagated; the prevention engine MUST keep
 //! running even when individual actions fail (e.g. `nft` missing on the box).
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -107,8 +107,8 @@ impl ResponseLevel {
 
 pub struct Engine {
     policy: PolicyHandle,
-    audit:  AuditEmitter,
-    cfg:    EngineConfig,
+    audit: AuditEmitter,
+    cfg: EngineConfig,
     /// Set of currently-blocked IPs/CIDRs (string form for direct nft passthrough).
     blocked: Arc<tokio::sync::Mutex<HashSet<String>>>,
     /// Register of honeytokens deployed on this host (deploy/revoke lifecycle).
@@ -220,7 +220,11 @@ impl Engine {
             allow.sort();
             allow.dedup();
             isolated = network::isolate(self.cfg.net_backend, &allow).is_ok();
-            actions.push(if isolated { "isolate" } else { "isolate_failed" });
+            actions.push(if isolated {
+                "isolate"
+            } else {
+                "isolate_failed"
+            });
         }
 
         // Flight recorder: pull the buffered pre-history of the accessor and its
@@ -253,7 +257,10 @@ impl Engine {
             true,
             format!(
                 "honeytoken '{}' accessed by {} (pid {}) — response level '{}'",
-                data.kind, data.accessor.comm, pid, level.as_str()
+                data.kind,
+                data.accessor.comm,
+                pid,
+                level.as_str()
             ),
             None,
             None,
@@ -281,8 +288,15 @@ impl Engine {
     /// Auto-respond to a generic local detection (config-gated, off by default).
     async fn auto_respond_detection(&self, event: &AgentEvent, det: &DetectionData) {
         let targets = response::targets_from_detection(&det.subject, &det.evidence);
-        self.auto_respond(event, &det.rule_id, &det.category, det.confidence, &det.subject, targets)
-            .await;
+        self.auto_respond(
+            event,
+            &det.rule_id,
+            &det.category,
+            det.confidence,
+            &det.subject,
+            targets,
+        )
+        .await;
     }
 
     /// Auto-respond to a ransomware indicator. Its payload carries the writer
@@ -333,8 +347,16 @@ impl Engine {
         };
 
         let decision = response::decide(
-            enabled, action, min_sev, min_conf, &allow,
-            event.severity, rule_id, category, confidence, &targets,
+            enabled,
+            action,
+            min_sev,
+            min_conf,
+            &allow,
+            event.severity,
+            rule_id,
+            category,
+            confidence,
+            &targets,
         );
         if matches!(decision.action, AutoAction::None) {
             return;
@@ -391,7 +413,11 @@ impl Engine {
         if matches!(decision.action, AutoAction::Quarantine) {
             if let Some(path) = &targets.file_path {
                 quarantined = quarantine::quarantine(Path::new(path)).is_ok();
-                actions.push(if quarantined { "quarantine" } else { "quarantine_failed" });
+                actions.push(if quarantined {
+                    "quarantine"
+                } else {
+                    "quarantine_failed"
+                });
             }
         }
 
@@ -400,7 +426,11 @@ impl Engine {
             allow.sort();
             allow.dedup();
             isolated = network::isolate(self.cfg.net_backend, &allow).is_ok();
-            actions.push(if isolated { "isolate" } else { "isolate_failed" });
+            actions.push(if isolated {
+                "isolate"
+            } else {
+                "isolate_failed"
+            });
         }
 
         if actions.is_empty() {
@@ -575,7 +605,10 @@ impl Engine {
 
     /// Echo the detection-time session, correlating the remote source IP from
     /// the flight recorder's buffered logons when it is not already populated.
-    fn correlate_session(&self, data: &HoneytokenAccessData) -> Option<crate::schema::SessionContext> {
+    fn correlate_session(
+        &self,
+        data: &HoneytokenAccessData,
+    ) -> Option<crate::schema::SessionContext> {
         let mut s = data.session.clone()?;
         if s.remote_addr.is_none() {
             if let Some((addr, port)) = self.recorder.correlate_remote(s.login_user.as_deref()) {
@@ -719,7 +752,11 @@ impl Engine {
             CommandPayload::ThawPid { pid } => {
                 self.cmd_thaw_pid(*pid, &cmd_id);
             }
-            CommandPayload::RunScript { interpreter, script_b64, timeout_secs } => {
+            CommandPayload::RunScript {
+                interpreter,
+                script_b64,
+                timeout_secs,
+            } => {
                 self.cmd_run_script(interpreter.as_deref(), script_b64, *timeout_secs, &cmd_id)
                     .await;
             }
@@ -790,33 +827,47 @@ impl Engine {
             .stdin(std::process::Stdio::null())
             .output();
 
-        let (success, code, stdout, stderr, note) =
-            match tokio::time::timeout(timeout, run).await {
-                Ok(Ok(out)) => (
-                    out.status.success(),
-                    out.status.code(),
-                    out.stdout,
-                    out.stderr,
-                    String::new(),
-                ),
-                Ok(Err(e)) => (false, None, Vec::new(), Vec::new(), format!("spawn failed: {e}")),
-                Err(_) => (false, None, Vec::new(), Vec::new(), "timed out".to_string()),
-            };
+        let (success, code, stdout, stderr, note) = match tokio::time::timeout(timeout, run).await {
+            Ok(Ok(out)) => (
+                out.status.success(),
+                out.status.code(),
+                out.stdout,
+                out.stderr,
+                String::new(),
+            ),
+            Ok(Err(e)) => (
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                format!("spawn failed: {e}"),
+            ),
+            Err(_) => (false, None, Vec::new(), Vec::new(), "timed out".to_string()),
+        };
 
         let max = max_bytes as usize;
         let out_art = response_rtr::cap_and_encode(&stdout, max);
-        let err_art = response_rtr::cap_and_encode(&stderr, max.saturating_sub(out_art.b64.len()).max(1));
+        let err_art =
+            response_rtr::cap_and_encode(&stderr, max.saturating_sub(out_art.b64.len()).max(1));
 
         self.audit.emit(
             EventAction::CommandAccepted,
-            if success { Severity::Info } else { Severity::Medium },
+            if success {
+                Severity::Info
+            } else {
+                Severity::Medium
+            },
             "rtr_run_script",
             prog.clone(),
             success,
             format!(
                 "ran script via {prog} (exit {}{})",
                 code.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
-                if note.is_empty() { String::new() } else { format!(", {note}") }
+                if note.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {note}")
+                }
             ),
             None,
             Some(cmd_id.into()),
@@ -850,7 +901,10 @@ impl Engine {
                     "rtr_collect_file",
                     path.to_string(),
                     true,
-                    format!("collected {} of {} bytes from {path}", art.returned_len, art.total_len),
+                    format!(
+                        "collected {} of {} bytes from {path}",
+                        art.returned_len, art.total_len
+                    ),
                     None,
                     Some(cmd_id.into()),
                     json!({
@@ -986,8 +1040,16 @@ impl Engine {
         let art = response_rtr::cap_and_encode(&buf, cap as usize);
         let success = !buf.is_empty();
         self.audit.emit(
-            if success { EventAction::CommandAccepted } else { EventAction::CommandRejected },
-            if success { Severity::Info } else { Severity::Medium },
+            if success {
+                EventAction::CommandAccepted
+            } else {
+                EventAction::CommandRejected
+            },
+            if success {
+                Severity::Info
+            } else {
+                Severity::Medium
+            },
             "rtr_collect_memory",
             format!("pid {pid}"),
             success,
@@ -995,7 +1057,11 @@ impl Engine {
                 "dumped {} bytes from {} region(s) of pid {pid}{}",
                 art.returned_len,
                 regions.len(),
-                if mem.is_err() { " (/proc/<pid>/mem unreadable — need CAP_SYS_PTRACE)" } else { "" }
+                if mem.is_err() {
+                    " (/proc/<pid>/mem unreadable — need CAP_SYS_PTRACE)"
+                } else {
+                    ""
+                }
             ),
             None,
             Some(cmd_id.into()),
@@ -1020,7 +1086,11 @@ impl Engine {
         let snapshot = forensics::capture_snapshot(pid, frozen);
         self.audit.emit(
             EventAction::ProcessFrozen,
-            if frozen { Severity::High } else { Severity::Medium },
+            if frozen {
+                Severity::High
+            } else {
+                Severity::Medium
+            },
             "process_freeze",
             pid.to_string(),
             frozen,
@@ -1044,7 +1114,11 @@ impl Engine {
         let thawed = process::thaw_pid(pid).is_ok();
         self.audit.emit(
             EventAction::ProcessThawed,
-            if thawed { Severity::Info } else { Severity::Medium },
+            if thawed {
+                Severity::Info
+            } else {
+                Severity::Medium
+            },
             "process_thaw",
             pid.to_string(),
             thawed,
@@ -1230,18 +1304,34 @@ impl Engine {
     /// Run a software-management operation and audit the outcome.  Package work
     /// shells out to the package manager (via an argv, no shell).
     fn cmd_package(&self, op: super::software::Operation<'_>, cmd_id: &str) {
-        use crate::schema::{EventAction, Severity};
         use super::software::Operation;
+        use crate::schema::{EventAction, Severity};
 
         let (action, kind, target): (EventAction, &str, String) = match &op {
-            Operation::Install(p) => (EventAction::PackageInstalled, "package_install", p.to_string()),
-            Operation::Remove(p)  => (EventAction::PackageRemoved,   "package_remove",  p.to_string()),
-            Operation::Upgrade(p) => (EventAction::PackageUpgraded,  "package_upgrade", p.to_string()),
-            Operation::UpgradeAll => (EventAction::PackageUpgraded,  "package_upgrade", "<all>".to_string()),
+            Operation::Install(p) => (
+                EventAction::PackageInstalled,
+                "package_install",
+                p.to_string(),
+            ),
+            Operation::Remove(p) => (EventAction::PackageRemoved, "package_remove", p.to_string()),
+            Operation::Upgrade(p) => (
+                EventAction::PackageUpgraded,
+                "package_upgrade",
+                p.to_string(),
+            ),
+            Operation::UpgradeAll => (
+                EventAction::PackageUpgraded,
+                "package_upgrade",
+                "<all>".to_string(),
+            ),
         };
 
         let result = super::software::execute(op);
-        let severity = if result.success { Severity::Info } else { Severity::Medium };
+        let severity = if result.success {
+            Severity::Info
+        } else {
+            Severity::Medium
+        };
 
         self.audit.emit(
             action,
@@ -1263,12 +1353,16 @@ impl Engine {
         let res = process::kill_pid(pid);
         let success = res.is_ok();
         let reason = match res {
-            Ok(_)  => format!("SIGKILL delivered to pid {pid}"),
+            Ok(_) => format!("SIGKILL delivered to pid {pid}"),
             Err(e) => format!("kill failed: {e:#}"),
         };
         self.audit.emit(
             crate::schema::EventAction::ProcessBlocked,
-            if success { crate::schema::Severity::High } else { crate::schema::Severity::Medium },
+            if success {
+                crate::schema::Severity::High
+            } else {
+                crate::schema::Severity::Medium
+            },
             "process_block",
             pid.to_string(),
             success,
@@ -1287,7 +1381,10 @@ impl Engine {
         }
         let res = network::isolate(self.cfg.net_backend, &allow);
         let (success, reason) = match res {
-            Ok(_)  => (true,  format!("host isolated; allowlist size = {}", allow.len())),
+            Ok(_) => (
+                true,
+                format!("host isolated; allowlist size = {}", allow.len()),
+            ),
             Err(e) => (false, format!("isolate failed: {e:#}")),
         };
         self.audit.emit(
@@ -1306,7 +1403,7 @@ impl Engine {
     fn cmd_deisolate(&self, cmd_id: &str) {
         let res = network::deisolate(self.cfg.net_backend);
         let (success, reason) = match res {
-            Ok(_)  => (true,  "host isolation lifted".to_string()),
+            Ok(_) => (true, "host isolation lifted".to_string()),
             Err(e) => (false, format!("deisolate failed: {e:#}")),
         };
         self.audit.emit(
@@ -1357,7 +1454,7 @@ impl Engine {
 
     fn cmd_restore(&self, qid: &str, cmd_id: &str) {
         let parsed = match Uuid::parse_str(qid) {
-            Ok(u)  => u,
+            Ok(u) => u,
             Err(e) => {
                 self.audit.emit(
                     crate::schema::EventAction::FileRestored,
@@ -1406,8 +1503,8 @@ impl Engine {
     async fn cmd_block_ip(&self, ip: &str, ttl_secs: Option<u64>, cmd_id: &str) {
         let res = network::block_ip(self.cfg.net_backend, ip);
         let (success, reason) = match &res {
-            Ok(handle) => (true,  format!("block rule installed ({handle})")),
-            Err(e)     => (false, format!("block_ip failed: {e:#}")),
+            Ok(handle) => (true, format!("block rule installed ({handle})")),
+            Err(e) => (false, format!("block_ip failed: {e:#}")),
         };
         if success {
             self.blocked.lock().await.insert(ip.to_string());
@@ -1428,8 +1525,8 @@ impl Engine {
             let backend = self.cfg.net_backend;
             let blocked = Arc::clone(&self.blocked);
             let ip_owned = ip.to_string();
-            let audit    = self.audit.clone();
-            let cmd_id   = cmd_id.to_string();
+            let audit = self.audit.clone();
+            let cmd_id = cmd_id.to_string();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(ttl)).await;
                 if let Err(e) = network::unblock_ip(backend, &ip_owned) {
@@ -1455,10 +1552,12 @@ impl Engine {
     async fn cmd_unblock_ip(&self, ip: &str, cmd_id: &str) {
         let res = network::unblock_ip(self.cfg.net_backend, ip);
         let (success, reason) = match res {
-            Ok(_)  => (true,  format!("unblocked {ip}")),
+            Ok(_) => (true, format!("unblocked {ip}")),
             Err(e) => (false, format!("unblock failed: {e:#}")),
         };
-        if success { self.blocked.lock().await.remove(ip); }
+        if success {
+            self.blocked.lock().await.remove(ip);
+        }
         self.audit.emit(
             crate::schema::EventAction::IpUnblocked,
             crate::schema::Severity::Info,
@@ -1526,8 +1625,11 @@ mod tests {
     fn test_engine() -> (Engine, mpsc::Receiver<AgentEvent>) {
         let (tx, rx) = mpsc::channel(16);
         let audit = AuditEmitter::new(tx, "test-agent".into(), "test-host".into());
-        let ht_path = std::env::temp_dir()
-            .join(format!("trapd-test-ht-{}-{:p}.json", std::process::id(), &rx));
+        let ht_path = std::env::temp_dir().join(format!(
+            "trapd-test-ht-{}-{:p}.json",
+            std::process::id(),
+            &rx
+        ));
         let engine = Engine::new(
             PolicyHandle::new(PolicyStore::default()),
             audit,
@@ -1718,7 +1820,10 @@ mod tests {
         assert_eq!(ResponseLevel::parse("alert"), ResponseLevel::Alert);
         assert_eq!(ResponseLevel::parse("kill"), ResponseLevel::Kill);
         assert_eq!(ResponseLevel::parse("isolate"), ResponseLevel::Isolate);
-        assert_eq!(ResponseLevel::parse("isolate_network"), ResponseLevel::Isolate);
+        assert_eq!(
+            ResponseLevel::parse("isolate_network"),
+            ResponseLevel::Isolate
+        );
         // Unknown values fail safe to the non-destructive default.
         assert_eq!(ResponseLevel::parse("wat"), ResponseLevel::Alert);
         // Case/whitespace insensitive.

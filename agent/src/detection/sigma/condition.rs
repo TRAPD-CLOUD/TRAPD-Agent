@@ -27,7 +27,11 @@ pub enum ConditionExpr {
     And(Box<ConditionExpr>, Box<ConditionExpr>),
     Or(Box<ConditionExpr>, Box<ConditionExpr>),
     /// `all of <pattern>` / `N of <pattern>` (`them` is encoded as pattern `*`).
-    Quant { all: bool, n: usize, pattern: String },
+    Quant {
+        all: bool,
+        n: usize,
+        pattern: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +190,10 @@ impl ConditionExpr {
         let mut p = Parser { toks, pos: 0 };
         let e = p.parse_expr()?;
         if p.pos != p.toks.len() {
-            return Err(anyhow!("trailing tokens in condition after position {}", p.pos));
+            return Err(anyhow!(
+                "trailing tokens in condition after position {}",
+                p.pos
+            ));
         }
         Ok(e)
     }
@@ -272,7 +279,11 @@ mod tests {
     #[test]
     fn quantifier_wildcard_pattern() {
         let e = ConditionExpr::parse("1 of selection*").unwrap();
-        assert!(e.eval(&results(&[("selection_a", false), ("selection_b", true), ("filter", false)])));
+        assert!(e.eval(&results(&[
+            ("selection_a", false),
+            ("selection_b", true),
+            ("filter", false)
+        ])));
         assert!(!e.eval(&results(&[("selection_a", false), ("filter", true)])));
 
         let all = ConditionExpr::parse("all of selection*").unwrap();

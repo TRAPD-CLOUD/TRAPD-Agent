@@ -60,7 +60,9 @@ pub fn loaded_libraries(pid: u32) -> Vec<String> {
         // Format: addr perms offset dev inode  pathname
         // The pathname is everything after the inode column; only file-backed
         // mappings have one. Take it from the first '/'.
-        let Some(slash) = line.find('/') else { continue };
+        let Some(slash) = line.find('/') else {
+            continue;
+        };
         let path = line[slash..].trim();
         if is_shared_object(path) {
             libs.insert(path.to_string());
@@ -117,8 +119,16 @@ const ENV_ALLOWLIST: &[&str] = &[
 
 /// Substrings that mark a variable name as a secret — its value is redacted but
 /// its presence is still reported (an attacker leaking a `*_TOKEN` is signal).
-const SECRET_MARKERS: &[&str] =
-    &["TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY", "KEY", "CREDENTIAL"];
+const SECRET_MARKERS: &[&str] = &[
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "APIKEY",
+    "API_KEY",
+    "KEY",
+    "CREDENTIAL",
+];
 
 /// Capture the curated environment of a process from `/proc/<pid>/environ`.
 ///
@@ -136,8 +146,12 @@ pub fn curated_env(pid: u32) -> BTreeMap<String, String> {
         if kv.is_empty() {
             continue;
         }
-        let Ok(s) = std::str::from_utf8(kv) else { continue };
-        let Some((k, v)) = s.split_once('=') else { continue };
+        let Ok(s) = std::str::from_utf8(kv) else {
+            continue;
+        };
+        let Some((k, v)) = s.split_once('=') else {
+            continue;
+        };
         if !ENV_ALLOWLIST.contains(&k) {
             continue;
         }
@@ -225,7 +239,9 @@ fn inline_script_arg(cmdline: &str) -> Option<String> {
 fn decode_base64_blobs(cmdline: &str) -> Vec<String> {
     use base64::Engine as _;
     let mut out = Vec::new();
-    for tok in cmdline.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '(' | ')' | ',')) {
+    for tok in
+        cmdline.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '(' | ')' | ','))
+    {
         let candidate = tok.trim_matches(|c| matches!(c, '\'' | '"' | '`'));
         if !looks_base64(candidate) {
             continue;
@@ -287,11 +303,43 @@ fn script_indicators(
     .to_ascii_lowercase();
 
     let patterns: &[(&str, &[&str])] = &[
-        ("base64_decode", &["base64 -d", "base64 --decode", "b64decode", "frombase64string"]),
-        ("pipe_to_shell", &["| sh", "| bash", "|sh", "|bash", "curl", "wget"]),
-        ("reverse_shell", &["/dev/tcp/", "socket.socket", "sh -i", "pty.spawn", "fsockopen"]),
-        ("in_memory_exec", &["memfd_create", "exec(", "eval(", "iex ", "invoke-expression"]),
-        ("download_cradle", &["urllib", "requests.get", "downloadstring", "net.webclient"]),
+        (
+            "base64_decode",
+            &[
+                "base64 -d",
+                "base64 --decode",
+                "b64decode",
+                "frombase64string",
+            ],
+        ),
+        (
+            "pipe_to_shell",
+            &["| sh", "| bash", "|sh", "|bash", "curl", "wget"],
+        ),
+        (
+            "reverse_shell",
+            &[
+                "/dev/tcp/",
+                "socket.socket",
+                "sh -i",
+                "pty.spawn",
+                "fsockopen",
+            ],
+        ),
+        (
+            "in_memory_exec",
+            &[
+                "memfd_create",
+                "exec(",
+                "eval(",
+                "iex ",
+                "invoke-expression",
+            ],
+        ),
+        (
+            "download_cradle",
+            &["urllib", "requests.get", "downloadstring", "net.webclient"],
+        ),
     ];
     for (tag, needles) in patterns {
         if needles.iter().any(|n| hay.contains(n)) {
@@ -306,11 +354,11 @@ fn script_indicators(
 /// Resolved container facts for a process.
 #[derive(Default)]
 pub struct ContainerFacts {
-    pub container_id:    Option<String>,
-    pub runtime:         Option<String>,
-    pub image:           Option<String>,
-    pub image_digest:    Option<String>,
-    pub k8s:             Option<K8sContext>,
+    pub container_id: Option<String>,
+    pub runtime: Option<String>,
+    pub image: Option<String>,
+    pub image_digest: Option<String>,
+    pub k8s: Option<K8sContext>,
 }
 
 /// Best-effort container + Kubernetes context for a process.
@@ -377,7 +425,9 @@ fn parse_cgroup(cgroup: &str) -> (Option<String>, Option<String>, Option<String>
     let mut pod_uid = None;
 
     for line in cgroup.lines() {
-        let Some(path) = line.splitn(3, ':').nth(2) else { continue };
+        let Some(path) = line.splitn(3, ':').nth(2) else {
+            continue;
+        };
         if path == "/" {
             continue;
         }
@@ -519,9 +569,18 @@ mod tests {
 
     #[test]
     fn strips_runtime_prefixes() {
-        assert_eq!(strip_runtime_prefix("docker-abc123.scope"), (Some("docker"), "abc123"));
-        assert_eq!(strip_runtime_prefix("crio-deadbeef.scope"), (Some("crio"), "deadbeef"));
-        assert_eq!(strip_runtime_prefix("libpod-ff00.scope"), (Some("podman"), "ff00"));
+        assert_eq!(
+            strip_runtime_prefix("docker-abc123.scope"),
+            (Some("docker"), "abc123")
+        );
+        assert_eq!(
+            strip_runtime_prefix("crio-deadbeef.scope"),
+            (Some("crio"), "deadbeef")
+        );
+        assert_eq!(
+            strip_runtime_prefix("libpod-ff00.scope"),
+            (Some("podman"), "ff00")
+        );
         assert_eq!(strip_runtime_prefix("abcdef").0, None);
     }
 
@@ -530,7 +589,10 @@ mod tests {
         let cg = "0::/system.slice/docker-3b9c2f4e5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d.scope";
         let (id, runtime, pod) = parse_cgroup(cg);
         assert_eq!(runtime.as_deref(), Some("docker"));
-        assert_eq!(id.as_deref(), Some("3b9c2f4e5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d"));
+        assert_eq!(
+            id.as_deref(),
+            Some("3b9c2f4e5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d")
+        );
         assert!(pod.is_none());
     }
 
@@ -543,10 +605,7 @@ mod tests {
         // kubepods marks the runtime; the container id is the cri-containerd hash.
         assert!(runtime.is_some());
         assert!(id.is_some());
-        assert_eq!(
-            pod.as_deref(),
-            Some("1234abcd-5678-ef01-2345-6789abcdef01")
-        );
+        assert_eq!(pod.as_deref(), Some("1234abcd-5678-ef01-2345-6789abcdef01"));
     }
 
     #[test]
@@ -558,7 +617,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(i.lang, "python");
-        assert_eq!(i.inline_script.as_deref(), Some("import os; os.system('id')"));
+        assert_eq!(
+            i.inline_script.as_deref(),
+            Some("import os; os.system('id')")
+        );
     }
 
     #[test]
@@ -581,7 +643,9 @@ mod tests {
         let cmdline = format!("bash -c echo {b64} | base64 -d | sh");
         let i = interpreter_context("bash", "/bin/bash", &cmdline).unwrap();
         assert!(
-            i.decoded_payloads.iter().any(|p| p.contains("decoded script")),
+            i.decoded_payloads
+                .iter()
+                .any(|p| p.contains("decoded script")),
             "expected decoded payload, got {:?}",
             i.decoded_payloads
         );
@@ -596,7 +660,10 @@ mod tests {
 
     #[test]
     fn redacts_secret_env_values() {
-        assert_eq!(sanitize_env_value("AWS_SECRET_ACCESS_KEY", "abc123"), "***redacted***");
+        assert_eq!(
+            sanitize_env_value("AWS_SECRET_ACCESS_KEY", "abc123"),
+            "***redacted***"
+        );
         assert_eq!(sanitize_env_value("API_TOKEN", "xyz"), "***redacted***");
         assert_eq!(sanitize_env_value("PATH", "/usr/bin"), "/usr/bin");
     }

@@ -43,8 +43,18 @@ impl IocSet {
         let raw: RawIocFile = serde_json::from_slice(bytes)?;
         Ok(Self {
             hashes: raw.hashes.iter().map(|h| normalize_hash(h)).collect(),
-            ips: raw.ips.iter().map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect(),
-            domains: raw.domains.iter().map(|s| s.trim().trim_end_matches('.').to_ascii_lowercase()).filter(|s| !s.is_empty()).collect(),
+            ips: raw
+                .ips
+                .iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            domains: raw
+                .domains
+                .iter()
+                .map(|s| s.trim().trim_end_matches('.').to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
         })
     }
 
@@ -98,7 +108,10 @@ impl IocSet {
 /// Strip a leading `sha256:` (any case) and lower-case the hex.
 fn normalize_hash(h: &str) -> String {
     let h = h.trim();
-    let h = h.strip_prefix("sha256:").or_else(|| h.strip_prefix("SHA256:")).unwrap_or(h);
+    let h = h
+        .strip_prefix("sha256:")
+        .or_else(|| h.strip_prefix("SHA256:"))
+        .unwrap_or(h);
     h.to_ascii_lowercase()
 }
 
@@ -135,9 +148,18 @@ mod tests {
     #[test]
     fn matches_domain_and_subdomains() {
         let s = sample();
-        assert_eq!(s.match_domain("evil.example.com").as_deref(), Some("evil.example.com"));
-        assert_eq!(s.match_domain("c2.evil.example.com").as_deref(), Some("evil.example.com"));
-        assert_eq!(s.match_domain("EVIL.EXAMPLE.COM").as_deref(), Some("evil.example.com"));
+        assert_eq!(
+            s.match_domain("evil.example.com").as_deref(),
+            Some("evil.example.com")
+        );
+        assert_eq!(
+            s.match_domain("c2.evil.example.com").as_deref(),
+            Some("evil.example.com")
+        );
+        assert_eq!(
+            s.match_domain("EVIL.EXAMPLE.COM").as_deref(),
+            Some("evil.example.com")
+        );
         assert!(s.match_domain("example.com").is_none());
         assert!(s.match_domain("good.test").is_none());
     }

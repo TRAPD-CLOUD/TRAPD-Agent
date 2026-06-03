@@ -27,13 +27,13 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-const DEFAULT_STATE_DIR:  &str = "/var/lib/trapd";
+const DEFAULT_STATE_DIR: &str = "/var/lib/trapd";
 const DEFAULT_CONFIG_DIR: &str = "/etc/trapd";
-const DEFAULT_LOG_DIR:    &str = "/var/log/trapd";
+const DEFAULT_LOG_DIR: &str = "/var/log/trapd";
 
-static STATE_DIR:  OnceLock<PathBuf> = OnceLock::new();
+static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
-static LOG_DIR:    OnceLock<PathBuf> = OnceLock::new();
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Writable state directory (device identity, credentials, nonces, baselines).
 pub fn state_dir() -> &'static Path {
@@ -56,8 +56,12 @@ pub fn log_dir() -> &'static Path {
 
 // ── Well-known files ──────────────────────────────────────────────────────────
 
-pub fn device_id_file()   -> PathBuf { state_dir().join("device_id") }
-pub fn credentials_file() -> PathBuf { state_dir().join("credentials.json") }
+pub fn device_id_file() -> PathBuf {
+    state_dir().join("device_id")
+}
+pub fn credentials_file() -> PathBuf {
+    state_dir().join("credentials.json")
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -185,8 +189,7 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create dir {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
 
     let tmp = parent.join(format!(
         ".{}.tmp.{}",

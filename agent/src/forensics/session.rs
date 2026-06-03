@@ -233,23 +233,38 @@ mod tests {
     fn cgroup_picks_deepest_path() {
         // cgroup v2 single line.
         let v2 = "0::/system.slice/docker-abc.scope\n";
-        assert_eq!(most_specific_cgroup(v2).as_deref(), Some("/system.slice/docker-abc.scope"));
+        assert_eq!(
+            most_specific_cgroup(v2).as_deref(),
+            Some("/system.slice/docker-abc.scope")
+        );
         // cgroup v1 multi-line: deepest path wins over a bare "/".
         let v1 = "12:pids:/\n3:memory:/docker/deadbeef\n2:cpu:/\n";
-        assert_eq!(most_specific_cgroup(v1).as_deref(), Some("/docker/deadbeef"));
+        assert_eq!(
+            most_specific_cgroup(v1).as_deref(),
+            Some("/docker/deadbeef")
+        );
     }
 
     #[test]
     fn container_id_extracted_per_runtime() {
         let full = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let docker = format!("/system.slice/docker-{full}.scope");
-        assert_eq!(container_from_cgroup(&docker), Some(("docker", full.to_string())));
+        assert_eq!(
+            container_from_cgroup(&docker),
+            Some(("docker", full.to_string()))
+        );
 
         let k8s = format!("/kubepods/besteffort/pod123/{full}");
-        assert_eq!(container_from_cgroup(&k8s), Some(("kubepods", full.to_string())));
+        assert_eq!(
+            container_from_cgroup(&k8s),
+            Some(("kubepods", full.to_string()))
+        );
 
         let podman = format!("/machine.slice/libpod-{full}.scope");
-        assert_eq!(container_from_cgroup(&podman), Some(("podman", full.to_string())));
+        assert_eq!(
+            container_from_cgroup(&podman),
+            Some(("podman", full.to_string()))
+        );
 
         // A host process (no container scope) yields nothing.
         assert_eq!(container_from_cgroup("/system.slice/sshd.service"), None);
@@ -259,13 +274,21 @@ mod tests {
     /// Fake `/proc` exercising the full assembly.
     struct FakeProc;
     impl ProcReader for FakeProc {
-        fn loginuid(&self, _: i32) -> Option<String> { Some("1000\n".into()) }
-        fn sessionid(&self, _: i32) -> Option<String> { Some("42\n".into()) }
-        fn stat(&self, _: i32) -> Option<String> { Some("100 (bash) S 7 100 7 34819 100".into()) }
+        fn loginuid(&self, _: i32) -> Option<String> {
+            Some("1000\n".into())
+        }
+        fn sessionid(&self, _: i32) -> Option<String> {
+            Some("42\n".into())
+        }
+        fn stat(&self, _: i32) -> Option<String> {
+            Some("100 (bash) S 7 100 7 34819 100".into())
+        }
         fn cgroup(&self, _: i32) -> Option<String> {
             Some("0::/system.slice/sshd.service\n".into())
         }
-        fn cwd(&self, _: i32) -> Option<String> { Some("/home/alice".into()) }
+        fn cwd(&self, _: i32) -> Option<String> {
+            Some("/home/alice".into())
+        }
         fn ns_link(&self, _: i32, ns: &str) -> Option<String> {
             (ns == "net").then(|| "net:[4026531992]".to_string())
         }
@@ -285,6 +308,9 @@ mod tests {
         assert_eq!(s.cgroup.as_deref(), Some("/system.slice/sshd.service"));
         assert_eq!(s.container_id, None, "a host service is not a container");
         assert_eq!(s.namespaces.net, Some(4026531992));
-        assert!(s.remote_addr.is_none(), "remote IP is correlated by the engine");
+        assert!(
+            s.remote_addr.is_none(),
+            "remote IP is correlated by the engine"
+        );
     }
 }

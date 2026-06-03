@@ -25,7 +25,7 @@ const CHECK_INTERVAL_SECS: u64 = 10;
 
 /// Async task — runs indefinitely, polling `/proc/self/status`.
 pub async fn run(tx: Sender<AgentEvent>, agent_id: String, hostname: String) {
-    let mut ticker     = interval(Duration::from_secs(CHECK_INTERVAL_SECS));
+    let mut ticker = interval(Duration::from_secs(CHECK_INTERVAL_SECS));
     let mut prev_tracer: u32 = 0;
 
     loop {
@@ -36,7 +36,7 @@ pub async fn run(tx: Sender<AgentEvent>, agent_id: String, hostname: String) {
         if tracer != 0 && tracer != prev_tracer {
             warn!(
                 tracer_pid = tracer,
-                agent_pid  = std::process::id(),
+                agent_pid = std::process::id(),
                 "ANTI-TAMPER: ptrace attachment detected on agent process"
             );
 
@@ -47,11 +47,7 @@ pub async fn run(tx: Sender<AgentEvent>, agent_id: String, hostname: String) {
                 EventAction::AgentTamper,
                 Severity::Critical,
                 EventData::AgentTamper(AgentTamperData {
-                    path: format!(
-                        "/proc/{}/status [TracerPid={}]",
-                        std::process::id(),
-                        tracer
-                    ),
+                    path: format!("/proc/{}/status [TracerPid={}]", std::process::id(), tracer),
                     action: "ptrace_attach_detected".to_string(),
                 }),
             );

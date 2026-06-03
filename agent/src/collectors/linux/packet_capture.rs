@@ -75,9 +75,8 @@ impl Collector for PacketCaptureCollector {
             // Drain everything currently queued before re-arming readiness.
             loop {
                 let fd = guard.get_inner().0;
-                let n = unsafe {
-                    libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-                };
+                let n =
+                    unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
                 if n <= 0 {
                     // EWOULDBLOCK (queue drained) or a transient error: re-arm.
                     guard.clear_ready();
@@ -213,7 +212,12 @@ fn parse_ipv4(data: &[u8]) -> Option<L3<'_>> {
     let proto = data[9];
     let src = IpAddr::from([data[12], data[13], data[14], data[15]]);
     let dst = IpAddr::from([data[16], data[17], data[18], data[19]]);
-    Some(L3 { proto, src, dst, payload: &data[ihl..] })
+    Some(L3 {
+        proto,
+        src,
+        dst,
+        payload: &data[ihl..],
+    })
 }
 
 fn parse_ipv6(data: &[u8]) -> Option<L3<'_>> {
@@ -340,7 +344,8 @@ fn parse_dns_response(
         let rdata = &msg[pos..pos + rdlen];
         match atype {
             1 if rdlen == 4 => {
-                resolved_ips.push(IpAddr::from([rdata[0], rdata[1], rdata[2], rdata[3]]).to_string());
+                resolved_ips
+                    .push(IpAddr::from([rdata[0], rdata[1], rdata[2], rdata[3]]).to_string());
             }
             28 if rdlen == 16 => {
                 let mut a = [0u8; 16];
@@ -414,7 +419,11 @@ fn read_name(msg: &[u8], start: usize) -> Option<(String, usize)> {
         }
     }
 
-    let name = if labels.is_empty() { ".".to_string() } else { labels.join(".") };
+    let name = if labels.is_empty() {
+        ".".to_string()
+    } else {
+        labels.join(".")
+    };
     Some((name, after))
 }
 
@@ -496,7 +505,10 @@ fn ja3_string(ch: &ClientHello) -> String {
         .map(|x| x.to_string())
         .collect::<Vec<_>>()
         .join("-");
-    format!("{},{},{},{},{}", ch.legacy_version, ciphers, exts, groups, formats)
+    format!(
+        "{},{},{},{},{}",
+        ch.legacy_version, ciphers, exts, groups, formats
+    )
 }
 
 fn md5_hex(data: &[u8]) -> String {
@@ -533,7 +545,10 @@ fn parse_client_hello(payload: &[u8]) -> Option<ClientHello> {
     let cs_len = be16(body, p)? as usize;
     p += 2;
     let cs = body.get(p..p + cs_len)?;
-    let ciphers: Vec<u16> = cs.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+    let ciphers: Vec<u16> = cs
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
     p += cs_len;
     // compression_methods
     let cm_len = *body.get(p)? as usize;
@@ -614,7 +629,11 @@ fn parse_extension(ch: &mut ClientHello, etype: u16, edata: &[u8]) {
         // supported_versions
         43 => {
             if let Some(&len) = edata.first() {
-                for c in edata.get(1..1 + len as usize).unwrap_or(&[]).chunks_exact(2) {
+                for c in edata
+                    .get(1..1 + len as usize)
+                    .unwrap_or(&[])
+                    .chunks_exact(2)
+                {
                     ch.supported_versions.push(u16::from_be_bytes([c[0], c[1]]));
                 }
             }
@@ -642,7 +661,7 @@ mod tests {
         m.extend_from_slice(&2u16.to_be_bytes()); // ancount
         m.extend_from_slice(&0u16.to_be_bytes()); // nscount
         m.extend_from_slice(&0u16.to_be_bytes()); // arcount
-        // Question: example.com A IN
+                                                  // Question: example.com A IN
         m.push(7);
         m.extend_from_slice(b"example");
         m.push(3);
@@ -650,7 +669,7 @@ mod tests {
         m.push(0);
         m.extend_from_slice(&1u16.to_be_bytes()); // qtype A
         m.extend_from_slice(&1u16.to_be_bytes()); // qclass IN
-        // Answer 1: CNAME (name = pointer to offset 12)
+                                                  // Answer 1: CNAME (name = pointer to offset 12)
         m.extend_from_slice(&0xC00Cu16.to_be_bytes());
         m.extend_from_slice(&5u16.to_be_bytes()); // type CNAME
         m.extend_from_slice(&1u16.to_be_bytes()); // class
@@ -703,7 +722,13 @@ mod tests {
     fn ignores_dns_query_qr_clear() {
         let mut msg = sample_dns_response();
         msg[2] = 0x01; // clear QR bit (flags high byte → 0x01)
-        assert!(parse_dns_response(&msg, "10.0.0.5".parse().unwrap(), "1.1.1.1".parse().unwrap(), 1).is_none());
+        assert!(parse_dns_response(
+            &msg,
+            "10.0.0.5".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            1
+        )
+        .is_none());
     }
 
     #[test]
@@ -718,11 +743,26 @@ mod tests {
     #[test]
     fn parses_ipv4_udp() {
         let mut pkt = vec![
-            0x45, 0x00, 0x00, 0x00, // ver/ihl, tos, total len
-            0x00, 0x00, 0x00, 0x00, // id, frag
-            0x40, IPPROTO_UDP, 0x00, 0x00, // ttl, proto, checksum
-            10, 0, 0, 1, // src
-            8, 8, 8, 8, // dst
+            0x45,
+            0x00,
+            0x00,
+            0x00, // ver/ihl, tos, total len
+            0x00,
+            0x00,
+            0x00,
+            0x00, // id, frag
+            0x40,
+            IPPROTO_UDP,
+            0x00,
+            0x00, // ttl, proto, checksum
+            10,
+            0,
+            0,
+            1, // src
+            8,
+            8,
+            8,
+            8, // dst
         ];
         // UDP header: sport 53, dport 1000, len, csum
         pkt.extend_from_slice(&53u16.to_be_bytes());
@@ -747,13 +787,13 @@ mod tests {
         hs.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy version TLS1.2
         hs.extend_from_slice(&[0u8; 32]); // random
         hs.push(0); // session id len
-        // cipher suites: GREASE 0x0a0a + 0x1301
+                    // cipher suites: GREASE 0x0a0a + 0x1301
         hs.extend_from_slice(&4u16.to_be_bytes());
         hs.extend_from_slice(&0x0a0au16.to_be_bytes());
         hs.extend_from_slice(&0x1301u16.to_be_bytes());
         hs.push(1); // compression methods len
         hs.push(0); // null compression
-        // extensions
+                    // extensions
         let mut exts = Vec::new();
         // SNI ext (0)
         let mut sni = Vec::new();
@@ -797,7 +837,13 @@ mod tests {
     #[test]
     fn parses_client_hello_sni_and_ja3() {
         let rec = sample_client_hello();
-        let t = parse_tls(&rec, "10.0.0.5".parse().unwrap(), "1.2.3.4".parse().unwrap(), 443).unwrap();
+        let t = parse_tls(
+            &rec,
+            "10.0.0.5".parse().unwrap(),
+            "1.2.3.4".parse().unwrap(),
+            443,
+        )
+        .unwrap();
         assert_eq!(t.sni.as_deref(), Some("example.com"));
         assert_eq!(t.tls_version, "TLS 1.2");
         // JA3 string: version=771, ciphers=4865 (GREASE 0x0a0a filtered),
@@ -827,7 +873,28 @@ mod tests {
     fn frame_dispatch_emits_dns() {
         // Build an IPv4/UDP frame carrying the sample DNS response from port 53.
         let dns = sample_dns_response();
-        let mut pkt = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 0x40, IPPROTO_UDP, 0, 0, 1, 1, 1, 1, 10, 0, 0, 5];
+        let mut pkt = vec![
+            0x45,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0x40,
+            IPPROTO_UDP,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            10,
+            0,
+            0,
+            5,
+        ];
         pkt.extend_from_slice(&53u16.to_be_bytes());
         pkt.extend_from_slice(&33333u16.to_be_bytes());
         pkt.extend_from_slice(&((dns.len() + 8) as u16).to_be_bytes());

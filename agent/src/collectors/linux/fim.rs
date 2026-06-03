@@ -46,8 +46,8 @@ const MAX_FILES: usize = 50_000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FileState {
     sha256: String,
-    size:   u64,
-    mtime:  u64,
+    size: u64,
+    mtime: u64,
 }
 
 /// Persisted baseline: path → state.
@@ -67,10 +67,10 @@ enum ChangeKind {
 /// One detected integrity change.
 #[derive(Debug, Clone)]
 struct Change {
-    path:       String,
-    kind:       ChangeKind,
-    expected:   String,
-    actual:     String,
+    path: String,
+    kind: ChangeKind,
+    expected: String,
+    actual: String,
     size_delta: i64,
 }
 
@@ -95,18 +95,18 @@ fn diff(known: &HashMap<String, FileState>, current: &HashMap<String, FileState>
     for (path, cur) in current {
         match known.get(path) {
             Some(prev) if prev.sha256 != cur.sha256 => out.push(Change {
-                path:       path.clone(),
-                kind:       ChangeKind::Modified,
-                expected:   prev.sha256.clone(),
-                actual:     cur.sha256.clone(),
+                path: path.clone(),
+                kind: ChangeKind::Modified,
+                expected: prev.sha256.clone(),
+                actual: cur.sha256.clone(),
                 size_delta: cur.size as i64 - prev.size as i64,
             }),
             Some(_) => {}
             None => out.push(Change {
-                path:       path.clone(),
-                kind:       ChangeKind::Added,
-                expected:   String::new(),
-                actual:     cur.sha256.clone(),
+                path: path.clone(),
+                kind: ChangeKind::Added,
+                expected: String::new(),
+                actual: cur.sha256.clone(),
                 size_delta: cur.size as i64,
             }),
         }
@@ -114,10 +114,10 @@ fn diff(known: &HashMap<String, FileState>, current: &HashMap<String, FileState>
     for (path, prev) in known {
         if !current.contains_key(path) {
             out.push(Change {
-                path:       path.clone(),
-                kind:       ChangeKind::Removed,
-                expected:   prev.sha256.clone(),
-                actual:     String::new(),
+                path: path.clone(),
+                kind: ChangeKind::Removed,
+                expected: prev.sha256.clone(),
+                actual: String::new(),
                 size_delta: -(prev.size as i64),
             });
         }
@@ -130,7 +130,10 @@ fn scan(roots: &[String]) -> HashMap<String, FileState> {
     let mut out = HashMap::new();
     for root in roots {
         if out.len() >= MAX_FILES {
-            warn!(cap = MAX_FILES, "FIM: file cap reached — remaining paths skipped this scan");
+            warn!(
+                cap = MAX_FILES,
+                "FIM: file cap reached — remaining paths skipped this scan"
+            );
             break;
         }
         for entry in WalkDir::new(root)
@@ -163,7 +166,14 @@ fn scan(roots: &[String]) -> HashMap<String, FileState> {
             } else {
                 String::new()
             };
-            out.insert(path.to_string_lossy().into_owned(), FileState { sha256, size, mtime });
+            out.insert(
+                path.to_string_lossy().into_owned(),
+                FileState {
+                    sha256,
+                    size,
+                    mtime,
+                },
+            );
         }
     }
     out
@@ -176,7 +186,9 @@ fn load_baseline(path: &Path) -> Option<HashMap<String, FileState>> {
 }
 
 fn save_baseline(path: &Path, files: &HashMap<String, FileState>) {
-    let baseline = Baseline { files: files.clone() };
+    let baseline = Baseline {
+        files: files.clone(),
+    };
     match serde_json::to_vec(&baseline) {
         Ok(bytes) => {
             if let Err(e) = crate::paths::write_atomic(path, &bytes, 0o600) {
@@ -209,11 +221,19 @@ impl Collector for FimCollector {
         hostname: String,
     ) -> Result<()> {
         let env_off = std::env::var("TRAPD_FIM")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
             .unwrap_or(false);
 
         let (enabled, paths, interval_secs) = {
-            let c = self.cfg.read().map_err(|_| anyhow::anyhow!("config lock poisoned"))?;
+            let c = self
+                .cfg
+                .read()
+                .map_err(|_| anyhow::anyhow!("config lock poisoned"))?;
             (c.fim_enabled, c.fim_paths.clone(), c.fim_interval_secs)
         };
         if env_off || !enabled {
@@ -270,10 +290,10 @@ impl Collector for FimCollector {
                     EventAction::IntegrityViolation,
                     severity_for(ch.kind),
                     EventData::IntegrityViolation(IntegrityViolationData {
-                        path:          ch.path,
+                        path: ch.path,
                         expected_hash: ch.expected,
-                        actual_hash:   ch.actual,
-                        size_delta:    ch.size_delta,
+                        actual_hash: ch.actual,
+                        size_delta: ch.size_delta,
                     }),
                 );
                 if tx.send(event).await.is_err() {
@@ -292,7 +312,11 @@ mod tests {
     use super::*;
 
     fn state(sha: &str, size: u64) -> FileState {
-        FileState { sha256: sha.into(), size, mtime: 0 }
+        FileState {
+            sha256: sha.into(),
+            size,
+            mtime: 0,
+        }
     }
 
     #[test]

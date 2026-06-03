@@ -200,7 +200,9 @@ fn severity_word(sev: Severity) -> &'static str {
 
 /// Escape a CEF *extension value*: backslash, equals and newlines.
 fn cef_escape_ext(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('=', "\\=").replace(['\n', '\r'], " ")
+    s.replace('\\', "\\\\")
+        .replace('=', "\\=")
+        .replace(['\n', '\r'], " ")
 }
 
 /// Escape a CEF *header field*: backslash and pipe.
@@ -283,9 +285,16 @@ fn syslog_pri(sev: Severity) -> u8 {
 pub fn rfc5424(event: &AgentEvent, msg: &str) -> String {
     let pri = syslog_pri(event.severity);
     let ts = event.timestamp.to_rfc3339();
-    let host = if event.hostname.is_empty() { "-" } else { event.hostname.as_str() };
+    let host = if event.hostname.is_empty() {
+        "-"
+    } else {
+        event.hostname.as_str()
+    };
     // <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
-    format!("<{pri}>1 {ts} {host} trapd-agent {} - - {msg}", std::process::id())
+    format!(
+        "<{pri}>1 {ts} {host} trapd-agent {} - - {msg}",
+        std::process::id()
+    )
 }
 
 #[cfg(test)]

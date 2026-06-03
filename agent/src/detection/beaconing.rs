@@ -138,7 +138,9 @@ impl BeaconTracker {
     /// between sweeps.
     fn prune(&mut self, now: f64) {
         let over_cap = self.dests.len() > MAX_TRACKED;
-        let due = self.last_prune.is_none_or(|t| now - t >= PRUNE_INTERVAL_SECS);
+        let due = self
+            .last_prune
+            .is_none_or(|t| now - t >= PRUNE_INTERVAL_SECS);
         if !over_cap && !due {
             return;
         }
@@ -172,7 +174,11 @@ impl BeaconTracker {
 }
 
 fn intervals_of(times: &VecDeque<f64>) -> Vec<f64> {
-    times.iter().zip(times.iter().skip(1)).map(|(a, b)| b - a).collect()
+    times
+        .iter()
+        .zip(times.iter().skip(1))
+        .map(|(a, b)| b - a)
+        .collect()
 }
 
 /// Returns `(mean, coefficient_of_variation)` or `None` if undefined.
@@ -261,7 +267,10 @@ mod tests {
         // (distinct, increasing timestamps within the idle TTL) so only the
         // hard cap — not the time sweep — can hold the map down.
         for i in 0..(MAX_TRACKED * 2) {
-            t.observe(&format!("10.0.{}.{}:443", i / 256, i % 256), i as f64 * 0.001);
+            t.observe(
+                &format!("10.0.{}.{}:443", i / 256, i % 256),
+                i as f64 * 0.001,
+            );
         }
         assert!(
             t.tracked() <= MAX_TRACKED,

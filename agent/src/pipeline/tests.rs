@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use super::Spool;
-use crate::schema::{
-    AgentEvent, EventAction, EventClass, EventData, Severity, SystemSnapshotData,
-};
+use crate::schema::{AgentEvent, EventAction, EventClass, EventData, Severity, SystemSnapshotData};
 
 fn dummy_event() -> AgentEvent {
     AgentEvent::new(
@@ -15,16 +13,16 @@ fn dummy_event() -> AgentEvent {
         EventAction::Snapshot,
         Severity::Info,
         EventData::SystemSnapshot(SystemSnapshotData {
-            os:               "Linux".to_string(),
-            kernel:           "6.0.0".to_string(),
-            distro:           "Test".to_string(),
-            cpu_count:        1,
-            cpu_usage_pct:    0.0,
-            memory_total_mb:  1024,
-            memory_used_mb:   512,
-            memory_free_mb:   512,
-            uptime_secs:      100,
-            load_avg:         [0.0, 0.0, 0.0],
+            os: "Linux".to_string(),
+            kernel: "6.0.0".to_string(),
+            distro: "Test".to_string(),
+            cpu_count: 1,
+            cpu_usage_pct: 0.0,
+            memory_total_mb: 1024,
+            memory_used_mb: 512,
+            memory_free_mb: 512,
+            uptime_secs: 100,
+            load_avg: [0.0, 0.0, 0.0],
         }),
     )
 }
@@ -51,7 +49,11 @@ fn drops_oldest_when_full() {
         s.push(dummy_event());
     }
     assert_eq!(s.len(), 3, "must not exceed capacity");
-    assert_eq!(s.dropped_total(), 1, "one oldest event must have been dropped");
+    assert_eq!(
+        s.dropped_total(),
+        1,
+        "one oldest event must have been dropped"
+    );
 }
 
 #[test]
@@ -90,7 +92,11 @@ fn durable_spool_survives_reopen() {
     } // handle dropped — simulates a restart
 
     let s2 = Spool::durable_at(path.clone(), 100);
-    assert_eq!(s2.len(), 3, "persisted events must be replayed after a restart");
+    assert_eq!(
+        s2.len(),
+        3,
+        "persisted events must be replayed after a restart"
+    );
 
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
@@ -107,7 +113,11 @@ fn unsent_events_are_replayed_at_least_once() {
         s.drain(1); // shipped, but journal not yet compacted
     }
     let s2 = Spool::durable_at(path.clone(), 100);
-    assert_eq!(s2.len(), 2, "without compaction, shipped events replay (at-least-once)");
+    assert_eq!(
+        s2.len(),
+        2,
+        "without compaction, shipped events replay (at-least-once)"
+    );
 
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
@@ -119,12 +129,16 @@ fn compaction_reconciles_shipped_events() {
     s.push(dummy_event());
     s.push(dummy_event());
     s.push(dummy_event());
-    s.drain(2);          // ship two
-    s.compact();         // reconcile the journal to the live set
+    s.drain(2); // ship two
+    s.compact(); // reconcile the journal to the live set
     drop(s);
 
     let s2 = Spool::durable_at(path.clone(), 100);
-    assert_eq!(s2.len(), 1, "after compaction only the un-shipped event remains");
+    assert_eq!(
+        s2.len(),
+        1,
+        "after compaction only the un-shipped event remains"
+    );
 
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }

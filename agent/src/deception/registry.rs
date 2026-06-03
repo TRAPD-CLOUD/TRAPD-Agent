@@ -90,8 +90,7 @@ pub struct HoneytokenRecord {
 ///     `kubectl` against it is observed;
 ///   * `ssh_honeypot` — an SSH key whose use against honeypot infra logs a login
 ///     attempt.
-pub const CANARY_CHANNELS: &[&str] =
-    &["aws_cloudtrail", "dns", "http", "kube_api", "ssh_honeypot"];
+pub const CANARY_CHANNELS: &[&str] = &["aws_cloudtrail", "dns", "http", "kube_api", "ssh_honeypot"];
 
 /// A second, independent signal channel attached to a honeytoken (issue #32,
 /// point 2).
@@ -171,7 +170,10 @@ impl HoneytokenStore {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        Self { path, inner: Mutex::new(registry) }
+        Self {
+            path,
+            inner: Mutex::new(registry),
+        }
     }
 
     /// True if a token is already registered at `path`.
@@ -208,23 +210,25 @@ impl HoneytokenStore {
     /// yet called from the binary (the backend owns foreign-signal ingestion).
     #[allow(dead_code)]
     pub fn find_by_tracking_id(&self, tracking_id: &str) -> Option<HoneytokenRecord> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|r| {
-                r.tokens
-                    .iter()
-                    .find(|t| {
-                        t.out_of_band.as_ref().is_some_and(|o| o.tracking_id == tracking_id)
-                    })
-                    .cloned()
-            })
+        self.inner.lock().ok().and_then(|r| {
+            r.tokens
+                .iter()
+                .find(|t| {
+                    t.out_of_band
+                        .as_ref()
+                        .is_some_and(|o| o.tracking_id == tracking_id)
+                })
+                .cloned()
+        })
     }
 
     /// Snapshot of all currently-registered tokens (used by the eBPF map
     /// reconciler to learn which paths to arm).
     pub fn list(&self) -> Vec<HoneytokenRecord> {
-        self.inner.lock().map(|r| r.tokens.clone()).unwrap_or_default()
+        self.inner
+            .lock()
+            .map(|r| r.tokens.clone())
+            .unwrap_or_default()
     }
 
     /// Number of registered tokens.
@@ -241,7 +245,10 @@ impl HoneytokenStore {
 
     /// Add (or replace, keyed by path) a record and persist.
     pub fn insert(&self, record: HoneytokenRecord) -> Result<()> {
-        let mut guard = self.inner.lock().map_err(|_| anyhow::anyhow!("honeytoken registry poisoned"))?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("honeytoken registry poisoned"))?;
         guard.tokens.retain(|t| t.path != record.path);
         guard.tokens.push(record);
         Self::persist(&self.path, &guard)
@@ -250,7 +257,10 @@ impl HoneytokenStore {
     /// Remove the record at `path` and persist. Returns the removed record, or
     /// `None` when no token was registered there.
     pub fn remove_by_path(&self, path: &str) -> Result<Option<HoneytokenRecord>> {
-        let mut guard = self.inner.lock().map_err(|_| anyhow::anyhow!("honeytoken registry poisoned"))?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("honeytoken registry poisoned"))?;
         let Some(pos) = guard.tokens.iter().position(|t| t.path == path) else {
             return Ok(None);
         };
@@ -311,7 +321,11 @@ mod tests {
     }
 
     fn record_with_oob(path: &str, oob: OutOfBandCanary) -> HoneytokenRecord {
-        HoneytokenRecord { out_of_band: Some(oob), canary_marker: None, ..record(path) }
+        HoneytokenRecord {
+            out_of_band: Some(oob),
+            canary_marker: None,
+            ..record(path)
+        }
     }
 
     #[test]
@@ -350,7 +364,9 @@ mod tests {
             tracking_id: "trk-1".into(),
             markers: vec!["a1b2c3.canary.example.net".into()],
         };
-        store.insert(record_with_oob("/home/u/.aws/credentials", oob)).unwrap();
+        store
+            .insert(record_with_oob("/home/u/.aws/credentials", oob))
+            .unwrap();
         // An out-of-band marker is just as "in use" as a legacy canary marker.
         assert!(store.canary_in_use("a1b2c3.canary.example.net"));
         assert!(!store.canary_in_use("other.canary.example.net"));
@@ -365,8 +381,12 @@ mod tests {
             tracking_id: "trk-aws-42".into(),
             markers: vec!["AKIA2E0AABCDEFGHIJKL".into()],
         };
-        store.insert(record_with_oob("/home/u/.aws/credentials", oob)).unwrap();
-        let found = store.find_by_tracking_id("trk-aws-42").expect("token resolved");
+        store
+            .insert(record_with_oob("/home/u/.aws/credentials", oob))
+            .unwrap();
+        let found = store
+            .find_by_tracking_id("trk-aws-42")
+            .expect("token resolved");
         assert_eq!(found.path, "/home/u/.aws/credentials");
         assert!(store.find_by_tracking_id("nope").is_none());
         let _ = std::fs::remove_file(&store.path);
@@ -381,7 +401,9 @@ mod tests {
             tracking_id: "trk-http".into(),
             markers: vec!["https://x.canary.example.net/p.png".into()],
         };
-        store.insert(record_with_oob("/srv/www/.env", oob.clone())).unwrap();
+        store
+            .insert(record_with_oob("/srv/www/.env", oob.clone()))
+            .unwrap();
         drop(store);
 
         let reloaded = HoneytokenStore::load_from(path.clone());

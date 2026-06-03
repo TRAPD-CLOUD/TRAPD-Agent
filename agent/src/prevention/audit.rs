@@ -12,14 +12,18 @@ use crate::schema::{
 
 #[derive(Clone)]
 pub struct AuditEmitter {
-    tx:       Sender<AgentEvent>,
+    tx: Sender<AgentEvent>,
     agent_id: String,
     hostname: String,
 }
 
 impl AuditEmitter {
     pub fn new(tx: Sender<AgentEvent>, agent_id: String, hostname: String) -> Self {
-        Self { tx, agent_id, hostname }
+        Self {
+            tx,
+            agent_id,
+            hostname,
+        }
     }
 
     /// Emit one prevention event.  Best-effort — if the pipeline is full or
@@ -28,15 +32,15 @@ impl AuditEmitter {
     #[allow(clippy::too_many_arguments)]
     pub fn emit(
         &self,
-        action:    EventAction,
-        severity:  Severity,
-        kind:      &str,
-        target:    impl Into<String>,
-        success:   bool,
-        reason:    impl Into<String>,
-        rule_id:   Option<String>,
+        action: EventAction,
+        severity: Severity,
+        kind: &str,
+        target: impl Into<String>,
+        success: bool,
+        reason: impl Into<String>,
+        rule_id: Option<String>,
         command_id: Option<String>,
-        details:   Value,
+        details: Value,
     ) {
         let event = AgentEvent::new(
             self.agent_id.clone(),
@@ -45,10 +49,10 @@ impl AuditEmitter {
             action,
             severity,
             EventData::Prevention(PreventionEventData {
-                kind:    kind.into(),
-                target:  target.into(),
+                kind: kind.into(),
+                target: target.into(),
                 success,
-                reason:  reason.into(),
+                reason: reason.into(),
                 rule_id,
                 command_id,
                 details,

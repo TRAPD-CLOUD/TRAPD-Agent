@@ -23,9 +23,15 @@ use tracing::{info, warn};
 
 use crate::paths;
 
-fn hash_store_path() -> PathBuf { paths::config_dir().join("binary.sha256") }
-fn pubkey_path()     -> PathBuf { paths::config_dir().join("signing.pub") }
-fn sig_path()        -> PathBuf { paths::config_dir().join("binary.sig") }
+fn hash_store_path() -> PathBuf {
+    paths::config_dir().join("binary.sha256")
+}
+fn pubkey_path() -> PathBuf {
+    paths::config_dir().join("signing.pub")
+}
+fn sig_path() -> PathBuf {
+    paths::config_dir().join("binary.sig")
+}
 
 /// Run all binary integrity checks.  Call this once at agent startup,
 /// before any network connections or sensitive operations.
@@ -48,8 +54,12 @@ pub fn check() -> Result<()> {
     let hash_file = hash_store_path();
 
     if hash_file.exists() {
-        let stored = std::fs::read_to_string(&hash_file)
-            .with_context(|| format!("Cannot read binary hash baseline from {}", hash_file.display()))?;
+        let stored = std::fs::read_to_string(&hash_file).with_context(|| {
+            format!(
+                "Cannot read binary hash baseline from {}",
+                hash_file.display()
+            )
+        })?;
         let stored = stored.trim();
 
         if stored != hash_str {
@@ -67,7 +77,9 @@ pub fn check() -> Result<()> {
         // config directory is not writable (non-root test run) we warn rather
         // than abort, so the agent still comes up.
         match write_baseline(&hash_file, &hash_str) {
-            Ok(()) => info!(path = %hash_file.display(), "Binary hash baseline written (first run)"),
+            Ok(()) => {
+                info!(path = %hash_file.display(), "Binary hash baseline written (first run)")
+            }
             Err(e) => warn!(
                 path = %hash_file.display(),
                 error = %e,
@@ -93,7 +105,7 @@ fn verify_ed25519_signature(hash_bytes: &[u8]) -> Result<()> {
     use ed25519_dalek::{Signature, VerifyingKey};
 
     let pubkey_path = pubkey_path();
-    let sig_path    = sig_path();
+    let sig_path = sig_path();
 
     match (pubkey_path.exists(), sig_path.exists()) {
         (false, _) => {
@@ -116,27 +128,31 @@ fn verify_ed25519_signature(hash_bytes: &[u8]) -> Result<()> {
         _ => {}
     }
 
-    let pubkey_bytes = std::fs::read(&pubkey_path)
-        .with_context(|| format!("Cannot read Ed25519 public key from {}", pubkey_path.display()))?;
-    let pubkey_arr: [u8; 32] = pubkey_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("signing.pub must be exactly 32 raw bytes (Ed25519 verifying key)"))?;
+    let pubkey_bytes = std::fs::read(&pubkey_path).with_context(|| {
+        format!(
+            "Cannot read Ed25519 public key from {}",
+            pubkey_path.display()
+        )
+    })?;
+    let pubkey_arr: [u8; 32] = pubkey_bytes.try_into().map_err(|_| {
+        anyhow::anyhow!("signing.pub must be exactly 32 raw bytes (Ed25519 verifying key)")
+    })?;
     let verifying_key = VerifyingKey::from_bytes(&pubkey_arr)
         .context("signing.pub contains an invalid Ed25519 verifying key")?;
 
     let sig_bytes = std::fs::read(&sig_path)
         .with_context(|| format!("Cannot read Ed25519 signature from {}", sig_path.display()))?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("binary.sig must be exactly 64 raw bytes (Ed25519 signature)"))?;
+    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| {
+        anyhow::anyhow!("binary.sig must be exactly 64 raw bytes (Ed25519 signature)")
+    })?;
     let signature = Signature::from_bytes(&sig_arr);
 
     // The signature covers the 32-byte raw SHA256 digest of the binary.
     verifying_key
         .verify_strict(hash_bytes, &signature)
         .context(
-            "Ed25519 signature verification FAILED — binary may have been replaced or tampered with"
-        )?;
+        "Ed25519 signature verification FAILED — binary may have been replaced or tampered with",
+    )?;
 
     info!("Ed25519 signature ✓");
     Ok(())
@@ -156,7 +172,9 @@ fn sha256_of_file(path: &Path) -> Result<(String, Vec<u8>)> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65_536];
     loop {
-        let n = file.read(&mut buf).context("I/O error while hashing binary")?;
+        let n = file
+            .read(&mut buf)
+            .context("I/O error while hashing binary")?;
         if n == 0 {
             break;
         }

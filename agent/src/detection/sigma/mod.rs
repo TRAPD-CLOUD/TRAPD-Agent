@@ -101,7 +101,10 @@ impl SigmaEngine {
         let mut errors = Vec::new();
         for de in serde_yaml_ng::Deserializer::from_str(text) {
             let raw: Result<model::RawRule, _> = serde::Deserialize::deserialize(de);
-            match raw.map_err(anyhow::Error::from).and_then(model::CompiledRule::compile) {
+            match raw
+                .map_err(anyhow::Error::from)
+                .and_then(model::CompiledRule::compile)
+            {
                 Ok(rule) => {
                     self.rules.push(rule);
                     added += 1;

@@ -158,7 +158,9 @@ impl DnsTunnelTracker {
     /// enforced [`MAX_TRACKED`] cap.
     fn prune(&mut self, now: f64) {
         let over_cap = self.domains.len() > MAX_TRACKED;
-        let due = self.last_prune.is_none_or(|t| now - t >= PRUNE_INTERVAL_SECS);
+        let due = self
+            .last_prune
+            .is_none_or(|t| now - t >= PRUNE_INTERVAL_SECS);
         if !over_cap && !due {
             return;
         }
@@ -225,7 +227,9 @@ mod tests {
         let mut t = DnsTunnelTracker::new();
         // A single look-up whose sub-domain label is an encoded payload.
         let name = format!("{}.evil.com", "a".repeat(60));
-        let v = t.observe(&name, 0.0).expect("long labels should be flagged");
+        let v = t
+            .observe(&name, 0.0)
+            .expect("long labels should be flagged");
         assert_eq!(v.reason, "avg_label_length");
         assert_eq!(v.domain, "evil.com");
         assert!(v.avg_label_length > 45.0);

@@ -105,7 +105,11 @@ pub enum CommandPayload {
     /// Restore a previously quarantined file back to its original path.
     RestoreFile { quarantine_id: String },
     /// Add an IP or CIDR to the persistent deny-list.
-    BlockIp { ip: String, #[serde(default)] ttl_secs: Option<u64> },
+    BlockIp {
+        ip: String,
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+    },
     /// Remove an IP/CIDR from the deny-list.
     UnblockIp { ip: String },
     /// Replace the entire IoC rule set.
@@ -198,17 +202,17 @@ pub enum CommandPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandEnvelope {
     pub command_id: Uuid,
-    pub issued_at:  DateTime<Utc>,
+    pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
-    pub agent_id:   String,
-    pub nonce:      Uuid,
-    pub payload:    CommandPayload,
+    pub agent_id: String,
+    pub nonce: Uuid,
+    pub payload: CommandPayload,
 }
 
 /// Wire-level signed command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedCommand {
-    pub envelope:  CommandEnvelope,
+    pub envelope: CommandEnvelope,
     /// Base64-encoded 64-byte Ed25519 signature over canonical_json(envelope).
     pub signature: String,
 }
@@ -223,7 +227,7 @@ pub enum Verdict {
 /// Loads + caches the Ed25519 verifying key.  Cheap to clone.
 #[derive(Clone)]
 pub struct Verifier {
-    key:    VerifyingKey,
+    key: VerifyingKey,
     agent_id: String,
     nonces: Arc<Mutex<NonceStore>>,
 }
@@ -262,7 +266,8 @@ pub fn verify_canonical<T: Serialize>(
         .try_into()
         .map_err(|_| "signature must be 64 bytes".to_string())?;
     let signature = Signature::from_bytes(&sig_arr);
-    let canonical = serde_json::to_vec(value).map_err(|e| format!("canonicalisation failed: {e}"))?;
+    let canonical =
+        serde_json::to_vec(value).map_err(|e| format!("canonicalisation failed: {e}"))?;
     key.verify_strict(&canonical, &signature)
         .map_err(|e| format!("Ed25519 verification failed: {e}"))
 }
@@ -272,7 +277,11 @@ impl Verifier {
         let key = load_verifying_key(pubkey_path)?;
         let nonces = Arc::new(Mutex::new(NonceStore::load(nonce_store_path)));
         info!(path = %pubkey_path.display(), "Response-command verifier loaded");
-        Ok(Self { key, agent_id, nonces })
+        Ok(Self {
+            key,
+            agent_id,
+            nonces,
+        })
     }
 
     /// Verify a `SignedCommand` end-to-end.  Failure reasons are returned so
@@ -294,12 +303,14 @@ impl Verifier {
         let now = Utc::now();
         if cmd.envelope.expires_at < now {
             return Verdict::Rejected(format!(
-                "command expired at {} (now {})", cmd.envelope.expires_at, now
+                "command expired at {} (now {})",
+                cmd.envelope.expires_at, now
             ));
         }
         if cmd.envelope.issued_at > now + chrono::Duration::minutes(5) {
             return Verdict::Rejected(format!(
-                "command issued in the future ({})", cmd.envelope.issued_at
+                "command issued in the future ({})",
+                cmd.envelope.issued_at
             ));
         }
 
@@ -313,9 +324,7 @@ impl Verifier {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if !store.try_insert(cmd.envelope.nonce, cmd.envelope.expires_at) {
-            return Verdict::Rejected(format!(
-                "replay: nonce {} already seen", cmd.envelope.nonce
-            ));
+            return Verdict::Rejected(format!("replay: nonce {} already seen", cmd.envelope.nonce));
         }
         drop(store);
 
@@ -331,13 +340,13 @@ impl Verifier {
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct NonceRecord {
-    nonce:      Uuid,
+    nonce: Uuid,
     expires_at: DateTime<Utc>,
 }
 
 struct NonceStore {
-    path:    std::path::PathBuf,
-    seen:    HashSet<Uuid>,
+    path: std::path::PathBuf,
+    seen: HashSet<Uuid>,
     records: Vec<NonceRecord>,
 }
 
@@ -429,11 +438,13 @@ mod cross_lang_tests {
 
     // install_package "nginx"
     const ENV1: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"22222222-2222-2222-2222-222222222222","payload":{"kind":"install_package","name":"nginx"}}"#;
-    const SIG1: &str = "ttR686hugcf021c/y7KgsQMK59CSwkGUK3NVlsVLEtFXxt373BeMcMhTC1gKSfljYb+SVVV4uCG4H61kkrJwBw==";
+    const SIG1: &str =
+        "ttR686hugcf021c/y7KgsQMK59CSwkGUK3NVlsVLEtFXxt373BeMcMhTC1gKSfljYb+SVVV4uCG4H61kkrJwBw==";
 
     // upgrade_package, name=null (upgrade-all)
     const ENV2: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"33333333-3333-3333-3333-333333333333","payload":{"kind":"upgrade_package","name":null}}"#;
-    const SIG2: &str = "uT+YB5dgXErGwNAgxYmxM0D8tR/YxTVg+jximA8SABzjLu1BD8PQ37Am4M2gfFl1ywV+h3uAmdatRozsRUqVAg==";
+    const SIG2: &str =
+        "uT+YB5dgXErGwNAgxYmxM0D8tR/YxTVg+jximA8SABzjLu1BD8PQ37Am4M2gfFl1ywV+h3uAmdatRozsRUqVAg==";
 
     fn temp_path(suffix: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -454,10 +465,9 @@ mod cross_lang_tests {
     #[test]
     fn accepts_ts_signed_install() {
         let (v, p, n) = verifier();
-        let cmd: SignedCommand = serde_json::from_str(
-            &format!(r#"{{"envelope":{ENV1},"signature":"{SIG1}"}}"#),
-        )
-        .unwrap();
+        let cmd: SignedCommand =
+            serde_json::from_str(&format!(r#"{{"envelope":{ENV1},"signature":"{SIG1}"}}"#))
+                .unwrap();
         match v.verify(&cmd) {
             Verdict::Ok(env) => assert_eq!(env.agent_id, "agent-test"),
             Verdict::Rejected(why) => panic!("install vector rejected: {why}"),
@@ -469,11 +479,13 @@ mod cross_lang_tests {
     #[test]
     fn accepts_ts_signed_upgrade_all() {
         let (v, p, n) = verifier();
-        let cmd: SignedCommand = serde_json::from_str(
-            &format!(r#"{{"envelope":{ENV2},"signature":"{SIG2}"}}"#),
-        )
-        .unwrap();
-        assert!(matches!(v.verify(&cmd), Verdict::Ok(_)), "upgrade-all vector rejected");
+        let cmd: SignedCommand =
+            serde_json::from_str(&format!(r#"{{"envelope":{ENV2},"signature":"{SIG2}"}}"#))
+                .unwrap();
+        assert!(
+            matches!(v.verify(&cmd), Verdict::Ok(_)),
+            "upgrade-all vector rejected"
+        );
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(n);
     }
@@ -483,11 +495,14 @@ mod cross_lang_tests {
         let (v, p, n) = verifier();
         // Flip the package name; signature must no longer verify.
         let tampered = ENV1.replace("nginx", "evilpkg");
-        let cmd: SignedCommand = serde_json::from_str(
-            &format!(r#"{{"envelope":{tampered},"signature":"{SIG1}"}}"#),
-        )
+        let cmd: SignedCommand = serde_json::from_str(&format!(
+            r#"{{"envelope":{tampered},"signature":"{SIG1}"}}"#
+        ))
         .unwrap();
-        assert!(matches!(v.verify(&cmd), Verdict::Rejected(_)), "tampered payload accepted");
+        assert!(
+            matches!(v.verify(&cmd), Verdict::Rejected(_)),
+            "tampered payload accepted"
+        );
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(n);
     }
@@ -502,27 +517,33 @@ mod cross_lang_tests {
 
     // deploy_honeytoken (full: out_of_band + breadcrumb + all options set)
     const ENV3: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"44444444-4444-4444-4444-444444444444","payload":{"kind":"deploy_honeytoken","path":"/home/alice/.aws/credentials","content_b64":"QUtJQUVYQU1QTEU=","mode":384,"mimic_neighbor":true,"canary_marker":"AKIAEXAMPLE","out_of_band":{"channel":"aws_cloudtrail","tracking_id":"trk-abc-123","markers":["AKIAEXAMPLE"]},"token_kind":"aws_credentials","breadcrumbs":[{"path":"/home/alice/.bash_history","content_b64":"ZXhwb3J0IEFXUw==","mode":0,"append":true}]}}"#;
-    const SIG3: &str = "Vl1FjZi7v4RNvJX78TJUdtden3QqNal63oM9/964AWqDBJxLUgYl/BrrHYyuhh1Ny2gey6fe5BbUQoC+MTP+CQ==";
+    const SIG3: &str =
+        "Vl1FjZi7v4RNvJX78TJUdtden3QqNal63oM9/964AWqDBJxLUgYl/BrrHYyuhh1Ny2gey6fe5BbUQoC+MTP+CQ==";
 
     // deploy_honeytoken (minimal: null options, empty breadcrumbs)
     const ENV4: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"55555555-5555-5555-5555-555555555555","payload":{"kind":"deploy_honeytoken","path":"/srv/app/.env","content_b64":"U0VDUkVUPTE=","mode":0,"mimic_neighbor":false,"canary_marker":null,"out_of_band":null,"token_kind":null,"breadcrumbs":[]}}"#;
-    const SIG4: &str = "Xdyyif3hh34vzvm6Hjo6IVoqR2o2AqeiNEIMKyEiD5248N61Jy17mbmWEnWQEoffPgZC2Paql/nEcL9xEFdKCA==";
+    const SIG4: &str =
+        "Xdyyif3hh34vzvm6Hjo6IVoqR2o2AqeiNEIMKyEiD5248N61Jy17mbmWEnWQEoffPgZC2Paql/nEcL9xEFdKCA==";
 
     // revoke_honeytoken
     const ENV5: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"66666666-6666-6666-6666-666666666666","payload":{"kind":"revoke_honeytoken","path":"/srv/app/.env"}}"#;
-    const SIG5: &str = "fmkRmTUnMf72VJ6RBfNH3RtBxbJMY2O3OY8KTGcaOPFq/lUbggBm8SGs0LIeziURHhHySMMuP9hGlFlRSSWCCg==";
+    const SIG5: &str =
+        "fmkRmTUnMf72VJ6RBfNH3RtBxbJMY2O3OY8KTGcaOPFq/lUbggBm8SGs0LIeziURHhHySMMuP9hGlFlRSSWCCg==";
 
     // freeze_pid
     const ENV6: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"77777777-7777-7777-7777-777777777777","payload":{"kind":"freeze_pid","pid":4242}}"#;
-    const SIG6: &str = "n48rafHUR6F7qhwsyuih6QHZcDFx3DkpxQ63M5mBbBivMcdtJrVcBHpJ/eYb2MrXux3hd/qICkuhCQuATx4kBA==";
+    const SIG6: &str =
+        "n48rafHUR6F7qhwsyuih6QHZcDFx3DkpxQ63M5mBbBivMcdtJrVcBHpJ/eYb2MrXux3hd/qICkuhCQuATx4kBA==";
 
     // thaw_pid
     const ENV7: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"88888888-8888-8888-8888-888888888888","payload":{"kind":"thaw_pid","pid":4242}}"#;
-    const SIG7: &str = "O7Vabjri9hBQ/hkq46bjUUdz0ugzJ3Vk93DcV4zUH6ugK2fNAsdApkOcrYnBopfzt/zIyIkQ/m7PzQeQMY/0Aw==";
+    const SIG7: &str =
+        "O7Vabjri9hBQ/hkq46bjUUdz0ugzJ3Vk93DcV4zUH6ugK2fNAsdApkOcrYnBopfzt/zIyIkQ/m7PzQeQMY/0Aw==";
 
     // kill_pid
     const ENV8: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"99999999-9999-9999-9999-999999999999","payload":{"kind":"kill_pid","pid":4242}}"#;
-    const SIG8: &str = "6ysMGbqRLHq5NmtBrKiWLOJjIyyFxM/2pFsk3HfhopTLRdd4Gh395DkZydPWzbuQ3FkPG22QJjCO8ee0JpxaAg==";
+    const SIG8: &str =
+        "6ysMGbqRLHq5NmtBrKiWLOJjIyyFxM/2pFsk3HfhopTLRdd4Gh395DkZydPWzbuQ3FkPG22QJjCO8ee0JpxaAg==";
 
     #[test]
     fn verifies_after_nonce_store_lock_poisoned() {

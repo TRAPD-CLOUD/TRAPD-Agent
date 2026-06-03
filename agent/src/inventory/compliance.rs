@@ -28,7 +28,10 @@ pub struct ComplianceFlags {
 
 impl Default for ComplianceFlags {
     fn default() -> Self {
-        Self { vuln_scan: true, cis: true }
+        Self {
+            vuln_scan: true,
+            cis: true,
+        }
     }
 }
 
@@ -94,7 +97,10 @@ pub fn build_sbom(packages: &[SoftwarePackage], pkg_type: &str) -> Sbom {
             }
         })
         .collect();
-    Sbom { components, ..Default::default() }
+    Sbom {
+        components,
+        ..Default::default()
+    }
 }
 
 /// Map the inventory `source` (dpkg/rpm/…) to a purl package type.
@@ -270,9 +276,21 @@ fn sysctl_check(id: &str, title: &str, level: u8, path: &str, want: &str) -> Cis
         Some(v) => {
             let got = v.trim();
             let status = if got == want { "pass" } else { "fail" };
-            CisFinding::new(id, title, level, status, format!("{path} = {got} (want {want})"))
+            CisFinding::new(
+                id,
+                title,
+                level,
+                status,
+                format!("{path} = {got} (want {want})"),
+            )
         }
-        None => CisFinding::new(id, title, level, "not_applicable", format!("{path} unreadable")),
+        None => CisFinding::new(
+            id,
+            title,
+            level,
+            "not_applicable",
+            format!("{path} unreadable"),
+        ),
     }
 }
 
@@ -306,11 +324,12 @@ pub fn cis_checks() -> Vec<CisFinding> {
     // 5.2 — SSH server hardening.
     if let Some(cfg) = read("/etc/ssh/sshd_config") {
         let root = sshd_directive(&cfg, "PermitRootLogin").unwrap_or_else(|| "yes".into());
-        let status = if root.eq_ignore_ascii_case("no") || root.eq_ignore_ascii_case("prohibit-password") {
-            "pass"
-        } else {
-            "fail"
-        };
+        let status =
+            if root.eq_ignore_ascii_case("no") || root.eq_ignore_ascii_case("prohibit-password") {
+                "pass"
+            } else {
+                "fail"
+            };
         out.push(CisFinding::new(
             "5.2.8",
             "Ensure SSH root login is disabled",
@@ -320,7 +339,11 @@ pub fn cis_checks() -> Vec<CisFinding> {
         ));
 
         let pw = sshd_directive(&cfg, "PasswordAuthentication").unwrap_or_else(|| "yes".into());
-        let status = if pw.eq_ignore_ascii_case("no") { "pass" } else { "fail" };
+        let status = if pw.eq_ignore_ascii_case("no") {
+            "pass"
+        } else {
+            "fail"
+        };
         out.push(CisFinding::new(
             "5.2.10",
             "Ensure SSH password authentication is disabled",
@@ -339,8 +362,18 @@ pub fn cis_checks() -> Vec<CisFinding> {
     }
 
     // 6.1 — sensitive-file permissions.
-    out.push(perm_check("6.1.2", "Ensure permissions on /etc/passwd are 644 or stricter", "/etc/passwd", 0o644));
-    out.push(perm_check("6.1.4", "Ensure permissions on /etc/shadow are 640 or stricter", "/etc/shadow", 0o640));
+    out.push(perm_check(
+        "6.1.2",
+        "Ensure permissions on /etc/passwd are 644 or stricter",
+        "/etc/passwd",
+        0o644,
+    ));
+    out.push(perm_check(
+        "6.1.4",
+        "Ensure permissions on /etc/shadow are 640 or stricter",
+        "/etc/shadow",
+        0o640,
+    ));
 
     out
 }
@@ -353,8 +386,18 @@ fn perm_check(id: &str, title: &str, path: &str, max_mode: u32) -> CisFinding {
         match std::fs::metadata(path) {
             Ok(md) => {
                 let mode = md.permissions().mode() & 0o777;
-                let status = if mode & !max_mode == 0 { "pass" } else { "fail" };
-                CisFinding::new(id, title, 1, status, format!("{path} mode = {mode:04o} (max {max_mode:04o})"))
+                let status = if mode & !max_mode == 0 {
+                    "pass"
+                } else {
+                    "fail"
+                };
+                CisFinding::new(
+                    id,
+                    title,
+                    1,
+                    status,
+                    format!("{path} mode = {mode:04o} (max {max_mode:04o})"),
+                )
             }
             Err(_) => CisFinding::new(id, title, 1, "not_applicable", format!("{path} absent")),
         }
@@ -394,7 +437,12 @@ pub fn assess(
     let cis_findings = if flags.cis { cis_checks() } else { Vec::new() };
     let cis_fail_count = cis_findings.iter().filter(|f| f.status == "fail").count();
 
-    ComplianceReport { sbom, vulnerabilities, cis_findings, cis_fail_count }
+    ComplianceReport {
+        sbom,
+        vulnerabilities,
+        cis_findings,
+        cis_fail_count,
+    }
 }
 
 #[cfg(test)]
@@ -402,7 +450,11 @@ mod tests {
     use super::*;
 
     fn pkg(name: &str, ver: &str) -> SoftwarePackage {
-        SoftwarePackage { name: name.into(), version: ver.into(), architecture: Some("amd64".into()) }
+        SoftwarePackage {
+            name: name.into(),
+            version: ver.into(),
+            architecture: Some("amd64".into()),
+        }
     }
 
     #[test]
@@ -447,7 +499,10 @@ mod tests {
     #[test]
     fn sshd_directive_takes_last_effective_value() {
         let cfg = "PermitRootLogin yes\n# comment\nPermitRootLogin no\n";
-        assert_eq!(sshd_directive(cfg, "permitrootlogin").as_deref(), Some("no"));
+        assert_eq!(
+            sshd_directive(cfg, "permitrootlogin").as_deref(),
+            Some("no")
+        );
         assert_eq!(sshd_directive(cfg, "Missing"), None);
     }
 
@@ -457,7 +512,10 @@ mod tests {
         let findings = cis_checks();
         assert!(!findings.is_empty());
         for f in &findings {
-            assert!(matches!(f.status.as_str(), "pass" | "fail" | "not_applicable"));
+            assert!(matches!(
+                f.status.as_str(),
+                "pass" | "fail" | "not_applicable"
+            ));
         }
     }
 }

@@ -4,14 +4,14 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
-    pub event_id:  Uuid,
-    pub agent_id:  String,
-    pub hostname:  String,
+    pub event_id: Uuid,
+    pub agent_id: String,
+    pub hostname: String,
     pub timestamp: DateTime<Utc>,
-    pub class:     EventClass,
-    pub action:    EventAction,
-    pub severity:  Severity,
-    pub data:      EventData,
+    pub class: EventClass,
+    pub action: EventAction,
+    pub severity: Severity,
+    pub data: EventData,
 }
 
 impl AgentEvent {
@@ -24,7 +24,7 @@ impl AgentEvent {
         data: EventData,
     ) -> Self {
         Self {
-            event_id:  Uuid::new_v4(),
+            event_id: Uuid::new_v4(),
             agent_id,
             hostname,
             timestamp: Utc::now(),
@@ -233,12 +233,12 @@ pub struct EbpfDropsData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessCreateData {
-    pub pid:      i32,
-    pub ppid:     i32,
-    pub name:     String,
-    pub exe:      String,
-    pub cmdline:  String,
-    pub uid:      u32,
+    pub pid: i32,
+    pub ppid: i32,
+    pub name: String,
+    pub exe: String,
+    pub cmdline: String,
+    pub uid: u32,
     pub username: String,
     /// SHA256 of the executable image, hashed at collection time.  `None` when
     /// hashing is disabled or the image is not a hashable regular file.
@@ -248,21 +248,21 @@ pub struct ProcessCreateData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessTerminateData {
-    pub pid:  i32,
+    pub pid: i32,
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecEventData {
-    pub pid:      i32,
-    pub ppid:     i32,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub ppid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:     String,
-    pub exe:      String,
-    pub cmdline:  String,
-    pub cwd:      String,
+    pub comm: String,
+    pub exe: String,
+    pub cmdline: String,
+    pub cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,13 +302,13 @@ pub struct ExecEventData {
 #[derive(Debug, Clone, Default)]
 pub struct ExecEnrichment {
     pub loaded_libraries: Vec<String>,
-    pub interpreter:      Option<InterpreterContext>,
-    pub env:              std::collections::BTreeMap<String, String>,
-    pub container_id:     Option<String>,
+    pub interpreter: Option<InterpreterContext>,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub container_id: Option<String>,
     pub container_runtime: Option<String>,
-    pub container_image:  Option<String>,
+    pub container_image: Option<String>,
     pub container_image_digest: Option<String>,
-    pub k8s:              Option<K8sContext>,
+    pub k8s: Option<K8sContext>,
 }
 
 /// Decoded view of a script interpreter invocation — the inline program body
@@ -333,9 +333,9 @@ pub struct InterpreterContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct K8sContext {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pod_uid:   Option<String>,
+    pub pod_uid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pod_name:  Option<String>,
+    pub pod_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     /// Orchestration labels (`io.kubernetes.*`, custom pod labels).
@@ -351,9 +351,9 @@ pub struct NetworkConnectionData {
     pub dst_addr: String,
     pub dst_port: u16,
     /// `established` / `open` on flow start; `closed` on the flow-end record.
-    pub state:    String,
-    pub pid:      Option<i32>,
-    pub process:  Option<String>,
+    pub state: String,
+    pub pid: Option<i32>,
+    pub process: Option<String>,
     /// Flow lifetime in milliseconds, measured from first observation to the
     /// flow-close record (set only on the `closed` event).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -378,25 +378,25 @@ pub struct NetworkConnectionData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemSnapshotData {
-    pub os:              String,
-    pub kernel:          String,
-    pub distro:          String,
-    pub cpu_count:       usize,
-    pub cpu_usage_pct:   f32,
+    pub os: String,
+    pub kernel: String,
+    pub distro: String,
+    pub cpu_count: usize,
+    pub cpu_usage_pct: f32,
     pub memory_total_mb: u64,
-    pub memory_used_mb:  u64,
-    pub memory_free_mb:  u64,
-    pub uptime_secs:     u64,
-    pub load_avg:        [f64; 3],
+    pub memory_used_mb: u64,
+    pub memory_free_mb: u64,
+    pub uptime_secs: u64,
+    pub load_avg: [f64; 3],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserLogonData {
-    pub username:    String,
-    pub src_addr:    Option<String>,
-    pub src_port:    Option<u16>,
+    pub username: String,
+    pub src_addr: Option<String>,
+    pub src_port: Option<u16>,
     pub auth_method: Option<String>,
-    pub success:     bool,
+    pub success: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,147 +411,147 @@ pub struct FileEventData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileOpenData {
-    pub pid:      i32,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:     String,
-    pub path:     String,
-    pub flags:    u64,
+    pub comm: String,
+    pub path: String,
+    pub flags: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkSocketData {
-    pub pid:      i32,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:     String,
-    pub op:       String,
-    pub family:   String,
-    pub addr:     String,
-    pub port:     u16,
+    pub comm: String,
+    pub op: String,
+    pub family: String,
+    pub addr: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkData {
-    pub parent_pid:  i32,
-    pub child_pid:   i32,
+    pub parent_pid: i32,
+    pub child_pid: i32,
     pub parent_comm: String,
-    pub child_comm:  String,
+    pub child_comm: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileUnlinkData {
-    pub pid:      i32,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:     String,
-    pub path:     String,
+    pub comm: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRenameData {
-    pub pid:      i32,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:     String,
+    pub comm: String,
     pub old_path: String,
     pub new_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChmodData {
-    pub pid:      i32,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:     String,
-    pub path:     String,
-    pub mode:     u32,
+    pub comm: String,
+    pub path: String,
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChownData {
-    pub pid:      i32,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:     String,
-    pub path:     String,
-    pub new_uid:  u32,
-    pub new_gid:  u32,
+    pub comm: String,
+    pub path: String,
+    pub new_uid: u32,
+    pub new_gid: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MmapData {
-    pub pid:   i32,
-    pub uid:   u32,
-    pub gid:   u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:  String,
-    pub addr:  u64,
-    pub len:   u64,
-    pub prot:  u32,
+    pub comm: String,
+    pub addr: u64,
+    pub len: u64,
+    pub prot: u32,
     pub flags: u32,
     pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtraceData {
-    pub pid:        i32,
-    pub uid:        u32,
-    pub gid:        u32,
-    pub username:   String,
-    pub comm:       String,
-    pub request:    u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub username: String,
+    pub comm: String,
+    pub request: u32,
     pub target_pid: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleLoadData {
-    pub pid:     i32,
-    pub uid:     u32,
-    pub gid:     u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub name:    String,
-    pub taints:  u32,
+    pub name: String,
+    pub taints: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShmData {
-    pub pid:      i32,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:     String,
-    pub op:       String,
-    pub key:      i32,
-    pub size:     u64,
-    pub flags:    i32,
+    pub comm: String,
+    pub op: String,
+    pub key: i32,
+    pub size: u64,
+    pub flags: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NsChangeData {
-    pub pid:      i32,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:     String,
-    pub op:       String,
+    pub comm: String,
+    pub op: String,
     pub namespaces: String,
-    pub flags:    u64,
+    pub flags: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsData {
-    pub pid:      i32,
-    pub uid:      u32,
-    pub gid:      u32,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
     pub username: String,
-    pub comm:     String,
+    pub comm: String,
     pub dst_addr: String,
     pub dst_port: u16,
 }
@@ -604,42 +604,42 @@ pub struct TlsHandshakeData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrityViolationData {
-    pub path:          String,
+    pub path: String,
     pub expected_hash: String,
-    pub actual_hash:   String,
-    pub size_delta:    i64,
+    pub actual_hash: String,
+    pub size_delta: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RansomwareIndicatorData {
     pub indicator_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path:           Option<String>,
+    pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pid:            Option<i32>,
+    pub pid: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub comm:           Option<String>,
+    pub comm: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub entropy:        Option<f64>,
+    pub entropy: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub write_rate:     Option<u64>,
-    pub details:        String,
+    pub write_rate: Option<u64>,
+    pub details: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTamperData {
-    pub path:   String,
+    pub path: String,
     pub action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteRateAnomalyData {
-    pub pid:             i32,
-    pub uid:             u32,
-    pub gid:             u32,
-    pub username:        String,
-    pub comm:            String,
-    pub write_count:     u64,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub username: String,
+    pub comm: String,
+    pub write_count: u64,
     pub burst_threshold: u64,
 }
 
@@ -649,8 +649,8 @@ pub struct KillAttemptData {
     pub sender_uid: u32,
     pub sender_gid: u32,
     pub sender_comm: String,
-    pub target_pid:  i32,
-    pub signal:      i32,
+    pub target_pid: i32,
+    pub signal: i32,
     pub signal_name: String,
 }
 
@@ -669,7 +669,7 @@ pub struct KillAttemptData {
 ///   "command_rejected"/"command_accepted"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreventionEventData {
-    pub kind:   String,
+    pub kind: String,
     /// The thing being acted on:  PID, IP, file path, command id, …
     pub target: String,
     /// Whether the underlying syscall / shell-out succeeded.
@@ -678,13 +678,13 @@ pub struct PreventionEventData {
     pub reason: String,
     /// Optional IoC rule id that triggered this action.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rule_id:    Option<String>,
+    pub rule_id: Option<String>,
     /// Optional id of the signed command that requested this action.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_id: Option<String>,
     /// Free-form structured details (process metadata, hashes, etc.).
     #[serde(skip_serializing_if = "serde_json::Value::is_null", default)]
-    pub details:    serde_json::Value,
+    pub details: serde_json::Value,
 }
 
 // ── Detection engine payload ──────────────────────────────────────────────────
@@ -699,11 +699,11 @@ pub struct PreventionEventData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionData {
     /// Stable rule identifier, e.g. `lolbin.shell_spawns_downloader`.
-    pub rule_id:    String,
+    pub rule_id: String,
     /// Human-readable title of what was detected.
-    pub title:      String,
+    pub title: String,
     /// Detection family: `ioc`, `lolbin`, `reverse_shell`, `beaconing`, …
-    pub category:   String,
+    pub category: String,
     /// MITRE ATT&CK tactic (e.g. `TA0011 Command and Control`), if mapped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mitre_tactic: Option<String>,
@@ -713,12 +713,12 @@ pub struct DetectionData {
     /// Confidence 0–100 that this is a true positive.
     pub confidence: u8,
     /// What the detection fired on: pid, ip:port, file path, hash, …
-    pub subject:    String,
+    pub subject: String,
     /// Free-form explanation, including the matched evidence.
-    pub detail:     String,
+    pub detail: String,
     /// Optional structured evidence (matched IOC, observed cadence, …).
     #[serde(skip_serializing_if = "serde_json::Value::is_null", default)]
-    pub evidence:   serde_json::Value,
+    pub evidence: serde_json::Value,
 }
 
 // ── Honeytoken access payload (deception, step 2) ─────────────────────────────
@@ -862,25 +862,25 @@ pub struct ProcessAncestor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetuidData {
-    pub pid:     i32,
+    pub pid: i32,
     pub old_uid: u32,
     pub new_uid: u32,
-    pub comm:    String,
+    pub comm: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemfdCreateData {
-    pub pid:   i32,
-    pub comm:  String,
-    pub name:  String,
+    pub pid: i32,
+    pub comm: String,
+    pub name: String,
     pub flags: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryAnomalyData {
-    pub pid:    i32,
+    pub pid: i32,
     pub region: String,
-    pub perms:  String,
+    pub perms: String,
 }
 
 #[cfg(test)]

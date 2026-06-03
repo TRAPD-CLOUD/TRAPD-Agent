@@ -87,21 +87,34 @@ mod tests {
         fn status(&self, _: i32) -> Option<String> {
             Some("Name:\tcat\nState:\tT (stopped)\nPid:\t100\n".into())
         }
-        fn exe(&self, _: i32) -> Option<String> { Some("/bin/cat".into()) }
-        fn cwd(&self, _: i32) -> Option<String> { Some("/home/alice".into()) }
-        fn cmdline(&self, _: i32) -> Option<String> { Some("cat /home/alice/.aws/credentials".into()) }
-        fn open_fds(&self, _: i32) -> Vec<String> { self.fds.clone() }
+        fn exe(&self, _: i32) -> Option<String> {
+            Some("/bin/cat".into())
+        }
+        fn cwd(&self, _: i32) -> Option<String> {
+            Some("/home/alice".into())
+        }
+        fn cmdline(&self, _: i32) -> Option<String> {
+            Some("cat /home/alice/.aws/credentials".into())
+        }
+        fn open_fds(&self, _: i32) -> Vec<String> {
+            self.fds.clone()
+        }
     }
 
     #[test]
     fn parses_state_line() {
-        assert_eq!(parse_state("State:\tT (stopped)\n").as_deref(), Some("T (stopped)"));
+        assert_eq!(
+            parse_state("State:\tT (stopped)\n").as_deref(),
+            Some("T (stopped)")
+        );
         assert_eq!(parse_state("No state here"), None);
     }
 
     #[test]
     fn captures_and_marks_frozen() {
-        let p = FakeProc { fds: vec!["/dev/pts/3".into(), "/home/alice/.aws/credentials".into()] };
+        let p = FakeProc {
+            fds: vec!["/dev/pts/3".into(), "/home/alice/.aws/credentials".into()],
+        };
         let snap = capture(&p, 100, true);
         assert!(snap.frozen);
         assert_eq!(snap.state.as_deref(), Some("T (stopped)"));

@@ -22,7 +22,10 @@ pub struct FieldView {
 impl FieldView {
     /// Values for a (lower-cased) Sigma field name, or an empty slice.
     pub fn get(&self, field: &str) -> &[String] {
-        self.fields.get(field).map(|v| v.as_slice()).unwrap_or(EMPTY)
+        self.fields
+            .get(field)
+            .map(|v| v.as_slice())
+            .unwrap_or(EMPTY)
     }
 
     /// Concatenation of the salient fields, for keyword (`Search::Keywords`)
@@ -115,7 +118,12 @@ impl FieldView {
             _ => return None,
         };
 
-        Some(FieldView { category, product: "linux", fields: f, full_text })
+        Some(FieldView {
+            category,
+            product: "linux",
+            fields: f,
+            full_text,
+        })
     }
 }
 

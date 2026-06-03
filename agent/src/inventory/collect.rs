@@ -25,7 +25,12 @@ const SCHEMA_VERSION: u32 = 4;
 /// Build a full inventory snapshot for this host (all compliance checks on).
 #[allow(dead_code)] // convenience wrapper retained for tests/external callers
 pub fn gather(agent_id: String, device_id: String, hostname: String) -> InventorySnapshot {
-    gather_with_flags(agent_id, device_id, hostname, super::compliance::ComplianceFlags::default())
+    gather_with_flags(
+        agent_id,
+        device_id,
+        hostname,
+        super::compliance::ComplianceFlags::default(),
+    )
 }
 
 /// Build a snapshot, gating the vulnerability/CIS work on the supplied flags.
@@ -75,8 +80,14 @@ pub fn gather_with_flags(
 /// Filesystem roots scanned for SUID/SGID binaries and file capabilities. These
 /// cover the standard executable locations without walking the whole disk.
 const POSTURE_SCAN_ROOTS: &[&str] = &[
-    "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin",
-    "/bin", "/sbin", "/usr/lib", "/opt",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/bin",
+    "/sbin",
+    "/usr/lib",
+    "/opt",
 ];
 
 /// Cap on the number of directory entries visited per scan, so the inventory
@@ -159,7 +170,8 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
     }
 
     suid.sort_by(|a, b| a.path.cmp(&b.path));
-    caps.sort_by(|a, b| a.path.cmp(&b.path));    (suid, caps)
+    caps.sort_by(|a, b| a.path.cmp(&b.path));
+    (suid, caps)
 }
 
 /// SHA256 of a file, formatted `sha256:<hex>`; `None` on any IO error.
@@ -249,16 +261,46 @@ fn decode_vfs_cap(raw: &[u8]) -> Option<String> {
 
 /// Capability names indexed by bit position (subset through CAP_CHECKPOINT_RESTORE).
 const CAP_NAMES: &[&str] = &[
-    "cap_chown", "cap_dac_override", "cap_dac_read_search", "cap_fowner",
-    "cap_fsetid", "cap_kill", "cap_setgid", "cap_setuid",
-    "cap_setpcap", "cap_linux_immutable", "cap_net_bind_service", "cap_net_broadcast",
-    "cap_net_admin", "cap_net_raw", "cap_ipc_lock", "cap_ipc_owner",
-    "cap_sys_module", "cap_sys_rawio", "cap_sys_chroot", "cap_sys_ptrace",
-    "cap_sys_pacct", "cap_sys_admin", "cap_sys_boot", "cap_sys_nice",
-    "cap_sys_resource", "cap_sys_time", "cap_sys_tty_config", "cap_mknod",
-    "cap_lease", "cap_audit_write", "cap_audit_control", "cap_setfcap",
-    "cap_mac_override", "cap_mac_admin", "cap_syslog", "cap_wake_alarm",
-    "cap_block_suspend", "cap_audit_read", "cap_perfmon", "cap_bpf",
+    "cap_chown",
+    "cap_dac_override",
+    "cap_dac_read_search",
+    "cap_fowner",
+    "cap_fsetid",
+    "cap_kill",
+    "cap_setgid",
+    "cap_setuid",
+    "cap_setpcap",
+    "cap_linux_immutable",
+    "cap_net_bind_service",
+    "cap_net_broadcast",
+    "cap_net_admin",
+    "cap_net_raw",
+    "cap_ipc_lock",
+    "cap_ipc_owner",
+    "cap_sys_module",
+    "cap_sys_rawio",
+    "cap_sys_chroot",
+    "cap_sys_ptrace",
+    "cap_sys_pacct",
+    "cap_sys_admin",
+    "cap_sys_boot",
+    "cap_sys_nice",
+    "cap_sys_resource",
+    "cap_sys_time",
+    "cap_sys_tty_config",
+    "cap_mknod",
+    "cap_lease",
+    "cap_audit_write",
+    "cap_audit_control",
+    "cap_setfcap",
+    "cap_mac_override",
+    "cap_mac_admin",
+    "cap_syslog",
+    "cap_wake_alarm",
+    "cap_block_suspend",
+    "cap_audit_read",
+    "cap_perfmon",
+    "cap_bpf",
     "cap_checkpoint_restore",
 ];
 
@@ -269,14 +311,7 @@ fn read_xattr(path: &str, name: &str) -> Option<Vec<u8>> {
     let c_name = CString::new(name).ok()?;
 
     // First call with a null buffer to size the value.
-    let len = unsafe {
-        libc::getxattr(
-            c_path.as_ptr(),
-            c_name.as_ptr(),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
+    let len = unsafe { libc::getxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
     if len <= 0 {
         return None;
     }
@@ -351,9 +386,7 @@ fn gather_listening_ports() -> Vec<ListeningPort> {
     }
 
     out.sort_by_key(|a| (a.port, a.protocol.clone()));
-    out.dedup_by(|a, b| {
-        a.port == b.port && a.protocol == b.protocol && a.address == b.address
-    });
+    out.dedup_by(|a, b| a.port == b.port && a.protocol == b.protocol && a.address == b.address);
     out
 }
 
@@ -428,7 +461,12 @@ fn gather_kernel_modules() -> Vec<KernelModule> {
         let taint = f.next().unwrap_or("");
         let signature = module_signature(name, taint).to_string();
 
-        out.push(KernelModule { name: name.to_string(), size, state, signature });
+        out.push(KernelModule {
+            name: name.to_string(),
+            size,
+            state,
+            signature,
+        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -460,7 +498,10 @@ fn gather_os() -> OsInfo {
     let osr = parse_os_release();
     OsInfo {
         family: "linux".to_string(),
-        name: osr.get("NAME").cloned().unwrap_or_else(|| "Linux".to_string()),
+        name: osr
+            .get("NAME")
+            .cloned()
+            .unwrap_or_else(|| "Linux".to_string()),
         version: osr.get("VERSION_ID").cloned().unwrap_or_default(),
         pretty_name: osr
             .get("PRETTY_NAME")
@@ -615,7 +656,13 @@ fn gather_network() -> Vec<NetInterface> {
             .map(|s| s == "up")
             .unwrap_or(false);
         let (ipv4, ipv6) = ip_map.get(&name).cloned().unwrap_or_default();
-        out.push(NetInterface { name, mac, ipv4, ipv6, up });
+        out.push(NetInterface {
+            name,
+            mac,
+            ipv4,
+            ipv6,
+            up,
+        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -646,12 +693,24 @@ fn ifaddr_ip_map() -> std::collections::HashMap<String, (Vec<String>, Vec<String
 
 fn gather_software() -> SoftwareInventory {
     if let Some(pkgs) = dpkg_packages() {
-        return SoftwareInventory { source: "dpkg".into(), package_count: pkgs.len(), packages: pkgs };
+        return SoftwareInventory {
+            source: "dpkg".into(),
+            package_count: pkgs.len(),
+            packages: pkgs,
+        };
     }
     if let Some(pkgs) = rpm_packages() {
-        return SoftwareInventory { source: "rpm".into(), package_count: pkgs.len(), packages: pkgs };
+        return SoftwareInventory {
+            source: "rpm".into(),
+            package_count: pkgs.len(),
+            packages: pkgs,
+        };
     }
-    SoftwareInventory { source: "none".into(), package_count: 0, packages: Vec::new() }
+    SoftwareInventory {
+        source: "none".into(),
+        package_count: 0,
+        packages: Vec::new(),
+    }
 }
 
 fn dpkg_packages() -> Option<Vec<SoftwarePackage>> {
@@ -668,11 +727,22 @@ fn dpkg_packages() -> Option<Vec<SoftwarePackage>> {
                 return None;
             }
             let version = parts.next().unwrap_or("").trim().to_string();
-            let arch = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-            Some(SoftwarePackage { name: name.to_string(), version, architecture: arch })
+            let arch = parts
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Some(SoftwarePackage {
+                name: name.to_string(),
+                version,
+                architecture: arch,
+            })
         })
         .collect();
-    if pkgs.is_empty() { None } else { Some(pkgs) }
+    if pkgs.is_empty() {
+        None
+    } else {
+        Some(pkgs)
+    }
 }
 
 fn rpm_packages() -> Option<Vec<SoftwarePackage>> {
@@ -689,11 +759,22 @@ fn rpm_packages() -> Option<Vec<SoftwarePackage>> {
                 return None;
             }
             let version = parts.next().unwrap_or("").trim().to_string();
-            let arch = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-            Some(SoftwarePackage { name: name.to_string(), version, architecture: arch })
+            let arch = parts
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Some(SoftwarePackage {
+                name: name.to_string(),
+                version,
+                architecture: arch,
+            })
         })
         .collect();
-    if pkgs.is_empty() { None } else { Some(pkgs) }
+    if pkgs.is_empty() {
+        None
+    } else {
+        Some(pkgs)
+    }
 }
 
 // ── Users ───────────────────────────────────────────────────────────────────
@@ -716,9 +797,17 @@ fn gather_users() -> Vec<UserAccount> {
             let home = f[5].to_string();
             let shell = f[6].to_string();
             // "Human" = root, or a normal login uid with a real interactive shell.
-            let real_shell = !(shell.ends_with("nologin") || shell.ends_with("false") || shell.is_empty());
+            let real_shell =
+                !(shell.ends_with("nologin") || shell.ends_with("false") || shell.is_empty());
             let is_human = real_shell && (uid == 0 || uid >= 1000);
-            Some(UserAccount { username, uid, gid, home, shell, is_human })
+            Some(UserAccount {
+                username,
+                uid,
+                gid,
+                home,
+                shell,
+                is_human,
+            })
         })
         .collect()
 }
@@ -726,7 +815,10 @@ fn gather_users() -> Vec<UserAccount> {
 // ── Small helpers ───────────────────────────────────────────────────────────
 
 fn read_trim(path: &str) -> Option<String> {
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Run a command and capture trimmed stdout, or None if it is missing/fails.
@@ -807,9 +899,18 @@ mod tests {
     #[test]
     fn module_signature_reads_taint() {
         // An unsigned-module taint flag ('E') must classify as unsigned.
-        assert_eq!(module_signature("definitely_not_a_real_module_xyz", "(OE)"), "unsigned");
-        assert_eq!(module_signature("definitely_not_a_real_module_xyz", "(O)"), "signed");
-        assert_eq!(module_signature("definitely_not_a_real_module_xyz", ""), "unknown");
+        assert_eq!(
+            module_signature("definitely_not_a_real_module_xyz", "(OE)"),
+            "unsigned"
+        );
+        assert_eq!(
+            module_signature("definitely_not_a_real_module_xyz", "(O)"),
+            "signed"
+        );
+        assert_eq!(
+            module_signature("definitely_not_a_real_module_xyz", ""),
+            "unknown"
+        );
     }
 
     #[test]

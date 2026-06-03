@@ -63,7 +63,12 @@ pub fn streaming_client() -> Result<reqwest::Client> {
 /// Whether the operator has explicitly opted into the system trust store.
 fn system_roots_opt_in() -> bool {
     std::env::var(ALLOW_SYSTEM_ROOTS_ENV)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -140,7 +145,9 @@ fn pin_required(ca_exists: bool, opt_in: bool) -> Result<bool> {
     } else if opt_in {
         Ok(false)
     } else {
-        Err(anyhow!("control channel is unpinned and system roots are not opted in"))
+        Err(anyhow!(
+            "control channel is unpinned and system roots are not opted in"
+        ))
     }
 }
 
@@ -224,26 +231,41 @@ mod tests {
 
     #[test]
     fn trims_trailing_slash() {
-        assert_eq!(normalize_base_url("https://api.example.com/"), "https://api.example.com");
+        assert_eq!(
+            normalize_base_url("https://api.example.com/"),
+            "https://api.example.com"
+        );
     }
 
     #[test]
     fn trims_multiple_trailing_slashes() {
-        assert_eq!(normalize_base_url("https://api.example.com///"), "https://api.example.com");
+        assert_eq!(
+            normalize_base_url("https://api.example.com///"),
+            "https://api.example.com"
+        );
     }
 
     #[test]
     fn trims_surrounding_whitespace() {
-        assert_eq!(normalize_base_url("  https://api.example.com/  "), "https://api.example.com");
+        assert_eq!(
+            normalize_base_url("  https://api.example.com/  "),
+            "https://api.example.com"
+        );
     }
 
     #[test]
     fn leaves_clean_url_untouched() {
-        assert_eq!(normalize_base_url("https://api.example.com"), "https://api.example.com");
+        assert_eq!(
+            normalize_base_url("https://api.example.com"),
+            "https://api.example.com"
+        );
     }
 
     #[test]
     fn preserves_path_prefix() {
-        assert_eq!(normalize_base_url("https://h.example.com/base/"), "https://h.example.com/base");
+        assert_eq!(
+            normalize_base_url("https://h.example.com/base/"),
+            "https://h.example.com/base"
+        );
     }
 }

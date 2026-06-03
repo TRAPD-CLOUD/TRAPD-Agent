@@ -97,16 +97,16 @@ fn resolve_pid_name(inode: u64, inode_map: &HashMap<u64, i32>) -> (Option<i32>, 
 #[derive(Clone)]
 struct FlowInfo {
     first_seen: Instant,
-    protocol:   String,
-    src_addr:   String,
-    src_port:   u16,
-    dst_addr:   String,
-    dst_port:   u16,
-    pid:        Option<i32>,
-    process:    Option<String>,
+    protocol: String,
+    src_addr: String,
+    src_port: u16,
+    dst_addr: String,
+    dst_port: u16,
+    pid: Option<i32>,
+    process: Option<String>,
     /// Cumulative byte/packet/rtt counters from the most recent INET_DIAG poll
     /// (joined by socket inode at observation time; empty for UDP).
-    stats:      super::inet_diag::FlowStats,
+    stats: super::inet_diag::FlowStats,
 }
 
 impl FlowInfo {
@@ -138,7 +138,7 @@ impl Collector for NetworkCollector {
 
     async fn run(
         &mut self,
-        tx:       Sender<AgentEvent>,
+        tx: Sender<AgentEvent>,
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
@@ -194,9 +194,16 @@ impl Collector for NetworkCollector {
                 let key = flow_key(&flow);
                 new_tcp.insert(key, flow);
             }
-            if reconcile(&mut self.known_tcp, new_tcp, "established", &tx, &agent_id, &hostname)
-                .await
-                .is_err()
+            if reconcile(
+                &mut self.known_tcp,
+                new_tcp,
+                "established",
+                &tx,
+                &agent_id,
+                &hostname,
+            )
+            .await
+            .is_err()
             {
                 return Ok(());
             }
@@ -232,9 +239,16 @@ impl Collector for NetworkCollector {
                 let key = flow_key(&flow);
                 new_udp.insert(key, flow);
             }
-            if reconcile(&mut self.known_udp, new_udp, "open", &tx, &agent_id, &hostname)
-                .await
-                .is_err()
+            if reconcile(
+                &mut self.known_udp,
+                new_udp,
+                "open",
+                &tx,
+                &agent_id,
+                &hostname,
+            )
+            .await
+            .is_err()
             {
                 return Ok(());
             }
@@ -347,7 +361,9 @@ mod tests {
         let mut next = HashMap::new();
         next.insert(flow_key(&f), f);
 
-        reconcile(&mut prev, next, "established", &tx, "a", "h").await.unwrap();
+        reconcile(&mut prev, next, "established", &tx, "a", "h")
+            .await
+            .unwrap();
 
         let ev = rx.try_recv().expect("a start event");
         let c = conn(&ev);
@@ -366,12 +382,17 @@ mod tests {
         let mut prev = HashMap::new();
         prev.insert(flow_key(&f), f);
 
-        reconcile(&mut prev, HashMap::new(), "established", &tx, "a", "h").await.unwrap();
+        reconcile(&mut prev, HashMap::new(), "established", &tx, "a", "h")
+            .await
+            .unwrap();
 
         let ev = rx.try_recv().expect("a close event");
         let c = conn(&ev);
         assert_eq!(c.state, "closed");
-        assert!(c.duration_ms.unwrap() >= 50, "duration measured from first-seen");
+        assert!(
+            c.duration_ms.unwrap() >= 50,
+            "duration measured from first-seen"
+        );
         assert!(prev.is_empty(), "closed flow dropped from tracking");
     }
 
@@ -381,6 +402,9 @@ mod tests {
         let b = flow("fe80::2", 443, Instant::now());
         assert_ne!(flow_key(&a), flow_key(&b));
         // Same 4-tuple ⇒ same key (stable across polls).
-        assert_eq!(flow_key(&a), flow_key(&flow("fe80::1", 443, Instant::now())));
+        assert_eq!(
+            flow_key(&a),
+            flow_key(&flow("fe80::1", 443, Instant::now()))
+        );
     }
 }

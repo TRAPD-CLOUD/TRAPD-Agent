@@ -17,10 +17,10 @@ use crate::schema::{
 };
 
 pub struct ProcessCollector {
-    initialized:   bool,
-    known_pids:    HashSet<i32>,
-    known_names:   HashMap<i32, String>,
-    uid_to_user:   HashMap<u32, String>,
+    initialized: bool,
+    known_pids: HashSet<i32>,
+    known_names: HashMap<i32, String>,
+    uid_to_user: HashMap<u32, String>,
     /// Baseline of every SUID binary present on the host at agent start.  An
     /// exec of a SUID binary *not* in this set is suspicious (MITRE T1548.001).
     suid_baseline: HashSet<PathBuf>,
@@ -29,12 +29,15 @@ pub struct ProcessCollector {
 impl ProcessCollector {
     pub fn new() -> Self {
         let suid_baseline = scan_suid_baseline();
-        info!("ProcessCollector: SUID baseline ready — {} binaries", suid_baseline.len());
+        info!(
+            "ProcessCollector: SUID baseline ready — {} binaries",
+            suid_baseline.len()
+        );
         Self {
-            initialized:   false,
-            known_pids:    HashSet::new(),
-            known_names:   HashMap::new(),
-            uid_to_user:   load_passwd().unwrap_or_default(),
+            initialized: false,
+            known_pids: HashSet::new(),
+            known_names: HashMap::new(),
+            uid_to_user: load_passwd().unwrap_or_default(),
             suid_baseline,
         }
     }
@@ -100,12 +103,21 @@ fn check_rwx_maps(pid: i32) -> Vec<(String, String)> {
     let mut results = Vec::new();
     for line in content.lines() {
         let mut fields = line.split_whitespace();
-        let region     = match fields.next() { Some(r) => r, None => continue };
-        let perms      = match fields.next() { Some(p) => p, None => continue };
-        let _offset    = fields.next();
-        let _dev       = fields.next();
-        let inode_str  = match fields.next() { Some(i) => i, None => continue };
-        let pathname   = fields.next();
+        let region = match fields.next() {
+            Some(r) => r,
+            None => continue,
+        };
+        let perms = match fields.next() {
+            Some(p) => p,
+            None => continue,
+        };
+        let _offset = fields.next();
+        let _dev = fields.next();
+        let inode_str = match fields.next() {
+            Some(i) => i,
+            None => continue,
+        };
+        let pathname = fields.next();
 
         let inode: u64 = inode_str.parse().unwrap_or(1);
         let is_rwx = perms.contains('r') && perms.contains('w') && perms.contains('x');
@@ -160,9 +172,9 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
         let exe_sha256 = super::exehash::hash_executable(&exe);
 
         let data = ProcessCreateData {
-            pid:     stat.pid,
-            ppid:    stat.ppid,
-            name:    stat.comm.clone(),
+            pid: stat.pid,
+            ppid: stat.ppid,
+            name: stat.comm.clone(),
             exe,
             cmdline,
             uid,
@@ -182,7 +194,7 @@ impl Collector for ProcessCollector {
 
     async fn run(
         &mut self,
-        tx:       Sender<AgentEvent>,
+        tx: Sender<AgentEvent>,
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
@@ -205,7 +217,11 @@ impl Collector for ProcessCollector {
             let current_pids: HashSet<i32> = current.keys().copied().collect();
 
             // New processes
-            for pid in current_pids.difference(&self.known_pids).copied().collect::<Vec<_>>() {
+            for pid in current_pids
+                .difference(&self.known_pids)
+                .copied()
+                .collect::<Vec<_>>()
+            {
                 if let Some(info) = current.get(&pid) {
                     let event = AgentEvent::new(
                         agent_id.clone(),
@@ -228,11 +244,7 @@ impl Collector for ProcessCollector {
                             EventClass::Memory,
                             EventAction::MemoryAnomaly,
                             Severity::High,
-                            EventData::MemoryAnomaly(MemoryAnomalyData {
-                                pid,
-                                region,
-                                perms,
-                            }),
+                            EventData::MemoryAnomaly(MemoryAnomalyData { pid, region, perms }),
                         );
                         if tx.send(anomaly).await.is_err() {
                             return Ok(());
@@ -281,7 +293,12 @@ impl Collector for ProcessCollector {
             }
 
             // Terminated processes
-            for pid in self.known_pids.difference(&current_pids).copied().collect::<Vec<_>>() {
+            for pid in self
+                .known_pids
+                .difference(&current_pids)
+                .copied()
+                .collect::<Vec<_>>()
+            {
                 let name = self.known_names.remove(&pid).unwrap_or_default();
                 let event = AgentEvent::new(
                     agent_id.clone(),

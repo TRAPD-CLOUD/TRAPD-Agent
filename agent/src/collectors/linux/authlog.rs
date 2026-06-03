@@ -37,7 +37,7 @@ impl Collector for AuthLogCollector {
 
     async fn run(
         &mut self,
-        tx:       Sender<AgentEvent>,
+        tx: Sender<AgentEvent>,
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
@@ -62,7 +62,7 @@ impl Collector for AuthLogCollector {
         // Start at the end — ignore historical entries.
         let mut offset = reader.seek(std::io::SeekFrom::End(0)).await?;
         let mut ticker = interval(Duration::from_secs(2));
-        let mut line   = String::new();
+        let mut line = String::new();
 
         loop {
             ticker.tick().await;
@@ -109,8 +109,10 @@ async fn open_auth_log() -> Option<(String, File)> {
 fn parse_auth_line(line: &str, agent_id: String, hostname: String) -> Option<AgentEvent> {
     if let Some(ev) = parse_accepted(line, "password") {
         return Some(AgentEvent::new(
-            agent_id.clone(), hostname.clone(),
-            EventClass::User, EventAction::Logon,
+            agent_id.clone(),
+            hostname.clone(),
+            EventClass::User,
+            EventAction::Logon,
             Severity::Info,
             EventData::UserLogon(ev),
         ));
@@ -118,8 +120,10 @@ fn parse_auth_line(line: &str, agent_id: String, hostname: String) -> Option<Age
 
     if let Some(ev) = parse_accepted(line, "publickey") {
         return Some(AgentEvent::new(
-            agent_id.clone(), hostname.clone(),
-            EventClass::User, EventAction::Logon,
+            agent_id.clone(),
+            hostname.clone(),
+            EventClass::User,
+            EventAction::Logon,
             Severity::Info,
             EventData::UserLogon(ev),
         ));
@@ -127,8 +131,10 @@ fn parse_auth_line(line: &str, agent_id: String, hostname: String) -> Option<Age
 
     if let Some(ev) = parse_failed(line) {
         return Some(AgentEvent::new(
-            agent_id.clone(), hostname.clone(),
-            EventClass::User, EventAction::LogonFailed,
+            agent_id.clone(),
+            hostname.clone(),
+            EventClass::User,
+            EventAction::LogonFailed,
             Severity::Medium,
             EventData::UserLogon(ev),
         ));
@@ -136,8 +142,10 @@ fn parse_auth_line(line: &str, agent_id: String, hostname: String) -> Option<Age
 
     if let Some(ev) = parse_session(line, true) {
         return Some(AgentEvent::new(
-            agent_id.clone(), hostname.clone(),
-            EventClass::User, EventAction::SessionOpen,
+            agent_id.clone(),
+            hostname.clone(),
+            EventClass::User,
+            EventAction::SessionOpen,
             Severity::Info,
             EventData::UserSession(ev),
         ));
@@ -145,8 +153,10 @@ fn parse_auth_line(line: &str, agent_id: String, hostname: String) -> Option<Age
 
     if let Some(ev) = parse_session(line, false) {
         return Some(AgentEvent::new(
-            agent_id.clone(), hostname.clone(),
-            EventClass::User, EventAction::SessionClose,
+            agent_id.clone(),
+            hostname.clone(),
+            EventClass::User,
+            EventAction::SessionClose,
             Severity::Info,
             EventData::UserSession(ev),
         ));
@@ -157,8 +167,8 @@ fn parse_auth_line(line: &str, agent_id: String, hostname: String) -> Option<Age
 
 fn parse_accepted(line: &str, method: &str) -> Option<UserLogonData> {
     let marker = format!("Accepted {method} for ");
-    let pos    = line.find(marker.as_str())?;
-    let rest   = &line[pos + marker.len()..];
+    let pos = line.find(marker.as_str())?;
+    let rest = &line[pos + marker.len()..];
 
     // "<user> from <ip> port <port> ssh2"
     let parts: Vec<&str> = rest.split_whitespace().collect();
@@ -181,7 +191,7 @@ fn parse_accepted(line: &str, method: &str) -> Option<UserLogonData> {
 }
 
 fn parse_failed(line: &str) -> Option<UserLogonData> {
-    let pos  = line.find("Failed password for ")?;
+    let pos = line.find("Failed password for ")?;
     let rest = &line[pos + 20..];
 
     // rest = "[invalid user ]<user> from <ip> [port <port>] ..."
@@ -194,9 +204,7 @@ fn parse_failed(line: &str) -> Option<UserLogonData> {
     let addr_parts: Vec<&str> = addr_rest.split_whitespace().collect();
     let src_addr = addr_parts.first().map(|s| s.to_string());
     // "from <ip> port <port>" — port may or may not be present
-    let src_port = addr_parts
-        .get(2)
-        .and_then(|s| s.parse::<u16>().ok());
+    let src_port = addr_parts.get(2).and_then(|s| s.parse::<u16>().ok());
 
     Some(UserLogonData {
         username,
@@ -213,8 +221,8 @@ fn parse_session(line: &str, opened: bool) -> Option<UserSessionData> {
     } else {
         "session closed for user "
     };
-    let pos      = line.find(marker)?;
-    let rest     = &line[pos + marker.len()..];
+    let pos = line.find(marker)?;
+    let rest = &line[pos + marker.len()..];
     let username = rest.split_whitespace().next()?.to_string();
     Some(UserSessionData { username })
 }

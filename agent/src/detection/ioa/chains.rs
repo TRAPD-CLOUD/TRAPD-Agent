@@ -33,34 +33,48 @@ const FIRE_COOLDOWN: Duration = Duration::from_secs(60);
 pub struct EventFacts {
     /// The acting pid, when the event has one.  Events without a pid cannot be
     /// correlated into a lineage and are ignored by the correlator.
-    pub pid:                Option<i32>,
-    pub is_shell_exec:      bool,
+    pub pid: Option<i32>,
+    pub is_shell_exec: bool,
     pub is_downloader_exec: bool,
     /// Exec of a binary living in a world-writable / temp / in-memory location.
-    pub is_temp_exec:       bool,
+    pub is_temp_exec: bool,
     /// A chmod that set any execute bit.
-    pub made_executable:    bool,
+    pub made_executable: bool,
     /// setuid(0) from a non-root uid — privilege gained.
-    pub setuid_root:        bool,
+    pub setuid_root: bool,
     /// An exec/create observed running as a non-root uid.
-    pub is_nonroot_proc:    bool,
+    pub is_nonroot_proc: bool,
     /// Touched a credential store (shadow, SSH key, cloud creds, …).
-    pub cred_access:        bool,
+    pub cred_access: bool,
     /// Outbound connection to a routable destination.
-    pub outbound_routable:  bool,
+    pub outbound_routable: bool,
     /// Wrote to an autostart / persistence location.
-    pub persistence_write:  bool,
+    pub persistence_write: bool,
 }
 
 type Predicate = fn(&EventFacts) -> bool;
 
-fn p_shell(f: &EventFacts) -> bool { f.is_shell_exec }
-fn p_downloader(f: &EventFacts) -> bool { f.is_downloader_exec }
-fn p_temp_exec(f: &EventFacts) -> bool { f.is_temp_exec }
-fn p_setuid_root(f: &EventFacts) -> bool { f.setuid_root }
-fn p_nonroot(f: &EventFacts) -> bool { f.is_nonroot_proc }
-fn p_cred(f: &EventFacts) -> bool { f.cred_access }
-fn p_outbound(f: &EventFacts) -> bool { f.outbound_routable }
+fn p_shell(f: &EventFacts) -> bool {
+    f.is_shell_exec
+}
+fn p_downloader(f: &EventFacts) -> bool {
+    f.is_downloader_exec
+}
+fn p_temp_exec(f: &EventFacts) -> bool {
+    f.is_temp_exec
+}
+fn p_setuid_root(f: &EventFacts) -> bool {
+    f.setuid_root
+}
+fn p_nonroot(f: &EventFacts) -> bool {
+    f.is_nonroot_proc
+}
+fn p_cred(f: &EventFacts) -> bool {
+    f.cred_access
+}
+fn p_outbound(f: &EventFacts) -> bool {
+    f.outbound_routable
+}
 /// "Did something with the new privileges": run a dropped binary, persist, or
 /// grab credentials.
 fn p_priv_action(f: &EventFacts) -> bool {
@@ -69,20 +83,20 @@ fn p_priv_action(f: &EventFacts) -> bool {
 
 /// One stage in a chain.
 pub struct Stage {
-    pub label:   &'static str,
+    pub label: &'static str,
     pub matches: Predicate,
 }
 
 /// A declarative attack chain.
 pub struct ChainDef {
-    pub id:              &'static str,
-    pub title:          &'static str,
-    pub category:       &'static str,
-    pub mitre_tactic:   &'static str,
-    pub mitre_technique:&'static str,
+    pub id: &'static str,
+    pub title: &'static str,
+    pub category: &'static str,
+    pub mitre_tactic: &'static str,
+    pub mitre_technique: &'static str,
     /// Confidence assigned when the full chain fires (0–100).
-    pub confidence:     u8,
-    pub stages:         &'static [Stage],
+    pub confidence: u8,
+    pub stages: &'static [Stage],
 }
 
 /// The built-in chain library.  Deliberately few and high-signal: each one is a
@@ -91,43 +105,67 @@ pub struct ChainDef {
 pub static CHAINS: &[ChainDef] = &[
     // sshd → bash → curl (download) → chmod +x / exec from /tmp.
     ChainDef {
-        id:              "ioa.download_and_execute",
-        title:           "Staged download-and-execute",
-        category:        "ioa.execution",
-        mitre_tactic:    "TA0002 Execution",
+        id: "ioa.download_and_execute",
+        title: "Staged download-and-execute",
+        category: "ioa.execution",
+        mitre_tactic: "TA0002 Execution",
         mitre_technique: "T1059",
-        confidence:      88,
+        confidence: 88,
         stages: &[
-            Stage { label: "interactive shell",          matches: p_shell },
-            Stage { label: "network downloader spawned", matches: p_downloader },
-            Stage { label: "executes dropped payload",   matches: p_temp_exec },
+            Stage {
+                label: "interactive shell",
+                matches: p_shell,
+            },
+            Stage {
+                label: "network downloader spawned",
+                matches: p_downloader,
+            },
+            Stage {
+                label: "executes dropped payload",
+                matches: p_temp_exec,
+            },
         ],
     },
     // unprivileged process → setuid(0) → acts with the new root privileges.
     ChainDef {
-        id:              "ioa.privilege_escalation_activity",
-        title:           "Privilege escalation followed by suspicious activity",
-        category:        "ioa.privilege_escalation",
-        mitre_tactic:    "TA0004 Privilege Escalation",
+        id: "ioa.privilege_escalation_activity",
+        title: "Privilege escalation followed by suspicious activity",
+        category: "ioa.privilege_escalation",
+        mitre_tactic: "TA0004 Privilege Escalation",
         mitre_technique: "T1548",
-        confidence:      82,
+        confidence: 82,
         stages: &[
-            Stage { label: "unprivileged process",   matches: p_nonroot },
-            Stage { label: "gains root (setuid 0)",  matches: p_setuid_root },
-            Stage { label: "post-escalation action", matches: p_priv_action },
+            Stage {
+                label: "unprivileged process",
+                matches: p_nonroot,
+            },
+            Stage {
+                label: "gains root (setuid 0)",
+                matches: p_setuid_root,
+            },
+            Stage {
+                label: "post-escalation action",
+                matches: p_priv_action,
+            },
         ],
     },
     // reads a credential store → makes an outbound connection (likely exfil).
     ChainDef {
-        id:              "ioa.credential_access_exfil",
-        title:           "Credential access followed by outbound network",
-        category:        "ioa.exfiltration",
-        mitre_tactic:    "TA0010 Exfiltration",
+        id: "ioa.credential_access_exfil",
+        title: "Credential access followed by outbound network",
+        category: "ioa.exfiltration",
+        mitre_tactic: "TA0010 Exfiltration",
         mitre_technique: "T1041",
-        confidence:      76,
+        confidence: 76,
         stages: &[
-            Stage { label: "credential store access", matches: p_cred },
-            Stage { label: "outbound connection",     matches: p_outbound },
+            Stage {
+                label: "credential store access",
+                matches: p_cred,
+            },
+            Stage {
+                label: "outbound connection",
+                matches: p_outbound,
+            },
         ],
     },
 ];
@@ -135,20 +173,20 @@ pub static CHAINS: &[ChainDef] = &[
 /// Evidence for one matched stage.
 #[derive(Clone, Debug)]
 pub struct StageEvidence {
-    pub stage:     usize,
-    pub label:     &'static str,
-    pub pid:       i32,
+    pub stage: usize,
+    pub label: &'static str,
+    pub pid: i32,
     pub offset_ms: u128,
 }
 
 /// A fully-matched chain, ready to be turned into a detection.
 #[derive(Clone, Debug)]
 pub struct CompletedChain {
-    pub def_idx:     usize,
-    pub anchor_pid:  i32,
-    pub final_pid:   i32,
+    pub def_idx: usize,
+    pub anchor_pid: i32,
+    pub final_pid: i32,
     pub duration_ms: u128,
-    pub stages:      Vec<StageEvidence>,
+    pub stages: Vec<StageEvidence>,
 }
 
 impl CompletedChain {
@@ -159,17 +197,17 @@ impl CompletedChain {
 
 /// One in-flight partial match.
 struct ChainInstance {
-    def_idx:    usize,
+    def_idx: usize,
     anchor_pid: i32,
     /// Index of the *next* stage to match (`[0..stage)` already matched).
-    stage:      usize,
-    started:    Instant,
-    hits:       Vec<StageEvidence>,
+    stage: usize,
+    started: Instant,
+    hits: Vec<StageEvidence>,
 }
 
 /// Tracks all partial chains and emits completed ones.
 pub struct Correlator {
-    active:         Vec<ChainInstance>,
+    active: Vec<ChainInstance>,
     /// (def_idx, anchor_pid) → last fired, for the anti-storm cooldown.
     recently_fired: HashMap<(usize, i32), Instant>,
 }
@@ -177,7 +215,7 @@ pub struct Correlator {
 impl Correlator {
     pub fn new() -> Self {
         Self {
-            active:         Vec::new(),
+            active: Vec::new(),
             recently_fired: HashMap::new(),
         }
     }
@@ -229,11 +267,11 @@ impl Correlator {
                     {
                         slot.insert(now);
                         completed.push(CompletedChain {
-                            def_idx:     inst.def_idx,
-                            anchor_pid:  inst.anchor_pid,
-                            final_pid:   pid,
+                            def_idx: inst.def_idx,
+                            anchor_pid: inst.anchor_pid,
+                            final_pid: pid,
                             duration_ms: now.duration_since(inst.started).as_millis(),
-                            stages:      inst.hits.clone(),
+                            stages: inst.hits.clone(),
                         });
                     }
                 }
@@ -258,13 +296,13 @@ impl Correlator {
                 continue;
             }
             self.active.push(ChainInstance {
-                def_idx:    idx,
+                def_idx: idx,
                 anchor_pid: pid,
-                stage:      1,
-                started:    now,
-                hits:       vec![StageEvidence {
-                    stage:     0,
-                    label:     def.stages[0].label,
+                stage: 1,
+                started: now,
+                hits: vec![StageEvidence {
+                    stage: 0,
+                    label: def.stages[0].label,
                     pid,
                     offset_ms: 0,
                 }],
@@ -292,7 +330,11 @@ mod tests {
     use super::*;
 
     fn shell() -> EventFacts {
-        EventFacts { pid: Some(200), is_shell_exec: true, ..Default::default() }
+        EventFacts {
+            pid: Some(200),
+            is_shell_exec: true,
+            ..Default::default()
+        }
     }
 
     /// Build a tree where 200 is a bash and 301/302 are its children.
@@ -314,10 +356,20 @@ mod tests {
         // S0: the shell (anchor 200).
         assert!(c.observe(&shell(), &tree, t0).is_empty());
         // S1: curl (pid 301), a child of the shell.
-        let dl = EventFacts { pid: Some(301), is_downloader_exec: true, ..Default::default() };
-        assert!(c.observe(&dl, &tree, t0 + Duration::from_secs(1)).is_empty());
+        let dl = EventFacts {
+            pid: Some(301),
+            is_downloader_exec: true,
+            ..Default::default()
+        };
+        assert!(c
+            .observe(&dl, &tree, t0 + Duration::from_secs(1))
+            .is_empty());
         // S2: exec of /tmp/x (pid 302), a sibling.
-        let ex = EventFacts { pid: Some(302), is_temp_exec: true, ..Default::default() };
+        let ex = EventFacts {
+            pid: Some(302),
+            is_temp_exec: true,
+            ..Default::default()
+        };
         let done = c.observe(&ex, &tree, t0 + Duration::from_secs(2));
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].def().id, "ioa.download_and_execute");
@@ -331,9 +383,17 @@ mod tests {
         let mut c = Correlator::new();
         let t0 = Instant::now();
         // Downloader before any shell — no S0 yet, so nothing advances.
-        let dl = EventFacts { pid: Some(301), is_downloader_exec: true, ..Default::default() };
+        let dl = EventFacts {
+            pid: Some(301),
+            is_downloader_exec: true,
+            ..Default::default()
+        };
         assert!(c.observe(&dl, &tree, t0).is_empty());
-        let ex = EventFacts { pid: Some(302), is_temp_exec: true, ..Default::default() };
+        let ex = EventFacts {
+            pid: Some(302),
+            is_temp_exec: true,
+            ..Default::default()
+        };
         assert!(c.observe(&ex, &tree, t0).is_empty());
     }
 
@@ -343,12 +403,23 @@ mod tests {
         let mut c = Correlator::new();
         let t0 = Instant::now();
         c.observe(&shell(), &tree, t0);
-        let dl = EventFacts { pid: Some(301), is_downloader_exec: true, ..Default::default() };
+        let dl = EventFacts {
+            pid: Some(301),
+            is_downloader_exec: true,
+            ..Default::default()
+        };
         c.observe(&dl, &tree, t0 + Duration::from_secs(1));
         // The payload exec arrives after the window — partial has expired.
-        let ex = EventFacts { pid: Some(302), is_temp_exec: true, ..Default::default() };
+        let ex = EventFacts {
+            pid: Some(302),
+            is_temp_exec: true,
+            ..Default::default()
+        };
         let done = c.observe(&ex, &tree, t0 + CHAIN_WINDOW + Duration::from_secs(1));
-        assert!(done.is_empty(), "a chain must not complete outside its window");
+        assert!(
+            done.is_empty(),
+            "a chain must not complete outside its window"
+        );
     }
 
     #[test]
@@ -360,11 +431,21 @@ mod tests {
         let mut c = Correlator::new();
         let t0 = Instant::now();
         c.observe(&shell(), &tree, t0);
-        let dl = EventFacts { pid: Some(301), is_downloader_exec: true, ..Default::default() };
+        let dl = EventFacts {
+            pid: Some(301),
+            is_downloader_exec: true,
+            ..Default::default()
+        };
         c.observe(&dl, &tree, t0 + Duration::from_secs(1));
         // Temp exec by an unrelated process must not complete the shell's chain.
-        let ex = EventFacts { pid: Some(999), is_temp_exec: true, ..Default::default() };
-        assert!(c.observe(&ex, &tree, t0 + Duration::from_secs(2)).is_empty());
+        let ex = EventFacts {
+            pid: Some(999),
+            is_temp_exec: true,
+            ..Default::default()
+        };
+        assert!(c
+            .observe(&ex, &tree, t0 + Duration::from_secs(2))
+            .is_empty());
     }
 
     #[test]
@@ -374,9 +455,17 @@ mod tests {
         let t0 = Instant::now();
         let drive = |c: &mut Correlator, base: Instant| {
             c.observe(&shell(), &tree, base);
-            let dl = EventFacts { pid: Some(301), is_downloader_exec: true, ..Default::default() };
+            let dl = EventFacts {
+                pid: Some(301),
+                is_downloader_exec: true,
+                ..Default::default()
+            };
             c.observe(&dl, &tree, base + Duration::from_millis(10));
-            let ex = EventFacts { pid: Some(302), is_temp_exec: true, ..Default::default() };
+            let ex = EventFacts {
+                pid: Some(302),
+                is_temp_exec: true,
+                ..Default::default()
+            };
             c.observe(&ex, &tree, base + Duration::from_millis(20))
         };
         assert_eq!(drive(&mut c, t0).len(), 1, "first run fires");

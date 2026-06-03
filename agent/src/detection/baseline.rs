@@ -42,7 +42,12 @@ struct Ewma {
 
 impl Ewma {
     fn new(alpha: f64) -> Self {
-        Self { mean: 0.0, var: 0.0, count: 0, alpha }
+        Self {
+            mean: 0.0,
+            var: 0.0,
+            count: 0,
+            alpha,
+        }
     }
 
     /// Z-score of `x` against the current distribution (0 until warmed up).
@@ -92,16 +97,14 @@ pub struct BaselineEngine {
 
 impl BaselineEngine {
     pub fn new() -> Self {
-        Self { binaries: HashMap::new(), rates: HashMap::new() }
+        Self {
+            binaries: HashMap::new(),
+            rates: HashMap::new(),
+        }
     }
 
     /// Observe one process execution. Returns at most one anomaly detection.
-    pub fn observe_exec(
-        &mut self,
-        user: &str,
-        exe: &str,
-        now: Instant,
-    ) -> Option<DetectionData> {
+    pub fn observe_exec(&mut self, user: &str, exe: &str, now: Instant) -> Option<DetectionData> {
         let novelty = self.check_novelty(user, exe);
         // Rate is always updated (learning) but only one finding per event, so
         // novelty (more specific) wins over a rate burst.
@@ -153,11 +156,14 @@ impl BaselineEngine {
         if self.rates.len() >= MAX_ENTITIES && !self.rates.contains_key(user) {
             return None;
         }
-        let prof = self.rates.entry(user.to_string()).or_insert_with(|| RateProfile {
-            window_start: now,
-            window_count: 0,
-            stat: Ewma::new(0.3),
-        });
+        let prof = self
+            .rates
+            .entry(user.to_string())
+            .or_insert_with(|| RateProfile {
+                window_start: now,
+                window_count: 0,
+                stat: Ewma::new(0.3),
+            });
 
         // Same minute → just count.
         if now.duration_since(prof.window_start) < Duration::from_secs(60) {
@@ -229,7 +235,9 @@ mod tests {
         // A repeat of a known binary is silent.
         assert!(b.observe_exec("alice", "/bin/ls", t).is_none());
         // A brand-new binary for the now-warmed user is anomalous.
-        let d = b.observe_exec("alice", "/tmp/x", t).expect("novel binary flagged");
+        let d = b
+            .observe_exec("alice", "/tmp/x", t)
+            .expect("novel binary flagged");
         assert_eq!(d.rule_id, "anomaly.rare_binary_for_user");
     }
 
@@ -258,7 +266,8 @@ mod tests {
         t += Duration::from_secs(61);
         let d = b.update_rate("svc", t);
         assert!(
-            d.map(|d| d.rule_id == "anomaly.exec_rate_spike").unwrap_or(false),
+            d.map(|d| d.rule_id == "anomaly.exec_rate_spike")
+                .unwrap_or(false),
             "a 200/min burst over a 2/min baseline must be flagged"
         );
     }

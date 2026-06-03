@@ -48,8 +48,15 @@ pub const IMDS_ADDR: &str = "169.254.169.254";
 /// What [`NetScanTracker::observe`] decided about one connection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetVerdict {
-    PortScan { target: String, ports: usize },
-    LateralMovement { port: u16, service: String, hosts: usize },
+    PortScan {
+        target: String,
+        ports: usize,
+    },
+    LateralMovement {
+        port: u16,
+        service: String,
+        hosts: usize,
+    },
     ImdsAccess,
 }
 
@@ -208,7 +215,10 @@ mod tests {
                 }
             }
         }
-        assert!(!hit, "public SSH fan-out must not be flagged as lateral movement");
+        assert!(
+            !hit,
+            "public SSH fan-out must not be flagged as lateral movement"
+        );
     }
 
     #[test]

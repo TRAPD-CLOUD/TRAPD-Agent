@@ -127,12 +127,12 @@ pub struct KernelModule {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OsInfo {
-    pub family: String,           // "linux"
-    pub name: String,             // "Ubuntu"
-    pub version: String,          // "24.04.3 LTS"
-    pub pretty_name: String,      // "Ubuntu 24.04.3 LTS"
-    pub kernel: String,           // "6.6.87.2-microsoft-standard-WSL2"
-    pub arch: String,             // "x86_64"
+    pub family: String,      // "linux"
+    pub name: String,        // "Ubuntu"
+    pub version: String,     // "24.04.3 LTS"
+    pub pretty_name: String, // "Ubuntu 24.04.3 LTS"
+    pub kernel: String,      // "6.6.87.2-microsoft-standard-WSL2"
+    pub arch: String,        // "x86_64"
     pub machine_id: Option<String>,
     pub timezone: Option<String>,
     pub boot_time_unix: u64,
@@ -146,7 +146,7 @@ pub struct HardwareInfo {
     pub serial: Option<String>,
     pub bios_vendor: Option<String>,
     pub bios_version: Option<String>,
-    pub chassis: Option<String>,    // "vm" / "laptop" / "desktop" / "server"
+    pub chassis: Option<String>, // "vm" / "laptop" / "desktop" / "server"
     pub virtualization: Option<String>, // "wsl" / "kvm" / "none" …
     pub cpu_model: String,
     pub cpu_physical_cores: usize,
@@ -305,7 +305,10 @@ impl InventoryReporter {
     }
 
     fn inventory_enabled(&self) -> bool {
-        self.config.read().map(|c| c.inventory_enabled).unwrap_or(true)
+        self.config
+            .read()
+            .map(|c| c.inventory_enabled)
+            .unwrap_or(true)
     }
 
     async fn post(&self, snapshot: &InventorySnapshot) {
@@ -320,7 +323,10 @@ impl InventoryReporter {
             Ok(resp) if resp.status().is_success() => {
                 info!("inventory: snapshot sent to backend");
             }
-            Ok(resp) => warn!("inventory: backend rejected snapshot: HTTP {}", resp.status()),
+            Ok(resp) => warn!(
+                "inventory: backend rejected snapshot: HTTP {}",
+                resp.status()
+            ),
             Err(e) => warn!("inventory: send failed: {e}"),
         }
     }
@@ -329,7 +335,9 @@ impl InventoryReporter {
         let path = crate::paths::state_dir().join("inventory.json");
         match serde_json::to_vec_pretty(snapshot) {
             Ok(bytes) => match crate::paths::write_atomic(&path, &bytes, 0o600) {
-                Ok(()) => info!(path = %path.display(), "inventory: snapshot written locally (offline)"),
+                Ok(()) => {
+                    info!(path = %path.display(), "inventory: snapshot written locally (offline)")
+                }
                 Err(e) => warn!("inventory: local write failed: {e}"),
             },
             Err(e) => warn!("inventory: serialize failed: {e}"),

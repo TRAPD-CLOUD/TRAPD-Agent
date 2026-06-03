@@ -91,9 +91,7 @@ fn query_family(family: u8) -> std::io::Result<HashMap<u64, FlowStats>> {
     let guard = FdGuard(fd);
 
     let req = build_request(family);
-    let sent = unsafe {
-        libc::send(guard.0, req.as_ptr() as *const libc::c_void, req.len(), 0)
-    };
+    let sent = unsafe { libc::send(guard.0, req.as_ptr() as *const libc::c_void, req.len(), 0) };
     if sent < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -101,9 +99,7 @@ fn query_family(family: u8) -> std::io::Result<HashMap<u64, FlowStats>> {
     let mut out = HashMap::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = unsafe {
-            libc::recv(guard.0, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-        };
+        let n = unsafe { libc::recv(guard.0, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -130,13 +126,13 @@ fn build_request(family: u8) -> Vec<u8> {
     m[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
     m[8..12].copy_from_slice(&1u32.to_ne_bytes()); // seq
     m[12..16].copy_from_slice(&0u32.to_ne_bytes()); // pid
-    // inet_diag_req_v2 (starts at 16)
+                                                    // inet_diag_req_v2 (starts at 16)
     m[16] = family; // sdiag_family
     m[17] = IPPROTO_TCP; // sdiag_protocol
     m[18] = INET_DIAG_INFO_REQ; // idiag_ext
     m[19] = 0; // pad
     m[20..24].copy_from_slice(&TCP_STATES_ALL.to_ne_bytes()); // idiag_states
-    // id (sockid, 48 bytes) left zeroed → dump all
+                                                              // id (sockid, 48 bytes) left zeroed → dump all
     m
 }
 
@@ -150,7 +146,8 @@ enum ParseOutcome {
 fn parse_dump(data: &[u8], out: &mut HashMap<u64, FlowStats>) -> ParseOutcome {
     let mut off = 0usize;
     while off + 16 <= data.len() {
-        let len = u32::from_ne_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+        let len =
+            u32::from_ne_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
         let mtype = u16::from_ne_bytes([data[off + 4], data[off + 5]]);
         if len < 16 || off + len > data.len() {
             break;
@@ -213,9 +210,8 @@ pub fn parse_tcp_info(info: &[u8]) -> FlowStats {
             .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
     };
     let read_u64 = |off: usize| -> Option<u64> {
-        info.get(off..off + 8).map(|b| {
-            u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-        })
+        info.get(off..off + 8)
+            .map(|b| u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     };
     FlowStats {
         bytes_sent: read_u64(TCPI_BYTES_ACKED_OFF),

