@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde_json::json;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -120,6 +121,11 @@ pub struct Engine {
     recorder: Arc<FlightRecorder>,
     /// Cooldown register for automated detection-response, keyed `rule_id:pid`.
     auto_cooldown: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+    /// Shared kick to the eBPF reconciler + health checker, pulsed right after a
+    /// honeytoken deploy/revoke so arming and the on-disk verification run
+    /// immediately instead of waiting for the next periodic tick. `None` in tests
+    /// or when eBPF detection is unavailable.
+    reconcile_signal: Option<Arc<Notify>>,
 }
 
 impl Engine {
@@ -139,6 +145,25 @@ impl Engine {
             cfg_handle,
             recorder: Arc::new(FlightRecorder::new(forensics::recorder::DEFAULT_CAPACITY)),
             auto_cooldown: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            reconcile_signal: None,
+        }
+    }
+
+    /// Attach the shared reconcile/health kick. Pulsed after every honeytoken
+    /// deploy/revoke so the eBPF reconciler arms/disarms and the health checker
+    /// re-verifies the affected token within ms.
+    pub fn with_reconcile_signal(mut self, signal: Arc<Notify>) -> Self {
+        self.reconcile_signal = Some(signal);
+        self
+    }
+
+    /// Pulse the reconcile/health kick, if wired. `notify_waiters` wakes *both*
+    /// consumers (the eBPF reconciler and the health checker) that are currently
+    /// parked; a consumer mid-pass simply catches the change on its next periodic
+    /// tick, so no wakeup is ever required for correctness.
+    fn kick_reconcile(&self) {
+        if let Some(sig) = &self.reconcile_signal {
+            sig.notify_waiters();
         }
     }
 
@@ -1244,6 +1269,9 @@ impl Engine {
                         })),
                     }),
                 );
+                // Arm the new token in the eBPF maps + verify it on disk now,
+                // rather than waiting for the next periodic reconcile tick.
+                self.kick_reconcile();
             }
             Err(e) => {
                 self.audit.emit(
@@ -1262,7 +1290,12 @@ impl Engine {
     }
 
     fn cmd_revoke_honeytoken(&self, path: &str, cmd_id: &str) {
-        match deception::revoke(&self.honeytokens, path) {
+        let outcome = deception::revoke(&self.honeytokens, path);
+        // Disarm in the kernel maps immediately on a successful revoke.
+        if outcome.is_ok() {
+            self.kick_reconcile();
+        }
+        match outcome {
             Ok(record) => {
                 self.audit.emit(
                     crate::schema::EventAction::HoneytokenRevoked,

@@ -48,7 +48,7 @@ fn default_fim_paths() -> Vec<String> {
     ]
 }
 fn default_command_poll_interval() -> u64 {
-    10
+    5
 }
 fn default_inventory_enabled() -> bool {
     true

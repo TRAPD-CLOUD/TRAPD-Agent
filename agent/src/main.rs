@@ -154,6 +154,10 @@ async fn main() -> Result<()> {
         .read()
         .map(|c| c.prevention_enabled)
         .unwrap_or(true);
+    // Shared kick from the prevention engine to the eBPF reconciler + the
+    // honeytoken health checker: pulsed after every deploy/revoke so arming and
+    // on-disk verification happen within ms instead of up to a full tick later.
+    let reconcile_signal = Arc::new(tokio::sync::Notify::new());
     let prev_event_tx = if prevention_enabled && !offline {
         match start_prevention(
             &backend_url,
@@ -162,6 +166,7 @@ async fn main() -> Result<()> {
             &hostname,
             tx.clone(),
             Arc::clone(&agent_config),
+            Arc::clone(&reconcile_signal),
         )
         .await
         {
@@ -206,7 +211,9 @@ async fn main() -> Result<()> {
         warn!("eBPF binary not found — exec events will be detected by polling only.");
     }
 
-    let ebpf_syscalls = EbpfSyscallCollector::new().with_config(Arc::clone(&agent_config));
+    let ebpf_syscalls = EbpfSyscallCollector::new()
+        .with_config(Arc::clone(&agent_config))
+        .with_reconcile_signal(Arc::clone(&reconcile_signal));
     if ebpf_syscalls.is_available() {
         info!("eBPF syscall tracer available — spawning EbpfSyscallCollector");
         spawn_collector!(ebpf_syscalls);
@@ -389,6 +396,7 @@ async fn start_prevention(
     hostname: &str,
     pipeline_tx: tokio::sync::mpsc::Sender<schema::AgentEvent>,
     cfg_handle: Arc<RwLock<AgentConfig>>,
+    reconcile_signal: Arc<tokio::sync::Notify>,
 ) -> Result<tokio::sync::mpsc::Sender<schema::AgentEvent>> {
     use prevention::{
         audit::AuditEmitter,
@@ -436,13 +444,26 @@ async fn start_prevention(
     let honeytokens = Arc::new(deception::HoneytokenStore::load());
     info!(count = honeytokens.len(), "Honeytoken register loaded");
 
-    let engine = Arc::new(Engine::new(
-        policy.clone(),
+    // Periodic on-disk verification: confirms each planted token still exists
+    // (and is unchanged), so the backend can flag one deleted/tampered
+    // out-of-band — i.e. without tripping the eBPF access detector. Also kicked
+    // immediately after a deploy/revoke via `reconcile_signal`.
+    spawn_honeytoken_health(
         audit.clone(),
-        engine_cfg,
-        honeytokens,
-        Arc::clone(&cfg_handle),
-    ));
+        Arc::clone(&honeytokens),
+        Arc::clone(&reconcile_signal),
+    );
+
+    let engine = Arc::new(
+        Engine::new(
+            policy.clone(),
+            audit.clone(),
+            engine_cfg,
+            Arc::clone(&honeytokens),
+            Arc::clone(&cfg_handle),
+        )
+        .with_reconcile_signal(reconcile_signal),
+    );
     Arc::clone(&engine).spawn_event_loop(event_rx);
 
     if let Some(v) = verifier {
@@ -450,7 +471,7 @@ async fn start_prevention(
         let poll_secs = cfg_handle
             .read()
             .map(|c| c.command_poll_interval_secs)
-            .unwrap_or(10);
+            .unwrap_or(5);
         let puller = CommandPuller::new(
             backend_url,
             agent_id,
@@ -468,6 +489,76 @@ async fn start_prevention(
     lsm.sync(&policy).await;
 
     Ok(event_tx)
+}
+
+/// Periodic honeytoken health/existence verifier.
+///
+/// Answers a question the eBPF access detector cannot: *is the planted token
+/// still there, and unchanged?* — catching a token deleted or edited
+/// out-of-band (while the agent was down, or by a tool the content-read gate
+/// does not cover). Emits one `prevention.honeytoken_health` audit event per
+/// registered token each pass, which the backend correlates into the token's
+/// `file_status` / `last_verified_at`. Runs on a modest interval and also fires
+/// immediately on a deploy/revoke kick so a fresh token is verified within ms.
+fn spawn_honeytoken_health(
+    audit: prevention::audit::AuditEmitter,
+    store: Arc<deception::HoneytokenStore>,
+    reconcile_signal: Arc<tokio::sync::Notify>,
+) {
+    use schema::{EventAction, Severity};
+    // Slow enough to stay near-silent on a steady host, fresh enough that an
+    // out-of-band deletion surfaces within a minute.
+    const HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HEALTH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = reconcile_signal.notified() => {}
+            }
+            // The engine mutates this same register on deploy/revoke, so the live
+            // Arc already reflects the current set of planted tokens.
+            for rec in store.list() {
+                let health = deception::verify_record(&rec);
+                let severity = if health.present && !health.modified {
+                    Severity::Info
+                } else {
+                    Severity::High
+                };
+                let reason = match health.status_label() {
+                    "missing" => format!("honeytoken '{}' is missing from disk", rec.kind),
+                    "modified" => {
+                        format!("honeytoken '{}' content changed since deployment", rec.kind)
+                    }
+                    _ => format!("honeytoken '{}' present and unchanged", rec.kind),
+                };
+                audit.emit(
+                    EventAction::HoneytokenHealth,
+                    severity,
+                    "honeytoken_health",
+                    rec.path.clone(),
+                    health.present && !health.modified,
+                    reason,
+                    None,
+                    // No command_id: health is autonomous telemetry, not a
+                    // command result — leaving it out keeps the backend from
+                    // mistaking it for the deploy command's completion.
+                    None,
+                    serde_json::json!({
+                        "id": rec.id,
+                        "kind": rec.kind,
+                        "present": health.present,
+                        "modified": health.modified,
+                        "file_status": health.status_label(),
+                        "expected_sha256": rec.sha256,
+                        "actual_sha256": health.actual_sha256,
+                    }),
+                );
+            }
+        }
+    });
 }
 
 fn build_isolation_allowlist(
