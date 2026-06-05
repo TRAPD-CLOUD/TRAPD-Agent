@@ -70,6 +70,7 @@ use aya::maps::HashMap as BpfHashMap;
 use aya::maps::{MapData, PerCpuArray};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Notify;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{info, warn};
 
@@ -355,6 +356,10 @@ pub struct EbpfSyscallCollector {
     /// Live agent config — drives honeytoken-detection enable + accessor
     /// allowlist. `None` disables honeytoken arming (e.g. in minimal tests).
     cfg: Option<Arc<RwLock<AgentConfig>>>,
+    /// Kick from the prevention engine right after a deploy/revoke command so the
+    /// reconciler arms/disarms the affected token immediately instead of waiting
+    /// for the next periodic tick. `None` falls back to pure interval polling.
+    reconcile_signal: Option<Arc<Notify>>,
 }
 
 impl EbpfSyscallCollector {
@@ -362,6 +367,7 @@ impl EbpfSyscallCollector {
         Self {
             ebpf_path: Self::locate_binary(),
             cfg: None,
+            reconcile_signal: None,
         }
     }
 
@@ -369,6 +375,13 @@ impl EbpfSyscallCollector {
     /// accessor allowlist read at runtime.
     pub fn with_config(mut self, cfg: Arc<RwLock<AgentConfig>>) -> Self {
         self.cfg = Some(cfg);
+        self
+    }
+
+    /// Attach the shared deploy/revoke kick so freshly-deployed tokens are armed
+    /// (and revoked ones disarmed) within ms instead of up to a full tick.
+    pub fn with_reconcile_signal(mut self, signal: Arc<Notify>) -> Self {
+        self.reconcile_signal = Some(signal);
         self
     }
 
@@ -443,12 +456,15 @@ impl EbpfSyscallCollector {
         };
 
         let cfg = self.cfg.clone();
+        let reconcile_signal = self.reconcile_signal.clone();
         let agent_pid = std::process::id();
         // token_id(u64) → (uuid string, path, kind), written by the reconciler,
         // read by the access consumer.
         let token_index: TokenIndex = Arc::new(RwLock::new(StdHashMap::new()));
 
-        // Reconciler.
+        // Reconciler. Runs on a short periodic tick *and* on an explicit kick
+        // from the prevention engine after a deploy/revoke, so a freshly-planted
+        // token is armed within ms rather than up to a full tick later.
         {
             let token_index = Arc::clone(&token_index);
             let cfg = cfg.clone();
@@ -459,9 +475,21 @@ impl EbpfSyscallCollector {
                 let mut armed: HashSet<[u8; PATH_LEN]> = HashSet::new();
                 let mut armed_dirs: HashSet<[u8; PATH_LEN]> = HashSet::new();
                 let mut armed_inodes: HashSet<u64> = HashSet::new();
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
-                    ticker.tick().await;
+                    // Either the periodic safety net fires, or the engine kicks us
+                    // immediately after placing/removing a token.
+                    match &reconcile_signal {
+                        Some(sig) => {
+                            tokio::select! {
+                                _ = ticker.tick() => {}
+                                _ = sig.notified() => {}
+                            }
+                        }
+                        None => {
+                            ticker.tick().await;
+                        }
+                    }
                     let enabled = cfg
                         .as_ref()
                         .map(|c| {

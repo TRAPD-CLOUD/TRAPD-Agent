@@ -284,6 +284,70 @@ pub fn revoke(store: &HoneytokenStore, path: &str) -> Result<HoneytokenRecord> {
     Ok(record)
 }
 
+// ── Health / existence verification ─────────────────────────────────────────────
+
+/// On-disk verification result for a single registered honeytoken.
+///
+/// Lets the backend distinguish a live token from one that was deleted or
+/// tampered with **out-of-band** — i.e. without tripping the eBPF access
+/// detector (e.g. removed while the agent was down, or edited by a tool the
+/// content-read gate does not cover). The eBPF detector answers "was it
+/// *touched*?"; this answers "is it *still there and unchanged*?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthCheck {
+    /// The file still exists at the registered path.
+    pub present: bool,
+    /// The file exists but its content digest no longer matches what we planted.
+    /// Only meaningful when `present` and a digest was recorded at deploy time.
+    pub modified: bool,
+    /// The current content digest, when the file could be read.
+    pub actual_sha256: Option<String>,
+}
+
+impl HealthCheck {
+    /// Compact backend-facing label: `present` | `missing` | `modified`.
+    pub fn status_label(&self) -> &'static str {
+        if !self.present {
+            "missing"
+        } else if self.modified {
+            "modified"
+        } else {
+            "present"
+        }
+    }
+}
+
+/// Verify a single registered honeytoken against its on-disk state. Pure (no
+/// side effects, no telemetry) so it is unit-testable; the periodic health task
+/// wraps it and emits the result.
+pub fn verify_record(rec: &HoneytokenRecord) -> HealthCheck {
+    match fs::read(&rec.path) {
+        Ok(bytes) => {
+            let actual = hex::encode(Sha256::digest(&bytes));
+            // A recorded digest of "" means none was captured — never flag such a
+            // token as modified (we have nothing to compare against).
+            let modified = !rec.sha256.is_empty() && actual != rec.sha256;
+            HealthCheck {
+                present: true,
+                modified,
+                actual_sha256: Some(actual),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HealthCheck {
+            present: false,
+            modified: false,
+            actual_sha256: None,
+        },
+        // Exists but unreadable (e.g. perms, or a directory at the path): present
+        // when an entry is there at all (lstat), missing only when truly absent.
+        Err(_) => HealthCheck {
+            present: Path::new(&rec.path).symlink_metadata().is_ok(),
+            modified: false,
+            actual_sha256: None,
+        },
+    }
+}
+
 // ── Breadcrumbs ───────────────────────────────────────────────────────────────
 
 /// Place one breadcrumb and return the record describing what was written.
@@ -936,6 +1000,36 @@ mod tests {
             "left intact when tail changed"
         );
         assert!(after.ends_with("later-command\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_reports_present_modified_and_missing() {
+        let dir = scratch_dir();
+        let store = store_in(&dir);
+        let path = dir.join(".aws").join("credentials");
+        let path_s = path.to_string_lossy().into_owned();
+        let rec = deploy(&store, req(&path_s, VALID_AWS)).unwrap();
+
+        // Freshly planted: present, unmodified, digest matches the record.
+        let h = verify_record(&rec);
+        assert!(h.present && !h.modified, "fresh token is present & unmodified");
+        assert_eq!(h.actual_sha256.as_deref(), Some(rec.sha256.as_str()));
+        assert_eq!(h.status_label(), "present");
+
+        // Tampered out-of-band (edited without going through the agent): present
+        // but the digest no longer matches → modified.
+        fs::write(&path, b"someone edited the bait\n").unwrap();
+        let h = verify_record(&rec);
+        assert!(h.present && h.modified, "edited token is flagged modified");
+        assert_eq!(h.status_label(), "modified");
+
+        // Deleted out-of-band: missing.
+        fs::remove_file(&path).unwrap();
+        let h = verify_record(&rec);
+        assert!(!h.present && !h.modified, "deleted token is missing");
+        assert_eq!(h.status_label(), "missing");
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

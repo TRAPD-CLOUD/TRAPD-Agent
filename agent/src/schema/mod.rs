@@ -134,6 +134,10 @@ pub enum EventAction {
     HoneytokenDeployed,
     /// A previously-deployed honeytoken was removed via a signed command.
     HoneytokenRevoked,
+    /// Periodic on-disk verification of a deployed honeytoken: is the planted
+    /// file still present, and does its content digest still match? Lets the
+    /// backend distinguish a live token from one deleted/tampered out-of-band.
+    HoneytokenHealth,
     /// A honeytoken was *accessed* (opened) — by definition an intrusion signal.
     HoneytokenAccess,
     /// A process was frozen (SIGSTOP) for forensic capture instead of killed
