@@ -83,6 +83,7 @@ pub fn gather_with_flags(
 
 /// Filesystem roots scanned for SUID/SGID binaries and file capabilities. These
 /// cover the standard executable locations without walking the whole disk.
+#[cfg(target_os = "linux")]
 const POSTURE_SCAN_ROOTS: &[&str] = &[
     "/usr/bin",
     "/usr/sbin",
@@ -96,6 +97,7 @@ const POSTURE_SCAN_ROOTS: &[&str] = &[
 
 /// Cap on the number of directory entries visited per scan, so the inventory
 /// pass stays bounded even on a pathological filesystem.
+#[cfg(target_os = "linux")]
 const MAX_SCAN_ENTRIES: usize = 200_000;
 
 fn gather_security_posture() -> SecurityPosture {
@@ -111,6 +113,7 @@ fn gather_security_posture() -> SecurityPosture {
 /// Single filesystem walk that collects both SUID/SGID binaries and files
 /// carrying a `security.capability` xattr — doing it in one pass avoids walking
 /// the executable roots twice.
+#[cfg(target_os = "linux")]
 fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
@@ -179,6 +182,7 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
 }
 
 /// SHA256 of a file, formatted `sha256:<hex>`; `None` on any IO error.
+#[cfg(target_os = "linux")]
 fn sha256_path(path: &str) -> Option<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -199,6 +203,7 @@ fn sha256_path(path: &str) -> Option<String> {
 /// Read and decode the `security.capability` xattr into a `getcap`-style string,
 /// e.g. `cap_net_raw,cap_net_admin+ep`. Returns `None` when the file has no
 /// capability set (the common case) or the xattr is unreadable.
+#[cfg(target_os = "linux")]
 fn read_file_capability(path: &str) -> Option<String> {
     let raw = read_xattr(path, "security.capability")?;
     decode_vfs_cap(&raw)
@@ -207,6 +212,7 @@ fn read_file_capability(path: &str) -> Option<String> {
 /// Decode a `VFS_CAP` xattr blob (struct `vfs_cap_data` / `vfs_ns_cap_data`,
 /// little-endian) into a human-readable capability string. Supports the v1, v2
 /// and v3 layouts.
+#[cfg(target_os = "linux")]
 fn decode_vfs_cap(raw: &[u8]) -> Option<String> {
     if raw.len() < 8 {
         return None;
@@ -264,6 +270,7 @@ fn decode_vfs_cap(raw: &[u8]) -> Option<String> {
 }
 
 /// Capability names indexed by bit position (subset through CAP_CHECKPOINT_RESTORE).
+#[cfg(target_os = "linux")]
 const CAP_NAMES: &[&str] = &[
     "cap_chown",
     "cap_dac_override",
@@ -308,7 +315,14 @@ const CAP_NAMES: &[&str] = &[
     "cap_checkpoint_restore",
 ];
 
+/// SUID/SGID bits and `security.capability` xattrs are Linux concepts.
+#[cfg(not(target_os = "linux"))]
+fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
+    (Vec::new(), Vec::new())
+}
+
 /// Read an extended attribute via `getxattr(2)`. Returns the raw bytes.
+#[cfg(target_os = "linux")]
 fn read_xattr(path: &str, name: &str) -> Option<Vec<u8>> {
     use std::ffi::CString;
     let c_path = CString::new(path).ok()?;
@@ -337,6 +351,7 @@ fn read_xattr(path: &str, name: &str) -> Option<Vec<u8>> {
 
 /// Listening sockets: TCP sockets in the LISTEN state plus UDP bound sockets,
 /// IPv4 and IPv6, resolved back to the owning process where possible.
+#[cfg(target_os = "linux")]
 fn gather_listening_ports() -> Vec<ListeningPort> {
     use procfs::net::TcpState;
 
@@ -394,7 +409,15 @@ fn gather_listening_ports() -> Vec<ListeningPort> {
     out
 }
 
+/// Listening-socket enumeration is procfs-based; off-Linux the posture simply
+/// omits it until a native (e.g. GetExtendedTcpTable) gatherer exists.
+#[cfg(not(target_os = "linux"))]
+fn gather_listening_ports() -> Vec<ListeningPort> {
+    Vec::new()
+}
+
 /// Map socket inode → owning pid by scanning `/proc/<pid>/fd`.
+#[cfg(target_os = "linux")]
 fn build_inode_pid_map() -> std::collections::HashMap<u64, i32> {
     let mut map = std::collections::HashMap::new();
     let Ok(proc_dir) = std::fs::read_dir("/proc") else {
@@ -424,6 +447,7 @@ fn build_inode_pid_map() -> std::collections::HashMap<u64, i32> {
     map
 }
 
+#[cfg(target_os = "linux")]
 fn resolve_inode(
     inode: u64,
     map: &std::collections::HashMap<u64, i32>,
@@ -501,7 +525,7 @@ fn module_signature(name: &str, proc_taint: &str) -> &'static str {
 fn gather_os() -> OsInfo {
     let osr = parse_os_release();
     OsInfo {
-        family: "linux".to_string(),
+        family: std::env::consts::OS.to_string(),
         name: osr
             .get("NAME")
             .cloned()
@@ -673,6 +697,7 @@ fn gather_network() -> Vec<NetInterface> {
 }
 
 /// Map interface name -> (ipv4 list, ipv6 list) via getifaddrs(3).
+#[cfg(target_os = "linux")]
 #[allow(clippy::type_complexity)]
 fn ifaddr_ip_map() -> std::collections::HashMap<String, (Vec<String>, Vec<String>)> {
     let mut map: std::collections::HashMap<String, (Vec<String>, Vec<String>)> =
@@ -691,6 +716,15 @@ fn ifaddr_ip_map() -> std::collections::HashMap<String, (Vec<String>, Vec<String
         }
     }
     map
+}
+
+/// Interface addresses come from getifaddrs(3); off-Linux the runtime
+/// `/sys/class/net` walk yields no interfaces anyway, so this is never reached
+/// with data — keep the signature for the shared caller.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::type_complexity)]
+fn ifaddr_ip_map() -> std::collections::HashMap<String, (Vec<String>, Vec<String>)> {
+    std::collections::HashMap::new()
 }
 
 // ── Software ────────────────────────────────────────────────────────────────

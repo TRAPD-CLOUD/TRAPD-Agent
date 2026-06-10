@@ -1013,7 +1013,10 @@ mod tests {
 
         // Freshly planted: present, unmodified, digest matches the record.
         let h = verify_record(&rec);
-        assert!(h.present && !h.modified, "fresh token is present & unmodified");
+        assert!(
+            h.present && !h.modified,
+            "fresh token is present & unmodified"
+        );
         assert_eq!(h.actual_sha256.as_deref(), Some(rec.sha256.as_str()));
         assert_eq!(h.status_label(), "present");
 

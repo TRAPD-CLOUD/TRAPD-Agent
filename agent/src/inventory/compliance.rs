@@ -406,6 +406,7 @@ fn perm_check(id: &str, title: &str, path: &str, max_mode: u32) -> CisFinding {
     }
     #[cfg(not(unix))]
     {
+        let _ = (path, max_mode);
         CisFinding::new(id, title, 1, "not_applicable", "non-unix host")
     }
 }

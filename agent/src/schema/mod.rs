@@ -304,6 +304,7 @@ pub struct ExecEventData {
 /// Aggregated process-enrichment payload produced by
 /// [`crate::collectors::linux::proc_enrich`]; flattened into [`ExecEventData`].
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // built by the Linux proc-enrich collector
 pub struct ExecEnrichment {
     pub loaded_libraries: Vec<String>,
     pub interpreter: Option<InterpreterContext>,

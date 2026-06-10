@@ -161,8 +161,15 @@ fn verify_ed25519_signature(hash_bytes: &[u8]) -> Result<()> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn exe_path() -> Result<PathBuf> {
-    std::fs::read_link("/proc/self/exe")
-        .context("Cannot resolve /proc/self/exe — are we running on Linux?")
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link("/proc/self/exe")
+            .context("Cannot resolve /proc/self/exe — are we running on Linux?")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe().context("Cannot resolve the running executable's path")
+    }
 }
 
 /// Returns `(hex_string, raw_32_bytes)`.

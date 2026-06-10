@@ -277,7 +277,8 @@ mod tests {
 
     #[test]
     fn failed_password_invalid_user_strips_prefix() {
-        let l = format!("{HOST}Failed password for invalid user admin from 198.51.100.7 port 22 ssh2");
+        let l =
+            format!("{HOST}Failed password for invalid user admin from 198.51.100.7 port 22 ssh2");
         let ev = parse_failed(&l).expect("should parse");
         assert_eq!(ev.username, "admin");
         assert_eq!(ev.src_addr.as_deref(), Some("198.51.100.7"));

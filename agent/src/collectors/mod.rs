@@ -16,4 +16,8 @@ pub trait Collector: Send + Sync + 'static {
     ) -> Result<()>;
 }
 
+#[cfg(target_os = "linux")]
 pub mod linux;
+
+#[cfg(target_os = "windows")]
+pub mod windows;

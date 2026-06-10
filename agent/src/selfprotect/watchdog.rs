@@ -91,7 +91,10 @@ pub fn spawn_detached() {
     }
 
     #[cfg(not(target_os = "linux"))]
-    warn!("Watchdog: only supported on Linux — skipping");
+    {
+        let _ = (exe, my_pid);
+        warn!("Watchdog: only supported on Linux — skipping");
+    }
 }
 
 /// Run the watchdog loop.  This function **never returns**.

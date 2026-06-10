@@ -13,6 +13,7 @@
 
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -76,9 +77,12 @@ pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
         bail!("not a regular file: {}", path.display());
     }
     let size = meta.len();
-    let mode = meta.mode();
-    let uid = meta.uid();
-    let gid = meta.gid();
+    #[cfg(unix)]
+    let (mode, uid, gid) = (meta.mode(), meta.uid(), meta.gid());
+    // Windows has no unix mode/uid/gid; record zeros so the restore path (which
+    // only re-applies them on unix) stays schema-compatible.
+    #[cfg(not(unix))]
+    let (mode, uid, gid) = (0u32, 0u32, 0u32);
 
     let sha = sha256_of(path)?;
 
