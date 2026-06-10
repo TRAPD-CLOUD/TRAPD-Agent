@@ -319,6 +319,7 @@ fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
     s.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
+#[cfg(target_os = "linux")]
 fn read_os_version() -> String {
     std::fs::read_to_string("/etc/os-release")
         .ok()
@@ -328,4 +329,11 @@ fn read_os_version() -> String {
                 .map(|l| l["PRETTY_NAME=".len()..].trim_matches('"').to_string())
         })
         .unwrap_or_else(|| "Linux".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_os_version() -> String {
+    // e.g. "Windows 11 Pro" — same role as PRETTY_NAME on Linux.
+    sysinfo::System::long_os_version()
+        .unwrap_or_else(|| std::env::consts::OS.to_string())
 }

@@ -154,12 +154,20 @@ impl Heartbeat {
     }
 }
 
-/// Total + available bytes of the filesystem mounted at `/`.
+/// Total + available bytes of the filesystem backing the OS — `/` on unix,
+/// the system drive (`C:\` unless relocated) on Windows.
 fn root_disk_bytes() -> (u64, u64) {
+    #[cfg(windows)]
+    let root = std::env::var("SystemDrive")
+        .map(|d| format!("{d}\\"))
+        .unwrap_or_else(|_| "C:\\".to_string());
+    #[cfg(not(windows))]
+    let root = "/".to_string();
+
     let disks = Disks::new_with_refreshed_list();
     disks
         .iter()
-        .find(|d| d.mount_point().to_string_lossy() == "/")
+        .find(|d| d.mount_point().to_string_lossy() == root)
         .map(|d| (d.total_space(), d.available_space()))
         .unwrap_or((0, 0))
 }
@@ -174,6 +182,7 @@ fn pct(used: u64, total: u64) -> f32 {
 
 /// Count running processes by enumerating numeric entries in `/proc`.
 /// Cheap and avoids a full sysinfo process refresh on every beat.
+#[cfg(target_os = "linux")]
 fn count_processes() -> usize {
     match std::fs::read_dir("/proc") {
         Ok(rd) => rd
@@ -187,4 +196,15 @@ fn count_processes() -> usize {
             .count(),
         Err(_) => 0,
     }
+}
+
+/// No `/proc` here — take a one-shot sysinfo process refresh instead.
+#[cfg(not(target_os = "linux"))]
+fn count_processes() -> usize {
+    use sysinfo::{ProcessRefreshKind, RefreshKind};
+    System::new_with_specifics(
+        RefreshKind::new().with_processes(ProcessRefreshKind::new()),
+    )
+    .processes()
+    .len()
 }

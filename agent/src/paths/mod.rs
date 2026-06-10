@@ -27,9 +27,21 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
+#[cfg(not(windows))]
 const DEFAULT_STATE_DIR: &str = "/var/lib/trapd";
+#[cfg(not(windows))]
 const DEFAULT_CONFIG_DIR: &str = "/etc/trapd";
+#[cfg(not(windows))]
 const DEFAULT_LOG_DIR: &str = "/var/log/trapd";
+
+// Windows: the canonical machine-wide writable location is %ProgramData%
+// (services run as LocalSystem, which has no meaningful $HOME either).
+#[cfg(windows)]
+const DEFAULT_STATE_DIR: &str = r"C:\ProgramData\trapd\state";
+#[cfg(windows)]
+const DEFAULT_CONFIG_DIR: &str = r"C:\ProgramData\trapd\config";
+#[cfg(windows)]
+const DEFAULT_LOG_DIR: &str = r"C:\ProgramData\trapd\logs";
 
 static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();

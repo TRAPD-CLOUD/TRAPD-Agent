@@ -1,4 +1,13 @@
-use std::sync::{Arc, Mutex, RwLock};
+// Shared modules (deception data model, signed-command verification, inventory
+// types) are compiled in full on Windows so the wire formats stay identical to
+// the Linux agent, but large parts have no Windows caller yet. Allow the
+// dead-code lint there rather than fragmenting shared modules with per-item
+// cfg gates.
+#![cfg_attr(windows, allow(dead_code))]
+
+use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
+use std::sync::RwLock;
 
 use anyhow::{Context, Result};
 use tokio::fs;
@@ -8,8 +17,10 @@ use uuid::Uuid;
 mod collectors;
 mod config;
 mod deception;
+#[cfg(target_os = "linux")]
 mod detection;
 mod enrollment;
+#[cfg(target_os = "linux")]
 mod forensics;
 mod heartbeat;
 mod http;
@@ -19,24 +30,51 @@ mod paths;
 mod pipeline;
 mod prevention;
 mod schema;
+#[cfg(target_os = "linux")]
 mod selfprotect;
 mod transport;
+#[cfg(windows)]
+mod winsvc;
 
+#[cfg(target_os = "linux")]
 use collectors::linux::agent_protect::AgentProtectCollector;
+#[cfg(target_os = "linux")]
 use collectors::linux::authlog::AuthLogCollector;
+#[cfg(target_os = "linux")]
 use collectors::linux::ebpf_exec::EbpfExecCollector;
+#[cfg(target_os = "linux")]
 use collectors::linux::ebpf_syscalls::EbpfSyscallCollector;
+#[cfg(target_os = "linux")]
 use collectors::linux::filesystem::FilesystemCollector;
+#[cfg(target_os = "linux")]
 use collectors::linux::network::NetworkCollector;
+#[cfg(target_os = "linux")]
 use collectors::linux::process::ProcessCollector;
+#[cfg(target_os = "linux")]
 use collectors::linux::system::SystemCollector;
+#[cfg(target_os = "linux")]
 use collectors::Collector;
+#[cfg(target_os = "linux")]
 use config::{AgentConfig, ConfigPuller};
+#[cfg(target_os = "linux")]
 use heartbeat::Heartbeat;
 use output::{write_event, OutputMode};
-use pipeline::{create_pipeline, Spool};
+#[cfg(target_os = "linux")]
+use pipeline::create_pipeline;
+use pipeline::Spool;
+#[cfg(target_os = "linux")]
 use transport::Transport;
 
+/// Windows entry point: CLI verbs (`install` / `uninstall` / `run`) plus the
+/// Service Control Manager dispatch path live in [`winsvc`]; the shared
+/// telemetry pipeline (enrollment, heartbeat, collectors, transport) is reused
+/// from the same modules the Linux agent uses.
+#[cfg(windows)]
+fn main() -> Result<()> {
+    winsvc::entry()
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<()> {
     if let Some(monitored_pid) = selfprotect::watchdog::detect() {
@@ -389,6 +427,7 @@ async fn handle_event(event: &schema::AgentEvent, mode: &OutputMode, buf: &Arc<M
 
 /// Build / spawn the prevention subsystem.  Returns the sender used by the
 /// tee in the main consumer to forward events to the enforcement engine.
+#[cfg(target_os = "linux")]
 async fn start_prevention(
     backend_url: &str,
     agent_id: &str,
@@ -500,6 +539,7 @@ async fn start_prevention(
 /// registered token each pass, which the backend correlates into the token's
 /// `file_status` / `last_verified_at`. Runs on a modest interval and also fires
 /// immediately on a deploy/revoke kick so a fresh token is verified within ms.
+#[cfg(target_os = "linux")]
 fn spawn_honeytoken_health(
     audit: prevention::audit::AuditEmitter,
     store: Arc<deception::HoneytokenStore>,
@@ -561,6 +601,7 @@ fn spawn_honeytoken_health(
     });
 }
 
+#[cfg(target_os = "linux")]
 fn build_isolation_allowlist(
     backend_url: &str,
     cfg: &Arc<RwLock<AgentConfig>>,
@@ -590,6 +631,7 @@ fn build_isolation_allowlist(
     out
 }
 
+#[cfg(target_os = "linux")]
 fn backend_host(url: &str) -> Option<String> {
     let s = url.split("://").nth(1).unwrap_or(url);
     let s = s.split('/').next().unwrap_or(s);
@@ -670,6 +712,7 @@ mod tests {
         assert!(!env_truthy("TRAPD_DEFINITELY_UNSET_VAR_XYZ"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn backend_host_extracts_hostname() {
         assert_eq!(
