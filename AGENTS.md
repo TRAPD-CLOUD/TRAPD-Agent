@@ -10,7 +10,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - Main binary: `agent/src/main.rs` builds `trapd-agent`.
 - Current package version: `trapd-agent` `0.2.0`.
 - Primary output: structured JSON events, written locally as NDJSON and/or sent to the backend.
-- Platform focus: Linux, plus a Windows build (`cargo build --target x86_64-pc-windows-msvc` or `-gnu`) that shares the OS-neutral schema, enrollment, heartbeat, signed-config and ingest channels. Windows-only sensing lives in `agent/src/collectors/windows/` (honeytoken sentinel: decoy files via ReadDirectoryChangesW/`notify` + registry decoys via RegNotifyChangeKeyValue); Linux-only telemetry (`collectors/linux`, eBPF, prevention enforcement) is `cfg`-gated out. `trapd-agent.exe uninstall` removes every planted decoy (files + `HKLM\SOFTWARE\TRAPD\Honeytokens`).
+- Platform focus: Linux, plus a Windows build (`cargo build --target x86_64-pc-windows-msvc` or `-gnu`) that shares the OS-neutral schema, enrollment, heartbeat, signed-config and ingest channels. Windows-only sensing lives in `agent/src/collectors/windows/` (honeytoken sentinel: decoy files via ReadDirectoryChangesW/`notify` + registry decoys via RegNotifyChangeKeyValue, both reporting `honeytoken_deployed`/`honeytoken_health` lifecycle events the stream-processor mirrors into the `honeytokens` table; plus a sysinfo-based process create/terminate collector feeding the shared detection engine). The OS-neutral system-snapshot collector (`collectors/system.rs`) runs on every platform. Linux-only telemetry (`collectors/linux`, eBPF, prevention enforcement) is `cfg`-gated out. `trapd-agent.exe uninstall` removes every planted decoy (files + `HKLM\SOFTWARE\TRAPD\Honeytokens`).
 
 ## Important Paths
 

@@ -7,3 +7,4 @@
 //! process/network telemetry) follow the same `Collector` trait.
 
 pub mod honeytokens;
+pub mod process;

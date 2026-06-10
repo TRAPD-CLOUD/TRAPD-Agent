@@ -36,13 +36,15 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use notify::Watcher;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
 
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
 use crate::schema::{
-    AgentEvent, EventAction, EventClass, EventData, HoneytokenAccessData, ProcessLineage, Severity,
+    AgentEvent, EventAction, EventClass, EventData, HoneytokenAccessData, PreventionEventData,
+    ProcessLineage, Severity,
 };
 
 /// Registry key (under HKLM) holding the decoy values.
@@ -66,6 +68,12 @@ const SELF_WRITE_SUPPRESSION: Duration = Duration::from_secs(3);
 /// last-access poll that detects content reads.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Honeytoken *health* is reported to the backend every N sweeps (= 60s with
+/// the 15s sweep), matching the Linux health verifier's cadence. The backend
+/// correlates these `prevention.honeytoken_health` events into the token's
+/// `file_status` / `last_verified_at` lifecycle columns.
+const HEALTH_EVERY_N_SWEEPS: u32 = 4;
+
 // ── Shared filesystem-token state ─────────────────────────────────────────────
 
 #[derive(Default)]
@@ -74,6 +82,10 @@ struct FsState {
     planted: Mutex<HashMap<PathBuf, Instant>>,
     /// Last observed access time per decoy path (read-detection baseline).
     atime: Mutex<HashMap<PathBuf, SystemTime>>,
+    /// Expected content digest per decoy path (`sha256:<hex>`), captured at
+    /// plant time (or from the surviving file on startup) — the baseline the
+    /// health verifier diffs against to flag out-of-band tampering.
+    sha: Mutex<HashMap<PathBuf, String>>,
 }
 
 impl FsState {
@@ -100,6 +112,14 @@ impl FsState {
 
 fn accessed_time(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.accessed().ok())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn sha256_of_file(path: &Path) -> Option<String> {
+    std::fs::read(path).ok().map(|b| sha256_hex(&b))
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
@@ -133,9 +153,15 @@ impl Collector for HoneytokenCollector {
         let planted = plant_missing(&initial, &state);
         info!(
             configured = initial.len(),
-            created = planted,
+            created = planted.len(),
             "filesystem honeytokens ensured"
         );
+        // Register every configured decoy with the backend lifecycle mirror
+        // (`prevention.honeytoken_deployed` → `honeytokens` row), so the
+        // dashboard shows Windows tokens *before* their first trigger.
+        for path in &initial {
+            emit_fs_deployed(&tx, &agent_id, &hostname, path, &state);
+        }
 
         // Registry decoys + blocking RegNotifyChangeKeyValue monitor.
         {
@@ -162,10 +188,21 @@ impl Collector for HoneytokenCollector {
                 .context("spawn filesystem honeytoken watcher thread")?;
         }
 
-        // Resilience sweep + read (last-access) detection.
+        // Resilience sweep + read (last-access) detection + periodic health.
+        let mut tick: u32 = 0;
         loop {
             tokio::time::sleep(SWEEP_INTERVAL).await;
-            sweep(&tx, &agent_id, &hostname, &self.config, &state).await;
+            tick = tick.wrapping_add(1);
+            let report_health = tick % HEALTH_EVERY_N_SWEEPS == 0;
+            sweep(
+                &tx,
+                &agent_id,
+                &hostname,
+                &self.config,
+                &state,
+                report_health,
+            )
+            .await;
         }
     }
 }
@@ -189,19 +226,26 @@ fn configured_paths(config: &Arc<RwLock<AgentConfig>>) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Create every missing decoy file (with believable bait content). Returns how
-/// many were (re)created. Failures are logged, never fatal: a path on a
+/// Create every missing decoy file (with believable bait content). Returns the
+/// paths that were (re)created. Failures are logged, never fatal: a path on a
 /// non-existent drive must not take the sentinel down.
-fn plant_missing(paths: &[PathBuf], state: &FsState) -> usize {
-    let mut created = 0;
+fn plant_missing(paths: &[PathBuf], state: &FsState) -> Vec<PathBuf> {
+    let mut created = Vec::new();
     for path in paths {
         if path.exists() {
-            // Ensure a baseline exists for read detection even when the file
-            // survived a restart.
+            // Ensure read-detection + tamper baselines exist even when the
+            // file survived a restart (its current content is the baseline).
             if let Ok(mut m) = state.atime.lock() {
                 if !m.contains_key(path) {
                     if let Some(at) = accessed_time(path) {
                         m.insert(path.clone(), at);
+                    }
+                }
+            }
+            if let Ok(mut m) = state.sha.lock() {
+                if !m.contains_key(path) {
+                    if let Some(d) = sha256_of_file(path) {
+                        m.insert(path.clone(), d);
                     }
                 }
             }
@@ -213,11 +257,15 @@ fn plant_missing(paths: &[PathBuf], state: &FsState) -> usize {
                 continue;
             }
         }
-        match std::fs::write(path, bait_content(path)) {
+        let bait = bait_content(path);
+        match std::fs::write(path, &bait) {
             Ok(()) => {
                 state.mark_planted(path);
+                if let Ok(mut m) = state.sha.lock() {
+                    m.insert(path.clone(), sha256_hex(&bait));
+                }
                 info!(path = %path.display(), "honeytoken decoy file planted");
-                created += 1;
+                created.push(path.clone());
             }
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "honeytoken: cannot plant decoy file")
@@ -366,22 +414,31 @@ fn handle_fs_event(
     }
 }
 
-/// Periodic resilience pass: replant deleted decoys and poll last-access
-/// timestamps to detect content reads.
+/// Periodic resilience pass: replant deleted decoys, poll last-access
+/// timestamps to detect content reads, and (on the slower health cadence)
+/// report each token's on-host status to the backend lifecycle mirror.
 async fn sweep(
     tx: &Sender<AgentEvent>,
     agent_id: &str,
     hostname: &str,
     config: &Arc<RwLock<AgentConfig>>,
     state: &Arc<FsState>,
+    report_health: bool,
 ) {
     let paths = configured_paths(config);
 
     // Replant anything missing (deletion itself was already raised by the
-    // watcher; the sweep restores the bait so it keeps working).
+    // watcher; the sweep restores the bait so it keeps working) and re-register
+    // the restored token with the backend (status back to `active`).
     let recreated = plant_missing(&paths, state);
-    if recreated > 0 {
-        info!(recreated, "honeytoken decoy files replanted");
+    if !recreated.is_empty() {
+        info!(
+            recreated = recreated.len(),
+            "honeytoken decoy files replanted"
+        );
+        for path in &recreated {
+            emit_fs_deployed(tx, agent_id, hostname, path, state);
+        }
     }
 
     // Read detection: a moved-on last-access timestamp outside our own write
@@ -399,6 +456,168 @@ async fn sweep(
         if let Ok(mut m) = state.atime.lock() {
             m.insert(path.clone(), now_at);
         }
+    }
+
+    // Health verification (Linux-parity): is each planted token still there,
+    // and does its content digest still match? Catches tampering that happened
+    // while the agent was down (no watcher event fired).
+    if report_health {
+        for path in &paths {
+            let expected = state.sha.lock().ok().and_then(|m| m.get(path).cloned());
+            let actual = sha256_of_file(path);
+            let (present, modified) = match (&expected, &actual) {
+                (_, None) => (false, false),
+                (Some(e), Some(a)) => (true, e != a),
+                (None, Some(_)) => (true, false),
+            };
+            emit_fs_health(
+                tx, agent_id, hostname, path, present, modified, expected, actual,
+            );
+        }
+        for (path, present, modified) in registry::health() {
+            emit_registry_health(tx, agent_id, hostname, &path, present, modified);
+        }
+    }
+}
+
+/// Report one decoy file to the backend lifecycle mirror
+/// (`prevention.honeytoken_deployed` → upserts the `honeytokens` row).
+fn emit_fs_deployed(
+    tx: &Sender<AgentEvent>,
+    agent_id: &str,
+    hostname: &str,
+    path: &Path,
+    state: &FsState,
+) {
+    let sha256 = state.sha.lock().ok().and_then(|m| m.get(path).cloned());
+    send_prevention(
+        tx,
+        agent_id,
+        hostname,
+        EventAction::HoneytokenDeployed,
+        Severity::Info,
+        "honeytoken_deploy",
+        path.display().to_string(),
+        true,
+        "windows decoy file planted by agent".to_string(),
+        serde_json::json!({ "kind": "windows_decoy_file", "sha256": sha256 }),
+    );
+}
+
+/// Report one decoy file's on-host health
+/// (`prevention.honeytoken_health` → token `file_status`/`last_verified_at`).
+#[allow(clippy::too_many_arguments)]
+fn emit_fs_health(
+    tx: &Sender<AgentEvent>,
+    agent_id: &str,
+    hostname: &str,
+    path: &Path,
+    present: bool,
+    modified: bool,
+    expected_sha256: Option<String>,
+    actual_sha256: Option<String>,
+) {
+    let file_status = match (present, modified) {
+        (false, _) => "missing",
+        (true, true) => "modified",
+        (true, false) => "present",
+    };
+    let healthy = present && !modified;
+    send_prevention(
+        tx,
+        agent_id,
+        hostname,
+        EventAction::HoneytokenHealth,
+        if healthy {
+            Severity::Info
+        } else {
+            Severity::High
+        },
+        "honeytoken_health",
+        path.display().to_string(),
+        healthy,
+        format!("windows decoy file is {file_status}"),
+        serde_json::json!({
+            "kind": "windows_decoy_file",
+            "present": present,
+            "modified": modified,
+            "file_status": file_status,
+            "expected_sha256": expected_sha256,
+            "actual_sha256": actual_sha256,
+        }),
+    );
+}
+
+/// Report one registry decoy's health (same lifecycle contract as files).
+fn emit_registry_health(
+    tx: &Sender<AgentEvent>,
+    agent_id: &str,
+    hostname: &str,
+    path: &str,
+    present: bool,
+    modified: bool,
+) {
+    let file_status = match (present, modified) {
+        (false, _) => "missing",
+        (true, true) => "modified",
+        (true, false) => "present",
+    };
+    let healthy = present && !modified;
+    send_prevention(
+        tx,
+        agent_id,
+        hostname,
+        EventAction::HoneytokenHealth,
+        if healthy {
+            Severity::Info
+        } else {
+            Severity::High
+        },
+        "honeytoken_health",
+        path.to_string(),
+        healthy,
+        format!("windows registry decoy is {file_status}"),
+        serde_json::json!({
+            "kind": "windows_registry_key",
+            "present": present,
+            "modified": modified,
+            "file_status": file_status,
+        }),
+    );
+}
+
+/// Ship one prevention-class lifecycle event (deploy/health) to the pipeline.
+#[allow(clippy::too_many_arguments)]
+fn send_prevention(
+    tx: &Sender<AgentEvent>,
+    agent_id: &str,
+    hostname: &str,
+    action: EventAction,
+    severity: Severity,
+    kind: &str,
+    target: String,
+    success: bool,
+    reason: String,
+    details: serde_json::Value,
+) {
+    let event = AgentEvent::new(
+        agent_id.to_string(),
+        hostname.to_string(),
+        EventClass::Prevention,
+        action,
+        severity,
+        EventData::Prevention(PreventionEventData {
+            kind: kind.to_string(),
+            target,
+            success,
+            reason,
+            rule_id: None,
+            command_id: None,
+            details,
+        }),
+    );
+    if let Err(e) = tx.try_send(event) {
+        warn!(error = %e, "honeytoken: lifecycle event dropped (pipeline full/closed)");
     }
 }
 
@@ -635,6 +854,42 @@ mod registry {
         }
     }
 
+    /// On-host health of every registry decoy: `(path, present, modified)`.
+    /// Opens the key read-only; a missing key reports every value as missing.
+    pub fn health() -> Vec<(String, bool, bool)> {
+        use windows_sys::Win32::System::Registry::RegOpenKeyExW;
+        let subkey = wide(super::REGISTRY_SUBKEY);
+        let mut hkey: HKEY = std::ptr::null_mut();
+        let rc = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                subkey.as_ptr(),
+                0,
+                KEY_QUERY_VALUE,
+                &mut hkey,
+            )
+        };
+        let opened = rc == ERROR_SUCCESS;
+        let out = super::REGISTRY_VALUES
+            .iter()
+            .map(|(name, expected)| {
+                let path = format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY);
+                if !opened {
+                    return (path, false, false);
+                }
+                match read_value(hkey, name) {
+                    None => (path, false, false),
+                    Some(v) if v != *expected => (path, true, true),
+                    Some(_) => (path, true, false),
+                }
+            })
+            .collect();
+        if opened {
+            unsafe { RegCloseKey(hkey) };
+        }
+        out
+    }
+
     /// Dedicated monitor thread: create the decoys, then block in
     /// `RegNotifyChangeKeyValue` and raise a detection for every change that is
     /// not our own restore. The key and its values are recreated whenever they
@@ -658,6 +913,22 @@ mod registry {
                 values = super::REGISTRY_VALUES.len(),
                 "registry honeytokens ensured"
             );
+            // Register each decoy value with the backend lifecycle mirror, so
+            // registry tokens show up in the dashboard before any trigger.
+            for (name, _) in super::REGISTRY_VALUES {
+                super::send_prevention(
+                    &tx,
+                    &agent_id,
+                    &hostname,
+                    EventAction::HoneytokenDeployed,
+                    Severity::Info,
+                    "honeytoken_deploy",
+                    format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY),
+                    true,
+                    "windows registry decoy planted by agent".to_string(),
+                    serde_json::json!({ "kind": "windows_registry_key" }),
+                );
+            }
             // Creating/restoring values above counts as a self-write.
             let mut last_restore = Instant::now();
 

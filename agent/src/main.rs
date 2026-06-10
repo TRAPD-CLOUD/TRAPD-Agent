@@ -26,8 +26,9 @@ mod transport;
 use collectors::linux::{
     agent_protect::AgentProtectCollector, authlog::AuthLogCollector, ebpf_exec::EbpfExecCollector,
     ebpf_syscalls::EbpfSyscallCollector, filesystem::FilesystemCollector,
-    network::NetworkCollector, process::ProcessCollector, system::SystemCollector,
+    network::NetworkCollector, process::ProcessCollector,
 };
+use collectors::system::SystemCollector;
 use collectors::Collector;
 use config::{AgentConfig, ConfigPuller};
 use heartbeat::Heartbeat;
@@ -261,14 +262,19 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Windows: the honeytoken sentinel (decoy files via ReadDirectoryChangesW +
-    // registry decoys via RegNotifyChangeKeyValue). Emits the same OS-neutral
-    // `HoneytokenAccess` detections as the Linux deception subsystem, through
-    // the same pipeline → spool → ingest path.
+    // Windows: OS-neutral system snapshots, a sysinfo-based process collector
+    // (create/terminate telemetry feeding the shared detection engine), and the
+    // honeytoken sentinel (decoy files via ReadDirectoryChangesW + registry
+    // decoys via RegNotifyChangeKeyValue). All of it emits the same OS-neutral
+    // events as the Linux agent, through the same pipeline → spool → ingest path.
     #[cfg(target_os = "windows")]
-    spawn_collector!(collectors::windows::honeytokens::HoneytokenCollector::new(
-        Arc::clone(&agent_config)
-    ));
+    {
+        spawn_collector!(SystemCollector::new());
+        spawn_collector!(collectors::windows::process::ProcessCollector::new());
+        spawn_collector!(collectors::windows::honeytokens::HoneytokenCollector::new(
+            Arc::clone(&agent_config)
+        ));
+    }
 
     drop(tx);
 

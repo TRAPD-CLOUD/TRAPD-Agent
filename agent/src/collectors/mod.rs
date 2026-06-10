@@ -16,6 +16,9 @@ pub trait Collector: Send + Sync + 'static {
     ) -> Result<()>;
 }
 
+// OS-neutral collectors (sysinfo-backed), shared by every platform build.
+pub mod system;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 
