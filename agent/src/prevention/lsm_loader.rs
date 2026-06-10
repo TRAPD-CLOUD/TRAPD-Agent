@@ -14,13 +14,18 @@
 //! returns a `Disabled` handle; the userspace post-exec fallback in
 //! `process::enforce_exec` still works.
 
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+#[cfg(target_os = "linux")]
+use tracing::info;
+use tracing::warn;
 
-use super::policy::{IocRule, PolicyHandle};
+#[cfg(target_os = "linux")]
+use super::policy::IocRule;
+use super::policy::PolicyHandle;
 
 /// Handle to the in-kernel block-maps.
 pub struct LsmHandle {

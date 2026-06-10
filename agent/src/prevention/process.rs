@@ -17,7 +17,9 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::Result;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 

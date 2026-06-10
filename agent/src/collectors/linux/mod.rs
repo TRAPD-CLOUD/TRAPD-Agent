@@ -13,4 +13,3 @@ pub mod network;
 pub mod packet_capture;
 pub mod proc_enrich;
 pub mod process;
-pub mod system;

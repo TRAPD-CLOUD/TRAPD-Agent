@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::fs;
 
 use anyhow::Result;
@@ -24,16 +25,25 @@ impl Default for SystemCollector {
 }
 
 fn read_distro() -> String {
-    let content = match fs::read_to_string("/etc/os-release") {
-        Ok(c) => c,
-        Err(_) => return String::new(),
-    };
-    for line in content.lines() {
-        if let Some(val) = line.strip_prefix("PRETTY_NAME=") {
-            return val.trim_matches('"').to_string();
+    #[cfg(target_os = "linux")]
+    {
+        let content = match fs::read_to_string("/etc/os-release") {
+            Ok(c) => c,
+            Err(_) => return String::new(),
+        };
+        for line in content.lines() {
+            if let Some(val) = line.strip_prefix("PRETTY_NAME=") {
+                return val.trim_matches('"').to_string();
+            }
         }
+        String::new()
     }
-    String::new()
+    // Off-Linux the closest "distro" equivalent is the long OS description
+    // (e.g. "Windows 11 Pro"), so the dashboard renders something useful.
+    #[cfg(not(target_os = "linux"))]
+    {
+        System::long_os_version().unwrap_or_default()
+    }
 }
 
 fn collect_system_info() -> Result<SystemSnapshotData> {
@@ -55,7 +65,7 @@ fn collect_system_info() -> Result<SystemSnapshotData> {
     let uptime_secs = System::uptime();
     let load = System::load_average();
     let kernel = System::kernel_version().unwrap_or_default();
-    let os_name = System::name().unwrap_or_else(|| "Linux".to_string());
+    let os_name = System::name().unwrap_or_else(|| std::env::consts::OS.to_string());
     let distro = read_distro();
 
     Ok(SystemSnapshotData {

@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::prevention::{
@@ -14,6 +14,12 @@ use crate::prevention::{
 };
 
 fn default_poll_interval() -> u64 {
+    60
+}
+fn default_heartbeat_interval() -> u64 {
+    30
+}
+fn default_config_poll_interval() -> u64 {
     60
 }
 fn default_fs_watch_paths() -> Vec<String> {
@@ -62,6 +68,17 @@ fn default_honeytoken_response() -> String {
 fn default_honeytoken_deception_escalation() -> bool {
     false
 }
+/// Decoy files the *Windows* agent plants and watches. Linux honeytokens are
+/// deployed over the signed command channel instead, so Linux ignores this.
+/// Kept platform-independent so the canonical signed-config bytes are identical
+/// on every OS.
+fn default_honeytoken_paths() -> Vec<String> {
+    vec![
+        "C:\\Users\\Public\\passwords.txt".into(),
+        "C:\\Users\\Public\\credentials.xlsx".into(),
+        "C:\\ProgramData\\backup_keys.txt".into(),
+    ]
+}
 fn default_auto_response_enabled() -> bool {
     false
 }
@@ -106,6 +123,12 @@ fn default_siem_format() -> String {
 pub struct AgentConfig {
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+    /// Seconds between heartbeats (`POST /agents/{id}/heartbeat`). Floored at 5.
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
+    /// Seconds between config pulls (`GET /agents/{id}/config`). Floored at 10.
+    #[serde(default = "default_config_poll_interval")]
+    pub config_poll_interval_secs: u64,
     #[serde(default = "default_enabled_collectors")]
     pub enabled_collectors: Vec<String>,
     #[serde(default = "default_fs_watch_paths")]
@@ -164,6 +187,11 @@ pub struct AgentConfig {
     /// `false`; escalation is an opt-in, backend-coordinated action.
     #[serde(default = "default_honeytoken_deception_escalation")]
     pub honeytoken_deception_escalation: bool,
+    /// Decoy file paths the Windows agent plants and monitors (filesystem
+    /// honeytokens). Empty entries are ignored; Linux agents ignore the field
+    /// entirely (their tokens arrive over the signed command channel).
+    #[serde(default = "default_honeytoken_paths")]
+    pub honeytoken_paths: Vec<String>,
 
     // ── Automated response to local detections (P0 response playbooks) ──────
     /// Master opt-in for automatically responding to *local detections* — IOC
@@ -279,6 +307,8 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             poll_interval_secs: default_poll_interval(),
+            heartbeat_interval_secs: default_heartbeat_interval(),
+            config_poll_interval_secs: default_config_poll_interval(),
             enabled_collectors: default_enabled_collectors(),
             fs_watch_paths: default_fs_watch_paths(),
             prevention_enabled: default_prevention_enabled(),
@@ -292,6 +322,7 @@ impl Default for AgentConfig {
             honeytoken_response: default_honeytoken_response(),
             honeytoken_accessor_allowlist: Vec::new(),
             honeytoken_deception_escalation: default_honeytoken_deception_escalation(),
+            honeytoken_paths: default_honeytoken_paths(),
             auto_response_enabled: default_auto_response_enabled(),
             auto_response_action: default_auto_response_action(),
             auto_response_min_severity: default_auto_response_min_severity(),
@@ -561,10 +592,19 @@ impl ConfigPuller {
     }
 
     pub async fn run(mut self) {
-        let mut ticker = interval(Duration::from_secs(60));
+        // First pull immediately on startup, then on the configured cadence.
+        // The interval is re-read each round so a backend-delivered change to
+        // `config_poll_interval_secs` takes effect without a restart. Floored
+        // at 10s so a bad config cannot hammer the backend.
         loop {
-            ticker.tick().await;
             self.pull().await;
+            let secs = self
+                .config
+                .read()
+                .map(|c| c.config_poll_interval_secs)
+                .unwrap_or_else(|_| default_config_poll_interval())
+                .max(10);
+            tokio::time::sleep(Duration::from_secs(secs)).await;
         }
     }
 
@@ -805,9 +845,9 @@ mod signed_config_tests {
     // here means the backend's `canonicalConfig` field order/contents drifted
     // from the Rust `AgentConfig` re-serialisation — the exact bug to catch.
     const XLANG_PUB_HEX: &str = "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664";
-    const XLANG_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768,"sigma_enabled":true,"sigma_rules":[],"anomaly_detection_enabled":true,"vuln_scan_enabled":true,"cis_benchmark_enabled":true,"siem_enabled":false,"siem_format":"cef","siem_syslog_address":"","siem_hec_url":"","siem_hec_token":"","cve_feed":[]}}"#;
+    const XLANG_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"heartbeat_interval_secs":30,"config_poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"honeytoken_paths":["C:\\Users\\Public\\passwords.txt","C:\\Users\\Public\\credentials.xlsx","C:\\ProgramData\\backup_keys.txt"],"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768,"sigma_enabled":true,"sigma_rules":[],"anomaly_detection_enabled":true,"vuln_scan_enabled":true,"cis_benchmark_enabled":true,"siem_enabled":false,"siem_format":"cef","siem_syslog_address":"","siem_hec_url":"","siem_hec_token":"","cve_feed":[]}}"#;
     const XLANG_SIG: &str =
-        "clI4e2yqhhEHlm7znPKIQPfFRY4AQoPVkrvnk0zTPkYXJ1Rq4qInLzFNeZhZ7UUW8AH9XfzpuLvhb1toeShVCw==";
+        "vNQjV2iY9neNY/0Pf5HY8MetMPA8R2ZELyURSAqkdmv6izcCAAl1wXUNAOQfGUsztNdCpc2AXmasCde5R9Q4AQ==";
 
     #[test]
     fn accepts_ts_signed_default_config() {

@@ -11,6 +11,10 @@
 //! Production `/proc` readers live here; the assembly logic is unit-tested in
 //! each submodule against fakes.
 
+// The session-capture half is consumed by the Linux honeytoken detector only;
+// off-Linux it compiles (pure /proc string reads) but has no caller yet.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 pub mod recorder;
 pub mod session;
 pub mod snapshot;

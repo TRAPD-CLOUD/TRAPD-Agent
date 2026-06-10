@@ -25,6 +25,7 @@ mod baseline;
 mod beaconing;
 mod behavior;
 mod dns_tunnel;
+#[cfg(target_os = "linux")] // fed only by the eBPF file-open gate
 pub mod honeytoken;
 mod ioa;
 mod ioc;
@@ -460,6 +461,7 @@ impl DetectionEngine {
         self.detection(severity, data)
     }
 
+    #[cfg(target_os = "linux")]
     fn inspect_file_open(&self, path: &str, comm: &str, out: &mut Vec<AgentEvent>) {
         // Sensitive credential-store access (logic + lists live in the
         // filesystem collector, mirroring how `behavior` owns its heuristics).
@@ -469,6 +471,11 @@ impl DetectionEngine {
             out.push(self.detection(sev, d));
         }
     }
+
+    /// Off-Linux there is no file-open telemetry source yet, and the sensitive
+    /// path lists live in the Linux filesystem collector.
+    #[cfg(not(target_os = "linux"))]
+    fn inspect_file_open(&self, _path: &str, _comm: &str, _out: &mut Vec<AgentEvent>) {}
 
     fn inspect_domain(&self, domain: &str, out: &mut Vec<AgentEvent>) {
         let matched = self.iocs.read().ok().and_then(|i| i.match_domain(domain));

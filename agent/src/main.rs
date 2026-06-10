@@ -22,14 +22,13 @@ mod schema;
 mod selfprotect;
 mod transport;
 
-use collectors::linux::agent_protect::AgentProtectCollector;
-use collectors::linux::authlog::AuthLogCollector;
-use collectors::linux::ebpf_exec::EbpfExecCollector;
-use collectors::linux::ebpf_syscalls::EbpfSyscallCollector;
-use collectors::linux::filesystem::FilesystemCollector;
-use collectors::linux::network::NetworkCollector;
-use collectors::linux::process::ProcessCollector;
-use collectors::linux::system::SystemCollector;
+#[cfg(target_os = "linux")]
+use collectors::linux::{
+    agent_protect::AgentProtectCollector, authlog::AuthLogCollector, ebpf_exec::EbpfExecCollector,
+    ebpf_syscalls::EbpfSyscallCollector, filesystem::FilesystemCollector,
+    network::NetworkCollector, process::ProcessCollector,
+};
+use collectors::system::SystemCollector;
 use collectors::Collector;
 use config::{AgentConfig, ConfigPuller};
 use heartbeat::Heartbeat;
@@ -55,6 +54,22 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // `trapd-agent uninstall` — remove every host artifact the agent planted.
+    // On Windows that is the honeytoken decoy files + the registry decoys;
+    // Linux honeytokens are deployed/revoked over the signed command channel,
+    // so there is nothing to clean up locally.
+    if std::env::args().nth(1).as_deref() == Some("uninstall") {
+        #[cfg(target_os = "windows")]
+        {
+            paths::init_state_dir();
+            collectors::windows::honeytokens::uninstall(&config::load_persisted());
+            info!("Uninstall cleanup complete (honeytoken files + registry decoys removed)");
+        }
+        #[cfg(not(target_os = "windows"))]
+        info!("Uninstall: no local honeytoken artifacts on this platform — nothing to do");
+        return Ok(());
+    }
 
     selfprotect::kernel_hardening::audit();
 
@@ -203,47 +218,62 @@ async fn main() -> Result<()> {
         }};
     }
 
-    let ebpf_exec = EbpfExecCollector::new();
-    if ebpf_exec.is_available() {
-        info!("eBPF exec tracer available — spawning EbpfExecCollector");
-        spawn_collector!(ebpf_exec);
-    } else {
-        warn!("eBPF binary not found — exec events will be detected by polling only.");
-    }
-
-    let ebpf_syscalls = EbpfSyscallCollector::new()
-        .with_config(Arc::clone(&agent_config))
-        .with_reconcile_signal(Arc::clone(&reconcile_signal));
-    if ebpf_syscalls.is_available() {
-        info!("eBPF syscall tracer available — spawning EbpfSyscallCollector");
-        spawn_collector!(ebpf_syscalls);
-    } else {
-        warn!("eBPF binary not found — syscall events unavailable.");
-    }
-
-    spawn_collector!(SystemCollector::new());
-    spawn_collector!(ProcessCollector::new());
-    spawn_collector!(NetworkCollector::new());
-    spawn_collector!(AuthLogCollector::new());
-    spawn_collector!(FilesystemCollector::new());
-    spawn_collector!(AgentProtectCollector::new());
-    spawn_collector!(collectors::linux::fim::FimCollector::new(Arc::clone(
-        &agent_config
-    )));
-    spawn_collector!(collectors::linux::memscan::MemScanCollector::new(
-        Arc::clone(&agent_config)
-    ));
-    // Passive DNS-response + TLS-handshake capture (AF_PACKET). Best-effort:
-    // needs CAP_NET_RAW; logs and exits cleanly without it while the rest run.
-    spawn_collector!(collectors::linux::packet_capture::PacketCaptureCollector::new());
-
+    #[cfg(target_os = "linux")]
     {
+        let ebpf_exec = EbpfExecCollector::new();
+        if ebpf_exec.is_available() {
+            info!("eBPF exec tracer available — spawning EbpfExecCollector");
+            spawn_collector!(ebpf_exec);
+        } else {
+            warn!("eBPF binary not found — exec events will be detected by polling only.");
+        }
+
+        let ebpf_syscalls = EbpfSyscallCollector::new()
+            .with_config(Arc::clone(&agent_config))
+            .with_reconcile_signal(Arc::clone(&reconcile_signal));
+        if ebpf_syscalls.is_available() {
+            info!("eBPF syscall tracer available — spawning EbpfSyscallCollector");
+            spawn_collector!(ebpf_syscalls);
+        } else {
+            warn!("eBPF binary not found — syscall events unavailable.");
+        }
+
+        spawn_collector!(SystemCollector::new());
+        spawn_collector!(ProcessCollector::new());
+        spawn_collector!(NetworkCollector::new());
+        spawn_collector!(AuthLogCollector::new());
+        spawn_collector!(FilesystemCollector::new());
+        spawn_collector!(AgentProtectCollector::new());
+        spawn_collector!(collectors::linux::fim::FimCollector::new(Arc::clone(
+            &agent_config
+        )));
+        spawn_collector!(collectors::linux::memscan::MemScanCollector::new(
+            Arc::clone(&agent_config)
+        ));
+        // Passive DNS-response + TLS-handshake capture (AF_PACKET). Best-effort:
+        // needs CAP_NET_RAW; logs and exits cleanly without it while the rest run.
+        spawn_collector!(collectors::linux::packet_capture::PacketCaptureCollector::new());
+
         let tx_ap = tx.clone();
         let aid = agent_id.clone();
         let host = hostname.clone();
         tokio::spawn(async move {
             selfprotect::anti_ptrace::run(tx_ap, aid, host).await;
         });
+    }
+
+    // Windows: OS-neutral system snapshots, a sysinfo-based process collector
+    // (create/terminate telemetry feeding the shared detection engine), and the
+    // honeytoken sentinel (decoy files via ReadDirectoryChangesW + registry
+    // decoys via RegNotifyChangeKeyValue). All of it emits the same OS-neutral
+    // events as the Linux agent, through the same pipeline → spool → ingest path.
+    #[cfg(target_os = "windows")]
+    {
+        spawn_collector!(SystemCollector::new());
+        spawn_collector!(collectors::windows::process::ProcessCollector::new());
+        spawn_collector!(collectors::windows::honeytokens::HoneytokenCollector::new(
+            Arc::clone(&agent_config)
+        ));
     }
 
     drop(tx);
@@ -356,7 +386,13 @@ async fn main() -> Result<()> {
         }));
         tokio::spawn(async move { config_puller.run().await });
 
-        let heartbeat = Heartbeat::new(&backend_url, agent_id.clone(), token, hostname.clone())?;
+        let heartbeat = Heartbeat::new(
+            &backend_url,
+            agent_id.clone(),
+            token,
+            hostname.clone(),
+            Arc::clone(&agent_config),
+        )?;
         tokio::spawn(async move { heartbeat.run().await });
     }
 
