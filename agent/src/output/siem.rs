@@ -120,9 +120,11 @@ impl SiemForwarder {
                 let sock = tokio::net::UnixDatagram::unbound()?;
                 sock.send_to(bytes, path).await?;
             }
+            // Unix-domain syslog sockets do not exist on Windows; the sink is
+            // refused at configuration time, this arm is unreachable.
             #[cfg(not(unix))]
-            SyslogSink::Unix(_) => {
-                anyhow::bail!("unix datagram syslog sinks are not supported on this platform");
+            SyslogSink::Unix(path) => {
+                anyhow::bail!("unix syslog socket {path:?} unsupported on this platform")
             }
             SyslogSink::Udp(addr) => {
                 let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;

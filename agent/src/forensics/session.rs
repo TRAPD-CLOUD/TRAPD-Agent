@@ -10,6 +10,10 @@
 //! `/proc` reads sit behind [`ProcReader`] so the assembly logic is testable
 //! without a live `/proc`.
 
+// The session-capture half is consumed by the Linux honeytoken detector only;
+// off-Linux it compiles (pure /proc string reads) but has no caller yet.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use crate::schema::{NamespaceIds, SessionContext};
 
 /// The namespaces we record, paired with the `/proc/<pid>/ns/<name>` link name.

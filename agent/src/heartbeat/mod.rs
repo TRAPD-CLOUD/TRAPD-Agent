@@ -10,15 +10,18 @@
 //! The metrics struct is OS-neutral so the future Windows agent reports the
 //! same shape.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::Utc;
 use serde::Serialize;
 use sysinfo::{Disks, System};
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 use tracing::{debug, warn};
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+use crate::config::AgentConfig;
+
+/// Fallback cadence when the config lock is poisoned.
+const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 #[derive(Serialize)]
 struct HeartbeatPayload {
@@ -53,6 +56,9 @@ pub struct Heartbeat {
     token: String,
     agent_id: String,
     hostname: String,
+    /// Live agent config; `heartbeat_interval_secs` is re-read every beat so a
+    /// backend-delivered change takes effect without a restart.
+    config: Arc<RwLock<AgentConfig>>,
     /// `System` is reused across beats so CPU deltas are meaningful.
     sys: Mutex<System>,
 }
@@ -63,6 +69,7 @@ impl Heartbeat {
         agent_id: String,
         token: String,
         hostname: String,
+        config: Arc<RwLock<AgentConfig>>,
     ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
         Ok(Self {
@@ -71,15 +78,23 @@ impl Heartbeat {
             token,
             agent_id,
             hostname,
+            config,
             sys: Mutex::new(System::new()),
         })
     }
 
     pub async fn run(self) {
-        let mut ticker = interval(HEARTBEAT_INTERVAL);
+        // Beat immediately on startup, then on the configured cadence (floored
+        // at 5s so a bad config cannot flood the backend).
         loop {
-            ticker.tick().await;
             self.send().await;
+            let secs = self
+                .config
+                .read()
+                .map(|c| c.heartbeat_interval_secs)
+                .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_SECS)
+                .max(5);
+            tokio::time::sleep(Duration::from_secs(secs)).await;
         }
     }
 

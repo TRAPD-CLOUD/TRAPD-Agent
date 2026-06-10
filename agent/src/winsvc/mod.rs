@@ -201,7 +201,14 @@ fn uninstall() -> Result<()> {
     service.delete().context("delete service")?;
     println!("Service '{SERVICE_NAME}' stopped and deleted");
 
-    // 3. Remove the binary. Windows cannot delete a running executable, so
+    // 3. Remove the host artifacts the agent planted: honeytoken decoy files +
+    //    registry decoys (the Linux agent revokes these over the signed command
+    //    channel, so this local cleanup is Windows-only).
+    crate::paths::init_state_dir();
+    crate::collectors::windows::honeytokens::uninstall(&crate::config::load_persisted());
+    println!("Honeytoken decoy files + registry decoys removed");
+
+    // 4. Remove the binary. Windows cannot delete a running executable, so
     //    hand the deletion to a detached cmd.exe that waits for this process
     //    to exit first. Best-effort: a failure leaves only an inert file.
     if let Ok(exe) = std::env::current_exe() {

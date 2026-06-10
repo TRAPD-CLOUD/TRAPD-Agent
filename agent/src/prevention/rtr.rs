@@ -15,6 +15,7 @@
 
 use base64::Engine as _;
 
+#[cfg(target_os = "linux")]
 use super::super::collectors::linux::memscan::{self, MapRegion};
 
 /// A size-capped, base64-encoded artifact plus provenance about truncation.
@@ -61,6 +62,7 @@ pub fn shell_invocation(interpreter: Option<&str>) -> (String, &'static str) {
 /// **anonymous-executable** regions (the interesting, injected ones) are chosen
 /// first, then the rest, accumulating until `max_total` bytes are budgeted.
 /// Returns `(start, end)` byte ranges, never exceeding the budget.
+#[cfg(target_os = "linux")]
 pub fn dumpable_regions(maps: &str, max_total: u64) -> Vec<(u64, u64)> {
     let regions = memscan::parse_maps(maps);
     let readable = |r: &MapRegion| r.perms.contains('r') && r.end > r.start;
@@ -82,6 +84,12 @@ pub fn dumpable_regions(maps: &str, max_total: u64) -> Vec<(u64, u64)> {
         budget -= take;
     }
     out
+}
+
+/// Off-Linux there is no `/proc/<pid>/maps` to parse — no regions to dump.
+#[cfg(not(target_os = "linux"))]
+pub fn dumpable_regions(_maps: &str, _max_total: u64) -> Vec<(u64, u64)> {
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -119,6 +127,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn dumpable_regions_prioritises_anon_exec_and_respects_budget() {
         // A file-backed text segment (readable) and an anonymous RWX region.
@@ -133,6 +142,7 @@ mod tests {
         assert_eq!(regions[0], (0x7f0000000000, 0x7f0000000800));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn dumpable_regions_excludes_unreadable() {
         let maps = "7f0000002000-7f0000003000 ---p 00000000 00:00 0 ";

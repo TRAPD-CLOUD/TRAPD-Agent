@@ -321,14 +321,25 @@ fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
 
 #[cfg(target_os = "linux")]
 fn read_os_version() -> String {
-    std::fs::read_to_string("/etc/os-release")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("PRETTY_NAME="))
-                .map(|l| l["PRETTY_NAME=".len()..].trim_matches('"').to_string())
-        })
-        .unwrap_or_else(|| "Linux".to_string())
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("PRETTY_NAME="))
+                    .map(|l| l["PRETTY_NAME=".len()..].trim_matches('"').to_string())
+            })
+            .unwrap_or_else(|| "Linux".to_string())
+    }
+    // Windows (and any other OS): the long descriptive name from sysinfo,
+    // e.g. "Windows 11 Pro" — so the backend can tell agent platforms apart.
+    #[cfg(not(target_os = "linux"))]
+    {
+        sysinfo::System::long_os_version()
+            .or_else(sysinfo::System::name)
+            .unwrap_or_else(|| std::env::consts::OS.to_string())
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

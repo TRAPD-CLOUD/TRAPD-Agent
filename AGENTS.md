@@ -10,7 +10,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - Main binary: `agent/src/main.rs` builds `trapd-agent`.
 - Current package version: `trapd-agent` `0.2.0`.
 - Primary output: structured JSON events, written locally as NDJSON and/or sent to the backend.
-- Platform focus: Linux. Some schema types are intentionally OS-neutral for future Windows support.
+- Platform focus: Linux, plus a Windows build (`cargo build --target x86_64-pc-windows-msvc` or `-gnu`) that shares the OS-neutral schema, enrollment, heartbeat, signed-config and ingest channels. Windows-only sensing lives in `agent/src/collectors/windows/` (honeytoken sentinel: decoy files via ReadDirectoryChangesW/`notify` + registry decoys via RegNotifyChangeKeyValue, both reporting `honeytoken_deployed`/`honeytoken_health` lifecycle events the stream-processor mirrors into the `honeytokens` table; plus a sysinfo-based process create/terminate collector feeding the shared detection engine). The OS-neutral system-snapshot collector (`collectors/system.rs`) runs on every platform. Linux-only telemetry (`collectors/linux`, eBPF, prevention enforcement) is `cfg`-gated out. `trapd-agent.exe uninstall` removes every planted decoy (files + `HKLM\SOFTWARE\TRAPD\Honeytokens`).
 
 ## Important Paths
 
@@ -86,7 +86,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 - Auth: bearer `agent_secret`.
 - Request body: `HeartbeatPayload`.
-- Cadence: every 30 seconds.
+- Cadence: `heartbeat_interval_secs` (default 30, floored at 5); the first beat happens immediately at startup.
 - Any non-2xx is logged and ignored by the agent.
 
 ### `GET /api/v1/agents/{agent_id}/config`
@@ -98,7 +98,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - Signature: base64 Ed25519 over `canonical_json(ConfigEnvelope)`, verified with the same raw 32-byte key as commands (`<config>/command_signing.pub`).
 - Envelope is rejected when: signature invalid, `agent_id` is not this agent, `issued_at` is more than 5 minutes in the future, or `issued_at` is not strictly greater than the last applied config's (replay/rollback protection). The high-water mark is persisted to `<state>/config_issued_at.json`, so rollback is refused across restarts too.
 - The `ETag` is cached **only after a config is successfully verified+applied**, so a rejected (unsigned/tampered) payload is re-fetched and re-evaluated rather than masked behind a later `304`.
-- Poll cadence: every 60 seconds.
+- Poll cadence: `config_poll_interval_secs` (default 60, floored at 10); the first pull happens immediately at startup. The accepted config is persisted to `<state>/agent_config.json` and reloaded on the next start, so the agent keeps working from last-known-good when the backend is unreachable.
 - The agent now **requires** the body to be a signed `SignedConfig` envelope —
   a bare `AgentConfig` is rejected and the last-known-good config is kept. The
   backend MUST emit `SignedConfig`. See *Backend Implementation Notes* →
@@ -944,6 +944,8 @@ older than the last applied config.
 ```json
 {
   "poll_interval_secs": "u64, default 60",
+  "heartbeat_interval_secs": "u64, default 30 (floored at 5)",
+  "config_poll_interval_secs": "u64, default 60 (floored at 10)",
   "enabled_collectors": ["string, default process/network/system/authlog/filesystem"],
   "fs_watch_paths": ["string, default /etc,/bin,/tmp"],
   "prevention_enabled": "bool, default true",
@@ -953,7 +955,8 @@ older than the last applied config.
   "honeytoken_detection_enabled": "bool, default true",
   "honeytoken_response": "string, default \"alert\" (none|alert|freeze|kill|isolate)",
   "honeytoken_accessor_allowlist": ["string (extra benign accessor comms)"],
-  "honeytoken_deception_escalation": "bool, default false"
+  "honeytoken_deception_escalation": "bool, default false",
+  "honeytoken_paths": ["string — Windows decoy files, default C:\\Users\\Public\\passwords.txt, C:\\Users\\Public\\credentials.xlsx, C:\\ProgramData\\backup_keys.txt"]
 }
 ```
 
@@ -965,6 +968,13 @@ the accessor) < `isolate` (also full host network isolation).
 (mlocate/updatedb, AV scanners, backup tools, and the agent itself) used to
 suppress false positives. `honeytoken_deception_escalation` (default `false`)
 opts in to emitting a `deception_escalation` signal on each confirmed hit.
+`honeytoken_paths` drives the **Windows** filesystem decoys (planted on
+startup, replanted when deleted, watched for read/modify/rename/delete); Linux
+agents ignore it — their tokens arrive over the signed command channel. The
+Windows agent also plants registry decoys (`DatabasePassword`,
+`AdminCredentials`, `BackupKey`) under `HKLM\SOFTWARE\TRAPD\Honeytokens`
+and watches them with `RegNotifyChangeKeyValue`; both kinds report the same
+`HoneytokenAccess` detection event as Linux.
 
 ## Command Schemas
 

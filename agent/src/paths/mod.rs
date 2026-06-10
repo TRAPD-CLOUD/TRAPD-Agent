@@ -27,21 +27,23 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-#[cfg(not(windows))]
+#[cfg(not(target_os = "windows"))]
 const DEFAULT_STATE_DIR: &str = "/var/lib/trapd";
-#[cfg(not(windows))]
+#[cfg(not(target_os = "windows"))]
 const DEFAULT_CONFIG_DIR: &str = "/etc/trapd";
-#[cfg(not(windows))]
+#[cfg(not(target_os = "windows"))]
 const DEFAULT_LOG_DIR: &str = "/var/log/trapd";
 
-// Windows: the canonical machine-wide writable location is %ProgramData%
-// (services run as LocalSystem, which has no meaningful $HOME either).
-#[cfg(windows)]
-const DEFAULT_STATE_DIR: &str = r"C:\ProgramData\trapd\state";
-#[cfg(windows)]
-const DEFAULT_CONFIG_DIR: &str = r"C:\ProgramData\trapd\config";
-#[cfg(windows)]
-const DEFAULT_LOG_DIR: &str = r"C:\ProgramData\trapd\logs";
+// Windows: everything lives under `%ProgramData%\TRAPD` (the established
+// location for machine-wide agent state), resolved at runtime so a relocated
+// ProgramData is honoured. The `TRAPD_*_DIR` overrides work identically.
+#[cfg(target_os = "windows")]
+fn program_data() -> PathBuf {
+    std::env::var("ProgramData")
+        .or_else(|_| std::env::var("PROGRAMDATA"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("C:\\ProgramData"))
+}
 
 static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -55,15 +57,50 @@ pub fn state_dir() -> &'static Path {
 /// Read-only configuration directory (env file, policy, TLS material).
 pub fn config_dir() -> &'static Path {
     CONFIG_DIR
-        .get_or_init(|| dir_from_env("TRAPD_CONFIG_DIR", DEFAULT_CONFIG_DIR))
+        .get_or_init(|| dir_from_env("TRAPD_CONFIG_DIR", default_config_dir()))
         .as_path()
 }
 
 /// Log directory (NDJSON event log).
 pub fn log_dir() -> &'static Path {
     LOG_DIR
-        .get_or_init(|| dir_from_env("TRAPD_LOG_DIR", DEFAULT_LOG_DIR))
+        .get_or_init(|| dir_from_env("TRAPD_LOG_DIR", default_log_dir()))
         .as_path()
+}
+
+// ── Platform default locations ───────────────────────────────────────────────
+
+fn default_state_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        program_data().join("TRAPD").join("state")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from(DEFAULT_STATE_DIR)
+    }
+}
+
+fn default_config_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        program_data().join("TRAPD").join("config")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from(DEFAULT_CONFIG_DIR)
+    }
+}
+
+fn default_log_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        program_data().join("TRAPD").join("logs")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from(DEFAULT_LOG_DIR)
+    }
 }
 
 // ── Well-known files ──────────────────────────────────────────────────────────
@@ -77,10 +114,8 @@ pub fn credentials_file() -> PathBuf {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn dir_from_env(env: &str, default: &str) -> PathBuf {
-    std::env::var(env)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(default))
+fn dir_from_env(env: &str, default: PathBuf) -> PathBuf {
+    std::env::var(env).map(PathBuf::from).unwrap_or(default)
 }
 
 /// Resolve the state directory, preferring the canonical location and falling
@@ -99,7 +134,7 @@ fn resolve_state_dir() -> PathBuf {
     }
 
     // 2. Canonical system location.
-    let canonical = PathBuf::from(DEFAULT_STATE_DIR);
+    let canonical = default_state_dir();
     if ensure_writable(&canonical) {
         return canonical;
     }
@@ -109,7 +144,8 @@ fn resolve_state_dir() -> PathBuf {
         if ensure_writable(&candidate) {
             warn!(
                 dir = %candidate.display(),
-                "using fallback state dir — {DEFAULT_STATE_DIR} not writable (non-root run?)"
+                canonical = %canonical.display(),
+                "using fallback state dir — canonical location not writable (non-root run?)"
             );
             return candidate;
         }

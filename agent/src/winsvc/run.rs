@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context, Result};
 use tracing::{error, info, warn};
 
+use crate::collectors::system::SystemCollector;
+use crate::collectors::windows::honeytokens::HoneytokenCollector;
 use crate::collectors::windows::process::ProcessCollector;
-use crate::collectors::windows::system::SystemCollector;
 use crate::collectors::windows::users::UserSessionCollector;
 use crate::collectors::Collector;
 use crate::config::{self, AgentConfig, ConfigPuller};
@@ -190,6 +191,9 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     spawn_collector!(SystemCollector::new());
     spawn_collector!(ProcessCollector::new());
     spawn_collector!(UserSessionCollector::new());
+    // Honeytoken sentinel: decoy files (ReadDirectoryChangesW) + registry decoys
+    // (RegNotifyChangeKeyValue), driven by the signed-config deception policy.
+    spawn_collector!(HoneytokenCollector::new(Arc::clone(&agent_config)));
 
     drop(tx);
 
@@ -232,7 +236,13 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         )?;
         tokio::spawn(async move { config_puller.run().await });
 
-        let heartbeat = Heartbeat::new(&backend_url, agent_id.clone(), token, hostname.clone())?;
+        let heartbeat = Heartbeat::new(
+            &backend_url,
+            agent_id.clone(),
+            token,
+            hostname.clone(),
+            Arc::clone(&agent_config),
+        )?;
         tokio::spawn(async move { heartbeat.run().await });
     }
 
