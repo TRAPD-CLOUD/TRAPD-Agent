@@ -14,17 +14,32 @@
 //!
 //! See `engine.rs` for the orchestration loop.
 
-pub mod audit;
-pub mod command_puller;
+// `commands` (signed-envelope verification) and `policy` (IoC rule model) are
+// platform-neutral: the signed-config channel reuses them on every OS. The
+// enforcement modules below act on Linux primitives (signals, iptables,
+// chattr, LSM) and are compiled for Linux only.
 pub mod commands;
-pub mod engine;
-pub mod lsm_loader;
-pub mod network;
 pub mod policy;
+
+#[cfg(target_os = "linux")]
+pub mod audit;
+#[cfg(target_os = "linux")]
+pub mod command_puller;
+#[cfg(target_os = "linux")]
+pub mod engine;
+#[cfg(target_os = "linux")]
+pub mod lsm_loader;
+#[cfg(target_os = "linux")]
+pub mod network;
+#[cfg(target_os = "linux")]
 pub mod process;
+#[cfg(target_os = "linux")]
 pub mod quarantine;
+#[cfg(target_os = "linux")]
 pub mod response;
+#[cfg(target_os = "linux")]
 pub mod rtr;
+#[cfg(target_os = "linux")]
 pub mod software;
 
 use std::path::PathBuf;

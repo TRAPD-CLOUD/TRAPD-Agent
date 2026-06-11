@@ -54,12 +54,15 @@ libc = "0.2"
 procfs  = "0.17"
 inotify = "0.10"
 
-# Windows agent — filesystem honeytoken monitoring (ReadDirectoryChangesW via
-# `notify`) and registry honeytokens (RegNotifyChangeKeyValue via windows-sys).
-[target.'cfg(target_os = "windows")'.dependencies]
+# Windows agent dependencies (Windows only):
+#  - filesystem honeytoken monitoring (ReadDirectoryChangesW via `notify`)
+#  - registry honeytokens (RegNotifyChangeKeyValue via windows-sys)
+#  - service integration (register/run/stop under the SCM via windows-service)
+[target.'cfg(windows)'.dependencies]
 notify      = "8"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Registry",
     "Win32_Security",
 ] }
+windows-service = "0.7"

@@ -11,6 +11,34 @@ jobs:
       - run: cargo build --release --manifest-path agent/Cargo.toml
       - run: cargo clippy --manifest-path agent/Cargo.toml -- -D warnings
       - run: cargo test --manifest-path agent/Cargo.toml
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: trapd-agent-linux-x86_64
+          path: target/release/trapd-agent
+
+  # Windows agent — cross-compiled from Linux with the mingw-w64 toolchain
+  # (the same recipe the release workflow uses), so a change that breaks the
+  # Windows build is caught on every push/PR, not at tag time.
+  windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mingw-w64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: cargo build --release --target x86_64-pc-windows-gnu --manifest-path agent/Cargo.toml
+      - run: cargo clippy --release --target x86_64-pc-windows-gnu --manifest-path agent/Cargo.toml -- -D warnings
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: trapd-agent-windows-x86_64.exe
+          path: target/x86_64-pc-windows-gnu/release/trapd-agent.exe
 
   # The kernel-side detection lives entirely in the trapd-agent-ebpf crate,
   # which is a SEPARATE workspace built with a pinned nightly + bpf-linker for
