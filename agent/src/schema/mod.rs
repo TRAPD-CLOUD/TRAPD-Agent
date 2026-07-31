@@ -4,17 +4,32 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
+    /// Globally unique, assigned **once** at creation and never regenerated —
+    /// not on retry, not on queue recovery, not on restart. That stability is
+    /// what lets the backend deduplicate idempotently under at-least-once
+    /// delivery.
     pub event_id: Uuid,
     pub agent_id: String,
     pub hostname: String,
+    /// Wall-clock creation time. Subject to NTP steps; use
+    /// `origin.monotonic_timestamp_ns` when ordering matters.
     pub timestamp: DateTime<Utc>,
     pub class: EventClass,
     pub action: EventAction,
     pub severity: Severity,
+    /// Provenance: boot, position in the ordered stream, monotonic clock.
+    /// Optional so journals and backends predating it still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::telemetry::EventOrigin>,
     pub data: EventData,
 }
 
 impl AgentEvent {
+    /// Create an event, stamping a fresh `event_id` and provenance.
+    ///
+    /// Every event consumes a sequence number from one process-wide counter, so
+    /// the numbers a backend receives are totally ordered and a gap in them is
+    /// direct evidence that something was lost between here and there.
     pub fn new(
         agent_id: String,
         hostname: String,
@@ -31,8 +46,26 @@ impl AgentEvent {
             class,
             action,
             severity,
+            origin: Some(crate::telemetry::identity::EventOrigin::unsourced()),
             data,
         }
+    }
+
+    /// Name the collector that produced this event.
+    pub fn with_source(mut self, source: &str) -> Self {
+        if let Some(origin) = self.origin.as_mut() {
+            origin.source = Some(source.to_string());
+        }
+        self
+    }
+
+    /// This event's position in the agent's ordered stream, if stamped.
+    ///
+    /// Read by the schema tests that assert sequence numbers advance; the
+    /// backend reads the same value off the wire.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn sequence_number(&self) -> Option<u64> {
+        self.origin.as_ref().map(|o| o.sequence_number)
     }
 }
 
@@ -235,7 +268,7 @@ pub struct EbpfDropsData {
     pub delta: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessCreateData {
     pub pid: i32,
     pub ppid: i32,
@@ -248,6 +281,14 @@ pub struct ProcessCreateData {
     /// hashing is disabled or the image is not a hashable regular file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exe_sha256: Option<String>,
+    /// Process start time in clock ticks since boot (`/proc/<pid>/stat` field
+    /// 22) — the discriminator that makes this process distinguishable from a
+    /// later one that reused its PID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
+    /// Which `/proc` reads failed or were truncated while building this event.
+    #[serde(default, flatten)]
+    pub enrichment: crate::telemetry::Enrichment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,7 +297,7 @@ pub struct ProcessTerminateData {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExecEventData {
     pub pid: i32,
     pub ppid: i32,
@@ -267,6 +308,20 @@ pub struct ExecEventData {
     pub exe: String,
     pub cmdline: String,
     pub cwd: String,
+    /// Process start time in clock ticks since boot (`/proc/<pid>/stat` field
+    /// 22). Together with `pid` and `origin.boot_id` this is the process's
+    /// stable identity — a bare PID is not one, because the kernel reuses PIDs
+    /// and correlating on PID alone fabricates lineages that never existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
+    /// Parent's start time, so parent→child links survive PID reuse too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_start_time: Option<u64>,
+    /// Which `/proc` reads failed or were truncated. Flattened, so a partially
+    /// enriched event carries `enrichment_status` / `enrichment_errors` /
+    /// `truncated_fields` alongside the fields they describe.
+    #[serde(default, flatten)]
+    pub enrichment: crate::telemetry::Enrichment,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

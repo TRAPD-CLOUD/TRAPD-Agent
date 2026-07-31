@@ -178,6 +178,7 @@ mod tests {
             container_image: None,
             container_image_digest: None,
             k8s: None,
+            ..Default::default()
         };
         AgentEvent::new(
             "a".into(),

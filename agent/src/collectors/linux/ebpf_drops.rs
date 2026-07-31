@@ -80,6 +80,12 @@ impl DropMonitor {
     /// and logs a warning naming the programs that grew this interval.
     pub fn poll(&mut self) -> Option<EbpfDropsData> {
         let (per_slot, total) = self.read();
+
+        // Publish unconditionally — the kernel-loss gauge has to be current in
+        // the diagnostics report even on a poll where nothing changed, so an
+        // operator can distinguish "no drops" from "not measured".
+        crate::telemetry::metrics::metrics().set_ebpf_events_lost(total);
+
         let delta = total.saturating_sub(self.prev_total);
         if delta == 0 {
             return None;

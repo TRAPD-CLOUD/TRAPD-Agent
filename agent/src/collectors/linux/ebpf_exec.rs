@@ -34,6 +34,12 @@ use tracing::{info, warn};
 
 use crate::collectors::Collector;
 use crate::schema::{AgentEvent, EventAction, EventClass, EventData, ExecEventData, Severity};
+use crate::telemetry::limits::{truncate_str, Truncation, MAX_CMDLINE_BYTES};
+use crate::telemetry::metrics::{metrics, CollectorMode};
+use crate::telemetry::{Enrichment, EnrichmentError};
+
+/// Source name stamped on every event this collector produces.
+const SOURCE: &str = "ebpf_exec";
 
 // ── Kernel↔Userspace struct layout ───────────────────────────────────────────
 // Must be kept in sync with `ExecEvent` in trapd-agent-ebpf/src/main.rs.
@@ -125,36 +131,41 @@ fn cstr(buf: &[u8]) -> &str {
     std::str::from_utf8(&buf[..end]).unwrap_or("")
 }
 
-/// Read PPid from /proc/<pid>/status (best-effort; returns 0 if unavailable).
-fn proc_ppid(pid: u32) -> u32 {
-    fs::read_to_string(format!("/proc/{pid}/status"))
-        .unwrap_or_default()
+/// Read PPid from `/proc/<pid>/status`.
+///
+/// Returns why the read failed rather than a bare `0`, because `0` is
+/// indistinguishable from "the kernel reported PPid 0" and would quietly
+/// reparent an orphan onto the swapper task.
+fn proc_ppid(pid: u32) -> Result<u32, EnrichmentError> {
+    let status =
+        fs::read_to_string(format!("/proc/{pid}/status")).map_err(|e| EnrichmentError::from_io(&e))?;
+    status
         .lines()
-        .find_map(|l| {
-            l.strip_prefix("PPid:")
-                .map(|v| v.trim().parse().unwrap_or(0))
-        })
-        .unwrap_or(0)
+        .find_map(|l| l.strip_prefix("PPid:"))
+        .and_then(|v| v.trim().parse().ok())
+        .ok_or(EnrichmentError::ParseFailed)
 }
 
-/// Read full argv from /proc/<pid>/cmdline (NUL-separated, joined with spaces).
-fn proc_cmdline(pid: u32) -> String {
-    fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|bytes| {
-            bytes
-                .split(|&b| b == 0)
-                .filter_map(|part| std::str::from_utf8(part).ok().filter(|s| !s.is_empty()))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default()
+/// Read full argv from `/proc/<pid>/cmdline` (NUL-separated, joined with spaces).
+///
+/// Capped at [`MAX_CMDLINE_BYTES`]; the returned [`Truncation`] is `Some` when
+/// the command line was longer, so a consumer can tell a complete command line
+/// from its prefix.
+fn proc_cmdline(pid: u32) -> Result<(String, Option<Truncation>), EnrichmentError> {
+    let bytes = fs::read(format!("/proc/{pid}/cmdline")).map_err(|e| EnrichmentError::from_io(&e))?;
+    let joined = bytes
+        .split(|&b| b == 0)
+        .filter_map(|part| std::str::from_utf8(part).ok().filter(|s| !s.is_empty()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(truncate_str(&joined, MAX_CMDLINE_BYTES))
 }
 
-/// Resolve /proc/<pid>/cwd symlink to the absolute working directory path.
-fn proc_cwd(pid: u32) -> String {
+/// Resolve the `/proc/<pid>/cwd` symlink to an absolute path.
+fn proc_cwd(pid: u32) -> Result<String, EnrichmentError> {
     fs::read_link(format!("/proc/{pid}/cwd"))
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_err(|e| EnrichmentError::from_io(&e))
 }
 
 /// Extract a short (12-char) container ID from /proc/<pid>/cgroup, if any.
@@ -276,6 +287,7 @@ impl Collector for EbpfExecCollector {
             path = %path,
             "eBPF exec tracer attached to sched/sched_process_exec"
         );
+        metrics().add_collector_mode(CollectorMode::Ebpf);
 
         // Self-exclusion: drop the agent's own exec events.
         let agent_pid = std::process::id();
@@ -301,6 +313,8 @@ impl Collector for EbpfExecCollector {
                 let raw: RawExecEvent =
                     unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawExecEvent) };
 
+                metrics().ebpf_event_received();
+
                 let pid = raw.pid;
                 if pid == agent_pid {
                     continue;
@@ -308,11 +322,52 @@ impl Collector for EbpfExecCollector {
                 let exe = cstr(&raw.filename).to_string();
                 let comm = cstr(&raw.comm).to_string();
 
-                // Enrich from /proc — best-effort; short-lived processes may
-                // already be gone, in which case these return empty strings.
-                let ppid = proc_ppid(pid);
-                let cmdline = proc_cmdline(pid);
-                let cwd = proc_cwd(pid);
+                // The kernel record is already complete and will ship whatever
+                // happens below. Everything from here is /proc enrichment, and a
+                // short-lived process — exactly the kind the eBPF tracer exists
+                // to catch — may well be gone already. Each failure is recorded
+                // against its field instead of discarding the event.
+                let enrich_started = std::time::Instant::now();
+                let mut notes = Enrichment::new();
+
+                // Read the start time first: it is what distinguishes this
+                // process from a later one that reuses its PID, and it is only
+                // readable while the process still exists.
+                let process_start_time = crate::telemetry::identity::process_start_time(pid as i32);
+                if process_start_time.is_none() {
+                    notes.fail("process_start_time", EnrichmentError::ProcessExited);
+                }
+
+                let ppid = match proc_ppid(pid) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        notes.fail("ppid", e);
+                        0
+                    }
+                };
+                let parent_start_time = (ppid > 0)
+                    .then(|| crate::telemetry::identity::process_start_time(ppid as i32))
+                    .flatten();
+
+                let cmdline = match proc_cmdline(pid) {
+                    Ok((value, truncation)) => {
+                        notes.truncated("cmdline", truncation);
+                        value
+                    }
+                    Err(e) => {
+                        notes.fail("cmdline", e);
+                        String::new()
+                    }
+                };
+
+                let cwd = match proc_cwd(pid) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        notes.fail("cwd", e);
+                        String::new()
+                    }
+                };
+
                 let container_id = proc_container_id(pid);
                 let username = proc_username(raw.uid);
 
@@ -344,6 +399,8 @@ impl Collector for EbpfExecCollector {
                 // hash-matching and the IOA process-tree lineage.
                 let exe_sha256 = super::exehash::hash_executable(&exe);
 
+                metrics().enrichment_attempt(enrich_started.elapsed().as_millis() as u64);
+
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),
@@ -360,6 +417,11 @@ impl Collector for EbpfExecCollector {
                         exe,
                         cmdline,
                         cwd,
+                        process_start_time,
+                        parent_start_time,
+                        // Four fields were attempted from /proc: start time,
+                        // ppid, cmdline and cwd.
+                        enrichment: notes.finish(4),
                         container_id: enrich.container_id.or(container_id),
                         ld_preload,
                         exe_sha256,
@@ -371,12 +433,17 @@ impl Collector for EbpfExecCollector {
                         container_image_digest: enrich.container_image_digest,
                         k8s: enrich.k8s,
                     })),
-                );
+                )
+                .with_source(SOURCE);
 
-                if tx.send(event).await.is_err() {
-                    // Pipeline shut down — exit cleanly
+                // Deliberately non-blocking: awaiting a full pipeline would stop
+                // this loop draining the kernel ring buffer, turning a countable
+                // userspace drop into an opaque kernel one.
+                if tx.is_closed() {
+                    // Pipeline shut down — exit cleanly.
                     return Ok(());
                 }
+                crate::pipeline::try_emit(&tx, event, SOURCE);
             }
 
             guard.clear_ready();
