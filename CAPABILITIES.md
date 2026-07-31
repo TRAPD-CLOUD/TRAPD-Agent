@@ -83,8 +83,37 @@ back through the pipeline (persist + backend + auto-response).
 | TLS with **fail-closed CA pinning** + optional mTLS | ✅ |
 | Durable disk-backed spool (offline queue, replay) | ✅ |
 | Signed, monotonic config delivery | ✅ |
-| **Sigma + anomaly + SIEM + vuln config over signed channel** | ✅ **NEW** |
+| **Sigma + anomaly + SIEM + vuln config over signed channel** | ✅ |
 | mTLS certificate rotation | ⏳ |
+
+---
+
+## 4b. Telemetry loss transparency (`agent/src/telemetry/`) — ✅ NEW
+
+The pipeline does not promise that no event is ever lost — under a burst that
+would mean blocking a kernel ring-buffer consumer, which merely hides the loss.
+It promises that **nothing is lost silently**: every accepted event is either
+acknowledged, still queued, or dropped with a named, counted reason.
+
+| Capability | Status | Notes |
+|------------|--------|-------|
+| Stable `event_id` across retry / recovery / restart | ✅ | assigned once; backend dedupes idempotently (at-least-once) |
+| Provenance (`boot_id`, `sequence_number`, monotonic clock) | ✅ | a sequence gap is direct evidence of loss; ordering survives NTP steps |
+| PID-reuse-safe process identity | ✅ | `(boot_id, pid, start_time)`; the `/proc` poller reports a recycled PID as terminate+create instead of missing both |
+| Checksummed, crash-safe persistent queue | ✅ | CRC-32 per record, length validated before allocation, `0600`/`0700`, atomic compaction |
+| Torn tail vs. corruption distinguished | ✅ | interrupted append is expected; a checksum mismatch escalates to `recovery_required` |
+| Partial / duplicate / out-of-order acknowledgement | ✅ | unconfirmed events stay queued — silence is not consent |
+| Exponential backoff with full jitter | ✅ | per-record and per-batch; attempt count persists across restarts |
+| Bounded queue (events **and** bytes) with counted eviction | ✅ | `TRAPD_SPOOL_MAX`, `TRAPD_SPOOL_MAX_BYTES` |
+| Partial enrichment (never discards the kernel record) | ✅ | `enrichment_status` / `enrichment_errors` per field |
+| Explicit truncation markers | ✅ | original vs. captured length, cut on a UTF-8 boundary |
+| 11 distinct drop reasons, all counted | ✅ | the sum is asserted against the total; a mismatch is `recovery_required` |
+| Derived health state (8 states) | ✅ | pure function of the metrics, so it cannot drift from them |
+| `trapd-agent diagnostics telemetry` | ✅ | collector mode, drops by reason, queue, retries, latency percentiles |
+| Parser fuzzing (journal framing + bounded reader) | ✅ | seeded, ~45 k iterations in the unit suite |
+| Load profiles (100 / 1 000 / 5 000 eps) | ✅ | `--test telemetry_load -- --ignored`; 1 000 eps × 60 s verified lossless |
+| Prometheus/OTEL metric export | ⏳ | counters exist; only the JSON report is exposed today |
+| Multi-day soak profile in CI | ⏳ | bounded load tests gate PRs; long profiles need a reference host |
 
 ---
 
@@ -163,5 +192,8 @@ Provisioned files under `<config>` (default `/etc/trapd`): `ca.crt`, `agent.crt`
 
 ---
 
-_Last updated: 2026-06-03 — reflects the Sigma engine, anomaly baseline, inline
-network IoC enforcement, SBOM/CVE/CIS, and SIEM forwarding work._
+_Last updated: 2026-07-31 — adds the loss-transparent telemetry pipeline
+(§4b: stable event identity, checksummed persistent queue, drop attribution,
+health model and `diagnostics telemetry`). Previous revision covered the Sigma
+engine, anomaly baseline, inline network IoC enforcement, SBOM/CVE/CIS and SIEM
+forwarding._

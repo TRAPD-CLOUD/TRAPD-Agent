@@ -48,10 +48,101 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 ## Filesystem Layout
 
-- State dir: default `/var/lib/trapd`, override `TRAPD_STATE_DIR`; contains `device_id`, `credentials.json`, nonces (`command_nonces.json`), `config_issued_at.json` (signed-config `issued_at` high-water mark, `0600`), `agent_config.json` (last verified config, kept across restarts, `0600`), baselines, `honeytokens.json` (deployed-honeytoken register, `0600`).
+- State dir: default `/var/lib/trapd`, override `TRAPD_STATE_DIR`; contains `device_id`, `credentials.json`, nonces (`command_nonces.json`), `config_issued_at.json` (signed-config `issued_at` high-water mark, `0600`), `agent_config.json` (last verified config, kept across restarts, `0600`), baselines, `honeytokens.json` (deployed-honeytoken register, `0600`), `spool/queue.journal` (persistent event queue, `0600`, dir `0700`), `telemetry.json` (diagnostics report, `0600`).
 - Config dir: default `/etc/trapd`, override `TRAPD_CONFIG_DIR`; contains `agent.env`, `policy.json`, `ca.crt`, `agent.crt`, `agent.key`, `command_signing.pub`.
 - Log dir: default `/var/log/trapd`, override `TRAPD_LOG_DIR`; contains `events.ndjson`.
 - State dir is hardened to `0700`; credentials are atomically written as `0600`.
+
+## Telemetry Pipeline: Loss Transparency
+
+The path `eBPF → collector → enrichment → detection → persistent queue →
+transport → acknowledgement` does **not** promise that no event is ever lost.
+Under a burst that promise could only be kept by blocking a ring-buffer
+consumer, which pushes the loss into the kernel where it is far less
+observable. The promise it does make: **nothing is lost silently.** For every
+event the agent accepted, exactly one of these is true and provable —
+
+1. the backend acknowledged it,
+2. it is still in the persistent queue, or
+3. it was dropped with a named reason and a counter to prove it.
+
+### Drop reasons
+
+Every discard names one of these; they are stable metric-label values.
+
+```text
+kernel_ringbuffer_full      userspace_channel_full     event_too_large
+enrichment_timeout          serialization_failed       persistent_queue_full
+persistent_queue_corrupt    backend_rejected           unsupported_event_version
+rate_limit_applied          internal_error
+```
+
+`internal_error` is the catch-all so an unattributed failure is still counted;
+a sustained non-zero value there is a bug. The agent checks the invariant
+`sum(per-reason) == total dropped` and escalates a mismatch to
+`recovery_required`.
+
+### Persistent queue
+
+`<state>/spool/queue.journal`, `0600` in a `0700` directory, append-only, one
+framed record per line:
+
+```text
+TRAPD-SPOOL v1\n
+<crc32:8hex> <len:dec> <payload-json>\n
+```
+
+A checksum **and** a length are both carried because they fail differently: a
+short payload with no terminator is a record cut short by a crash mid-append
+(expected after an unclean stop, counted separately, not an alarm), while a
+checksum mismatch is content altered on disk (real loss → `recovery_required`).
+Declared lengths are validated against a hard ceiling *before* any allocation,
+and journal lines are read with a bounded reader, so a corrupt or hostile length
+prefix cannot drive an unbounded allocation during recovery.
+
+Bounded by both event count (`TRAPD_SPOOL_MAX`, default 50 000) and bytes
+(`TRAPD_SPOOL_MAX_BYTES`, default 1 GiB) — 50 000 events is fine until they each
+carry a 16 KiB command line. On overflow the **oldest** event is evicted and
+counted as `persistent_queue_full`: during an outage an operator investigating a
+live incident needs the last few minutes, and refusing new events would blind
+the agent for the rest of the outage.
+
+A full disk or read-only mount does not stop the agent: the journal is marked
+degraded, collection continues in memory, and the lost durability is logged and
+surfaced rather than silently accepted.
+
+### Health states
+
+Derived purely from the metrics, evaluated most-severe-first:
+
+```text
+recovery_required   corrupt journal records, or a drop with no reason recorded
+collector_failed    every process collector failed to start
+queue_full          queue at capacity; events are being evicted
+queue_near_capacity queue over 80 % full
+backpressured       events being shed for capacity reasons
+offline             no backend acknowledgement for 30 s (suppressed offline)
+degraded            losses or failures recorded that do not threaten delivery
+healthy             nominal
+```
+
+Enrichment failures degrade health only when they exceed **half** of all
+attempts. Some failures are unavoidable — short-lived processes exit before
+`/proc` can be read — so alarming on any failure would pin health at `degraded`
+permanently and make the signal worthless; a majority failing instead means
+`hidepid` or missing capabilities.
+
+### `trapd-agent diagnostics telemetry`
+
+Reports collector mode, events received, kernel and userspace drops (broken down
+by reason), queue depth and utilization, retry count, last backend
+acknowledgement and end-to-end latency percentiles.
+
+The running agent publishes `<state>/telemetry.json` every 10 s (atomically,
+`0600`) and the command renders it, since it runs in a separate process. A
+missing report is reported as such rather than as zeroes — all-zero counters are
+indistinguishable from a healthy idle agent, which is the most dangerous
+possible output.
 
 ## HTTP Conventions
 
@@ -78,9 +169,40 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 - Auth: bearer `agent_secret`.
 - Request body: JSON array of `AgentEvent`.
-- Batch size: up to 100 events.
-- Flush interval: every 5 seconds.
-- Any 2xx drains events from the local ring buffer; non-2xx leaves them buffered.
+- Batch size: up to 100 events, or 4 MiB, whichever comes first.
+- Flush interval: every 5 seconds, plus jittered exponential backoff (1 s → 5 min)
+  after a failed batch.
+- Delivery is **at-least-once** — see "Idempotent ingest" below.
+
+**Response handling.** The three outcomes map to different queue actions, so the
+status code matters:
+
+| Response | Agent behaviour |
+|---|---|
+| 2xx | events acknowledged and removed from the queue |
+| 5xx, 408, 425, 429, timeout, connection error | events stay queued, retried with backoff |
+| other 4xx | events **removed** and counted as `backend_rejected` |
+
+A permanent 4xx is treated as unrecoverable on purpose: retrying it forever
+would block every event behind it. The events are dropped, but loudly — they are
+counted under the `backend_rejected` drop reason and shown by
+`trapd-agent diagnostics telemetry` as permanent loss. Do not return a 4xx for a
+transient condition.
+
+**Optional per-event acknowledgement.** A 2xx body may report which events were
+accepted:
+
+```json
+{ "accepted": ["<event_id>", "…"], "rejected": ["<event_id>", "…"] }
+```
+
+- `accepted` — durably stored; the agent removes them.
+- `rejected` — permanently refused; removed and counted as `backend_rejected`.
+- **Not mentioned in either list → the agent keeps the event queued** and
+  retries it. Silence is not consent: assuming acceptance would lose events.
+- Unknown ids in the response are ignored; duplicates are harmless.
+- A 2xx with an absent, empty or unparseable body means "the whole batch was
+  accepted", which is the pre-existing contract.
 
 ### `POST /api/v1/agents/{agent_id}/heartbeat`
 
@@ -144,9 +266,37 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
   "class": "process|network|system|user|filesystem|memory|kernel|ipc|prevention|detection",
   "action": "EventAction",
   "severity": "info|low|medium|high|critical",
+  "origin": "EventOrigin, optional",
   "data": "EventData"
 }
 ```
+
+`event_id` is assigned **once**, when the event is created, and is never
+regenerated — not on retry, not on queue recovery, not across an agent restart.
+Delivery is **at-least-once**, so the backend MUST deduplicate on `event_id`
+idempotently; see *Backend Implementation Notes* → "Idempotent ingest".
+
+### `EventOrigin`
+
+Provenance for gap detection and clock-independent ordering. Optional, so
+events from older agents (and journals written by them) still parse.
+
+```json
+{
+  "boot_id": "string (system boot; stable across agent restarts, changes on reboot)",
+  "sequence_number": "u64 (1-based, +1 per event within one agent run)",
+  "monotonic_timestamp_ns": "u64 (CLOCK_MONOTONIC on Linux — same base as bpf_ktime_get_ns)",
+  "source": "string, optional (producing collector, e.g. ebpf_exec)"
+}
+```
+
+- **`sequence_number`** is issued from one process-wide counter, so the stream a
+  backend receives is totally ordered and a **gap is direct evidence of loss** —
+  `(boot_id, sequence_number)` identifies exactly which events went missing.
+  It resets on agent restart; `boot_id` does not, so use the pair.
+- **`monotonic_timestamp_ns`** is immune to NTP steps and manual clock changes,
+  which can make `timestamp` non-monotonic or even run it backwards. Use it for
+  ordering and latency arithmetic; use `timestamp` for display.
 
 ### `EventAction`
 
@@ -174,9 +324,78 @@ package_upgraded, honeytoken_deployed, honeytoken_revoked, honeytoken_access
   "exe": "string",
   "cmdline": "string",
   "uid": "u32",
-  "username": "string"
+  "username": "string",
+  "exe_sha256": "string, optional",
+  "process_start_time": "u64, optional",
+  "enrichment_status": "complete|partial|failed, optional",
+  "enrichment_errors": "object, optional",
+  "truncated_fields": "object, optional"
 }
 ```
+
+### Process identity: never key on PID alone
+
+`process_start_time` is field 22 of `/proc/<pid>/stat` — the process's start
+time in clock ticks since boot, assigned by the kernel and immutable for the
+life of the process. The stable identity of a process is the triple
+**`(origin.boot_id, pid, process_start_time)`**, and the backend must correlate
+on that, not on `pid`.
+
+The kernel recycles PIDs aggressively. Two events with the same `pid` and
+different `process_start_time` are **different processes**; joining them would
+fabricate a process lineage that never existed. Identity here is three-valued:
+same (both start times known and equal), different (both known and unequal), or
+*unknown* (either missing). Treat unknown as "cannot correlate" rather than
+guessing either way.
+
+The agent applies the same rule internally: its `/proc` poller reports a
+recycled PID as a termination followed by a creation, rather than seeing the
+PID in two consecutive polls and emitting neither.
+
+### Partial enrichment
+
+`/proc` enrichment happens *after* the kernel event, so a short-lived process —
+exactly the kind the eBPF tracer exists to catch — may already be gone. The raw
+kernel record always ships; fields that could not be resolved are reported
+instead of being silently emitted as empty:
+
+```json
+{
+  "pid": 1234,
+  "exe": "/usr/bin/bash",
+  "cmdline": "",
+  "enrichment_status": "partial",
+  "enrichment_errors": { "cmdline": "process_exited" }
+}
+```
+
+- `enrichment_status` — `partial` (some fields resolved) or `failed` (none did,
+  which points at `hidepid`/missing capabilities rather than a process race).
+  **Omitted entirely when enrichment was complete**, so fully-enriched events
+  carry no overhead.
+- `enrichment_errors` — `field -> cause`, one of `process_exited`,
+  `permission_denied`, `timeout`, `parse_failed`, `unsupported`, `io_error`.
+  `process_exited` is expected and benign; `permission_denied` is a deployment
+  problem.
+- An empty `cmdline` with no error means the command line really was empty.
+
+### Truncation
+
+Fields with a size ceiling are cut on a UTF-8 boundary and marked, so a
+consumer can tell a complete value from a prefix:
+
+```json
+{
+  "cmdline": "…16384 bytes…",
+  "truncated_fields": {
+    "cmdline": { "truncated": true, "original_length": 131072, "captured_length": 16384 }
+  }
+}
+```
+
+Ceilings: command line 16 KiB, single event 256 KiB, ingest batch 4 MiB / 100
+events. An event still over the event limit after field truncation is dropped
+as `event_too_large` rather than being allowed to wedge the batch.
 
 ### `ProcessTerminateData`
 
@@ -200,9 +419,17 @@ package_upgraded, honeytoken_deployed, honeytoken_revoked, honeytoken_access
   "exe": "string",
   "cmdline": "string",
   "cwd": "string",
-  "container_id": "string, optional"
+  "container_id": "string, optional",
+  "process_start_time": "u64, optional",
+  "parent_start_time": "u64, optional",
+  "enrichment_status": "complete|partial|failed, optional",
+  "enrichment_errors": "object, optional",
+  "truncated_fields": "object, optional"
 }
 ```
+
+`parent_start_time` makes the parent→child link survive PID reuse as well: a
+`ppid` on its own is subject to exactly the same recycling problem as `pid`.
 
 ### `NetworkConnectionData`
 
@@ -1120,6 +1347,31 @@ Discriminated by `type`.
 ```
 
 ## Backend Implementation Notes
+
+### Idempotent ingest (required)
+
+The agent guarantees **at-least-once** delivery, not exactly-once. Duplicates
+are produced by design in two places: a crash between "batch shipped" and
+"journal compacted" replays the batch on the next start, and a response lost in
+flight is retried. The backend **must** therefore deduplicate on `event_id`,
+which is stable across every retry, queue recovery and agent restart.
+
+This is a deliberate trade. Suppressing duplicates on the agent would require an
+fsync per acknowledged batch (a large throughput cost) and still could not be
+made exactly-once without distributed consensus. Deduplicating on a stable id is
+cheap on the backend and cannot lose events; the alternative can.
+
+Practically: make ingest an upsert keyed on `event_id`, and treat a re-delivered
+event as a no-op rather than an error — returning a 4xx for a duplicate would
+make the agent count it as permanent loss.
+
+### Detecting loss from the wire
+
+`origin.sequence_number` increments by exactly one per event within one agent
+run, scoped by `origin.boot_id`. A gap in the sequence for a given
+`(agent_id, boot_id)` means events were lost between the agent and the backend,
+and names precisely which ones. A restart of the agent resets the sequence while
+keeping `boot_id`, so treat a reset to 1 as a new run rather than as loss.
 
 - Event ingest must accept an array, not NDJSON, for `/api/v1/ingest/events`.
 - Local file output is NDJSON: one serialized `AgentEvent` per line.

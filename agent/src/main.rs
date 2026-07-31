@@ -32,6 +32,7 @@ mod prevention;
 mod schema;
 #[cfg(target_os = "linux")]
 mod selfprotect;
+mod telemetry;
 mod transport;
 #[cfg(windows)]
 mod winsvc;
@@ -102,6 +103,30 @@ async fn main() -> Result<()> {
         #[cfg(not(target_os = "windows"))]
         info!("Uninstall: no local honeytoken artifacts on this platform — nothing to do");
         return Ok(());
+    }
+
+    // `trapd-agent diagnostics telemetry` — report on the running agent's
+    // pipeline. Read-only and side-effect free, so it must run before any of
+    // the start-up work below (which would fight the live agent for the state
+    // directory).
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("diagnostics") {
+            paths::init_state_dir();
+            return match args.get(2).map(String::as_str) {
+                Some("telemetry") => {
+                    print!("{}", telemetry::diagnostics::run());
+                    Ok(())
+                }
+                other => {
+                    eprintln!(
+                        "unknown diagnostics topic {:?}\n\nusage: trapd-agent diagnostics telemetry",
+                        other.unwrap_or("(none)")
+                    );
+                    std::process::exit(2);
+                }
+            };
+        }
     }
 
     selfprotect::kernel_hardening::audit();
@@ -191,7 +216,13 @@ async fn main() -> Result<()> {
         Spool::in_memory(pipeline::SPOOL_MAX_MEMORY)
     } else {
         Spool::durable(pipeline::spool_max_from_env())
+            .with_max_bytes(pipeline::spool_max_bytes_from_env())
     };
+    if spool.is_degraded() {
+        warn!(
+            "spool has no durable backing — unacknowledged events will not survive a restart"
+        );
+    }
     let ring_buffer: Arc<Mutex<Spool>> = Arc::new(Mutex::new(spool));
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
@@ -245,7 +276,10 @@ async fn main() -> Result<()> {
             let cname = c.name();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = c.run(tx2, aid, host).await {
+                    // A collector that exits is a blind spot, so it is counted
+                    // and surfaced in health rather than only logged.
                     error!("{cname} exited with error: {e:#}");
+                    telemetry::metrics::metrics().collector_failed();
                 }
             }));
         }};
@@ -361,8 +395,13 @@ async fn main() -> Result<()> {
     let siem_fwd = siem.clone();
     let mut consumer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
+            // Forwarding to prevention is best-effort — a stalled enforcement
+            // engine must not stall telemetry — but a dropped tee is still
+            // counted rather than swallowed.
             if let Some(p) = &prev_tx {
-                let _ = p.try_send(event.clone());
+                pipeline::try_tee(p, event.clone(), "prevention_tee");
+                telemetry::metrics::metrics()
+                    .set_detection_queue_depth(p.max_capacity().saturating_sub(p.capacity()) as u64);
             }
             handle_event(&event, &mode, &buf_for_consumer).await;
             siem_fwd.forward(&event).await;
@@ -371,13 +410,34 @@ async fn main() -> Result<()> {
             // persisted, buffered for the backend, and forwarded to prevention.
             for det in det_engine.inspect(&event) {
                 if let Some(p) = &prev_tx {
-                    let _ = p.try_send(det.clone());
+                    pipeline::try_tee(p, det.clone(), "prevention_tee");
                 }
                 handle_event(&det, &mode, &buf_for_consumer).await;
                 siem_fwd.forward(&det).await;
             }
         }
     });
+
+    // Publish the telemetry report the `diagnostics telemetry` command reads.
+    // Runs in both modes: an offline agent still needs its queue and drop
+    // counters to be inspectable.
+    {
+        let started = std::time::Instant::now();
+        let report_path = telemetry::TelemetryReport::default_path();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                ticker.tick().await;
+                let report =
+                    telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
+                if let Err(e) = report.write_atomic(&report_path) {
+                    // Losing the report costs visibility, not telemetry, so it
+                    // must never take the agent down with it.
+                    warn!(error = %e, "could not publish the telemetry report");
+                }
+            }
+        });
+    }
 
     // Asset inventory reporter — runs in BOTH modes.  Online it POSTs to
     // `/api/v1/agents/{id}/inventory`; offline it writes <state>/inventory.json
@@ -442,17 +502,46 @@ async fn main() -> Result<()> {
     }
 
     consumer.await.ok();
+
+    // Reconcile the journal to exactly the un-acknowledged set, so the next
+    // start replays those and nothing else.
+    match ring_buffer.lock() {
+        Ok(mut spool) => {
+            spool.checkpoint();
+            info!(
+                pending = spool.len(),
+                "spool checkpointed — pending events will be replayed on the next start"
+            );
+        }
+        Err(e) => error!("could not checkpoint the spool on shutdown: {e}"),
+    }
+
     info!("Shutdown complete");
     Ok(())
 }
 
+/// Persist one event locally and enqueue it for the backend.
+///
+/// This is the single point every event passes through on its way into the
+/// pipeline — collector telemetry *and* detection-engine findings alike — so it
+/// is where "accepted" is counted. Counting per-collector instead would miss
+/// findings, and the accounting invariant (`accepted == acknowledged + queued +
+/// dropped`) would silently stop holding.
 async fn handle_event(event: &schema::AgentEvent, mode: &OutputMode, buf: &Arc<Mutex<Spool>>) {
+    pipeline::accepted();
     if let Err(err) = write_event(event, mode).await {
         error!("Failed to write event: {err}");
     }
     match buf.lock() {
-        Ok(mut b) => b.push(event.clone()),
-        Err(e) => error!("Ring buffer mutex poisoned: {e}"),
+        // A rejected push is already counted against a named drop reason by the
+        // spool itself, so there is nothing to attribute here.
+        Ok(mut b) => {
+            let _ = b.push(event.clone());
+        }
+        Err(e) => {
+            error!("Spool mutex poisoned: {e}");
+            telemetry::metrics::metrics().event_dropped(telemetry::DropReason::InternalError);
+        }
     }
 }
 

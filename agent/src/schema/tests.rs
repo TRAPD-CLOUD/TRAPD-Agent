@@ -23,6 +23,7 @@ fn process_create_event() -> AgentEvent {
             uid: 33,
             username: "www-data".to_string(),
             exe_sha256: None,
+            ..Default::default()
         }),
     )
 }
@@ -496,4 +497,209 @@ fn test_point5_event_actions_serialize_snake_case() {
         let json = serde_json::to_string(&action).expect("serialize action");
         assert_eq!(json, format!("\"{want}\""));
     }
+}
+
+// ── Event identity & provenance ──────────────────────────────────────────────
+
+/// Build an exec event with the given command line and enrichment notes.
+fn exec_event(cmdline: &str, enrichment: crate::telemetry::Enrichment) -> AgentEvent {
+    AgentEvent::new(
+        "agent-1".into(),
+        "host-1".into(),
+        EventClass::Process,
+        EventAction::Exec,
+        Severity::Info,
+        EventData::ProcessExec(Box::new(super::ExecEventData {
+            pid: 1234,
+            ppid: 1,
+            cmdline: cmdline.into(),
+            exe: "/usr/bin/bash".into(),
+            comm: "bash".into(),
+            process_start_time: Some(987_654),
+            parent_start_time: Some(12),
+            enrichment,
+            ..Default::default()
+        })),
+    )
+}
+
+#[test]
+fn every_event_carries_provenance() {
+    let event = process_create_event();
+    let val: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+
+    let origin = &val["origin"];
+    assert!(origin["boot_id"].is_string(), "boot_id must be present");
+    assert!(
+        origin["sequence_number"].as_u64().unwrap() > 0,
+        "sequence numbers start at 1 so a gap is detectable"
+    );
+    assert!(
+        origin["monotonic_timestamp_ns"].as_u64().unwrap() > 0,
+        "a wall-clock step must not be able to reorder events"
+    );
+}
+
+#[test]
+fn sequence_numbers_increase_across_events() {
+    let a = process_create_event();
+    let b = process_create_event();
+    assert!(
+        b.sequence_number().unwrap() > a.sequence_number().unwrap(),
+        "consecutive events must take consecutive sequence numbers"
+    );
+}
+
+#[test]
+fn event_ids_are_unique_per_event() {
+    let a = process_create_event();
+    let b = process_create_event();
+    assert_ne!(a.event_id, b.event_id);
+}
+
+#[test]
+fn with_source_names_the_collector_without_reassigning_identity() {
+    let event = process_create_event();
+    let id = event.event_id;
+    let seq = event.sequence_number();
+
+    let tagged = event.with_source("ebpf_exec");
+    assert_eq!(
+        tagged.origin.as_ref().unwrap().source.as_deref(),
+        Some("ebpf_exec")
+    );
+    assert_eq!(tagged.event_id, id, "tagging must not mint a new event_id");
+    assert_eq!(tagged.sequence_number(), seq, "nor consume another sequence");
+}
+
+#[test]
+fn process_events_carry_a_start_time_for_pid_reuse() {
+    let val: serde_json::Value = serde_json::from_str(
+        &serde_json::to_string(&exec_event("bash -i", Default::default())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        val["data"]["process_start_time"], 987_654,
+        "a bare PID is not an identity — the start time is what disambiguates reuse"
+    );
+    assert_eq!(val["data"]["parent_start_time"], 12);
+}
+
+// ── Enrichment on the wire ───────────────────────────────────────────────────
+
+#[test]
+fn a_fully_enriched_event_carries_no_enrichment_overhead() {
+    let event = exec_event("bash -i", crate::telemetry::Enrichment::new().finish(3));
+    let val: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+
+    assert!(val["data"]["enrichment_status"].is_null());
+    assert!(val["data"]["enrichment_errors"].is_null());
+    assert!(val["data"]["truncated_fields"].is_null());
+    assert_eq!(val["data"]["cmdline"], "bash -i");
+}
+
+#[test]
+fn a_partially_enriched_event_says_which_field_failed_and_why() {
+    // The raw kernel record still ships; only the /proc-sourced field is
+    // missing, and it says so.
+    let mut notes = crate::telemetry::Enrichment::new();
+    notes.fail("cmdline", crate::telemetry::EnrichmentError::ProcessExited);
+    let event = exec_event("", notes.finish(3));
+
+    let val: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+    assert_eq!(val["data"]["enrichment_status"], "partial");
+    assert_eq!(val["data"]["enrichment_errors"]["cmdline"], "process_exited");
+    assert_eq!(
+        val["data"]["exe"], "/usr/bin/bash",
+        "the kernel-sourced fields must survive an enrichment failure"
+    );
+    assert_eq!(val["data"]["pid"], 1234);
+}
+
+#[test]
+fn a_truncated_command_line_is_marked_with_both_lengths() {
+    let long = "a".repeat(131_072);
+    let (cut, truncation) =
+        crate::telemetry::limits::truncate_str(&long, crate::telemetry::limits::MAX_CMDLINE_BYTES);
+    let mut notes = crate::telemetry::Enrichment::new();
+    notes.truncated("cmdline", truncation);
+    let event = exec_event(&cut, notes.finish(3));
+
+    let val: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+    let marker = &val["data"]["truncated_fields"]["cmdline"];
+    assert_eq!(marker["truncated"], true);
+    assert_eq!(marker["original_length"], 131_072);
+    assert_eq!(marker["captured_length"], 16_384);
+    assert_eq!(
+        val["data"]["cmdline"].as_str().unwrap().len(),
+        16_384,
+        "the captured prefix must match what the marker claims"
+    );
+}
+
+// ── Round-tripping (the journal replays these) ───────────────────────────────
+
+#[test]
+fn an_event_with_enrichment_notes_round_trips() {
+    // `EventData` is an untagged enum and the enrichment block is flattened
+    // into it, which is exactly the combination most likely to break silently.
+    let mut notes = crate::telemetry::Enrichment::new();
+    notes.fail("cwd", crate::telemetry::EnrichmentError::PermissionDenied);
+    notes.truncated(
+        "cmdline",
+        Some(crate::telemetry::limits::Truncation::new(100, 10)),
+    );
+    let event = exec_event("aaaaaaaaaa", notes.finish(3));
+
+    let json = serde_json::to_string(&event).unwrap();
+    let back: AgentEvent = serde_json::from_str(&json).expect("must round-trip");
+
+    assert_eq!(back.event_id, event.event_id);
+    assert_eq!(back.sequence_number(), event.sequence_number());
+    let EventData::ProcessExec(data) = &back.data else {
+        panic!("untagged deserialization picked the wrong variant: {:?}", back.data);
+    };
+    assert_eq!(data.pid, 1234);
+    assert_eq!(data.process_start_time, Some(987_654));
+    assert_eq!(
+        data.enrichment.status(),
+        crate::telemetry::enrichment::EnrichmentStatus::Partial
+    );
+    assert_eq!(
+        data.enrichment.enrichment_errors["cwd"],
+        crate::telemetry::EnrichmentError::PermissionDenied
+    );
+    assert_eq!(data.enrichment.truncated_fields["cmdline"].original_length, 100);
+}
+
+#[test]
+fn an_event_without_the_new_fields_still_parses() {
+    // Journals written by an older agent must remain replayable — otherwise an
+    // upgrade would discard every queued event.
+    let legacy = r#"{
+        "event_id": "6f1c9b1e-0000-4000-8000-000000000001",
+        "agent_id": "a",
+        "hostname": "h",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "class": "process",
+        "action": "create",
+        "severity": "info",
+        "data": {
+            "pid": 7, "ppid": 1, "name": "sh", "exe": "/bin/sh",
+            "cmdline": "sh", "uid": 0, "username": "root"
+        }
+    }"#;
+
+    let event: AgentEvent = serde_json::from_str(legacy).expect("legacy events must still parse");
+    assert!(event.origin.is_none(), "absent provenance stays absent");
+    let EventData::ProcessCreate(data) = &event.data else {
+        panic!("wrong variant: {:?}", event.data);
+    };
+    assert_eq!(data.pid, 7);
+    assert_eq!(data.process_start_time, None);
+    assert!(data.enrichment.is_clean());
 }

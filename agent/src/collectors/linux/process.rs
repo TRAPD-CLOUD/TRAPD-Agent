@@ -15,11 +15,34 @@ use crate::schema::{
     AgentEvent, DetectionData, EventAction, EventClass, EventData, MemoryAnomalyData,
     ProcessCreateData, ProcessTerminateData, Severity,
 };
+use crate::telemetry::limits::{truncate_str, MAX_CMDLINE_BYTES};
+use crate::telemetry::metrics::{metrics, CollectorMode};
+use crate::telemetry::{Enrichment, EnrichmentError};
+
+/// What the collector remembers about a process between polls.
+///
+/// The start time is carried alongside the name because a PID on its own cannot
+/// answer "is this still the same process?" — see [`diff_processes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KnownProcess {
+    name: String,
+    start_time: Option<u64>,
+}
+
+/// What changed between two polls.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProcessDiff {
+    /// PIDs newly observed, including PIDs that were recycled onto a new
+    /// process since the previous poll.
+    created: Vec<i32>,
+    /// `(pid, name)` of processes that are gone, including the previous
+    /// occupant of a recycled PID.
+    terminated: Vec<(i32, String)>,
+}
 
 pub struct ProcessCollector {
     initialized: bool,
-    known_pids: HashSet<i32>,
-    known_names: HashMap<i32, String>,
+    known: HashMap<i32, KnownProcess>,
     uid_to_user: HashMap<u32, String>,
     /// Baseline of every SUID binary present on the host at agent start.  An
     /// exec of a SUID binary *not* in this set is suspicious (MITRE T1548.001).
@@ -35,12 +58,73 @@ impl ProcessCollector {
         );
         Self {
             initialized: false,
-            known_pids: HashSet::new(),
-            known_names: HashMap::new(),
+            known: HashMap::new(),
             uid_to_user: load_passwd().unwrap_or_default(),
             suid_baseline,
         }
     }
+}
+
+/// Compare two polls and report what was created and what ended.
+///
+/// A poll interval is long enough for a PID to be freed and handed to a new
+/// process, and the kernel recycles PIDs aggressively on a busy host. Comparing
+/// PID sets alone would then see the PID in *both* polls and emit neither a
+/// terminate for the process that ended nor a create for the one that started —
+/// two events lost with nothing to indicate anything was missed. That silent
+/// hole is exactly what the start-time comparison closes: a PID present in both
+/// polls with a *different* start time is reported as a termination followed by
+/// a creation.
+///
+/// Reuse must be *proven*, not assumed: when either start time is unknown the
+/// PID is treated as the same process, because inventing a spurious
+/// terminate/create pair on every unreadable `/proc` entry would be its own
+/// kind of false telemetry.
+fn diff_processes(
+    known: &HashMap<i32, KnownProcess>,
+    current: &HashMap<i32, ProcessCreateData>,
+) -> ProcessDiff {
+    let mut diff = ProcessDiff::default();
+
+    for (pid, info) in current {
+        match known.get(pid) {
+            None => diff.created.push(*pid),
+            Some(prev) => {
+                let before = crate::telemetry::ProcessKey::new(*pid, prev.start_time);
+                let now = crate::telemetry::ProcessKey::new(*pid, info.process_start_time);
+                if before.provably_different_from(&now) {
+                    // The PID was recycled: report both halves.
+                    diff.terminated.push((*pid, prev.name.clone()));
+                    diff.created.push(*pid);
+                }
+            }
+        }
+    }
+
+    for (pid, prev) in known {
+        if !current.contains_key(pid) {
+            diff.terminated.push((*pid, prev.name.clone()));
+        }
+    }
+
+    // Deterministic order keeps the emitted event stream reproducible, which
+    // matters for both tests and for reading a live event log.
+    diff.created.sort_unstable();
+    diff.terminated.sort_unstable();
+    diff
+}
+
+/// `PF_KTHREAD` — the kernel's own flag marking a task as a kernel thread.
+///
+/// Using the flag rather than heuristics like "ppid == 2" is what makes this
+/// reliable: a userspace process can be reparented, but only the kernel sets
+/// this bit.
+const PF_KTHREAD: u32 = 0x0020_0000;
+
+/// Whether this task is a kernel thread, and therefore legitimately has no
+/// executable image and no command line.
+fn is_kernel_thread(stat: &procfs::process::Stat) -> bool {
+    stat.flags & PF_KTHREAD != 0
 }
 
 /// True if `path` currently has its SUID bit set.  `stat()`s the binary.
@@ -157,15 +241,40 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
             Err(_) => continue,
         };
 
-        let exe = proc
-            .exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // A process can exit between the directory scan and these reads, so
+        // each field is recorded as resolved-or-explained rather than being
+        // flattened to an empty string that reads like "no command line".
+        //
+        // Kernel threads are the exception: they have no executable image and
+        // no argv *by construction*, so reporting a failure for each would
+        // brand a few hundred perfectly normal tasks as enrichment failures on
+        // every poll and pin agent health at "degraded" forever.
+        let kthread = is_kernel_thread(&stat);
+        let mut notes = Enrichment::new();
 
-        let cmdline = proc
-            .cmdline()
-            .map(|args| args.join(" "))
-            .unwrap_or_default();
+        let exe = match proc.exe() {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(_) => {
+                if !kthread {
+                    notes.fail("exe", EnrichmentError::ProcessExited);
+                }
+                String::new()
+            }
+        };
+
+        let cmdline = match proc.cmdline() {
+            Ok(args) => {
+                let (value, truncation) = truncate_str(&args.join(" "), MAX_CMDLINE_BYTES);
+                notes.truncated("cmdline", truncation);
+                value
+            }
+            Err(_) => {
+                if !kthread {
+                    notes.fail("cmdline", EnrichmentError::ProcessExited);
+                }
+                String::new()
+            }
+        };
 
         let uid = status.ruid;
         let username = uid_map.get(&uid).cloned().unwrap_or_default();
@@ -180,6 +289,11 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
             uid,
             username,
             exe_sha256,
+            // `stat.starttime` is field 22 straight from the kernel — the same
+            // value that makes this process distinguishable from a later one
+            // reusing its PID.
+            process_start_time: Some(stat.starttime),
+            enrichment: notes.finish(if kthread { 0 } else { 2 }),
         };
         out.insert(stat.pid, data);
     }
@@ -199,6 +313,7 @@ impl Collector for ProcessCollector {
         hostname: String,
     ) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(3));
+        metrics().add_collector_mode(CollectorMode::ProcPolling);
 
         loop {
             ticker.tick().await;
@@ -206,22 +321,15 @@ impl Collector for ProcessCollector {
             let current = collect_processes(&self.uid_to_user);
 
             if !self.initialized {
-                for (pid, info) in &current {
-                    self.known_pids.insert(*pid);
-                    self.known_names.insert(*pid, info.name.clone());
-                }
+                self.known = snapshot_known(&current);
                 self.initialized = true;
                 continue;
             }
 
-            let current_pids: HashSet<i32> = current.keys().copied().collect();
+            let diff = diff_processes(&self.known, &current);
 
             // New processes
-            for pid in current_pids
-                .difference(&self.known_pids)
-                .copied()
-                .collect::<Vec<_>>()
-            {
+            for pid in diff.created {
                 if let Some(info) = current.get(&pid) {
                     let event = AgentEvent::new(
                         agent_id.clone(),
@@ -234,7 +342,6 @@ impl Collector for ProcessCollector {
                     if tx.send(event).await.is_err() {
                         return Ok(());
                     }
-                    self.known_names.insert(pid, info.name.clone());
 
                     // Check for rwx anonymous memory mappings (fileless shellcode indicator).
                     for (region, perms) in check_rwx_maps(pid) {
@@ -293,13 +400,7 @@ impl Collector for ProcessCollector {
             }
 
             // Terminated processes
-            for pid in self
-                .known_pids
-                .difference(&current_pids)
-                .copied()
-                .collect::<Vec<_>>()
-            {
-                let name = self.known_names.remove(&pid).unwrap_or_default();
+            for (pid, name) in diff.terminated {
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),
@@ -313,7 +414,167 @@ impl Collector for ProcessCollector {
                 }
             }
 
-            self.known_pids = current_pids;
+            self.known = snapshot_known(&current);
         }
+    }
+}
+
+/// Reduce a poll to the state needed to diff against the next one.
+fn snapshot_known(current: &HashMap<i32, ProcessCreateData>) -> HashMap<i32, KnownProcess> {
+    current
+        .iter()
+        .map(|(pid, info)| {
+            (
+                *pid,
+                KnownProcess {
+                    name: info.name.clone(),
+                    start_time: info.process_start_time,
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn known(pid: i32, name: &str, start_time: Option<u64>) -> (i32, KnownProcess) {
+        (
+            pid,
+            KnownProcess {
+                name: name.to_string(),
+                start_time,
+            },
+        )
+    }
+
+    fn seen(pid: i32, name: &str, start_time: Option<u64>) -> (i32, ProcessCreateData) {
+        (
+            pid,
+            ProcessCreateData {
+                pid,
+                name: name.to_string(),
+                process_start_time: start_time,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn an_unchanged_process_produces_no_events() {
+        let before = HashMap::from([known(100, "bash", Some(5))]);
+        let after = HashMap::from([seen(100, "bash", Some(5))]);
+        assert_eq!(diff_processes(&before, &after), ProcessDiff::default());
+    }
+
+    #[test]
+    fn a_new_pid_is_a_creation() {
+        let before = HashMap::new();
+        let after = HashMap::from([seen(100, "bash", Some(5))]);
+        let diff = diff_processes(&before, &after);
+        assert_eq!(diff.created, vec![100]);
+        assert!(diff.terminated.is_empty());
+    }
+
+    #[test]
+    fn a_vanished_pid_is_a_termination() {
+        let before = HashMap::from([known(100, "bash", Some(5))]);
+        let after = HashMap::new();
+        let diff = diff_processes(&before, &after);
+        assert!(diff.created.is_empty());
+        assert_eq!(diff.terminated, vec![(100, "bash".to_string())]);
+    }
+
+    #[test]
+    fn a_recycled_pid_yields_both_a_termination_and_a_creation() {
+        // The bug this exists to prevent: comparing PID sets alone sees 100 in
+        // both polls and emits nothing, losing two events with no trace.
+        let before = HashMap::from([known(100, "bash", Some(5))]);
+        let after = HashMap::from([seen(100, "nc", Some(9_999))]);
+
+        let diff = diff_processes(&before, &after);
+        assert_eq!(
+            diff.created,
+            vec![100],
+            "the process that took over the PID must be reported"
+        );
+        assert_eq!(
+            diff.terminated,
+            vec![(100, "bash".to_string())],
+            "and so must the one that gave it up, under its own name"
+        );
+    }
+
+    #[test]
+    fn an_unknown_start_time_does_not_invent_a_reuse() {
+        // Guessing here would emit a spurious terminate/create pair on every
+        // poll for any process whose /proc entry could not be read.
+        for (before_st, after_st) in [(None, Some(5)), (Some(5), None), (None, None)] {
+            let before = HashMap::from([known(100, "bash", before_st)]);
+            let after = HashMap::from([seen(100, "bash", after_st)]);
+            assert_eq!(
+                diff_processes(&before, &after),
+                ProcessDiff::default(),
+                "unproven reuse ({before_st:?} -> {after_st:?}) must produce no events"
+            );
+        }
+    }
+
+    #[test]
+    fn a_renamed_process_keeping_its_start_time_is_not_a_reuse() {
+        // A process can rename itself via prctl; that is not a new process.
+        let before = HashMap::from([known(100, "bash", Some(5))]);
+        let after = HashMap::from([seen(100, "definitely-not-bash", Some(5))]);
+        assert_eq!(diff_processes(&before, &after), ProcessDiff::default());
+    }
+
+    #[test]
+    fn a_termination_reports_the_previous_occupants_name() {
+        // Reporting the *new* occupant's name for the terminated process would
+        // attribute the exit to the wrong binary.
+        let before = HashMap::from([known(100, "sshd", Some(1))]);
+        let after = HashMap::from([seen(100, "cryptominer", Some(2))]);
+        let diff = diff_processes(&before, &after);
+        assert_eq!(diff.terminated, vec![(100, "sshd".to_string())]);
+    }
+
+    #[test]
+    fn multiple_changes_are_all_reported_in_a_stable_order() {
+        let before = HashMap::from([
+            known(1, "init", Some(1)),
+            known(2, "gone", Some(2)),
+            known(3, "recycled", Some(3)),
+        ]);
+        let after = HashMap::from([
+            seen(1, "init", Some(1)),   // unchanged
+            seen(3, "newthing", Some(30)), // recycled
+            seen(4, "fresh", Some(40)), // new
+        ]);
+
+        let diff = diff_processes(&before, &after);
+        assert_eq!(diff.created, vec![3, 4]);
+        assert_eq!(
+            diff.terminated,
+            vec![(2, "gone".to_string()), (3, "recycled".to_string())]
+        );
+    }
+
+    #[test]
+    fn snapshot_carries_the_start_time_forward() {
+        // If the snapshot dropped the start time, reuse detection would work
+        // once and then silently stop.
+        let current = HashMap::from([seen(7, "bash", Some(42))]);
+        let snap = snapshot_known(&current);
+        assert_eq!(snap[&7].start_time, Some(42));
+        assert_eq!(snap[&7].name, "bash");
+    }
+
+    #[test]
+    fn an_empty_poll_terminates_everything_known() {
+        let before = HashMap::from([known(1, "a", Some(1)), known(2, "b", Some(2))]);
+        let diff = diff_processes(&before, &HashMap::new());
+        assert_eq!(diff.terminated.len(), 2);
+        assert!(diff.created.is_empty());
     }
 }

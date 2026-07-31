@@ -677,6 +677,7 @@ mod tests {
                 uid: 0,
                 username: "root".into(),
                 exe_sha256: None,
+                ..Default::default()
             }),
         )
     }
@@ -760,6 +761,7 @@ mod tests {
                 container_image: None,
                 container_image_digest: None,
                 k8s: None,
+                ..Default::default()
             })),
         );
         let out = e.inspect(&ev);
