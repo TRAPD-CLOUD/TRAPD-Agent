@@ -97,10 +97,9 @@ impl IocSet {
             if self.domains.contains(hay) {
                 return Some(hay.to_string());
             }
-            match hay.find('.') {
-                Some(idx) => hay = &hay[idx + 1..],
-                None => return None,
-            }
+            // No dot left means we have tested the bare TLD and found nothing.
+            let idx = hay.find('.')?;
+            hay = &hay[idx + 1..];
         }
     }
 }

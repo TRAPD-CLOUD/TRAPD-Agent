@@ -193,7 +193,7 @@ impl Collector for HoneytokenCollector {
         loop {
             tokio::time::sleep(SWEEP_INTERVAL).await;
             tick = tick.wrapping_add(1);
-            let report_health = tick % HEALTH_EVERY_N_SWEEPS == 0;
+            let report_health = tick.is_multiple_of(HEALTH_EVERY_N_SWEEPS);
             sweep(
                 &tx,
                 &agent_id,

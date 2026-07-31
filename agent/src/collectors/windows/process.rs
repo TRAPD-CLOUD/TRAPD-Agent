@@ -31,6 +31,8 @@ use crate::schema::{
     AgentEvent, EventAction, EventClass, EventData, ProcessCreateData, ProcessTerminateData,
     Severity,
 };
+use crate::telemetry::limits::{truncate_str, MAX_CMDLINE_BYTES};
+use crate::telemetry::Enrichment;
 
 /// Poll cadence — matches the Linux polling collector.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -150,10 +152,20 @@ impl Collector for ProcessCollector {
                     continue; // already gone again
                 };
                 let exe: PathBuf = proc_.exe().map(Path::to_path_buf).unwrap_or_default();
-                let cmdline = proc_.cmd().join(" ");
                 let ppid = proc_.parent().map(|p| p.as_u32() as i32).unwrap_or(0);
-                let username = self.username_of(spid);
                 let name = proc_.name().to_string();
+                let start_time = proc_.start_time();
+
+                // Cap the command line and mark it when it does not fit, so a
+                // consumer can tell a complete command line from a prefix —
+                // the same contract the Linux collectors follow.
+                let mut notes = Enrichment::new();
+                let (cmdline, truncation) = truncate_str(&proc_.cmd().join(" "), MAX_CMDLINE_BYTES);
+                notes.truncated("cmdline", truncation);
+
+                // Everything above borrows `self.sys` through `proc_`; the two
+                // calls below need `&mut self`, so the borrow has to end first.
+                let username = self.username_of(spid);
                 let exe_sha256 = self.exe_sha256(&exe);
 
                 let data = ProcessCreateData {
@@ -167,6 +179,15 @@ impl Collector for ProcessCollector {
                     uid: 0,
                     username,
                     exe_sha256,
+                    // Windows recycles PIDs just as Linux does, so the same
+                    // rule applies: correlate on (boot_id, pid, start_time),
+                    // never on the PID alone. `sysinfo` reports the start time
+                    // in seconds since the Unix epoch here rather than in clock
+                    // ticks since boot — the units differ from Linux, but the
+                    // field's job (telling one occupant of a PID from the next)
+                    // is identical.
+                    process_start_time: Some(start_time),
+                    enrichment: notes.finish(0),
                 };
                 let event = AgentEvent::new(
                     agent_id.clone(),

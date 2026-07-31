@@ -20,6 +20,9 @@ pub mod backoff;
 pub mod journal;
 pub mod spool;
 
+// The env-override helpers are called from the Linux `main` only; the Windows
+// runtime builds its spool through `winsvc::run`.
+#[allow(unused_imports)]
 pub use spool::{
     spool_max_bytes_from_env, spool_max_from_env, Spool, SpoolEntry, SPOOL_MAX_MEMORY,
 };

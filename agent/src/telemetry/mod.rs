@@ -48,7 +48,16 @@ pub mod snapshot;
 // Re-exported because they appear in the shared event schema and in collector
 // code; everything else is reached through its own module path, which keeps the
 // call site's dependency on this module visible.
+//
+// `allow(unused_imports)`: which of these has a caller depends on the target —
+// `ProcessKey` and `TelemetryReport` are Linux-only today, while the schema
+// needs `EventOrigin` and `Enrichment` everywhere. The alternative is a thicket
+// of `cfg(target_os)` on re-exports of one cohesive module.
+#[allow(unused_imports)]
 pub use drops::DropReason;
+#[allow(unused_imports)]
 pub use enrichment::{Enrichment, EnrichmentError};
+#[allow(unused_imports)]
 pub use identity::{EventOrigin, ProcessKey};
+#[allow(unused_imports)]
 pub use snapshot::TelemetryReport;
