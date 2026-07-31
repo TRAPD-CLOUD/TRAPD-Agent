@@ -5,9 +5,9 @@
 // cfg gates.
 #![cfg_attr(windows, allow(dead_code))]
 
-use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use tokio::fs;
@@ -53,7 +53,7 @@ use collectors::Collector;
 use config::{AgentConfig, ConfigPuller};
 #[cfg(target_os = "linux")]
 use heartbeat::Heartbeat;
-use output::{write_event, OutputMode};
+use output::{OutputMode, OutputWriter};
 #[cfg(target_os = "linux")]
 use pipeline::create_pipeline;
 use pipeline::Spool;
@@ -219,9 +219,7 @@ async fn main() -> Result<()> {
             .with_max_bytes(pipeline::spool_max_bytes_from_env())
     };
     if spool.is_degraded() {
-        warn!(
-            "spool has no durable backing — unacknowledged events will not survive a restart"
-        );
+        warn!("spool has no durable backing — unacknowledged events will not survive a restart");
     }
     let ring_buffer: Arc<Mutex<Spool>> = Arc::new(Mutex::new(spool));
     let (tx, mut rx) = create_pipeline();
@@ -389,12 +387,25 @@ async fn main() -> Result<()> {
     };
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
-    let mode = output_mode;
+    let mut output = OutputWriter::new(output_mode).await?;
     let prev_tx = prev_event_tx.clone();
     let det_engine = Arc::clone(&engine);
     let siem_fwd = siem.clone();
     let mut consumer = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
+        let mut output_flush = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            let event = tokio::select! {
+                event = rx.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+                _ = output_flush.tick() => {
+                    if let Err(err) = output.flush().await {
+                        error!("Failed to flush event output: {err}");
+                    }
+                    continue;
+                }
+            };
             // Forwarding to prevention is best-effort — a stalled enforcement
             // engine must not stall telemetry — but a dropped tee is still
             // counted rather than swallowed.
@@ -403,7 +414,7 @@ async fn main() -> Result<()> {
                 telemetry::metrics::metrics()
                     .set_detection_queue_depth(p.max_capacity().saturating_sub(p.capacity()) as u64);
             }
-            handle_event(&event, &mode, &buf_for_consumer).await;
+            handle_event(&event, &mut output, &buf_for_consumer).await;
             siem_fwd.forward(&event).await;
 
             // Run detections and treat each finding as a first-class event:
@@ -412,9 +423,12 @@ async fn main() -> Result<()> {
                 if let Some(p) = &prev_tx {
                     pipeline::try_tee(p, det.clone(), "prevention_tee");
                 }
-                handle_event(&det, &mode, &buf_for_consumer).await;
+                handle_event(&det, &mut output, &buf_for_consumer).await;
                 siem_fwd.forward(&det).await;
             }
+        }
+        if let Err(err) = output.flush().await {
+            error!("Failed to flush event output: {err}");
         }
     });
 
@@ -527,9 +541,13 @@ async fn main() -> Result<()> {
 /// is where "accepted" is counted. Counting per-collector instead would miss
 /// findings, and the accounting invariant (`accepted == acknowledged + queued +
 /// dropped`) would silently stop holding.
-async fn handle_event(event: &schema::AgentEvent, mode: &OutputMode, buf: &Arc<Mutex<Spool>>) {
+async fn handle_event(
+    event: &schema::AgentEvent,
+    output: &mut OutputWriter,
+    buf: &Arc<Mutex<Spool>>,
+) {
     pipeline::accepted();
-    if let Err(err) = write_event(event, mode).await {
+    if let Err(err) = output.write_event(event).await {
         error!("Failed to write event: {err}");
     }
     match buf.lock() {

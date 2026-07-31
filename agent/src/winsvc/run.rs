@@ -20,7 +20,7 @@ use crate::collectors::windows::users::UserSessionCollector;
 use crate::collectors::Collector;
 use crate::config::{self, AgentConfig, ConfigPuller};
 use crate::heartbeat::Heartbeat;
-use crate::output::OutputMode;
+use crate::output::{OutputMode, OutputWriter};
 use crate::pipeline::{self, create_pipeline, Spool};
 use crate::transport::Transport;
 use crate::{env_truthy, handle_event, load_or_create_device_id, paths};
@@ -215,11 +215,27 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     };
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
-    let mode = output_mode;
+    let mut output = OutputWriter::new(output_mode).await?;
     let mut consumer = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            handle_event(&event, &mode, &buf_for_consumer).await;
+        let mut output_flush = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            let event = tokio::select! {
+                event = rx.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+                _ = output_flush.tick() => {
+                    if let Err(err) = output.flush().await {
+                        error!("Failed to flush event output: {err}");
+                    }
+                    continue;
+                }
+            };
+            handle_event(&event, &mut output, &buf_for_consumer).await;
             siem.forward(&event).await;
+        }
+        if let Err(err) = output.flush().await {
+            error!("Failed to flush event output: {err}");
         }
     });
 
