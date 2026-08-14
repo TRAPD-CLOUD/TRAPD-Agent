@@ -553,7 +553,7 @@ outside the workspace because it targets `bpfel-unknown-none` and needs a pinned
 nightly toolchain. Build it with the xtask helper:
 
 ```sh
-cargo install bpf-linker            # one-time
+cargo binstall bpf-linker           # one-time; installs the upstream prebuilt binary
 cargo xtask build-ebpf --release    # pinned nightly + rust-src installed automatically
 ```
 

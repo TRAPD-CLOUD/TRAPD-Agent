@@ -4,7 +4,7 @@
 //!   cargo xtask build-ebpf [--release]
 //!
 //! Requirements:
-//!   cargo install bpf-linker
+//!   cargo binstall bpf-linker
 //!
 //! The nightly toolchain and rust-src component are pinned by
 //! `trapd-agent-ebpf/rust-toolchain.toml` and installed automatically by
@@ -31,7 +31,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "Usage:\n  cargo xtask build-ebpf [--release]\n\n\
          Requirements:\n  \
-           cargo install bpf-linker\n  \
+           cargo binstall bpf-linker\n  \
          The pinned nightly toolchain + rust-src component are installed\n  \
          automatically from trapd-agent-ebpf/rust-toolchain.toml."
     );
@@ -89,7 +89,7 @@ fn build_ebpf(release: bool) -> ExitCode {
     match cmd.status() {
         Err(e) => {
             eprintln!("error: failed to exec cargo: {e}");
-            eprintln!("hint:  cargo install bpf-linker");
+            eprintln!("hint:  cargo binstall bpf-linker");
             ExitCode::FAILURE
         }
         Ok(s) if !s.success() => {
