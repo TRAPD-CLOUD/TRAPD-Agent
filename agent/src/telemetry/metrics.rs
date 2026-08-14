@@ -79,6 +79,7 @@ pub struct Metrics {
 
     // ── Userspace collectors ─────────────────────────────────────────────────
     collector_events_received: AtomicU64,
+    collector_first_event_unix_ms: AtomicU64,
     collector_events_dropped: AtomicU64,
     drops_by_reason: [AtomicU64; DropReason::COUNT],
     collector_failures: AtomicU64,
@@ -102,15 +103,20 @@ pub struct Metrics {
     spool_corrupt_records: AtomicU64,
     spool_truncated_tail_records: AtomicU64,
     spool_recovered_records: AtomicU64,
+    spool_oldest_age_ms: AtomicU64,
 
     // ── Transport ────────────────────────────────────────────────────────────
     transport_batches_sent: AtomicU64,
     transport_batches_failed: AtomicU64,
     transport_events_acknowledged: AtomicU64,
+    transport_first_ack_unix_ms: AtomicU64,
     transport_events_retried: AtomicU64,
     backend_rejected_events: AtomicU64,
     last_ack_unix_ms: AtomicU64,
     backend_connected: AtomicU64,
+    transport_last_batch_size: AtomicU64,
+    transport_request_latency_ms: AtomicU64,
+    transport_catching_up: AtomicU64,
 
     // ── End to end ───────────────────────────────────────────────────────────
     end_to_end_latency: LatencyHistogram,
@@ -125,6 +131,7 @@ impl Metrics {
             ebpf_events_received: AtomicU64::new(0),
             ebpf_events_lost: AtomicU64::new(0),
             collector_events_received: AtomicU64::new(0),
+            collector_first_event_unix_ms: AtomicU64::new(0),
             collector_events_dropped: AtomicU64::new(0),
             drops_by_reason: [Self::ZERO; DropReason::COUNT],
             collector_failures: AtomicU64::new(0),
@@ -142,13 +149,18 @@ impl Metrics {
             spool_corrupt_records: AtomicU64::new(0),
             spool_truncated_tail_records: AtomicU64::new(0),
             spool_recovered_records: AtomicU64::new(0),
+            spool_oldest_age_ms: AtomicU64::new(0),
             transport_batches_sent: AtomicU64::new(0),
             transport_batches_failed: AtomicU64::new(0),
             transport_events_acknowledged: AtomicU64::new(0),
+            transport_first_ack_unix_ms: AtomicU64::new(0),
             transport_events_retried: AtomicU64::new(0),
             backend_rejected_events: AtomicU64::new(0),
             last_ack_unix_ms: AtomicU64::new(0),
             backend_connected: AtomicU64::new(0),
+            transport_last_batch_size: AtomicU64::new(0),
+            transport_request_latency_ms: AtomicU64::new(0),
+            transport_catching_up: AtomicU64::new(0),
             end_to_end_latency: LatencyHistogram::new(),
         }
     }
@@ -179,14 +191,22 @@ impl Metrics {
 
     /// An event was produced by a collector and handed to the pipeline.
     pub fn collector_event_received(&self) {
-        self.collector_events_received.fetch_add(1, Ordering::Relaxed);
+        let _ = self.collector_first_event_unix_ms.compare_exchange(
+            0,
+            now_unix_ms(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.collector_events_received
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// An event was discarded.  This is the single choke point for *every*
     /// deliberate loss, which is what lets the diagnostics command assert that
     /// the per-reason breakdown sums to the total.
     pub fn event_dropped(&self, reason: DropReason) {
-        self.collector_events_dropped.fetch_add(1, Ordering::Relaxed);
+        self.collector_events_dropped
+            .fetch_add(1, Ordering::Relaxed);
         self.drops_by_reason[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -195,7 +215,8 @@ impl Metrics {
         if n == 0 {
             return;
         }
-        self.collector_events_dropped.fetch_add(n, Ordering::Relaxed);
+        self.collector_events_dropped
+            .fetch_add(n, Ordering::Relaxed);
         self.drops_by_reason[reason.index()].fetch_add(n, Ordering::Relaxed);
     }
 
@@ -265,6 +286,10 @@ impl Metrics {
         self.spool_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    pub fn set_spool_oldest_age_ms(&self, age: u64) {
+        self.spool_oldest_age_ms.store(age, Ordering::Relaxed);
+    }
+
     pub fn set_spool_capacity(&self, events: u64, bytes: u64) {
         self.spool_capacity_events.store(events, Ordering::Relaxed);
         self.spool_capacity_bytes.store(bytes, Ordering::Relaxed);
@@ -301,14 +326,35 @@ impl Metrics {
         self.transport_batches_sent.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn set_transport_activity(&self, batch_size: u64, latency_ms: u64, catching_up: bool) {
+        self.transport_last_batch_size
+            .store(batch_size, Ordering::Relaxed);
+        self.transport_request_latency_ms
+            .store(latency_ms, Ordering::Relaxed);
+        self.transport_catching_up
+            .store(u64::from(catching_up), Ordering::Relaxed);
+    }
+
+    pub fn set_transport_catching_up(&self, catching_up: bool) {
+        self.transport_catching_up
+            .store(u64::from(catching_up), Ordering::Relaxed);
+    }
+
     pub fn transport_batch_failed(&self) {
-        self.transport_batches_failed.fetch_add(1, Ordering::Relaxed);
+        self.transport_batches_failed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// `n` events were confirmed durable by the backend.  Also stamps the
     /// last-acknowledgement clock the health model uses to detect a stalled
     /// control channel.
     pub fn transport_events_acknowledged(&self, n: u64) {
+        let _ = self.transport_first_ack_unix_ms.compare_exchange(
+            0,
+            now_unix_ms(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         self.transport_events_acknowledged
             .fetch_add(n, Ordering::Relaxed);
         self.last_ack_unix_ms
@@ -316,7 +362,8 @@ impl Metrics {
     }
 
     pub fn transport_events_retried(&self, n: u64) {
-        self.transport_events_retried.fetch_add(n, Ordering::Relaxed);
+        self.transport_events_retried
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn backend_rejected_events(&self, n: u64) {
@@ -348,6 +395,9 @@ impl Metrics {
     // ── Snapshot ─────────────────────────────────────────────────────────────
 
     pub fn snapshot(&self) -> MetricsSnapshot {
+        let now = now_unix_ms();
+        let generated = self.collector_events_received.load(Ordering::Relaxed);
+        let acknowledged = self.transport_events_acknowledged.load(Ordering::Relaxed);
         let mut drops = BTreeMap::new();
         for reason in DropReason::ALL {
             let v = self.drops_for(reason);
@@ -358,7 +408,12 @@ impl Metrics {
         MetricsSnapshot {
             ebpf_events_received_total: self.ebpf_events_received.load(Ordering::Relaxed),
             ebpf_events_lost_total: self.ebpf_events_lost.load(Ordering::Relaxed),
-            collector_events_received_total: self.collector_events_received.load(Ordering::Relaxed),
+            collector_events_received_total: generated,
+            generated_events_per_second: rate_since(
+                generated,
+                self.collector_first_event_unix_ms.load(Ordering::Relaxed),
+                now,
+            ),
             collector_events_dropped_total: self.collector_events_dropped.load(Ordering::Relaxed),
             collector_events_dropped_by_reason: drops,
             collector_failures_total: self.collector_failures.load(Ordering::Relaxed),
@@ -378,14 +433,23 @@ impl Metrics {
                 .spool_truncated_tail_records
                 .load(Ordering::Relaxed),
             spool_recovered_records_total: self.spool_recovered_records.load(Ordering::Relaxed),
+            spool_oldest_event_age_ms: self.spool_oldest_age_ms.load(Ordering::Relaxed),
             transport_batches_sent_total: self.transport_batches_sent.load(Ordering::Relaxed),
             transport_batches_failed_total: self.transport_batches_failed.load(Ordering::Relaxed),
             transport_events_acknowledged_total: self
                 .transport_events_acknowledged
                 .load(Ordering::Relaxed),
+            sent_events_per_second: rate_since(
+                acknowledged,
+                self.transport_first_ack_unix_ms.load(Ordering::Relaxed),
+                now,
+            ),
             transport_events_retried_total: self.transport_events_retried.load(Ordering::Relaxed),
             backend_rejected_events_total: self.backend_rejected_events.load(Ordering::Relaxed),
             backend_connected: self.backend_connected(),
+            transport_last_batch_size: self.transport_last_batch_size.load(Ordering::Relaxed),
+            transport_request_latency_ms: self.transport_request_latency_ms.load(Ordering::Relaxed),
+            transport_catching_up: self.transport_catching_up.load(Ordering::Relaxed) == 1,
             last_ack_unix_ms: self.last_ack_unix_ms(),
             end_to_end_latency: self.end_to_end_latency.snapshot(),
         }
@@ -398,6 +462,8 @@ impl Metrics {
         self.ebpf_events_received.store(0, Ordering::Relaxed);
         self.ebpf_events_lost.store(0, Ordering::Relaxed);
         self.collector_events_received.store(0, Ordering::Relaxed);
+        self.collector_first_event_unix_ms
+            .store(0, Ordering::Relaxed);
         self.collector_events_dropped.store(0, Ordering::Relaxed);
         for c in &self.drops_by_reason {
             c.store(0, Ordering::Relaxed);
@@ -414,15 +480,23 @@ impl Metrics {
         self.spool_capacity_events.store(0, Ordering::Relaxed);
         self.spool_capacity_bytes.store(0, Ordering::Relaxed);
         self.spool_corrupt_records.store(0, Ordering::Relaxed);
-        self.spool_truncated_tail_records.store(0, Ordering::Relaxed);
+        self.spool_truncated_tail_records
+            .store(0, Ordering::Relaxed);
         self.spool_recovered_records.store(0, Ordering::Relaxed);
+        self.spool_oldest_age_ms.store(0, Ordering::Relaxed);
         self.transport_batches_sent.store(0, Ordering::Relaxed);
         self.transport_batches_failed.store(0, Ordering::Relaxed);
-        self.transport_events_acknowledged.store(0, Ordering::Relaxed);
+        self.transport_events_acknowledged
+            .store(0, Ordering::Relaxed);
+        self.transport_first_ack_unix_ms.store(0, Ordering::Relaxed);
         self.transport_events_retried.store(0, Ordering::Relaxed);
         self.backend_rejected_events.store(0, Ordering::Relaxed);
         self.last_ack_unix_ms.store(0, Ordering::Relaxed);
         self.backend_connected.store(0, Ordering::Relaxed);
+        self.transport_last_batch_size.store(0, Ordering::Relaxed);
+        self.transport_request_latency_ms
+            .store(0, Ordering::Relaxed);
+        self.transport_catching_up.store(0, Ordering::Relaxed);
     }
 }
 
@@ -448,6 +522,8 @@ pub struct MetricsSnapshot {
     pub ebpf_events_received_total: u64,
     pub ebpf_events_lost_total: u64,
     pub collector_events_received_total: u64,
+    #[serde(default)]
+    pub generated_events_per_second: f64,
     pub collector_events_dropped_total: u64,
     #[serde(default)]
     pub collector_events_dropped_by_reason: BTreeMap<String, u64>,
@@ -467,16 +543,35 @@ pub struct MetricsSnapshot {
     pub spool_corrupt_records_total: u64,
     pub spool_truncated_tail_records_total: u64,
     pub spool_recovered_records_total: u64,
+    #[serde(default)]
+    pub spool_oldest_event_age_ms: u64,
     pub transport_batches_sent_total: u64,
     pub transport_batches_failed_total: u64,
     pub transport_events_acknowledged_total: u64,
+    #[serde(default)]
+    pub sent_events_per_second: f64,
     pub transport_events_retried_total: u64,
     pub backend_rejected_events_total: u64,
     pub backend_connected: bool,
+    #[serde(default)]
+    pub transport_last_batch_size: u64,
+    #[serde(default)]
+    pub transport_request_latency_ms: u64,
+    #[serde(default)]
+    pub transport_catching_up: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_ack_unix_ms: Option<u64>,
     #[serde(default)]
     pub end_to_end_latency: LatencySnapshot,
+}
+
+fn rate_since(total: u64, first_ms: u64, now_ms: u64) -> f64 {
+    let elapsed_ms = now_ms.saturating_sub(first_ms);
+    if first_ms == 0 || elapsed_ms == 0 {
+        0.0
+    } else {
+        total as f64 * 1000.0 / elapsed_ms as f64
+    }
 }
 
 impl MetricsSnapshot {
@@ -542,7 +637,10 @@ mod tests {
             snap.collector_events_dropped_by_reason["userspace_channel_full"],
             2
         );
-        assert_eq!(snap.collector_events_dropped_by_reason["event_too_large"], 1);
+        assert_eq!(
+            snap.collector_events_dropped_by_reason["event_too_large"],
+            1
+        );
         assert!(
             snap.drops_fully_attributed(),
             "every drop must carry a reason"
@@ -696,7 +794,10 @@ mod tests {
         let json = serde_json::to_string(&m.snapshot()).unwrap();
         let back: MetricsSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.collector_events_received_total, 1);
-        assert_eq!(back.collector_events_dropped_by_reason["persistent_queue_full"], 1);
+        assert_eq!(
+            back.collector_events_dropped_by_reason["persistent_queue_full"],
+            1
+        );
         assert_eq!(back.spool_events, 3);
         assert!(back.end_to_end_latency.p99_ms.unwrap() >= 42);
     }

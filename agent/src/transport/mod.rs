@@ -33,14 +33,18 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::pipeline::{backoff, Spool};
 use crate::telemetry::limits::MAX_BATCH_EVENTS;
 use crate::telemetry::{metrics::metrics, DropReason};
 
-const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// Low latency when the queue is small; successful backlog batches are drained
+/// immediately (with a small governor delay) instead of waiting another tick.
+const NORMAL_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+const CATCH_UP_THRESHOLD: usize = 200;
+const CATCH_UP_PACING: Duration = Duration::from_millis(25);
 
 /// Optional per-event result envelope.
 ///
@@ -84,15 +88,12 @@ impl Transport {
     }
 
     pub async fn run(self) {
-        let mut ticker = interval(FLUSH_INTERVAL);
         // Consecutive batch failures, used to back the *whole* flush loop off
         // when the backend is down — per-record backoff alone would still have
         // every tick build and attempt a batch.
         let mut consecutive_failures: u32 = 0;
 
         loop {
-            ticker.tick().await;
-
             if consecutive_failures > 0 {
                 let wait = backoff::jittered_delay(consecutive_failures);
                 if !wait.is_zero() {
@@ -100,9 +101,24 @@ impl Transport {
                 }
             }
 
-            match self.flush().await {
-                FlushOutcome::Idle => {}
-                FlushOutcome::Delivered => consecutive_failures = 0,
+            let catching_up = self.queue_depth() >= CATCH_UP_THRESHOLD;
+            match self.flush(catching_up).await {
+                FlushOutcome::Idle => {
+                    metrics().set_transport_catching_up(false);
+                    tokio::time::sleep(NORMAL_FLUSH_INTERVAL).await;
+                }
+                FlushOutcome::Delivered => {
+                    consecutive_failures = 0;
+                    // Sequential requests deliberately bound inflight memory to
+                    // one batch. In catch-up mode this still permits up to 40
+                    // batches/s while backend latency applies natural pressure.
+                    tokio::time::sleep(if catching_up {
+                        CATCH_UP_PACING
+                    } else {
+                        NORMAL_FLUSH_INTERVAL
+                    })
+                    .await;
+                }
                 FlushOutcome::Failed => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                 }
@@ -110,7 +126,11 @@ impl Transport {
         }
     }
 
-    async fn flush(&self) -> FlushOutcome {
+    fn queue_depth(&self) -> usize {
+        self.buffer.lock().map_or(0, |b| b.len())
+    }
+
+    async fn flush(&self, catching_up: bool) -> FlushOutcome {
         let batch = match self.buffer.lock() {
             Ok(buf) => buf.peek_batch(MAX_BATCH_EVENTS),
             Err(e) => {
@@ -128,6 +148,7 @@ impl Transport {
         let seqs: Vec<u64> = batch.iter().map(|e| e.seq).collect();
         let events: Vec<_> = batch.iter().map(|e| e.event.clone()).collect();
 
+        let started = Instant::now();
         let response = self
             .client
             .post(&self.ingest_url)
@@ -135,6 +156,11 @@ impl Transport {
             .json(&events)
             .send()
             .await;
+        metrics().set_transport_activity(
+            n as u64,
+            started.elapsed().as_millis() as u64,
+            catching_up,
+        );
 
         match response {
             Ok(resp) if resp.status().is_success() => {
@@ -283,8 +309,10 @@ enum FlushOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{AgentEvent, EventAction, EventClass, EventData, Severity, SystemSnapshotData};
     use crate::pipeline::SpoolEntry;
+    use crate::schema::{
+        AgentEvent, EventAction, EventClass, EventData, Severity, SystemSnapshotData,
+    };
 
     fn event() -> AgentEvent {
         AgentEvent::new(
@@ -331,7 +359,10 @@ mod tests {
     fn explicitly_retryable_4xx_statuses_are_not_permanent() {
         // Retrying these is the documented, correct behaviour.
         for status in [408, 425, 429] {
-            assert!(!is_permanent(status), "{status} must be retried, not dropped");
+            assert!(
+                !is_permanent(status),
+                "{status} must be retried, not dropped"
+            );
         }
     }
 

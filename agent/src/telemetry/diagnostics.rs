@@ -90,7 +90,11 @@ pub fn render(report: &TelemetryReport, now_unix_ms: u64) -> String {
     // ── Enrichment ──────────────────────────────────────────────────────────
     if m.enrichment_attempts_total > 0 {
         let _ = writeln!(out, "\nEnrichment:");
-        let _ = writeln!(out, "  Attempts: {}", thousands(m.enrichment_attempts_total));
+        let _ = writeln!(
+            out,
+            "  Attempts: {}",
+            thousands(m.enrichment_attempts_total)
+        );
         let _ = writeln!(
             out,
             "  Field failures: {} (events kept, fields marked)",
@@ -116,10 +120,40 @@ pub fn render(report: &TelemetryReport, now_unix_ms: u64) -> String {
     let _ = writeln!(out, "  Events: {}", thousands(m.spool_events));
     let _ = writeln!(
         out,
+        "  Rates: generated {:.1}/s, acknowledged {:.1}/s",
+        m.generated_events_per_second, m.sent_events_per_second
+    );
+    let _ = writeln!(
+        out,
+        "  Oldest event: {}",
+        humanize_ms(m.spool_oldest_event_age_ms)
+    );
+    let _ = writeln!(
+        out,
         "  Used: {} of {} ({:.1}%)",
         humanize_bytes(m.spool_bytes),
         humanize_bytes(m.spool_capacity_bytes),
         m.spool_utilization() * 100.0
+    );
+    let _ = writeln!(
+        out,
+        "  Drain state: {}",
+        if !m.backend_connected && m.spool_events > 0 {
+            "transport_degraded"
+        } else if m.transport_catching_up
+            && m.generated_events_per_second > m.sent_events_per_second
+        {
+            "falling_behind"
+        } else if m.transport_catching_up {
+            "catching_up"
+        } else {
+            "healthy"
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  Last batch: {} events, request {} ms",
+        m.transport_last_batch_size, m.transport_request_latency_ms
     );
     let _ = writeln!(
         out,
@@ -217,10 +251,7 @@ pub fn render(report: &TelemetryReport, now_unix_ms: u64) -> String {
         thousands(report.sequences_issued)
     );
     if m.drops_fully_attributed() {
-        let _ = writeln!(
-            out,
-            "  Every dropped event has a recorded reason: yes"
-        );
+        let _ = writeln!(out, "  Every dropped event has a recorded reason: yes");
     } else {
         let _ = writeln!(
             out,
@@ -482,7 +513,10 @@ mod tests {
         let out = render(&r, NOW);
         assert!(out.contains("Mode: offline"));
         assert!(out.contains("not configured (offline)"));
-        assert!(!out.contains("unreachable"), "offline is not a failure:\n{out}");
+        assert!(
+            !out.contains("unreachable"),
+            "offline is not a failure:\n{out}"
+        );
     }
 
     #[test]
@@ -555,7 +589,10 @@ mod tests {
 
     #[test]
     fn boot_ids_are_shortened_for_display() {
-        assert_eq!(short_boot("abcd1234-0000-0000-0000-000000000000"), "abcd1234");
+        assert_eq!(
+            short_boot("abcd1234-0000-0000-0000-000000000000"),
+            "abcd1234"
+        );
         assert_eq!(short_boot("nodashes"), "nodashes");
         assert_eq!(short_boot(""), "");
     }

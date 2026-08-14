@@ -387,6 +387,13 @@ impl Spool {
 
     fn publish(&self) {
         metrics().set_spool_state(self.mem.len() as u64, self.bytes);
+        let age = self.mem.front().map_or(0, |entry| {
+            chrono::Utc::now()
+                .signed_duration_since(entry.event.timestamp)
+                .num_milliseconds()
+                .max(0) as u64
+        });
+        metrics().set_spool_oldest_age_ms(age);
     }
 
     fn publish_capacity(&self) {
@@ -473,7 +480,10 @@ impl Spool {
                 }
                 RecordOutcome::TruncatedTail => torn += 1,
                 RecordOutcome::UnsupportedVersion(v) => {
-                    warn!(version = v, "spool: journal record from a newer agent — skipping");
+                    warn!(
+                        version = v,
+                        "spool: journal record from a newer agent — skipping"
+                    );
                     unsupported += 1;
                 }
                 RecordOutcome::Corrupt(why) => {
@@ -538,7 +548,9 @@ impl Spool {
             };
             match journal::encode(&rec) {
                 Ok(line) => buf.extend_from_slice(&line),
-                Err(e) => warn!(error = %e, "spool: skipping unserializable entry during compaction"),
+                Err(e) => {
+                    warn!(error = %e, "spool: skipping unserializable entry during compaction")
+                }
             }
         }
 

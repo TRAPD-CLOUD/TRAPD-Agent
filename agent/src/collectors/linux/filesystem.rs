@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read as IoRead;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -76,6 +76,7 @@ const BASELINE_MAX_AGE_SECS: i64 = 86_400;
 /// modifications within MASS_MOD_WINDOW.
 const MASS_MOD_THRESHOLD: usize = 50;
 const MASS_MOD_WINDOW: Duration = Duration::from_secs(10);
+const GENERIC_COALESCE_WINDOW: Duration = Duration::from_secs(2);
 
 /// Ransomware-associated file extension suffixes (lower-case).
 const RANSOM_EXTENSIONS: &[&str] = &[
@@ -228,6 +229,7 @@ fn run_sync(
 
     // Sliding window for mass-modification (ransomware) detection.
     let mut mod_window: VecDeque<Instant> = VecDeque::new();
+    let mut recently_emitted: HashMap<(String, &'static str), Instant> = HashMap::new();
 
     let mut buf = [0u8; 4096];
     loop {
@@ -424,6 +426,9 @@ fn run_sync(
 
             // ── Basic inotify event (always emitted) ──────────────────────────
             if let Some(action) = mask_to_action(mask) {
+                if suppress_generic_event(&path, &action, &mut recently_emitted, Instant::now()) {
+                    continue;
+                }
                 if send(
                     &tx,
                     AgentEvent::new(
@@ -440,6 +445,59 @@ fn run_sync(
             }
         }
     }
+}
+
+/// Reduce low-value write amplification without touching security detections.
+/// Critical persistence/credential paths bypass both filtering and coalescing.
+fn suppress_generic_event(
+    path: &str,
+    action: &EventAction,
+    recent: &mut HashMap<(String, &'static str), Instant>,
+    now: Instant,
+) -> bool {
+    let critical = is_security_critical_path(path);
+    let noisy = path.contains("/__pycache__/")
+        || path.contains("/.cache/")
+        || path.ends_with('~')
+        || path.ends_with(".swp")
+        || path.ends_with(".tmp");
+    if noisy && !critical {
+        return true;
+    }
+    if critical {
+        return false;
+    }
+    let action_key = match action {
+        EventAction::Create => "create",
+        EventAction::Delete => "delete",
+        EventAction::Modify => "modify",
+        _ => "other",
+    };
+    let key = (path.to_string(), action_key);
+    if recent
+        .get(&key)
+        .is_some_and(|last| now.duration_since(*last) < GENERIC_COALESCE_WINDOW)
+    {
+        return true;
+    }
+    recent.insert(key, now);
+    if recent.len() > 4096 {
+        recent.retain(|_, seen| now.duration_since(*seen) < GENERIC_COALESCE_WINDOW);
+    }
+    false
+}
+
+fn is_security_critical_path(path: &str) -> bool {
+    matches!(path, "/etc/passwd" | "/etc/shadow" | "/etc/sudoers")
+        || path.starts_with("/etc/ssh/")
+        || path.contains("/.ssh/authorized_keys")
+        || path.starts_with("/etc/systemd/system/")
+        || path.starts_with("/usr/lib/systemd/system/")
+        || path.starts_with("/etc/cron")
+        || path.starts_with("/var/spool/cron/")
+        || path.starts_with("/usr/bin/")
+        || path.starts_with("/usr/sbin/")
+        || path.starts_with("/etc/trapd/")
 }
 
 /// Returns `true` if the receiver was dropped (agent shutting down).
@@ -901,5 +959,70 @@ mod tests {
     fn ignores_non_sensitive_paths() {
         assert!(inspect_sensitive_access("/etc/hostname", "cat").is_none());
         assert!(inspect_sensitive_access("/home/u/notes.txt", "vim").is_none());
+    }
+
+    #[test]
+    fn repetitive_generic_events_are_coalesced() {
+        let now = Instant::now();
+        let mut recent = HashMap::new();
+        assert!(!suppress_generic_event(
+            "/tmp/trapd-detection-test",
+            &EventAction::Modify,
+            &mut recent,
+            now
+        ));
+        assert!(suppress_generic_event(
+            "/tmp/trapd-detection-test",
+            &EventAction::Modify,
+            &mut recent,
+            now + Duration::from_millis(10)
+        ));
+        assert!(!suppress_generic_event(
+            "/tmp/trapd-detection-test",
+            &EventAction::Modify,
+            &mut recent,
+            now + GENERIC_COALESCE_WINDOW
+        ));
+    }
+
+    #[test]
+    fn critical_paths_are_never_coalesced_or_ignored() {
+        let now = Instant::now();
+        let mut recent = HashMap::new();
+        for path in [
+            "/etc/shadow",
+            "/etc/ssh/sshd_config",
+            "/home/alice/.ssh/authorized_keys",
+            "/etc/systemd/system/persist.service",
+            "/var/spool/cron/root",
+            "/usr/bin/sudo",
+        ] {
+            assert!(!suppress_generic_event(
+                path,
+                &EventAction::Modify,
+                &mut recent,
+                now
+            ));
+            assert!(!suppress_generic_event(
+                path,
+                &EventAction::Modify,
+                &mut recent,
+                now
+            ));
+        }
+    }
+
+    #[test]
+    fn cache_and_editor_artifacts_are_suppressed() {
+        let mut recent = HashMap::new();
+        let now = Instant::now();
+        for path in ["/home/a/.cache/x", "/tmp/a.swp", "/tmp/a.tmp", "/tmp/a~"] {
+            assert!(suppress_generic_event(
+                path,
+                &EventAction::Modify,
+                &mut recent,
+                now
+            ));
+        }
     }
 }
