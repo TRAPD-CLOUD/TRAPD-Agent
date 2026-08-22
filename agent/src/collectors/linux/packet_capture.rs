@@ -546,8 +546,10 @@ fn parse_client_hello(payload: &[u8]) -> Option<ClientHello> {
     p += 2;
     let cs = body.get(p..p + cs_len)?;
     let ciphers: Vec<u16> = cs
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_be_bytes(*c))
         .collect();
     p += cs_len;
     // compression_methods
@@ -600,8 +602,8 @@ fn parse_extension(ch: &mut ClientHello, etype: u16, edata: &[u8]) {
         10 => {
             if edata.len() >= 2 {
                 let list_len = u16::from_be_bytes([edata[0], edata[1]]) as usize;
-                for c in edata.get(2..2 + list_len).unwrap_or(&[]).chunks_exact(2) {
-                    ch.groups.push(u16::from_be_bytes([c[0], c[1]]));
+                for c in edata.get(2..2 + list_len).unwrap_or(&[]).as_chunks::<2>().0 {
+                    ch.groups.push(u16::from_be_bytes(*c));
                 }
             }
         }
@@ -632,9 +634,10 @@ fn parse_extension(ch: &mut ClientHello, etype: u16, edata: &[u8]) {
                 for c in edata
                     .get(1..1 + len as usize)
                     .unwrap_or(&[])
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
                 {
-                    ch.supported_versions.push(u16::from_be_bytes([c[0], c[1]]));
+                    ch.supported_versions.push(u16::from_be_bytes(*c));
                 }
             }
         }
