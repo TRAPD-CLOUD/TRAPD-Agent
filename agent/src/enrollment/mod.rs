@@ -22,14 +22,31 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::paths;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Persisted agent identity. `agent_secret` is a long-lived bearer credential
+/// (equivalent to a password) for every authenticated backend endpoint, so:
+/// - [`std::fmt::Debug`] is implemented by hand to redact it — the derived
+///   impl would print it verbatim into any `{:?}`-formatted log line.
+/// - The struct zeroizes its memory on drop ([`ZeroizeOnDrop`]) so the secret
+///   does not linger in freed heap memory for longer than necessary.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct Credentials {
     pub agent_id: String,
     pub agent_secret: String,
     pub project_id: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("agent_id", &self.agent_id)
+            .field("agent_secret", &"***")
+            .field("project_id", &self.project_id)
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -347,4 +364,40 @@ fn read_os_version() -> String {
     // e.g. "Windows 11 Pro" — same role as PRETTY_NAME on Linux.
     sysinfo::System::long_os_version()
         .unwrap_or_else(|| std::env::consts::OS.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Credentials {
+        Credentials {
+            agent_id: "agent-123".to_string(),
+            agent_secret: "top-secret-value-do-not-leak".to_string(),
+            project_id: "project-abc".to_string(),
+        }
+    }
+
+    #[test]
+    fn debug_redacts_agent_secret_but_not_other_fields() {
+        let creds = sample();
+        let debug = format!("{creds:?}");
+
+        assert!(
+            !debug.contains("top-secret-value-do-not-leak"),
+            "agent_secret must never appear in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("agent-123"),
+            "agent_id is not secret and should still be visible: {debug}"
+        );
+        assert!(
+            debug.contains("project-abc"),
+            "project_id is not secret and should still be visible: {debug}"
+        );
+        assert!(
+            debug.contains("***") || debug.to_lowercase().contains("redacted"),
+            "agent_secret field should show a redaction marker: {debug}"
+        );
+    }
 }

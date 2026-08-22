@@ -150,7 +150,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         let creds = crate::enrollment::load_or_enroll(&backend_url, &device_id, &hostname)
             .await
             .context("Failed to obtain agent credentials")?;
-        (backend_url, creds.agent_id, creds.agent_secret)
+        (backend_url, creds.agent_id.clone(), creds.agent_secret.clone())
     };
 
     let output_mode = OutputMode::from_env();

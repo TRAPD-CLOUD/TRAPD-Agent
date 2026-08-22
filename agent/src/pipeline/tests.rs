@@ -302,6 +302,27 @@ fn a_future_deadline_keeps_an_entry_ineligible() {
 // ── Durability & crash recovery ──────────────────────────────────────────────
 
 #[test]
+fn periodic_fsync_runs_well_before_compaction_threshold() {
+    // Durability must not depend on hitting COMPACT_EVERY (5,000 appends) — a
+    // much more frequent periodic fsync (every 50 appends, FSYNC_EVERY in
+    // spool.rs) is what actually bounds the crash-loss window. This exercises
+    // the fsync counter directly rather than trying to observe crash
+    // survival, which a unit test cannot do.
+    let dir = TempDir::new("periodic_fsync");
+    let mut s = Spool::durable_at(dir.journal(), 1_000);
+
+    assert_eq!(s.fsyncs_total(), 0, "no appends yet — no fsync yet");
+
+    for _ in 0..60 {
+        s.push(dummy_event()).unwrap();
+    }
+    assert!(
+        s.fsyncs_total() >= 1,
+        "a periodic fsync must have run well before the 5,000-append compaction threshold"
+    );
+}
+
+#[test]
 fn unacknowledged_events_survive_a_restart() {
     let dir = TempDir::new("restart");
     let ids: Vec<_> = {
