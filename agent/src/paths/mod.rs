@@ -21,6 +21,7 @@
 //! per-uid `/tmp` directory so the agent always has somewhere to persist its
 //! identity.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -198,8 +199,19 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     ));
 
     let write_result = (|| -> Result<()> {
-        std::fs::write(&tmp, contents).with_context(|| format!("write temp {}", tmp.display()))?;
-        set_file_mode(&tmp, mode);
+        // The temp file is created *already* restricted to `mode` — never
+        // world/group-readable for even an instant. Writing with the default
+        // (umask-derived) mode and chmod'ing afterward leaves a window where a
+        // co-resident local user can read secrets (e.g. credentials.json)
+        // mid-write.
+        let mut f = create_secure_tmp(&tmp, mode)
+            .with_context(|| format!("create secure temp {}", tmp.display()))?;
+        use std::io::Write as _;
+        f.write_all(contents)
+            .with_context(|| format!("write temp {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync temp {}", tmp.display()))?;
+        drop(f);
         std::fs::rename(&tmp, path)
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
@@ -211,11 +223,126 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     write_result
 }
 
+/// Create `path` fresh, atomically restricted to `mode` from the moment it
+/// comes into existence (a single `open(2)` with `O_CREAT|O_EXCL` and the
+/// requested mode — no separate `chmod` step, so no window where the file is
+/// readable at the umask-derived default mode).
+///
+/// Any stale leftover at `path` (e.g. from a previous crashed run) is removed
+/// first: reusing an existing file via a plain `create(true)` would silently
+/// keep its old — possibly permissive — mode bits, since `mode()` only
+/// applies when the file is actually created.
 #[cfg(target_os = "linux")]
-fn set_file_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+fn create_secure_tmp(path: &Path, mode: u32) -> std::io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let _ = std::fs::remove_file(path);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_file_mode(_path: &Path, _mode: u32) {}
+fn create_secure_tmp(path: &Path, mode: u32) -> std::io::Result<File> {
+    let _ = std::fs::remove_file(path);
+    let f = std::fs::File::create(path)?;
+    let _ = mode; // no portable mode-on-create outside unix targets
+    Ok(f)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trapd_paths_test_{}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            tag,
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The whole point of the fix: the temp file must come into existence
+    /// already restricted to `mode` (a single create-with-mode syscall), never
+    /// created world/group-readable and chmod'd afterward — that two-step
+    /// sequence is exactly the race a co-resident local user could win.
+    #[test]
+    fn create_secure_tmp_sets_mode_atomically_before_any_write() {
+        let dir = scratch_dir("atomic_mode");
+        let path = dir.join("secret.tmp");
+
+        let f = create_secure_tmp(&path, 0o600).expect("create secure tmp");
+        let mode = f.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "temp file must be created with the restricted mode directly, not chmod'd afterward"
+        );
+
+        drop(f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale temp file left over from a previous crashed run (with looser
+    /// permissions) must never be silently reused — `create(true)` without
+    /// `create_new` would keep the pre-existing (wrong) mode bits.
+    #[test]
+    fn create_secure_tmp_discards_stale_leftover_with_wrong_mode() {
+        let dir = scratch_dir("stale_leftover");
+        let path = dir.join("secret.tmp");
+
+        std::fs::write(&path, b"stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let f = create_secure_tmp(&path, 0o600).expect("create secure tmp");
+        let mode = f.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "stale leftover mode must not survive");
+
+        drop(f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_end_to_end_produces_requested_mode_and_content() {
+        let dir = scratch_dir("end_to_end");
+        let path = dir.join("credentials.json");
+
+        write_atomic(&path, b"{\"a\":1}", 0o600).expect("write_atomic");
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_tmp_file_behind_on_success() {
+        let dir = scratch_dir("no_tmp_leftover");
+        let path = dir.join("credentials.json");
+
+        write_atomic(&path, b"hello", 0o600).expect("write_atomic");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no tmp file should remain: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

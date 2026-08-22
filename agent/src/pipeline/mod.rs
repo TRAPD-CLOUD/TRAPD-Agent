@@ -11,6 +11,16 @@
 //! Delivery is **at-least-once**: the journal is compacted lazily, so a crash
 //! between "shipped" and "compacted" can replay a few already-sent events.  The
 //! backend de-duplicates on `event_id`, which every event carries.
+//!
+//! **Durability**: every appended line is `write()`d immediately, but `write()`
+//! alone only lands in the page cache — it does not survive a power loss or
+//! kernel panic until `fsync`'d. The journal is fsync'd every [`FSYNC_EVERY`]
+//! appends (independent of, and far more often than, the [`COMPACT_EVERY`]
+//! rewrite), so at most `FSYNC_EVERY - 1` events are at risk on an unclean
+//! shutdown — not up to `COMPACT_EVERY` as before. `FSYNC_EVERY` trades a
+//! little throughput (one `fsync(2)` per batch instead of per compaction) for
+//! that bound; a smaller value tightens the durability window further at a
+//! proportional fsync-rate cost.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -35,6 +45,12 @@ pub const SPOOL_MAX_DURABLE: usize = 50_000;
 /// journal to roughly the live set plus this many stale lines, and caps how
 /// many already-sent events can be replayed after a crash.
 const COMPACT_EVERY: usize = 5_000;
+
+/// Fsync the on-disk journal after this many appends, independent of
+/// compaction. Bounds how many events can be lost to an unclean shutdown (the
+/// previous behaviour bounded this by `COMPACT_EVERY` — 5,000 events — which
+/// overstated the durability the doc comment claimed).
+const FSYNC_EVERY: usize = 50;
 
 pub fn create_pipeline() -> (mpsc::Sender<AgentEvent>, mpsc::Receiver<AgentEvent>) {
     mpsc::channel(CHANNEL_CAPACITY)
@@ -62,6 +78,13 @@ pub struct Spool {
     file: Option<SpoolFile>,
     dropped_total: u64,
     appends_since_compact: usize,
+    appends_since_fsync: usize,
+    fsyncs_total: u64,
+    /// Test-only instrumentation: records which OS thread `push()` executed
+    /// on, so a test can assert the blocking journal write happened off the
+    /// async executor thread (i.e. inside `spawn_blocking`).
+    #[cfg(test)]
+    last_push_thread: Option<std::thread::ThreadId>,
 }
 
 struct SpoolFile {
@@ -79,6 +102,10 @@ impl Spool {
             file: None,
             dropped_total: 0,
             appends_since_compact: 0,
+            appends_since_fsync: 0,
+            fsyncs_total: 0,
+            #[cfg(test)]
+            last_push_thread: None,
         }
     }
 
@@ -90,7 +117,7 @@ impl Spool {
         Self::durable_at(path, max)
     }
 
-    fn durable_at(path: PathBuf, max: usize) -> Self {
+    pub(crate) fn durable_at(path: PathBuf, max: usize) -> Self {
         let mut spool = Self::in_memory(max);
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -124,9 +151,14 @@ impl Spool {
         spool
     }
 
-    /// Append an event.  Persists first (so a crash right after can't lose it),
-    /// then enforces the cap.
+    /// Append an event.  Written to the journal first (so a crash right after
+    /// can't lose it once fsync'd — see [`FSYNC_EVERY`]), then enforces the
+    /// cap.
     pub fn push(&mut self, event: AgentEvent) {
+        #[cfg(test)]
+        {
+            self.last_push_thread = Some(std::thread::current().id());
+        }
         if let Some(f) = self.file.as_mut() {
             match serde_json::to_string(&event) {
                 Ok(mut line) => {
@@ -138,6 +170,17 @@ impl Spool {
                 Err(e) => warn!(error = %e, "spool: event serialise failed"),
             }
             self.appends_since_compact += 1;
+            self.appends_since_fsync += 1;
+
+            // Fsync on a short, fixed cadence — independent of compaction —
+            // so durability does not depend on reaching COMPACT_EVERY.
+            if self.appends_since_fsync >= FSYNC_EVERY {
+                if let Err(e) = f.handle.sync_all() {
+                    warn!(error = %e, "spool: periodic journal fsync failed");
+                }
+                self.fsyncs_total += 1;
+                self.appends_since_fsync = 0;
+            }
         }
 
         self.mem.push_back(event);
@@ -177,6 +220,14 @@ impl Spool {
     /// Total events dropped because the spool was full (observability).
     pub fn dropped_total(&self) -> u64 {
         self.dropped_total
+    }
+
+    /// Total periodic fsyncs performed on the journal (observability / test
+    /// hook — proves durability does not wait for compaction). Not yet wired
+    /// into a metrics/heartbeat consumer, unlike `dropped_total`.
+    #[allow(dead_code)]
+    pub fn fsyncs_total(&self) -> u64 {
+        self.fsyncs_total
     }
 
     /// Replay a journal file into memory; returns the number of events read.
@@ -231,6 +282,9 @@ impl Spool {
                 Ok(handle) => {
                     self.file = Some(SpoolFile { path, handle });
                     self.appends_since_compact = 0;
+                    // Compaction just fsync'd the rewritten journal, so the
+                    // periodic-fsync clock also resets here.
+                    self.appends_since_fsync = 0;
                 }
                 Err(e) => {
                     warn!(error = %e, "spool: reopen after compaction failed — in-memory only");
@@ -249,6 +303,11 @@ impl Spool {
 impl Spool {
     pub fn len(&self) -> usize {
         self.mem.len()
+    }
+
+    /// Thread the most recent `push()` executed on (test-only instrumentation).
+    pub fn last_push_thread(&self) -> Option<std::thread::ThreadId> {
+        self.last_push_thread
     }
 }
 

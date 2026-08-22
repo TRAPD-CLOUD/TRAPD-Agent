@@ -10,13 +10,15 @@
 //! The metrics struct is OS-neutral so the future Windows agent reports the
 //! same shape.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use serde::Serialize;
 use sysinfo::{Disks, System};
 use tokio::time::{interval, Duration};
 use tracing::{debug, warn};
+
+use crate::pipeline::Spool;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -45,6 +47,19 @@ struct Metrics {
     load_avg: [f64; 3],
     uptime_secs: u64,
     process_count: usize,
+    /// Total events dropped from the backend outbox because the spool was
+    /// full (backend unreachable / falling behind) — see
+    /// `pipeline::Spool::dropped_total`. Surfaced here so operators can see
+    /// telemetry loss on the backend/dashboard side, not just in agent logs.
+    spool_dropped_total: u64,
+}
+
+/// Attach the spool's cumulative dropped-event count to a sampled `Metrics`.
+/// Pulled out as a small pure step so it is unit-testable without the
+/// network client `Heartbeat::new` requires.
+fn attach_spool_metrics(mut metrics: Metrics, spool: &Mutex<Spool>) -> Metrics {
+    metrics.spool_dropped_total = spool.lock().map(|s| s.dropped_total()).unwrap_or(0);
+    metrics
 }
 
 pub struct Heartbeat {
@@ -55,6 +70,9 @@ pub struct Heartbeat {
     hostname: String,
     /// `System` is reused across beats so CPU deltas are meaningful.
     sys: Mutex<System>,
+    /// Backend outbox — read-only here, to surface `dropped_total()` on the
+    /// beat so operators see telemetry loss on the backend side too.
+    spool: Arc<Mutex<Spool>>,
 }
 
 impl Heartbeat {
@@ -63,6 +81,7 @@ impl Heartbeat {
         agent_id: String,
         token: String,
         hostname: String,
+        spool: Arc<Mutex<Spool>>,
     ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
         Ok(Self {
@@ -72,6 +91,7 @@ impl Heartbeat {
             agent_id,
             hostname,
             sys: Mutex::new(System::new()),
+            spool,
         })
     }
 
@@ -84,7 +104,7 @@ impl Heartbeat {
     }
 
     async fn send(&self) {
-        let metrics = self.sample_metrics();
+        let metrics = attach_spool_metrics(self.sample_metrics(), &self.spool);
         let payload = HeartbeatPayload {
             agent_id: self.agent_id.clone(),
             hostname: self.hostname.clone(),
@@ -150,6 +170,7 @@ impl Heartbeat {
             load_avg: [load.one, load.five, load.fifteen],
             uptime_secs: System::uptime(),
             process_count: proc_count,
+            spool_dropped_total: 0, // filled in by attach_spool_metrics below
         }
     }
 }
@@ -186,5 +207,69 @@ fn count_processes() -> usize {
             })
             .count(),
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_field_serializes_as_spool_dropped_total() {
+        let metrics = Metrics {
+            spool_dropped_total: 42,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&metrics).unwrap();
+        assert_eq!(json["spool_dropped_total"], 42);
+    }
+
+    #[test]
+    fn attach_spool_metrics_surfaces_the_spools_dropped_total() {
+        let spool = Mutex::new(Spool::in_memory(2));
+        {
+            let mut s = spool.lock().unwrap();
+            for _ in 0..5 {
+                s.push(dummy_event());
+            }
+        }
+        assert_eq!(
+            spool.lock().unwrap().dropped_total(),
+            3,
+            "sanity: 5 pushes into a cap-2 spool drop 3"
+        );
+
+        let metrics = attach_spool_metrics(Metrics::default(), &spool);
+        assert_eq!(metrics.spool_dropped_total, 3);
+    }
+
+    #[test]
+    fn attach_spool_metrics_reports_zero_when_nothing_dropped() {
+        let spool = Mutex::new(Spool::in_memory(10));
+        spool.lock().unwrap().push(dummy_event());
+        let metrics = attach_spool_metrics(Metrics::default(), &spool);
+        assert_eq!(metrics.spool_dropped_total, 0);
+    }
+
+    fn dummy_event() -> crate::schema::AgentEvent {
+        crate::schema::AgentEvent::new(
+            uuid::Uuid::new_v4().to_string(),
+            "test-host".to_string(),
+            crate::schema::EventClass::System,
+            crate::schema::EventAction::Snapshot,
+            crate::schema::Severity::Info,
+            crate::schema::EventData::SystemSnapshot(crate::schema::SystemSnapshotData {
+                os: "Linux".to_string(),
+                kernel: "6.0.0".to_string(),
+                distro: "Test".to_string(),
+                cpu_count: 1,
+                cpu_usage_pct: 0.0,
+                memory_total_mb: 1024,
+                memory_used_mb: 512,
+                memory_free_mb: 512,
+                uptime_secs: 100,
+                load_avg: [0.0, 0.0, 0.0],
+            }),
+        )
     }
 }

@@ -144,6 +144,29 @@ fn compaction_reconciles_shipped_events() {
 }
 
 #[test]
+fn periodic_fsync_runs_well_before_compaction_threshold() {
+    // Durability must not depend on hitting COMPACT_EVERY (5_000 appends) — a
+    // periodic fsync, on a much smaller cadence, is the actual durability
+    // guarantee. This exercises the fsync counter directly rather than trying
+    // to observe crash survival (which a unit test cannot do).
+    let path = tmp_journal("periodic_fsync");
+    let mut s = Spool::durable_at(path.clone(), 1_000);
+
+    assert_eq!(s.fsyncs_total(), 0, "no appends yet — no fsync yet");
+
+    for _ in 0..super::FSYNC_EVERY {
+        s.push(dummy_event());
+    }
+    assert!(
+        s.fsyncs_total() >= 1,
+        "a periodic fsync must have run well before the {}-append compaction threshold",
+        super::COMPACT_EVERY
+    );
+
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
 fn durable_spool_enforces_cap_across_reload() {
     let path = tmp_journal("cap");
     {

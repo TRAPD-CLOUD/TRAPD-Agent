@@ -22,14 +22,31 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::paths;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Persisted agent identity. `agent_secret` is a long-lived bearer credential
+/// (equivalent to a password) for every authenticated backend endpoint, so:
+/// - [`std::fmt::Debug`] is implemented by hand to redact it — the derived
+///   impl would print it verbatim into any `{:?}`-formatted log line.
+/// - The struct zeroizes its memory on drop ([`ZeroizeOnDrop`]) so the secret
+///   does not linger in freed heap memory for longer than necessary.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct Credentials {
     pub agent_id: String,
     pub agent_secret: String,
     pub project_id: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("agent_id", &self.agent_id)
+            .field("agent_secret", &"***")
+            .field("project_id", &self.project_id)
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -149,7 +166,8 @@ pub async fn load_or_enroll(
                         );
                     }
                 }
-                let delay = retry_after.unwrap_or_else(|| backoff(attempt));
+                let delay = retry_after
+                    .unwrap_or_else(|| crate::backoff::backoff(attempt, BACKOFF_BASE, BACKOFF_MAX));
                 warn!(
                     attempt,
                     retry_in_secs = delay.as_secs(),
@@ -283,35 +301,6 @@ fn max_attempts_from_env() -> Option<u32> {
     }
 }
 
-/// Capped exponential backoff with CSPRNG jitter.
-fn backoff(attempt: u32) -> Duration {
-    let exp = BACKOFF_BASE.saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1).min(16)));
-    let capped = exp.min(BACKOFF_MAX);
-    // Add up to ~1s of jitter so a fleet of agents restarting together (e.g.
-    // after a power event) does not clump into the same sub-second retry
-    // window. Drawn from the OS CSPRNG rather than the wall clock, which would
-    // be near-identical across machines that boot together.
-    capped + Duration::from_millis(jitter_ms())
-}
-
-/// Uniform-ish jitter in `[0, 1000)` ms from the OS CSPRNG, falling back to the
-/// wall clock if the RNG is somehow unavailable (never fails the backoff).
-fn jitter_ms() -> u64 {
-    let mut buf = [0u8; 8];
-    let raw = match getrandom::fill(&mut buf) {
-        Ok(()) => u64::from_le_bytes(buf),
-        Err(_) => now_nanos() as u64,
-    };
-    raw % 1000
-}
-
-fn now_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
 fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
     let val = resp.headers().get(reqwest::header::RETRY_AFTER)?;
     let s = val.to_str().ok()?;
@@ -328,4 +317,40 @@ fn read_os_version() -> String {
                 .map(|l| l["PRETTY_NAME=".len()..].trim_matches('"').to_string())
         })
         .unwrap_or_else(|| "Linux".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Credentials {
+        Credentials {
+            agent_id: "agent-123".to_string(),
+            agent_secret: "top-secret-value-do-not-leak".to_string(),
+            project_id: "project-abc".to_string(),
+        }
+    }
+
+    #[test]
+    fn debug_redacts_agent_secret_but_not_other_fields() {
+        let creds = sample();
+        let debug = format!("{creds:?}");
+
+        assert!(
+            !debug.contains("top-secret-value-do-not-leak"),
+            "agent_secret must never appear in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("agent-123"),
+            "agent_id is not secret and should still be visible: {debug}"
+        );
+        assert!(
+            debug.contains("project-abc"),
+            "project_id is not secret and should still be visible: {debug}"
+        );
+        assert!(
+            debug.contains("***") || debug.to_lowercase().contains("redacted"),
+            "agent_secret field should show a redaction marker: {debug}"
+        );
+    }
 }

@@ -5,6 +5,7 @@ use tokio::fs;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod backoff;
 mod collectors;
 mod config;
 mod deception;
@@ -113,7 +114,8 @@ async fn main() -> Result<()> {
             .context("Failed to obtain agent credentials")?;
         let agent_id = creds.agent_id.clone();
         let token = creds.agent_secret.clone();
-        (backend_url, agent_id, token, creds.project_id)
+        let project_id = creds.project_id.clone();
+        (backend_url, agent_id, token, project_id)
     };
 
     let output_mode = OutputMode::from_env();
@@ -356,7 +358,13 @@ async fn main() -> Result<()> {
         }));
         tokio::spawn(async move { config_puller.run().await });
 
-        let heartbeat = Heartbeat::new(&backend_url, agent_id.clone(), token, hostname.clone())?;
+        let heartbeat = Heartbeat::new(
+            &backend_url,
+            agent_id.clone(),
+            token,
+            hostname.clone(),
+            Arc::clone(&ring_buffer),
+        )?;
         tokio::spawn(async move { heartbeat.run().await });
     }
 
@@ -381,9 +389,20 @@ async fn handle_event(event: &schema::AgentEvent, mode: &OutputMode, buf: &Arc<M
     if let Err(err) = write_event(event, mode).await {
         error!("Failed to write event: {err}");
     }
-    match buf.lock() {
-        Ok(mut b) => b.push(event.clone()),
+    // Spool::push() does synchronous disk I/O (journal append, and
+    // periodically an fsync — see pipeline::FSYNC_EVERY). handle_event runs
+    // inside the single async consumer task, so doing that inline would block
+    // the executor thread and stall every other task on it; offload it to the
+    // blocking thread pool instead.
+    let buf = Arc::clone(buf);
+    let event = event.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || match buf.lock() {
+        Ok(mut b) => b.push(event),
         Err(e) => error!("Ring buffer mutex poisoned: {e}"),
+    })
+    .await
+    {
+        error!("spool push task panicked: {e}");
     }
 }
 
@@ -668,6 +687,68 @@ mod tests {
         }
         std::env::remove_var("TRAPD_TEST_FLAG2");
         assert!(!env_truthy("TRAPD_DEFINITELY_UNSET_VAR_XYZ"));
+    }
+
+    fn dummy_event() -> schema::AgentEvent {
+        schema::AgentEvent::new(
+            Uuid::new_v4().to_string(),
+            "test-host".to_string(),
+            schema::EventClass::System,
+            schema::EventAction::Snapshot,
+            schema::Severity::Info,
+            schema::EventData::SystemSnapshot(schema::SystemSnapshotData {
+                os: "Linux".to_string(),
+                kernel: "6.0.0".to_string(),
+                distro: "Test".to_string(),
+                cpu_count: 1,
+                cpu_usage_pct: 0.0,
+                memory_total_mb: 1024,
+                memory_used_mb: 512,
+                memory_free_mb: 512,
+                uptime_secs: 100,
+                load_avg: [0.0, 0.0, 0.0],
+            }),
+        )
+    }
+
+    /// `handle_event` runs inside the single async consumer task; the spool
+    /// journal append is synchronous disk I/O (`std::fs::write`/`sync_all`)
+    /// and must not run directly on the async executor thread, or it starves
+    /// every other task on a busy agent. On a `current_thread` runtime the
+    /// test body and the executor are the same OS thread, so if the push
+    /// happened inline it would be observed on `executor_thread`; wrapped in
+    /// `spawn_blocking` it runs on a separate blocking-pool thread instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_event_offloads_spool_push_off_the_async_executor_thread() {
+        let executor_thread = std::thread::current().id();
+
+        let dir = std::env::temp_dir().join(format!(
+            "trapd_handle_event_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let spool = Spool::durable_at(dir.join("queue.ndjson"), 10);
+        let buf: Arc<Mutex<Spool>> = Arc::new(Mutex::new(spool));
+
+        let event = dummy_event();
+        handle_event(&event, &OutputMode::Stdout, &buf).await;
+
+        let pushed_thread = buf.lock().unwrap().last_push_thread();
+        assert_eq!(
+            buf.lock().unwrap().len(),
+            1,
+            "event must still land in the spool"
+        );
+        assert_ne!(
+            pushed_thread,
+            Some(executor_thread),
+            "spool push must run off the async executor thread (spawn_blocking), not inline"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

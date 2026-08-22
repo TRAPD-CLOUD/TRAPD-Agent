@@ -7,13 +7,31 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 use tracing::{debug, warn};
 
 use crate::pipeline::Spool;
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const BATCH_SIZE: usize = 100;
+
+// ── Retry-after-failure backoff tuning ─────────────────────────────────────
+// Steady-state (no failures) cadence stays FLUSH_INTERVAL; only a failed
+// flush escalates the wait, mirroring crate::enrollment's capped exponential
+// backoff + jitter so a fleet whose backend is down doesn't hammer it on a
+// fixed 5s ticker forever.
+const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(5);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(120);
+
+/// Delay before the next flush attempt, given how many consecutive flushes
+/// have just failed (`0` = steady state / just succeeded or nothing to send).
+fn next_delay(consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        FLUSH_INTERVAL
+    } else {
+        crate::backoff::backoff(consecutive_failures, RETRY_BACKOFF_BASE, RETRY_BACKOFF_MAX)
+    }
+}
 
 pub struct Transport {
     buffer: Arc<Mutex<Spool>>,
@@ -42,27 +60,38 @@ impl Transport {
     }
 
     pub async fn run(self) {
-        let mut ticker = interval(FLUSH_INTERVAL);
+        // A plain sleep-then-flush loop rather than a fixed `interval` ticker:
+        // the steady-state wait is still FLUSH_INTERVAL, but a failed flush
+        // escalates the wait via `next_delay` instead of retrying on the same
+        // fixed 5s cadence forever (which just hammers a downed backend).
+        let mut consecutive_failures: u32 = 0;
         loop {
-            ticker.tick().await;
-            self.flush().await;
+            tokio::time::sleep(next_delay(consecutive_failures)).await;
+            if self.flush().await {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
         }
     }
 
-    async fn flush(&self) {
+    /// Attempt one flush. Returns `true` on success (or nothing to send —
+    /// there is no failure to back off from), `false` on a failure that
+    /// should trigger backoff before the next attempt.
+    async fn flush(&self) -> bool {
         let batch = {
             let buf = match self.buffer.lock() {
                 Ok(b) => b,
                 Err(e) => {
                     warn!("Transport: ring buffer mutex poisoned: {e}");
-                    return;
+                    return true;
                 }
             };
             buf.peek_batch(BATCH_SIZE)
         };
 
         if batch.is_empty() {
-            return;
+            return true;
         }
 
         let n = batch.len();
@@ -87,16 +116,62 @@ impl Transport {
                     }
                 };
                 debug!("Transport: flushed {n} events to backend (spool dropped_total={dropped})");
+                true
             }
             Ok(resp) => {
                 warn!(
                     "Transport: backend returned {status} — leaving {n} events in buffer",
                     status = resp.status()
                 );
+                false
             }
             Err(e) => {
                 warn!("Transport: request failed ({e}) — leaving {n} events in buffer");
+                false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steady_state_uses_the_fixed_flush_interval() {
+        assert_eq!(next_delay(0), FLUSH_INTERVAL);
+    }
+
+    #[test]
+    fn failure_escalates_beyond_the_flush_interval_and_grows() {
+        let d1 = next_delay(1);
+        let d2 = next_delay(2);
+        let d3 = next_delay(3);
+        assert!(
+            d1 >= FLUSH_INTERVAL,
+            "first retry must be >= steady-state interval"
+        );
+        assert!(d2 > d1, "backoff must grow between consecutive failures");
+        assert!(d3 > d2, "backoff must keep growing");
+    }
+
+    #[test]
+    fn failure_backoff_is_capped() {
+        for n in [10, 50, 1000, u32::MAX] {
+            let d = next_delay(n);
+            assert!(
+                d < RETRY_BACKOFF_MAX + Duration::from_secs(1),
+                "attempt {n}: {d:?} must stay within max + jitter"
+            );
+        }
+    }
+
+    #[test]
+    fn recovering_resets_to_steady_state() {
+        // After some failures, a success brings consecutive_failures back to
+        // 0 — the caller (Transport::run) is responsible for that reset; here
+        // we just confirm next_delay(0) always returns to steady state.
+        let _ = next_delay(5);
+        assert_eq!(next_delay(0), FLUSH_INTERVAL);
     }
 }
