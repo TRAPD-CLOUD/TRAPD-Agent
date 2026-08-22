@@ -37,8 +37,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install bpf-linker
-        run: cargo install bpf-linker
+      # `cargo install bpf-linker` builds bpf-linker from source, which links
+      # against a specific LLVM version via llvm-sys and needs a matching
+      # `llvm-config` on PATH — something the GitHub-hosted runner image does
+      # not reliably provide (it broke silently after a runner image update).
+      # bpf-linker's own docs recommend installing a prebuilt binary release
+      # instead: https://github.com/aya-rs/bpf-linker#installation.
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Install bpf-linker (prebuilt binary)
+        run: cargo binstall --no-confirm bpf-linker
 
       # Blocking: a verifier/compile failure in any eBPF program fails the PR.
       - name: Build eBPF programs (release)
