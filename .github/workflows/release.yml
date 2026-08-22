@@ -88,6 +88,11 @@ jobs:
           # The eBPF crate redirects its target-dir to ../target (root) via
           # trapd-agent-ebpf/.cargo/config.toml, so the artifact lands here:
           cp target/bpfel-unknown-none/release/trapd-agent-exec trapd-agent-exec
+          # Published as its own release asset (not generated inline by
+          # install.sh) so trapd-update's self-refresh step can fetch and
+          # verify the current version of itself on every run — see the
+          # comment at the top of deploy/trapd-update.sh.
+          cp deploy/trapd-update.sh trapd-update.sh
 
       - name: Generate SHA256 checksums
         run: |
@@ -98,10 +103,12 @@ jobs:
           sha256sum trapd-agent-linux-x86_64       > trapd-agent-linux-x86_64.sha256
           sha256sum trapd-agent-windows-x86_64.exe > trapd-agent-windows-x86_64.exe.sha256
           sha256sum trapd-agent-exec               > trapd-agent-exec.sha256
+          sha256sum trapd-update.sh                > trapd-update.sh.sha256
           sha256sum \
             trapd-agent-linux-x86_64 \
             trapd-agent-windows-x86_64.exe \
             trapd-agent-exec \
+            trapd-update.sh \
             sbom-trapd-agent.cdx.json \
             sbom-trapd-agent-ebpf.cdx.json > SHA256SUMS
           cat SHA256SUMS
@@ -116,6 +123,8 @@ jobs:
             trapd-agent-windows-x86_64.exe.sha256
             trapd-agent-exec
             trapd-agent-exec.sha256
+            trapd-update.sh
+            trapd-update.sh.sha256
             sbom-trapd-agent.cdx.json
             sbom-trapd-agent-ebpf.cdx.json
             SHA256SUMS

@@ -240,97 +240,20 @@ SystemCallArchitectures=native
 WantedBy=multi-user.target
 EOF
 
-# ── Write trapd-update script ────────────────────────────────────────────────
-cat > "$UPDATE_BIN" <<UPDATER
-#!/usr/bin/env bash
-set -euo pipefail
-
-REPO="${REPO}"
-BINARY_NAME="${BINARY_NAME}"
-EBPF_BINARY_NAME="${EBPF_BINARY_NAME}"
-INSTALL_BIN="${INSTALL_BIN}"
-EBPF_INSTALL_DIR="${EBPF_INSTALL_DIR}"
-EBPF_INSTALL_BIN="${EBPF_INSTALL_BIN}"
-CONFIG_DIR="${ENV_DIR}"
-
-log() { echo "\$(date -u +"%Y-%m-%dT%H:%M:%SZ") trapd-update: \$*"; }
-
-# Verify a downloaded artifact against its published SHA256 before installing it
-# as root.  A missing or mismatching checksum aborts the update so a tampered
-# release asset can never replace the running agent binary.
-verify_checksum() {
-    local file="\$1" sums_url="\$2" sums_file
-    sums_file="\$(mktemp)"
-    if ! curl -fsSL "\$sums_url" -o "\$sums_file"; then
-        rm -f "\$sums_file"
-        log "ERROR: could not download checksum (\$sums_url) — refusing unverified binary." >&2
-        exit 1
-    fi
-    local expected actual
-    expected="\$(awk '{print \$1}' "\$sums_file" | head -1)"
-    actual="\$(sha256sum "\$file" | awk '{print \$1}')"
-    rm -f "\$sums_file"
-    if [[ -z "\$expected" || "\$expected" != "\$actual" ]]; then
-        log "ERROR: SHA256 mismatch for \${file##*/} — binary may have been tampered with." >&2
-        exit 1
-    fi
-}
-
-LATEST_TAG=\$(curl -sf "https://api.github.com/repos/\${REPO}/releases/latest" \\
-    | grep '"tag_name"' \\
-    | head -1 \\
-    | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-
-if [[ -z "\$LATEST_TAG" ]]; then
-    log "ERROR: Could not fetch latest release tag." >&2
-    exit 1
-fi
-
-# `trapd-agent --version` prints "trapd-agent v0.4.0"; take field 2 and strip the
-# leading "v" so it compares cleanly against the de-prefixed release tag below.
-# Without the strip, "v0.4.0" never equals "0.4.0" and the gate re-downloads daily.
-CURRENT_VERSION=\$("\$INSTALL_BIN" --version 2>/dev/null | awk '{print \$2}' | sed 's/^v//' || echo "unknown")
-LATEST_VERSION="\${LATEST_TAG#v}"
-
-if [[ "\$CURRENT_VERSION" == "\$LATEST_VERSION" ]]; then
-    log "Already up to date (\$CURRENT_VERSION)."
-    exit 0
-fi
-
-log "Updating \$CURRENT_VERSION → \$LATEST_TAG..."
-
-DOWNLOAD_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${BINARY_NAME}"
-TMP_BINARY="\$(mktemp /tmp/trapd-agent.XXXXXXXX)"
-curl -fL "\$DOWNLOAD_URL" -o "\$TMP_BINARY"
-verify_checksum "\$TMP_BINARY" "\${DOWNLOAD_URL}.sha256"
-chmod +x "\$TMP_BINARY"
-mv -f "\$TMP_BINARY" "\$INSTALL_BIN"
-
-# Refresh the self-integrity baseline to the freshly installed (and already
-# checksum-verified) binary. Without this, the agent's selfprotect::binary_integrity
-# check reads the OLD baseline at \${CONFIG_DIR}/binary.sha256, sees its own legit
-# update as a "BINARY INTEGRITY VIOLATION", and refuses to start (crash loop).
-# The download above is verified against the release .sha256, so this baseline is
-# anchored to a trusted artifact — it does not weaken tamper detection at rest.
-mkdir -p "\$CONFIG_DIR"
-echo "sha256:\$(sha256sum "\$INSTALL_BIN" | awk '{print \$1}')" > "\$CONFIG_DIR/binary.sha256"
-chmod 600 "\$CONFIG_DIR/binary.sha256"
-
-EBPF_URL="https://github.com/\${REPO}/releases/download/\${LATEST_TAG}/\${EBPF_BINARY_NAME}"
-TMP_EBPF="\$(mktemp /tmp/trapd-agent-exec.XXXXXXXX)"
-if curl -fL "\$EBPF_URL" -o "\$TMP_EBPF" 2>/dev/null; then
-    verify_checksum "\$TMP_EBPF" "\${EBPF_URL}.sha256"
-    chmod 644 "\$TMP_EBPF"
-    mkdir -p "\$EBPF_INSTALL_DIR"
-    mv -f "\$TMP_EBPF" "\$EBPF_INSTALL_BIN"
-    log "eBPF binary updated."
-fi
-
-systemctl restart trapd-agent
-log "Updated to \${LATEST_TAG}."
-UPDATER
-
-chmod +x "$UPDATE_BIN"
+# ── Install trapd-update script ──────────────────────────────────────────────
+# Downloaded from the release (like the agent binary) rather than generated
+# inline: a copy baked in once at install time would never pick up bug fixes
+# made to the updater logic itself, on hosts that installed before the fix
+# shipped. deploy/trapd-update.sh re-fetches and replaces itself on every run
+# for the same reason — see the comment at the top of that file.
+UPDATE_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/trapd-update.sh"
+TMP_UPDATE="$(mktemp /tmp/trapd-update.XXXXXXXX)"
+echo "Downloading trapd-update.sh..."
+curl -fL "$UPDATE_URL" -o "$TMP_UPDATE"
+verify_checksum "$TMP_UPDATE" "${UPDATE_URL}.sha256"
+chmod +x "$TMP_UPDATE"
+mv -f "$TMP_UPDATE" "$UPDATE_BIN"
+echo "Installed to ${UPDATE_BIN}"
 
 # ── Write update service + timer ─────────────────────────────────────────────
 cat > "$UPDATE_SERVICE_FILE" <<'EOF'
