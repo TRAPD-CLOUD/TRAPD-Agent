@@ -15,6 +15,15 @@
 //! discard because `event_id` is stable across retries and restarts. Exactly-once
 //! would require distributed consensus for no operational gain.
 //!
+//! **Durability window.** Compaction rewrites and fsyncs the whole journal
+//! every [`COMPACT_EVERY`] appends (5,000) — a `write()` alone only lands in
+//! the kernel page cache, so an unclean shutdown (power loss, kernel panic,
+//! `SIGKILL`) between two compactions could otherwise lose up to that many
+//! already-accepted events. A separate, much shorter [`FSYNC_EVERY`] cadence
+//! fsyncs just the open journal file (no rewrite) far more often than
+//! compaction runs, bounding that window without paying compaction's cost on
+//! every batch.
+//!
 //! ## Overflow policy
 //!
 //! When the queue is full the **oldest** event is evicted, counted as
@@ -58,6 +67,11 @@ pub const SPOOL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// Compact the journal after this many appends.
 const COMPACT_EVERY: usize = 5_000;
 
+/// Fsync the open journal file after this many appends, independent of (and
+/// far more often than) [`COMPACT_EVERY`] — see the module-level durability
+/// note above.
+const FSYNC_EVERY: usize = 50;
+
 /// A queued event and its delivery state.
 #[derive(Debug, Clone)]
 pub struct SpoolEntry {
@@ -98,6 +112,13 @@ pub struct Spool {
     dropped_total: u64,
     corrupt_records: u64,
     appends_since_compact: usize,
+    appends_since_fsync: usize,
+    fsyncs_total: u64,
+    /// Test-only instrumentation: records which OS thread `push()` executed
+    /// on, so a test can assert the blocking journal write happened off the
+    /// async executor thread (i.e. inside `spawn_blocking`).
+    #[cfg(test)]
+    last_push_thread: Option<std::thread::ThreadId>,
 }
 
 impl Spool {
@@ -115,6 +136,10 @@ impl Spool {
             dropped_total: 0,
             corrupt_records: 0,
             appends_since_compact: 0,
+            appends_since_fsync: 0,
+            fsyncs_total: 0,
+            #[cfg(test)]
+            last_push_thread: None,
         };
         // Publish immediately: a capacity of zero in the diagnostics report
         // would make every utilization reading meaningless.
@@ -195,6 +220,10 @@ impl Spool {
     /// accepted. An `Err` here is always counted — there is no path that
     /// discards an event without naming why.
     pub fn push(&mut self, event: AgentEvent) -> Result<u64, DropReason> {
+        #[cfg(test)]
+        {
+            self.last_push_thread = Some(std::thread::current().id());
+        }
         let seq = self.next_seq;
 
         let record = JournalRecord {
@@ -290,6 +319,18 @@ impl Spool {
             return;
         }
         self.appends_since_compact += 1;
+        self.appends_since_fsync += 1;
+
+        // `write()` alone only reaches the page cache — fsync on a short,
+        // fixed cadence independent of compaction so durability does not wait
+        // for COMPACT_EVERY (see the module-level durability note).
+        if self.appends_since_fsync >= FSYNC_EVERY {
+            if let Err(e) = f.handle.sync_all() {
+                warn!(error = %e, "spool: periodic journal fsync failed");
+            }
+            self.fsyncs_total += 1;
+            self.appends_since_fsync = 0;
+        }
     }
 
     // ── Consumer side ────────────────────────────────────────────────────────
@@ -566,6 +607,9 @@ impl Spool {
                 Ok(handle) => {
                     self.file = Some(JournalFile { path, handle });
                     self.appends_since_compact = 0;
+                    // Compaction just fsync'd the rewritten journal, so the
+                    // periodic-fsync clock also resets here.
+                    self.appends_since_fsync = 0;
                 }
                 Err(e) => {
                     warn!(error = %e, "spool: reopen after compaction failed — memory only");
@@ -624,6 +668,20 @@ impl Spool {
     /// Journal records that failed checksum validation during recovery.
     pub fn corrupt_records(&self) -> u64 {
         self.corrupt_records
+    }
+
+    /// Periodic journal fsyncs performed independent of compaction — proves
+    /// durability does not wait for [`COMPACT_EVERY`] (see the module-level
+    /// durability note and [`FSYNC_EVERY`]).
+    pub fn fsyncs_total(&self) -> u64 {
+        self.fsyncs_total
+    }
+
+    /// Thread the most recent `push()` executed on (test-only instrumentation
+    /// for asserting blocking journal I/O runs off the async executor).
+    #[cfg(test)]
+    pub fn last_push_thread(&self) -> Option<std::thread::ThreadId> {
+        self.last_push_thread
     }
 
     /// True when the queue lost its on-disk backing and is running in memory.

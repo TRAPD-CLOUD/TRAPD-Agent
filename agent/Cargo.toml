@@ -30,6 +30,7 @@ base64             = "0.22"
 globset            = "0.4"
 ipnet              = { version = "2", features = ["serde"] }
 getrandom          = "0.3"
+zeroize            = { version = "1", features = ["derive"] }
 
 # Optional YARA file-scanning support — enable with `--features yara`.
 # Requires the libyara C library + headers at build time; off by default so the
