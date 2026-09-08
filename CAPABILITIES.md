@@ -67,6 +67,9 @@ the hard part, and that is what is measured.
 | Hidden processes | `/proc` listing · direct `/proc/<pid>` · `kill(pid,0)` liveness · eBPF exec/fork PIDs | `rootkit.process_hidden_from_listing`, `rootkit.process_hidden_from_procfs` |
 | Hidden sockets | `/proc/net/{tcp,tcp6,udp,udp6}` · `sock_diag` netlink · eBPF bind sightings | `rootkit.socket_hidden_from_procfs`, `rootkit.listener_hidden_from_host_views` |
 | Kernel modules | `/proc/modules` · `/sys/module` · eBPF `module_load` · `/lib/modules/<release>` | `rootkit.module_hidden_from_proc_modules`, `rootkit.module_hidden_after_load`, `rootkit.module_not_in_module_tree`, `rootkit.module_unsigned`, `rootkit.module_unloaded`, `rootkit.known_rootkit_module`, `rootkit.module_file_changed`, `rootkit.module_tree_bulk_change` |
+| Hidden files & directories | libc `readdir` · raw `getdents64` · directory `st_nlink` · names from eBPF writes/unlinks/renames, `/proc/<pid>/fd` and `/proc/<pid>/maps` | `rootkit.file_hidden_from_listing`, `rootkit.dir_entry_hidden_from_libc`, `rootkit.subdirectory_hidden_from_listing`, `rootkit.file_listing_inconsistent` |
+| Hidden mounts | `/proc/mounts` · `/proc/self/mountinfo` · `/proc/self/mountstats` | `rootkit.mount_hidden_from_interface`, `rootkit.file_shadowed_by_mount` |
+| Unrecorded logins | `/var/run/utmp` · login sessions reconstructed from `/proc` | `rootkit.login_session_hidden_from_utmp` |
 | System binaries | on-disk digest · the digest the distribution's package database records | `rootkit.system_binary_tampered`, `rootkit.system_binary_changed`, `rootkit.system_binary_shadowed`, `rootkit.system_binaries_bulk_change`, `rootkit.ld_preload_configured` |
 
 Findings are ordinary `class=detection` / `action=detected` events with
@@ -82,6 +85,35 @@ package database (`dpkg` md5sums, `rpm --verify`) — the only source that can
 tell an upgrade from tampering, because after an upgrade the file changed *and*
 still matches its package.
 
+**Hiding a file is the most common thing a rootkit does,** and it is done by
+filtering directory reads. The file itself is untouched, so three separate
+invariants still hold and each catches a different layer of the lie:
+
+* **Directory link count.** `st_nlink` on a directory is `2` plus one per
+  subdirectory, maintained by the filesystem as an inode field rather than by
+  the code that answers directory reads. A deficit against the listed
+  subdirectories finds a hidden *directory* with **no candidate name at all**,
+  which is the only check that can find something nobody has touched. Run only
+  on ext2/3/4, XFS and tmpfs; btrfs reports `1` for every directory and
+  overlayfs does not maintain it, so there it is skipped rather than left to
+  fire constantly.
+* **libc `readdir` vs. raw `getdents64`.** The same directory, enumerated
+  through deliberately different code. A name the syscall returns and libc does
+  not localises the compromise to userspace — an `/etc/ld.so.preload` rootkit
+  can only interpose the library call.
+* **A known name vs. its parent's listing.** `lstat` answers directly and never
+  consults the listing, so a file that stats but is absent from its directory
+  is hidden. The difficulty is *getting* the name, since a filtered listing
+  will not supply it; the names come from eBPF-observed writes, creates,
+  unlinks and renames (below anything userspace can hook), from the targets of
+  every open descriptor in `/proc/<pid>/fd` (rootkits keep their files open)
+  and from file-backed regions in `/proc/<pid>/maps` (a preloaded library is
+  mapped even when it is not open).
+
+Overlayfs is treated as comparable for *listings* while being excluded from the
+link-count check: it is what a container's root filesystem usually is, so
+excluding it outright would disable the detector exactly where containers run.
+
 **False positives are the design constraint,** since the value of a rootkit
 alert is that it is worth waking someone for:
 
@@ -91,6 +123,9 @@ alert is that it is worth waking someone for:
 | Corroboration | a standing disagreement must survive consecutive sweeps; transition findings (unload, digest change) report immediately because they exist in exactly one sweep |
 | Bulk collapse | a kernel package update or system upgrade becomes one `Low` finding instead of hundreds of `Critical` ones |
 | Namespace guard | the eBPF cross-view is dropped when the agent is not in the initial PID namespace, where host PIDs cannot be compared against a namespaced `/proc` |
+| Bracketed reads | a candidate file is `lstat`-ed before *and* after its directory listing and must show the same inode both times, so a file created or deleted around the read cannot look concealed |
+| Filesystem eligibility | the synthetic trees (`/proc`, `/sys`, cgroup, …) and the filesystems answered by something other than local disk (FUSE, NFS, CIFS) are excluded from listing comparisons they cannot answer |
+| Named exclusions | the file-level mounts every container runtime creates (`/etc/hosts`, `/etc/resolv.conf`, projected secrets) are excluded by name; a login session must descend from `sshd`/`login`/`getty`, which is what keeps `tmux` panes and `docker exec` out |
 
 | Capability | Status | Notes |
 |------------|--------|-------|
@@ -98,9 +133,13 @@ alert is that it is worth waking someone for:
 | Hidden-socket cross-view | ✅ | `sock_diag` dump extended to return socket identity, not just counters |
 | Kernel module monitoring | ✅ | load is already real-time via eBPF, so this covers unload, concealment, provenance and the module tree |
 | Package-verified binary integrity | ✅ | `dpkg` + `rpm`; falls back to a self-recorded digest baseline, which reports *change* but cannot prove *wrongness* |
+| Hidden file & directory cross-view | ✅ | three checks; the link-count one needs no candidate name, so it finds a directory nobody has touched |
+| Hidden mount cross-view | ✅ | three renderings of one kernel mount table, plus file-level mounts that shadow a system file while leaving its inode intact |
+| Unrecorded login cross-view | ✅ | utmp is a writable file, so sessions are rebuilt from `/proc`; skipped where utmp records nothing, as in a container |
 | `diagnostics rootkit` | ✅ | reports view sizes, not just findings — an interface that silently returns nothing is otherwise indistinguishable from a clean host |
-| Kernel-layer inode gate for hidden files | ⏳ | file concealment (`getdents` filtering) is not yet cross-checked |
+| Kernel-layer inode gate for hidden files | 🟡 | the name sources are eBPF write-opens, `/proc/<pid>/fd` and `/proc/<pid>/maps`; a file only ever *read* by a relative path is not yet named, which a BTF/CO-RE inode read in the openat program would close |
 | `kill(pid,0)` independence | 🟡 | a rootkit hooking the signal path as well as procfs defeats the liveness view; the eBPF view still names the process |
+| utmp ABI | 🟡 | the 384-byte glibc record layout is assumed and refused when it does not match, so the check is inert on a musl host rather than wrong |
 
 Runtime knobs are environment variables rather than signed-config fields on
 purpose: the config envelope is signed over its canonical byte sequence, so a
@@ -110,10 +149,13 @@ reject config from a backend not updated in lockstep.
 | Variable | Default | Purpose |
 |---|---|---|
 | `TRAPD_ROOTKIT` | on | set to `0`/`off` to disable the sweeps |
-| `TRAPD_ROOTKIT_INTERVAL_SECS` | `300` (floor 60) | process/socket/module sweep interval |
-| `TRAPD_ROOTKIT_INTEGRITY_INTERVAL_SECS` | `3600` (floor 300) | binary-integrity sweep interval |
+| `TRAPD_ROOTKIT_INTERVAL_SECS` | `300` (floor 60) | process/socket/module/mount/login sweep interval |
+| `TRAPD_ROOTKIT_INTEGRITY_INTERVAL_SECS` | `3600` (floor 300) | binary-integrity and directory-walk interval |
 | `TRAPD_ROOTKIT_PID_SCAN_MAX` | `65536` | highest PID probed for procfs concealment |
 | `TRAPD_ROOTKIT_CORROBORATION` | `2` | consecutive sweeps a standing disagreement must survive |
+| `TRAPD_ROOTKIT_FILE_ROOTS` | `/etc,/bin,/sbin,/lib,/usr/bin,/usr/sbin,/usr/lib,/usr/local,/boot,/root,/tmp,/var/tmp,/dev/shm` | trees walked for concealed files |
+| `TRAPD_ROOTKIT_DIR_SCAN_MAX` | `20000` | directories per file sweep; reaching it is logged, never silent |
+| `TRAPD_ROOTKIT_DIR_SCAN_DEPTH` | `8` | how deep below a root the walk descends |
 
 ---
 
@@ -257,9 +299,10 @@ Provisioned files under `<config>` (default `/etc/trapd`): `ca.crt`, `agent.crt`
 ---
 
 _Last updated: 2026-09-08 — adds cross-view rootkit and manipulation detection
-(§2b: hidden processes, hidden sockets, kernel modules, package-verified binary
-integrity, `diagnostics rootkit`). Previous revision added the loss-transparent
-telemetry pipeline_
+(§2b: hidden processes, hidden sockets, hidden files and directories, hidden
+mounts, unrecorded logins, kernel modules, package-verified binary integrity,
+`diagnostics rootkit`). Previous revision added the loss-transparent telemetry
+pipeline_
 
 _Earlier: the loss-transparent telemetry pipeline
 (§4b: stable event identity, checksummed persistent queue, drop attribution,

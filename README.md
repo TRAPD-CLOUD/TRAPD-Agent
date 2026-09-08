@@ -120,7 +120,7 @@ Collectors live in `agent/src/collectors/linux/`. Two tiers:
 | `FilesystemCollector` | `inotify` | `filesystem/create|delete|modify` under watched paths (`/etc`, `/bin`, `/tmp` by default) |
 | `AgentProtectCollector` | agent's own files | `agent_tamper` events |
 | `FimCollector` | SHA256 baseline of `fim_paths` (`/etc`, `/usr/bin`, `/boot`, … by default) | `filesystem/integrity_violation` (modified / added / removed) — every `fim_interval_secs`; baseline persists across restarts |
-| `RootkitCollector` | cross-view comparison of `/proc`, `sock_diag` netlink, `/sys/module`, `/lib/modules` and the package database | `detection/detected` with `category: "rootkit"` — hidden processes/sockets/modules and tampered system binaries, every 5 min (binary integrity hourly) |
+| `RootkitCollector` | cross-view comparison of `/proc`, `sock_diag` netlink, `/sys/module`, `/lib/modules`, directory listings, the mount table, `utmp` and the package database | `detection/detected` with `category: "rootkit"` — hidden processes, sockets, files, directories, mounts, modules and login sessions, plus tampered system binaries, every 5 min (binary integrity and the directory walk hourly) |
 
 **eBPF collectors (when the eBPF object is built & installed; see
 [Building from source](#building-from-source)):**
@@ -132,16 +132,39 @@ Collectors live in `agent/src/collectors/linux/`. Two tiers:
 
 **Rootkit detection by disagreement.** `RootkitCollector` never asks "does this
 look malicious?" — it asks the same question through interfaces a rootkit has
-to hook separately and reports where the answers differ: the `/proc` listing
-against direct `/proc/<pid>` access and `kill(pid, 0)` liveness, `/proc/net`
-against a `sock_diag` netlink dump, `/proc/modules` against `/sys/module`, and
-each system binary against the digest its own distribution package records. The
-eBPF collectors feed it exec/fork PIDs, bind ports and module loads observed
-below all of those interfaces, but three of the four detectors work without
-eBPF at all. Which binaries are watched is resolved from the host's `PATH` and
-its setuid executables rather than a hardcoded list, so it follows the
-distribution. Run `trapd-agent diagnostics rootkit` to see the views, their
-sizes and any findings — see [CAPABILITIES.md](CAPABILITIES.md) §2b.
+to hook separately and reports where the answers differ:
+
+| Concealed thing | Interfaces played against each other |
+|---|---|
+| Processes | the `/proc` listing · direct `/proc/<pid>` access · `kill(pid, 0)` liveness |
+| Sockets | `/proc/net` · a `sock_diag` netlink dump |
+| Files & directories | libc `readdir` · the raw `getdents64` syscall · a directory's `st_nlink` subdirectory count · `lstat` on a name learned elsewhere |
+| Mounts | `/proc/mounts` · `/proc/self/mountinfo` · `/proc/self/mountstats` |
+| Login sessions | `/var/run/utmp` · sessions rebuilt from `/proc` |
+| Kernel modules | `/proc/modules` · `/sys/module` · `/lib/modules/<release>` |
+| System binaries | the on-disk digest · the digest its own distribution package records |
+
+The eBPF collectors feed it exec/fork PIDs, bind ports, module loads and the
+paths of files being written, unlinked or renamed — all observed below every
+interface above — but the comparisons stand on their own, so the collector is
+worth running on hosts where the eBPF programs cannot load.
+
+The file checks are worth a note, because hiding a file is the most common
+thing a rootkit does. A name has to come from *somewhere* before it can be
+looked up directly, and a filtered listing will not supply it, so the agent
+harvests candidate names from eBPF syscall observations, from the targets of
+every open descriptor in `/proc/<pid>/fd` (rootkits keep their own files open)
+and from the file-backed regions in `/proc/<pid>/maps`. The directory
+link-count check needs no name at all: `st_nlink` is maintained by the
+filesystem, not by the code that answers directory reads, so a count that
+exceeds the listed subdirectories reveals a hidden directory nobody has
+touched.
+
+Which binaries are watched is resolved from the host's `PATH` and its setuid
+executables rather than a hardcoded list, so it follows the distribution. Run
+`trapd-agent diagnostics rootkit` to see the views, their sizes and any
+findings — an interface that silently returns nothing looks exactly like a
+clean host from the findings alone. See [CAPABILITIES.md](CAPABILITIES.md) §2b.
 
 The kernel-side programs are in the standalone `trapd-agent-ebpf` crate
 (`exec`, `fork`, `network`, `dns`, `file_open`, `file_manip`, `write`, `mmap`,
