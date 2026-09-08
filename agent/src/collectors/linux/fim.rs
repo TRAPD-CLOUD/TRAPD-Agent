@@ -304,7 +304,9 @@ impl Collector for FimCollector {
                         source: FilesystemSource::PeriodicScan,
                         integrity: match ch.kind {
                             ChangeKind::Added => IntegrityStatus::BaselineAdded,
-                            ChangeKind::Modified | ChangeKind::Removed => IntegrityStatus::Violation,
+                            ChangeKind::Modified | ChangeKind::Removed => {
+                                IntegrityStatus::Violation
+                            }
                         },
                         expected_hash: (!ch.expected.is_empty()).then_some(ch.expected),
                         actual_hash: (!ch.actual.is_empty()).then_some(ch.actual),
