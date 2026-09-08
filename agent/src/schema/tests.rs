@@ -1,8 +1,9 @@
 use uuid::Uuid;
 
 use super::{
-    AgentEvent, DnsData, EbpfDropsData, EventAction, EventClass, EventData, FileOpenData, ForkData,
-    HoneytokenAccessData, MmapData, ModuleLoadData, NamespaceIds, NetworkSocketData, NsChangeData,
+    AgentEvent, DnsData, EbpfDropsData, EventAction, EventClass, EventData, FileOpenData,
+    FilesystemEventData, FilesystemOperation, FilesystemSource, ForkData, HoneytokenAccessData,
+    IntegrityStatus, MmapData, ModuleLoadData, NamespaceIds, NetworkSocketData, NsChangeData,
     ProcessCreateData, ProcessLineage, PtraceData, SessionContext, Severity, ShmData,
     SystemSnapshotData,
 };
@@ -178,6 +179,33 @@ fn test_file_open_event_roundtrip() {
     assert_eq!(val["data"]["path"], "/etc/passwd");
     assert_eq!(val["data"]["pid"], 42);
     assert_eq!(val["data"]["flags"], 0x241_u64);
+}
+
+#[test]
+fn filesystem_notifications_share_one_wire_model() {
+    let event = AgentEvent::new(
+        "agent".into(),
+        "host".into(),
+        EventClass::Filesystem,
+        EventAction::Modify,
+        Severity::High,
+        EventData::Filesystem(FilesystemEventData {
+            path: "/etc/ssh/sshd_config".into(),
+            operation: FilesystemOperation::Modified,
+            source: FilesystemSource::PeriodicScan,
+            integrity: IntegrityStatus::Violation,
+            expected_hash: Some("old".into()),
+            actual_hash: Some("new".into()),
+            size_delta: Some(12),
+        }),
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+
+    assert_eq!(value["action"], "modify");
+    assert_eq!(value["data"]["source"], "periodic_scan");
+    assert_eq!(value["data"]["integrity"], "violation");
+    assert_eq!(value["data"]["expected_hash"], "old");
 }
 
 #[test]
@@ -570,7 +598,11 @@ fn with_source_names_the_collector_without_reassigning_identity() {
         Some("ebpf_exec")
     );
     assert_eq!(tagged.event_id, id, "tagging must not mint a new event_id");
-    assert_eq!(tagged.sequence_number(), seq, "nor consume another sequence");
+    assert_eq!(
+        tagged.sequence_number(),
+        seq,
+        "nor consume another sequence"
+    );
 }
 
 #[test]
@@ -611,7 +643,10 @@ fn a_partially_enriched_event_says_which_field_failed_and_why() {
     let val: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
     assert_eq!(val["data"]["enrichment_status"], "partial");
-    assert_eq!(val["data"]["enrichment_errors"]["cmdline"], "process_exited");
+    assert_eq!(
+        val["data"]["enrichment_errors"]["cmdline"],
+        "process_exited"
+    );
     assert_eq!(
         val["data"]["exe"], "/usr/bin/bash",
         "the kernel-sourced fields must survive an enrichment failure"
@@ -661,7 +696,10 @@ fn an_event_with_enrichment_notes_round_trips() {
     assert_eq!(back.event_id, event.event_id);
     assert_eq!(back.sequence_number(), event.sequence_number());
     let EventData::ProcessExec(data) = &back.data else {
-        panic!("untagged deserialization picked the wrong variant: {:?}", back.data);
+        panic!(
+            "untagged deserialization picked the wrong variant: {:?}",
+            back.data
+        );
     };
     assert_eq!(data.pid, 1234);
     assert_eq!(data.process_start_time, Some(987_654));
@@ -673,7 +711,10 @@ fn an_event_with_enrichment_notes_round_trips() {
         data.enrichment.enrichment_errors["cwd"],
         crate::telemetry::EnrichmentError::PermissionDenied
     );
-    assert_eq!(data.enrichment.truncated_fields["cmdline"].original_length, 100);
+    assert_eq!(
+        data.enrichment.truncated_fields["cmdline"].original_length,
+        100
+    );
 }
 
 #[test]
