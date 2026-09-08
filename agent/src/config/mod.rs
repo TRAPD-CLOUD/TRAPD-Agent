@@ -14,7 +14,12 @@ use crate::prevention::{
 };
 
 pub mod logs;
-pub use logs::{LogSourceConfig, MultilineConfig, SourceKind};
+pub use logs::LogSourceConfig;
+// Public signed-config API. The Windows binary never constructs sources
+// (the collector is Linux-only), so clippy would otherwise flag the
+// re-exports as unused.
+#[allow(unused_imports)]
+pub use logs::{MultilineConfig, SourceKind};
 
 fn default_poll_interval() -> u64 {
     60
