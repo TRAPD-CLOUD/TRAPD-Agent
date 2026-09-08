@@ -22,6 +22,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - `agent/src/prevention/commands.rs`: signed response command schema.
 - `agent/src/prevention/policy.rs`: IoC policy/rule schema.
 - `agent/src/deception/`: honeytoken deception subsystem — `profiler.rs` (deterministic recon profile / token candidates), `registry.rs` (deployed-token register at `<state>/honeytokens.json`, incl. out-of-band canary records), `validate.rs` (bait-content + out-of-band-canary validation and anti-fingerprinting guards), `mod.rs` (camouflaged deploy + safe revoke). Step 1 places and manages tokens; the on-host detection path lives in `detection/honeytoken.rs`.
+- `agent/src/collectors/linux/logs/`: generic log collector — `LogSource → Reader → Framing → Parser → Normalizer → LogEventData`. Tails files (inode + fingerprint, rotation/truncation, globs, persisted offsets), systemd journal (`journalctl --after-cursor`), and syslog sockets. Built-in parsers: nginx/apache access+error, postgresql, mysql, docker json-file, ssh, sudo, auditd, JSON, syslog RFC3164/5424, plain, auto.
 - `agent/src/forensics/`: response forensics (issue #32, point 5) — `session.rs` (login/TTY/container/namespace/cgroup context from `/proc`), `snapshot.rs` (point-in-time process capture for the freeze response), `recorder.rs` (bounded flight recorder of recent pid-bearing telemetry + remote-IP correlation).
 - `agent/src/transport/mod.rs`: event ingest transport.
 - `agent/src/output/mod.rs`: local stdout/file NDJSON output.
@@ -48,7 +49,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 ## Filesystem Layout
 
-- State dir: default `/var/lib/trapd`, override `TRAPD_STATE_DIR`; contains `device_id`, `credentials.json`, nonces (`command_nonces.json`), `config_issued_at.json` (signed-config `issued_at` high-water mark, `0600`), `agent_config.json` (last verified config, kept across restarts, `0600`), baselines, `honeytokens.json` (deployed-honeytoken register, `0600`), `spool/queue.journal` (persistent event queue, `0600`, dir `0700`), `telemetry.json` (diagnostics report, `0600`).
+- State dir: default `/var/lib/trapd`, override `TRAPD_STATE_DIR`; contains `device_id`, `credentials.json`, nonces (`command_nonces.json`), `config_issued_at.json` (signed-config `issued_at` high-water mark, `0600`), `agent_config.json` (last verified config, kept across restarts, `0600`), baselines, `honeytokens.json` (deployed-honeytoken register, `0600`), `log_offsets.json` (log-collector file/journal harvest cursors with inode + content fingerprints, `0600`), `spool/queue.journal` (persistent event queue, `0600`, dir `0700`), `telemetry.json` (diagnostics report, `0600`).
 - Config dir: default `/etc/trapd`, override `TRAPD_CONFIG_DIR`; contains `agent.env`, `policy.json`, `ca.crt`, `agent.crt`, `agent.key`, `command_signing.pub`.
 - Log dir: default `/var/log/trapd`, override `TRAPD_LOG_DIR`; contains `events.ndjson`.
 - State dir is hardened to `0700`; credentials are atomically written as `0600`.
@@ -263,7 +264,7 @@ accepted:
   "agent_id": "string",
   "hostname": "string",
   "timestamp": "RFC3339 UTC datetime",
-  "class": "process|network|system|user|filesystem|memory|kernel|ipc|prevention|detection",
+  "class": "process|network|system|user|filesystem|memory|kernel|ipc|prevention|detection|log",
   "action": "EventAction",
   "severity": "info|low|medium|high|critical",
   "origin": "EventOrigin, optional",
@@ -309,7 +310,8 @@ agent_tamper, write_rate_anomaly, kill_attempt, process_blocked,
 network_isolated, network_deisolated, ip_blocked, ip_unblocked,
 file_quarantined, file_restored, policy_updated, command_rejected,
 command_accepted, detected, package_installed, package_removed,
-package_upgraded, honeytoken_deployed, honeytoken_revoked, honeytoken_access
+package_upgraded, honeytoken_deployed, honeytoken_revoked, honeytoken_access,
+log
 ```
 
 ## EventData Schemas
@@ -460,6 +462,48 @@ as `event_too_large` rather than being allowed to wedge the batch.
   "memory_free_mb": "u64",
   "uptime_secs": "u64",
   "load_avg": ["f64", "f64", "f64"]
+}
+```
+
+### `LogEventData`
+
+Canonical record from the generic log collector (`class=log`, `action=log`).
+Every source — plain file, JSON, syslog, systemd journal, nginx, apache,
+postgresql, mysql, docker, ssh, sudo, auditd, custom application — collapses
+onto this shape. The original line is always in `message` (secret-redacted,
+length-capped); extracted fields are additive.
+
+```json
+{
+  "source": "string (operator name, e.g. nginx)",
+  "source_type": "string (file|journal|syslog)",
+  "parser": "string (nginx_access|json|auditd|auto|…)",
+  "message": "string (redacted original line)",
+  "path": "string, optional (file path, journal unit, or listen address)",
+  "log_timestamp": "RFC3339, optional (parsed from the line; AgentEvent.timestamp is ingest time)",
+  "facility": "string, optional",
+  "severity_raw": "string, optional",
+  "hostname_raw": "string, optional",
+  "app_name": "string, optional",
+  "proc_id": "string, optional",
+  "pid": "i32, optional",
+  "uid": "u32, optional",
+  "username": "string, optional",
+  "src_addr": "string, optional",
+  "src_port": "u16, optional",
+  "dst_addr": "string, optional",
+  "dst_port": "u16, optional",
+  "http_method": "string, optional",
+  "http_status": "u16, optional",
+  "http_path": "string, optional",
+  "http_user_agent": "string, optional",
+  "event_category": "string, optional (web|database|auth|audit|container|syslog|application)",
+  "event_outcome": "string, optional (success|failure|unknown)",
+  "mitre_tactic": "string, optional",
+  "mitre_technique": "string, optional",
+  "fields": { "k": "v" },
+  "truncated": "bool, omitted when false",
+  "multiline": "bool, omitted when false"
 }
 ```
 
@@ -1183,7 +1227,8 @@ older than the last applied config.
   "honeytoken_response": "string, default \"alert\" (none|alert|freeze|kill|isolate)",
   "honeytoken_accessor_allowlist": ["string (extra benign accessor comms)"],
   "honeytoken_deception_escalation": "bool, default false",
-  "honeytoken_paths": ["string — Windows decoy files, default C:\\Users\\Public\\passwords.txt, C:\\Users\\Public\\credentials.xlsx, C:\\ProgramData\\backup_keys.txt"]
+  "honeytoken_paths": ["string — Windows decoy files, default C:\\Users\\Public\\passwords.txt, C:\\Users\\Public\\credentials.xlsx, C:\\ProgramData\\backup_keys.txt"],
+  "logs": "LogCollectorConfig, optional — omitted from signed bytes when unset so existing envelopes keep verifying"
 }
 ```
 
@@ -1202,6 +1247,52 @@ Windows agent also plants registry decoys (`DatabasePassword`,
 `AdminCredentials`, `BackupKey`) under `HKLM\SOFTWARE\TRAPD\Honeytokens`
 and watches them with `RegNotifyChangeKeyValue`; both kinds report the same
 `HoneytokenAccess` detection event as Linux.
+
+`logs` configures the generic Linux log collector. Absent / `null` means
+"use built-in defaults": enabled, auto-discover well-known security logs
+(nginx, apache, postgresql, mysql, auditd — only paths that exist), 2000
+events/sec, 1 MiB max line, persisted cursors at `<state>/log_offsets.json`.
+Explicit sources always win on name collision with auto-discovery. Docker
+json-file logs are **not** auto-discovered (too noisy); add them explicitly.
+
+```yaml
+logs:
+  enabled: true
+  auto_discover: true
+  max_line_bytes: 1048576
+  max_events_per_sec: 2000
+  multiline_max_lines: 100
+  multiline_max_bytes: 65536
+  start_at: end          # end | beginning; files created after start are always read from 0
+  sources:
+    - name: nginx
+      type: file
+      path: /var/log/nginx/access.log
+      parser: nginx_access
+    - name: app
+      type: file
+      path: /var/log/myapp/*.log
+      parser: json
+      multiline:
+        pattern: '^\d{4}-\d{2}-\d{2}'
+        timeout_ms: 1000
+    - name: sshd
+      type: journal
+      unit: ssh.service
+      parser: ssh
+    - name: syslog_in
+      type: syslog
+      path: unix:///run/trapd/syslog.sock
+      parser: syslog
+```
+
+Parsers: `auto`, `plain`, `json`, `syslog`, `nginx_access`, `nginx_error`,
+`apache_access`, `apache_error`, `postgresql`, `mysql`, `docker`, `ssh`,
+`sudo`, `auditd`. The file reader tracks `(dev, inode, offset)` plus head/tail
+content fingerprints, detects rename rotation, copytruncate, and inode reuse,
+and checkpoints atomically. File harvest uses bounded `send` (backpressure);
+syslog/journal use `try_emit` (cannot stall a datagram socket). Rate-limit
+drops are counted as `rate_limit_applied`.
 
 ## Command Schemas
 
@@ -1376,7 +1467,7 @@ keeping `boot_id`, so treat a reset to 1 as a new run rather than as loss.
 - Event ingest must accept an array, not NDJSON, for `/api/v1/ingest/events`.
 - Local file output is NDJSON: one serialized `AgentEvent` per line.
 - Treat unknown `EventAction`/payload combinations defensively; the agent evolves with new eBPF and prevention actions.
-- Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=prevention` -> `PreventionEventData` (incl. `action=process_frozen`/`process_thawed`/`deception_escalation`); `class=detection, action=detected` -> `DetectionData`; `class=detection, action=honeytoken_access` -> `HoneytokenAccessData` (carries the optional `session` forensics).
+- Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=prevention` -> `PreventionEventData` (incl. `action=process_frozen`/`process_thawed`/`deception_escalation`); `class=detection, action=detected` -> `DetectionData`; `class=detection, action=honeytoken_access` -> `HoneytokenAccessData` (carries the optional `session` forensics); `class=log, action=log` -> `LogEventData` (generic log collector — route on `source` / `parser` / `event_category`, not on the raw line).
 - For command responses, return `[]` when no commands are pending.
 - Do not return unsigned commands. The agent rejects commands without a valid Ed25519 signature, matching `agent_id`, unexpired window, and fresh nonce.
 - Config endpoint must return a `SignedConfig`: wrap the `AgentConfig` in a `ConfigEnvelope` (`agent_id`, `issued_at`, `config`) and sign `canonical_json(envelope)` with the same Ed25519 key used for response commands (`command_signing.pub`). Do not return unsigned config — the agent rejects it. Bump `issued_at` monotonically so the agent's rollback guard accepts updates.

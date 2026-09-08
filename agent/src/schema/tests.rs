@@ -744,3 +744,47 @@ fn an_event_without_the_new_fields_still_parses() {
     assert_eq!(data.process_start_time, None);
     assert!(data.enrichment.is_clean());
 }
+
+#[test]
+fn log_event_roundtrip_does_not_collide_with_user_or_file_variants() {
+    // Untagged EventData: a log record that happens to carry `username` or
+    // `path` must not deserialize as UserSession / FileEvent.
+    let event = AgentEvent::new(
+        "agent".into(),
+        "host".into(),
+        EventClass::Log,
+        EventAction::Log,
+        Severity::Medium,
+        EventData::Log(Box::new(crate::schema::LogEventData {
+            source: "nginx".into(),
+            source_type: "file".into(),
+            parser: "nginx_access".into(),
+            message:
+                r#"203.0.113.9 - alice [10/Oct/2023:13:55:36 +0000] "GET /admin HTTP/1.1" 403 182"#
+                    .into(),
+            path: Some("/var/log/nginx/access.log".into()),
+            username: Some("alice".into()),
+            src_addr: Some("203.0.113.9".into()),
+            http_status: Some(403),
+            event_category: Some("web".into()),
+            ..Default::default()
+        })),
+    );
+    let json = serde_json::to_string(&event).expect("serialize");
+    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(val["class"], "log");
+    assert_eq!(val["action"], "log");
+    assert_eq!(val["data"]["source"], "nginx");
+    assert_eq!(val["data"]["parser"], "nginx_access");
+    assert_eq!(val["data"]["http_status"], 403);
+
+    let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+    match back.data {
+        EventData::Log(d) => {
+            assert_eq!(d.source, "nginx");
+            assert_eq!(d.username.as_deref(), Some("alice"));
+            assert_eq!(d.path.as_deref(), Some("/var/log/nginx/access.log"));
+        }
+        other => panic!("untagged EventData stole the log payload: {other:?}"),
+    }
+}

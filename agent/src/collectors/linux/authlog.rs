@@ -246,6 +246,17 @@ fn parse_failed_for(rest: &str, auth_method: Option<&str>) -> Option<UserLogonDa
     })
 }
 
+/// Public wrapper used by the generic log collector's `ssh` parser so the
+/// sshd line grammar lives in one place.
+pub fn parse_failed_line(line: &str) -> Option<UserLogonData> {
+    parse_failed(line)
+}
+
+/// Public wrapper used by the generic log collector's `ssh` parser.
+pub fn parse_accepted_line(line: &str) -> Option<UserLogonData> {
+    parse_accepted(line, "password").or_else(|| parse_accepted(line, "publickey"))
+}
+
 fn parse_session(line: &str, opened: bool) -> Option<UserSessionData> {
     let marker = if opened {
         "session opened for user "

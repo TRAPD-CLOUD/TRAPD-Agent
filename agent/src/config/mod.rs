@@ -13,6 +13,9 @@ use crate::prevention::{
     commands::{load_verifying_key, verify_canonical},
 };
 
+pub mod logs;
+pub use logs::{LogCollectorConfig, LogSourceConfig, MultilineConfig};
+
 fn default_poll_interval() -> u64 {
     60
 }
@@ -301,6 +304,15 @@ pub struct AgentConfig {
     /// writing to the host filesystem.
     #[serde(default)]
     pub cve_feed: Vec<crate::inventory::compliance::CveEntry>,
+
+    // ── Generic log collector ───────────────────────────────────────────────
+    /// Optional log-collector configuration. `None` (the default, and the
+    /// value produced when the field is absent from a signed envelope) means
+    /// "use built-in defaults": enabled, auto-discover well-known Linux
+    /// security logs. Skipped on serialisation so existing signed-config
+    /// vectors keep verifying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<LogCollectorConfig>,
 }
 
 impl Default for AgentConfig {
@@ -343,6 +355,7 @@ impl Default for AgentConfig {
             siem_hec_url: String::new(),
             siem_hec_token: String::new(),
             cve_feed: Vec::new(),
+            logs: None,
         }
     }
 }
@@ -871,6 +884,15 @@ mod signed_config_tests {
             Err(why) => panic!("TS-signed default config rejected: {why}"),
         }
         cleanup(pub_path, wm_path);
+    }
+
+    #[test]
+    fn default_config_omits_logs_so_xlang_bytes_stay_stable() {
+        let json = serde_json::to_value(AgentConfig::default()).unwrap();
+        assert!(
+            json.get("logs").is_none(),
+            "logs must be skip_serializing when unset, otherwise signed-config vectors break"
+        );
     }
 
     #[test]

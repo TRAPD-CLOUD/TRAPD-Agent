@@ -97,6 +97,65 @@ impl FieldView {
                 put("processid", e.pid.to_string());
                 ("file_event", e.path.clone())
             }
+            EventData::Log(e) => {
+                put("message", e.message.clone());
+                put("logsource", e.source.clone());
+                put("parser", e.parser.clone());
+                if let Some(p) = &e.path {
+                    put("targetfilename", p.clone());
+                    put("filename", p.clone());
+                }
+                if let Some(u) = &e.username {
+                    put("user", u.clone());
+                }
+                if let Some(ip) = &e.src_addr {
+                    put("sourceip", ip.clone());
+                    put("src_ip", ip.clone());
+                }
+                if let Some(port) = e.src_port {
+                    put("sourceport", port.to_string());
+                }
+                if let Some(m) = &e.http_method {
+                    put("httpmethod", m.clone());
+                }
+                if let Some(st) = e.http_status {
+                    put("httpstatus", st.to_string());
+                    put("status", st.to_string());
+                }
+                if let Some(p) = &e.http_path {
+                    put("url", p.clone());
+                    put("requesturi", p.clone());
+                }
+                if let Some(ua) = &e.http_user_agent {
+                    put("useragent", ua.clone());
+                }
+                if let Some(app) = &e.app_name {
+                    put("app", app.clone());
+                    put("application", app.clone());
+                }
+                if let Some(c) = &e.event_category {
+                    put("eventcategory", c.clone());
+                }
+                if let Some(o) = &e.event_outcome {
+                    put("eventoutcome", o.clone());
+                }
+                if let Some(pid) = e.pid {
+                    put("processid", pid.to_string());
+                }
+                for (k, v) in &e.fields {
+                    put(&k.to_ascii_lowercase(), v.clone());
+                }
+                let category = match e.event_category.as_deref() {
+                    Some("web") => "webserver",
+                    Some("auth") => "authentication",
+                    Some("audit") => "auditd",
+                    Some("database") => "database",
+                    Some("container") => "container",
+                    Some("syslog") => "syslog",
+                    _ => "application",
+                };
+                (category, e.message.clone())
+            }
             EventData::Filesystem(e) => {
                 put("targetfilename", e.path.clone());
                 put("filename", e.path.clone());

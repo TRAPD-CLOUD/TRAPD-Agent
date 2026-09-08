@@ -87,6 +87,10 @@ pub enum EventClass {
     Prevention,
     /// A behavioural/IOC detection raised by the local detection engine.
     Detection,
+    /// A normalized log record from the generic log collector (files,
+    /// systemd journal, syslog). Security-first: parsers extract identity,
+    /// network, HTTP and MITRE fields rather than shipping opaque lines.
+    Log,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +191,8 @@ pub enum EventAction {
     /// ring buffer was full). A non-zero count is a detection blind-spot under
     /// load (issue #52).
     EbpfDrops,
+    /// A normalized log record ingested by the generic log collector.
+    Log,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +216,11 @@ pub enum EventData {
     ProcessExec(Box<ExecEventData>),
     NetworkConnection(NetworkConnectionData),
     SystemSnapshot(SystemSnapshotData),
+    /// Canonical log record. Boxed: the original message plus extracted fields
+    /// make this larger than neighbouring variants. Placed *before* `UserLogon`
+    /// / `UserSession` / `FileEvent` so untagged deserialization cannot steal a
+    /// log payload that happens to carry `username` or `path`.
+    Log(Box<LogEventData>),
     UserLogon(UserLogonData),
     UserSession(UserSessionData),
     /// Canonical filesystem notification. Both the real-time watcher and the
@@ -454,6 +465,85 @@ pub struct SystemSnapshotData {
     pub memory_free_mb: u64,
     pub uptime_secs: u64,
     pub load_avg: [f64; 3],
+}
+
+/// Canonical log record produced by the generic log collector.
+///
+/// The pipeline is `LogSource → Reader → Framing → Parser → Normalizer →`
+/// this struct. Every source (plain file, JSON, syslog, journald, nginx,
+/// apache, postgres, mysql, docker, ssh, sudo, auditd, custom) collapses
+/// onto the same security-oriented shape so the backend, Sigma rules and
+/// SIEM forwarder share one schema. The original line is always preserved
+/// in `message` (redacted, length-capped); extracted fields are *additive*.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LogEventData {
+    /// Operator-assigned source name (`nginx`, `app`, …).
+    pub source: String,
+    /// Reader kind: `file`, `journal`, `syslog`.
+    pub source_type: String,
+    /// Parser that produced this record (`nginx_access`, `json`, `auditd`, …).
+    pub parser: String,
+    /// Original (redacted, possibly truncated) log line / journal MESSAGE.
+    pub message: String,
+    /// File path, journal unit, or syslog listen address this record came from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Timestamp parsed out of the log line, when the parser could recover one.
+    /// Distinct from `AgentEvent.timestamp`, which is when the agent ingested it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_timestamp: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity_raw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname_raw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proc_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_user_agent: Option<String>,
+    /// Coarse family: `web`, `database`, `auth`, `audit`, `container`,
+    /// `syslog`, `application`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_category: Option<String>,
+    /// `success` / `failure` / `unknown` when the parser can tell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mitre_tactic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mitre_technique: Option<String>,
+    /// Extra parser-specific fields (status text, database name, audit key, …).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fields: std::collections::BTreeMap<String, String>,
+    /// The line exceeded `max_line_bytes` and was cut on a UTF-8 boundary.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// This record was assembled from more than one physical line.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multiline: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -40,7 +40,7 @@ mod winsvc;
 #[cfg(target_os = "linux")]
 use collectors::linux::{
     agent_protect::AgentProtectCollector, authlog::AuthLogCollector, ebpf_exec::EbpfExecCollector,
-    ebpf_syscalls::EbpfSyscallCollector, filesystem::FilesystemCollector,
+    ebpf_syscalls::EbpfSyscallCollector, filesystem::FilesystemCollector, logs::LogCollector,
     network::NetworkCollector, process::ProcessCollector,
 };
 // Only consumed by the Linux `async fn main`; the Windows runtime (winsvc::run)
@@ -308,6 +308,7 @@ async fn main() -> Result<()> {
         spawn_collector!(ProcessCollector::new());
         spawn_collector!(NetworkCollector::new());
         spawn_collector!(AuthLogCollector::new());
+        spawn_collector!(LogCollector::new(Arc::clone(&agent_config)));
         spawn_collector!(FilesystemCollector::new(Arc::clone(&agent_config)));
         spawn_collector!(AgentProtectCollector::new());
         spawn_collector!(collectors::linux::memscan::MemScanCollector::new(
