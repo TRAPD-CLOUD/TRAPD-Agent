@@ -251,6 +251,34 @@ parallel with native backend ingest:
 
 ---
 
+## 6b. Generic log collector (`agent/src/collectors/linux/logs/`) — ✅ NEW
+
+Linux security collector: one pipeline, many sources — never a per-product
+hard-coded tailer.
+
+```text
+LogSource → Reader → Framing / Multiline → Parser → Normalizer → Canonical Event
+```
+
+| Capability | Status | Notes |
+|------------|--------|-------|
+| File tail (plain, JSON, glob) | ✅ | inode + fingerprint; copytruncate; logrotate rename follow |
+| systemd journal | ✅ | `journalctl --output=json --follow` + persisted `__CURSOR` |
+| Syslog listener | ✅ | UDP / unix datagram; does not steal `:514`/`/dev/log` |
+| Multiline | ✅ | start-regex + timeout + max lines/bytes; dedicated auditd event-id grouping |
+| Parsers | ✅ | syslog RFC3164/5424, json, nginx/apache access+error, postgres, mysql, docker, sshd, sudo, auditd, kv, cef, auto |
+| Persisted offsets | ✅ | `<state>/log_offsets.json` (`0600`); at-least-once across restarts |
+| Backpressure | ✅ | log reader `send().await`s (pauses, does not drop into a kernel buffer) |
+| Rate limits | ✅ | per-source token bucket; excess counted `rate_limit_applied` |
+| Max line size | ✅ | default 64 KiB, UTF-8 cut, `truncated_fields` marker |
+| Sigma + detection | ✅ | log events project into Sigma; sudo COMMAND / src_addr feed the engine |
+| Built-in catalogue | ✅ | auto-discovers auth, auditd, nginx, apache, postgres, mysql, docker, cron |
+
+Config: `logs_enabled` (default on), `logs: [LogSourceConfig]`, `logs_include_builtins`.
+Empty `logs` discovers builtins; an explicit list is exclusive.
+
+---
+
 ## 7. Configuration reference (selected)
 
 All fields are delivered over the **signed, monotonic** config channel and
@@ -264,6 +292,7 @@ mirrored in the backend signer (`services/web/lib/api/config/sign.ts`).
 | `anomaly_detection_enabled` | `true` | statistical baseline |
 | `vuln_scan_enabled` / `cis_benchmark_enabled` | true / true | SBOM+CVE / CIS checks |
 | `siem_enabled` / `siem_format` / `siem_syslog_address` / `siem_hec_url` / `siem_hec_token` | off / cef / "" / "" / "" | SIEM forwarding |
+| `logs_enabled` / `logs` / `logs_include_builtins` | true / `[]` / false | generic log collector + catalogue |
 | `rtr_enabled` / `rtr_max_artifact_bytes` | false / 32768 | real-time response |
 | `honeytoken_*` | — | deception lifecycle + escalation |
 
@@ -280,6 +309,7 @@ Provisioned files under `<config>` (default `/etc/trapd`): `ca.crt`, `agent.crt`
 - ⏳ Memory-injection prevention (block, not just detect).
 
 **P1 — detection breadth/fidelity**
+- ✅ Generic Linux log collector (file / journal / syslog, parsers, rotation).
 - ⏳ YARA over process memory.
 - ⏳ Threat-intel: SQLite IOC store + STIX/TAXII consumer + IP/domain reputation.
 
@@ -298,14 +328,11 @@ Provisioned files under `<config>` (default `/etc/trapd`): `ca.crt`, `agent.crt`
 
 ---
 
-_Last updated: 2026-09-08 — adds cross-view rootkit and manipulation detection
-(§2b: hidden processes, hidden sockets, hidden files and directories, hidden
-mounts, unrecorded logins, kernel modules, package-verified binary integrity,
-`diagnostics rootkit`). Previous revision added the loss-transparent telemetry
-pipeline_
+_Last updated: 2026-09-08 — adds the generic Linux log collector
+(§6b: file/journal/syslog pipeline, inode-aware rotation, parsers for
+nginx/apache/postgres/mysql/docker/ssh/sudo/auditd, persisted offsets)
+and cross-view rootkit and manipulation detection (§2b: hidden
+processes/sockets/files/mounts/logins, kernel modules, package-verified
+binary integrity, `diagnostics rootkit`). Previous revision covered the
+loss-transparent telemetry pipeline._
 
-_Earlier: the loss-transparent telemetry pipeline
-(§4b: stable event identity, checksummed persistent queue, drop attribution,
-health model and `diagnostics telemetry`). Previous revision covered the Sigma
-engine, anomaly baseline, inline network IoC enforcement, SBOM/CVE/CIS and SIEM
-forwarding._

@@ -3,8 +3,8 @@ use uuid::Uuid;
 use super::{
     AgentEvent, DnsData, EbpfDropsData, EventAction, EventClass, EventData, FileOpenData,
     FilesystemEventData, FilesystemOperation, FilesystemSource, ForkData, HoneytokenAccessData,
-    IntegrityStatus, MmapData, ModuleLoadData, NamespaceIds, NetworkSocketData, NsChangeData,
-    ProcessCreateData, ProcessLineage, PtraceData, SessionContext, Severity, ShmData,
+    IntegrityStatus, LogEventData, MmapData, ModuleLoadData, NamespaceIds, NetworkSocketData,
+    NsChangeData, ProcessCreateData, ProcessLineage, PtraceData, SessionContext, Severity, ShmData,
     SystemSnapshotData,
 };
 
@@ -152,6 +152,7 @@ fn test_new_ebpf_class_serialization() {
         r#""kernel""#
     );
     assert_eq!(serde_json::to_string(&EventClass::Ipc).unwrap(), r#""ipc""#);
+    assert_eq!(serde_json::to_string(&EventClass::Log).unwrap(), r#""log""#);
 }
 
 #[test]
@@ -521,6 +522,7 @@ fn test_point5_event_actions_serialize_snake_case() {
         (EventAction::ProcessFrozen, "process_frozen"),
         (EventAction::ProcessThawed, "process_thawed"),
         (EventAction::DeceptionEscalation, "deception_escalation"),
+        (EventAction::Log, "log"),
     ] {
         let json = serde_json::to_string(&action).expect("serialize action");
         assert_eq!(json, format!("\"{want}\""));
@@ -743,4 +745,54 @@ fn an_event_without_the_new_fields_still_parses() {
     assert_eq!(data.pid, 7);
     assert_eq!(data.process_start_time, None);
     assert!(data.enrichment.is_clean());
+}
+
+#[test]
+fn test_log_event_canonical_shape() {
+    let event = AgentEvent::new(
+        "agent-1".into(),
+        "host-1".into(),
+        EventClass::Log,
+        EventAction::Log,
+        Severity::Medium,
+        EventData::Log(Box::new(LogEventData {
+            source: "nginx".into(),
+            source_type: "file".into(),
+            source_path: "/var/log/nginx/access.log".into(),
+            parser: "nginx_access".into(),
+            message: r#"1.2.3.4 - - [10/Oct/2024:13:55:36 +0000] "GET / HTTP/1.1" 403 12 "-" "-""#
+                .into(),
+            category: "web".into(),
+            log_timestamp: None,
+            facility: None,
+            log_severity: None,
+            proc: Some("nginx".into()),
+            pid: None,
+            uid: None,
+            username: None,
+            log_host: None,
+            fields: {
+                let mut m = serde_json::Map::new();
+                m.insert("status".into(), serde_json::json!(403));
+                m.insert("remote_addr".into(), serde_json::json!("1.2.3.4"));
+                m
+            },
+            mitre_tactic: Some("TA0006 Credential Access".into()),
+            mitre_technique: Some("T1110".into()),
+            offset: Some(128),
+            inode: Some(99),
+            truncated_fields: None,
+        })),
+    );
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["class"], "log");
+    assert_eq!(json["action"], "log");
+    assert_eq!(json["data"]["source"], "nginx");
+    assert_eq!(json["data"]["source_path"], "/var/log/nginx/access.log");
+    assert_eq!(json["data"]["parser"], "nginx_access");
+    assert_eq!(json["data"]["category"], "web");
+    assert_eq!(json["data"]["fields"]["status"], 403);
+    // Untagged EventData must not steal this as FileEventData {path}.
+    let back: AgentEvent = serde_json::from_value(json).unwrap();
+    assert!(matches!(back.data, EventData::Log(_)));
 }

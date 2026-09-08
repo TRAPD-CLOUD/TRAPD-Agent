@@ -8,6 +8,7 @@ pub mod exehash;
 pub mod filesystem;
 pub mod fim;
 pub mod inet_diag;
+pub mod logs;
 pub mod memscan;
 pub mod network;
 pub mod packet_capture;

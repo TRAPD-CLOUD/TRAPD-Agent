@@ -123,6 +123,39 @@ impl FieldView {
                 put("processid", e.pid.to_string());
                 ("process_creation", e.comm.clone())
             }
+            EventData::Log(e) => {
+                put("message", e.message.clone());
+                put("logsource", e.source.clone());
+                put("filename", e.source_path.clone());
+                put("parser", e.parser.clone());
+                put("category", e.category.clone());
+                if let Some(u) = &e.username {
+                    put("user", u.clone());
+                }
+                if let Some(p) = &e.proc {
+                    put("image", p.clone());
+                    put("comm", p.clone());
+                }
+                if let Some(pid) = e.pid {
+                    put("processid", pid.to_string());
+                }
+                for (k, v) in &e.fields {
+                    if let Some(s) = v.as_str() {
+                        put(k, s.to_string());
+                    } else {
+                        put(k, v.to_string());
+                    }
+                }
+                let category = match e.category.as_str() {
+                    "web" => "webserver",
+                    "authentication" => "authentication",
+                    "audit" => "auditd",
+                    "database" => "database",
+                    "container" => "syslog",
+                    _ => "syslog",
+                };
+                (category, e.message.clone())
+            }
             _ => return None,
         };
 

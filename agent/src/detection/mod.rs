@@ -239,6 +239,33 @@ impl DetectionEngine {
             EventData::FileOpen(f) => {
                 self.inspect_file_open(&f.path, &f.comm, &mut out);
             }
+            EventData::Log(l) => {
+                // Log records feed the same engine: a sudo COMMAND is an
+                // exec-equivalent, a remote_addr/src_addr is a network IOC.
+                if let Some(cmd) = l.fields.get("command").and_then(|v| v.as_str()) {
+                    self.inspect_process(
+                        l.proc.as_deref().unwrap_or("unknown"),
+                        "",
+                        cmd,
+                        None,
+                        &mut out,
+                    );
+                }
+                let ip = l
+                    .fields
+                    .get("src_addr")
+                    .or_else(|| l.fields.get("remote_addr"))
+                    .and_then(|v| v.as_str());
+                if let Some(ip) = ip {
+                    let port = l
+                        .fields
+                        .get("src_port")
+                        .or_else(|| l.fields.get("destinationport"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u16;
+                    self.inspect_network(ip, port, &mut out);
+                }
+            }
             _ => {}
         }
 

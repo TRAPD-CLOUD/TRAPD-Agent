@@ -19,6 +19,7 @@ what it does in seconds, with no backend at all.
   kernel  ─ eBPF ──────► │  collectors ─┐                                │
   /proc   ─ poll ──────► │  (telemetry) │                                │
   auth.log ────────────► │              ▼                                │
+  journal / nginx / … ─► │              │                                │
   inotify  ────────────► │        event pipeline ──► detection engine    │
                          │              │ (durable spool)  │ (findings)   │
                          │              ▼                  ▼              │
@@ -117,6 +118,7 @@ Collectors live in `agent/src/collectors/linux/`. Two tiers:
 | `ProcessCollector` | `/proc` diff | `process/create`, `process/terminate` — every 3 s |
 | `NetworkCollector` | `/proc/net` | `network/connection` (proto, src/dst, state, owning PID) — every 5 s |
 | `AuthLogCollector` | `/var/log/auth.log` | `user/logon`, `user/logon_failed`, `user/session_open`, `user/session_close` |
+| `LogCollector` | files, systemd journal, syslog | `log/log` — generic pipeline (nginx, apache, postgres, mysql, docker, ssh, sudo, auditd, json, custom). Inode tracking, rotation, truncation, persisted offsets, multiline, per-source rate limits. |
 | `FilesystemCollector` | `inotify` | `filesystem/create|delete|modify` under watched paths (`/etc`, `/bin`, `/tmp` by default) |
 | `AgentProtectCollector` | agent's own files | `agent_tamper` events |
 | `FimCollector` | SHA256 baseline of `fim_paths` (`/etc`, `/usr/bin`, `/boot`, … by default) | `filesystem/integrity_violation` (modified / added / removed) — every `fim_interval_secs`; baseline persists across restarts |
@@ -389,12 +391,27 @@ RUST_LOG=info
 ```
 
 Most behaviour (poll intervals, enabled collectors, watched FS paths, prevention
-toggle, isolation allowlist) is delivered at runtime by the backend via the
+toggle, isolation allowlist, **log sources**) is delivered at runtime by the backend via the
 config-pull endpoint (`AgentConfig`) and can change without a restart. The
 deception subsystem is likewise backend-controlled:
 `honeytoken_detection_enabled`, `honeytoken_response` (`none`/`alert`/`freeze`/
 `kill`/`isolate`), `honeytoken_accessor_allowlist` (extra benign accessors) and
 `honeytoken_deception_escalation`.
+
+Log collection (`logs_enabled`, default on) auto-discovers standard Linux
+security logs when `logs` is empty. Override with an explicit list:
+
+```yaml
+logs:
+  - name: nginx
+    type: file
+    path: /var/log/nginx/access.log
+    parser: nginx_access
+  - name: app
+    type: file
+    path: /var/log/myapp/*.log
+    parser: json
+```
 
 **Automated response to local detections** is likewise config-driven and
 **opt-in** (off by default, so a false positive cannot kill a legitimate process
@@ -447,7 +464,7 @@ Every event — collected, detection, or prevention — shares one envelope:
   "agent_id":  "uuid-v4",
   "hostname":  "myserver",
   "timestamp": "2026-06-01T14:32:01.123Z",
-  "class":     "process|network|system|user|filesystem|memory|kernel|ipc|prevention|detection",
+  "class":     "process|network|system|user|filesystem|memory|kernel|ipc|prevention|detection|log",
   "action":    "create|exec|connection|detected|honeytoken_access|...",
   "severity":  "info|low|medium|high|critical",
   "data":      { }
