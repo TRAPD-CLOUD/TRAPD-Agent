@@ -5,9 +5,9 @@
 // cfg gates.
 #![cfg_attr(windows, allow(dead_code))]
 
-use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use tokio::fs;
@@ -220,9 +220,7 @@ async fn main() -> Result<()> {
             .with_max_bytes(pipeline::spool_max_bytes_from_env())
     };
     if spool.is_degraded() {
-        warn!(
-            "spool has no durable backing — unacknowledged events will not survive a restart"
-        );
+        warn!("spool has no durable backing — unacknowledged events will not survive a restart");
     }
     let ring_buffer: Arc<Mutex<Spool>> = Arc::new(Mutex::new(spool));
     let (tx, mut rx) = create_pipeline();
@@ -310,11 +308,8 @@ async fn main() -> Result<()> {
         spawn_collector!(ProcessCollector::new());
         spawn_collector!(NetworkCollector::new());
         spawn_collector!(AuthLogCollector::new());
-        spawn_collector!(FilesystemCollector::new());
+        spawn_collector!(FilesystemCollector::new(Arc::clone(&agent_config)));
         spawn_collector!(AgentProtectCollector::new());
-        spawn_collector!(collectors::linux::fim::FimCollector::new(Arc::clone(
-            &agent_config
-        )));
         spawn_collector!(collectors::linux::memscan::MemScanCollector::new(
             Arc::clone(&agent_config)
         ));

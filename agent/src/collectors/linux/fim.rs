@@ -34,7 +34,8 @@ use walkdir::WalkDir;
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
 use crate::schema::{
-    AgentEvent, EventAction, EventClass, EventData, IntegrityViolationData, Severity,
+    AgentEvent, EventAction, EventClass, EventData, FilesystemEventData, FilesystemOperation,
+    FilesystemSource, IntegrityStatus, Severity,
 };
 
 /// Files larger than this are recorded by size/mtime only (not hashed).
@@ -287,13 +288,29 @@ impl Collector for FimCollector {
                     agent_id.clone(),
                     hostname.clone(),
                     EventClass::Filesystem,
-                    EventAction::IntegrityViolation,
+                    match ch.kind {
+                        ChangeKind::Added => EventAction::Create,
+                        ChangeKind::Modified => EventAction::Modify,
+                        ChangeKind::Removed => EventAction::Delete,
+                    },
                     severity_for(ch.kind),
-                    EventData::IntegrityViolation(IntegrityViolationData {
+                    EventData::Filesystem(FilesystemEventData {
                         path: ch.path,
-                        expected_hash: ch.expected,
-                        actual_hash: ch.actual,
-                        size_delta: ch.size_delta,
+                        operation: match ch.kind {
+                            ChangeKind::Added => FilesystemOperation::Created,
+                            ChangeKind::Modified => FilesystemOperation::Modified,
+                            ChangeKind::Removed => FilesystemOperation::Deleted,
+                        },
+                        source: FilesystemSource::PeriodicScan,
+                        integrity: match ch.kind {
+                            ChangeKind::Added => IntegrityStatus::BaselineAdded,
+                            ChangeKind::Modified | ChangeKind::Removed => {
+                                IntegrityStatus::Violation
+                            }
+                        },
+                        expected_hash: (!ch.expected.is_empty()).then_some(ch.expected),
+                        actual_hash: (!ch.actual.is_empty()).then_some(ch.actual),
+                        size_delta: Some(ch.size_delta),
                     }),
                 );
                 if tx.send(event).await.is_err() {
