@@ -13,6 +13,9 @@ use crate::prevention::{
     commands::{load_verifying_key, verify_canonical},
 };
 
+pub mod logs;
+pub use logs::{LogSourceConfig, MultilineConfig, SourceKind};
+
 fn default_poll_interval() -> u64 {
     60
 }
@@ -32,7 +35,21 @@ fn default_enabled_collectors() -> Vec<String> {
         "system".into(),
         "authlog".into(),
         "filesystem".into(),
+        "logs".into(),
     ]
+}
+
+fn default_logs_enabled() -> bool {
+    true
+}
+fn default_logs_include_builtins() -> bool {
+    false
+}
+fn skip_if_true(v: &bool) -> bool {
+    *v
+}
+fn skip_if_false(v: &bool) -> bool {
+    !*v
 }
 fn default_prevention_enabled() -> bool {
     true
@@ -301,6 +318,26 @@ pub struct AgentConfig {
     /// writing to the host filesystem.
     #[serde(default)]
     pub cve_feed: Vec<crate::inventory::compliance::CveEntry>,
+
+    // ── Generic log collector ───────────────────────────────────────────────
+    /// Master switch for the file/journal/syslog collector. Default on; with
+    /// an empty `logs` list the collector auto-discovers the built-in Linux
+    /// security catalogue (sshd, sudo, auditd, nginx, apache, postgres,
+    /// mysql, docker) and only arms sources whose paths actually exist.
+    #[serde(default = "default_logs_enabled", skip_serializing_if = "skip_if_true")]
+    pub logs_enabled: bool,
+    /// When `logs` is non-empty, also arm the built-in catalogue. Default
+    /// `false`: an explicit list is exclusive. Empty `logs` always discovers
+    /// builtins (subject to `logs_enabled`).
+    #[serde(
+        default = "default_logs_include_builtins",
+        skip_serializing_if = "skip_if_false"
+    )]
+    pub logs_include_builtins: bool,
+    /// Explicit log sources. Empty means "use the built-in catalogue".
+    /// See [`LogSourceConfig`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<LogSourceConfig>,
 }
 
 impl Default for AgentConfig {
@@ -343,6 +380,9 @@ impl Default for AgentConfig {
             siem_hec_url: String::new(),
             siem_hec_token: String::new(),
             cve_feed: Vec::new(),
+            logs_enabled: default_logs_enabled(),
+            logs_include_builtins: default_logs_include_builtins(),
+            logs: Vec::new(),
         }
     }
 }

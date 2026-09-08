@@ -87,6 +87,9 @@ pub enum EventClass {
     Prevention,
     /// A behavioural/IOC detection raised by the local detection engine.
     Detection,
+    /// Canonical log record from the generic log collector (file, journal,
+    /// syslog). Routed by `class=log` + `action=log`; see [`LogEventData`].
+    Log,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +190,8 @@ pub enum EventAction {
     /// ring buffer was full). A non-zero count is a detection blind-spot under
     /// load (issue #52).
     EbpfDrops,
+    /// A framed, parsed, normalised log record from the generic log collector.
+    Log,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +258,10 @@ pub enum EventData {
     HoneytokenAccess(Box<HoneytokenAccessData>),
     // ── Observability ────────────────────────────────────────────────────────
     EbpfDrops(EbpfDropsData),
+    // ── Generic log collector (file / journal / syslog) ─────────────────────
+    // Boxed: the structured `fields` map plus the original message can dwarf
+    // the other variants; boxing keeps `EventData` compact.
+    Log(Box<LogEventData>),
 }
 
 // ── Existing data structs ────────────────────────────────────────────────────────────────────────
@@ -994,6 +1003,74 @@ pub struct MemoryAnomalyData {
     pub pid: i32,
     pub region: String,
     pub perms: String,
+}
+
+/// Canonical log record produced by the generic log collector.
+///
+/// The pipeline is `LogSource → Reader → Framing → Parser → Normalizer →`
+/// this payload. Every source (plain file, rotated file, systemd journal,
+/// syslog listener) emits the same shape so the backend, Sigma engine and
+/// SIEM forwarder do not need a per-source decoder. The original message is
+/// always retained; structured fields are additive.
+///
+/// Field names avoid a top-level `path` so untagged `EventData`
+/// deserialisation cannot collide with the legacy [`FileEventData`]
+/// `{path}` variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEventData {
+    /// Configured source name (`nginx`, `sshd`, `app`, …).
+    pub source: String,
+    /// Reader kind: `file`, `journal`, or `syslog`.
+    pub source_type: String,
+    /// Absolute file path, journal unit, or syslog listen address.
+    pub source_path: String,
+    /// Parser that produced this event (`nginx_access`, `json`, `auditd`, …).
+    pub parser: String,
+    /// Original (possibly multiline) message. Truncated on a UTF-8 boundary
+    /// when it exceeded the source's `max_line_bytes`.
+    pub message: String,
+    /// ECS-ish category: `authentication`, `web`, `database`, `audit`,
+    /// `container`, `syslog`, `application`.
+    pub category: String,
+    /// Timestamp parsed from the log line itself, when the parser could
+    /// recover one. Collection time lives on the envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_timestamp: Option<DateTime<Utc>>,
+    /// Syslog facility name (`auth`, `daemon`, …) when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facility: Option<String>,
+    /// Syslog/journal severity keyword (`emerg`..`debug`) when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_severity: Option<String>,
+    /// Process / syslog tag extracted from the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Host inside the log line (may differ from the agent's hostname).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_host: Option<String>,
+    /// Parser-extracted structured fields (status, uri, syscall, …).
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mitre_tactic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mitre_technique: Option<String>,
+    /// Byte offset in the source file after this record was consumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    /// Source-file inode at the time of the read (rotation forensics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inode: Option<u64>,
+    /// Present only when `message` was cut to `max_line_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_fields:
+        Option<std::collections::BTreeMap<String, crate::telemetry::limits::Truncation>>,
 }
 
 #[cfg(test)]
