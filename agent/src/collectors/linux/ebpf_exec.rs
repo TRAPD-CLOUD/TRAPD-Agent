@@ -322,6 +322,11 @@ impl Collector for EbpfExecCollector {
                 let exe = cstr(&raw.filename).to_string();
                 let comm = cstr(&raw.comm).to_string();
 
+                // The kernel's own answer to "this PID exists", recorded before
+                // any /proc read, so the rootkit sweep can compare it against
+                // what procfs is willing to admit later.
+                crate::rootkit::kernel_view::kernel_view().record_process(pid as i32, &comm);
+
                 // The kernel record is already complete and will ship whatever
                 // happens below. Everything from here is /proc enrichment, and a
                 // short-lived process — exactly the kind the eBPF tracer exists
