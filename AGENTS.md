@@ -22,6 +22,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - `agent/src/prevention/commands.rs`: signed response command schema.
 - `agent/src/prevention/policy.rs`: IoC policy/rule schema.
 - `agent/src/deception/`: honeytoken deception subsystem — `profiler.rs` (deterministic recon profile / token candidates), `registry.rs` (deployed-token register at `<state>/honeytokens.json`, incl. out-of-band canary records), `validate.rs` (bait-content + out-of-band-canary validation and anti-fingerprinting guards), `mod.rs` (camouflaged deploy + safe revoke). Step 1 places and manages tokens; the on-host detection path lives in `detection/honeytoken.rs`.
+- `agent/src/rootkit/`: cross-view rootkit and host-manipulation detection — `hidden_process.rs` (`/proc` listing vs. direct `/proc/<pid>` vs. `kill(pid,0)` liveness vs. eBPF PIDs), `hidden_socket.rs` (`/proc/net/*` vs. `sock_diag` netlink vs. eBPF binds), `modules.rs` (`/proc/modules` vs. `/sys/module` vs. eBPF module loads vs. `/lib/modules/<release>`), `binaries.rs` (on-disk digest vs. the distribution package database, over a `PATH`-resolved tool set), `kernel_view.rs` (bounded registry of eBPF sightings), `mod.rs` (finding model, corroboration, `diagnostics rootkit`). Driven by `collectors/linux/rootkit.rs`.
 - `agent/src/forensics/`: response forensics (issue #32, point 5) — `session.rs` (login/TTY/container/namespace/cgroup context from `/proc`), `snapshot.rs` (point-in-time process capture for the freeze response), `recorder.rs` (bounded flight recorder of recent pid-bearing telemetry + remote-IP correlation).
 - `agent/src/transport/mod.rs`: event ingest transport.
 - `agent/src/output/mod.rs`: local stdout/file NDJSON output.
@@ -850,6 +851,46 @@ decide"; an operator then issues `freeze_pid`/`thaw_pid`/`kill_pid`.
   "evidence": "object|array|string|number|bool|null, optional"
 }
 ```
+
+#### Rootkit findings (`category: "rootkit"`)
+
+Cross-view rootkit and host-manipulation detections arrive as ordinary
+`class=detection` / `action=detected` events with `origin.source = "rootkit"`,
+so no new routing is required. They are distinguished only by
+`category: "rootkit"` and their `rule_id`:
+
+```text
+rootkit.process_hidden_from_listing      rootkit.process_hidden_from_procfs
+rootkit.socket_hidden_from_procfs        rootkit.listener_hidden_from_host_views
+rootkit.module_hidden_from_proc_modules  rootkit.module_hidden_after_load
+rootkit.module_not_in_module_tree        rootkit.module_unsigned
+rootkit.module_unloaded                  rootkit.known_rootkit_module
+rootkit.module_file_changed              rootkit.module_tree_bulk_change
+rootkit.system_binary_tampered           rootkit.system_binary_changed
+rootkit.system_binary_shadowed           rootkit.system_binaries_bulk_change
+rootkit.ld_preload_configured
+```
+
+`evidence` carries a `views` object naming which interfaces agreed and which
+did not (e.g. `{"netlink": true, "procfs": false}`), which is the substance of
+the finding — the backend should surface it rather than only the `detail`
+string, because *which* view lied narrows down what was hooked.
+
+Two things matter when triaging these on the backend:
+
+- **`confidence` is calibrated, not decorative.** A digest that disagrees with
+  the distribution's own package database is 95; an unsigned module — which a
+  locally built DKMS driver produces legitimately — is 45. Treating the
+  category as uniformly critical throws that away.
+- **A `*_bulk_change` finding is the agent saying "this was probably a package
+  upgrade".** It is emitted at `Low` *instead of* the individual findings, so
+  escalating it defeats the noise suppression it exists to provide.
+
+The rootkit sweeps are configured by environment variables on the host, not
+over the signed config channel: adding `AgentConfig` fields changes the
+canonical byte sequence the backend must sign, which would make every agent
+reject config from a backend that had not been updated in lockstep. See
+`CAPABILITIES.md` §2b for the variables.
 
 ## Enrollment Schemas
 

@@ -55,6 +55,68 @@ back through the pipeline (persist + backend + auto-response).
 
 ---
 
+## 2b. Rootkit & manipulation detection (`agent/src/rootkit/`) — ✅ NEW
+
+Not a signature scanner. Every detector reads the **same fact through
+interfaces a rootkit has to hook separately**, and reports the disagreement.
+Hiding from one interface is easy; staying consistent across all of them is
+the hard part, and that is what is measured.
+
+| Detector | Views compared | Rule ids |
+|---|---|---|
+| Hidden processes | `/proc` listing · direct `/proc/<pid>` · `kill(pid,0)` liveness · eBPF exec/fork PIDs | `rootkit.process_hidden_from_listing`, `rootkit.process_hidden_from_procfs` |
+| Hidden sockets | `/proc/net/{tcp,tcp6,udp,udp6}` · `sock_diag` netlink · eBPF bind sightings | `rootkit.socket_hidden_from_procfs`, `rootkit.listener_hidden_from_host_views` |
+| Kernel modules | `/proc/modules` · `/sys/module` · eBPF `module_load` · `/lib/modules/<release>` | `rootkit.module_hidden_from_proc_modules`, `rootkit.module_hidden_after_load`, `rootkit.module_not_in_module_tree`, `rootkit.module_unsigned`, `rootkit.module_unloaded`, `rootkit.known_rootkit_module`, `rootkit.module_file_changed`, `rootkit.module_tree_bulk_change` |
+| System binaries | on-disk digest · the digest the distribution's package database records | `rootkit.system_binary_tampered`, `rootkit.system_binary_changed`, `rootkit.system_binary_shadowed`, `rootkit.system_binaries_bulk_change`, `rootkit.ld_preload_configured` |
+
+Findings are ordinary `class=detection` / `action=detected` events with
+`category: "rootkit"`, so auto-response, SIEM forwarding and the backend
+pipeline apply unchanged.
+
+**Nothing is hardcoded to a distribution.** Which binaries are watched is
+derived from the host: a set of tool *names* per role (process visibility,
+network visibility, module management, authentication, …) resolved through the
+host's own `PATH`, plus every setuid/setgid executable discovered in those
+directories at runtime. What they should contain comes from the host's own
+package database (`dpkg` md5sums, `rpm --verify`) — the only source that can
+tell an upgrade from tampering, because after an upgrade the file changed *and*
+still matches its package.
+
+**False positives are the design constraint,** since the value of a rootkit
+alert is that it is worth waking someone for:
+
+| Mechanism | Example |
+|---|---|
+| Benign-explanation filters | threads are absent from the `/proc` listing by design (`Tgid` check); built-in modules have no `/proc/modules` entry (`initstate` check); dual-stack sockets render identically in both views |
+| Corroboration | a standing disagreement must survive consecutive sweeps; transition findings (unload, digest change) report immediately because they exist in exactly one sweep |
+| Bulk collapse | a kernel package update or system upgrade becomes one `Low` finding instead of hundreds of `Critical` ones |
+| Namespace guard | the eBPF cross-view is dropped when the agent is not in the initial PID namespace, where host PIDs cannot be compared against a namespaced `/proc` |
+
+| Capability | Status | Notes |
+|------------|--------|-------|
+| Hidden-process cross-view | ✅ | four views; works without eBPF (three of them need no kernel programs) |
+| Hidden-socket cross-view | ✅ | `sock_diag` dump extended to return socket identity, not just counters |
+| Kernel module monitoring | ✅ | load is already real-time via eBPF, so this covers unload, concealment, provenance and the module tree |
+| Package-verified binary integrity | ✅ | `dpkg` + `rpm`; falls back to a self-recorded digest baseline, which reports *change* but cannot prove *wrongness* |
+| `diagnostics rootkit` | ✅ | reports view sizes, not just findings — an interface that silently returns nothing is otherwise indistinguishable from a clean host |
+| Kernel-layer inode gate for hidden files | ⏳ | file concealment (`getdents` filtering) is not yet cross-checked |
+| `kill(pid,0)` independence | 🟡 | a rootkit hooking the signal path as well as procfs defeats the liveness view; the eBPF view still names the process |
+
+Runtime knobs are environment variables rather than signed-config fields on
+purpose: the config envelope is signed over its canonical byte sequence, so a
+new field changes the bytes the backend must produce and would make every agent
+reject config from a backend not updated in lockstep.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TRAPD_ROOTKIT` | on | set to `0`/`off` to disable the sweeps |
+| `TRAPD_ROOTKIT_INTERVAL_SECS` | `300` (floor 60) | process/socket/module sweep interval |
+| `TRAPD_ROOTKIT_INTEGRITY_INTERVAL_SECS` | `3600` (floor 300) | binary-integrity sweep interval |
+| `TRAPD_ROOTKIT_PID_SCAN_MAX` | `65536` | highest PID probed for procfs concealment |
+| `TRAPD_ROOTKIT_CORROBORATION` | `2` | consecutive sweeps a standing disagreement must survive |
+
+---
+
 ## 3. Prevention & active response (`agent/src/prevention/`)
 
 | Capability | Status | Notes |
@@ -186,13 +248,20 @@ Provisioned files under `<config>` (default `/etc/trapd`): `ca.crt`, `agent.crt`
 
 **P3 — coverage polish**
 - ⏳ live `dlopen`/CRI lifecycle events, JA3S, multi-segment TLS reassembly.
+- ⏳ Rootkit: cross-view detection of **hidden files** (kernel-layer inode gate
+  to catch `getdents` filtering, the one concealment class §2b does not cover).
 
 > Items marked 🧪 are kernel- or feature-gated and validated in a kernel/CI
 > environment rather than in unit tests.
 
 ---
 
-_Last updated: 2026-07-31 — adds the loss-transparent telemetry pipeline
+_Last updated: 2026-09-08 — adds cross-view rootkit and manipulation detection
+(§2b: hidden processes, hidden sockets, kernel modules, package-verified binary
+integrity, `diagnostics rootkit`). Previous revision added the loss-transparent
+telemetry pipeline_
+
+_Earlier: the loss-transparent telemetry pipeline
 (§4b: stable event identity, checksummed persistent queue, drop attribution,
 health model and `diagnostics telemetry`). Previous revision covered the Sigma
 engine, anomaly baseline, inline network IoC enforcement, SBOM/CVE/CIS and SIEM

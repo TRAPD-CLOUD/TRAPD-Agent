@@ -120,6 +120,7 @@ Collectors live in `agent/src/collectors/linux/`. Two tiers:
 | `FilesystemCollector` | `inotify` | `filesystem/create|delete|modify` under watched paths (`/etc`, `/bin`, `/tmp` by default) |
 | `AgentProtectCollector` | agent's own files | `agent_tamper` events |
 | `FimCollector` | SHA256 baseline of `fim_paths` (`/etc`, `/usr/bin`, `/boot`, … by default) | `filesystem/integrity_violation` (modified / added / removed) — every `fim_interval_secs`; baseline persists across restarts |
+| `RootkitCollector` | cross-view comparison of `/proc`, `sock_diag` netlink, `/sys/module`, `/lib/modules` and the package database | `detection/detected` with `category: "rootkit"` — hidden processes/sockets/modules and tampered system binaries, every 5 min (binary integrity hourly) |
 
 **eBPF collectors (when the eBPF object is built & installed; see
 [Building from source](#building-from-source)):**
@@ -128,6 +129,19 @@ Collectors live in `agent/src/collectors/linux/`. Two tiers:
 |-----------|--------------|-------|
 | `EbpfExecCollector` | `sched_process_exec` | rich `process/exec` (uid/gid, cwd, full cmdline, container id, **exe SHA256**) |
 | `EbpfSyscallCollector` | many tracepoints | `fork`, `file open/unlink/rename/chmod/chown`, `mmap`, `ptrace`, `module_load`, `setuid`, `dns_query`, `shm`, `ns_change`, `kill_attempt`, `memfd`, and honeytoken-access detection |
+
+**Rootkit detection by disagreement.** `RootkitCollector` never asks "does this
+look malicious?" — it asks the same question through interfaces a rootkit has
+to hook separately and reports where the answers differ: the `/proc` listing
+against direct `/proc/<pid>` access and `kill(pid, 0)` liveness, `/proc/net`
+against a `sock_diag` netlink dump, `/proc/modules` against `/sys/module`, and
+each system binary against the digest its own distribution package records. The
+eBPF collectors feed it exec/fork PIDs, bind ports and module loads observed
+below all of those interfaces, but three of the four detectors work without
+eBPF at all. Which binaries are watched is resolved from the host's `PATH` and
+its setuid executables rather than a hardcoded list, so it follows the
+distribution. Run `trapd-agent diagnostics rootkit` to see the views, their
+sizes and any findings — see [CAPABILITIES.md](CAPABILITIES.md) §2b.
 
 The kernel-side programs are in the standalone `trapd-agent-ebpf` crate
 (`exec`, `fork`, `network`, `dns`, `file_open`, `file_manip`, `write`, `mmap`,
