@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use inotify::{EventMask, Inotify, WatchMask};
 use tokio::sync::mpsc::Sender;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
@@ -398,6 +398,12 @@ fn run_sync(
                 if suppress_generic_event(&path, &action, &mut recently_emitted, Instant::now()) {
                     continue;
                 }
+                let operation = match action {
+                    EventAction::Create => FilesystemOperation::Created,
+                    EventAction::Modify => FilesystemOperation::Modified,
+                    EventAction::Delete => FilesystemOperation::Deleted,
+                    _ => unreachable!("mask_to_action only returns filesystem actions"),
+                };
                 if send(
                     &tx,
                     AgentEvent::new(
@@ -408,12 +414,7 @@ fn run_sync(
                         Severity::Info,
                         EventData::Filesystem(FilesystemEventData {
                             path,
-                            operation: match action {
-                                EventAction::Create => FilesystemOperation::Created,
-                                EventAction::Modify => FilesystemOperation::Modified,
-                                EventAction::Delete => FilesystemOperation::Deleted,
-                                _ => unreachable!("mask_to_action only returns filesystem actions"),
-                            },
+                            operation,
                             source: FilesystemSource::Realtime,
                             integrity: IntegrityStatus::NotChecked,
                             expected_hash: None,
