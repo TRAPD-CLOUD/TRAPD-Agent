@@ -14,7 +14,9 @@ use crate::prevention::{
 };
 
 pub mod logs;
-pub use logs::{LogCollectorConfig, LogSourceConfig, MultilineConfig};
+pub use logs::LogCollectorConfig;
+#[cfg(target_os = "linux")]
+pub use logs::{LogSourceConfig, MultilineConfig};
 
 fn default_poll_interval() -> u64 {
     60
