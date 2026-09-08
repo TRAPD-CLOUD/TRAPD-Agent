@@ -34,6 +34,13 @@ const BIND_CAP: usize = 1_024;
 const MODULE_TTL: Duration = Duration::from_secs(3_600);
 const MODULE_CAP: usize = 512;
 
+/// Paths the kernel saw being written, created, unlinked or renamed. These are
+/// the candidate names for the hidden-file check: a name has to come from
+/// somewhere before it can be looked up directly, and a filtered directory
+/// listing will not supply it.
+const PATH_TTL: Duration = Duration::from_secs(3_600);
+const PATH_CAP: usize = 4_096;
+
 /// A bounded, expiring set of sightings.
 #[derive(Debug)]
 struct Recent<K: Eq + Hash + Clone, V> {
@@ -97,11 +104,19 @@ pub struct BindSighting {
     pub comm: String,
 }
 
+/// A path the kernel saw being touched, and the operation that revealed it.
+#[derive(Debug, Clone)]
+pub struct PathSighting {
+    pub comm: String,
+    pub op: &'static str,
+}
+
 #[derive(Debug)]
 pub struct KernelView {
     processes: Mutex<Recent<i32, ProcessSighting>>,
     binds: Mutex<Recent<u16, BindSighting>>,
     modules: Mutex<Recent<String, ()>>,
+    paths: Mutex<Recent<String, PathSighting>>,
 }
 
 impl KernelView {
@@ -110,6 +125,7 @@ impl KernelView {
             processes: Mutex::new(Recent::new(PROCESS_TTL, PROCESS_CAP)),
             binds: Mutex::new(Recent::new(BIND_TTL, BIND_CAP)),
             modules: Mutex::new(Recent::new(MODULE_TTL, MODULE_CAP)),
+            paths: Mutex::new(Recent::new(PATH_TTL, PATH_CAP)),
         }
     }
 
@@ -153,6 +169,27 @@ impl KernelView {
         }
     }
 
+    /// Record a path the kernel resolved for a write, create, unlink or rename.
+    ///
+    /// Only absolute paths are useful: `openat` with a directory fd carries a
+    /// relative name the sweep cannot resolve later, and guessing the base
+    /// directory would invent paths that were never touched.
+    pub fn record_path(&self, path: &str, comm: &str, op: &'static str) {
+        if !path.starts_with('/') || path.len() < 2 {
+            return;
+        }
+        if let Ok(mut g) = self.paths.lock() {
+            g.insert(
+                path.to_string(),
+                PathSighting {
+                    comm: comm.to_string(),
+                    op,
+                },
+                Instant::now(),
+            );
+        }
+    }
+
     pub fn processes(&self) -> Vec<(i32, ProcessSighting)> {
         let now = Instant::now();
         self.processes
@@ -174,6 +211,14 @@ impl KernelView {
         self.modules
             .lock()
             .map(|g| g.snapshot(now).into_iter().map(|(k, _)| k).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn paths(&self) -> Vec<(String, PathSighting)> {
+        let now = Instant::now();
+        self.paths
+            .lock()
+            .map(|g| g.snapshot(now))
             .unwrap_or_default()
     }
 }
@@ -275,5 +320,18 @@ mod tests {
         assert!(view.processes().is_empty());
         assert!(view.binds().is_empty());
         assert!(view.modules().is_empty());
+    }
+
+    #[test]
+    fn only_absolute_paths_are_recorded() {
+        let view = KernelView::new();
+        view.record_path("relative/name", "sh", "write");
+        view.record_path("/", "sh", "write");
+        assert!(
+            view.paths().is_empty(),
+            "a relative openat name cannot be resolved by a later sweep"
+        );
+        view.record_path("/tmp/.hidden", "sh", "write");
+        assert_eq!(view.paths().len(), 1);
     }
 }

@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::collectors::Collector;
 use crate::rootkit::{
-    binaries, hidden_process, hidden_socket,
+    binaries, hidden_file, hidden_login, hidden_mount, hidden_process, hidden_socket,
     kernel_view::kernel_view,
     modules::{self, ModuleHistory, TreeSnapshot},
     Corroborator, Finding, RootkitConfig,
@@ -87,15 +87,58 @@ impl RootkitCollector {
             self.module_tree = Some(tree);
         }
 
-        // ── Critical binary integrity ───────────────────────────────────────
-        // Much heavier than the other sweeps (digests plus the package
-        // database), so it runs on its own, slower schedule.
+        // ── Hidden mounts ───────────────────────────────────────────────────
+        let mount_findings =
+            tokio::task::spawn_blocking(|| hidden_mount::analyze(&hidden_mount::gather()))
+                .await
+                .unwrap_or_default();
+        findings.extend(mount_findings);
+
+        // ── Unrecorded logins ───────────────────────────────────────────────
+        let login_findings =
+            tokio::task::spawn_blocking(|| hidden_login::analyze(&hidden_login::gather()))
+                .await
+                .unwrap_or_default();
+        findings.extend(login_findings);
+
+        // ── Heavy sweeps ────────────────────────────────────────────────────
+        // The binary digests (plus the package database) and the directory walk
+        // both cost far more than the /proc and netlink comparisons above, so
+        // they share their own slower schedule.
         let due = self
             .last_integrity_sweep
             .map(|last| last.elapsed() >= self.cfg.integrity_interval)
             .unwrap_or(true);
         if due {
             self.last_integrity_sweep = Some(Instant::now());
+
+            let cfg = self.cfg.clone();
+            let paths = kernel_view().paths();
+            if let Ok((file_findings, candidates, summary)) =
+                tokio::task::spawn_blocking(move || {
+                    let (dirs, candidates, summary) = hidden_file::gather(&cfg, &paths);
+                    let findings = hidden_file::analyze(&dirs, &candidates);
+                    (findings, candidates.len(), summary)
+                })
+                .await
+            {
+                if summary.truncated {
+                    warn!(
+                        directories = summary.directories,
+                        "rootkit: directory ceiling reached, part of the tree was not \
+                         checked for hidden files; raise TRAPD_ROOTKIT_DIR_SCAN_MAX or \
+                         narrow TRAPD_ROOTKIT_FILE_ROOTS"
+                    );
+                }
+                debug!(
+                    directories = summary.directories,
+                    link_count_comparable = summary.nlink_checked,
+                    candidates,
+                    "rootkit: file sweep complete"
+                );
+                findings.extend(file_findings);
+            }
+
             let state_dir = crate::paths::state_dir().to_path_buf();
             let integrity = tokio::task::spawn_blocking(move || binaries::sweep(&state_dir))
                 .await

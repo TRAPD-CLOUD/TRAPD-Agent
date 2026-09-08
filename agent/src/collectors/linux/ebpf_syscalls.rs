@@ -1158,6 +1158,11 @@ impl Collector for EbpfSyscallCollector {
                             if ev.pid == agent_pid {
                                 continue;
                             }
+                            // A name observed below the directory listing: the
+                            // rootkit sweep looks it up directly, which is how
+                            // a file filtered out of getdents is still found.
+                            crate::rootkit::kernel_view::kernel_view()
+                                .record_path(cstr(&ev.filename), cstr(&ev.comm), "write");
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1248,6 +1253,8 @@ impl Collector for EbpfSyscallCollector {
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawFileUnlinkEvent>(&item) } {
                             if ev.pid == agent_pid { continue; } // self-exclusion
+                            crate::rootkit::kernel_view::kernel_view()
+                                .record_path(cstr(&ev.path), cstr(&ev.comm), "unlink");
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1273,6 +1280,9 @@ impl Collector for EbpfSyscallCollector {
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawFileRenameEvent>(&item) } {
                             if ev.pid == agent_pid { continue; } // self-exclusion
+                            let view = crate::rootkit::kernel_view::kernel_view();
+                            view.record_path(cstr(&ev.old_path), cstr(&ev.comm), "rename");
+                            view.record_path(cstr(&ev.new_path), cstr(&ev.comm), "rename");
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),

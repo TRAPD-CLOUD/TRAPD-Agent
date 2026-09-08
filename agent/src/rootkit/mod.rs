@@ -9,6 +9,9 @@
 //! |---|---|
 //! | [`hidden_process`] | `/proc` listing vs. direct `/proc/<pid>` access vs. signal liveness vs. eBPF-observed PIDs |
 //! | [`hidden_socket`] | `/proc/net/*` vs. `sock_diag` netlink vs. eBPF-observed binds |
+//! | [`hidden_file`] | libc `readdir` vs. raw `getdents64` vs. directory link count vs. names from eBPF, `/proc/<pid>/fd` and `/proc/<pid>/maps` |
+//! | [`hidden_mount`] | `/proc/mounts` vs. `/proc/self/mountinfo` vs. `/proc/self/mountstats` |
+//! | [`hidden_login`] | `/var/run/utmp` vs. login sessions reconstructed from `/proc` |
 //! | [`modules`] | `/proc/modules` vs. `/sys/module` vs. eBPF module loads vs. the on-disk module tree |
 //! | [`binaries`] | on-disk digest vs. the package manager's recorded digest |
 //!
@@ -34,6 +37,9 @@
 //!   storm of critical findings.
 
 pub mod binaries;
+pub mod hidden_file;
+pub mod hidden_login;
+pub mod hidden_mount;
 pub mod hidden_process;
 pub mod hidden_socket;
 pub mod kernel_view;
@@ -183,6 +189,12 @@ pub struct RootkitConfig {
     pub pid_scan_max: i32,
     /// Consecutive sweeps a disagreement must survive before it is reported.
     pub corroboration: u32,
+    /// Directory trees walked when looking for concealed files.
+    pub file_roots: Vec<String>,
+    /// Ceiling on directories visited per file sweep, so a host with a very
+    /// large `/usr` cannot turn a sweep into an unbounded walk.
+    pub dir_scan_max: usize,
+    pub dir_scan_depth: usize,
 }
 
 impl Default for RootkitConfig {
@@ -193,6 +205,12 @@ impl Default for RootkitConfig {
             integrity_interval: Duration::from_secs(3600),
             pid_scan_max: 65_536,
             corroboration: 2,
+            file_roots: hidden_file::DEFAULT_ROOTS
+                .iter()
+                .map(|r| (*r).to_string())
+                .collect(),
+            dir_scan_max: 20_000,
+            dir_scan_depth: 8,
         }
     }
 }
@@ -218,6 +236,18 @@ impl RootkitConfig {
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(defaults.corroboration),
+            file_roots: std::env::var("TRAPD_ROOTKIT_FILE_ROOTS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| p.starts_with('/'))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|roots| !roots.is_empty())
+                .unwrap_or(defaults.file_roots),
+            dir_scan_max: env_usize("TRAPD_ROOTKIT_DIR_SCAN_MAX", defaults.dir_scan_max),
+            dir_scan_depth: env_usize("TRAPD_ROOTKIT_DIR_SCAN_DEPTH", defaults.dir_scan_depth),
         }
     }
 }
@@ -251,7 +281,17 @@ pub fn diagnostics() -> String {
         cfg.integrity_interval.as_secs()
     );
     let _ = writeln!(out, "  pid scan ceiling        {}", cfg.pid_scan_max);
-    let _ = writeln!(out, "  corroborating sweeps    {}\n", cfg.corroboration);
+    let _ = writeln!(out, "  corroborating sweeps    {}", cfg.corroboration);
+    let _ = writeln!(
+        out,
+        "  file roots              {}",
+        cfg.file_roots.join(" ")
+    );
+    let _ = writeln!(
+        out,
+        "  directory ceiling       {} (depth {})\n",
+        cfg.dir_scan_max, cfg.dir_scan_depth
+    );
 
     let sightings = view.processes();
     let comparable = kernel_view::in_initial_pid_namespace();
@@ -341,6 +381,79 @@ pub fn diagnostics() -> String {
     );
     let _ = writeln!(out, "  findings                {}\n", module_findings.len());
 
+    let (dir_views, candidates, file_summary) = hidden_file::gather(&cfg, &view.paths());
+    let file_findings = hidden_file::analyze(&dir_views, &candidates);
+    let _ = writeln!(out, "files");
+    let _ = writeln!(
+        out,
+        "  directories walked      {}{}",
+        file_summary.directories,
+        if file_summary.truncated {
+            " (ceiling reached — tree not fully covered)"
+        } else {
+            ""
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  link-count comparable   {}{}",
+        file_summary.nlink_checked,
+        if file_summary.nlink_checked == 0 {
+            " (filesystem does not count subdirectories in st_nlink)"
+        } else {
+            ""
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  candidate names         {} ({} from eBPF)",
+        file_summary.candidates,
+        view.paths().len()
+    );
+    let _ = writeln!(out, "  findings                {}\n", file_findings.len());
+
+    let mount_views = hidden_mount::gather();
+    let mount_findings = hidden_mount::analyze(&mount_views);
+    let _ = writeln!(out, "mounts");
+    let _ = writeln!(
+        out,
+        "  /proc/mounts            {}",
+        mount_views.mounts.len()
+    );
+    let _ = writeln!(
+        out,
+        "  /proc/self/mountinfo    {}",
+        mount_views.mountinfo.len()
+    );
+    let _ = writeln!(
+        out,
+        "  /proc/self/mountstats   {}",
+        if mount_views.mountstats_readable {
+            mount_views.mountstats.len().to_string()
+        } else {
+            "unavailable".to_string()
+        }
+    );
+    let _ = writeln!(out, "  findings                {}\n", mount_findings.len());
+
+    let login_views = hidden_login::gather();
+    let login_findings = hidden_login::analyze(&login_views);
+    let _ = writeln!(out, "logins");
+    let _ = writeln!(
+        out,
+        "  utmp sessions           {}",
+        match login_views.utmp.as_ref() {
+            Some(entries) => entries
+                .iter()
+                .filter(|e| e.kind == hidden_login::USER_PROCESS)
+                .count()
+                .to_string(),
+            None => "unreadable (check skipped)".to_string(),
+        }
+    );
+    let _ = writeln!(out, "  /proc login sessions    {}", login_views.live.len());
+    let _ = writeln!(out, "  findings                {}\n", login_findings.len());
+
     let (binary_findings, summary) = binaries::observe(crate::paths::state_dir(), false);
     let _ = writeln!(out, "system binaries");
     let _ = writeln!(out, "  watched                 {}", summary.watched);
@@ -368,6 +481,9 @@ pub fn diagnostics() -> String {
         .into_iter()
         .chain(socket_findings)
         .chain(module_findings)
+        .chain(file_findings)
+        .chain(mount_findings)
+        .chain(login_findings)
         .chain(binary_findings)
         .collect();
 
@@ -412,6 +528,14 @@ fn env_disabled(key: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn env_usize(key: &str, fallback: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(fallback)
 }
 
 fn env_secs(key: &str, fallback: Duration, floor: u64) -> Duration {
