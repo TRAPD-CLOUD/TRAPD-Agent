@@ -29,6 +29,8 @@ mod output;
 mod paths;
 mod pipeline;
 mod prevention;
+#[cfg(target_os = "linux")]
+mod rootkit;
 mod schema;
 #[cfg(target_os = "linux")]
 mod selfprotect;
@@ -41,7 +43,7 @@ mod winsvc;
 use collectors::linux::{
     agent_protect::AgentProtectCollector, authlog::AuthLogCollector, ebpf_exec::EbpfExecCollector,
     ebpf_syscalls::EbpfSyscallCollector, filesystem::FilesystemCollector, logs::LogCollector,
-    network::NetworkCollector, process::ProcessCollector,
+    network::NetworkCollector, process::ProcessCollector, rootkit::RootkitCollector,
 };
 // Only consumed by the Linux `async fn main`; the Windows runtime (winsvc::run)
 // imports these itself, so gate them to avoid an unused-import warning there.
@@ -118,9 +120,18 @@ async fn main() -> Result<()> {
                     print!("{}", telemetry::diagnostics::run());
                     Ok(())
                 }
+                // Runs one cross-view sweep in this process and reports the
+                // views as well as the findings, so an operator can see whether
+                // each interface actually answered before trusting a clean
+                // result. Read-only: it leaves the agent's baselines alone.
+                #[cfg(target_os = "linux")]
+                Some("rootkit") => {
+                    print!("{}", rootkit::diagnostics());
+                    Ok(())
+                }
                 other => {
                     eprintln!(
-                        "unknown diagnostics topic {:?}\n\nusage: trapd-agent diagnostics telemetry",
+                        "unknown diagnostics topic {:?}\n\nusage: trapd-agent diagnostics <telemetry|rootkit>",
                         other.unwrap_or("(none)")
                     );
                     std::process::exit(2);
@@ -314,6 +325,10 @@ async fn main() -> Result<()> {
         spawn_collector!(collectors::linux::memscan::MemScanCollector::new(
             Arc::clone(&agent_config)
         ));
+        // Cross-view rootkit sweeps. Works without eBPF (the /proc-versus-netlink
+        // and package-digest comparisons need no kernel programs); the eBPF
+        // sightings, when available, add the checks that see below both views.
+        spawn_collector!(RootkitCollector::new());
         // Passive DNS-response + TLS-handshake capture (AF_PACKET). Best-effort:
         // needs CAP_NET_RAW; logs and exits cleanly without it while the rest run.
         spawn_collector!(collectors::linux::packet_capture::PacketCaptureCollector::new());

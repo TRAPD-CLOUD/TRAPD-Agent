@@ -1158,6 +1158,11 @@ impl Collector for EbpfSyscallCollector {
                             if ev.pid == agent_pid {
                                 continue;
                             }
+                            // A name observed below the directory listing: the
+                            // rootkit sweep looks it up directly, which is how
+                            // a file filtered out of getdents is still found.
+                            crate::rootkit::kernel_view::kernel_view()
+                                .record_path(cstr(&ev.filename), cstr(&ev.comm), "write");
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1184,6 +1189,13 @@ impl Collector for EbpfSyscallCollector {
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawNetEvent>(&item) } {
                             if ev.pid == agent_pid { continue; } // self-exclusion (own uploads to backend)
+                            // A bind seen at the syscall layer, below both
+                            // /proc/net and netlink: the rootkit sweep uses it
+                            // to spot a listener neither view admits to.
+                            if ev.op == 1 {
+                                crate::rootkit::kernel_view::kernel_view()
+                                    .record_bind(ev.pid as i32, ev.port, cstr(&ev.comm));
+                            }
                             let username = proc_username(ev.uid);
                             let (action, severity) = match ev.op {
                                 0 => (EventAction::Connection, Severity::Info),
@@ -1217,6 +1229,8 @@ impl Collector for EbpfSyscallCollector {
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawForkEvent>(&item) } {
                             if ev.parent_pid == agent_pid || ev.child_pid == agent_pid { continue; } // self-exclusion
+                            crate::rootkit::kernel_view::kernel_view()
+                                .record_process(ev.child_pid as i32, cstr(&ev.child_comm));
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
                                 EventClass::Process, EventAction::Fork,
@@ -1239,6 +1253,8 @@ impl Collector for EbpfSyscallCollector {
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawFileUnlinkEvent>(&item) } {
                             if ev.pid == agent_pid { continue; } // self-exclusion
+                            crate::rootkit::kernel_view::kernel_view()
+                                .record_path(cstr(&ev.path), cstr(&ev.comm), "unlink");
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1264,6 +1280,9 @@ impl Collector for EbpfSyscallCollector {
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawFileRenameEvent>(&item) } {
                             if ev.pid == agent_pid { continue; } // self-exclusion
+                            let view = crate::rootkit::kernel_view::kernel_view();
+                            view.record_path(cstr(&ev.old_path), cstr(&ev.comm), "rename");
+                            view.record_path(cstr(&ev.new_path), cstr(&ev.comm), "rename");
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
@@ -1401,6 +1420,10 @@ impl Collector for EbpfSyscallCollector {
                     while let Some(item) = rb.next() {
                         if let Some(ev) = unsafe { read_raw::<RawModuleLoadEvent>(&item) } {
                             if ev.pid == agent_pid { continue; } // self-exclusion
+                            // Recorded so a module that removes itself from
+                            // /proc/modules and /sys/module can still be named.
+                            crate::rootkit::kernel_view::kernel_view()
+                                .record_module_load(cstr(&ev.name));
                             let username = proc_username(ev.uid);
                             let event = AgentEvent::new(
                                 agent_id.clone(), hostname.clone(),
