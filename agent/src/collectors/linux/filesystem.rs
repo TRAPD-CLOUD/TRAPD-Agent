@@ -1,37 +1,23 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::Read as IoRead;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use inotify::{EventMask, Inotify, WatchMask};
-use rusqlite::{params, Connection};
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
-use walkdir::WalkDir;
 
 use crate::collectors::Collector;
+use crate::config::AgentConfig;
 use crate::schema::{
-    AgentEvent, AgentTamperData, DetectionData, EventAction, EventClass, EventData, FileEventData,
-    IntegrityViolationData, RansomwareIndicatorData, Severity,
+    AgentEvent, AgentTamperData, DetectionData, EventAction, EventClass, EventData,
+    FilesystemEventData, FilesystemOperation, FilesystemSource, IntegrityStatus,
+    RansomwareIndicatorData, Severity,
 };
 
 // ── Watched path groups ───────────────────────────────────────────────────────
-
-/// Paths subject to SHA256 integrity baseline (FIM).
-const FIM_PATHS: &[&str] = &[
-    "/usr/bin",
-    "/usr/sbin",
-    "/lib",
-    "/lib64",
-    "/boot",
-    "/sbin",
-    "/root",
-    "/etc",
-    "/bin",
-];
 
 /// Paths monitored for ransomware-style mass writes / high-entropy content.
 const RANSOM_WATCH_PATHS: &[&str] = &["/tmp", "/home", "/var/www", "/var/data"];
@@ -69,9 +55,6 @@ const ENTROPY_THRESHOLD: f64 = 7.2;
 /// Maximum file size read for entropy analysis (8 MiB).
 const MAX_ENTROPY_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Rebuild the SHA256 baseline if the DB is older than this many seconds (24 h).
-const BASELINE_MAX_AGE_SECS: i64 = 86_400;
-
 /// Emit a "high_write_rate" ransomware indicator after this many unique-path
 /// modifications within MASS_MOD_WINDOW.
 const MASS_MOD_THRESHOLD: usize = 50;
@@ -104,22 +87,12 @@ const RANSOM_EXTENSIONS: &[&str] = &[
 // ── Collector struct ──────────────────────────────────────────────────────────
 
 pub struct FilesystemCollector {
-    db_path: PathBuf,
+    cfg: Arc<RwLock<AgentConfig>>,
 }
 
 impl FilesystemCollector {
-    pub fn new() -> Self {
-        // State lives in the canonical, $HOME-independent state dir (resolved by
-        // `crate::paths`) so the FIM baseline DB survives under systemd just like
-        // device_id and credentials.
-        let db_path = crate::paths::state_dir().join("fim_baseline.db");
-        Self { db_path }
-    }
-}
-
-impl Default for FilesystemCollector {
-    fn default() -> Self {
-        Self::new()
+    pub fn new(cfg: Arc<RwLock<AgentConfig>>) -> Self {
+        Self { cfg }
     }
 }
 
@@ -135,7 +108,6 @@ impl Collector for FilesystemCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
-        let db_path = self.db_path.clone();
         let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel::<AgentEvent>(512);
 
         // Honeytoken FIM (issue #32, point 1): watch every deployed bait file for
@@ -154,8 +126,23 @@ impl Collector for FilesystemCollector {
             });
         }
 
+        let realtime_tx = fs_tx.clone();
+        let realtime_agent_id = agent_id.clone();
+        let realtime_hostname = hostname.clone();
+        let fim_paths = self
+            .cfg
+            .read()
+            .map(|cfg| cfg.fim_paths.clone())
+            .unwrap_or_default();
         std::thread::spawn(move || {
-            run_sync(fs_tx, agent_id, hostname, db_path);
+            run_sync(realtime_tx, realtime_agent_id, realtime_hostname, fim_paths);
+        });
+        // Both sources feed one outward stream and use FilesystemEventData.
+        let mut fim = super::fim::FimCollector::new(Arc::clone(&self.cfg));
+        tokio::spawn(async move {
+            if let Err(error) = fim.run(fs_tx, agent_id, hostname).await {
+                warn!(%error, "FilesystemCollector: periodic FIM stopped");
+            }
         });
 
         while let Some(event) = fs_rx.recv().await {
@@ -173,20 +160,8 @@ fn run_sync(
     tx: tokio::sync::mpsc::Sender<AgentEvent>,
     agent_id: String,
     hostname: String,
-    db_path: PathBuf,
+    fim_paths: Vec<String>,
 ) {
-    let conn = match open_db(&db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("FilesystemCollector: SQLite init failed: {e}");
-            return;
-        }
-    };
-
-    // Build or refresh the SHA256 baseline.
-    let baseline_count = load_or_build_baseline(&conn);
-    info!("FilesystemCollector: baseline ready — {baseline_count} files indexed");
-
     let mut inotify = match Inotify::init() {
         Ok(i) => i,
         Err(e) => {
@@ -195,19 +170,21 @@ fn run_sync(
         }
     };
 
-    let mut wd_map: std::collections::HashMap<inotify::WatchDescriptor, &'static str> =
+    let mut wd_map: std::collections::HashMap<inotify::WatchDescriptor, String> =
         std::collections::HashMap::new();
 
-    // Combine all path groups into a single watch list (deduplicated by inotify itself).
-    let all_paths: Vec<&'static str> = FIM_PATHS
-        .iter()
-        .chain(RANSOM_WATCH_PATHS.iter())
-        .chain(BACKUP_PATHS.iter())
-        .chain(AGENT_CONFIG_PATHS.iter())
-        .copied()
-        .collect();
+    // FIM configuration governs both periodic hashing and real-time
+    // notifications; the remaining roots exist only for their named detections.
+    let mut all_paths = fim_paths;
+    all_paths.extend(
+        RANSOM_WATCH_PATHS
+            .iter()
+            .chain(BACKUP_PATHS.iter())
+            .chain(AGENT_CONFIG_PATHS.iter())
+            .map(|path| (*path).to_string()),
+    );
 
-    for &path in &all_paths {
+    for path in &all_paths {
         // Skip optional watch roots that don't exist on this host (e.g. /var/www,
         // /backup on a minimal box) quietly — a missing root is not an error and
         // shouldn't spam WARN. Real failures on existing paths still warn.
@@ -217,7 +194,7 @@ fn run_sync(
         }
         match inotify.watches().add(path, WATCH_MASK) {
             Ok(wd) => {
-                wd_map.insert(wd, path);
+                wd_map.insert(wd, path.clone());
             }
             Err(e) => warn!("FilesystemCollector: cannot watch {path}: {e}"),
         }
@@ -242,7 +219,7 @@ fn run_sync(
         };
 
         for event in events {
-            let dir = match wd_map.get(&event.wd).copied() {
+            let dir = match wd_map.get(&event.wd) {
                 Some(d) => d,
                 None => continue,
             };
@@ -278,13 +255,6 @@ fn run_sync(
                     ),
                 ) {
                     return;
-                }
-            }
-
-            // ── FIM: SHA256 integrity check on MODIFY ─────────────────────────
-            if mask.contains(EventMask::MODIFY) && is_fim_path(&path) {
-                if let Err(e) = check_fim_integrity(&conn, &path, &agent_id, &hostname, &tx) {
-                    warn!("FilesystemCollector: FIM check error for {path}: {e}");
                 }
             }
 
@@ -437,7 +407,20 @@ fn run_sync(
                         EventClass::Filesystem,
                         action,
                         Severity::Info,
-                        EventData::FileEvent(FileEventData { path }),
+                        EventData::Filesystem(FilesystemEventData {
+                            path,
+                            operation: match action {
+                                EventAction::Create => FilesystemOperation::Created,
+                                EventAction::Modify => FilesystemOperation::Modified,
+                                EventAction::Delete => FilesystemOperation::Deleted,
+                                _ => unreachable!("mask_to_action only returns filesystem actions"),
+                            },
+                            source: FilesystemSource::Realtime,
+                            integrity: IntegrityStatus::NotChecked,
+                            expected_hash: None,
+                            actual_hash: None,
+                            size_delta: None,
+                        }),
                     ),
                 ) {
                     return;
@@ -662,178 +645,6 @@ fn run_token_fim(tx: tokio::sync::mpsc::Sender<AgentEvent>, agent_id: String, ho
     }
 }
 
-// ── SQLite baseline ───────────────────────────────────────────────────────────
-
-fn open_db(db_path: &Path) -> Result<Connection> {
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let conn = Connection::open(db_path)?;
-    // WAL gives crash-consistent reads/writes; restrict the DB (and its WAL/SHM
-    // sidecars) to owner-only so a non-root reader cannot lift the pre-computed
-    // map of monitored file hashes to help evade FIM detection.
-    let _ = conn.pragma_update(None, "journal_mode", "WAL");
-    restrict_db_perms(db_path);
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS baseline (
-            path       TEXT PRIMARY KEY,
-            hash       TEXT NOT NULL,
-            size       INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        );",
-    )?;
-    Ok(conn)
-}
-
-/// Best-effort `0600` on the SQLite database and its WAL/SHM sidecars.
-#[cfg(target_os = "linux")]
-fn restrict_db_perms(db_path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    for suffix in ["", "-wal", "-shm"] {
-        let p = if suffix.is_empty() {
-            db_path.to_path_buf()
-        } else {
-            let mut s = db_path.as_os_str().to_os_string();
-            s.push(suffix);
-            PathBuf::from(s)
-        };
-        if p.exists() {
-            let _ = std::fs::set_permissions(&p, perms.clone());
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn restrict_db_perms(_db_path: &Path) {}
-
-/// Load existing baseline from DB; rebuild if empty or older than BASELINE_MAX_AGE_SECS.
-fn load_or_build_baseline(conn: &Connection) -> usize {
-    let now = chrono::Utc::now().timestamp();
-
-    // Check the age of the most recent baseline entry.
-    let oldest: Option<i64> = conn
-        .query_row("SELECT MIN(updated_at) FROM baseline", [], |r| r.get(0))
-        .ok()
-        .flatten();
-
-    let needs_rebuild = match oldest {
-        None => true,
-        Some(t) => (now - t) > BASELINE_MAX_AGE_SECS,
-    };
-
-    if needs_rebuild {
-        info!("FilesystemCollector: (re)building SHA256 baseline for FIM paths …");
-        build_baseline(conn)
-    } else {
-        conn.query_row("SELECT COUNT(*) FROM baseline", [], |r| {
-            r.get::<_, usize>(0)
-        })
-        .unwrap_or(0)
-    }
-}
-
-fn build_baseline(conn: &Connection) -> usize {
-    let now = chrono::Utc::now().timestamp();
-    let mut count = 0usize;
-
-    for &root in FIM_PATHS {
-        if !Path::new(root).exists() {
-            continue;
-        }
-        for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path().to_string_lossy().into_owned();
-            match sha256_file(&path) {
-                Ok((hash, size)) => {
-                    let _ = conn.execute(
-                        "INSERT OR REPLACE INTO baseline (path, hash, size, updated_at) \
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![path, hash, size as i64, now],
-                    );
-                    count += 1;
-                }
-                Err(e) => warn!("FilesystemCollector: baseline hash failed for {path}: {e}"),
-            }
-        }
-    }
-    count
-}
-
-/// Check whether a modified file's hash matches the baseline and emit an event if not.
-/// The baseline is intentionally NOT updated here — it stays stable until explicitly rebuilt.
-fn check_fim_integrity(
-    conn: &Connection,
-    path: &str,
-    agent_id: &str,
-    hostname: &str,
-    tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-) -> Result<()> {
-    let (new_hash, new_size) = match sha256_file(path) {
-        Ok(v) => v,
-        Err(_) => return Ok(()), // file gone / unreadable — DELETE event will cover it
-    };
-
-    let row: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT hash, size FROM baseline WHERE path = ?1",
-            params![path],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok();
-
-    match row {
-        None => {
-            // File not in baseline yet — add it (new file created after agent start).
-            let now = chrono::Utc::now().timestamp();
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO baseline (path, hash, size, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![path, new_hash, new_size as i64, now],
-            );
-        }
-        Some((expected_hash, old_size)) if expected_hash != new_hash => {
-            let size_delta = new_size as i64 - old_size;
-            tx.blocking_send(AgentEvent::new(
-                agent_id.to_string(),
-                hostname.to_string(),
-                EventClass::Filesystem,
-                EventAction::IntegrityViolation,
-                Severity::High,
-                EventData::IntegrityViolation(IntegrityViolationData {
-                    path: path.to_string(),
-                    expected_hash,
-                    actual_hash: new_hash,
-                    size_delta,
-                }),
-            ))?;
-        }
-        Some(_) => {} // hash unchanged — no violation
-    }
-
-    Ok(())
-}
-
-// ── Crypto / entropy helpers ──────────────────────────────────────────────────
-
-fn sha256_file(path: &str) -> Result<(String, u64)> {
-    let meta = std::fs::metadata(path)?;
-    let size = meta.len();
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65_536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok((format!("sha256:{}", hex::encode(hasher.finalize())), size))
-}
-
 fn compute_file_entropy(path: &str) -> Option<f64> {
     let meta = std::fs::metadata(path).ok()?;
     let len = meta.len();
@@ -864,10 +675,6 @@ fn shannon_entropy(data: &[u8]) -> f64 {
 }
 
 // ── Path classification helpers ───────────────────────────────────────────────
-
-fn is_fim_path(path: &str) -> bool {
-    FIM_PATHS.iter().any(|&p| path.starts_with(p))
-}
 
 fn is_backup_path(path: &str) -> bool {
     BACKUP_PATHS.iter().any(|&p| path.starts_with(p))

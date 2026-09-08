@@ -310,11 +310,8 @@ async fn main() -> Result<()> {
         spawn_collector!(ProcessCollector::new());
         spawn_collector!(NetworkCollector::new());
         spawn_collector!(AuthLogCollector::new());
-        spawn_collector!(FilesystemCollector::new());
+        spawn_collector!(FilesystemCollector::new(Arc::clone(&agent_config)));
         spawn_collector!(AgentProtectCollector::new());
-        spawn_collector!(collectors::linux::fim::FimCollector::new(Arc::clone(
-            &agent_config
-        )));
         spawn_collector!(collectors::linux::memscan::MemScanCollector::new(
             Arc::clone(&agent_config)
         ));

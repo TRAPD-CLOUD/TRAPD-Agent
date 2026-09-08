@@ -97,9 +97,11 @@ impl FieldView {
                 put("processid", e.pid.to_string());
                 ("file_event", e.path.clone())
             }
-            EventData::FileEvent(e) => {
+            EventData::Filesystem(e) => {
                 put("targetfilename", e.path.clone());
                 put("filename", e.path.clone());
+                put("fileoperation", format!("{:?}", e.operation).to_ascii_lowercase());
+                put("integrity", format!("{:?}", e.integrity).to_ascii_lowercase());
                 ("file_event", e.path.clone())
             }
             EventData::ModuleLoad(e) => {

@@ -212,6 +212,11 @@ pub enum EventData {
     SystemSnapshot(SystemSnapshotData),
     UserLogon(UserLogonData),
     UserSession(UserSessionData),
+    /// Canonical filesystem notification. Both the real-time watcher and the
+    /// periodic integrity scanner emit this shape so consumers do not need
+    /// separate pipelines for FIM and ordinary filesystem activity.
+    Filesystem(FilesystemEventData),
+    /// Legacy journal compatibility only. New collectors emit `Filesystem`.
     FileEvent(FileEventData),
     // ── eBPF-sourced event data ──────────────────────────────────────
     FileOpen(FileOpenData),
@@ -229,6 +234,7 @@ pub enum EventData {
     Dns(DnsData),
     DnsResolution(DnsResolutionData),
     TlsHandshake(TlsHandshakeData),
+    /// Legacy journal compatibility only. New collectors emit `Filesystem`.
     IntegrityViolation(IntegrityViolationData),
     RansomwareIndicator(RansomwareIndicatorData),
     AgentTamper(AgentTamperData),
@@ -465,6 +471,50 @@ pub struct UserSessionData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FilesystemSource {
+    Realtime,
+    PeriodicScan,
+}
+
+/// Operation observed for a filesystem object.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesystemOperation {
+    Created,
+    Modified,
+    Deleted,
+}
+
+/// Result of integrity comparison when an event was produced by FIM.
+///
+/// Real-time notifications deliberately use `NotChecked`: an inotify event is
+/// useful immediately, while the scanner supplies the authoritative digest
+/// comparison in a later event.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrityStatus {
+    NotChecked,
+    BaselineAdded,
+    Violation,
+}
+
+/// One canonical filesystem event, emitted by every filesystem monitor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilesystemEventData {
+    pub path: String,
+    pub operation: FilesystemOperation,
+    pub source: FilesystemSource,
+    pub integrity: IntegrityStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_delta: Option<i64>,
+}
+
+/// Legacy pre-consolidation filesystem notification payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEventData {
     pub path: String,
 }
@@ -478,6 +528,16 @@ pub struct FileOpenData {
     pub comm: String,
     pub path: String,
     pub flags: u64,
+}
+
+/// Legacy pre-consolidation FIM payload, retained so queued events written by
+/// earlier releases can still be replayed after an upgrade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityViolationData {
+    pub path: String,
+    pub expected_hash: String,
+    pub actual_hash: String,
+    pub size_delta: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -660,14 +720,6 @@ pub struct TlsHandshakeData {
     /// ALPN protocols offered (`h2`, `http/1.1`, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alpn: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntegrityViolationData {
-    pub path: String,
-    pub expected_hash: String,
-    pub actual_hash: String,
-    pub size_delta: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
