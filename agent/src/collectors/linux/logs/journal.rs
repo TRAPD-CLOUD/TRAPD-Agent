@@ -9,11 +9,12 @@
 use std::process::Stdio;
 
 use serde_json::{Map, Value};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{info, warn};
 
 use crate::config::LogSourceConfig;
+use crate::telemetry::{metrics::metrics, DropReason};
 
 use super::checkpoint::JournalCheckpoint;
 use super::parser::ParsedLog;
@@ -23,6 +24,7 @@ pub struct JournalTail {
     child: Option<Child>,
     reader: Option<BufReader<tokio::process::ChildStdout>>,
     source: String,
+    max_line: usize,
 }
 
 impl JournalTail {
@@ -53,6 +55,7 @@ impl JournalTail {
         for unit in &source.units {
             cmd.arg("-u").arg(unit);
         }
+        let max_line = source.max_line_bytes.max(4 * 1024);
         match cmd.spawn() {
             Ok(mut child) => {
                 let stdout = child.stdout.take()?;
@@ -63,8 +66,9 @@ impl JournalTail {
                 );
                 Some(Self {
                     child: Some(child),
-                    reader: Some(BufReader::new(stdout)),
+                    reader: Some(BufReader::with_capacity(max_line.min(256 * 1024), stdout)),
                     source: source.name.clone(),
+                    max_line,
                 })
             }
             Err(e) => {
@@ -76,11 +80,10 @@ impl JournalTail {
 
     /// Read the next JSON record, or `None` on EOF.
     pub async fn next_line(&mut self) -> Option<String> {
+        let max_line = self.max_line;
         let reader = self.reader.as_mut()?;
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) => None,
-            Ok(_) => Some(line),
+        match read_line_bounded(reader, max_line).await {
+            Ok(v) => v,
             Err(e) => {
                 warn!(source = %self.source, error = %e, "journal read failed");
                 None
@@ -92,6 +95,59 @@ impl JournalTail {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
         }
+    }
+}
+
+/// Cap a single journal JSON record. A missing newline cannot grow the
+/// buffer without bound; oversized records are dropped as `event_too_large`
+/// and we resync on the next newline.
+async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let mut skipping = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if skipping || buf.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if skipping {
+                reader.consume(pos + 1);
+                metrics().event_dropped(DropReason::EventTooLarge);
+                return Ok(Some(String::new()));
+            }
+            buf.extend_from_slice(&available[..=pos]);
+            reader.consume(pos + 1);
+            if buf.len() > max {
+                metrics().event_dropped(DropReason::EventTooLarge);
+                return Ok(Some(String::new()));
+            }
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+            }
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        let n = available.len();
+        if skipping {
+            reader.consume(n);
+            continue;
+        }
+        if buf.len().saturating_add(n) > max {
+            reader.consume(n);
+            skipping = true;
+            buf.clear();
+            continue;
+        }
+        buf.extend_from_slice(available);
+        reader.consume(n);
     }
 }
 
@@ -177,6 +233,26 @@ fn priority_name(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_read_keeps_short_line() {
+        let data = b"{\"MESSAGE\":\"ok\"}\nnext\n";
+        let mut r = BufReader::new(&data[..]);
+        let got = read_line_bounded(&mut r, 64).await.unwrap();
+        assert_eq!(got.as_deref(), Some("{\"MESSAGE\":\"ok\"}"));
+    }
+
+    #[tokio::test]
+    async fn bounded_read_drops_oversized_line() {
+        let mut data = vec![b'x'; 100];
+        data.push(b'\n');
+        data.extend_from_slice(b"ok\n");
+        let mut r = BufReader::new(&data[..]);
+        let dropped = read_line_bounded(&mut r, 16).await.unwrap();
+        assert_eq!(dropped.as_deref(), Some(""));
+        let kept = read_line_bounded(&mut r, 16).await.unwrap();
+        assert_eq!(kept.as_deref(), Some("ok"));
+    }
 
     #[test]
     fn parses_journalctl_json_line() {

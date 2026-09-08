@@ -2,7 +2,9 @@
 //!
 //! The state machine is synchronous (`std::fs`) so rotation cases can be
 //! unit-tested without a runtime. The collector loop polls it on a timer
-//! (and wakes early via inotify when available).
+//! (250 ms). inotify is not used: NFS, overlayfs and many containers do
+//! not deliver it, and a missed event would stall the tail. Polling plus
+//! inode identity is the reliable path.
 //!
 //! Resume rules, in order:
 //!
@@ -89,12 +91,35 @@ impl FileTail {
         self.reconcile()?;
         let mut out = self.read_available()?;
         if out.is_empty() && self.pending_switch.is_some() {
+            // EOF on the rotated handle: emit a trailing line that never
+            // saw a newline, then switch. Dropping `rest` here is how
+            // readers silently lose the last record of a rotated file.
+            if let Some(rest) = self.take_incomplete() {
+                out.push(rest);
+            }
             if let Some((ident, fp)) = self.pending_switch.take() {
                 self.reopen_at(0, ident, fp)?;
-                out = self.read_available()?;
+                out.extend(self.read_available()?);
             }
         }
         Ok(out)
+    }
+
+    fn take_incomplete(&mut self) -> Option<TailedLine> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let bytes = std::mem::take(&mut self.rest);
+        let inode = self.open_inode.map(|(_, i)| i).unwrap_or(0);
+        Some(TailedLine {
+            line: RawLine {
+                original_len: bytes.len(),
+                truncated: false,
+                bytes,
+            },
+            offset: self.offset,
+            inode,
+        })
     }
 
     fn read_available(&mut self) -> std::io::Result<Vec<TailedLine>> {
@@ -511,6 +536,74 @@ mod tests {
             "expected the new file's line, got {:?}",
             lines.iter().map(|l| l.line.as_str()).collect::<Vec<_>>()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_rotation_does_not_drop_unread_bytes() {
+        let dir = tmpdir();
+        let path = dir.join("app.log");
+        write(&path, "old\n");
+        let src =
+            LogSourceConfig::file("app", &path.to_string_lossy(), "raw").read_from_beginning();
+        let mut tail = FileTail::new(&src, path.clone(), None);
+        let _ = tail.poll().unwrap();
+        // Append while we are not polling, then rotate — the still-open
+        // handle must drain these bytes before switching to the new inode.
+        write(&path, "tail\n");
+        let rotated = dir.join("app.log.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        write(&path, "new\n");
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            got.extend(
+                tail.poll()
+                    .unwrap()
+                    .into_iter()
+                    .map(|l| l.line.as_str().to_string()),
+            );
+        }
+        assert!(
+            got.iter().any(|l| l == "tail"),
+            "unread bytes on the rotated inode must not be dropped, got {got:?}"
+        );
+        assert!(
+            got.iter().any(|l| l == "new"),
+            "must follow the new inode, got {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_emits_incomplete_trailing_line() {
+        let dir = tmpdir();
+        let path = dir.join("app.log");
+        write(&path, "old\npartial");
+        let src =
+            LogSourceConfig::file("app", &path.to_string_lossy(), "raw").read_from_beginning();
+        let mut tail = FileTail::new(&src, path.clone(), None);
+        let first = tail.poll().unwrap();
+        assert_eq!(
+            first.iter().map(|l| l.line.as_str()).collect::<Vec<_>>(),
+            vec!["old"]
+        );
+        let rotated = dir.join("app.log.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        write(&path, "new\n");
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            got.extend(
+                tail.poll()
+                    .unwrap()
+                    .into_iter()
+                    .map(|l| l.line.as_str().to_string()),
+            );
+        }
+        assert!(
+            got.iter().any(|l| l == "partial"),
+            "incomplete last line of a rotated file must be emitted, got {got:?}"
+        );
+        assert!(got.iter().any(|l| l == "new"), "got {got:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -280,4 +280,14 @@ mod tests {
         assert_eq!(src.max_line_bytes, 64 * 1024);
         assert_eq!(src.read_from, "end");
     }
+
+    #[test]
+    fn journal_constructor_and_multiline_are_live() {
+        let src = LogSourceConfig::journal("journal_ssh", &["sshd.service"], "sshd")
+            .with_multiline(MultilineConfig::postgres());
+        assert_eq!(src.kind(), SourceKind::Journal);
+        assert_eq!(src.kind().as_str(), "journal");
+        assert_eq!(src.units, vec!["sshd.service"]);
+        assert!(src.multiline.is_some());
+    }
 }

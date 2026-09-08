@@ -13,8 +13,9 @@
 //! pipeline channel blocks the *log* reader (correct backpressure — logs
 //! are not a kernel ring buffer) without stalling eBPF collectors.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -42,10 +43,16 @@ use reader::{expand_paths, FileTail, RateLimiter};
 
 /// Debounce for the on-disk offset file.
 const CHECKPOINT_FLUSH: Duration = Duration::from_secs(1);
-/// How often file tails poll when inotify is unavailable / idle.
+/// File-tail poll interval. Rotation/truncation are detected on the same
+/// cadence; 250 ms is well inside a security-relevant window and does not
+/// depend on inotify (which is unavailable on NFS and some containers).
 const FILE_POLL: Duration = Duration::from_millis(250);
 /// How often globs are re-expanded (new files matching `*.log`).
 const GLOB_REFRESH: Duration = Duration::from_secs(15);
+/// How often the supervisor re-reads signed config and (re)arms sources.
+const SOURCE_SUPERVISE: Duration = Duration::from_secs(15);
+/// Back-off before restarting a source that exited (missing journalctl, …).
+const SOURCE_COOLDOWN: Duration = Duration::from_secs(30);
 
 pub struct LogCollector {
     cfg: Arc<std::sync::RwLock<AgentConfig>>,
@@ -77,49 +84,8 @@ impl Collector for LogCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
-        let sources = {
-            let cfg = self.cfg.read().unwrap_or_else(|e| e.into_inner());
-            catalogue::resolve(&cfg)
-        };
-        if sources.is_empty() {
-            info!("LogCollector: no sources armed (disabled, or no matching files)");
-            // Stay alive so a later config pull can add sources. Re-check
-            // periodically rather than exiting (an exited collector is a
-            // counted failure).
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                if tx.is_closed() {
-                    return Ok(());
-                }
-                let sources = {
-                    let cfg = self.cfg.read().unwrap_or_else(|e| e.into_inner());
-                    catalogue::resolve(&cfg)
-                };
-                if !sources.is_empty() {
-                    break;
-                }
-            }
-        }
-
         let cp_path = crate::paths::state_dir().join("log_offsets.json");
         let store = Arc::new(Mutex::new(CheckpointStore::load(cp_path)));
-
-        let current = {
-            let cfg = self.cfg.read().unwrap_or_else(|e| e.into_inner());
-            catalogue::resolve(&cfg)
-        };
-        info!(sources = current.len(), "LogCollector starting");
-
-        let mut handles = Vec::new();
-        for src in current {
-            let tx = tx.clone();
-            let store = Arc::clone(&store);
-            let agent_id = agent_id.clone();
-            let hostname = hostname.clone();
-            handles.push(tokio::spawn(async move {
-                run_source(src, tx, store, agent_id, hostname).await;
-            }));
-        }
 
         let store_flush = Arc::clone(&store);
         let flush_task = tokio::spawn(async move {
@@ -132,8 +98,86 @@ impl Collector for LogCollector {
             }
         });
 
-        for h in handles {
-            let _ = h.await;
+        // Supervisor: signed-config updates can add/remove sources without
+        // restarting the agent. File tails themselves never exit; journal/
+        // syslog tasks that die are retried after SOURCE_COOLDOWN.
+        let mut tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut cooldown: HashMap<String, Instant> = HashMap::new();
+        info!("LogCollector starting");
+
+        loop {
+            if tx.is_closed() {
+                break;
+            }
+
+            let sources = {
+                let cfg = self.cfg.read().unwrap_or_else(|e| e.into_inner());
+                catalogue::resolve(&cfg)
+            };
+            let desired: HashSet<String> = sources.iter().map(|s| s.name.clone()).collect();
+
+            let stale: Vec<String> = tasks
+                .keys()
+                .filter(|n| !desired.contains(*n))
+                .cloned()
+                .collect();
+            for name in stale {
+                if let Some(h) = tasks.remove(&name) {
+                    h.abort();
+                    info!(source = %name, "log source disarmed");
+                }
+            }
+
+            for src in sources {
+                if tasks.contains_key(&src.name) {
+                    continue;
+                }
+                if cooldown
+                    .get(&src.name)
+                    .is_some_and(|t| t.elapsed() < SOURCE_COOLDOWN)
+                {
+                    continue;
+                }
+                let name = src.name.clone();
+                cooldown.remove(&name);
+                info!(
+                    source = %name,
+                    kind = src.kind().as_str(),
+                    "log source armed"
+                );
+                let tx = tx.clone();
+                let store = Arc::clone(&store);
+                let agent_id = agent_id.clone();
+                let hostname = hostname.clone();
+                tasks.insert(
+                    name,
+                    tokio::spawn(async move {
+                        run_source(src, tx, store, agent_id, hostname).await;
+                    }),
+                );
+            }
+
+            let finished: Vec<String> = tasks
+                .iter()
+                .filter(|(_, h)| h.is_finished())
+                .map(|(n, _)| n.clone())
+                .collect();
+            for name in finished {
+                if let Some(h) = tasks.remove(&name) {
+                    let _ = h.await;
+                    cooldown.insert(name.clone(), Instant::now());
+                    warn!(source = %name, "log source exited — retry after cooldown");
+                }
+            }
+
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = tokio::time::sleep(SOURCE_SUPERVISE) => {}
+            }
+        }
+
+        for h in tasks.into_values() {
+            h.abort();
         }
         flush_task.abort();
         if let Ok(mut s) = store.lock() {
@@ -164,7 +208,7 @@ async fn run_file_source(
     agent_id: String,
     hostname: String,
 ) {
-    let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
     let mut watches: Vec<(FileTail, SourceFramer)> = Vec::new();
     let mut limiter = RateLimiter::new(src.max_eps);
     let mut last_glob = std::time::Instant::now() - GLOB_REFRESH;
