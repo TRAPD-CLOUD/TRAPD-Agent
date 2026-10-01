@@ -26,6 +26,8 @@ use crate::schema::{AgentEvent, DetectionData, EventData};
 
 use chains::{Correlator, EventFacts};
 use tree::ProcessTree;
+pub use tree::ProcContext;
+pub(crate) use tree::WEB_SERVERS;
 
 /// Shells whose appearance can anchor an execution chain.
 const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "fish"];
@@ -73,6 +75,8 @@ pub struct IoaResult {
     /// Process lineage of the event's acting pid (for enriching *other*
     /// detections raised on the same event).  JSON array, nearest-first.
     pub lineage: Option<serde_json::Value>,
+    /// The event's acting pid, when it has one.
+    pub pid: Option<i32>,
 }
 
 /// The stateful IOA engine.  Holds the process tree and the chain correlator.
@@ -120,7 +124,32 @@ impl IoaEngine {
             self.tree.gc(now);
         }
 
-        IoaResult { findings, lineage }
+        IoaResult {
+            findings,
+            lineage,
+            pid: facts.pid,
+        }
+    }
+
+    /// Correlation context of `pid` from the process tree.
+    pub fn context(&self, pid: i32) -> Option<ProcContext> {
+        self.tree.context(pid)
+    }
+
+    /// Lineage JSON of `pid` (nearest first), for enriching findings that did
+    /// not come through [`Self::observe`].
+    pub fn lineage(&self, pid: i32) -> Option<serde_json::Value> {
+        self.tree.lineage_json(pid)
+    }
+
+    /// True if `pid` is `ancestor` or one of its descendants.
+    pub fn descends_from(&self, ancestor: i32, pid: i32) -> bool {
+        self.tree.is_ancestor(ancestor, pid)
+    }
+
+    /// The `comm` of a known pid.
+    pub fn comm_of(&self, pid: i32) -> Option<String> {
+        self.tree.context(pid).map(|c| c.comm)
     }
 
     fn update_tree(&mut self, event: &AgentEvent, now: Instant) {
@@ -135,6 +164,10 @@ impl IoaEngine {
                     &p.comm,
                     &p.exe,
                     &p.cmdline,
+                    tree::ProcIdentity {
+                        start_ticks: p.process_start_time,
+                        container_id: p.container_id.clone(),
+                    },
                     now,
                 );
                 self.tree.set_exe_hash(p.pid, p.exe_sha256.as_deref());
@@ -148,6 +181,7 @@ impl IoaEngine {
                     &p.name,
                     &p.exe,
                     &p.cmdline,
+                    p.process_start_time,
                     now,
                 );
                 self.tree.set_exe_hash(p.pid, p.exe_sha256.as_deref());
@@ -171,10 +205,11 @@ impl IoaEngine {
             .iter()
             .map(|s| {
                 serde_json::json!({
-                    "stage":     s.stage,
-                    "label":     s.label,
-                    "pid":       s.pid,
-                    "offset_ms": s.offset_ms as u64,
+                    "stage":       s.stage,
+                    "label":       s.label,
+                    "pid":         s.pid,
+                    "process_key": self.tree.key_of(s.pid),
+                    "offset_ms":   s.offset_ms as u64,
                 })
             })
             .collect();
@@ -191,7 +226,28 @@ impl IoaEngine {
             evidence["process_lineage"] = lin;
         }
 
+        let anchor_key = self.tree.key_of(c.anchor_pid);
+        let mut correlation = self
+            .tree
+            .context(c.final_pid)
+            .map(|ctx| crate::schema::CorrelationKeys {
+                process_key: Some(ctx.process_key),
+                parent_key: ctx.parent_key,
+                lineage_keys: ctx.lineage_keys,
+                root_key: ctx.root_key,
+                pid: Some(ctx.pid),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        correlation.chain_id = Some(format!("ioa:{}:{anchor_key}", def.id));
+        if !correlation.lineage_keys.contains(&anchor_key)
+            && correlation.process_key.as_deref() != Some(anchor_key.as_str())
+        {
+            correlation.lineage_keys.push(anchor_key);
+        }
+
         DetectionData {
+            correlation: Some(correlation),
             rule_id: def.id.into(),
             title: def.title.into(),
             category: def.category.into(),
@@ -208,6 +264,7 @@ impl IoaEngine {
                 c.anchor_pid,
             ),
             evidence,
+            ..Default::default()
         }
     }
 }

@@ -128,9 +128,18 @@ async fn main() -> Result<()> {
                     print!("{}", rootkit::diagnostics());
                     Ok(())
                 }
+                // The rule catalog (base / max severity, mode, dedup window per
+                // rule) as JSON — the file the backend seeds its catalog from.
+                Some("rule-catalog") => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&detection::catalog::to_json())?
+                    );
+                    Ok(())
+                }
                 other => {
                     eprintln!(
-                        "unknown diagnostics topic {:?}\n\nusage: trapd-agent diagnostics <telemetry|rootkit>",
+                        "unknown diagnostics topic {:?}\n\nusage: trapd-agent diagnostics <telemetry|rootkit|rule-catalog>",
                         other.unwrap_or("(none)")
                     );
                     std::process::exit(2);
@@ -373,6 +382,12 @@ async fn main() -> Result<()> {
         engine.reload_sigma(&docs);
         engine.set_sigma_enabled(agent_config.read().map(|c| c.sigma_enabled).unwrap_or(true));
         engine.set_anomaly_enabled(anomaly);
+        engine.set_suppressions(
+            agent_config
+                .read()
+                .map(|c| c.detection_suppressions.clone())
+                .unwrap_or_default(),
+        );
     }
     info!(
         iocs = engine.ioc_count(),
@@ -406,7 +421,30 @@ async fn main() -> Result<()> {
     let det_engine = Arc::clone(&engine);
     let siem_fwd = siem.clone();
     let mut consumer = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
+        // Aggregate updates for repeated findings are released on this tick.
+        let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let event = tokio::select! {
+                event = rx.recv() => match event { Some(event) => event, None => break },
+                _ = flush_tick.tick() => {
+                    for f in det_engine.flush_findings(false) {
+                        emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem_fwd).await;
+                    }
+                    continue;
+                }
+            };
+
+            // A detection a collector raised itself (memory scan, rootkit,
+            // filesystem, honeytoken) goes through the same gate as engine
+            // findings; only what the gate admits is persisted and acted on.
+            if matches!(event.class, schema::EventClass::Detection) {
+                for f in det_engine.admit_external(event) {
+                    emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem_fwd).await;
+                }
+                continue;
+            }
+
             // Forwarding to prevention is best-effort — a stalled enforcement
             // engine must not stall telemetry — but a dropped tee is still
             // counted rather than swallowed.
@@ -418,15 +456,17 @@ async fn main() -> Result<()> {
             handle_event(&event, &mode, &buf_for_consumer).await;
             siem_fwd.forward(&event).await;
 
-            // Run detections and treat each finding as a first-class event:
-            // persisted, buffered for the backend, and forwarded to prevention.
-            for det in det_engine.inspect(&event) {
-                if let Some(p) = &prev_tx {
-                    pipeline::try_tee(p, det.clone(), "prevention_tee");
-                }
-                handle_event(&det, &mode, &buf_for_consumer).await;
-                siem_fwd.forward(&det).await;
+            // Run detections and treat each admitted finding as a first-class
+            // event: persisted, buffered for the backend, and forwarded to
+            // prevention.
+            for f in det_engine.admit(det_engine.inspect(&event)) {
+                emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem_fwd).await;
             }
+        }
+        // Channel closed (shutdown): release every pending aggregate so no
+        // occurrence count is lost.
+        for f in det_engine.flush_findings(true) {
+            emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem_fwd).await;
         }
     });
 
@@ -489,6 +529,7 @@ async fn main() -> Result<()> {
             sigma_engine.reload_sigma(&cfg.sigma_rules);
             sigma_engine.set_sigma_enabled(cfg.sigma_enabled);
             sigma_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
+            sigma_engine.set_suppressions(cfg.detection_suppressions.clone());
         }));
         tokio::spawn(async move { config_puller.run().await });
 
@@ -505,6 +546,14 @@ async fn main() -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down");
+            for handle in &handles {
+                handle.abort();
+            }
+        }
+        // `systemctl stop` sends SIGTERM: shut down the same orderly way, so
+        // the consumer drains and flushes pending finding aggregates.
+        _ = terminate_signal() => {
+            info!("Received SIGTERM, shutting down");
             for handle in &handles {
                 handle.abort();
             }
@@ -540,6 +589,42 @@ async fn main() -> Result<()> {
 /// is where "accepted" is counted. Counting per-collector instead would miss
 /// findings, and the accounting invariant (`accepted == acknowledged + queued +
 /// dropped`) would silently stop holding.
+/// Resolves on SIGTERM (Unix); never resolves elsewhere.
+async fn terminate_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(e) => {
+                warn!("could not install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await;
+}
+
+/// Emit one finding that left the detection gate: persist + ship it, forward
+/// it to the SIEM, and hand first emissions (not aggregate updates, which
+/// only refresh a count) to the prevention engine for auto-response.
+pub(crate) async fn emit_finding(
+    finding: detection::gate::Emitted,
+    prev_tx: Option<&tokio::sync::mpsc::Sender<schema::AgentEvent>>,
+    mode: &OutputMode,
+    buf: &Arc<Mutex<Spool>>,
+    siem: &output::siem::SiemForwarder,
+) {
+    if let (Some(p), false) = (prev_tx, finding.aggregate) {
+        pipeline::try_tee(p, finding.event.clone(), "prevention_tee");
+    }
+    handle_event(&finding.event, mode, buf).await;
+    siem.forward(&finding.event).await;
+}
+
 async fn handle_event(event: &schema::AgentEvent, mode: &OutputMode, buf: &Arc<Mutex<Spool>>) {
     pipeline::accepted();
     if let Err(err) = write_event(event, mode).await {

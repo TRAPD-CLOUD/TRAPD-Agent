@@ -127,10 +127,13 @@ pub fn classify_region(r: &MapRegion) -> Option<MemFinding> {
     if r.is_anon() {
         // Anonymous executable memory. RWX is the strongest single-region
         // injection signal; plain anon r-x is still abnormal for most code.
+        // Plain anon r-x is what every JIT leaves behind after sealing a
+        // code page, so it is correlation context (confidence < 50 makes it a
+        // non-alerting signal); RWX outside a known JIT is the alert.
         let (confidence, severity) = if r.is_write() {
             (88, Severity::High)
         } else {
-            (78, Severity::High)
+            (45, Severity::Low)
         };
         return Some(MemFinding {
             rule_id: "memory.anon_exec",
@@ -202,7 +205,30 @@ fn finding_to_detection(pid: i32, comm: &str, f: &MemFinding) -> DetectionData {
         subject: format!("pid {pid} ({comm})"),
         detail: format!("PID {pid} ({comm}): {}", f.region),
         evidence: serde_json::json!({ "pid": pid, "comm": comm, "region": f.region }),
+        ..Default::default()
     }
+}
+
+/// Runtimes that legitimately map writable+executable anonymous memory (JIT
+/// compilers). Matched against the exe basename (prefix for versioned names).
+const JIT_RUNTIMES: &[&str] = &[
+    "java", "node", "nodejs", "deno", "bun", "chrome", "chromium", "chromium-browse",
+    "firefox", "firefox-bin", "electron", "code", "slack", "discord", "teams", "spotify",
+    "dotnet", "pwsh", "mono", "luajit", "qemu-", "wine", "wine64", "gnome-shell", "gjs",
+    "plasmashell", "kwin_x11", "kwin_wayland", "Xorg", "Xwayland", "php-fpm", "php",
+    "python3", "pypy", "ruby", "julia", "erl", "beam.smp", "qemu-system-x86_64",
+    "steam", "webkit", "WebKitWebProcess", "thunderbird", "libreoffice", "soffice.bin",
+];
+
+/// True when `exe` is a JIT runtime whose anonymous executable memory is
+/// expected (`/proc/<pid>/exe` basename, or the `comm` as a fallback).
+pub fn is_jit_runtime(exe: &str) -> bool {
+    let base = exe.rsplit('/').next().unwrap_or(exe).trim_end_matches(" (deleted)");
+    JIT_RUNTIMES
+        .iter()
+        .any(|j| base == *j || (j.ends_with('-') && base.starts_with(j)) || base.starts_with(&format!("{j}.")))
+        || exe.contains("/jvm/")
+        || exe.contains("/electron")
 }
 
 // ── Collector ────────────────────────────────────────────────────────────────
@@ -272,7 +298,7 @@ impl Collector for MemScanCollector {
                         EventClass::Detection,
                         EventAction::Detected,
                         severity,
-                        EventData::Detection(det),
+                        EventData::Detection(Box::new(det)),
                     );
                     if tx.send(event).await.is_err() {
                         return Ok(());
@@ -296,12 +322,26 @@ impl MemScanCollector {
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| comm.clone());
+        let jit = is_jit_runtime(&exe) || is_jit_runtime(&comm);
         let mut out = Vec::new();
 
         if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
             for region in parse_maps(&maps) {
                 if let Some(f) = classify_region(&region) {
-                    let key = format!("{pid}:{}:{:#x}", f.rule_id, region.start);
+                    if jit && f.rule_id == "memory.anon_exec" {
+                        continue;
+                    }
+                    // Anonymous executable memory is reported once per process
+                    // (a JIT-like allocator keeps creating fresh regions);
+                    // file-backed findings stay per region.
+                    let key = if f.rule_id == "memory.anon_exec" {
+                        format!("{pid}:{}:{}", f.rule_id, region.is_write())
+                    } else {
+                        format!("{pid}:{}:{:#x}", f.rule_id, region.start)
+                    };
                     if self.seen.insert(key) {
                         out.push((f.severity, finding_to_detection(pid, &comm, &f)));
                     }
@@ -324,6 +364,7 @@ impl MemScanCollector {
                             subject: format!("pid {pid} ({comm})"),
                             detail: format!("PID {pid} ({comm}) runs with LD_PRELOAD={val}"),
                             evidence: serde_json::json!({ "pid": pid, "comm": comm, "ld_preload": val }),
+                            ..Default::default()
                         }));
                     }
                 }
@@ -378,6 +419,16 @@ mod tests {
         assert_eq!(f.rule_id, "memory.anon_exec");
         assert_eq!(f.severity, Severity::High);
         assert!(f.confidence >= 85);
+    }
+
+    #[test]
+    fn jit_runtimes_are_recognised() {
+        assert!(is_jit_runtime("/usr/lib/jvm/java-17-openjdk-amd64/bin/java"));
+        assert!(is_jit_runtime("/usr/bin/node"));
+        assert!(is_jit_runtime("/usr/bin/qemu-system-aarch64"));
+        assert!(is_jit_runtime("/opt/google/chrome/chrome"));
+        assert!(!is_jit_runtime("/tmp/payload"));
+        assert!(!is_jit_runtime("/usr/sbin/sshd"));
     }
 
     #[test]

@@ -343,6 +343,15 @@ pub struct AgentConfig {
     /// See [`LogSourceConfig`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logs: Vec<LogSourceConfig>,
+
+    // ── Detection tuning ────────────────────────────────────────────────────
+    /// Operator-defined suppressions applied by the detection gate before a
+    /// finding is emitted: drop it, keep it as a non-alerting signal, or lower
+    /// it one severity step. Managed from the console ("suppress similar").
+    /// Last field and omitted when empty, so the canonical (signed) form of a
+    /// config without suppressions is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detection_suppressions: Vec<crate::detection::gate::SuppressionRule>,
 }
 
 impl Default for AgentConfig {
@@ -370,6 +379,7 @@ impl Default for AgentConfig {
             auto_response_min_severity: default_auto_response_min_severity(),
             auto_response_min_confidence: default_auto_response_min_confidence(),
             auto_response_allowlist: Vec::new(),
+            detection_suppressions: Vec::new(),
             memory_scan_enabled: default_memory_scan_enabled(),
             memory_scan_interval_secs: default_memory_scan_interval_secs(),
             rtr_enabled: default_rtr_enabled(),

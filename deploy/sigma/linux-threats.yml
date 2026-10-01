@@ -3,24 +3,10 @@
 # deliverable inline over the signed config channel (AgentConfig.sigma_rules).
 # Supported logsource categories: process_creation, network_connection,
 # dns_query, file_event, driver_load.
----
-title: Bash Reverse Shell via /dev/tcp
-id: a1f4c2e0-0001-4a10-9c00-000000000001
-status: stable
-level: high
-logsource:
-  product: linux
-  category: process_creation
-detection:
-  selection:
-    Image|endswith:
-      - '/bash'
-      - '/sh'
-    CommandLine|contains: '/dev/tcp/'
-  condition: selection
-tags:
-  - attack.execution
-  - attack.t1059.004
+#
+# These complement the native rules; they must not re-detect what a native
+# rule already reports (bash /dev/tcp, curl|sh, /etc/shadow, IMDS, …), or one
+# action becomes two findings. `cargo test sigma_examples` enforces that.
 ---
 title: Netcat Reverse Shell Execution
 id: a1f4c2e0-0002-4a10-9c00-000000000002
@@ -31,61 +17,54 @@ logsource:
   category: process_creation
 detection:
   selection:
-    CommandLine|re: 'nc(\.traditional)?\s+.*-e\s+/(bin|usr/bin)/(ba)?sh'
+    CommandLine|re: 'nc(\.traditional|at)?\s+.*-e\s+/(bin|usr/bin)/(ba)?sh'
   condition: selection
 tags:
   - attack.execution
   - attack.t1059.004
 ---
-title: Curl/Wget Pipe To Shell (Download Cradle)
-id: a1f4c2e0-0003-4a10-9c00-000000000003
-status: experimental
-level: medium
-logsource:
-  product: linux
-  category: process_creation
-detection:
-  download:
-    CommandLine|contains:
-      - 'curl '
-      - 'wget '
-  pipe_to_shell:
-    CommandLine|contains:
-      - '| sh'
-      - '| bash'
-      - '|sh'
-      - '|bash'
-  condition: download and pipe_to_shell
-tags:
-  - attack.execution
-  - attack.t1059.004
----
-title: Read Of /etc/shadow By Non-Service Process
-id: a1f4c2e0-0004-4a10-9c00-000000000004
+title: Socat Reverse Shell
+id: a1f4c2e0-0006-4a10-9c00-000000000006
 status: experimental
 level: high
 logsource:
   product: linux
-  category: file_event
+  category: process_creation
 detection:
   selection:
-    TargetFilename: '/etc/shadow'
-  condition: selection
+    Image|endswith: '/socat'
+    CommandLine|contains:
+      - 'exec:'
+      - 'EXEC:'
+      - 'system:'
+  network:
+    CommandLine|contains: 'tcp'
+  condition: selection and network
 tags:
-  - attack.credential_access
-  - attack.t1003.008
+  - attack.execution
+  - attack.t1059.004
 ---
-title: Outbound Connection To Cloud Metadata IMDS
-id: a1f4c2e0-0005-4a10-9c00-000000000005
-status: stable
-level: medium
+title: Named Pipe Reverse Shell (mkfifo)
+id: a1f4c2e0-0007-4a10-9c00-000000000007
+status: experimental
+level: high
 logsource:
   product: linux
-  category: network_connection
+  category: process_creation
 detection:
-  selection:
-    DestinationIp: '169.254.169.254'
-  condition: selection
+  fifo:
+    CommandLine|contains:
+      - 'mkfifo'
+      - 'mknod'
+  shell:
+    CommandLine|contains:
+      - '/bin/sh'
+      - '/bin/bash'
+  netcat:
+    CommandLine|contains:
+      - 'nc '
+      - 'ncat '
+  condition: fifo and shell and netcat
 tags:
-  - attack.credential_access
-  - attack.t1552.005
+  - attack.execution
+  - attack.t1059.004

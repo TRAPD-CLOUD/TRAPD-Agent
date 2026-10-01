@@ -341,9 +341,9 @@ mod tests {
     fn tree() -> ProcessTree {
         let mut t = ProcessTree::new();
         let now = Instant::now();
-        t.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", now);
-        t.on_exec(301, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl", now);
-        t.on_exec(302, 200, 0, 0, "root", "x", "/tmp/x", "/tmp/x", now);
+        t.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", crate::detection::ioa::tree::ProcIdentity::default(), now);
+        t.on_exec(301, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl", crate::detection::ioa::tree::ProcIdentity::default(), now);
+        t.on_exec(302, 200, 0, 0, "root", "x", "/tmp/x", "/tmp/x", crate::detection::ioa::tree::ProcIdentity::default(), now);
         t
     }
 
@@ -427,7 +427,7 @@ mod tests {
         // 999 is not in the bash session subtree of 200.
         let mut tree = tree();
         let now = Instant::now();
-        tree.on_exec(999, 1, 0, 0, "root", "x", "/tmp/x", "/tmp/x", now);
+        tree.on_exec(999, 1, 0, 0, "root", "x", "/tmp/x", "/tmp/x", crate::detection::ioa::tree::ProcIdentity::default(), now);
         let mut c = Correlator::new();
         let t0 = Instant::now();
         c.observe(&shell(), &tree, t0);

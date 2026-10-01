@@ -312,7 +312,7 @@ impl Engine {
 
     /// Auto-respond to a generic local detection (config-gated, off by default).
     async fn auto_respond_detection(&self, event: &AgentEvent, det: &DetectionData) {
-        let targets = response::targets_from_detection(&det.subject, &det.evidence);
+        let targets = response::targets_for_rule(&det.rule_id, &det.subject, &det.evidence);
         self.auto_respond(
             event,
             &det.rule_id,

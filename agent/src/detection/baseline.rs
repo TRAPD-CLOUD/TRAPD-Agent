@@ -146,6 +146,7 @@ impl BaselineEngine {
                 "exe": exe,
                 "baseline_kind": "per_user_binary_novelty",
             }),
+            ..Default::default()
         })
     }
 
@@ -199,6 +200,7 @@ impl BaselineEngine {
                     "zscore": z,
                     "baseline_kind": "exec_rate",
                 }),
+                ..Default::default()
             });
         }
         None

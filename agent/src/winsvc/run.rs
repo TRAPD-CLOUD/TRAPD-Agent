@@ -23,7 +23,7 @@ use crate::heartbeat::Heartbeat;
 use crate::output::OutputMode;
 use crate::pipeline::{self, create_pipeline, Spool};
 use crate::transport::Transport;
-use crate::{env_truthy, handle_event, load_or_create_device_id, paths};
+use crate::{emit_finding, env_truthy, handle_event, load_or_create_device_id, paths};
 
 // ── Tracing sinks ─────────────────────────────────────────────────────────────
 
@@ -245,6 +245,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         engine.reload_sigma(&cfg.sigma_rules);
         engine.set_sigma_enabled(cfg.sigma_enabled);
         engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
+        engine.set_suppressions(cfg.detection_suppressions.clone());
     }
     Arc::clone(&engine).spawn_ioc_reloader(300);
 
@@ -271,6 +272,9 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let mut consumer = tokio::spawn(async move {
         let mut shutting_down = false;
+        // Aggregate updates for repeated findings are released on this tick.
+        let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let event = tokio::select! {
                 _ = &mut shutdown_rx, if !shutting_down => {
@@ -279,13 +283,27 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
                     continue;
                 }
                 event = rx.recv() => match event { Some(event) => event, None => break },
+                _ = flush_tick.tick() => {
+                    for f in consumer_engine.flush_findings(false) {
+                        emit_finding(f, None, &mode, &buf_for_consumer, &siem).await;
+                    }
+                    continue;
+                }
             };
+            if matches!(event.class, crate::schema::EventClass::Detection) {
+                for f in consumer_engine.admit_external(event) {
+                    emit_finding(f, None, &mode, &buf_for_consumer, &siem).await;
+                }
+                continue;
+            }
             handle_event(&event, &mode, &buf_for_consumer).await;
             siem.forward(&event).await;
-            for detection in consumer_engine.inspect(&event) {
-                handle_event(&detection, &mode, &buf_for_consumer).await;
-                siem.forward(&detection).await;
+            for f in consumer_engine.admit(consumer_engine.inspect(&event)) {
+                emit_finding(f, None, &mode, &buf_for_consumer, &siem).await;
             }
+        }
+        for f in consumer_engine.flush_findings(true) {
+            emit_finding(f, None, &mode, &buf_for_consumer, &siem).await;
         }
     });
 
@@ -330,6 +348,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             config_engine.reload_sigma(&cfg.sigma_rules);
             config_engine.set_sigma_enabled(cfg.sigma_enabled);
             config_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
+            config_engine.set_suppressions(cfg.detection_suppressions.clone());
         }));
         handles.push(tokio::spawn(async move { config_puller.run().await }));
 

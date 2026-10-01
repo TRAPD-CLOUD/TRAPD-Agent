@@ -91,14 +91,30 @@ pub struct Targets {
     pub file_path: Option<String>,
 }
 
-/// Resolve the response targets from a detection's `subject` + `evidence`.
+/// Paths a response must never quarantine: the OS itself. Moving
+/// `/usr/bin/bash` aside because a reverse shell ran *in* it would take the
+/// host down with the attacker.
+const NEVER_QUARANTINE: &[&str] = &[
+    "/usr/", "/bin/", "/sbin/", "/lib/", "/lib32/", "/lib64/", "/libx32/", "/etc/", "/boot/",
+    "/opt/trapd", "/var/lib/dpkg/", "/var/lib/rpm/", "/snap/",
+];
+
+/// Resolve the response targets from a detection's rule, `subject` and `evidence`.
 ///
 /// The acting PID is, in priority order: an explicit `evidence.pid`, an
 /// `accessor_pid`, or the head of the IOA-injected `process_lineage` (which the
 /// detection engine attaches to every process-correlated finding). PID 0/1 are
-/// never targets. The file path comes from `evidence.path`/`evidence.file`, or
-/// the `subject` when it is itself an absolute path.
-pub fn targets_from_detection(subject: &str, evidence: &serde_json::Value) -> Targets {
+/// never targets.
+///
+/// The file to quarantine must be named *as a dropped artifact*:
+/// `evidence.dropped_file`, or the subject of an IOC hash / temp-exec finding.
+/// A rule's `subject` is usually the acting executable (`/usr/bin/bash`), and
+/// `evidence.path` the file it touched (`/etc/shadow`) — neither is malware —
+/// so they are never quarantine targets, and no path under the OS
+/// directories ever is.
+///
+/// `rule_id` decides whether the subject itself is the dropped payload.
+pub fn targets_for_rule(rule_id: &str, subject: &str, evidence: &serde_json::Value) -> Targets {
     let pid = evidence
         .get("pid")
         .and_then(|v| v.as_i64())
@@ -114,12 +130,23 @@ pub fn targets_from_detection(subject: &str, evidence: &serde_json::Value) -> Ta
         .filter(|p| *p > 1)
         .map(|p| p as i32);
 
+    // Rules whose subject *is* the malicious file.
+    const SUBJECT_IS_PAYLOAD: &[&str] = &[
+        "ioc.process_hash",
+        "defense.tmp_exec_chmod",
+        "defense.kmod_from_tmp",
+        "impact.cryptominer",
+    ];
     let file_path = evidence
-        .get("path")
+        .get("dropped_file")
         .and_then(|v| v.as_str())
-        .or_else(|| evidence.get("file").and_then(|v| v.as_str()))
         .map(String::from)
-        .or_else(|| subject.starts_with('/').then(|| subject.to_string()));
+        .or_else(|| {
+            (SUBJECT_IS_PAYLOAD.contains(&rule_id) || rule_id.starts_with("yara."))
+                .then(|| subject.to_string())
+        })
+        .filter(|p| p.starts_with('/'))
+        .filter(|p| !NEVER_QUARANTINE.iter().any(|d| p.starts_with(d)));
 
     Targets { pid, file_path }
 }
@@ -407,10 +434,10 @@ mod tests {
     #[test]
     fn targets_prefers_explicit_pid_then_lineage() {
         let ev = json!({ "pid": 4242, "process_lineage": [{ "pid": 9 }] });
-        assert_eq!(targets_from_detection("/usr/bin/curl", &ev).pid, Some(4242));
+        assert_eq!(targets_for_rule("x", "/usr/bin/curl", &ev).pid, Some(4242));
 
         let ev2 = json!({ "process_lineage": [{ "pid": 777, "comm": "bash" }] });
-        let tg = targets_from_detection("bash", &ev2);
+        let tg = targets_for_rule("x", "bash", &ev2);
         assert_eq!(tg.pid, Some(777));
         assert_eq!(tg.file_path, None);
     }
@@ -418,18 +445,30 @@ mod tests {
     #[test]
     fn targets_never_takes_pid_0_or_1() {
         let ev = json!({ "pid": 1 });
-        assert_eq!(targets_from_detection("init", &ev).pid, None);
+        assert_eq!(targets_for_rule("x", "init", &ev).pid, None);
     }
 
     #[test]
-    fn targets_path_from_evidence_or_absolute_subject() {
-        let from_ev = targets_from_detection("something", &json!({ "path": "/etc/shadow" }));
-        assert_eq!(from_ev.file_path.as_deref(), Some("/etc/shadow"));
+    fn never_quarantines_the_acting_binary_or_touched_files() {
+        // A reverse shell runs *in* bash: bash is not the malware.
+        let revshell = targets_for_rule("revshell.dev_tcp_redirect", "/usr/bin/bash", &json!({ "pid": 77 }));
+        assert_eq!(revshell.file_path, None);
+        assert_eq!(revshell.pid, Some(77));
+        // The file a credential rule touched is the victim, not the payload.
+        let shadow = targets_for_rule("creds.sensitive_file_access", "/etc/shadow", &json!({ "path": "/etc/shadow" }));
+        assert_eq!(shadow.file_path, None);
+        // Even an explicitly dropped file under the OS directories is refused.
+        let os = targets_for_rule("x", "x", &json!({ "dropped_file": "/usr/bin/ls" }));
+        assert_eq!(os.file_path, None);
+    }
 
-        let from_subject = targets_from_detection("/tmp/payload", &json!({}));
-        assert_eq!(from_subject.file_path.as_deref(), Some("/tmp/payload"));
-
-        let none = targets_from_detection("curl", &json!({}));
+    #[test]
+    fn payload_rules_and_dropped_files_are_targets() {
+        let ioc = targets_for_rule("ioc.process_hash", "/tmp/payload", &json!({}));
+        assert_eq!(ioc.file_path.as_deref(), Some("/tmp/payload"));
+        let dropped = targets_for_rule("x", "curl", &json!({ "dropped_file": "/home/u/.cache/x" }));
+        assert_eq!(dropped.file_path.as_deref(), Some("/home/u/.cache/x"));
+        let none = targets_for_rule("x", "curl", &json!({}));
         assert_eq!(none.file_path, None);
     }
 }
