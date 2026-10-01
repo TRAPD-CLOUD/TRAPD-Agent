@@ -156,6 +156,11 @@ try {
     Get-ChildItem $root -File | Where-Object { $_.Extension -notin @('.exe', '.msi', '.wixpdb', '.key') } | Copy-Item -Destination $logs -Force -ErrorAction SilentlyContinue
     if (Test-Path $eventsPath) { Copy-Item $eventsPath $logs -Force }
     Copy-Item (Join-Path $data 'logs\agent.log') $logs -Force -ErrorAction SilentlyContinue
+    # Keep failure evidence visible in the job log as well as the artifact.
+    Read-Events | Group-Object class, action | Select-Object Name, Count | Format-Table | Out-Host
+    if (Test-Path (Join-Path $data 'logs\agent.log')) {
+        Get-Content (Join-Path $data 'logs\agent.log') -Tail 30 | Out-Host
+    }
     Stop-Process -Id $backend.Id -Force -ErrorAction SilentlyContinue
     Stop-Service trapd-agent -Force -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $watch -ErrorAction SilentlyContinue

@@ -22,7 +22,7 @@ use std::time::SystemTime;
 use anyhow::Result;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use sysinfo::{Pid, System, Users};
+use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind, Users};
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
 use tracing::info;
@@ -45,6 +45,16 @@ const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
 /// Upper bound on the exe-hash cache before it is reset (paths churn slowly,
 /// so this is rarely hit; the bound only guards against pathological hosts).
 const MAX_HASH_CACHE: usize = 4096;
+
+fn refresh_kind() -> ProcessRefreshKind {
+    // sysinfo's default refresh omits command lines and account identities.
+    // Fetch them explicitly so detection receives the same process context
+    // as the Linux collector; immutable fields only need loading once.
+    ProcessRefreshKind::new()
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_exe(UpdateKind::OnlyIfNotSet)
+        .with_user(UpdateKind::OnlyIfNotSet)
+}
 
 pub struct ProcessCollector {
     sys: System,
@@ -135,7 +145,7 @@ impl Collector for ProcessCollector {
 
         loop {
             ticker.tick().await;
-            self.sys.refresh_processes();
+            self.sys.refresh_processes_specifics(refresh_kind());
 
             let current: HashMap<i32, (String, Option<u64>)> = self
                 .sys
@@ -223,6 +233,9 @@ impl Collector for ProcessCollector {
                 if exe.as_os_str().is_empty() {
                     notes.fail("exe", EnrichmentError::IoError);
                 }
+                if cmdline.is_empty() {
+                    notes.fail("cmdline", EnrichmentError::IoError);
+                }
                 if username == "unknown" {
                     notes.fail("username", EnrichmentError::IoError);
                 }
@@ -262,5 +275,22 @@ impl Collector for ProcessCollector {
 
             self.known = current;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_process_refresh_collects_detection_context() {
+        let mut system = System::new();
+        system.refresh_processes_specifics(refresh_kind());
+        let process = system
+            .process(Pid::from_u32(std::process::id()))
+            .expect("current Windows process must be visible");
+        assert!(!process.cmd().is_empty(), "command line must be requested");
+        assert!(process.exe().is_some(), "executable must be requested");
+        assert!(process.user_id().is_some(), "account must be requested");
     }
 }
