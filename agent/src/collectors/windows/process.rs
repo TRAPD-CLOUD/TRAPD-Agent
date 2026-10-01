@@ -15,6 +15,7 @@
 //! later without touching the schema.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -32,7 +33,7 @@ use crate::schema::{
     Severity,
 };
 use crate::telemetry::limits::{truncate_str, MAX_CMDLINE_BYTES};
-use crate::telemetry::Enrichment;
+use crate::telemetry::{Enrichment, EnrichmentError};
 
 /// Poll cadence — matches the Linux polling collector.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -50,7 +51,7 @@ pub struct ProcessCollector {
     users: Users,
     initialized: bool,
     /// pid → name of every process seen in the previous poll.
-    known: HashMap<i32, String>,
+    known: HashMap<i32, (String, Option<u64>)>,
     /// exe path → (len, mtime, sha256) so an unchanged image is hashed once.
     hash_cache: HashMap<PathBuf, (u64, Option<SystemTime>, String)>,
 }
@@ -81,7 +82,15 @@ impl ProcessCollector {
                 return Some(hash.clone());
             }
         }
-        let bytes = std::fs::read(path).ok()?;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .ok()?
+            .take(MAX_HASH_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_HASH_BYTES {
+            return None;
+        }
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
         if self.hash_cache.len() >= MAX_HASH_CACHE {
             self.hash_cache.clear();
@@ -121,16 +130,27 @@ impl Collector for ProcessCollector {
     ) -> Result<()> {
         let mut ticker = interval(POLL_INTERVAL);
         info!("WindowsProcessCollector: polling process table every 3s");
+        crate::telemetry::metrics::metrics()
+            .set_collector_mode(crate::telemetry::metrics::CollectorMode::WindowsPolling);
 
         loop {
             ticker.tick().await;
             self.sys.refresh_processes();
 
-            let current: HashMap<i32, String> = self
+            let current: HashMap<i32, (String, Option<u64>)> = self
                 .sys
                 .processes()
                 .iter()
-                .map(|(pid, p)| (pid.as_u32() as i32, p.name().to_string()))
+                .map(|(pid, p)| {
+                    let pid = pid.as_u32() as i32;
+                    (
+                        pid,
+                        (
+                            p.name().to_string(),
+                            crate::telemetry::identity::process_start_time(pid),
+                        ),
+                    )
+                })
                 .collect();
 
             // First pass: absorb the already-running baseline without events.
@@ -140,10 +160,40 @@ impl Collector for ProcessCollector {
                 continue;
             }
 
-            // New processes.
+            // A recycled PID terminates its previous occupant before creating
+            // the replacement. Missing start times do not prove a reuse.
+            for (pid, (name, before)) in &self.known {
+                let gone = match current.get(pid) {
+                    None => true,
+                    Some((_, after)) => matches!((before, after), (Some(a), Some(b)) if a != b),
+                };
+                if gone {
+                    let event = AgentEvent::new(
+                        agent_id.clone(),
+                        hostname.clone(),
+                        EventClass::Process,
+                        EventAction::Terminate,
+                        Severity::Info,
+                        EventData::ProcessTerminate(ProcessTerminateData {
+                            pid: *pid,
+                            name: name.clone(),
+                        }),
+                    );
+                    if tx.send(event).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+
+            // New processes, including a proven replacement in an existing PID.
             let created: Vec<i32> = current
                 .keys()
-                .filter(|pid| !self.known.contains_key(pid))
+                .filter(|pid| match self.known.get(pid) {
+                    None => true,
+                    Some((_, before)) => {
+                        matches!((before, current[*pid].1), (Some(a), Some(b)) if *a != b)
+                    }
+                })
                 .copied()
                 .collect();
             for pid in created {
@@ -154,7 +204,7 @@ impl Collector for ProcessCollector {
                 let exe: PathBuf = proc_.exe().map(Path::to_path_buf).unwrap_or_default();
                 let ppid = proc_.parent().map(|p| p.as_u32() as i32).unwrap_or(0);
                 let name = proc_.name().to_string();
-                let start_time = proc_.start_time();
+                let start_time = current[&pid].1;
 
                 // Cap the command line and mark it when it does not fit, so a
                 // consumer can tell a complete command line from a prefix —
@@ -167,6 +217,18 @@ impl Collector for ProcessCollector {
                 // calls below need `&mut self`, so the borrow has to end first.
                 let username = self.username_of(spid);
                 let exe_sha256 = self.exe_sha256(&exe);
+                // sysinfo does not expose the native error for these missing
+                // fields. Record unresolved data without inventing a cause
+                // such as permission_denied or treating it as complete.
+                if exe.as_os_str().is_empty() {
+                    notes.fail("exe", EnrichmentError::IoError);
+                }
+                if username == "unknown" {
+                    notes.fail("username", EnrichmentError::IoError);
+                }
+                if start_time.is_none() {
+                    notes.fail("process_start_time", EnrichmentError::IoError);
+                }
 
                 let data = ProcessCreateData {
                     pid,
@@ -179,14 +241,10 @@ impl Collector for ProcessCollector {
                     uid: 0,
                     username,
                     exe_sha256,
-                    // Windows recycles PIDs just as Linux does, so the same
-                    // rule applies: correlate on (boot_id, pid, start_time),
-                    // never on the PID alone. `sysinfo` reports the start time
-                    // in seconds since the Unix epoch here rather than in clock
-                    // ticks since boot — the units differ from Linux, but the
-                    // field's job (telling one occupant of a PID from the next)
-                    // is identical.
-                    process_start_time: Some(start_time),
+                    // Native GetProcessTimes creation FILETIME (100ns ticks
+                    // since 1601). Its precision distinguishes PID reuse even
+                    // within one second; unresolved identity remains unknown.
+                    process_start_time: start_time,
                     enrichment: notes.finish(0),
                 };
                 let event = AgentEvent::new(
@@ -196,27 +254,6 @@ impl Collector for ProcessCollector {
                     EventAction::Create,
                     Severity::Info,
                     EventData::ProcessCreate(data),
-                );
-                if tx.send(event).await.is_err() {
-                    return Ok(());
-                }
-            }
-
-            // Vanished processes.
-            let terminated: Vec<(i32, String)> = self
-                .known
-                .iter()
-                .filter(|(pid, _)| !current.contains_key(pid))
-                .map(|(pid, name)| (*pid, name.clone()))
-                .collect();
-            for (pid, name) in terminated {
-                let event = AgentEvent::new(
-                    agent_id.clone(),
-                    hostname.clone(),
-                    EventClass::Process,
-                    EventAction::Terminate,
-                    Severity::Info,
-                    EventData::ProcessTerminate(ProcessTerminateData { pid, name }),
                 );
                 if tx.send(event).await.is_err() {
                     return Ok(());

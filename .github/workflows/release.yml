@@ -9,14 +9,16 @@ permissions:
   contents: write
 
 jobs:
+  windows-msi:
+    uses: ./.github/workflows/windows-package.yml
+
   release:
+    needs: windows-msi
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
 
       # The eBPF crate pins its own nightly via trapd-agent-ebpf/rust-toolchain.toml.
       # Trigger rustup to install it (with the rust-src component) up front so the
@@ -39,14 +41,6 @@ jobs:
 
       - name: Build agent (release)
         run: cargo build --release --manifest-path agent/Cargo.toml
-
-      - name: Install mingw-w64 cross toolchain (Windows agent)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64
-
-      - name: Build Windows agent (release)
-        run: cargo build --release --target x86_64-pc-windows-gnu --manifest-path agent/Cargo.toml
 
       - name: Build eBPF binary (release)
         run: cargo xtask build-ebpf --release
@@ -81,10 +75,15 @@ jobs:
           cargo audit --file Cargo.lock
           cargo audit --file trapd-agent-ebpf/Cargo.lock
 
+      - name: Download verified native Windows assets
+        uses: actions/download-artifact@v4
+        with:
+          name: trapd-windows-release
+          path: .
+
       - name: Stage release assets
         run: |
           cp target/release/trapd-agent trapd-agent-linux-x86_64
-          cp target/x86_64-pc-windows-gnu/release/trapd-agent.exe trapd-agent-windows-x86_64.exe
           # The eBPF crate redirects its target-dir to ../target (root) via
           # trapd-agent-ebpf/.cargo/config.toml, so the artifact lands here:
           cp target/bpfel-unknown-none/release/trapd-agent-exec trapd-agent-exec
@@ -102,13 +101,17 @@ jobs:
           # the binaries.
           sha256sum trapd-agent-linux-x86_64       > trapd-agent-linux-x86_64.sha256
           sha256sum trapd-agent-windows-x86_64.exe > trapd-agent-windows-x86_64.exe.sha256
+          sha256sum trapd-agent-windows-x86_64.msi > trapd-agent-windows-x86_64.msi.sha256
           sha256sum trapd-agent-exec               > trapd-agent-exec.sha256
           sha256sum trapd-update.sh                > trapd-update.sh.sha256
+          sha256sum trapd-agent-windows-install.ps1 > trapd-agent-windows-install.ps1.sha256
           sha256sum \
             trapd-agent-linux-x86_64 \
             trapd-agent-windows-x86_64.exe \
+            trapd-agent-windows-x86_64.msi \
             trapd-agent-exec \
             trapd-update.sh \
+            trapd-agent-windows-install.ps1 \
             sbom-trapd-agent.cdx.json \
             sbom-trapd-agent-ebpf.cdx.json > SHA256SUMS
           cat SHA256SUMS
@@ -121,11 +124,16 @@ jobs:
             trapd-agent-linux-x86_64.sha256
             trapd-agent-windows-x86_64.exe
             trapd-agent-windows-x86_64.exe.sha256
+            trapd-agent-windows-x86_64.msi
+            trapd-agent-windows-x86_64.msi.sha256
             trapd-agent-exec
             trapd-agent-exec.sha256
             trapd-update.sh
             trapd-update.sh.sha256
+            trapd-agent-windows-install.ps1
+            trapd-agent-windows-install.ps1.sha256
             sbom-trapd-agent.cdx.json
             sbom-trapd-agent-ebpf.cdx.json
             SHA256SUMS
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

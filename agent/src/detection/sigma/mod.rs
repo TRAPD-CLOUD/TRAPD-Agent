@@ -207,7 +207,11 @@ tags:
 
     #[test]
     fn matches_reverse_shell_and_respects_logsource() {
-        let (engine, errs) = SigmaEngine::from_yaml_docs(&[REV_SHELL_RULE.to_string()]);
+        let rule = REV_SHELL_RULE.replace(
+            "product: linux",
+            &format!("product: {}", std::env::consts::OS),
+        );
+        let (engine, errs) = SigmaEngine::from_yaml_docs(&[rule]);
         assert!(errs.is_empty(), "compile errors: {errs:?}");
         assert_eq!(engine.len(), 1);
 

@@ -216,6 +216,9 @@ pub enum EventData {
     NetworkConnection(NetworkConnectionData),
     SystemSnapshot(SystemSnapshotData),
     UserLogon(UserLogonData),
+    // Logs with a username must be tried before the minimal {username}
+    // session payload, or recovery would silently discard the log fields.
+    Log(Box<LogEventData>),
     UserSession(UserSessionData),
     /// Canonical filesystem notification. Both the real-time watcher and the
     /// periodic integrity scanner emit this shape so consumers do not need
@@ -258,10 +261,6 @@ pub enum EventData {
     HoneytokenAccess(Box<HoneytokenAccessData>),
     // ── Observability ────────────────────────────────────────────────────────
     EbpfDrops(EbpfDropsData),
-    // ── Generic log collector (file / journal / syslog) ─────────────────────
-    // Boxed: the structured `fields` map plus the original message can dwarf
-    // the other variants; boxing keeps `EventData` compact.
-    Log(Box<LogEventData>),
 }
 
 // ── Existing data structs ────────────────────────────────────────────────────────────────────────
@@ -1020,7 +1019,7 @@ pub struct MemoryAnomalyData {
 pub struct LogEventData {
     /// Configured source name (`nginx`, `sshd`, `app`, …).
     pub source: String,
-    /// Reader kind: `file`, `journal`, or `syslog`.
+    /// Reader kind: `file`, `journal`, `syslog`, or `windows_eventlog`.
     pub source_type: String,
     /// Absolute file path, journal unit, or syslog listen address.
     pub source_path: String,

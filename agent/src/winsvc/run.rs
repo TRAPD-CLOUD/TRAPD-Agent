@@ -109,13 +109,37 @@ fn load_env_file() {
     info!(path = %path.display(), "loaded agent.env");
 }
 
+fn load_msi_config() {
+    use crate::collectors::windows::registry;
+    use windows_sys::Win32::System::Registry::RRF_SUBKEY_WOW6464KEY;
+    for (value_name, env_name) in [
+        ("BackendUrl", "TRAPD_BACKEND_URL"),
+        ("EnrollToken", "TRAPD_ENROLL_TOKEN"),
+        ("AllowSystemRoots", "TRAPD_TLS_ALLOW_SYSTEM_ROOTS"),
+    ] {
+        if std::env::var_os(env_name).is_none() {
+            if let Some(value) =
+                registry::string("SOFTWARE\\TRAPD\\Agent", value_name, RRF_SUBKEY_WOW6464KEY)
+            {
+                if !value.trim().is_empty() {
+                    std::env::set_var(env_name, value);
+                }
+            }
+        }
+    }
+    if std::env::var_os("TRAPD_OUTPUT").is_none() {
+        std::env::set_var("TRAPD_OUTPUT", "file");
+    }
+}
+
 // ── Runtime ───────────────────────────────────────────────────────────────────
 
 /// Run the agent until `stop` fires (SCM stop/shutdown or Ctrl-C in console
 /// mode) or the event pipeline closes.
 pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Result<()> {
-    paths::init_state_dir();
     load_env_file();
+    load_msi_config();
+    paths::init_state_dir();
 
     let device_id = load_or_create_device_id()
         .await
@@ -150,7 +174,11 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         let creds = crate::enrollment::load_or_enroll(&backend_url, &device_id, &hostname)
             .await
             .context("Failed to obtain agent credentials")?;
-        (backend_url, creds.agent_id.clone(), creds.agent_secret.clone())
+        (
+            backend_url,
+            creds.agent_id.clone(),
+            creds.agent_secret.clone(),
+        )
     };
 
     let output_mode = OutputMode::from_env();
@@ -182,6 +210,11 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             let cname = c.name();
             handles.push(tokio::spawn(async move {
                 if let Err(e) = c.run(tx2, aid, host).await {
+                    crate::telemetry::metrics::metrics().collector_failed();
+                    if cname == "WindowsProcessCollector" {
+                        crate::telemetry::metrics::metrics()
+                            .set_collector_mode(crate::telemetry::metrics::CollectorMode::Failed);
+                    }
                     error!("{cname} exited with error: {e:#}");
                 }
             }));
@@ -191,11 +224,29 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     spawn_collector!(SystemCollector::new());
     spawn_collector!(ProcessCollector::new());
     spawn_collector!(UserSessionCollector::new());
+    spawn_collector!(crate::collectors::windows::network::NetworkCollector);
+    spawn_collector!(
+        crate::collectors::windows::eventlog::EventLogCollector::new(Arc::clone(&agent_config))
+    );
+    spawn_collector!(
+        crate::collectors::windows::filesystem::FilesystemCollector::new(Arc::clone(&agent_config))
+    );
     // Honeytoken sentinel: decoy files (ReadDirectoryChangesW) + registry decoys
     // (RegNotifyChangeKeyValue), driven by the signed-config deception policy.
     spawn_collector!(HoneytokenCollector::new(Arc::clone(&agent_config)));
 
     drop(tx);
+
+    let engine = Arc::new(crate::detection::DetectionEngine::new(
+        agent_id.clone(),
+        hostname.clone(),
+    ));
+    if let Ok(cfg) = agent_config.read() {
+        engine.reload_sigma(&cfg.sigma_rules);
+        engine.set_sigma_enabled(cfg.sigma_enabled);
+        engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
+    }
+    Arc::clone(&engine).spawn_ioc_reloader(300);
 
     // SIEM forwarder — same best-effort export path as the Linux agent.
     let siem = {
@@ -216,25 +267,71 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
     let mode = output_mode;
+    let consumer_engine = Arc::clone(&engine);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let mut consumer = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
+        let mut shutting_down = false;
+        loop {
+            let event = tokio::select! {
+                _ = &mut shutdown_rx, if !shutting_down => {
+                    rx.close();
+                    shutting_down = true;
+                    continue;
+                }
+                event = rx.recv() => match event { Some(event) => event, None => break },
+            };
             handle_event(&event, &mode, &buf_for_consumer).await;
             siem.forward(&event).await;
+            for detection in consumer_engine.inspect(&event) {
+                handle_event(&detection, &mode, &buf_for_consumer).await;
+                siem.forward(&detection).await;
+            }
         }
     });
+
+    let started = std::time::Instant::now();
+    handles.push(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            ticker.tick().await;
+            let report =
+                crate::telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
+            if let Err(e) = report.write_atomic(&crate::telemetry::TelemetryReport::default_path())
+            {
+                warn!(error = %e, "could not publish telemetry report");
+            }
+        }
+    }));
+
+    let inventory = crate::inventory::InventoryReporter::new(
+        &backend_url,
+        agent_id.clone(),
+        device_id.clone(),
+        token.clone(),
+        hostname.clone(),
+        offline,
+        Arc::clone(&agent_config),
+    )?;
+    handles.push(tokio::spawn(async move { inventory.run().await }));
 
     if !offline {
         let transport =
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
-        tokio::spawn(async move { transport.run().await });
+        handles.push(tokio::spawn(async move { transport.run().await }));
 
+        let config_engine = Arc::clone(&engine);
         let config_puller = ConfigPuller::new(
             Arc::clone(&agent_config),
             &backend_url,
             &agent_id,
             token.clone(),
-        )?;
-        tokio::spawn(async move { config_puller.run().await });
+        )?
+        .with_apply_hook(Arc::new(move |cfg: &AgentConfig| {
+            config_engine.reload_sigma(&cfg.sigma_rules);
+            config_engine.set_sigma_enabled(cfg.sigma_enabled);
+            config_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
+        }));
+        handles.push(tokio::spawn(async move { config_puller.run().await }));
 
         let heartbeat = Heartbeat::new(
             &backend_url,
@@ -243,22 +340,42 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             hostname.clone(),
             Arc::clone(&agent_config),
         )?;
-        tokio::spawn(async move { heartbeat.run().await });
+        handles.push(tokio::spawn(async move { heartbeat.run().await }));
     }
 
-    tokio::select! {
+    let consumer_finished = tokio::select! {
         _ = stop.recv() => {
             info!("Stop requested, shutting down");
             for handle in &handles {
                 handle.abort();
             }
+            false
         }
         _ = &mut consumer => {
             info!("Consumer task exited");
+            true
         }
-    }
+    };
 
-    consumer.await.ok();
+    for handle in &handles {
+        handle.abort();
+    }
+    // Close the receiver, reject further sends and drain already received
+    // events before checkpointing, even if native monitor threads hold senders.
+    let _ = shutdown_tx.send(());
+    if !consumer_finished
+        && tokio::time::timeout(std::time::Duration::from_secs(10), &mut consumer)
+            .await
+            .is_err()
+    {
+        consumer.abort();
+        crate::telemetry::metrics::metrics()
+            .event_dropped(crate::telemetry::DropReason::InternalError);
+        warn!("event consumer did not drain before shutdown deadline");
+    }
+    if let Ok(mut spool) = ring_buffer.lock() {
+        spool.checkpoint();
+    }
     info!("Shutdown complete");
     Ok(())
 }

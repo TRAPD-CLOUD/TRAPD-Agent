@@ -40,11 +40,24 @@ impl FieldView {
         let mut f: HashMap<String, Vec<String>> = HashMap::new();
         let mut put = |k: &str, v: String| {
             if !v.is_empty() {
-                f.entry(k.to_string()).or_default().push(v);
+                f.entry(k.to_ascii_lowercase()).or_default().push(v);
             }
         };
 
         let (category, full_text): (&'static str, String) = match &event.data {
+            EventData::ProcessCreate(e) => {
+                put("image", e.exe.clone());
+                put("commandline", e.cmdline.clone());
+                put("comm", e.name.clone());
+                put("user", e.username.clone());
+                put("processid", e.pid.to_string());
+                put("parentprocessid", e.ppid.to_string());
+                if let Some(h) = &e.exe_sha256 {
+                    put("sha256", h.clone());
+                    put("hashes", h.clone());
+                }
+                ("process_creation", format!("{} {}", e.exe, e.cmdline))
+            }
             EventData::ProcessExec(e) => {
                 put("image", e.exe.clone());
                 put("commandline", e.cmdline.clone());
@@ -161,7 +174,7 @@ impl FieldView {
 
         Some(FieldView {
             category,
-            product: "linux",
+            product: std::env::consts::OS,
             fields: f,
             full_text,
         })
@@ -215,5 +228,30 @@ mod tests {
         assert_eq!(v.get("sha256"), &["abc123".to_string()]);
         assert!(v.full_text().contains("/dev/tcp/"));
         assert!(v.get("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn process_create_projects_host_product_and_process_identity() {
+        let event = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Process,
+            EventAction::Create,
+            Severity::Info,
+            EventData::ProcessCreate(crate::schema::ProcessCreateData {
+                pid: 123,
+                ppid: 42,
+                exe: "test.exe".into(),
+                cmdline: "test.exe --marker".into(),
+                exe_sha256: Some("sha256:abcd".into()),
+                ..Default::default()
+            }),
+        );
+        let view =
+            FieldView::from_event(&event).expect("process create must be inspected by Sigma");
+        assert_eq!(view.product, std::env::consts::OS);
+        assert_eq!(view.category, "process_creation");
+        assert_eq!(view.get("parentprocessid"), &["42".to_string()]);
+        assert_eq!(view.get("sha256"), &["sha256:abcd".to_string()]);
     }
 }

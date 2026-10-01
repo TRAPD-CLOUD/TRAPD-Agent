@@ -796,3 +796,21 @@ fn test_log_event_canonical_shape() {
     let back: AgentEvent = serde_json::from_value(json).unwrap();
     assert!(matches!(back.data, EventData::Log(_)));
 }
+#[test]
+fn windows_authentication_log_keeps_fields_after_queue_round_trip() {
+    let payload = serde_json::json!({
+        "source": "windows_Security",
+        "source_type": "windows_eventlog",
+        "source_path": "Security",
+        "parser": "windows_eventlog_xml",
+        "message": "<Event>authentication failure</Event>",
+        "category": "authentication",
+        "username": "DOMAIN\\Jörg",
+        "pid": 42,
+        "fields": { "EventID": 4625, "TargetUserName": "Jörg" },
+        "offset": 123
+    });
+    let parsed: EventData = serde_json::from_value(payload.clone()).unwrap();
+    assert!(matches!(&parsed, EventData::Log(log) if log.fields["EventID"] == 4625));
+    assert_eq!(serde_json::to_value(parsed).unwrap(), payload);
+}

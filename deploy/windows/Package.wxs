@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="TRAPD Agent" Manufacturer="TRAPD" Version="$(var.Version)"
+           UpgradeCode="0D18AC24-8CE9-4513-A1E5-889FD2A01D93" Scope="perMachine" InstallerVersion="500">
+    <SummaryInformation Description="TRAPD Windows telemetry agent (x64)" />
+    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer TRAPD Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Launch Condition="VersionNT64" Message="TRAPD requires 64-bit Windows." />
+
+    <Property Id="BACKENDURL" Secure="yes">
+      <RegistrySearch Id="ExistingBackend" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="ENROLLTOKEN" Secure="yes" Hidden="yes">
+      <RegistrySearch Id="ExistingEnrollToken" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="raw" Bitness="always64" />
+    </Property>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="TRAPD Agent">
+        <Component Id="AgentService" Guid="CF0BCF0C-FB5C-4DD4-A872-1C16C7FAE06B" Bitness="always64">
+          <File Id="AgentExe" Source="$(var.AgentExe)" Name="trapd-agent.exe" KeyPath="yes" DefaultVersion="$(var.Version)" />
+          <ServiceInstall Id="InstallService" Name="trapd-agent" DisplayName="TRAPD Agent"
+                          Description="TRAPD endpoint telemetry and detection agent"
+                          Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" Vital="yes">
+            <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                                ThirdFailureActionType="restart" ResetPeriodInDays="1" RestartServiceDelayInSeconds="10" />
+          </ServiceInstall>
+          <ServiceControl Id="ManageService" Name="trapd-agent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+          <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATADIR" Name="TRAPD">
+        <Component Id="DataDirectory" Guid="136A6095-4BF6-48D3-9CF0-CBA31D045040" Permanent="yes" Bitness="always64">
+          <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" /></CreateFolder>
+        </Component>
+        <Directory Id="CONFIGDIR" Name="config">
+          <Component Id="ConfigDirectory" Guid="216B2CBE-ED4D-454C-AC9A-7C0E44A45C43" Permanent="yes" Bitness="always64">
+            <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" /></CreateFolder>
+          </Component>
+          <Component Id="DefaultConfig" Guid="7C6D5625-F935-45E3-8A13-A6278F92D2C8" Permanent="yes" NeverOverwrite="yes" Bitness="always64">
+            <File Id="DefaultEnv" Source="$(var.SourceDir)\agent.env.default" Name="agent.env" KeyPath="yes" />
+          </Component>
+        </Directory>
+        <Directory Id="STATEDIR" Name="state">
+          <Component Id="StateDirectory" Guid="A7BD0384-9A98-4B66-BDA8-E1292C094696" Permanent="yes" Bitness="always64">
+            <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" /></CreateFolder>
+          </Component>
+        </Directory>
+        <Directory Id="LOGDIR" Name="logs">
+          <Component Id="LogDirectory" Guid="CC125FE4-1CBB-459E-8C48-A1A8BEB91074" Permanent="yes" Bitness="always64">
+            <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" /></CreateFolder>
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+    <Component Id="RegistryConfig" Directory="INSTALLFOLDER" Guid="9625220B-260F-4E51-BFBE-476EF6BE1543" Permanent="yes" Bitness="always64">
+      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="Installed" Type="integer" Value="1" KeyPath="yes">
+        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
+      </RegistryValue>
+    </Component>
+    <Component Id="BackendConfig" Directory="INSTALLFOLDER" Guid="0C71EE73-B218-46C4-AE14-839BED9F71FC" Permanent="yes" Bitness="always64" Condition="BACKENDURL">
+      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="string" Value="[BACKENDURL]" KeyPath="yes" />
+    </Component>
+    <Component Id="EnrollmentConfig" Directory="INSTALLFOLDER" Guid="91605497-3A06-4D6A-90AA-C6857E11B074" Permanent="yes" Bitness="always64" Condition="ENROLLTOKEN">
+      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="string" Value="[ENROLLTOKEN]" KeyPath="yes" />
+    </Component>
+
+    <!-- MSI owns service registration. This verb only revokes agent decoys,
+         after StopServices and before RemoveFiles; upgrades preserve decoys. -->
+    <CustomAction Id="CleanupDecoys" FileRef="AgentExe" ExeCommand="cleanup" Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="CleanupDecoys" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+    <Feature Id="Agent" Title="TRAPD Agent" Level="1">
+      <ComponentRef Id="AgentService" /><ComponentRef Id="DataDirectory" /><ComponentRef Id="ConfigDirectory" />
+      <ComponentRef Id="DefaultConfig" /><ComponentRef Id="StateDirectory" /><ComponentRef Id="LogDirectory" />
+      <ComponentRef Id="RegistryConfig" /><ComponentRef Id="BackendConfig" /><ComponentRef Id="EnrollmentConfig" />
+    </Feature>
+  </Package>
+</Wix>

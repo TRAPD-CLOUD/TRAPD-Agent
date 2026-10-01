@@ -95,7 +95,10 @@ pub fn monotonic_ns() -> u64 {
         }
     }
     static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
 }
 
 /// Provenance stamped on every event.
@@ -221,7 +224,33 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         parse_start_time(&stat)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if pid <= 0 {
+            return None;
+        }
+        // SAFETY: the owned process handle is closed on all paths; all FILETIME
+        // out-parameters point to initialized storage. No process mutation.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+            if handle.is_null() {
+                return None;
+            }
+            let mut created = FILETIME::default();
+            let mut exited = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+            CloseHandle(handle);
+            (ok != 0)
+                .then_some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = pid;
         None
@@ -257,7 +286,10 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|_| std::thread::spawn(|| (0..500).map(|_| next_sequence()).collect::<Vec<_>>()))
             .collect();
-        let mut all: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let mut all: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
         let total = all.len();
         all.sort_unstable();
         all.dedup();
