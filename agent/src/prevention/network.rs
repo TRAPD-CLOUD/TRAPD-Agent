@@ -77,11 +77,12 @@ pub fn ensure_chains(backend: Backend) -> Result<()> {
             Ok(())
         }
         Backend::Iptables => {
-            let _ = run("iptables", &["-N", IPT_CHAIN]);
-            let listed = run_output("iptables", &["-C", "OUTPUT", "-j", IPT_CHAIN]);
-            if !listed.ok() {
-                run("iptables", &["-I", "OUTPUT", "1", "-j", IPT_CHAIN])
-                    .context("cannot insert TRAPD_BLOCK jump into OUTPUT")?;
+            for tool in ["iptables", "ip6tables"] {
+                ensure_iptables_chain(tool, IPT_CHAIN)?;
+                if !run_output(tool, &["-C", "OUTPUT", "-j", IPT_CHAIN]).ok() {
+                    run(tool, &["-I", "OUTPUT", "1", "-j", IPT_CHAIN])
+                        .context("cannot insert TRAPD_BLOCK jump into OUTPUT")?;
+                }
             }
             Ok(())
         }
@@ -112,6 +113,10 @@ pub fn block_ip(backend: Backend, target: &str) -> Result<String> {
                 NetTarget::Ip(IpAddr::V4(_)) | NetTarget::Cidr(IpNet::V4(_)) => "iptables",
                 NetTarget::Ip(IpAddr::V6(_)) | NetTarget::Cidr(IpNet::V6(_)) => "ip6tables",
             };
+            ensure_iptables_chain(opt, IPT_CHAIN)?;
+            if !run_output(opt, &["-C", "OUTPUT", "-j", IPT_CHAIN]).ok() {
+                run(opt, &["-I", "OUTPUT", "1", "-j", IPT_CHAIN])?;
+            }
             run(opt, &["-A", IPT_CHAIN, "-d", target, "-j", "DROP"])?;
             info!(target, tool = opt, "iptables drop rule added");
             Ok(format!("{opt}:{target}"))
@@ -146,13 +151,13 @@ pub fn unblock_ip(backend: Backend, target: &str) -> Result<()> {
                     if let Some(idx) = line.find("# handle ") {
                         let handle = line[idx + "# handle ".len()..].trim();
                         if !handle.is_empty() {
-                            let _ = run(
+                            run(
                                 "nft",
                                 &[
                                     "delete", "rule", NFT_FAMILY, NFT_TABLE, NFT_BLOCK, "handle",
                                     handle,
                                 ],
-                            );
+                            )?;
                             removed += 1;
                         }
                     }
@@ -226,23 +231,25 @@ pub fn isolate(backend: Backend, allowlist_ips: &[IpAddr]) -> Result<()> {
         }
         Backend::Iptables => {
             const ISOLATE_CHAIN: &str = "TRAPD_ISOLATE";
-            let _ = run("iptables", &["-N", ISOLATE_CHAIN]);
-            run("iptables", &["-F", ISOLATE_CHAIN])?;
-            run(
-                "iptables",
-                &["-A", ISOLATE_CHAIN, "-o", "lo", "-j", "ACCEPT"],
-            )?;
-            for ip in allowlist_ips {
-                if let IpAddr::V4(a) = ip {
-                    run(
-                        "iptables",
-                        &["-A", ISOLATE_CHAIN, "-d", &a.to_string(), "-j", "ACCEPT"],
-                    )?;
+            for tool in ["iptables", "ip6tables"] {
+                ensure_iptables_chain(tool, ISOLATE_CHAIN)?;
+                run(tool, &["-F", ISOLATE_CHAIN])?;
+                run(tool, &["-A", ISOLATE_CHAIN, "-o", "lo", "-j", "ACCEPT"])?;
+                for ip in allowlist_ips {
+                    if matches!(
+                        (tool, ip),
+                        ("iptables", IpAddr::V4(_)) | ("ip6tables", IpAddr::V6(_))
+                    ) {
+                        run(
+                            tool,
+                            &["-A", ISOLATE_CHAIN, "-d", &ip.to_string(), "-j", "ACCEPT"],
+                        )?;
+                    }
                 }
-            }
-            run("iptables", &["-A", ISOLATE_CHAIN, "-j", "DROP"])?;
-            if !run_output("iptables", &["-C", "OUTPUT", "-j", ISOLATE_CHAIN]).ok() {
-                run("iptables", &["-I", "OUTPUT", "1", "-j", ISOLATE_CHAIN])?;
+                run(tool, &["-A", ISOLATE_CHAIN, "-j", "DROP"])?;
+                if !run_output(tool, &["-C", "OUTPUT", "-j", ISOLATE_CHAIN]).ok() {
+                    run(tool, &["-I", "OUTPUT", "1", "-j", ISOLATE_CHAIN])?;
+                }
             }
             info!(allow = allowlist_ips.len(), "host isolated (iptables)");
             Ok(())
@@ -260,8 +267,23 @@ pub fn deisolate(backend: Backend) -> Result<()> {
         }
         Backend::Iptables => {
             const ISOLATE_CHAIN: &str = "TRAPD_ISOLATE";
-            let _ = run("iptables", &["-D", "OUTPUT", "-j", ISOLATE_CHAIN]);
-            let _ = run("iptables", &["-F", ISOLATE_CHAIN]);
+            let mut failures = Vec::new();
+            for tool in ["iptables", "ip6tables"] {
+                if let Err(e) = (|| -> Result<()> {
+                    // Create an absent chain so repeated deisolation is safe;
+                    // a missing executable/permission failure still fails closed.
+                    ensure_iptables_chain(tool, ISOLATE_CHAIN)?;
+                    while run_output(tool, &["-C", "OUTPUT", "-j", ISOLATE_CHAIN]).ok() {
+                        run(tool, &["-D", "OUTPUT", "-j", ISOLATE_CHAIN])?;
+                    }
+                    run(tool, &["-F", ISOLATE_CHAIN])
+                })() {
+                    failures.push(format!("{tool}: {e:#}"));
+                }
+            }
+            if !failures.is_empty() {
+                bail!("deisolation failed: {}", failures.join("; "));
+            }
             info!("host isolation lifted (iptables)");
             Ok(())
         }
@@ -288,7 +310,22 @@ fn nft(args: &[&str]) -> Result<()> {
     run("nft", args)
 }
 
+fn ensure_iptables_chain(tool: &str, chain: &str) -> Result<()> {
+    if run(tool, &["-N", chain]).is_err() {
+        run(tool, &["-S", chain]).context("cannot create or inspect firewall chain")?;
+    }
+    Ok(())
+}
+
 fn run(bin: &str, args: &[&str]) -> Result<()> {
+    #[cfg(test)]
+    if let Some(ok) = tests::capture(bin, args) {
+        return if ok {
+            Ok(())
+        } else {
+            Err(anyhow!("mock firewall failure"))
+        };
+    }
     debug!(?bin, ?args, "exec");
     let out = Command::new(bin)
         .args(args)
@@ -317,6 +354,13 @@ impl CapturedOutput {
 }
 
 fn run_output(bin: &str, args: &[&str]) -> CapturedOutput {
+    #[cfg(test)]
+    if let Some(status) = tests::capture(bin, args) {
+        return CapturedOutput {
+            status,
+            stdout: Vec::new(),
+        };
+    }
     match Command::new(bin).args(args).output() {
         Ok(o) => CapturedOutput {
             status: o.status.success(),
@@ -326,5 +370,113 @@ fn run_output(bin: &str, args: &[&str]) -> CapturedOutput {
             status: false,
             stdout: Vec::new(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    #[derive(Default)]
+    struct Firewall {
+        calls: Vec<(String, Vec<String>)>,
+        fail_v6: bool,
+        jumps: std::collections::HashSet<(String, String)>,
+    }
+    thread_local! { static FIREWALL: RefCell<Option<Firewall>> = const { RefCell::new(None) }; }
+    pub(super) fn capture(bin: &str, args: &[&str]) -> Option<bool> {
+        FIREWALL.with(|state| {
+            state.borrow_mut().as_mut().map(|f| {
+                f.calls
+                    .push((bin.into(), args.iter().map(|s| s.to_string()).collect()));
+                if f.fail_v6 && bin == "ip6tables" {
+                    return false;
+                }
+                if args.get(1) == Some(&"OUTPUT") {
+                    let key = (bin.to_string(), args.last().unwrap().to_string());
+                    match args.first().copied() {
+                        Some("-C") => return f.jumps.contains(&key),
+                        Some("-I") => {
+                            f.jumps.insert(key);
+                        }
+                        Some("-D") => {
+                            f.jumps.remove(&key);
+                        }
+                        _ => {}
+                    }
+                }
+                true
+            })
+        })
+    }
+    fn setup(fail_v6: bool) {
+        FIREWALL.with(|f| {
+            *f.borrow_mut() = Some(Firewall {
+                fail_v6,
+                ..Default::default()
+            })
+        });
+    }
+    fn called(bin: &str, args: &[&str]) -> bool {
+        FIREWALL.with(|f| {
+            f.borrow()
+                .as_ref()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|(b, a)| b == bin && a == args)
+        })
+    }
+    #[test]
+    fn iptables_isolates_both_families_and_preserves_allowlists() {
+        setup(false);
+        isolate(
+            Backend::Iptables,
+            &["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()],
+        )
+        .unwrap();
+        assert!(called("ip6tables", &["-A", "TRAPD_ISOLATE", "-j", "DROP"]));
+        assert!(called(
+            "ip6tables",
+            &["-A", "TRAPD_ISOLATE", "-d", "2001:db8::1", "-j", "ACCEPT"]
+        ));
+        assert!(called(
+            "iptables",
+            &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.1", "-j", "ACCEPT"]
+        ));
+    }
+    #[test]
+    fn iptables_chain_setup_and_deisolation_cover_ipv6() {
+        setup(false);
+        ensure_chains(Backend::Iptables).unwrap();
+        assert!(called("ip6tables", &["-N", "TRAPD_BLOCK"]));
+        isolate(Backend::Iptables, &[]).unwrap();
+        deisolate(Backend::Iptables).unwrap();
+        assert!(called(
+            "ip6tables",
+            &["-D", "OUTPUT", "-j", "TRAPD_ISOLATE"]
+        ));
+        assert!(called("iptables", &["-D", "OUTPUT", "-j", "TRAPD_ISOLATE"]));
+        assert!(called("ip6tables", &["-F", "TRAPD_ISOLATE"]));
+    }
+    #[test]
+    fn ipv6_failure_is_not_successful_isolation_or_deisolation() {
+        setup(true);
+        assert!(isolate(Backend::Iptables, &[]).is_err());
+        assert!(deisolate(Backend::Iptables).is_err());
+    }
+    #[test]
+    fn ipv6_block_and_unblock_use_attached_ipv6_chain() {
+        setup(false);
+        block_ip(Backend::Iptables, "2001:db8::2").unwrap();
+        assert!(called(
+            "ip6tables",
+            &["-I", "OUTPUT", "1", "-j", "TRAPD_BLOCK"]
+        ));
+        unblock_ip(Backend::Iptables, "2001:db8::2").unwrap();
+        assert!(called(
+            "ip6tables",
+            &["-D", "TRAPD_BLOCK", "-d", "2001:db8::2", "-j", "DROP"]
+        ));
     }
 }

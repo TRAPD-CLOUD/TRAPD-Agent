@@ -247,15 +247,13 @@ async fn main() -> Result<()> {
 
     // ── Prevention subsystem (active response) ────────────────────────────────
     // Requires the backend (signed command channel), so it is skipped offline.
-    let prevention_enabled = agent_config
-        .read()
-        .map(|c| c.prevention_enabled)
-        .unwrap_or(true);
+    // Keep the runtime available online even when initially disabled: each
+    // enforcement path checks the live flag and signed config can enable it.
     // Shared kick from the prevention engine to the eBPF reconciler + the
     // honeytoken health checker: pulsed after every deploy/revoke so arming and
     // on-disk verification happen within ms instead of up to a full tick later.
     let reconcile_signal = Arc::new(tokio::sync::Notify::new());
-    let prev_event_tx = if prevention_enabled && !offline {
+    let prev_event_tx = if !offline {
         match start_prevention(
             &backend_url,
             &agent_id,
@@ -753,9 +751,6 @@ async fn start_prevention(
         Arc::clone(&engine).spawn_command_loop(cmd_rx);
     }
 
-    let lsm = prevention::lsm_loader::LsmHandle::try_load();
-    lsm.sync(&policy).await;
-
     Ok(event_tx)
 }
 
@@ -790,7 +785,18 @@ fn spawn_honeytoken_health(
             // The engine mutates this same register on deploy/revoke, so the live
             // Arc already reflects the current set of planted tokens.
             for rec in store.list() {
-                let health = deception::verify_record(&rec);
+                let rec_for_check = rec.clone();
+                let health = match tokio::task::spawn_blocking(move || {
+                    deception::verify_record(&rec_for_check)
+                })
+                .await
+                {
+                    Ok(health) => health,
+                    Err(error) => {
+                        warn!(%error, token_id = %rec.id, "honeytoken verification task failed");
+                        continue;
+                    }
+                };
                 let severity = if health.present && !health.modified {
                     Severity::Info
                 } else {
@@ -798,6 +804,9 @@ fn spawn_honeytoken_health(
                 };
                 let reason = match health.status_label() {
                     "missing" => format!("honeytoken '{}' is missing from disk", rec.kind),
+                    "modified" if health.actual_sha256.is_none() => {
+                        format!("honeytoken '{}' cannot be safely verified", rec.kind)
+                    }
                     "modified" => {
                         format!("honeytoken '{}' content changed since deployment", rec.kind)
                     }

@@ -20,6 +20,8 @@ pub struct RawLine {
     pub bytes: Vec<u8>,
     pub truncated: bool,
     pub original_len: usize,
+    /// Bytes consumed from the file, including line terminators.
+    pub consumed_len: usize,
 }
 
 impl RawLine {
@@ -55,6 +57,7 @@ pub fn frame_bytes(data: &[u8], max_line: usize, rest: &mut Vec<u8>) -> Vec<RawL
             }
             out.push(RawLine {
                 original_len: original,
+                consumed_len: pos + 1,
                 truncated,
                 bytes: line,
             });
@@ -68,6 +71,7 @@ pub fn frame_bytes(data: &[u8], max_line: usize, rest: &mut Vec<u8>) -> Vec<RawL
                 bytes: cut,
                 truncated: true,
                 original_len: original,
+                consumed_len: original,
             });
             // Drop until the next newline so we resync; if there isn't one
             // yet, clear the buffer (the rest of the monster line arrives
@@ -148,6 +152,10 @@ impl MultilineAggregator {
         None
     }
 
+    pub fn has_pending(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
     #[allow(dead_code)]
     pub fn flush(&mut self) -> Option<String> {
         self.take()
@@ -196,29 +204,34 @@ impl AuditAggregator {
         }
     }
 
-    pub fn push(&mut self, line: &str) -> Option<String> {
+    pub fn push(&mut self, line: &str) -> Vec<String> {
         let id = audit_event_id(line);
-        let is_eoe = line.contains("type=EOE") || line.contains("type=EOE ");
+        let is_eoe = line.contains("type=EOE");
+        let mut out = Vec::new();
         if let Some(id) = id {
-            if self.current_id.as_deref() == Some(id.as_str()) {
-                self.buf.push(line.to_string());
-                if is_eoe || self.buf.len() >= self.max_lines {
-                    return self.take();
+            if self.current_id.as_deref() != Some(id.as_str()) {
+                if let Some(previous) = self.take() {
+                    out.push(previous);
                 }
-                return None;
+                self.current_id = Some(id);
             }
-            let flushed = self.take();
-            self.current_id = Some(id);
             self.buf.push(line.to_string());
-            if is_eoe {
-                return self.take().or(flushed);
+            if is_eoe || self.buf.len() >= self.max_lines {
+                if let Some(current) = self.take() {
+                    out.push(current);
+                }
             }
-            return flushed;
+        } else {
+            if let Some(previous) = self.take() {
+                out.push(previous);
+            }
+            out.push(line.to_string());
         }
-        // No event id — flush pending and pass the line through.
-        let flushed = self.take();
-        self.buf.push(line.to_string());
-        self.take().or(flushed)
+        out
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.buf.is_empty()
     }
 
     #[allow(dead_code)]
@@ -302,10 +315,10 @@ mod tests {
         let s1 = "type=SYSCALL msg=audit(1.0:9): syscall=59 comm=\"bash\"";
         let s2 = "type=EXECVE msg=audit(1.0:9): argc=2 a0=\"bash\"";
         let s3 = "type=SYSCALL msg=audit(1.0:10): syscall=2";
-        assert!(a.push(s1).is_none());
+        assert!(a.push(s1).is_empty());
         let flushed = a.push(s2);
-        assert!(flushed.is_none());
-        let rec = a.push(s3).unwrap();
+        assert!(flushed.is_empty());
+        let rec = a.push(s3).pop().unwrap();
         assert!(rec.contains("SYSCALL"));
         assert!(rec.contains("EXECVE"));
         assert!(rec.contains("msg=audit(1.0:9)"));

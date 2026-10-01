@@ -34,6 +34,7 @@ use crate::schema::{
 
 use super::audit::AuditEmitter;
 use super::commands::{CommandEnvelope, CommandPayload};
+use super::lsm_loader::LsmHandle;
 use super::network::{self, Backend};
 use super::policy::{IocRule, Match, PolicyHandle, PolicyStore, RuleAction};
 use super::process;
@@ -126,6 +127,8 @@ pub struct Engine {
     /// immediately instead of waiting for the next periodic tick. `None` in tests
     /// or when eBPF detection is unavailable.
     reconcile_signal: Option<Arc<Notify>>,
+    /// Owns the attached kernel program for the full prevention runtime.
+    kernel_blocker: LsmHandle,
 }
 
 impl Engine {
@@ -146,6 +149,7 @@ impl Engine {
             recorder: Arc::new(FlightRecorder::new(forensics::recorder::DEFAULT_CAPACITY)),
             auto_cooldown: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             reconcile_signal: None,
+            kernel_blocker: LsmHandle::disabled(),
         }
     }
 
@@ -167,17 +171,57 @@ impl Engine {
         }
     }
 
+    fn prevention_enabled(&self) -> bool {
+        self.cfg_handle
+            .read()
+            .map(|c| c.prevention_enabled)
+            .unwrap_or(false)
+    }
+
+    async fn sync_kernel_prevention(&self) {
+        let enabled = self.prevention_enabled();
+        self.kernel_blocker.set_enabled(enabled).await;
+        if enabled {
+            // Configuration can change while the program is being loaded.
+            if self.prevention_enabled() {
+                self.kernel_blocker.sync(&self.policy).await;
+            } else {
+                self.kernel_blocker.set_enabled(false).await;
+            }
+        }
+    }
+
     /// Spawn the event-enforcement loop.  Consumes the receiver.
     ///
     /// Two enforcement paths ride this stream: IoC enforcement on `ProcessExec`,
     /// and the policy-driven auto-response on a `HoneytokenAccess` detection.
     pub fn spawn_event_loop(self: Arc<Self>, mut rx: Receiver<AgentEvent>) {
         tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
+            let mut config_tick = tokio::time::interval(Duration::from_millis(100));
+            let mut last_enabled = None;
+            loop {
+                let event = tokio::select! {
+                    _ = config_tick.tick() => {
+                        let enabled = self.prevention_enabled();
+                        if last_enabled != Some(enabled) {
+                            self.sync_kernel_prevention().await;
+                            last_enabled = Some(enabled);
+                        }
+                        continue;
+                    }
+                    event = rx.recv() => match event {
+                        Some(event) => event,
+                        None => break,
+                    },
+                };
                 // Flight recorder (issue #32, point 5): every event feeds the
                 // bounded ring so a later honeytoken hit can ship the session's
                 // pre-history. Cheap and lock-poison-tolerant.
                 self.recorder.record(&event);
+                if !self.prevention_enabled() {
+                    self.kernel_blocker.set_enabled(false).await;
+                    continue;
+                }
                 match &event.data {
                     EventData::ProcessExec(exec) => {
                         let _ = process::enforce_exec(exec, &self.policy, &self.audit);
@@ -215,6 +259,9 @@ impl Engine {
     /// backend sees exactly what was done (and gets the hit telemetry for the
     /// ML feedback loop).
     async fn respond_honeytoken(&self, data: &HoneytokenAccessData) {
+        if !self.prevention_enabled() {
+            return;
+        }
         let level = self.honeytoken_response_level();
         let pid = data.accessor.pid;
         let target = format!("{} (pid {})", data.path, pid);
@@ -360,6 +407,9 @@ impl Engine {
         subject: &str,
         targets: Targets,
     ) {
+        if !self.prevention_enabled() {
+            return;
+        }
         let (enabled, action, min_sev, min_conf, allow) = match self.cfg_handle.read() {
             Ok(c) => (
                 c.auto_response_enabled,
@@ -414,6 +464,9 @@ impl Engine {
         targets: &Targets,
         decision: &response::Decision,
     ) {
+        if !self.prevention_enabled() {
+            return;
+        }
         let mut actions: Vec<&str> = Vec::new();
         let mut killed = false;
         let mut quarantined = false;
@@ -512,6 +565,9 @@ impl Engine {
     /// the destination and (best-effort) SIGKILLs the connecting process;
     /// `Alert` audits only. The network analogue of [`process::enforce_exec`].
     async fn enforce_network(&self, data: &NetworkConnectionData) {
+        if !self.prevention_enabled() {
+            return;
+        }
         // Only act on flow *start* records, never the synthetic close event.
         if data.state.eq_ignore_ascii_case("closed") {
             return;
@@ -529,10 +585,13 @@ impl Engine {
     }
 
     /// Inline IoC enforcement on a resolved DNS answer. A backend-pushed
-    /// `Domain` rule (Block-only) drops every resolved A/AAAA address so the
+    /// `Domain` block rule drops every resolved A/AAAA address so the
     /// follow-up connection cannot complete, even though the resolution itself
     /// carries no originating PID.
     async fn enforce_dns_resolution(&self, data: &DnsResolutionData) {
+        if !self.prevention_enabled() {
+            return;
+        }
         let m = match self.policy.read().match_domain(&data.qname) {
             Some(m) => m,
             None => return,
@@ -558,6 +617,9 @@ impl Engine {
         source: &str,
         qname: Option<&str>,
     ) {
+        if !self.prevention_enabled() {
+            return;
+        }
         let block = matches!(m.action, RuleAction::Block);
 
         // Deduplicate firewall installs per destination so a chatty flow does
@@ -708,6 +770,21 @@ impl Engine {
 
     async fn handle(&self, env: CommandEnvelope) {
         let cmd_id = env.command_id.to_string();
+        if !self.prevention_enabled() {
+            self.kernel_blocker.set_enabled(false).await;
+            self.audit.emit(
+                EventAction::CommandRejected,
+                Severity::Medium,
+                "command_rejected",
+                "<command>",
+                false,
+                "prevention is disabled by agent configuration",
+                None,
+                Some(cmd_id),
+                serde_json::Value::Null,
+            );
+            return;
+        }
         match &env.payload {
             CommandPayload::KillPid { pid } => {
                 self.cmd_kill_pid(*pid, &cmd_id);
@@ -731,7 +808,7 @@ impl Engine {
                 self.cmd_unblock_ip(ip, &cmd_id).await;
             }
             CommandPayload::UpdatePolicy { rules } => {
-                self.cmd_update_policy(rules.clone(), &cmd_id);
+                self.cmd_update_policy(rules.clone(), &cmd_id).await;
             }
             CommandPayload::InstallPackage { name } => {
                 self.cmd_package(super::software::Operation::Install(name), &cmd_id);
@@ -1604,11 +1681,12 @@ impl Engine {
         );
     }
 
-    fn cmd_update_policy(&self, rules: Vec<IocRule>, cmd_id: &str) {
+    async fn cmd_update_policy(&self, rules: Vec<IocRule>, cmd_id: &str) {
         let count = rules.len();
         match PolicyStore::from_rules(rules) {
             Ok(store) => {
                 self.policy.replace(store);
+                self.sync_kernel_prevention().await;
                 info!(rules = count, "IoC policy reloaded from backend");
                 self.audit.emit(
                     crate::schema::EventAction::PolicyUpdated,
@@ -1674,6 +1752,67 @@ mod tests {
             Arc::new(RwLock::new(AgentConfig::default())),
         );
         (engine, rx)
+    }
+
+    #[tokio::test]
+    async fn disabled_prevention_rejects_commands_before_policy_mutation() {
+        let (engine, mut rx) = test_engine();
+        engine.cfg_handle.write().unwrap().prevention_enabled = false;
+        let now = chrono::Utc::now();
+        engine
+            .handle(crate::prevention::commands::CommandEnvelope {
+                command_id: uuid::Uuid::new_v4(),
+                issued_at: now,
+                expires_at: now + chrono::Duration::minutes(1),
+                agent_id: "test-agent".into(),
+                nonce: uuid::Uuid::new_v4(),
+                payload: crate::prevention::commands::CommandPayload::UpdatePolicy {
+                    rules: vec![crate::prevention::policy::IocRule::Comm {
+                        id: "x".into(),
+                        value: "bash".into(),
+                        action: crate::prevention::policy::RuleAction::Block,
+                    }],
+                },
+            })
+            .await;
+        assert!(
+            engine.policy.read().rules().is_empty(),
+            "disabled prevention must not dispatch commands"
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap().action,
+            EventAction::CommandRejected
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabled_prevention_does_not_enforce_dns_rules() {
+        let (engine, mut rx) = test_engine();
+        engine.cfg_handle.write().unwrap().prevention_enabled = false;
+        engine.policy.replace(
+            PolicyStore::from_rules(vec![crate::prevention::policy::IocRule::Domain {
+                id: "block".into(),
+                value: "evil.example".into(),
+                action: crate::prevention::policy::RuleAction::Block,
+            }])
+            .unwrap(),
+        );
+        engine
+            .enforce_dns_resolution(&crate::schema::DnsResolutionData {
+                qname: "evil.example".into(),
+                qtype: "A".into(),
+                resolved_ips: vec!["198.51.100.9".into()],
+                cnames: vec![],
+                server_addr: "10.0.0.1".into(),
+                client_addr: "10.0.0.2".into(),
+                transaction_id: 42,
+                rcode: "NOERROR".into(),
+            })
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "disabled prevention must not enforce DNS"
+        );
     }
 
     #[test]

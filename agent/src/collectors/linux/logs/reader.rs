@@ -36,8 +36,9 @@ use std::os::unix::fs::MetadataExt;
 #[derive(Debug, Clone)]
 pub struct TailedLine {
     pub line: RawLine,
-    pub offset: u64,
     pub inode: u64,
+    pub start_offset: u64,
+    pub checkpoint: FileCheckpoint,
 }
 
 /// Open file + cursor for a single path.
@@ -57,6 +58,7 @@ pub struct FileTail {
     /// Path now points at a different inode; switch once the current handle
     /// returns EOF so unread bytes on the rotated file are not dropped.
     pending_switch: Option<((u64, u64), String)>,
+    reached_eof: bool,
 }
 
 impl FileTail {
@@ -77,6 +79,7 @@ impl FileTail {
             starts_at_end: source.starts_at_end(),
             known: checkpoint.is_some(),
             pending_switch: None,
+            reached_eof: false,
         };
         if let Some(cp) = checkpoint {
             tail.offset = cp.offset;
@@ -90,7 +93,7 @@ impl FileTail {
     pub fn poll(&mut self) -> std::io::Result<Vec<TailedLine>> {
         self.reconcile()?;
         let mut out = self.read_available()?;
-        if out.is_empty() && self.pending_switch.is_some() {
+        if self.reached_eof && self.pending_switch.is_some() {
             // EOF on the rotated handle: emit a trailing line that never
             // saw a newline, then switch. Dropping `rest` here is how
             // readers silently lose the last record of a rotated file.
@@ -111,24 +114,32 @@ impl FileTail {
         }
         let bytes = std::mem::take(&mut self.rest);
         let inode = self.open_inode.map(|(_, i)| i).unwrap_or(0);
+        let start_offset = self.offset.saturating_sub(bytes.len() as u64);
         Some(TailedLine {
             line: RawLine {
                 original_len: bytes.len(),
+                consumed_len: bytes.len(),
                 truncated: false,
                 bytes,
             },
-            offset: self.offset,
             inode,
+            start_offset,
+            checkpoint: self.checkpoint_at(self.offset)?,
         })
     }
 
     fn read_available(&mut self) -> std::io::Result<Vec<TailedLine>> {
+        self.reached_eof = false;
+        let start = self.offset.saturating_sub(self.rest.len() as u64);
         let Some(file) = self.file.as_mut() else {
             return Ok(Vec::new());
         };
         let mut buf = vec![0u8; 64 * 1024];
         let n = match file.read(&mut buf) {
-            Ok(0) => return Ok(Vec::new()),
+            Ok(0) => {
+                self.reached_eof = true;
+                return Ok(Vec::new());
+            }
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -137,23 +148,39 @@ impl FileTail {
         let pos = file.stream_position().unwrap_or(self.offset + n as u64);
         self.offset = pos;
         let inode = self.open_inode.map(|(_, i)| i).unwrap_or(0);
-        Ok(framed
-            .into_iter()
-            .map(|line| TailedLine {
+        let template = self
+            .checkpoint_at(pos)
+            .ok_or_else(|| std::io::Error::other("open log file has no identity"))?;
+        let mut cursor = start;
+        let mut out = Vec::with_capacity(framed.len());
+        for line in framed {
+            let start_offset = cursor;
+            cursor += line.consumed_len as u64;
+            let mut checkpoint = template.clone();
+            checkpoint.offset = cursor;
+            out.push(TailedLine {
                 line,
-                offset: pos,
                 inode,
-            })
-            .collect())
+                start_offset,
+                checkpoint,
+            });
+        }
+        Ok(out)
     }
 
     pub fn checkpoint(&self) -> Option<FileCheckpoint> {
+        // The physical suffix lives only in memory and must be replayed after
+        // a restart. Logical framing may rewind this cursor further.
+        self.checkpoint_at(self.offset.saturating_sub(self.rest.len() as u64))
+    }
+
+    fn checkpoint_at(&self, offset: u64) -> Option<FileCheckpoint> {
         let (dev, inode) = self.open_inode?;
         Some(FileCheckpoint {
             path: self.path.to_string_lossy().into_owned(),
             dev,
             inode,
-            offset: self.offset,
+            offset,
             size: self
                 .file
                 .as_ref()
@@ -478,6 +505,65 @@ mod tests {
             .unwrap();
         f.write_all(s.as_bytes()).unwrap();
         f.flush().unwrap();
+    }
+
+    #[test]
+    fn restart_retains_an_incomplete_line() {
+        let dir = tmpdir();
+        let path = dir.join("app.log");
+        write(&path, "complete\nprefix");
+        let src =
+            LogSourceConfig::file("app", &path.to_string_lossy(), "raw").read_from_beginning();
+        let mut tail = FileTail::new(&src, path.clone(), None);
+        assert_eq!(tail.poll().unwrap().len(), 1);
+        let cp = tail.checkpoint().unwrap();
+        assert_eq!(
+            cp.offset, 9,
+            "un-emitted prefix must remain before the checkpoint"
+        );
+        drop(tail);
+        write(&path, " suffix\n");
+        let mut resumed = FileTail::new(&src, path, Some(&cp));
+        assert_eq!(resumed.poll().unwrap()[0].line.as_str(), "prefix suffix");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn physical_lines_have_distinct_end_offsets() {
+        let dir = tmpdir();
+        let path = dir.join("app.log");
+        write(&path, "one\ntwo\r\nprefix");
+        let src =
+            LogSourceConfig::file("app", &path.to_string_lossy(), "raw").read_from_beginning();
+        let mut tail = FileTail::new(&src, path, None);
+        let got = tail.poll().unwrap();
+        assert_eq!(
+            got.iter().map(|r| r.checkpoint.offset).collect::<Vec<_>>(),
+            vec![4, 9]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rotation_drains_reads_without_complete_lines() {
+        let dir = tmpdir();
+        let path = dir.join("app.log");
+        write(&path, "old\n");
+        let mut src =
+            LogSourceConfig::file("app", &path.to_string_lossy(), "raw").read_from_beginning();
+        src.max_line_bytes = 256 * 1024;
+        let mut tail = FileTail::new(&src, path.clone(), None);
+        tail.poll().unwrap();
+        let long = "x".repeat(100_000);
+        write(&path, &format!("{long}\nlast old\n"));
+        std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+        write(&path, "new\n");
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            got.extend(tail.poll().unwrap().into_iter().map(|r| r.line.as_str()));
+        }
+        assert_eq!(got, vec![long, "last old".into(), "new".into()]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

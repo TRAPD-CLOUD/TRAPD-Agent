@@ -74,6 +74,198 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 /// `file_status` / `last_verified_at` lifecycle columns.
 const HEALTH_EVERY_N_SWEEPS: u32 = 4;
 
+const MAX_TOKEN_HASH_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct OwnedFile {
+    identity: [u32; 3],
+    sha256: String,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct DeploymentRegister {
+    #[serde(default)]
+    files: HashMap<PathBuf, OwnedFile>,
+    #[serde(default)]
+    registry_values: HashSet<String>,
+}
+
+fn deployment_path() -> PathBuf {
+    crate::paths::state_dir().join("windows_honeytoken_deployments.json")
+}
+
+fn deployments() -> &'static Mutex<DeploymentRegister> {
+    static REGISTER: std::sync::OnceLock<Mutex<DeploymentRegister>> = std::sync::OnceLock::new();
+    REGISTER.get_or_init(|| {
+        use std::io::Read;
+        let loaded = std::fs::File::open(deployment_path())
+            .ok()
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(MAX_TOKEN_HASH_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                if bytes.len() as u64 > MAX_TOKEN_HASH_BYTES {
+                    return None;
+                }
+                serde_json::from_slice(&bytes).ok()
+            });
+        Mutex::new(loaded.unwrap_or_default())
+    })
+}
+
+fn persist_deployments(register: &DeploymentRegister) -> Result<()> {
+    crate::paths::write_atomic(&deployment_path(), &serde_json::to_vec(register)?, 0o600)
+}
+
+fn owns_path(path: &Path) -> bool {
+    deployments()
+        .lock()
+        .is_ok_and(|register| register.files.contains_key(path))
+}
+
+// Use native identity and disposition on the opened file, so a replacement at
+// its pathname cannot be mistaken for an owned decoy during cleanup.
+#[repr(C)]
+#[derive(Default)]
+struct NativeFileInfo {
+    attributes: u32,
+    created: [u32; 2],
+    accessed: [u32; 2],
+    written: [u32; 2],
+    volume: u32,
+    size_high: u32,
+    size_low: u32,
+    links: u32,
+    index_high: u32,
+    index_low: u32,
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut NativeFileInfo) -> i32;
+    fn SetFileInformationByHandle(
+        handle: *mut std::ffi::c_void,
+        class: i32,
+        info: *const std::ffi::c_void,
+        size: u32,
+    ) -> i32;
+}
+
+fn file_identity(file: &std::fs::File) -> std::io::Result<[u32; 3]> {
+    use std::os::windows::io::AsRawHandle;
+    let mut info = NativeFileInfo::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok([info.volume, info.index_high, info.index_low])
+}
+
+fn remove_owned_file(path: &Path, owned: &OwnedFile) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::os::windows::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawHandle,
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .access_mode(0x8000_0000 | 0x0001_0000) // GENERIC_READ | DELETE
+        .share_mode(1) // FILE_SHARE_READ: no writer/rename may race this check
+        .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.file_attributes() & 0x400 != 0
+        || meta.len() > MAX_TOKEN_HASH_BYTES
+        || file_identity(&file)? != owned.identity
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decoy file identity changed",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    if format!("sha256:{}", hex::encode(hasher.finalize())) != owned.sha256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decoy content changed",
+        ));
+    }
+    // FILE_DISPOSITION_INFO uses a one-byte BOOLEAN. Delete the opened object,
+    // not whatever may subsequently appear at the recorded path.
+    let delete: u8 = 1;
+    if unsafe {
+        SetFileInformationByHandle(file.as_raw_handle(), 4, &delete as *const u8 as *const _, 1)
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ownership_regressions {
+    use super::*;
+
+    fn sample() -> (PathBuf, OwnedFile) {
+        let path = std::env::temp_dir().join(format!("trapd-win-owned-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"bait").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let owned = OwnedFile {
+            identity: file_identity(&file).unwrap(),
+            sha256: sha256_hex(b"bait"),
+        };
+        (path, owned)
+    }
+
+    #[test]
+    fn cleanup_removes_owned_unchanged_file() {
+        let (path, owned) = sample();
+        remove_owned_file(&path, &owned).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cleanup_preserves_changed_contents() {
+        let (path, owned) = sample();
+        std::fs::write(&path, b"real user credentials").unwrap();
+        assert!(remove_owned_file(&path, &owned).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"real user credentials");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cleanup_preserves_different_file_identity() {
+        let (path, owned) = sample();
+        let old = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"bait").unwrap();
+        assert!(remove_owned_file(&path, &owned).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"bait");
+        drop(old);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn preexisting_file_is_not_adopted_or_overwritten() {
+        let path = std::env::temp_dir().join(format!("trapd-win-decoy-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"real credentials").unwrap();
+        let state = FsState::default();
+        assert!(plant_missing(std::slice::from_ref(&path), &state).is_empty());
+        assert!(!state.sha.lock().unwrap().contains_key(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), b"real credentials");
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 // ── Shared filesystem-token state ─────────────────────────────────────────────
 
 #[derive(Default)]
@@ -86,6 +278,9 @@ struct FsState {
     /// plant time (or from the surviving file on startup) — the baseline the
     /// health verifier diffs against to flag out-of-band tampering.
     sha: Mutex<HashMap<PathBuf, String>>,
+    /// Warn once about preexisting/unregistered files. Upgrade migration never
+    /// adopts them: their provenance cannot be recovered safely from content.
+    ignored: Mutex<HashSet<PathBuf>>,
 }
 
 impl FsState {
@@ -119,7 +314,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn sha256_of_file(path: &Path) -> Option<String> {
-    std::fs::read(path).ok().map(|b| sha256_hex(&b))
+    crate::paths::bounded_regular_sha256(path, MAX_TOKEN_HASH_BYTES)
+        .ok()
+        .map(|digest| format!("sha256:{digest}"))
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
@@ -160,7 +357,9 @@ impl Collector for HoneytokenCollector {
         // (`prevention.honeytoken_deployed` → `honeytokens` row), so the
         // dashboard shows Windows tokens *before* their first trigger.
         for path in &initial {
-            emit_fs_deployed(&tx, &agent_id, &hostname, path, &state);
+            if owns_path(path) {
+                emit_fs_deployed(&tx, &agent_id, &hostname, path, &state);
+            }
         }
 
         // Registry decoys + blocking RegNotifyChangeKeyValue monitor.
@@ -168,9 +367,10 @@ impl Collector for HoneytokenCollector {
             let tx = tx.clone();
             let agent_id = agent_id.clone();
             let hostname = hostname.clone();
+            let config = Arc::clone(&self.config);
             std::thread::Builder::new()
                 .name("trapd-reg-honeytokens".into())
-                .spawn(move || registry::monitor(tx, agent_id, hostname))
+                .spawn(move || registry::monitor(tx, agent_id, hostname, config))
                 .context("spawn registry honeytoken monitor thread")?;
         }
 
@@ -230,11 +430,25 @@ fn configured_paths(config: &Arc<RwLock<AgentConfig>>) -> Vec<PathBuf> {
 /// paths that were (re)created. Failures are logged, never fatal: a path on a
 /// non-existent drive must not take the sentinel down.
 fn plant_missing(paths: &[PathBuf], state: &FsState) -> Vec<PathBuf> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
     let mut created = Vec::new();
     for path in paths {
-        if path.exists() {
-            // Ensure read-detection + tamper baselines exist even when the
-            // file survived a restart (its current content is the baseline).
+        if path.symlink_metadata().is_ok() {
+            let owned = deployments()
+                .lock()
+                .ok()
+                .and_then(|register| register.files.get(path).cloned());
+            let Some(owned) = owned else {
+                if state
+                    .ignored
+                    .lock()
+                    .is_ok_and(|mut ignored| ignored.insert(path.clone()))
+                {
+                    warn!(path = %path.display(), "honeytoken path already exists without a deployment record; preserving file and excluding it from decoy cleanup (including legacy installations)");
+                }
+                continue;
+            };
             if let Ok(mut m) = state.atime.lock() {
                 if !m.contains_key(path) {
                     if let Some(at) = accessed_time(path) {
@@ -243,11 +457,7 @@ fn plant_missing(paths: &[PathBuf], state: &FsState) -> Vec<PathBuf> {
                 }
             }
             if let Ok(mut m) = state.sha.lock() {
-                if !m.contains_key(path) {
-                    if let Some(d) = sha256_of_file(path) {
-                        m.insert(path.clone(), d);
-                    }
-                }
+                m.entry(path.clone()).or_insert(owned.sha256);
             }
             continue;
         }
@@ -258,7 +468,37 @@ fn plant_missing(paths: &[PathBuf], state: &FsState) -> Vec<PathBuf> {
             }
         }
         let bait = bait_content(path);
-        match std::fs::write(path, &bait) {
+        let result = (|| -> Result<()> {
+            // Exclusive creation refuses files and reparse points that appeared
+            // after the existence check. Deny sharing until ownership is saved.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .share_mode(0)
+                .custom_flags(0x0020_0000)
+                .open(path)?;
+            file.write_all(&bait)?;
+            file.sync_all()?;
+            let record = OwnedFile {
+                identity: file_identity(&file)?,
+                sha256: sha256_hex(&bait),
+            };
+            let mut register = deployments()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment register poisoned"))?;
+            let previous = register.files.insert(path.clone(), record);
+            if let Err(error) = persist_deployments(&register) {
+                register.files.remove(path);
+                if let Some(previous) = previous {
+                    register.files.insert(path.clone(), previous);
+                }
+                // Leave the exclusively created file in place conservatively;
+                // cleanup cannot claim ownership without a durable record.
+                return Err(error);
+            }
+            Ok(())
+        })();
+        match result {
             Ok(()) => {
                 state.mark_planted(path);
                 if let Ok(mut m) = state.sha.lock() {
@@ -326,7 +566,11 @@ fn fs_watch_loop(
             std::thread::sleep(Duration::from_secs(30));
             continue;
         }
-        let tokens: HashSet<PathBuf> = paths.iter().cloned().collect();
+        let tokens: HashSet<PathBuf> = paths
+            .iter()
+            .filter(|path| owns_path(path))
+            .cloned()
+            .collect();
         let dirs: HashSet<PathBuf> = paths
             .iter()
             .filter_map(|p| p.parent().map(Path::to_path_buf))
@@ -366,7 +610,13 @@ fn fs_watch_loop(
                 Ok(Err(e)) => warn!(error = %e, "honeytoken: watcher reported an error"),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // Pick up a config-delivered change to the token set.
-                    if configured_paths(&config) != paths {
+                    let current = configured_paths(&config);
+                    let current_tokens: HashSet<PathBuf> = current
+                        .iter()
+                        .filter(|path| owns_path(path))
+                        .cloned()
+                        .collect();
+                    if current != paths || current_tokens != tokens {
                         info!("honeytoken paths changed — rebuilding filesystem watch");
                         break;
                     }
@@ -444,6 +694,9 @@ async fn sweep(
     // Read detection: a moved-on last-access timestamp outside our own write
     // suppression window means something opened the bait.
     for path in &paths {
+        if !owns_path(path) {
+            continue;
+        }
         let Some(now_at) = accessed_time(path) else {
             continue;
         };
@@ -463,10 +716,24 @@ async fn sweep(
     // while the agent was down (no watcher event fired).
     if report_health {
         for path in &paths {
+            if !owns_path(path) {
+                continue;
+            }
             let expected = state.sha.lock().ok().and_then(|m| m.get(path).cloned());
             let actual = sha256_of_file(path);
+            // Hashing is an agent content read. Advance the atime baseline
+            // after closing that handle so the next poll does not attribute
+            // this verification read to an unknown accessor.
+            if let Some(atime) = accessed_time(path) {
+                if let Ok(mut baseline) = state.atime.lock() {
+                    baseline.insert(path.clone(), atime);
+                }
+            }
             let (present, modified) = match (&expected, &actual) {
-                (_, None) => (false, false),
+                (_, None) => (
+                    path.symlink_metadata().is_ok(),
+                    path.symlink_metadata().is_ok(),
+                ),
                 (Some(e), Some(a)) => (true, e != a),
                 (None, Some(_)) => (true, false),
             };
@@ -715,10 +982,10 @@ mod registry {
 
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW, RegNotifyChangeKeyValue,
-        RegQueryValueExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_NOTIFY, KEY_QUERY_VALUE,
-        KEY_SET_VALUE, REG_NOTIFY_CHANGE_ATTRIBUTES, REG_NOTIFY_CHANGE_LAST_SET,
-        REG_NOTIFY_CHANGE_NAME, REG_NOTIFY_CHANGE_SECURITY, REG_OPTION_NON_VOLATILE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegNotifyChangeKeyValue, RegQueryValueExW,
+        RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_NOTIFY, KEY_QUERY_VALUE, KEY_SET_VALUE,
+        REG_NOTIFY_CHANGE_ATTRIBUTES, REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_NAME,
+        REG_NOTIFY_CHANGE_SECURITY, REG_OPTION_NON_VOLATILE, REG_SZ,
     };
 
     /// NUL-terminated UTF-16 for the Win32 W-APIs.
@@ -756,8 +1023,22 @@ mod registry {
     fn restore_values(hkey: HKEY) -> usize {
         let mut written = 0;
         for (name, expected) in super::REGISTRY_VALUES {
+            let owned = deployments()
+                .lock()
+                .is_ok_and(|register| register.registry_values.contains(*name));
             match read_value(hkey, name) {
                 Some(current) if current == *expected => {}
+                // Existing values are never adopted, even if their contents
+                // happen to equal our bait. An upgrade cannot prove provenance.
+                Some(_) if !owned => {
+                    debug!(
+                        value = name,
+                        "preserving preexisting registry value without a deployment record"
+                    );
+                }
+                None if !owned && !value_is_missing(hkey, name) => {
+                    warn!(value = name, "registry value exists or cannot be inspected; refusing to overwrite unowned value");
+                }
                 _ => {
                     let wname = wide(name);
                     let data: Vec<u16> = wide(expected);
@@ -773,7 +1054,18 @@ mod registry {
                         )
                     };
                     if rc == ERROR_SUCCESS {
-                        written += 1;
+                        if let Ok(mut register) = deployments().lock() {
+                            let was_owned = register.registry_values.contains(*name);
+                            register.registry_values.insert((*name).to_string());
+                            if let Err(error) = persist_deployments(&register) {
+                                if !was_owned {
+                                    register.registry_values.remove(*name);
+                                }
+                                warn!(%error, value = name, "could not persist registry decoy ownership; cleanup will preserve unregistered value");
+                            } else {
+                                written += 1;
+                            }
+                        }
                     } else {
                         warn!(value = name, rc, "honeytoken: cannot write registry decoy");
                     }
@@ -781,6 +1073,23 @@ mod registry {
             }
         }
         written
+    }
+
+    /// Only an explicit NOT_FOUND establishes absence. The content reader's
+    /// None also covers wrong types, access failures and oversized values.
+    fn value_is_missing(hkey: HKEY, name: &str) -> bool {
+        let wname = wide(name);
+        let mut len = 0u32;
+        (unsafe {
+            RegQueryValueExW(
+                hkey,
+                wname.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut len,
+            )
+        }) == ERROR_FILE_NOT_FOUND
     }
 
     /// Read one REG_SZ decoy value. `None` when missing or unreadable.
@@ -805,15 +1114,26 @@ mod registry {
             }
             return None;
         }
+        if vtype != REG_SZ
+            || len as usize > buf.len()
+            || len < 2
+            || !len.is_multiple_of(2)
+            || buf[len as usize - 2..len as usize] != [0, 0]
+        {
+            return None;
+        }
         // Interpret as UTF-16 (REG_SZ), dropping the trailing NUL.
-        let units: Vec<u16> = buf[..len as usize]
+        let mut units: Vec<u16> = buf[..len as usize]
             .as_chunks::<2>()
             .0
             .iter()
             .map(|c| u16::from_le_bytes(*c))
-            .take_while(|&u| u != 0)
             .collect();
-        Some(String::from_utf16_lossy(&units))
+        units.pop(); // exactly the required final terminator
+        if units.contains(&0) {
+            return None;
+        }
+        String::from_utf16(&units).ok()
     }
 
     /// What the post-notification diff found per decoy value.
@@ -825,6 +1145,12 @@ mod registry {
     fn diff_values(hkey: HKEY) -> Vec<Discrepancy> {
         let mut out = Vec::new();
         for (name, expected) in super::REGISTRY_VALUES {
+            if !deployments()
+                .lock()
+                .is_ok_and(|register| register.registry_values.contains(*name))
+            {
+                continue;
+            }
             match read_value(hkey, name) {
                 None => out.push(Discrepancy::Deleted(name)),
                 Some(v) if v != *expected => out.push(Discrepancy::Modified(name)),
@@ -874,6 +1200,11 @@ mod registry {
         let opened = rc == ERROR_SUCCESS;
         let out = super::REGISTRY_VALUES
             .iter()
+            .filter(|(name, _)| {
+                deployments()
+                    .lock()
+                    .is_ok_and(|register| register.registry_values.contains(*name))
+            })
             .map(|(name, expected)| {
                 let path = format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY);
                 if !opened {
@@ -896,9 +1227,25 @@ mod registry {
     /// `RegNotifyChangeKeyValue` and raise a detection for every change that is
     /// not our own restore. The key and its values are recreated whenever they
     /// go missing (resilient against deletion).
-    pub fn monitor(tx: Sender<AgentEvent>, agent_id: String, hostname: String) {
+    pub fn monitor(
+        tx: Sender<AgentEvent>,
+        agent_id: String,
+        hostname: String,
+        config: Arc<RwLock<AgentConfig>>,
+    ) {
         loop {
-            let hkey = match ensure_key_and_values() {
+            if tx.is_closed() {
+                return;
+            }
+            let guard = config.read().unwrap_or_else(|error| error.into_inner());
+            if !guard.honeytoken_detection_enabled {
+                drop(guard);
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            let ensured = ensure_key_and_values();
+            drop(guard);
+            let hkey = match ensured {
                 Ok(h) => h,
                 Err(rc) => {
                     warn!(
@@ -918,6 +1265,12 @@ mod registry {
             // Register each decoy value with the backend lifecycle mirror, so
             // registry tokens show up in the dashboard before any trigger.
             for (name, _) in super::REGISTRY_VALUES {
+                if !deployments()
+                    .lock()
+                    .is_ok_and(|register| register.registry_values.contains(*name))
+                {
+                    continue;
+                }
                 super::send_prevention(
                     &tx,
                     &agent_id,
@@ -947,6 +1300,12 @@ mod registry {
                         0, // synchronous: block this thread until a change
                     )
                 };
+                // A config change while blocked in RegNotify must suppress the
+                // pending hit and all repairs before re-entering the outer gate.
+                let guard = config.read().unwrap_or_else(|error| error.into_inner());
+                if !guard.honeytoken_detection_enabled {
+                    break;
+                }
                 if rc != ERROR_SUCCESS {
                     warn!(rc, "honeytoken: RegNotifyChangeKeyValue failed — re-arming");
                     break;
@@ -1025,20 +1384,114 @@ mod registry {
 
     /// Remove the decoy registry key (and the now-empty parent, best-effort).
     pub fn cleanup() {
+        use windows_sys::Win32::System::Registry::RegOpenKeyExW;
         let subkey = wide(super::REGISTRY_SUBKEY);
-        let rc = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, subkey.as_ptr()) };
+        let mut hkey: HKEY = std::ptr::null_mut();
+        let rc = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                subkey.as_ptr(),
+                0,
+                KEY_QUERY_VALUE | KEY_SET_VALUE,
+                &mut hkey,
+            )
+        };
         if rc == ERROR_SUCCESS {
-            info!(key = super::REGISTRY_SUBKEY, "registry honeytokens removed");
+            if let Ok(mut register) = deployments().lock() {
+                for (name, expected) in super::REGISTRY_VALUES {
+                    if !register.registry_values.contains(*name) {
+                        continue;
+                    }
+                    match read_value(hkey, name) {
+                        Some(current) if current == *expected => {
+                            let wname = wide(name);
+                            if unsafe { RegDeleteValueW(hkey, wname.as_ptr()) } == ERROR_SUCCESS {
+                                register.registry_values.remove(*name);
+                            }
+                        }
+                        None => {
+                            register.registry_values.remove(*name);
+                        }
+                        Some(_) => warn!(
+                            value = name,
+                            "registry decoy changed; preserving value during cleanup"
+                        ),
+                    }
+                }
+                if let Err(error) = persist_deployments(&register) {
+                    warn!(%error, "could not persist registry cleanup register");
+                }
+            }
+            unsafe { RegCloseKey(hkey) };
+            // Retain the container keys. RegDeleteKeyW deletes keys containing
+            // values, and a query-then-delete cannot protect concurrent writers.
+            // Removing only recorded values preserves every unowned artifact.
         } else if rc != ERROR_FILE_NOT_FOUND {
-            warn!(
-                rc,
-                key = super::REGISTRY_SUBKEY,
-                "could not remove registry honeytokens"
+            warn!(rc, "could not open registry honeytokens for cleanup");
+        }
+    }
+
+    #[cfg(test)]
+    mod parsing_regressions {
+        use super::*;
+        use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER, REG_BINARY};
+
+        #[test]
+        fn existing_wrong_type_oversized_and_unterminated_values_are_preserved() {
+            let key = wide(&format!("SOFTWARE\\TRAPD-Test-{}", uuid::Uuid::new_v4()));
+            let mut hkey: HKEY = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    RegCreateKeyExW(
+                        HKEY_CURRENT_USER,
+                        key.as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        REG_OPTION_NON_VOLATILE,
+                        KEY_QUERY_VALUE | KEY_SET_VALUE,
+                        std::ptr::null(),
+                        &mut hkey,
+                        std::ptr::null_mut(),
+                    )
+                },
+                ERROR_SUCCESS
+            );
+            for (name, kind, bytes) in [
+                ("binary", REG_BINARY, vec![b'x', 0, 0, 0]),
+                ("oversized", REG_SZ, vec![0; 4096]),
+                ("unterminated", REG_SZ, vec![b'x', 0]),
+                ("embedded-nul", REG_SZ, vec![b'x', 0, 0, 0, b'y', 0, 0, 0]),
+            ] {
+                let wname = wide(name);
+                assert_eq!(
+                    unsafe {
+                        RegSetValueExW(
+                            hkey,
+                            wname.as_ptr(),
+                            0,
+                            kind,
+                            bytes.as_ptr(),
+                            bytes.len() as u32,
+                        )
+                    },
+                    ERROR_SUCCESS
+                );
+                assert!(
+                    !value_is_missing(hkey, name),
+                    "{name} must not authorize initialization"
+                );
+                assert!(
+                    read_value(hkey, name).is_none(),
+                    "{name} cannot be accepted as a valid string decoy"
+                );
+            }
+            assert!(value_is_missing(hkey, "missing"));
+            unsafe { RegCloseKey(hkey) };
+            assert_eq!(
+                unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key.as_ptr()) },
+                ERROR_SUCCESS
             );
         }
-        // Only succeeds when SOFTWARE\TRAPD is empty — exactly what we want.
-        let parent = wide(super::REGISTRY_PARENT_SUBKEY);
-        let _ = unsafe { RegDeleteKeyW(HKEY_LOCAL_MACHINE, parent.as_ptr()) };
     }
 }
 
@@ -1048,29 +1501,25 @@ mod registry {
 /// currently-configured set and the built-in defaults, so a config change
 /// between install and uninstall cannot strand a decoy) and the registry key.
 pub fn uninstall(cfg: &AgentConfig) {
-    let mut paths: Vec<PathBuf> = cfg
-        .honeytoken_paths
-        .iter()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .collect();
-    for p in AgentConfig::default().honeytoken_paths {
-        let p = PathBuf::from(p);
-        if !paths.contains(&p) {
-            paths.push(p);
-        }
-    }
-
-    for path in &paths {
-        match std::fs::remove_file(path) {
+    let _ = cfg; // Cleanup follows persisted ownership, including removed config paths.
+    let Ok(mut register) = deployments().lock() else {
+        return;
+    };
+    let files = register.files.clone();
+    for (path, owned) in &files {
+        match remove_owned_file(path, owned) {
             Ok(()) => info!(path = %path.display(), "honeytoken decoy file removed"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                warn!(path = %path.display(), error = %e, "could not remove honeytoken decoy file")
+                warn!(path = %path.display(), error = %e, "could not remove honeytoken decoy file");
+                continue;
             }
         }
+        register.files.remove(path);
     }
-
+    if let Err(error) = persist_deployments(&register) {
+        warn!(%error, "could not persist honeytoken cleanup register");
+    }
+    drop(register);
     registry::cleanup();
 }

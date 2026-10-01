@@ -177,6 +177,7 @@ impl HoneytokenStore {
     }
 
     /// True if a token is already registered at `path`.
+    #[cfg(test)]
     pub fn contains_path(&self, path: &str) -> bool {
         self.inner
             .lock()
