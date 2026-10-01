@@ -1114,16 +1114,23 @@ mod registry {
             }
             return None;
         }
+        if len as usize > buf.len() {
+            return None;
+        }
+        decode_value(vtype, &buf[..len as usize])
+    }
+
+    fn decode_value(vtype: u32, bytes: &[u8]) -> Option<String> {
         if vtype != REG_SZ
-            || len as usize > buf.len()
-            || len < 2
-            || !len.is_multiple_of(2)
-            || buf[len as usize - 2..len as usize] != [0, 0]
+            || bytes.len() > 2048
+            || bytes.len() < 2
+            || !bytes.len().is_multiple_of(2)
+            || !bytes.ends_with(&[0, 0])
         {
             return None;
         }
         // Interpret as UTF-16 (REG_SZ), dropping the trailing NUL.
-        let mut units: Vec<u16> = buf[..len as usize]
+        let mut units: Vec<u16> = bytes
             .as_chunks::<2>()
             .0
             .iter()
@@ -1437,7 +1444,25 @@ mod registry {
         use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER, REG_BINARY};
 
         #[test]
-        fn existing_wrong_type_oversized_and_unterminated_values_are_preserved() {
+        fn raw_malformed_registry_strings_are_rejected() {
+            // Test raw bytes directly: RegSetValueExW requires terminated strings,
+            // so writing an unterminated fixture through it is not reliable.
+            for bytes in [
+                vec![],
+                vec![b'x', 0],
+                vec![b'x', 0, 0],
+                vec![b'x', 0, 0, 0, b'y', 0, 0, 0],
+                vec![0x00, 0xd8, 0, 0],
+                vec![0; 4096],
+            ] {
+                assert!(decode_value(REG_SZ, &bytes).is_none(), "{bytes:?}");
+            }
+            assert!(decode_value(REG_BINARY, &[b'x', 0, 0, 0]).is_none());
+            assert_eq!(decode_value(REG_SZ, &[b'x', 0, 0, 0]), Some("x".into()));
+        }
+
+        #[test]
+        fn existing_wrong_type_oversized_and_embedded_nul_values_are_preserved() {
             let key = wide(&format!("SOFTWARE\\TRAPD-Test-{}", uuid::Uuid::new_v4()));
             let mut hkey: HKEY = std::ptr::null_mut();
             assert_eq!(
@@ -1459,7 +1484,6 @@ mod registry {
             for (name, kind, bytes) in [
                 ("binary", REG_BINARY, vec![b'x', 0, 0, 0]),
                 ("oversized", REG_SZ, vec![0; 4096]),
-                ("unterminated", REG_SZ, vec![b'x', 0]),
                 ("embedded-nul", REG_SZ, vec![b'x', 0, 0, 0, b'y', 0, 0, 0]),
             ] {
                 let wname = wide(name);

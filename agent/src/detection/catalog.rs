@@ -267,7 +267,7 @@ mod tests {
         }
         let committed = std::fs::read_to_string(&path).unwrap_or_default();
         assert_eq!(
-            committed, current,
+            committed.replace("\r\n", "\n"), current,
             "rule-catalog.json is stale; run TRAPD_UPDATE_CATALOG=1 cargo test catalog"
         );
     }

