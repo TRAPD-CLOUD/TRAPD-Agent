@@ -72,6 +72,14 @@ impl TempDir {
     fn journal(&self) -> PathBuf {
         self.0.join("queue.journal")
     }
+
+    fn unwritable_journal(&self) -> PathBuf {
+        // A regular file cannot contain a journal on either platform, even
+        // when tests run as root or Administrator. No host path or ACL needed.
+        let parent = self.0.join("not-a-directory");
+        std::fs::write(&parent, b"blocks journal directory creation").unwrap();
+        parent.join("queue.journal")
+    }
 }
 
 impl Drop for TempDir {
@@ -567,14 +575,18 @@ fn a_record_from_a_newer_agent_is_skipped_not_misread() {
 #[test]
 fn an_unwritable_location_degrades_to_memory_instead_of_failing() {
     // A read-only filesystem or a full disk must not stop collection.
-    let s = Spool::durable_at(PathBuf::from("/proc/trapd-cannot-exist/queue.journal"), 100);
+    let dir = TempDir::new("unwritable");
+    let s = Spool::durable_at(dir.unwritable_journal(), 100);
     assert!(s.is_degraded(), "the loss of durability must be visible");
     assert!(!s.is_durable());
 }
 
 #[test]
 fn a_degraded_spool_still_accepts_and_serves_events() {
-    let mut s = Spool::durable_at(PathBuf::from("/proc/trapd-cannot-exist/queue.journal"), 100);
+    let dir = TempDir::new("degraded");
+    let mut s = Spool::durable_at(dir.unwritable_journal(), 100);
+    assert!(s.is_degraded());
+    assert!(!s.is_durable());
     s.push(dummy_event()).unwrap();
     assert_eq!(
         s.len(),

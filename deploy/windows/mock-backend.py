@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root', type=Path, required=True)
@@ -22,18 +22,34 @@ parser.add_argument('--watch-dir', required=True)
 args = parser.parse_args()
 args.root.mkdir(parents=True, exist_ok=True)
 args.config_dir.mkdir(parents=True, exist_ok=True)
-tls_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'TRAPD MSI test CA')])
 now = datetime.datetime.now(datetime.timezone.utc)
-cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+ca_cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+        .public_key(ca_key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(x509.KeyUsage(digital_signature=False, content_commitment=False,
+            key_encipherment=False, data_encipherment=False, key_agreement=False,
+            key_cert_sign=True, crl_sign=True, encipher_only=False, decipher_only=False), critical=True)
+        .sign(ca_key, hashes.SHA256()))
+(args.config_dir / 'ca.crt').write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+# rustls rejects a CA certificate presented as an end-entity certificate.
+# Serve a distinct localhost certificate signed by the pinned test CA.
+tls_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+server_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'localhost')])
+cert = (x509.CertificateBuilder().subject_name(server_name).issuer_name(name)
         .public_key(tls_key.public_key()).serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(days=1))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
+            key_encipherment=True, data_encipherment=False, key_agreement=False,
+            key_cert_sign=False, crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
         .add_extension(x509.SubjectAlternativeName([x509.DNSName('localhost'), x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]), critical=False)
-        .sign(tls_key, hashes.SHA256()))
+        .sign(ca_key, hashes.SHA256()))
 cert_file = args.root / 'server.crt'
 cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-(args.config_dir / 'ca.crt').write_bytes(cert_file.read_bytes())
 key_file = args.root / 'server.key'
 key_file.write_bytes(tls_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
 signing_key = ed25519.Ed25519PrivateKey.generate()
