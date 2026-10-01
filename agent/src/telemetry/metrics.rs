@@ -34,6 +34,8 @@ pub enum CollectorMode {
     ProcPolling,
     /// Both are running (eBPF for exec, polling for create/terminate).
     Hybrid,
+    /// Windows process table polling (short-lived processes may be missed).
+    WindowsPolling,
     /// Every process collector failed to start.
     Failed,
 }
@@ -45,6 +47,7 @@ impl CollectorMode {
             CollectorMode::Ebpf => "ebpf",
             CollectorMode::ProcPolling => "proc_polling",
             CollectorMode::Hybrid => "hybrid",
+            CollectorMode::WindowsPolling => "windows_polling",
             CollectorMode::Failed => "failed",
         }
     }
@@ -55,6 +58,7 @@ impl CollectorMode {
             2 => CollectorMode::ProcPolling,
             3 => CollectorMode::Hybrid,
             4 => CollectorMode::Failed,
+            5 => CollectorMode::WindowsPolling,
             _ => CollectorMode::Unknown,
         }
     }
@@ -66,6 +70,7 @@ impl CollectorMode {
             CollectorMode::ProcPolling => 2,
             CollectorMode::Hybrid => 3,
             CollectorMode::Failed => 4,
+            CollectorMode::WindowsPolling => 5,
         }
     }
 }

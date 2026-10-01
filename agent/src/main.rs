@@ -17,7 +17,6 @@ use uuid::Uuid;
 mod collectors;
 mod config;
 mod deception;
-#[cfg(target_os = "linux")]
 mod detection;
 mod enrollment;
 #[cfg(target_os = "linux")]
@@ -372,6 +371,7 @@ async fn main() -> Result<()> {
             .map(|c| (c.sigma_rules.clone(), c.anomaly_detection_enabled))
             .unwrap_or_default();
         engine.reload_sigma(&docs);
+        engine.set_sigma_enabled(agent_config.read().map(|c| c.sigma_enabled).unwrap_or(true));
         engine.set_anomaly_enabled(anomaly);
     }
     info!(
@@ -487,6 +487,7 @@ async fn main() -> Result<()> {
         )?
         .with_apply_hook(std::sync::Arc::new(move |cfg: &AgentConfig| {
             sigma_engine.reload_sigma(&cfg.sigma_rules);
+            sigma_engine.set_sigma_enabled(cfg.sigma_enabled);
             sigma_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
         }));
         tokio::spawn(async move { config_puller.run().await });

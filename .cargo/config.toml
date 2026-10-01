@@ -3,3 +3,7 @@
 # release workflow can invoke `cargo xtask build-ebpf --release` without
 # spelling out `cargo run --package xtask -- build-ebpf --release`.
 xtask = "run --package xtask --"
+
+# The MSI needs no separate Visual C++ runtime installation.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,0 +1,51 @@
+name: Windows MSI
+on:
+  workflow_call:
+
+jobs:
+  package:
+    runs-on: windows-latest
+    env:
+      DOTNET_ROLL_FORWARD: Major
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build native Windows agent with static CRT
+        run: cargo build --release --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml
+      - name: Check native Windows code
+        run: cargo clippy --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml -- -D warnings
+      - name: Windows unit tests
+        run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml --bin trapd-agent
+      - name: Install pinned packaging and acceptance dependencies
+        run: |
+          dotnet tool install --global wix --version 4.0.6
+          wix extension add -g WixToolset.Util.wixext/4.0.6
+          python -m pip install cryptography==44.0.3
+      - name: Build MSI
+        run: ./deploy/windows/build-msi.ps1 -AgentExe target/x86_64-pc-windows-msvc/release/trapd-agent.exe
+      - name: Install MSI and verify telemetry and lifecycle
+        run: ./deploy/windows/test-msi.ps1 -Msi dist/trapd-agent-windows-x86_64.msi -AgentExe target/x86_64-pc-windows-msvc/release/trapd-agent.exe
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi-test-results
+          path: msi-test-results/
+      - name: Stage release assets
+        run: |
+          Copy-Item target/x86_64-pc-windows-msvc/release/trapd-agent.exe dist/trapd-agent-windows-x86_64.exe
+          Copy-Item deploy/install.ps1 dist/trapd-agent-windows-install.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trapd-windows-release
+          path: |
+            dist/trapd-agent-windows-x86_64.exe
+            dist/trapd-agent-windows-x86_64.msi
+            dist/trapd-agent-windows-install.ps1

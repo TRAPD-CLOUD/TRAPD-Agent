@@ -429,7 +429,7 @@ fn load_cve_feed() -> CveFeed {
 pub fn assess(
     packages: &[SoftwarePackage],
     source: &str,
-    _os: &OsInfo,
+    os: &OsInfo,
     flags: ComplianceFlags,
     config_cve: &[CveEntry],
 ) -> ComplianceReport {
@@ -443,7 +443,13 @@ pub fn assess(
         Vec::new()
     };
 
-    let cis_findings = if flags.cis { cis_checks() } else { Vec::new() };
+    // These checks inspect Linux sysctls, SSH configuration and unix modes.
+    // An empty Windows result means unassessed, never a claimed passing CIS audit.
+    let cis_findings = if flags.cis && os.family == "linux" {
+        cis_checks()
+    } else {
+        Vec::new()
+    };
     let cis_fail_count = cis_findings.iter().filter(|f| f.status == "fail").count();
 
     ComplianceReport {

@@ -8,7 +8,7 @@
 //! event.
 //!
 //! Why in userspace, not eBPF: this analytics layer is **platform-neutral** by
-//! design.  The Linux collectors and the future Windows collectors emit the
+//! design.  The Linux and Windows collectors emit the
 //! same [`crate::schema`] events, so this engine — IOC matching, ATT&CK-mapped
 //! behavioural heuristics, C2 beaconing — works unchanged on both. eBPF only
 //! changes *how* the raw telemetry is gathered, not how it is judged.
@@ -59,6 +59,7 @@ pub struct DetectionEngine {
     ioa: Mutex<ioa::IoaEngine>,
     /// Compiled Sigma ruleset (disk baseline + backend-pushed), hot-swappable.
     sigma: RwLock<sigma::SigmaEngine>,
+    sigma_enabled: std::sync::atomic::AtomicBool,
     /// Statistical behavioural baseline (process-lineage novelty + exec-rate).
     baseline: Mutex<baseline::BaselineEngine>,
     /// Runtime switch for the anomaly baseline (config `anomaly_detection_enabled`).
@@ -88,6 +89,7 @@ impl DetectionEngine {
             dns_tunnel: Mutex::new(dns_tunnel::DnsTunnelTracker::new()),
             ioa: Mutex::new(ioa::IoaEngine::new()),
             sigma: RwLock::new(Self::load_sigma_from_disk()),
+            sigma_enabled: std::sync::atomic::AtomicBool::new(true),
             baseline: Mutex::new(baseline::BaselineEngine::new()),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             started: Instant::now(),
@@ -97,6 +99,11 @@ impl DetectionEngine {
     /// Toggle the statistical anomaly baseline at runtime (config-driven).
     pub fn set_anomaly_enabled(&self, on: bool) {
         self.anomaly_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_sigma_enabled(&self, on: bool) {
+        self.sigma_enabled
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -193,6 +200,19 @@ impl DetectionEngine {
                     p.exe_sha256.as_deref(),
                     &mut out,
                 );
+                #[cfg(windows)]
+                if self
+                    .anomaly_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Ok(mut baseline) = self.baseline.lock() {
+                        if let Some(d) = baseline.observe_exec(&p.username, &p.exe, Instant::now())
+                        {
+                            let sev = severity_for(d.confidence);
+                            out.push(self.detection(sev, d));
+                        }
+                    }
+                }
             }
             EventData::ProcessExec(p) => {
                 self.inspect_process(
@@ -272,7 +292,11 @@ impl DetectionEngine {
         // Sigma: evaluate the compiled ruleset against this event's field
         // projection. Skipped cheaply when no rules are loaded or the event type
         // carries no Sigma mapping.
-        if self.sigma.read().map(|s| !s.is_empty()).unwrap_or(false) {
+        if self
+            .sigma_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.sigma.read().map(|s| !s.is_empty()).unwrap_or(false)
+        {
             if let Some(view) = sigma::fields::FieldView::from_event(event) {
                 if let Ok(engine) = self.sigma.read() {
                     for rule in engine.evaluate(&view) {
@@ -682,6 +706,7 @@ mod tests {
             dns_tunnel: Mutex::new(dns_tunnel::DnsTunnelTracker::new()),
             ioa: Mutex::new(ioa::IoaEngine::new()),
             sigma: RwLock::new(sigma::SigmaEngine::empty()),
+            sigma_enabled: std::sync::atomic::AtomicBool::new(true),
             baseline: Mutex::new(baseline::BaselineEngine::new()),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             started: Instant::now(),
@@ -805,6 +830,27 @@ mod tests {
         let e = engine();
         assert!(e.inspect(&net_event("93.184.216.34", 443)).is_empty());
         assert!(e.inspect(&proc_event("ls", "/bin/ls", "ls -la")).is_empty());
+    }
+
+    #[test]
+    fn config_can_disable_and_reenable_sigma_without_dropping_rules() {
+        let e = engine();
+        e.reload_sigma(&[format!(
+            "title: Config switch test\nlogsource:\n  product: {}\n  category: process_creation\ndetection:\n  selection:\n    CommandLine|contains: TRAPD_SIGMA_SWITCH\n  condition: selection\nlevel: high\n",
+            std::env::consts::OS
+        )]);
+        let event = proc_event("test", "test.exe", "TRAPD_SIGMA_SWITCH");
+        let sigma_hits = |events: Vec<AgentEvent>| {
+            events
+                .iter()
+                .filter(|ev| matches!(&ev.data, EventData::Detection(d) if d.category == "sigma"))
+                .count()
+        };
+        assert_eq!(sigma_hits(e.inspect(&event)), 1);
+        e.set_sigma_enabled(false);
+        assert_eq!(sigma_hits(e.inspect(&event)), 0);
+        e.set_sigma_enabled(true);
+        assert_eq!(sigma_hits(e.inspect(&event)), 1);
     }
 
     #[test]

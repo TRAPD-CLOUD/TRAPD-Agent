@@ -60,7 +60,6 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-#[cfg(target_os = "linux")]
 pub use profiler::build_profile_with_host;
 pub use profiler::ReconProfile;
 pub use registry::{BreadcrumbRecord, HoneytokenRecord, HoneytokenStore, OutOfBandCanary};

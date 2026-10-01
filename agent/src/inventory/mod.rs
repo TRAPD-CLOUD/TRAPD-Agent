@@ -15,34 +15,29 @@
 //! written to `<state>/inventory.json` so it can still be inspected locally.
 //!
 //! Cross-platform: the [`InventorySnapshot`] data model is OS-neutral by design
-//! (the future Windows agent fills the same fields from WMI / the registry);
-//! only the gathering helpers in this module are Linux-specific.
+//! with Linux and Windows gathering helpers behind platform gates.
 
 // The data model below is OS-neutral; only the gathering code is per-OS.
 #[cfg(target_os = "linux")]
 mod collect;
+#[cfg(windows)]
+#[path = "windows.rs"]
+mod collect;
 pub mod compliance;
 
-#[cfg(target_os = "linux")]
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
 use std::sync::RwLock;
 
 use serde::Serialize;
-#[cfg(target_os = "linux")]
-use tokio::time::{interval, Duration};
-#[cfg(target_os = "linux")]
+use tokio::time::Duration;
 use tracing::{info, warn};
 
-#[cfg(target_os = "linux")]
 use crate::config::AgentConfig;
 
 /// How often a full inventory snapshot is (re)sent.
-#[cfg(target_os = "linux")]
 const INVENTORY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60); // 6h
 /// Small delay after startup before the first snapshot, so the agent has
 /// finished initialising and the system has settled.
-#[cfg(target_os = "linux")]
 const STARTUP_DELAY: Duration = Duration::from_secs(15);
 
 // ── Data model (OS-neutral) ─────────────────────────────────────────────────
@@ -213,7 +208,6 @@ pub struct UserAccount {
 
 // ── Reporter ────────────────────────────────────────────────────────────────
 
-#[cfg(target_os = "linux")]
 pub struct InventoryReporter {
     client: reqwest::Client,
     url: String,
@@ -226,7 +220,6 @@ pub struct InventoryReporter {
     config: Arc<RwLock<AgentConfig>>,
 }
 
-#[cfg(target_os = "linux")]
 impl InventoryReporter {
     pub fn new(
         backend_url: &str,
@@ -260,10 +253,13 @@ impl InventoryReporter {
     }
 
     pub async fn run(self) {
-        let mut ticker = interval(INVENTORY_INTERVAL);
-
         tokio::time::sleep(STARTUP_DELAY).await;
         self.collect_and_report().await;
+
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + INVENTORY_INTERVAL,
+            INVENTORY_INTERVAL,
+        );
 
         loop {
             ticker.tick().await;

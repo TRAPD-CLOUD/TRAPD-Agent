@@ -2,6 +2,9 @@ name: CI
 on: [push, pull_request]
 
 jobs:
+  windows-msi:
+    uses: ./.github/workflows/windows-package.yml
+
   build:
     runs-on: ubuntu-latest
     steps:

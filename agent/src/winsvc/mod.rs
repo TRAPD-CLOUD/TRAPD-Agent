@@ -42,6 +42,21 @@ pub fn entry() -> Result<()> {
         }
         Some("install") => install(),
         Some("uninstall") => uninstall(),
+        Some("cleanup") => {
+            crate::collectors::windows::honeytokens::uninstall(&crate::config::load_persisted());
+            Ok(())
+        }
+        Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("telemetry") => {
+            print!("{}", crate::telemetry::diagnostics::run());
+            Ok(())
+        }
+        Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("config") => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::config::load_persisted())?
+            );
+            Ok(())
+        }
         Some("run") | Some("--console") => run_console(),
         None => match service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
             Ok(()) => Ok(()),
@@ -102,6 +117,15 @@ fn run_service() -> Result<()> {
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
         .context("register service control handler")?;
+
+    // Startup failures are reported as SERVICE_STOPPED with a nonzero exit
+    // code. Include those failures in the MSI-provisioned recovery policy.
+    if let Err(e) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .and_then(|manager| manager.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG))
+        .and_then(|service| service.set_failure_actions_on_non_crash_failures(true))
+    {
+        tracing::warn!(error = %e, "could not enable service recovery for startup failures");
+    }
 
     let set_state = |state: ServiceState, exit: ServiceExitCode| {
         status_handle.set_service_status(ServiceStatus {
@@ -164,7 +188,10 @@ fn install() -> Result<()> {
         .context("set service description")?;
 
     match service.start::<&std::ffi::OsStr>(&[]) {
-        Ok(()) => println!("Service '{SERVICE_NAME}' installed and started ({})", exe.display()),
+        Ok(()) => println!(
+            "Service '{SERVICE_NAME}' installed and started ({})",
+            exe.display()
+        ),
         Err(e) => println!(
             "Service '{SERVICE_NAME}' installed ({}) but did not start: {e}\n\
              Start it manually with: sc.exe start {SERVICE_NAME}",
@@ -175,9 +202,8 @@ fn install() -> Result<()> {
 }
 
 fn uninstall() -> Result<()> {
-    let manager =
-        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .context("connect to the service manager (run from an elevated prompt)")?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("connect to the service manager (run from an elevated prompt)")?;
 
     let service = manager
         .open_service(
@@ -221,7 +247,9 @@ fn uninstall() -> Result<()> {
             .spawn()
         {
             Ok(_) => println!("Binary removal scheduled: {exe_str}"),
-            Err(e) => println!("Could not schedule binary removal ({e}); delete {exe_str} manually"),
+            Err(e) => {
+                println!("Could not schedule binary removal ({e}); delete {exe_str} manually")
+            }
         }
     }
     Ok(())
