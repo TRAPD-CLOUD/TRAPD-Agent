@@ -215,6 +215,15 @@ fn remove_owned_file(path: &Path, owned: &OwnedFile) -> std::io::Result<()> {
 mod ownership_regressions {
     use super::*;
 
+    /// The ownership register is process-global, and `reconcile_removed`
+    /// retires every owned decoy that is not listed: tests that plant and
+    /// reconcile must not interleave.
+    static REGISTER_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serialize() -> std::sync::MutexGuard<'static, ()> {
+        REGISTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn sample() -> (PathBuf, OwnedFile) {
         let path = std::env::temp_dir().join(format!("trapd-win-owned-{}", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"bait").unwrap();
@@ -264,6 +273,101 @@ mod ownership_regressions {
         assert_eq!(std::fs::read(&path).unwrap(), b"real credentials");
         std::fs::remove_file(path).unwrap();
     }
+    fn revoked_events(rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EventData::Prevention(p) = event.data {
+                if matches!(event.action, EventAction::HoneytokenRevoked) {
+                    out.push((p.target, p.success));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn decoy_removed_from_config_is_retired_and_reported() {
+        let _serial = serialize();
+        let path = std::env::temp_dir().join(format!("trapd-win-retire-{}", uuid::Uuid::new_v4()));
+        let state = FsState::default();
+        assert_eq!(plant_missing(std::slice::from_ref(&path), &state).len(), 1);
+        let config = Arc::new(RwLock::new(AgentConfig::default()));
+        assert!(config.read().unwrap().honeytoken_paths.is_empty());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        reconcile_removed(&tx, "agent", "host", &config, &state);
+        assert!(!path.exists());
+        assert!(!owns_path(&path));
+        assert_eq!(
+            revoked_events(&mut rx),
+            vec![(path.display().to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn listed_decoy_is_not_retired() {
+        let _serial = serialize();
+        let path = std::env::temp_dir().join(format!("trapd-win-keep-{}", uuid::Uuid::new_v4()));
+        let state = FsState::default();
+        plant_missing(std::slice::from_ref(&path), &state);
+        let config = Arc::new(RwLock::new(AgentConfig::default()));
+        config.write().unwrap().honeytoken_paths = vec![path.display().to_string()];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        reconcile_removed(&tx, "agent", "host", &config, &state);
+        assert!(path.exists());
+        assert!(revoked_events(&mut rx).is_empty());
+        config.write().unwrap().honeytoken_paths.clear();
+        reconcile_removed(&tx, "agent", "host", &config, &state);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn modified_decoy_is_preserved_when_retired() {
+        let _serial = serialize();
+        let path = std::env::temp_dir().join(format!("trapd-win-edited-{}", uuid::Uuid::new_v4()));
+        let state = FsState::default();
+        plant_missing(std::slice::from_ref(&path), &state);
+        std::fs::write(&path, b"real user data").unwrap();
+        let config = Arc::new(RwLock::new(AgentConfig::default()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        reconcile_removed(&tx, "agent", "host", &config, &state);
+        assert_eq!(std::fs::read(&path).unwrap(), b"real user data");
+        assert!(!owns_path(&path));
+        assert_eq!(
+            revoked_events(&mut rx),
+            vec![(path.display().to_string(), false)]
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unplantable_path_is_reported_once() {
+        let path = std::env::temp_dir().join(format!("trapd-win-exists-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"real credentials").unwrap();
+        let state = FsState::default();
+        plant_missing(std::slice::from_ref(&path), &state);
+        plant_missing(std::slice::from_ref(&path), &state);
+        let failures = state.take_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, path);
+        assert!(state.take_failures().is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn registry_entries_are_not_treated_as_files() {
+        let mut cfg = AgentConfig::default();
+        assert!(!registry_decoys_requested(&cfg));
+        cfg.honeytoken_paths = vec![
+            "C:\\Data\\notes.txt".into(),
+            "HKLM\\SOFTWARE\\TRAPD\\Honeytokens".into(),
+        ];
+        assert!(registry_decoys_requested(&cfg));
+        let config = Arc::new(RwLock::new(cfg));
+        assert_eq!(
+            desired_file_paths(&config),
+            vec![PathBuf::from("C:\\Data\\notes.txt")]
+        );
+    }
 }
 
 // ── Shared filesystem-token state ─────────────────────────────────────────────
@@ -281,6 +385,11 @@ struct FsState {
     /// Warn once about preexisting/unregistered files. Upgrade migration never
     /// adopts them: their provenance cannot be recovered safely from content.
     ignored: Mutex<HashSet<PathBuf>>,
+    /// Plant failures not yet reported to the backend, with the reason.
+    failed: Mutex<Vec<(PathBuf, String)>>,
+    /// Paths whose failure was already reported (one event per failure, not
+    /// one per sweep). Cleared when the path is planted or leaves the config.
+    reported: Mutex<HashSet<PathBuf>>,
 }
 
 impl FsState {
@@ -294,6 +403,26 @@ impl FsState {
                 m.insert(path.to_path_buf(), at);
             }
         }
+    }
+
+    /// Queue a plant failure for the backend, once per path.
+    fn fail(&self, path: &Path, reason: impl Into<String>) {
+        let first = self
+            .reported
+            .lock()
+            .is_ok_and(|mut reported| reported.insert(path.to_path_buf()));
+        if first {
+            if let Ok(mut failed) = self.failed.lock() {
+                failed.push((path.to_path_buf(), reason.into()));
+            }
+        }
+    }
+
+    fn take_failures(&self) -> Vec<(PathBuf, String)> {
+        self.failed
+            .lock()
+            .map(|mut failed| std::mem::take(&mut *failed))
+            .unwrap_or_default()
     }
 
     fn recently_planted(&self, path: &Path) -> bool {
@@ -345,9 +474,12 @@ impl Collector for HoneytokenCollector {
     ) -> Result<()> {
         let state = Arc::new(FsState::default());
 
-        // Initial plant so the bait exists before any watcher is armed.
+        // Retire decoys that left the config while the agent was down, then
+        // plant so the bait exists before any watcher is armed.
+        reconcile_removed(&tx, &agent_id, &hostname, &self.config, &state);
         let initial = configured_paths(&self.config);
         let planted = plant_missing(&initial, &state);
+        report_plant_failures(&tx, &agent_id, &hostname, &state);
         info!(
             configured = initial.len(),
             created = planted.len(),
@@ -407,23 +539,49 @@ impl Collector for HoneytokenCollector {
     }
 }
 
-/// The effective decoy-file set: the config-delivered `honeytoken_paths`,
-/// trimmed and deduplicated. Empty when honeytoken detection is disabled.
-fn configured_paths(config: &Arc<RwLock<AgentConfig>>) -> Vec<PathBuf> {
+/// A `honeytoken_paths` entry that names a registry location rather than a
+/// file. Registry decoys are opt-in: they are planted only while the config
+/// lists an entry under [`REGISTRY_SUBKEY`] (`HKLM\SOFTWARE\TRAPD\Honeytokens`).
+fn is_registry_entry(entry: &str) -> bool {
+    entry.trim().to_ascii_lowercase().starts_with("hklm\\")
+}
+
+/// Whether the config asks for the registry decoys.
+fn registry_decoys_requested(cfg: &AgentConfig) -> bool {
+    cfg.honeytoken_paths
+        .iter()
+        .any(|entry| is_registry_entry(entry))
+}
+
+/// Every decoy *file* the operator listed, trimmed and deduplicated, whether or
+/// not detection is currently enabled. This is the ownership boundary: a decoy
+/// the agent planted that is no longer listed here is retired.
+fn desired_file_paths(config: &Arc<RwLock<AgentConfig>>) -> Vec<PathBuf> {
     let Ok(cfg) = config.read() else {
         return Vec::new();
     };
-    if !cfg.honeytoken_detection_enabled {
-        return Vec::new();
-    }
     let mut seen = HashSet::new();
     cfg.honeytoken_paths
         .iter()
         .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
+        .filter(|p| !p.is_empty() && !is_registry_entry(p))
         .map(PathBuf::from)
         .filter(|p| seen.insert(p.clone()))
         .collect()
+}
+
+/// The effective decoy-file set: the config-delivered `honeytoken_paths`.
+/// Empty when honeytoken detection is disabled.
+fn configured_paths(config: &Arc<RwLock<AgentConfig>>) -> Vec<PathBuf> {
+    let enabled = config
+        .read()
+        .map(|cfg| cfg.honeytoken_detection_enabled)
+        .unwrap_or(false);
+    if enabled {
+        desired_file_paths(config)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Create every missing decoy file (with believable bait content). Returns the
@@ -447,6 +605,10 @@ fn plant_missing(paths: &[PathBuf], state: &FsState) -> Vec<PathBuf> {
                 {
                     warn!(path = %path.display(), "honeytoken path already exists without a deployment record; preserving file and excluding it from decoy cleanup (including legacy installations)");
                 }
+                state.fail(
+                    path,
+                    "a file already exists at this path and is not managed by TRAPD",
+                );
                 continue;
             };
             if let Ok(mut m) = state.atime.lock() {
@@ -464,6 +626,7 @@ fn plant_missing(paths: &[PathBuf], state: &FsState) -> Vec<PathBuf> {
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 warn!(path = %path.display(), error = %e, "honeytoken: cannot create parent dir");
+                state.fail(path, format!("cannot create parent directory: {e}"));
                 continue;
             }
         }
@@ -504,11 +667,15 @@ fn plant_missing(paths: &[PathBuf], state: &FsState) -> Vec<PathBuf> {
                 if let Ok(mut m) = state.sha.lock() {
                     m.insert(path.clone(), sha256_hex(&bait));
                 }
+                if let Ok(mut reported) = state.reported.lock() {
+                    reported.remove(path);
+                }
                 info!(path = %path.display(), "honeytoken decoy file planted");
                 created.push(path.clone());
             }
             Err(e) => {
-                warn!(path = %path.display(), error = %e, "honeytoken: cannot plant decoy file")
+                warn!(path = %path.display(), error = %e, "honeytoken: cannot plant decoy file");
+                state.fail(path, format!("cannot plant decoy file: {e}"));
             }
         }
     }
@@ -675,12 +842,14 @@ async fn sweep(
     state: &Arc<FsState>,
     report_health: bool,
 ) {
+    reconcile_removed(tx, agent_id, hostname, config, state);
     let paths = configured_paths(config);
 
     // Replant anything missing (deletion itself was already raised by the
     // watcher; the sweep restores the bait so it keeps working) and re-register
     // the restored token with the backend (status back to `active`).
     let recreated = plant_missing(&paths, state);
+    report_plant_failures(tx, agent_id, hostname, state);
     if !recreated.is_empty() {
         info!(
             recreated = recreated.len(),
@@ -744,6 +913,120 @@ async fn sweep(
         for (path, present, modified) in registry::health() {
             emit_registry_health(tx, agent_id, hostname, &path, present, modified);
         }
+    }
+}
+
+/// Retire decoys the operator no longer lists: remove each owned file that has
+/// left `honeytoken_paths` and tell the backend (`prevention.honeytoken_revoked`).
+///
+/// A file is deleted only while its identity and content still match what the
+/// agent planted. If someone edited it, it is preserved, ownership is dropped
+/// and the backend is told the revoke did not remove it. A transient failure
+/// (e.g. a sharing violation) keeps ownership and is retried on the next sweep.
+fn reconcile_removed(
+    tx: &Sender<AgentEvent>,
+    agent_id: &str,
+    hostname: &str,
+    config: &Arc<RwLock<AgentConfig>>,
+    state: &FsState,
+) {
+    let desired: HashSet<PathBuf> = desired_file_paths(config).into_iter().collect();
+    if let Ok(mut reported) = state.reported.lock() {
+        reported.retain(|path| desired.contains(path));
+    }
+    let stale: Vec<(PathBuf, OwnedFile)> = match deployments().lock() {
+        Ok(register) => register
+            .files
+            .iter()
+            .filter(|(path, _)| !desired.contains(*path))
+            .map(|(path, owned)| (path.clone(), owned.clone()))
+            .collect(),
+        Err(_) => return,
+    };
+    for (path, owned) in stale {
+        let preserved = match remove_owned_file(&path, &owned) {
+            Ok(()) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                warn!(path = %path.display(), error = %e, "honeytoken decoy changed; preserving file");
+                true
+            }
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "honeytoken decoy removal failed; will retry");
+                continue;
+            }
+        };
+        let persisted = match deployments().lock() {
+            Ok(mut register) => {
+                register.files.remove(&path);
+                match persist_deployments(&register) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(%error, "could not persist honeytoken retirement; will retry");
+                        register.files.insert(path.clone(), owned.clone());
+                        false
+                    }
+                }
+            }
+            Err(_) => false,
+        };
+        if !persisted {
+            continue;
+        }
+        if let Ok(mut m) = state.sha.lock() {
+            m.remove(&path);
+        }
+        if let Ok(mut m) = state.atime.lock() {
+            m.remove(&path);
+        }
+        if let Ok(mut m) = state.planted.lock() {
+            m.remove(&path);
+        }
+        info!(path = %path.display(), preserved, "honeytoken decoy retired");
+        send_prevention(
+            tx,
+            agent_id,
+            hostname,
+            EventAction::HoneytokenRevoked,
+            if preserved {
+                Severity::Medium
+            } else {
+                Severity::Info
+            },
+            "honeytoken_revoke",
+            path.display().to_string(),
+            !preserved,
+            if preserved {
+                "decoy file was modified; preserved and no longer monitored".to_string()
+            } else {
+                "windows decoy file removed".to_string()
+            },
+            serde_json::json!({ "kind": "windows_decoy_file", "preserved": preserved }),
+        );
+    }
+}
+
+/// Report plant failures (once each) so the backend moves the token to `failed`
+/// instead of leaving it in `deploying`.
+fn report_plant_failures(
+    tx: &Sender<AgentEvent>,
+    agent_id: &str,
+    hostname: &str,
+    state: &FsState,
+) {
+    for (path, reason) in state.take_failures() {
+        send_prevention(
+            tx,
+            agent_id,
+            hostname,
+            EventAction::HoneytokenDeployed,
+            Severity::Medium,
+            "honeytoken_deploy",
+            path.display().to_string(),
+            false,
+            reason,
+            serde_json::json!({ "kind": "windows_decoy_file" }),
+        );
     }
 }
 
@@ -1245,8 +1528,27 @@ mod registry {
                 return;
             }
             let guard = config.read().unwrap_or_else(|error| error.into_inner());
-            if !guard.honeytoken_detection_enabled {
+            if !guard.honeytoken_detection_enabled || !super::registry_decoys_requested(&guard) {
+                // Registry decoys are opt-in: retire any planted earlier
+                // (config no longer lists them) and stay idle.
+                let retire = !super::registry_decoys_requested(&guard);
                 drop(guard);
+                if retire {
+                    for path in cleanup() {
+                        super::send_prevention(
+                            &tx,
+                            &agent_id,
+                            &hostname,
+                            EventAction::HoneytokenRevoked,
+                            Severity::Info,
+                            "honeytoken_revoke",
+                            path,
+                            true,
+                            "windows registry decoy removed".to_string(),
+                            serde_json::json!({ "kind": "windows_registry_key" }),
+                        );
+                    }
+                }
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
@@ -1310,7 +1612,8 @@ mod registry {
                 // A config change while blocked in RegNotify must suppress the
                 // pending hit and all repairs before re-entering the outer gate.
                 let guard = config.read().unwrap_or_else(|error| error.into_inner());
-                if !guard.honeytoken_detection_enabled {
+                if !guard.honeytoken_detection_enabled || !super::registry_decoys_requested(&guard)
+                {
                     break;
                 }
                 if rc != ERROR_SUCCESS {
@@ -1389,8 +1692,17 @@ mod registry {
         warn!(path, kind, "HONEYTOKEN TRIGGERED (registry)");
     }
 
-    /// Remove the decoy registry key (and the now-empty parent, best-effort).
-    pub fn cleanup() {
+    /// Remove the registry decoy values this agent planted (and only those, and
+    /// only while unchanged). Returns the paths no longer present. Idle (no
+    /// registry access) when nothing is registered.
+    pub fn cleanup() -> Vec<String> {
+        let mut removed = Vec::new();
+        if deployments()
+            .lock()
+            .is_ok_and(|register| register.registry_values.is_empty())
+        {
+            return removed;
+        }
         use windows_sys::Win32::System::Registry::RegOpenKeyExW;
         let subkey = wide(super::REGISTRY_SUBKEY);
         let mut hkey: HKEY = std::ptr::null_mut();
@@ -1414,10 +1726,12 @@ mod registry {
                             let wname = wide(name);
                             if unsafe { RegDeleteValueW(hkey, wname.as_ptr()) } == ERROR_SUCCESS {
                                 register.registry_values.remove(*name);
+                                removed.push(format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY));
                             }
                         }
                         None => {
                             register.registry_values.remove(*name);
+                            removed.push(format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY));
                         }
                         Some(_) => warn!(
                             value = name,
@@ -1436,6 +1750,7 @@ mod registry {
         } else if rc != ERROR_FILE_NOT_FOUND {
             warn!(rc, "could not open registry honeytokens for cleanup");
         }
+        removed
     }
 
     #[cfg(test)]

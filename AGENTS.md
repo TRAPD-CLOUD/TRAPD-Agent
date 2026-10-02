@@ -1282,7 +1282,7 @@ older than the last applied config.
   "honeytoken_response": "string, default \"alert\" (none|alert|freeze|kill|isolate)",
   "honeytoken_accessor_allowlist": ["string (extra benign accessor comms)"],
   "honeytoken_deception_escalation": "bool, default false",
-  "honeytoken_paths": ["string — Windows decoy files, default C:\\Users\\Public\\passwords.txt, C:\\Users\\Public\\credentials.xlsx, C:\\ProgramData\\backup_keys.txt"],
+  "honeytoken_paths": ["string — Windows decoy files chosen by the operator; empty by default (no decoys are planted unless listed)"],
   "logs_enabled": "bool, default true (omitted when true — signed-config compatible)",
   "logs_include_builtins": "bool, default false (when logs is non-empty, also arm the built-in catalogue)",
   "logs": ["LogSourceConfig — empty means auto-discover the built-in Linux security catalogue"]
@@ -1297,13 +1297,21 @@ the accessor) < `isolate` (also full host network isolation).
 (mlocate/updatedb, AV scanners, backup tools, and the agent itself) used to
 suppress false positives. `honeytoken_deception_escalation` (default `false`)
 opts in to emitting a `deception_escalation` signal on each confirmed hit.
-`honeytoken_paths` drives the **Windows** filesystem decoys (planted on
-startup, replanted when deleted, watched for read/modify/rename/delete); Linux
-agents ignore it — their tokens arrive over the signed command channel. The
-Windows agent also plants registry decoys (`DatabasePassword`,
-`AdminCredentials`, `BackupKey`) under `HKLM\SOFTWARE\TRAPD\Honeytokens`
-and watches them with `RegNotifyChangeKeyValue`; both kinds report the same
-`HoneytokenAccess` detection event as Linux.
+`honeytoken_paths` drives the **Windows** filesystem decoys and is **empty by
+default**: the operator chooses every path (location and file name). Each
+listed file is planted (never over an existing file), replanted when deleted
+and watched for read/modify/rename/delete; Linux agents ignore it — their
+tokens arrive over the signed command channel. A decoy the agent planted that
+leaves the list is retired: deleted only while its identity and content still
+match what was planted (a modified file is preserved and ownership dropped),
+reported as `prevention.honeytoken_revoked` (`success=false` when preserved).
+A path that cannot be planted (existing file, unwritable directory) is reported
+once as `prevention.honeytoken_deployed` with `success=false`. Registry decoys
+(`DatabasePassword`, `AdminCredentials`, `BackupKey` under
+`HKLM\SOFTWARE\TRAPD\Honeytokens`) are opt-in: they are planted only while the
+list contains an entry starting with `HKLM\` and are removed again when it no
+longer does. Both kinds report the same `HoneytokenAccess` detection event as
+Linux.
 
 `logs_enabled` (default `true`) is the master switch for the generic log
 collector. An empty `logs` list auto-discovers the built-in catalogue
