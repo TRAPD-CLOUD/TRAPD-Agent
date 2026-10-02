@@ -215,6 +215,15 @@ fn remove_owned_file(path: &Path, owned: &OwnedFile) -> std::io::Result<()> {
 mod ownership_regressions {
     use super::*;
 
+    /// The ownership register is process-global, and `reconcile_removed`
+    /// retires every owned decoy that is not listed: tests that plant and
+    /// reconcile must not interleave.
+    static REGISTER_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serialize() -> std::sync::MutexGuard<'static, ()> {
+        REGISTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn sample() -> (PathBuf, OwnedFile) {
         let path = std::env::temp_dir().join(format!("trapd-win-owned-{}", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"bait").unwrap();
@@ -278,6 +287,7 @@ mod ownership_regressions {
 
     #[test]
     fn decoy_removed_from_config_is_retired_and_reported() {
+        let _serial = serialize();
         let path = std::env::temp_dir().join(format!("trapd-win-retire-{}", uuid::Uuid::new_v4()));
         let state = FsState::default();
         assert_eq!(plant_missing(std::slice::from_ref(&path), &state).len(), 1);
@@ -295,6 +305,7 @@ mod ownership_regressions {
 
     #[test]
     fn listed_decoy_is_not_retired() {
+        let _serial = serialize();
         let path = std::env::temp_dir().join(format!("trapd-win-keep-{}", uuid::Uuid::new_v4()));
         let state = FsState::default();
         plant_missing(std::slice::from_ref(&path), &state);
@@ -311,6 +322,7 @@ mod ownership_regressions {
 
     #[test]
     fn modified_decoy_is_preserved_when_retired() {
+        let _serial = serialize();
         let path = std::env::temp_dir().join(format!("trapd-win-edited-{}", uuid::Uuid::new_v4()));
         let state = FsState::default();
         plant_missing(std::slice::from_ref(&path), &state);
