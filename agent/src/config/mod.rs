@@ -90,16 +90,14 @@ fn default_honeytoken_response() -> String {
 fn default_honeytoken_deception_escalation() -> bool {
     false
 }
-/// Decoy files the *Windows* agent plants and watches. Linux honeytokens are
-/// deployed over the signed command channel instead, so Linux ignores this.
+/// Decoy files the *Windows* agent plants and watches. Empty by default: the
+/// operator decides which paths become honeytokens (the dashboard adds and
+/// removes entries). Linux honeytokens are deployed over the signed command
+/// channel instead, so Linux ignores this.
 /// Kept platform-independent so the canonical signed-config bytes are identical
 /// on every OS.
 fn default_honeytoken_paths() -> Vec<String> {
-    vec![
-        "C:\\Users\\Public\\passwords.txt".into(),
-        "C:\\Users\\Public\\credentials.xlsx".into(),
-        "C:\\ProgramData\\backup_keys.txt".into(),
-    ]
+    Vec::new()
 }
 fn default_auto_response_enabled() -> bool {
     false
@@ -802,6 +800,13 @@ mod signed_config_tests {
     fn cleanup(p: PathBuf, w: PathBuf) {
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(w);
+    }
+
+    #[test]
+    fn no_honeytoken_paths_by_default() {
+        assert!(AgentConfig::default().honeytoken_paths.is_empty());
+        let parsed: AgentConfig = serde_json::from_str("{}").unwrap();
+        assert!(parsed.honeytoken_paths.is_empty());
     }
 
     #[test]
