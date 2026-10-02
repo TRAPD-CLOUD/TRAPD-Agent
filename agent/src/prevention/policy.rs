@@ -9,7 +9,7 @@
 //! `Arc<RwLock<…>>`.  Matchers are designed to be cheap enough to evaluate on
 //! every exec/connect/dns event in the hot path.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -125,14 +125,15 @@ pub struct Match {
 /// rebuilt wholesale on policy update, read lock-free on every event.
 #[derive(Default, Debug, Clone)]
 pub struct PolicyStore {
-    sha256: HashSet<String>,
+    sha256: HashMap<String, (String, RuleAction)>,
     comm: HashSet<String>,
+    comm_rules: HashMap<String, (String, RuleAction)>,
     parent_child: Vec<(String, String, String, RuleAction)>,
     path_globs: Vec<(String, GlobMatcher, RuleAction)>,
     ips: Vec<(String, IpAddr, RuleAction)>,
     cidrs: Vec<(String, IpNet, RuleAction)>,
     ports: Vec<(String, u16, RuleAction)>,
-    domains: HashSet<String>,
+    domains: HashMap<String, (String, RuleAction)>,
     raw: Vec<IocRule>,
 }
 
@@ -148,11 +149,12 @@ impl PolicyStore {
 
     fn index(&mut self, r: &IocRule) -> Result<()> {
         match r {
-            IocRule::Sha256 { value, .. } => {
-                self.sha256.insert(value.to_ascii_lowercase());
+            IocRule::Sha256 { id, value, action } => {
+                index_exact(&mut self.sha256, value.to_ascii_lowercase(), id, *action);
             }
-            IocRule::Comm { value, .. } => {
+            IocRule::Comm { id, value, action } => {
                 self.comm.insert(value.clone());
+                index_exact(&mut self.comm_rules, value.clone(), id, *action);
             }
             IocRule::ParentChild {
                 parent,
@@ -172,8 +174,8 @@ impl PolicyStore {
             IocRule::Ip { id, value, action } => self.ips.push((id.clone(), *value, *action)),
             IocRule::Cidr { id, value, action } => self.cidrs.push((id.clone(), *value, *action)),
             IocRule::Port { id, value, action } => self.ports.push((id.clone(), *value, *action)),
-            IocRule::Domain { value, .. } => {
-                self.domains.insert(value.to_ascii_lowercase());
+            IocRule::Domain { id, value, action } => {
+                index_exact(&mut self.domains, value.to_ascii_lowercase(), id, *action);
             }
         }
         Ok(())
@@ -181,6 +183,9 @@ impl PolicyStore {
 
     pub fn rules(&self) -> &[IocRule] {
         &self.raw
+    }
+    pub fn has_sha256_rules(&self) -> bool {
+        !self.sha256.is_empty()
     }
     #[allow(dead_code)]
     pub fn comm_set(&self) -> &HashSet<String> {
@@ -199,24 +204,24 @@ impl PolicyStore {
         let mut best: Option<Match> = None;
 
         if let Some(h) = sha256_hex {
-            if self.sha256.contains(&h.to_ascii_lowercase()) {
+            if let Some((id, action)) = self.sha256.get(&h.to_ascii_lowercase()) {
                 best = upgrade(
                     best,
                     Match {
-                        rule_id: format!("sha256:{h}"),
-                        action: RuleAction::Block,
+                        rule_id: id.clone(),
+                        action: *action,
                         reason: format!("SHA256 match: {h}"),
                     },
                 );
             }
         }
 
-        if self.comm.contains(comm) {
+        if let Some((id, action)) = self.comm_rules.get(comm) {
             best = upgrade(
                 best,
                 Match {
-                    rule_id: format!("comm:{comm}"),
-                    action: RuleAction::Block,
+                    rule_id: id.clone(),
+                    action: *action,
                     reason: format!("comm match: {comm}"),
                 },
             );
@@ -300,15 +305,30 @@ impl PolicyStore {
     #[allow(dead_code)]
     pub fn match_domain(&self, qname: &str) -> Option<Match> {
         let q = qname.to_ascii_lowercase();
-        if self.domains.contains(&q) {
+        if let Some((id, action)) = self.domains.get(&q) {
             Some(Match {
-                rule_id: format!("domain:{q}"),
-                action: RuleAction::Block,
+                rule_id: id.clone(),
+                action: *action,
                 reason: format!("domain match: {q}"),
             })
         } else {
             None
         }
+    }
+}
+
+/// Retain the first rule at a given action, with Block taking precedence.
+fn index_exact(
+    index: &mut HashMap<String, (String, RuleAction)>,
+    value: String,
+    id: &str,
+    action: RuleAction,
+) {
+    let existing = index
+        .entry(value)
+        .or_insert_with(|| (id.to_string(), action));
+    if existing.1 == RuleAction::Alert && action == RuleAction::Block {
+        *existing = (id.to_string(), action);
     }
 }
 
@@ -373,4 +393,66 @@ pub fn load_local_policy(path: &Path) -> Result<PolicyStore> {
     let store = PolicyStore::from_rules(file.rules)?;
     info!(path = %path.display(), rules = n, "Local IoC policy loaded");
     Ok(store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_rules_preserve_alert_actions_and_backend_ids() {
+        let store = PolicyStore::from_rules(vec![
+            IocRule::Sha256 {
+                id: "hash-alert".into(),
+                value: "ABC123".into(),
+                action: RuleAction::Alert,
+            },
+            IocRule::Comm {
+                id: "comm-alert".into(),
+                value: "bash".into(),
+                action: RuleAction::Alert,
+            },
+            IocRule::Domain {
+                id: "domain-alert".into(),
+                value: "EVIL.EXAMPLE".into(),
+                action: RuleAction::Alert,
+            },
+        ])
+        .unwrap();
+        for (matched, id) in [
+            (
+                store.match_exec("/bin/other", "other", None, Some("abc123")),
+                "hash-alert",
+            ),
+            (
+                store.match_exec("/bin/bash", "bash", None, None),
+                "comm-alert",
+            ),
+            (store.match_domain("evil.example"), "domain-alert"),
+        ] {
+            let matched = matched.unwrap();
+            assert_eq!(matched.action, RuleAction::Alert);
+            assert_eq!(matched.rule_id, id);
+        }
+    }
+
+    #[test]
+    fn duplicate_exact_rules_choose_block_and_preserve_its_id() {
+        let store = PolicyStore::from_rules(vec![
+            IocRule::Comm {
+                id: "alert".into(),
+                value: "bash".into(),
+                action: RuleAction::Alert,
+            },
+            IocRule::Comm {
+                id: "block".into(),
+                value: "bash".into(),
+                action: RuleAction::Block,
+            },
+        ])
+        .unwrap();
+        let matched = store.match_exec("/bin/bash", "bash", None, None).unwrap();
+        assert_eq!(matched.action, RuleAction::Block);
+        assert_eq!(matched.rule_id, "block");
+    }
 }

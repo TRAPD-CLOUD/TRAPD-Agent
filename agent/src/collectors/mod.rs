@@ -8,6 +8,8 @@ use crate::schema::AgentEvent;
 pub trait Collector: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
+    // async_trait adds #[must_use] even though the returned Future is already must-use.
+    #[allow(clippy::double_must_use)]
     async fn run(
         &mut self,
         tx: Sender<AgentEvent>,

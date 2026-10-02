@@ -9,6 +9,7 @@ ExecStart=/usr/local/bin/trapd-agent
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
+UMask=0077
 
 Environment=TRAPD_OUTPUT=file
 Environment=RUST_LOG=info
@@ -24,11 +25,12 @@ EnvironmentFile=-/etc/trapd/agent.env
 
 # systemd creates and owns these with the right permissions on every start:
 #   StateDirectory         -> /var/lib/trapd   (0700)  device_id, credentials
-#   LogsDirectory          -> /var/log/trapd   (0755)  events.ndjson
+#   LogsDirectory          -> /var/log/trapd   (0700)  events.ndjson
 #   ConfigurationDirectory -> /etc/trapd       (0755)  agent.env, policy, certs
 StateDirectory=trapd
 StateDirectoryMode=0700
 LogsDirectory=trapd
+LogsDirectoryMode=0700
 ConfigurationDirectory=trapd
 
 # ── Filesystem isolation ──────────────────────────────────────────────────────
@@ -56,7 +58,8 @@ NoNewPrivileges=true
 #   CAP_LINUX_IMMUTABLE — chattr +i on config files
 #   CAP_DAC_READ_SEARCH — read root-owned/0640 logs (/var/log/auth.log) and hash
 #                         files under /home, /root for FIM (read-only)
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE CAP_DAC_READ_SEARCH
+#   CAP_KILL       — signal user-owned processes for kill/freeze/thaw responses
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE CAP_DAC_READ_SEARCH CAP_KILL
 
 # ── Memory safety ─────────────────────────────────────────────────────────────
 # Deny mapping of memory regions that are simultaneously writable and executable.

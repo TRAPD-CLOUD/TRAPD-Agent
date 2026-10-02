@@ -42,21 +42,22 @@ const MAX_LINEAGE_DEPTH: usize = 12;
 /// they would not even trip the open-based gate — but we allowlist them
 /// explicitly anyway, plus AV scanners and backup tools that *do* read content.
 ///
-/// Note: comm matching is spoofable (an attacker can rename their binary). It is
-/// a false-positive filter, not a security boundary — the real signal is that
-/// *something* read the bait. Operators extend this via config; they cannot use
-/// it to weaken detection of an attacker who does not bother to disguise.
+/// Names are resolved to trusted executable identities when the allowlist is
+/// built. An accessor's mutable comm is never sufficient for suppression.
 const DEFAULT_ALLOWLIST: &[&str] = &[
     // locate/updatedb family (comm is truncated to 15 chars by the kernel)
     "updatedb",
     "updatedb.mlocat",
+    "updatedb.mlocate",
     "updatedb.plocat",
+    "updatedb.plocate",
     "mlocate",
     "plocate",
     "locate",
     "mandb",
     // desktop/file indexers
     "tracker-miner-f",
+    "tracker-miner-fs",
     "tracker-extract",
     "baloo_file",
     // AV / rootkit scanners
@@ -75,7 +76,7 @@ const DEFAULT_ALLOWLIST: &[&str] = &[
 /// Accessor allowlist: the default set plus any operator-configured comms.
 #[derive(Debug, Clone)]
 pub struct Allowlist {
-    comms: HashSet<String>,
+    executables: HashSet<(u64, u64)>,
     /// The agent's own PID — its camouflage/integrity reads of its own tokens
     /// must never alarm (self-exclusion, 2c).
     agent_pid: u32,
@@ -83,22 +84,85 @@ pub struct Allowlist {
 
 impl Allowlist {
     pub fn new(agent_pid: u32, extra: &[String]) -> Self {
-        let mut comms: HashSet<String> = DEFAULT_ALLOWLIST.iter().map(|s| s.to_string()).collect();
-        for c in extra {
-            let c = c.trim();
-            if !c.is_empty() {
-                comms.insert(c.to_string());
+        let mut executables = HashSet::new();
+        for name in DEFAULT_ALLOWLIST
+            .iter()
+            .copied()
+            .chain(extra.iter().map(|s| s.trim()))
+        {
+            if name.is_empty() {
+                continue;
+            }
+            let paths: Vec<std::path::PathBuf> = if std::path::Path::new(name).is_absolute() {
+                vec![name.into()]
+            } else {
+                [
+                    "/usr/bin",
+                    "/usr/sbin",
+                    "/bin",
+                    "/sbin",
+                    "/usr/local/bin",
+                    "/usr/local/sbin",
+                ]
+                .iter()
+                .map(|dir| std::path::Path::new(dir).join(name))
+                .collect()
+            };
+            for path in paths {
+                if let Some(id) = trusted_executable(&path) {
+                    executables.insert(id);
+                }
             }
         }
-        Self { comms, agent_pid }
+        Self {
+            executables,
+            agent_pid,
+        }
     }
 
     /// True when an access from `pid`/`comm` should be treated as benign.
-    pub fn is_allowed(&self, pid: i32, comm: &str) -> bool {
+    pub fn is_allowed(&self, pid: i32, _comm: &str) -> bool {
         if pid as u32 == self.agent_pid {
             return true; // the agent reading its own bait
         }
-        comm == "trapd-agent" || self.comms.contains(comm)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(format!("/proc/{pid}/exe"))
+                .ok()
+                .is_some_and(|meta| self.executables.contains(&(meta.dev(), meta.ino())))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+/// Authenticate both the executable and its canonical parent chain. Root
+/// ownership alone is insufficient when an unprivileged writer can replace a
+/// directory entry. Capture inode identity rather than trusting its basename.
+fn trusted_executable(path: &std::path::Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let canonical = path.canonicalize().ok()?;
+        for component in canonical.ancestors() {
+            let meta = std::fs::symlink_metadata(component).ok()?;
+            if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+                return None;
+            }
+        }
+        let meta = std::fs::metadata(canonical).ok()?;
+        if !meta.is_file() || meta.mode() & 0o111 == 0 {
+            return None;
+        }
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -441,17 +505,38 @@ mod tests {
     fn allowlist_excludes_agent_and_indexers() {
         let al = Allowlist::new(999, &["custombackup".to_string()]);
         assert!(al.is_allowed(999, "anything"), "agent pid is self-excluded");
-        assert!(al.is_allowed(5, "trapd-agent"), "agent comm excluded");
-        assert!(al.is_allowed(5, "updatedb"), "indexer excluded");
         assert!(
-            al.is_allowed(5, "custombackup"),
-            "configured extra excluded"
+            !al.is_allowed(5, "trapd-agent"),
+            "spoofed agent comm must not exclude"
+        );
+        assert!(
+            !al.is_allowed(5, "updatedb"),
+            "unverified indexer must not exclude"
+        );
+        assert!(
+            !al.is_allowed(5, "custombackup"),
+            "unverified configured extra must not exclude"
         );
         assert!(
             !al.is_allowed(5, "cat"),
             "an interactive read is NOT excluded"
         );
         assert!(!al.is_allowed(5, "python3"), "a script is NOT excluded");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authenticated_executable_identity_still_suppresses_scanner() {
+        use std::os::unix::fs::MetadataExt;
+        let pid = std::process::id();
+        let meta = std::fs::metadata(format!("/proc/{pid}/exe")).unwrap();
+        let mut al = Allowlist::new(pid + 1, &[]);
+        // Pin the installed scanner identity as the constructor does. The
+        // currently running test executable stands in for that scanner.
+        al.executables.insert((meta.dev(), meta.ino()));
+        assert!(al.is_allowed(pid as i32, "scanner"));
+        al.executables.clear();
+        assert!(!al.is_allowed(pid as i32, "scanner"));
     }
 
     #[test]

@@ -37,6 +37,92 @@ const MAX_DEPTH: usize = 32;
 /// `init`/`systemd` as a distant ancestor are *not* correlated.
 const RELATE_DEPTH: usize = 10;
 
+/// Max ancestors carried as correlation keys on a finding.
+const MAX_LINEAGE_KEYS: usize = 8;
+
+/// Session boundaries: a process whose parent is one of these starts a new
+/// session root (an SSH login shell, a cron job, a container's init, …).
+const SESSION_BOUNDARIES: &[&str] = &[
+    "systemd", "init", "sshd", "cron", "crond", "atd", "login", "su", "sudo",
+    "containerd-shim", "containerd-shim-runc-v2", "conmon", "runc", "tmux: server",
+    "screen", "gdm-session-worker", "lightdm", "sddm", "xrdp-sesman", "kthreadd",
+];
+/// System services that are never reported as a session root: grouping on
+/// them would tie unrelated activity together.
+const SYSTEM_ROOTS: &[&str] = &[
+    "systemd", "init", "sshd", "cron", "crond", "atd", "dbus-daemon", "kthreadd",
+    "containerd", "dockerd", "containerd-shim", "containerd-shim-runc-v2", "conmon",
+    "NetworkManager", "polkitd", "snapd", "journald", "systemd-journal", "systemd-logind",
+];
+/// Web servers / app servers: a shell below one of these is a web shell.
+pub const WEB_SERVERS: &[&str] = &[
+    "nginx", "apache2", "httpd", "lighttpd", "caddy", "php-fpm", "php-fpm7", "php-fpm8",
+    "php-fpm8.1", "php-fpm8.2", "php-fpm8.3", "tomcat", "catalina", "uwsgi", "gunicorn",
+    "w3wp",
+];
+/// Package managers: their children legitimately write to system locations.
+const PKG_MANAGERS: &[&str] = &[
+    "dpkg", "apt", "apt-get", "aptitude", "unattended-upgr", "unattended-upgrade", "rpm",
+    "dnf", "yum", "zypper", "pacman", "snapd", "flatpak", "apk", "packagekitd",
+];
+/// Configuration-management agents.
+const CONFIG_MGMT: &[&str] = &[
+    "ansible-playboo", "ansible-playbook", "ansible", "puppet", "chef-client", "salt-minion",
+    "salt-call", "cloud-init",
+];
+
+/// What a collector knows about a process's identity at exec time.
+#[derive(Debug, Clone, Default)]
+pub struct ProcIdentity {
+    pub start_ticks: Option<u64>,
+    pub container_id: Option<String>,
+}
+
+/// Correlation context of one process, resolved from the tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcContext {
+    pub pid: i32,
+    pub process_key: String,
+    pub parent_key: Option<String>,
+    /// Ancestors, nearest first, bounded to [`MAX_LINEAGE_KEYS`].
+    pub lineage_keys: Vec<String>,
+    pub root_key: Option<String>,
+    pub uid: u32,
+    pub username: String,
+    pub comm: String,
+    pub exe: String,
+    pub exe_hash: Option<String>,
+    pub container_id: Option<String>,
+    /// Ancestor `comm`s, nearest first (for lineage-based rules).
+    pub ancestor_comms: Vec<String>,
+    /// Policy flags: `root`, `web_lineage`, `pkg_mgr_lineage`,
+    /// `config_mgmt_lineage`, `ssh_session`, `container`.
+    pub flags: Vec<&'static str>,
+}
+
+/// Two known, different start times for one pid mean the pid was reused.
+fn is_reuse(old: Option<u64>, new: Option<u64>) -> bool {
+    matches!((old, new), (Some(a), Some(b)) if a != b)
+}
+
+/// `boot:pid:start` — the process identity used for correlation.
+pub fn process_key(pid: i32, start_ticks: Option<u64>) -> String {
+    format!("{}:{pid}:{}", boot_prefix(), start_ticks.unwrap_or(0))
+}
+
+fn boot_prefix() -> &'static str {
+    static PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PREFIX.get_or_init(|| {
+        let id = crate::telemetry::identity::boot_id();
+        id.split('-').next().unwrap_or(id).to_string()
+    })
+}
+
+fn comm_in(comm: &str, set: &[&str]) -> bool {
+    let base = comm.rsplit('/').next().unwrap_or(comm);
+    set.iter().any(|s| *s == base || (s.len() >= 6 && base.starts_with(s)))
+}
+
 /// One process in the tree.  After an `exec` the image fields (`exe`,
 /// `cmdline`, `exe_hash`) describe the *current* image; a `fork`ed child
 /// inherits its parent's image until it execs.
@@ -53,6 +139,11 @@ pub struct ProcNode {
     /// SHA256 of the executable image, when hashing is enabled and the file is
     /// a regular, size-bounded file.  `None` otherwise (memfd, too large, gone).
     pub exe_hash: Option<String>,
+    /// Kernel start time in clock ticks since boot, when the collector knew
+    /// it. With the pid it is the process identity that survives PID reuse.
+    pub start_ticks: Option<u64>,
+    /// Container the process runs in, when known.
+    pub container_id: Option<String>,
     /// When this node was first observed.
     pub start: Instant,
     /// Set when a `terminate` is seen; the node becomes a GC-able tombstone.
@@ -96,11 +187,17 @@ impl ProcessTree {
         comm: &str,
         exe: &str,
         cmdline: &str,
+        identity: ProcIdentity,
         now: Instant,
     ) {
-        // Preserve any hash already attached for this pid across a re-exec until
-        // the collector attaches the new image's hash via `set_exe_hash`.
-        let start = self.nodes.get(&pid).map(|n| n.start).unwrap_or(now);
+        // A re-exec keeps the process identity; a different start time means
+        // the pid was reused by an unrelated process.
+        let existing = self.nodes.get(&pid);
+        let reused = existing.is_some_and(|n| is_reuse(n.start_ticks, identity.start_ticks));
+        let start = existing.filter(|_| !reused).map(|n| n.start).unwrap_or(now);
+        let start_ticks = identity
+            .start_ticks
+            .or_else(|| existing.filter(|_| !reused).and_then(|n| n.start_ticks));
         self.nodes.insert(
             pid,
             ProcNode {
@@ -113,6 +210,8 @@ impl ProcessTree {
                 gid,
                 username: username.to_string(),
                 exe_hash: None,
+                start_ticks,
+                container_id: identity.container_id,
                 start,
                 exited: None,
             },
@@ -131,11 +230,15 @@ impl ProcessTree {
         name: &str,
         exe: &str,
         cmdline: &str,
+        start_ticks: Option<u64>,
         now: Instant,
     ) {
-        // Don't clobber a richer exec-sourced node for the same pid.
-        if self.nodes.contains_key(&pid) {
-            return;
+        // Don't clobber a richer exec-sourced node for the same process — but a
+        // different start time is a reused pid, which must replace it.
+        if let Some(n) = self.nodes.get(&pid) {
+            if !is_reuse(n.start_ticks, start_ticks) {
+                return;
+            }
         }
         self.nodes.insert(
             pid,
@@ -149,6 +252,8 @@ impl ProcessTree {
                 gid: 0,
                 username: username.to_string(),
                 exe_hash: None,
+                start_ticks,
+                container_id: None,
                 start: now,
                 exited: None,
             },
@@ -187,6 +292,8 @@ impl ProcessTree {
                 gid: p.gid,
                 username: p.username,
                 exe_hash: p.exe_hash,
+                start_ticks: None,
+                container_id: p.container_id,
                 start: now,
                 exited: None,
             },
@@ -200,6 +307,8 @@ impl ProcessTree {
                 gid: 0,
                 username: String::new(),
                 exe_hash: None,
+                start_ticks: None,
+                container_id: None,
                 start: now,
                 exited: None,
             },
@@ -215,6 +324,8 @@ impl ProcessTree {
             gid: 0,
             username: String::new(),
             exe_hash: None,
+            start_ticks: None,
+            container_id: None,
             start: now,
             exited: None,
         });
@@ -335,6 +446,90 @@ impl ProcessTree {
         Some(serde_json::Value::Array(out))
     }
 
+    /// Correlation context for `pid`, or `None` when the pid is unknown.
+    pub fn context(&self, pid: i32) -> Option<ProcContext> {
+        let node = self.nodes.get(&pid)?;
+        let mut ctx = ProcContext {
+            pid,
+            process_key: process_key(pid, node.start_ticks),
+            uid: node.uid,
+            username: node.username.clone(),
+            comm: node.comm.clone(),
+            exe: node.exe.clone(),
+            exe_hash: node.exe_hash.clone(),
+            container_id: node.container_id.clone(),
+            ..Default::default()
+        };
+
+        // Walk up, collecting ancestors (nearest first).
+        let mut chain: Vec<&ProcNode> = vec![node];
+        let mut cur = node;
+        for _ in 0..MAX_DEPTH {
+            if cur.ppid <= 0 || cur.ppid == cur.pid {
+                break;
+            }
+            match self.nodes.get(&cur.ppid) {
+                Some(p) => {
+                    chain.push(p);
+                    cur = p;
+                }
+                None => break,
+            }
+        }
+        for anc in chain.iter().skip(1) {
+            if ctx.lineage_keys.len() < MAX_LINEAGE_KEYS {
+                ctx.lineage_keys.push(process_key(anc.pid, anc.start_ticks));
+            }
+            ctx.ancestor_comms.push(anc.comm.clone());
+        }
+        ctx.parent_key = ctx.lineage_keys.first().cloned();
+
+        // Session root: the topmost process whose parent is a session boundary
+        // (or unknown / pid 1). Never a system service itself.
+        let mut root_idx = chain.len() - 1;
+        for i in 0..chain.len() {
+            let parent = chain.get(i + 1);
+            let boundary = match parent {
+                Some(p) => comm_in(&p.comm, SESSION_BOUNDARIES) || p.pid <= 1,
+                None => true,
+            };
+            if boundary {
+                root_idx = i;
+                break;
+            }
+        }
+        let root = chain[root_idx];
+        if !comm_in(&root.comm, SYSTEM_ROOTS) && root.pid > 1 {
+            ctx.root_key = Some(process_key(root.pid, root.start_ticks));
+        }
+
+        if node.uid == 0 {
+            ctx.flags.push(crate::detection::severity::FLAG_ROOT);
+        }
+        let ancestors = &chain[1..];
+        if ancestors.iter().any(|a| comm_in(&a.comm, WEB_SERVERS)) {
+            ctx.flags.push(crate::detection::severity::FLAG_WEB_LINEAGE);
+        }
+        if ancestors.iter().any(|a| comm_in(&a.comm, PKG_MANAGERS)) {
+            ctx.flags.push(crate::detection::severity::FLAG_PKG_MGR_LINEAGE);
+        }
+        if ancestors.iter().any(|a| comm_in(&a.comm, CONFIG_MGMT)) {
+            ctx.flags.push(crate::detection::severity::FLAG_CONFIG_MGMT_LINEAGE);
+        }
+        if ancestors.iter().any(|a| a.comm == "sshd") {
+            ctx.flags.push(crate::detection::severity::FLAG_SSH_SESSION);
+        }
+        if node.container_id.is_some() {
+            ctx.flags.push(crate::detection::severity::FLAG_CONTAINER);
+        }
+        Some(ctx)
+    }
+
+    /// The process key of `pid` as currently known (start time may be 0).
+    pub fn key_of(&self, pid: i32) -> String {
+        process_key(pid, self.nodes.get(&pid).and_then(|n| n.start_ticks))
+    }
+
     // ── Maintenance ───────────────────────────────────────────────────────────
 
     /// Reap expired tombstones and enforce the node cap.  Called periodically by
@@ -378,8 +573,8 @@ mod tests {
     fn resolves_direct_ancestry() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(100, 1, 0, 0, "root", "sshd", "/usr/sbin/sshd", "sshd", now);
-        tree.on_exec(200, 100, 0, 0, "root", "bash", "/bin/bash", "bash", now);
+        tree.on_exec(100, 1, 0, 0, "root", "sshd", "/usr/sbin/sshd", "sshd", ProcIdentity::default(), now);
+        tree.on_exec(200, 100, 0, 0, "root", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
         tree.on_exec(
             300,
             200,
@@ -389,7 +584,7 @@ mod tests {
             "curl",
             "/usr/bin/curl",
             "curl http://x",
-            now,
+            ProcIdentity::default(), now,
         );
         assert!(
             tree.is_ancestor(100, 300),
@@ -403,9 +598,9 @@ mod tests {
     fn siblings_under_one_shell_are_related() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", now);
+        tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
         // two children of the same shell — not ancestors of each other
-        tree.on_exec(301, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl", now);
+        tree.on_exec(301, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl", ProcIdentity::default(), now);
         tree.on_exec(
             302,
             200,
@@ -415,7 +610,7 @@ mod tests {
             "evil",
             "/tmp/evil",
             "/tmp/evil",
-            now,
+            ProcIdentity::default(), now,
         );
         assert!(!tree.is_ancestor(301, 302));
         assert!(
@@ -438,9 +633,9 @@ mod tests {
             "nginx",
             "/usr/sbin/nginx",
             "nginx",
-            now,
+            ProcIdentity::default(), now,
         );
-        tree.on_exec(20, 1, 0, 0, "root", "cron", "/usr/sbin/cron", "cron", now);
+        tree.on_exec(20, 1, 0, 0, "root", "cron", "/usr/sbin/cron", "cron", ProcIdentity::default(), now);
         assert!(!tree.related(10, 20));
     }
 
@@ -448,7 +643,7 @@ mod tests {
     fn fork_child_inherits_then_exec_replaces() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(200, 1, 1000, 1000, "u", "bash", "/bin/bash", "bash", now);
+        tree.on_exec(200, 1, 1000, 1000, "u", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
         tree.on_fork(200, 201, "bash", "bash", now);
         assert_eq!(
             tree.node(201).unwrap().exe,
@@ -464,7 +659,7 @@ mod tests {
             "curl",
             "/usr/bin/curl",
             "curl",
-            now,
+            ProcIdentity::default(), now,
         );
         assert_eq!(
             tree.node(201).unwrap().exe,
@@ -477,8 +672,8 @@ mod tests {
     fn tombstones_are_reaped_but_keep_living_children_resolvable() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", now);
-        tree.on_exec(300, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl", now);
+        tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
+        tree.on_exec(300, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl", ProcIdentity::default(), now);
         tree.on_exit(200, now);
         // Parent dead but child alive — lineage still resolvable before GC TTL.
         assert!(tree.is_ancestor(200, 300));
@@ -492,7 +687,7 @@ mod tests {
     fn set_exe_hash_surfaces_in_lineage() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", now);
+        tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
         tree.set_exe_hash(200, Some("abc123"));
         // Unknown pid / None are no-ops.
         tree.set_exe_hash(999, Some("nope"));
@@ -505,8 +700,8 @@ mod tests {
     fn lineage_json_walks_up_the_chain() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(100, 1, 0, 0, "root", "sshd", "/usr/sbin/sshd", "sshd", now);
-        tree.on_exec(200, 100, 0, 0, "root", "bash", "/bin/bash", "bash", now);
+        tree.on_exec(100, 1, 0, 0, "root", "sshd", "/usr/sbin/sshd", "sshd", ProcIdentity::default(), now);
+        tree.on_exec(200, 100, 0, 0, "root", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
         let lin = tree.lineage_json(200).unwrap();
         let arr = lin.as_array().unwrap();
         assert_eq!(arr[0]["pid"], 200);

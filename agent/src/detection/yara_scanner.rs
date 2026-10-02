@@ -136,6 +136,7 @@ impl YaraScanner {
                 "file_path": path,
                 "severity": severity_str(&severity),
             }),
+            ..Default::default()
         };
         Some((severity, detection))
     }

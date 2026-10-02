@@ -49,7 +49,9 @@ pub mod profiler;
 pub mod registry;
 pub mod validate;
 
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(any(test, not(target_os = "linux")))]
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -64,6 +66,98 @@ pub use profiler::build_profile_with_host;
 pub use profiler::ReconProfile;
 pub use registry::{BreadcrumbRecord, HoneytokenRecord, HoneytokenStore, OutOfBandCanary};
 pub use validate::{validate_bait, validate_out_of_band};
+
+#[cfg(all(test, unix))]
+mod safety_regressions {
+    use super::*;
+
+    fn scratch() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("trapd-safety-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn publication_never_overwrites_existing_target() {
+        let dir = scratch();
+        let path = dir.join("token");
+        fs::write(&path, b"real user data").unwrap();
+        assert!(write_camouflaged(&path, b"bait", 0o600, None, None).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"real user data");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn health_does_not_follow_symlinks() {
+        let dir = scratch();
+        let path = dir.join("token");
+        std::os::unix::fs::symlink("/etc/passwd", &path).unwrap();
+        let rec = HoneytokenRecord {
+            id: Uuid::new_v4(),
+            path: path.to_string_lossy().into_owned(),
+            kind: "unknown".into(),
+            mode: 0o600,
+            size_bytes: 4,
+            sha256: "known".into(),
+            mimic_neighbor: false,
+            neighbor_path: None,
+            canary_marker: None,
+            out_of_band: None,
+            deployed_at: Utc::now(),
+            command_id: None,
+            breadcrumbs: Vec::new(),
+        };
+        let health = verify_record(&rec);
+        assert!(health.actual_sha256.is_none());
+        assert!(
+            health.modified,
+            "an unverifiable replacement must not report healthy"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn health_hashing_refuses_oversized_and_special_files() {
+        let dir = scratch();
+        let large = dir.join("large");
+        fs::File::create(&large).unwrap().set_len(1 << 34).unwrap();
+        assert!(crate::paths::bounded_regular_sha256(&large, 1024 * 1024).is_err());
+        let fifo = dir.join("fifo");
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(crate::paths::bounded_regular_sha256(&fifo, 1024 * 1024).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn revoke_preserves_real_file_replacing_decoy() {
+        let dir = scratch();
+        let path = dir.join("token");
+        let store = HoneytokenStore::load_from(dir.join("register.json"));
+        let rec = HoneytokenRecord {
+            id: Uuid::new_v4(),
+            path: path.to_string_lossy().into_owned(),
+            kind: "unknown".into(),
+            mode: 0o600,
+            size_bytes: 4,
+            sha256: hex::encode(Sha256::digest(b"bait")),
+            mimic_neighbor: false,
+            neighbor_path: None,
+            canary_marker: None,
+            out_of_band: None,
+            deployed_at: Utc::now(),
+            command_id: None,
+            breadcrumbs: Vec::new(),
+        };
+        store.insert(rec.clone()).unwrap();
+        fs::write(&path, b"real user file").unwrap();
+        assert!(revoke(&store, &rec.path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"real user file");
+        assert!(store.contains_path(&rec.path));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
 
 /// Everything needed to place one honeytoken. Built by the engine from a
 /// verified `deploy_honeytoken` command.
@@ -166,6 +260,9 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
     let parent = target
         .parent()
         .ok_or_else(|| anyhow::anyhow!("target has no parent directory: {}", target.display()))?;
+    #[cfg(target_os = "linux")]
+    let _ = secure_parent(&target, true)?;
+    #[cfg(not(target_os = "linux"))]
     fs::create_dir_all(parent)
         .with_context(|| format!("create parent dir {}", parent.display()))?;
 
@@ -251,19 +348,16 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
 /// the register. Refuses any path that is not in the register — the agent only
 /// removes what it planted.
 pub fn revoke(store: &HoneytokenStore, path: &str) -> Result<HoneytokenRecord> {
-    if !store.contains_path(path) {
-        bail!("refusing to revoke {path}: not a registered honeytoken");
-    }
-
-    // Remove the file first; tolerate it being already gone (an attacker may
-    // have moved/deleted it — that is itself signal, but not an error here).
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn!(path, "honeytoken file already absent at revoke time");
-        }
-        Err(e) => return Err(e).with_context(|| format!("remove honeytoken {path}")),
-    }
+    let existing = store
+        .list()
+        .into_iter()
+        .find(|record| record.path == path)
+        .ok_or_else(|| anyhow::anyhow!("refusing to revoke {path}: not a registered honeytoken"))?;
+    remove_verified_file(
+        Path::new(path),
+        &existing.sha256,
+        existing.size_bytes.max(1024 * 1024),
+    )?;
 
     let record = store
         .remove_by_path(path)
@@ -322,9 +416,11 @@ impl HealthCheck {
 /// side effects, no telemetry) so it is unit-testable; the periodic health task
 /// wraps it and emits the result.
 pub fn verify_record(rec: &HoneytokenRecord) -> HealthCheck {
-    match fs::read(&rec.path) {
-        Ok(bytes) => {
-            let actual = hex::encode(Sha256::digest(&bytes));
+    match crate::paths::bounded_regular_sha256(
+        Path::new(&rec.path),
+        rec.size_bytes.max(1024 * 1024),
+    ) {
+        Ok(actual) => {
             // A recorded digest of "" means none was captured — never flag such a
             // token as modified (we have nothing to compare against).
             let modified = !rec.sha256.is_empty() && actual != rec.sha256;
@@ -343,7 +439,7 @@ pub fn verify_record(rec: &HoneytokenRecord) -> HealthCheck {
         // when an entry is there at all (lstat), missing only when truly absent.
         Err(_) => HealthCheck {
             present: Path::new(&rec.path).symlink_metadata().is_ok(),
-            modified: false,
+            modified: !rec.sha256.is_empty(),
             actual_sha256: None,
         },
     }
@@ -354,9 +450,13 @@ pub fn verify_record(rec: &HoneytokenRecord) -> HealthCheck {
 /// Place one breadcrumb and return the record describing what was written.
 fn place_breadcrumb(bc: &Breadcrumb) -> Result<BreadcrumbRecord> {
     let target = validate_target(&bc.path)?;
+    #[cfg(not(target_os = "linux"))]
     let parent = target
         .parent()
         .ok_or_else(|| anyhow::anyhow!("breadcrumb has no parent dir: {}", target.display()))?;
+    #[cfg(target_os = "linux")]
+    let _ = secure_parent(&target, true)?;
+    #[cfg(not(target_os = "linux"))]
     fs::create_dir_all(parent)
         .with_context(|| format!("create breadcrumb parent dir {}", parent.display()))?;
 
@@ -377,8 +477,8 @@ fn place_breadcrumb(bc: &Breadcrumb) -> Result<BreadcrumbRecord> {
             path: target.to_string_lossy().into_owned(),
             appended: false,
             offset: None,
-            len: None,
-            sha256: None,
+            len: Some(bc.content.len() as u64),
+            sha256: Some(hex::encode(Sha256::digest(&bc.content))),
         })
     }
 }
@@ -389,30 +489,13 @@ fn create_breadcrumb_file(target: &Path, content: &[u8], mode: u32) -> Result<()
     if target.symlink_metadata().is_ok() {
         bail!("breadcrumb target already exists: {}", target.display());
     }
-    let mut f = create_breadcrumb_handle(target, mode)?;
-    f.write_all(content).context("write breadcrumb content")?;
-    f.sync_all().ok();
-    Ok(())
-}
-
-#[cfg(unix)]
-fn create_breadcrumb_handle(target: &Path, mode: u32) -> Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(if mode == 0 { 0o600 } else { mode })
-        .open(target)
-        .with_context(|| format!("create_new {}", target.display()))
-}
-
-#[cfg(not(unix))]
-fn create_breadcrumb_handle(target: &Path, _mode: u32) -> Result<fs::File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)
-        .with_context(|| format!("create_new {}", target.display()))
+    write_camouflaged(
+        target,
+        content,
+        if mode == 0 { 0o600 } else { mode },
+        None,
+        None,
+    )
 }
 
 /// Append `content` to `path` without ever truncating it: the file is opened in
@@ -422,11 +505,15 @@ fn create_breadcrumb_handle(target: &Path, _mode: u32) -> Result<fs::File> {
 /// pre-append offset and the exact bytes written, so revoke can later remove
 /// precisely this addition.
 fn append_safe(target: &Path, content: &[u8], mode: u32) -> Result<(u64, Vec<u8>)> {
-    let pre_len = fs::metadata(target).map(|m| m.len()).unwrap_or(0);
+    let mut f = open_append_handle(target, mode)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        bail!("breadcrumb target is not a regular file");
+    }
+    let pre_len = meta.len();
 
     // Does the existing file already end with a newline?
     let needs_leading_nl = if pre_len > 0 {
-        let mut f = fs::File::open(target).context("open breadcrumb file to inspect tail")?;
         f.seek(SeekFrom::End(-1)).context("seek to tail")?;
         let mut last = [0u8; 1];
         f.read_exact(&mut last).context("read tail byte")?;
@@ -444,16 +531,39 @@ fn append_safe(target: &Path, content: &[u8], mode: u32) -> Result<(u64, Vec<u8>
         payload.push(b'\n');
     }
 
-    let mut f = open_append_handle(target, mode)?;
     f.write_all(&payload).context("append breadcrumb bytes")?;
     f.sync_all().ok();
     Ok((pre_len, payload))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn open_append_handle(target: &Path, mode: u32) -> Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let (parent, name) = secure_parent(target, true)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_APPEND
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | libc::O_CLOEXEC,
+            if mode == 0 { 0o600 } else { mode },
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn open_append_handle(target: &Path, mode: u32) -> Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
+        .read(true)
         .create(true)
         .append(true)
         .mode(if mode == 0 { 0o600 } else { mode })
@@ -464,6 +574,7 @@ fn open_append_handle(target: &Path, mode: u32) -> Result<fs::File> {
 #[cfg(not(unix))]
 fn open_append_handle(target: &Path, _mode: u32) -> Result<fs::File> {
     OpenOptions::new()
+        .read(true)
         .create(true)
         .append(true)
         .open(target)
@@ -475,38 +586,82 @@ fn open_append_handle(target: &Path, _mode: u32) -> Result<fs::File> {
 /// length and SHA-256), so concurrent/later writes are never clobbered.
 fn remove_breadcrumb(bc: &BreadcrumbRecord) -> Result<()> {
     if !bc.appended {
-        return match fs::remove_file(&bc.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("remove breadcrumb {}", bc.path)),
+        let Some(sha) = bc.sha256.as_deref() else {
+            warn!(path = %bc.path, "legacy breadcrumb has no content ownership proof; preserving file");
+            return Ok(());
         };
+        return remove_verified_file(
+            Path::new(&bc.path),
+            sha,
+            bc.len.unwrap_or(0).max(1024 * 1024),
+        );
     }
 
     let (Some(offset), Some(len), Some(sha)) = (bc.offset, bc.len, bc.sha256.as_ref()) else {
         return Ok(()); // nothing recorded to remove
     };
-    let Ok(meta) = fs::metadata(&bc.path) else {
-        return Ok(()); // file gone already
-    };
+    if Path::new(&bc.path).symlink_metadata().is_err() {
+        return Ok(());
+    }
+    let mut f = open_breadcrumb_for_cleanup(Path::new(&bc.path))?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        bail!("breadcrumb cleanup target is not a regular file");
+    }
     if meta.len() != offset + len {
         warn!(path = %bc.path, "appended breadcrumb: file grew/shrank since placement — leaving it intact");
         return Ok(());
     }
-    let mut f = fs::File::open(&bc.path).with_context(|| format!("open {}", bc.path))?;
     f.seek(SeekFrom::Start(offset))
         .context("seek to appended block")?;
-    let mut buf = vec![0u8; len as usize];
-    f.read_exact(&mut buf).context("read appended block")?;
-    if hex::encode(Sha256::digest(&buf)) != *sha {
+    let mut digest = Sha256::new();
+    let mut reader = (&mut f).take(len);
+    let mut buf = [0u8; 16384];
+    let mut consumed = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        consumed += n as u64;
+        digest.update(&buf[..n]);
+    }
+    if consumed != len || hex::encode(digest.finalize()) != *sha {
         warn!(path = %bc.path, "appended breadcrumb: tail no longer matches — leaving it intact");
         return Ok(());
     }
-    let f = OpenOptions::new()
-        .write(true)
-        .open(&bc.path)
-        .with_context(|| format!("reopen {} to truncate", bc.path))?;
+    let after = f.metadata()?;
+    if after.len() != meta.len() || after.modified().ok() != meta.modified().ok() {
+        warn!(path = %bc.path, "appended breadcrumb changed during cleanup; preserving file");
+        return Ok(());
+    }
+    // The same opened object is truncated, so a replaced pathname/symlink can
+    // never redirect this write. Noncooperating writes to the same inode can
+    // still race the final metadata check; leave any detected change intact.
     f.set_len(offset).context("truncate appended breadcrumb")?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_breadcrumb_for_cleanup(target: &Path) -> Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let (parent, name) = secure_parent(target, false)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_breadcrumb_for_cleanup(target: &Path) -> Result<fs::File> {
+    Ok(OpenOptions::new().read(true).write(true).open(target)?)
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────────
@@ -526,6 +681,7 @@ fn validate_target(path: &str) -> Result<PathBuf> {
 /// Write `content` to `target` atomically, applying mode and (best-effort)
 /// owner/timestamps before the rename so the file never appears half-written
 /// or freshly-touched once it is visible at its final path.
+#[cfg(not(target_os = "linux"))]
 fn write_camouflaged(
     target: &Path,
     content: &[u8],
@@ -542,7 +698,7 @@ fn write_camouflaged(
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("token"),
-        std::process::id()
+        Uuid::new_v4()
     ));
 
     let result = (|| -> Result<()> {
@@ -562,13 +718,293 @@ fn write_camouflaged(
         if let Some((atime, mtime)) = times {
             set_times(&tmp, atime, mtime);
         }
-        fs::rename(&tmp, target)
-            .with_context(|| format!("rename {} -> {}", tmp.display(), target.display()))?;
+        // Atomic no-replace publication. Unlike rename(), hard_link refuses an
+        // existing target even if it appeared after the earlier safety check.
+        fs::hard_link(&tmp, target).with_context(|| {
+            format!(
+                "publish {} -> {} without replacement",
+                tmp.display(),
+                target.display()
+            )
+        })?;
+        if let Err(error) = fs::remove_file(&tmp) {
+            warn!(%error, "could not remove published honeytoken staging link");
+        }
         Ok(())
     })();
 
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    // A failed create does not establish ownership of the staging path.
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn secure_parent(target: &Path, create_parents: bool) -> Result<(fs::File, std::ffi::CString)> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    };
+    let parent = target.parent().context("target has no parent")?;
+    let name = std::ffi::CString::new(
+        target
+            .file_name()
+            .context("target has no file name")?
+            .as_bytes(),
+    )?;
+    let root = std::ffi::CString::new("/")?;
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut dir = unsafe { fs::File::from_raw_fd(fd) };
+    for component in parent.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        let part = std::ffi::CString::new(part.as_bytes())?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let mut fd = unsafe { libc::openat(dir.as_raw_fd(), part.as_ptr(), flags) };
+        if fd < 0
+            && create_parents
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+        {
+            if unsafe { libc::mkdirat(dir.as_raw_fd(), part.as_ptr(), 0o755) } < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            fd = unsafe { libc::openat(dir.as_raw_fd(), part.as_ptr(), flags) };
+        }
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("open honeytoken parent without following links");
+        }
+        dir = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    Ok((dir, name))
+}
+
+#[cfg(target_os = "linux")]
+struct PrivateStage {
+    parent: fs::File,
+    dir: fs::File,
+    name: std::ffi::CString,
+}
+
+#[cfg(target_os = "linux")]
+impl PrivateStage {
+    fn new(parent: fs::File) -> Result<Self> {
+        use std::os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::fs::MetadataExt,
+        };
+        let name = std::ffi::CString::new(format!(".trapd-stage-{}", Uuid::new_v4()))?;
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let dir = unsafe { fs::File::from_raw_fd(fd) };
+        let meta = dir.metadata()?;
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+            bail!("honeytoken staging directory was replaced or is not private");
+        }
+        Ok(Self { parent, dir, name })
+    }
+
+    fn leaf() -> &'static std::ffi::CStr {
+        c"token"
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PrivateStage {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // Remove only our empty container; never remove a staged object here.
+        // A failed restore deliberately retains that object's recovery location.
+        let _ = unsafe {
+            libc::unlinkat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        };
+    }
+}
+
+/// Remove a registered artifact only after its bounded regular-file digest has
+/// been verified. Quarantine the directory entry into private staging and check
+/// again there, so a pathname replacement between checking and moving cannot
+/// cause a real file to be deleted.
+#[cfg(target_os = "linux")]
+fn remove_verified_file(target: &Path, sha: &str, max_bytes: u64) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    match target.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    if sha.is_empty() {
+        bail!(
+            "artifact has no content ownership proof; preserving {}",
+            target.display()
+        );
+    }
+    let (parent, name) = secure_parent(target, false)?;
+    let path = PathBuf::from(format!(
+        "/proc/self/fd/{}/{}",
+        parent.as_raw_fd(),
+        name.to_string_lossy()
+    ));
+    if crate::paths::bounded_regular_sha256(&path, max_bytes)? != sha {
+        bail!("artifact content changed; preserving {}", target.display());
+    }
+    let stage = PrivateStage::new(parent)?;
+    if unsafe {
+        libc::renameat2(
+            stage.parent.as_raw_fd(),
+            name.as_ptr(),
+            stage.dir.as_raw_fd(),
+            PrivateStage::leaf().as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } < 0
+    {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    let staged_path = PathBuf::from(format!("/proc/self/fd/{}/token", stage.dir.as_raw_fd()));
+    let verified = crate::paths::bounded_regular_sha256(&staged_path, max_bytes)
+        .is_ok_and(|actual| actual == sha);
+    if !verified {
+        let restored = unsafe {
+            libc::renameat2(
+                stage.dir.as_raw_fd(),
+                PrivateStage::leaf().as_ptr(),
+                stage.parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if restored < 0 {
+            let recovery = target
+                .parent()
+                .unwrap_or(Path::new("/"))
+                .join(stage.name.to_string_lossy().as_ref())
+                .join("token");
+            warn!(path = %target.display(), recovery = %recovery.display(), "artifact changed during cleanup and could not be restored without replacing another file; preserved in private staging");
+        }
+        bail!(
+            "artifact changed during cleanup; preserving {}",
+            target.display()
+        );
+    }
+    if unsafe { libc::unlinkat(stage.dir.as_raw_fd(), PrivateStage::leaf().as_ptr(), 0) } < 0 {
+        // Restore on a deletion failure as well, so normal permission/IO errors
+        // do not strand the original object in staging.
+        let error = std::io::Error::last_os_error();
+        let _ = unsafe {
+            libc::renameat2(
+                stage.dir.as_raw_fd(),
+                PrivateStage::leaf().as_ptr(),
+                stage.parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        return Err(error.into());
+    }
+    let _ = stage.parent.sync_all();
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_verified_file(target: &Path, sha: &str, max_bytes: u64) -> Result<()> {
+    match crate::paths::bounded_regular_sha256(target, max_bytes) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(actual) if !sha.is_empty() && actual == sha => {
+            fs::remove_file(target)?;
+            Ok(())
+        }
+        _ => bail!(
+            "artifact content could not be verified; preserving {}",
+            target.display()
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_camouflaged(
+    target: &Path,
+    content: &[u8],
+    mode: u32,
+    owner: Option<(u32, u32)>,
+    times: Option<(SystemTime, SystemTime)>,
+) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let (parent, name) = secure_parent(target, true)?;
+    let stage = PrivateStage::new(parent)?;
+    let fd = unsafe {
+        libc::openat(
+            stage.dir.as_raw_fd(),
+            PrivateStage::leaf().as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let result = (|| -> Result<()> {
+        file.write_all(content).context("write token content")?;
+        if unsafe { libc::fchmod(file.as_raw_fd(), mode) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if let Some((uid, gid)) = owner {
+            if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } < 0 {
+                warn!(error = %std::io::Error::last_os_error(), "honeytoken ownership alignment failed");
+            }
+        }
+        if let Some((atime, mtime)) = times {
+            file.set_times(fs::FileTimes::new().set_accessed(atime).set_modified(mtime))?;
+        }
+        file.sync_all()?;
+        if unsafe {
+            libc::linkat(
+                stage.dir.as_raw_fd(),
+                PrivateStage::leaf().as_ptr(),
+                stage.parent.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("publish honeytoken without replacement");
+        }
+        // Publication succeeded; cleanup failure must not prevent registration.
+        let _ = stage.parent.sync_all();
+        Ok(())
+    })();
+    if unsafe { libc::unlinkat(stage.dir.as_raw_fd(), PrivateStage::leaf().as_ptr(), 0) } < 0 {
+        warn!(error = %std::io::Error::last_os_error(), "could not remove honeytoken staging link");
     }
     result
 }
@@ -603,7 +1039,7 @@ fn choose_neighbor(dir: &Path, target: &Path) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn create_temp(path: &Path) -> Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
@@ -623,7 +1059,7 @@ fn create_temp(path: &Path) -> Result<fs::File> {
         .with_context(|| format!("create temp {}", path.display()))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
@@ -655,6 +1091,7 @@ fn neighbor_mode(_meta: &fs::Metadata) -> u32 {
 }
 
 /// Align atime/mtime to the mimicked neighbour via the stable std API.
+#[cfg(not(target_os = "linux"))]
 fn set_times(path: &Path, atime: SystemTime, mtime: SystemTime) {
     let times = fs::FileTimes::new().set_accessed(atime).set_modified(mtime);
     match OpenOptions::new().write(true).open(path) {
@@ -665,12 +1102,6 @@ fn set_times(path: &Path, atime: SystemTime, mtime: SystemTime) {
         }
         Err(e) => warn!(error = %e, "could not reopen honeytoken to set timestamps"),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn chown(path: &Path, uid: u32, gid: u32) -> Result<()> {
-    use nix::unistd::{chown as nix_chown, Gid, Uid};
-    nix_chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).context("chown failed")
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -15,12 +15,9 @@
 //! (e.g. SHA256 rules where the userspace hash hadn't been resolved to an
 //! inode yet) and is the only path on kernels < 5.3.
 
-use std::path::Path;
-
 #[cfg(target_os = "linux")]
 use anyhow::Context;
 use anyhow::Result;
-use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::schema::ExecEventData;
@@ -71,23 +68,6 @@ pub fn thaw_pid(_pid: i32) -> Result<()> {
     anyhow::bail!("process thaw only implemented on Linux")
 }
 
-/// Best-effort SHA256 of a file.  Returns `None` if the file is unreadable
-/// (short-lived process, deleted between exec and our hash attempt, …).
-fn hash_file(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = f.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Some(hex::encode(hasher.finalize()))
-}
-
 /// Look up the parent's comm by PPID.
 fn parent_comm(ppid: i32) -> Option<String> {
     if ppid <= 0 {
@@ -104,9 +84,24 @@ pub fn enforce_exec(
     policy: &PolicyHandle,
     audit: &AuditEmitter,
 ) -> Option<String> {
-    let needs_hash = !policy.read().rules().is_empty();
+    let needs_hash = policy.read().has_sha256_rules();
     let sha = if needs_hash {
-        hash_file(Path::new(&exec.exe))
+        // The collector's digest identifies the executable observed at exec;
+        // reopening its path can race an exit, unlink or replacement.
+        exec.exe_sha256
+            .as_ref()
+            .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .cloned()
+            .or_else(|| {
+                #[cfg(target_os = "linux")]
+                {
+                    crate::collectors::linux::exehash::hash_for_policy(&exec.exe)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    None
+                }
+            })
     } else {
         None
     };
@@ -170,6 +165,74 @@ pub fn enforce_exec(
                 details,
             );
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::policy::{IocRule, PolicyStore};
+    use super::*;
+
+    #[test]
+    fn comm_only_policy_does_not_hash_executables() {
+        let policy = PolicyHandle::new(
+            PolicyStore::from_rules(vec![IocRule::Comm {
+                id: "comm-alert".into(),
+                value: "fixture".into(),
+                action: RuleAction::Alert,
+            }])
+            .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let audit = AuditEmitter::new(tx, "agent".into(), "host".into());
+        let exec = ExecEventData {
+            pid: i32::MAX,
+            comm: "fixture".into(),
+            exe: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
+        enforce_exec(&exec, &policy, &audit);
+        match rx.try_recv().expect("comm rule should audit").data {
+            crate::schema::EventData::Prevention(data) => assert!(
+                data.details["sha256"].is_null(),
+                "comm-only policy must not perform a redundant disk hash"
+            ),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hash_policy_uses_collected_digest_when_executable_has_exited() {
+        let policy = PolicyHandle::new(
+            PolicyStore::from_rules(vec![IocRule::Sha256 {
+                id: "hash-alert".into(),
+                value: "ab".repeat(32),
+                action: RuleAction::Alert,
+            }])
+            .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let audit = AuditEmitter::new(tx, "agent".into(), "host".into());
+        let exec = ExecEventData {
+            pid: i32::MAX,
+            exe: "/nonexistent/trapd-digest-fixture".into(),
+            exe_sha256: Some("ab".repeat(32)),
+            ..Default::default()
+        };
+        assert!(enforce_exec(&exec, &policy, &audit).is_none());
+        let event = rx
+            .try_recv()
+            .expect("collected SHA256 must still match the policy");
+        match event.data {
+            crate::schema::EventData::Prevention(data) => {
+                assert_eq!(data.kind, "process_alert");
+                assert_eq!(data.rule_id.as_deref(), Some("hash-alert"));
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 }

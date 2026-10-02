@@ -62,7 +62,14 @@ unconfigured, so the checksum alone provides no independent release authenticity
 | Detection | Shared IOC, behaviour, IOA and Sigma engine; Windows process events project to product `windows`; signed config reloads Sigma and anomaly switches |
 | Backend | Shared enrollment, signed config, heartbeat, inventory and authenticated event ingest |
 | Delivery diagnostics | Persistent queue with restart recovery, telemetry report and `diagnostics telemetry` |
-| Honeytokens | Existing file and registry decoys, deployment/health events and cleanup during MSI removal |
+| Honeytokens | File and registry decoys, deployment/health events and ownership-verified cleanup during MSI removal |
+
+Windows honeytoken ownership is persisted in `<state>/windows_honeytoken_deployments.json`.
+Cleanup removes only registered, unchanged artifacts; file identity and content are
+checked before deletion. Modified files and preexisting registry values are preserved,
+and registry container keys remain. Registered paths are considered for cleanup even
+after configuration removes them. On upgrade, legacy decoys without ownership records
+are preserved with a warning rather than adopted or deleted automatically.
 
 Polling can miss short-lived processes and connections. File notifications do
 not identify the accessing process or report every file read. Windows has no

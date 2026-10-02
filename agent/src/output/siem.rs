@@ -17,7 +17,11 @@
 //! a dropped SIEM packet is a forwarding miss, not lost local telemetry (the
 //! NDJSON log + backend spool remain the system of record).
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use tokio::sync::{mpsc, OnceCell};
 
 use tracing::{debug, warn};
 
@@ -52,6 +56,15 @@ fn parse_syslog_addr(s: &str) -> Option<SyslogSink> {
 /// a disabled or unconfigured forwarder is a cheap no-op.
 #[derive(Clone)]
 pub struct SiemForwarder {
+    sink: Arc<SiemSink>,
+    queue: Arc<OnceCell<mpsc::Sender<AgentEvent>>>,
+    misses: Arc<AtomicU64>,
+}
+
+const FORWARD_QUEUE_CAPACITY: usize = 128;
+
+#[derive(Clone)]
+struct SiemSink {
     enabled: bool,
     fmt: SiemFormat,
     version: String,
@@ -77,35 +90,67 @@ impl SiemForwarder {
             .build()
             .unwrap_or_default();
         Self {
-            enabled: cfg.siem_enabled,
-            fmt: SiemFormat::parse(&cfg.siem_format),
-            version: version.to_string(),
-            syslog,
-            hec_url: Some(cfg.siem_hec_url.clone()).filter(|s| !s.is_empty()),
-            hec_token: Some(cfg.siem_hec_token.clone()).filter(|s| !s.is_empty()),
-            http: Arc::new(http),
+            queue: Arc::new(OnceCell::new()),
+            misses: Arc::new(AtomicU64::new(0)),
+            sink: Arc::new(SiemSink {
+                enabled: cfg.siem_enabled,
+                fmt: SiemFormat::parse(&cfg.siem_format),
+                version: version.to_string(),
+                syslog,
+                hec_url: Some(cfg.siem_hec_url.clone()).filter(|s| !s.is_empty()),
+                hec_token: Some(cfg.siem_hec_token.clone()).filter(|s| !s.is_empty()),
+                http: Arc::new(http),
+            }),
         }
     }
 
     pub fn is_active(&self) -> bool {
-        self.enabled && (self.syslog.is_some() || self.hec_url.is_some())
+        self.sink.enabled
+            && (self.sink.syslog.is_some()
+                || (self.sink.hec_url.is_some() && self.sink.hec_token.is_some()))
     }
 
-    /// Forward one event to every configured sink. Best-effort: each sink's
-    /// failure is logged and swallowed.
+    /// Queue best-effort forwarding without awaiting external network IO.
+    /// The bounded worker has its own miss count; a forwarding miss does not
+    /// discard the primary event already persisted by the telemetry pipeline.
     pub async fn forward(&self, event: &AgentEvent) {
-        if !self.enabled {
+        if !self.is_active() {
             return;
         }
-        let line = format_line(event, self.fmt, &self.version);
+        let sender = self
+            .queue
+            .get_or_init(|| async {
+                let (tx, mut rx) = mpsc::channel::<AgentEvent>(FORWARD_QUEUE_CAPACITY);
+                let sink = Arc::clone(&self.sink);
+                tokio::spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        sink.deliver(&event).await;
+                    }
+                });
+                tx
+            })
+            .await;
+        if sender.try_send(event.clone()).is_err() {
+            let total = self.misses.fetch_add(1, Ordering::Relaxed) + 1;
+            if total == 1 || total.is_multiple_of(1000) {
+                warn!(
+                    forwarding_misses = total,
+                    "SIEM forwarding queue full or closed — optional delivery skipped"
+                );
+            }
+        }
+    }
+}
 
+impl SiemSink {
+    async fn deliver(&self, event: &AgentEvent) {
+        let line = format_line(event, self.fmt, &self.version);
         if let Some(sink) = &self.syslog {
             let framed = rfc5424(event, &line);
             if let Err(e) = self.send_syslog(sink, framed.as_bytes()).await {
                 debug!(error = %e, "syslog forward failed");
             }
         }
-
         if let (Some(url), Some(token)) = (&self.hec_url, &self.hec_token) {
             if let Err(e) = self.send_hec(url, token, event, &line).await {
                 debug!(error = %e, "HEC forward failed");
@@ -323,6 +368,75 @@ mod tests {
                 comm: "sudo".into(),
             }),
         )
+    }
+
+    #[tokio::test]
+    async fn slow_hec_does_not_block_event_processing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = AgentConfig {
+            siem_enabled: true,
+            siem_hec_url: format!(
+                "http://{}/services/collector",
+                listener.local_addr().unwrap()
+            ),
+            siem_hec_token: "test-token".into(),
+            ..Default::default()
+        };
+        let forwarder = SiemForwarder::from_config(&cfg, "test");
+        let waiting = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            forwarder.forward(&ev()),
+        )
+        .await;
+        waiting.abort();
+        assert!(
+            result.is_ok(),
+            "a slow optional sink must not block the telemetry consumer"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_forwarding_reaches_healthy_syslog_sink() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cfg = AgentConfig {
+            siem_enabled: true,
+            siem_syslog_address: format!("udp://{}", receiver.local_addr().unwrap()),
+            siem_format: "json".into(),
+            ..Default::default()
+        };
+        let forwarder = SiemForwarder::from_config(&cfg, "test");
+        let event = ev();
+        forwarder.forward(&event).await;
+        let mut buf = [0u8; 8192];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let line = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(line.contains(&event.event_id.to_string()));
+        assert!(line.contains("trapd-agent"));
+    }
+
+    #[tokio::test]
+    async fn saturated_forwarding_is_bounded_and_counted() {
+        let cfg = AgentConfig {
+            siem_enabled: true,
+            siem_hec_url: "http://127.0.0.1:1".into(),
+            siem_hec_token: "test".into(),
+            ..Default::default()
+        };
+        let forwarder = SiemForwarder::from_config(&cfg, "test");
+        let (tx, rx) = mpsc::channel(FORWARD_QUEUE_CAPACITY);
+        forwarder.queue.set(tx).unwrap();
+        for _ in 0..=FORWARD_QUEUE_CAPACITY {
+            forwarder.forward(&ev()).await;
+        }
+        assert_eq!(rx.len(), FORWARD_QUEUE_CAPACITY);
+        assert_eq!(forwarder.misses.load(Ordering::Relaxed), 1);
     }
 
     #[test]

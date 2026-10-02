@@ -112,6 +112,65 @@ pub fn credentials_file() -> PathBuf {
     state_dir().join("credentials.json")
 }
 
+/// Hash an untrusted on-disk token with bounded memory and IO. Links and
+/// special files are refused before reading; a concurrent growth is bounded
+/// by the reader as well as the initial size check.
+pub(crate) fn bounded_regular_sha256(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself rather than its target. Metadata below
+        // rejects reparse points, including junctions, before any content read.
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "token is a reparse point",
+            ));
+        }
+    }
+    if !meta.is_file() || meta.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "token is not a bounded regular file",
+        ));
+    }
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    let mut hasher = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        bytes += n as u64;
+        if bytes > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "token exceeded hash limit",
+            ));
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn dir_from_env(env: &str, default: PathBuf) -> PathBuf {

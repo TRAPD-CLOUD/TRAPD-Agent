@@ -99,7 +99,7 @@ impl Finding {
             EventClass::Detection,
             EventAction::Detected,
             self.severity,
-            EventData::Detection(DetectionData {
+            EventData::Detection(Box::new(DetectionData {
                 rule_id: self.rule_id.to_string(),
                 title: self.title.to_string(),
                 category: CATEGORY.to_string(),
@@ -109,7 +109,8 @@ impl Finding {
                 subject: self.subject,
                 detail: self.detail,
                 evidence: self.evidence,
-            }),
+                ..Default::default()
+            })),
         )
         .with_source("rootkit")
     }

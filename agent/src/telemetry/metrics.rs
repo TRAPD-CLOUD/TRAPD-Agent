@@ -99,6 +99,9 @@ pub struct Metrics {
 
     // ── Detection ────────────────────────────────────────────────────────────
     detection_queue_depth: AtomicU64,
+    detections_suppressed: AtomicU64,
+    detections_aggregated: AtomicU64,
+    detections_uncatalogued: AtomicU64,
 
     // ── Persistent queue ─────────────────────────────────────────────────────
     spool_events: AtomicU64,
@@ -147,6 +150,9 @@ impl Metrics {
             enrichment_truncations: AtomicU64::new(0),
             enrichment_duration: LatencyHistogram::new(),
             detection_queue_depth: AtomicU64::new(0),
+            detections_suppressed: AtomicU64::new(0),
+            detections_aggregated: AtomicU64::new(0),
+            detections_uncatalogued: AtomicU64::new(0),
             spool_events: AtomicU64::new(0),
             spool_bytes: AtomicU64::new(0),
             spool_capacity_bytes: AtomicU64::new(0),
@@ -280,6 +286,21 @@ impl Metrics {
 
     pub fn set_detection_queue_depth(&self, depth: u64) {
         self.detection_queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// A finding dropped by a suppression rule.
+    pub fn detection_suppressed(&self) {
+        self.detections_suppressed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A repeat of a finding folded into an existing one instead of re-emitted.
+    pub fn detection_aggregated(&self) {
+        self.detections_aggregated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A finding from a rule the catalog does not know (conservative defaults).
+    pub fn detection_uncatalogued(&self) {
+        self.detections_uncatalogued.fetch_add(1, Ordering::Relaxed);
     }
 
     // ── Spool ────────────────────────────────────────────────────────────────
@@ -429,6 +450,9 @@ impl Metrics {
             enrichment_truncations_total: self.enrichment_truncations.load(Ordering::Relaxed),
             enrichment_duration: self.enrichment_duration.snapshot(),
             detection_queue_depth: self.detection_queue_depth.load(Ordering::Relaxed),
+            detections_suppressed_total: self.detections_suppressed.load(Ordering::Relaxed),
+            detections_aggregated_total: self.detections_aggregated.load(Ordering::Relaxed),
+            detections_uncatalogued_total: self.detections_uncatalogued.load(Ordering::Relaxed),
             spool_events: self.spool_events.load(Ordering::Relaxed),
             spool_bytes: self.spool_bytes.load(Ordering::Relaxed),
             spool_capacity_events: self.spool_capacity_events.load(Ordering::Relaxed),
@@ -480,6 +504,9 @@ impl Metrics {
         self.enrichment_partial.store(0, Ordering::Relaxed);
         self.enrichment_truncations.store(0, Ordering::Relaxed);
         self.detection_queue_depth.store(0, Ordering::Relaxed);
+        self.detections_suppressed.store(0, Ordering::Relaxed);
+        self.detections_aggregated.store(0, Ordering::Relaxed);
+        self.detections_uncatalogued.store(0, Ordering::Relaxed);
         self.spool_events.store(0, Ordering::Relaxed);
         self.spool_bytes.store(0, Ordering::Relaxed);
         self.spool_capacity_events.store(0, Ordering::Relaxed);
@@ -541,6 +568,12 @@ pub struct MetricsSnapshot {
     #[serde(default)]
     pub enrichment_duration: LatencySnapshot,
     pub detection_queue_depth: u64,
+    #[serde(default)]
+    pub detections_suppressed_total: u64,
+    #[serde(default)]
+    pub detections_aggregated_total: u64,
+    #[serde(default)]
+    pub detections_uncatalogued_total: u64,
     pub spool_events: u64,
     pub spool_bytes: u64,
     pub spool_capacity_events: u64,

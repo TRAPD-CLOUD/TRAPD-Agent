@@ -194,9 +194,12 @@ pub enum EventAction {
     Log,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    #[default]
     Info,
     Low,
     Medium,
@@ -254,7 +257,8 @@ pub enum EventData {
     // ── Prevention event payload ────────────────────────────────────────
     Prevention(PreventionEventData),
     // ── Detection engine payload ────────────────────────────────────────
-    Detection(DetectionData),
+    // Boxed: correlation keys and gate metadata make this a large variant.
+    Detection(Box<DetectionData>),
     // ── Honeytoken access (deception) ───────────────────────────────────
     // Boxed: the forensic session/lineage payload is much larger than the other
     // variants, so boxing keeps `EventData` compact (clippy::large_enum_variant).
@@ -817,7 +821,11 @@ pub struct PreventionEventData {
 ///
 /// This type is deliberately platform-neutral: the same engine and schema will
 /// back the future Windows agent, only the *collectors* feeding it differ.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Everything after `evidence` is stamped centrally (catalog, severity policy,
+/// correlation, finding gate) rather than by the individual rules, and is
+/// optional on the wire so journals and backends predating it still parse.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DetectionData {
     /// Stable rule identifier, e.g. `lolbin.shell_spawns_downloader`.
     pub rule_id: String,
@@ -840,6 +848,80 @@ pub struct DetectionData {
     /// Optional structured evidence (matched IOC, observed cadence, …).
     #[serde(skip_serializing_if = "serde_json::Value::is_null", default)]
     pub evidence: serde_json::Value,
+    /// `alert` findings stand on their own; `signal` findings are context that
+    /// never raises an alert by itself but strengthens correlated ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<DetectionMode>,
+    /// Rule-catalog severity before contextual modifiers were applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_severity: Option<Severity>,
+    /// Audit trail of the severity decision, e.g. `["base:high", "+root"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub severity_reasons: Vec<String>,
+    /// Context the severity policy reasoned over (`root`, `web_lineage`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_flags: Vec<String>,
+    /// Entity keys that link this finding to others (process tree, file,
+    /// remote endpoint) — what the backend groups incidents and graphs by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<CorrelationKeys>,
+    /// Stable key repeats of this finding share; aggregate updates reuse it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
+    /// Cumulative number of occurrences folded into this finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+/// Whether a finding may raise an alert on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DetectionMode {
+    #[default]
+    Alert,
+    Signal,
+}
+
+/// Correlation keys for a finding. Process keys are `boot_id:pid:start_time`
+/// (start time in clock ticks, `0` when unknown), so they survive PID reuse.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorrelationKeys {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_key: Option<String>,
+    /// Ancestors of the acting process, nearest first (bounded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage_keys: Vec<String>,
+    /// The session root: the topmost ancestor below a system service
+    /// (sshd, systemd, cron, init, container shim). Never a system service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_key: Option<String>,
+    /// One IOA chain instance; every stage finding of it shares the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
 }
 
 // ── Honeytoken access payload (deception, step 2) ─────────────────────────────

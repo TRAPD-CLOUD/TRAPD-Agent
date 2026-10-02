@@ -130,8 +130,13 @@ fi
 # ── Create directories ───────────────────────────────────────────────────────
 # systemd's StateDirectory=/LogsDirectory= also create these, but doing it here
 # keeps a manual (non-systemd) run working too.
+if [[ -L "$LOG_DIR" ]]; then
+    echo "ERROR: refusing symlink log directory ${LOG_DIR}." >&2
+    exit 1
+fi
 mkdir -p "$ENV_DIR" "$LOG_DIR" "$STATE_DIR"
 chmod 700 "$STATE_DIR"
+chmod 700 "$LOG_DIR"
 # The config dir holds agent.env (enrollment token + backend URL), the mTLS
 # client key (agent.key) and CA certs.  Make it owner-only so an unprivileged
 # user cannot even enumerate which sensitive files are present.
@@ -191,6 +196,7 @@ ExecStart=/usr/local/bin/trapd-agent
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
+UMask=0077
 
 Environment=TRAPD_OUTPUT=file
 Environment=RUST_LOG=info
@@ -208,6 +214,7 @@ EnvironmentFile=-/etc/trapd/agent.env
 StateDirectory=trapd
 StateDirectoryMode=0700
 LogsDirectory=trapd
+LogsDirectoryMode=0700
 ConfigurationDirectory=trapd
 
 # ── Hardening ────────────────────────────────────────────────────────────────
@@ -225,7 +232,8 @@ NoNewPrivileges=true
 # Capabilities for eBPF loading, network containment and file quarantine.
 # CAP_DAC_READ_SEARCH lets the (root) agent read root-owned/0640 logs such as
 # /var/log/auth.log and hash files under /home, /root for FIM (read-only).
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE CAP_DAC_READ_SEARCH
+# CAP_KILL permits response signals to processes owned by other users.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE CAP_DAC_READ_SEARCH CAP_KILL
 MemoryDenyWriteExecute=true
 LockPersonality=true
 RestrictRealtime=true
@@ -287,7 +295,7 @@ cat > "$LOGROTATE_FILE" <<'EOF'
     compress
     missingok
     notifempty
-    create 0640 root root
+    create 0600 root root
 }
 EOF
 

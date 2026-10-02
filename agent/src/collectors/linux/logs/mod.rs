@@ -201,6 +201,15 @@ async fn run_source(
     }
 }
 
+/// The committed cursor stays before all physical/logical data that only
+/// exists in memory. A restart replays it instead of silently skipping it.
+struct FileWatch {
+    tail: FileTail,
+    framer: SourceFramer,
+    pending_start: Option<checkpoint::FileCheckpoint>,
+    pending_end: Option<checkpoint::FileCheckpoint>,
+}
+
 async fn run_file_source(
     src: LogSourceConfig,
     tx: Sender<AgentEvent>,
@@ -209,7 +218,7 @@ async fn run_file_source(
     hostname: String,
 ) {
     let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
-    let mut watches: Vec<(FileTail, SourceFramer)> = Vec::new();
+    let mut watches: Vec<FileWatch> = Vec::new();
     let mut limiter = RateLimiter::new(src.max_eps);
     let mut last_glob = std::time::Instant::now() - GLOB_REFRESH;
     let mut ticker = tokio::time::interval(FILE_POLL);
@@ -228,61 +237,159 @@ async fn run_file_source(
                     let key = file_key(&src.name, &p.to_string_lossy());
                     let cp = store.lock().ok().and_then(|s| s.get_file(&key).cloned());
                     info!(source = %src.name, path = %p.display(), "file tail armed");
-                    watches.push((FileTail::new(&src, p, cp.as_ref()), SourceFramer::new(&src)));
+                    watches.push(FileWatch {
+                        tail: FileTail::new(&src, p, cp.as_ref()),
+                        framer: SourceFramer::new(&src),
+                        pending_start: None,
+                        pending_end: None,
+                    });
                 }
             }
         }
 
         let mut i = 0;
         while i < watches.len() {
-            let records = match watches[i].0.poll() {
+            let records = match watches[i].tail.poll() {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!(source = %src.name, path = %watches[i].0.path.display(), error = %e, "file poll");
+                    debug!(source = %src.name, path = %watches[i].tail.path.display(), error = %e, "file poll");
                     i += 1;
                     continue;
                 }
             };
-            let path = watches[i].0.path.clone();
+            let path = watches[i].tail.path.clone();
             let path_s = path.to_string_lossy().into_owned();
             for rec in records {
-                let logical = match watches[i].1.push(&rec.line.as_str()) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                if !emit_one(
-                    &src,
-                    &logical,
-                    normalize::EmitMeta {
-                        source_path: &path_s,
-                        offset: Some(rec.offset),
-                        inode: Some(rec.inode),
-                        truncated: rec.line.truncated,
-                        original_len: rec.line.original_len,
-                    },
-                    &tx,
-                    &agent_id,
-                    &hostname,
-                    &mut limiter,
-                )
-                .await
-                {
-                    return;
+                // A logical record cannot span two file generations. Release
+                // the old record before accepting a line from a new inode.
+                if watches[i].pending_start.as_ref().is_some_and(|cp| {
+                    cp.inode != rec.inode
+                        || cp.dev != rec.checkpoint.dev
+                        || watches[i]
+                            .pending_end
+                            .as_ref()
+                            .is_some_and(|end| rec.start_offset < end.offset)
+                }) {
+                    if let (Some(logical), Some(cp)) =
+                        (watches[i].framer.flush(), watches[i].pending_end.take())
+                    {
+                        if !emit_one(
+                            &src,
+                            &logical,
+                            normalize::EmitMeta {
+                                source_path: &path_s,
+                                offset: Some(cp.offset),
+                                inode: Some(cp.inode),
+                                truncated: false,
+                                original_len: 0,
+                            },
+                            &tx,
+                            &agent_id,
+                            &hostname,
+                            &mut limiter,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                    watches[i].pending_start = None;
+                }
+                let previous_end = watches[i].pending_end.clone();
+                let logical_records = watches[i].framer.push(&rec.line.as_str());
+                let pending = watches[i].framer.has_pending();
+                let count = logical_records.len();
+                for (index, logical) in logical_records.into_iter().enumerate() {
+                    let completed_previous =
+                        previous_end.is_some() && (pending || index + 1 < count);
+                    let cp = if completed_previous {
+                        previous_end.as_ref().unwrap()
+                    } else {
+                        &rec.checkpoint
+                    };
+                    if !emit_one(
+                        &src,
+                        &logical,
+                        normalize::EmitMeta {
+                            source_path: &path_s,
+                            offset: Some(cp.offset),
+                            inode: Some(cp.inode),
+                            truncated: rec.line.truncated,
+                            original_len: rec.line.original_len,
+                        },
+                        &tx,
+                        &agent_id,
+                        &hostname,
+                        &mut limiter,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+                if pending {
+                    if watches[i].pending_start.is_none() || count > 0 {
+                        let mut start = rec.checkpoint.clone();
+                        start.offset = rec.start_offset;
+                        watches[i].pending_start = Some(start);
+                    }
+                    watches[i].pending_end = Some(rec.checkpoint);
+                } else {
+                    watches[i].pending_start = None;
+                    watches[i].pending_end = None;
                 }
             }
-            while let Some(logical) = watches[i].1.poll_timeout() {
-                let (offset, inode) = watches[i]
-                    .0
-                    .checkpoint()
-                    .map(|c| (Some(c.offset), Some(c.inode)))
-                    .unwrap_or((None, None));
+            // Rotation/truncation may lead into an empty file, producing no
+            // TailedLine that could carry the generation change. Flush the
+            // old logical buffer against its original identity in that case.
+            let tail_cp = watches[i].tail.checkpoint();
+            let changed = watches[i]
+                .pending_end
+                .as_ref()
+                .zip(tail_cp.as_ref())
+                .is_some_and(|(old, current)| {
+                    old.dev != current.dev
+                        || old.inode != current.inode
+                        || current.offset < old.offset
+                });
+            if changed {
+                if let (Some(logical), Some(cp)) =
+                    (watches[i].framer.flush(), watches[i].pending_end.take())
+                {
+                    if !emit_one(
+                        &src,
+                        &logical,
+                        normalize::EmitMeta {
+                            source_path: &path_s,
+                            offset: Some(cp.offset),
+                            inode: Some(cp.inode),
+                            truncated: false,
+                            original_len: 0,
+                        },
+                        &tx,
+                        &agent_id,
+                        &hostname,
+                        &mut limiter,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+                watches[i].pending_start = None;
+            }
+            while let Some(logical) = watches[i].framer.poll_timeout() {
+                let cp = watches[i]
+                    .pending_end
+                    .take()
+                    .or_else(|| watches[i].tail.checkpoint());
                 if !emit_one(
                     &src,
                     &logical,
                     normalize::EmitMeta {
                         source_path: &path_s,
-                        offset,
-                        inode,
+                        offset: cp.as_ref().map(|c| c.offset),
+                        inode: cp.as_ref().map(|c| c.inode),
                         truncated: false,
                         original_len: 0,
                     },
@@ -295,8 +402,13 @@ async fn run_file_source(
                 {
                     return;
                 }
+                watches[i].pending_start = None;
             }
-            if let Some(cp) = watches[i].0.checkpoint() {
+            let cp = watches[i]
+                .pending_start
+                .clone()
+                .or_else(|| watches[i].tail.checkpoint());
+            if let Some(cp) = cp {
                 if let Ok(mut s) = store.lock() {
                     s.put_file(file_key(&src.name, &path.to_string_lossy()), cp);
                 }
@@ -474,11 +586,27 @@ impl SourceFramer {
         Self::Pass
     }
 
-    fn push(&mut self, line: &str) -> Option<String> {
+    fn push(&mut self, line: &str) -> Vec<String> {
         match self {
-            Self::Pass => Some(line.to_string()),
-            Self::Multiline(m) => m.push(line),
+            Self::Pass => vec![line.to_string()],
+            Self::Multiline(m) => m.push(line).into_iter().collect(),
             Self::Audit(a) => a.push(line),
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        match self {
+            Self::Pass => false,
+            Self::Multiline(m) => m.has_pending(),
+            Self::Audit(a) => a.has_pending(),
+        }
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        match self {
+            Self::Pass => None,
+            Self::Multiline(m) => m.flush(),
+            Self::Audit(a) => a.flush(),
         }
     }
 
@@ -494,6 +622,98 @@ impl SourceFramer {
 mod tests {
     use super::*;
     use crate::schema::{EventAction, EventClass, EventData};
+
+    #[tokio::test]
+    async fn file_generation_change_flushes_pending_audit_into_empty_file() {
+        for copytruncate in [false, true] {
+            let dir = std::env::temp_dir()
+                .join(format!("trapd_audit_generation_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("audit.log");
+            let first = "type=SYSCALL msg=audit(1.0:9): syscall=59 comm=\"bash\"\n";
+            std::fs::write(&path, first).unwrap();
+            let src = LogSourceConfig::file("audit", &path.to_string_lossy(), "auditd")
+                .read_from_beginning();
+            let store = Arc::new(Mutex::new(CheckpointStore::load(dir.join("cp.json"))));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let task = tokio::spawn(run_file_source(
+                src.clone(),
+                tx,
+                store.clone(),
+                "a".into(),
+                "h".into(),
+            ));
+            let key = file_key(&src.name, &path.to_string_lossy());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if store.lock().unwrap().get_file(&key).is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(rx.try_recv().is_err());
+            if !copytruncate {
+                std::fs::rename(&path, dir.join("audit.log.1")).unwrap();
+            }
+            std::fs::write(&path, "").unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+            task.abort();
+            let _ = task.await;
+            std::fs::remove_dir_all(dir).unwrap();
+            let event = result
+                .expect("generation boundary must release the old audit record")
+                .unwrap();
+            let EventData::Log(log) = event.data else {
+                panic!("expected log");
+            };
+            assert!(log.message.contains("msg=audit(1.0:9)"));
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_checkpoint_retains_pending_multiline() {
+        let dir = std::env::temp_dir().join(format!("trapd_multiline_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.log");
+        let first = "2024-01-15 12:00:00.000 UTC [1] LOG: SELECT\n    FROM users\n";
+        std::fs::write(&path, first).unwrap();
+        let mut src =
+            LogSourceConfig::file("app", &path.to_string_lossy(), "raw").read_from_beginning();
+        let mut ml = crate::config::MultilineConfig::postgres();
+        ml.timeout_ms = 60_000;
+        src.multiline = Some(ml);
+        let store = Arc::new(Mutex::new(CheckpointStore::load(dir.join("cp.json"))));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(run_file_source(
+            src.clone(),
+            tx,
+            store.clone(),
+            "a".into(),
+            "h".into(),
+        ));
+        let key = file_key(&src.name, &path.to_string_lossy());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.lock().unwrap().get_file(&key).is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let cp = store.lock().unwrap().get_file(&key).unwrap().clone();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(cp.offset, 0, "pending logical record must be replayable");
+        assert!(rx.try_recv().is_err());
+        let mut resumed = FileTail::new(&src, path, Some(&cp));
+        assert_eq!(resumed.poll().unwrap().len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn file_source_emits_canonical_log_event() {

@@ -371,7 +371,7 @@ impl Collector for ProcessCollector {
                                 EventClass::Detection,
                                 EventAction::Detected,
                                 Severity::High,
-                                EventData::Detection(DetectionData {
+                                EventData::Detection(Box::new(DetectionData {
                                     rule_id: "privesc.untracked_suid_exec".into(),
                                     title: "Execution of a SUID binary not in the startup baseline".into(),
                                     category: "privilege_escalation".into(),
@@ -389,7 +389,8 @@ impl Collector for ProcessCollector {
                                         "uid": info.uid,
                                         "comm": info.name,
                                     }),
-                                }),
+                                    ..Default::default()
+                                })),
                             );
                             if tx.send(det).await.is_err() {
                                 return Ok(());

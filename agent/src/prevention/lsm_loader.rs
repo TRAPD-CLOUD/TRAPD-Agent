@@ -15,21 +15,22 @@
 //! `process::enforce_exec` still works.
 
 #[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
 use std::path::Path;
-use std::sync::Arc;
 
 use tokio::sync::Mutex;
 #[cfg(target_os = "linux")]
 use tracing::info;
 use tracing::warn;
 
-#[cfg(target_os = "linux")]
-use super::policy::IocRule;
 use super::policy::PolicyHandle;
+#[cfg(target_os = "linux")]
+use super::policy::{IocRule, RuleAction};
 
 /// Handle to the in-kernel block-maps.
 pub struct LsmHandle {
-    state: Arc<Mutex<Option<LsmState>>>,
+    state: Mutex<Option<LsmState>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -43,19 +44,30 @@ struct LsmState {
 struct LsmState;
 
 impl LsmHandle {
-    /// Try to load the kernel-side blocker.  Returns a disabled handle on
-    /// any failure (missing binary, missing CAP_BPF, kernel too old, …).
-    pub fn try_load() -> Self {
-        let inner = Self::do_load().unwrap_or_else(|e| {
+    /// A runtime-owned handle which does not attach until prevention is enabled.
+    pub fn disabled() -> Self {
+        Self {
+            state: Mutex::new(None),
+        }
+    }
+
+    /// Detach immediately on disable; attach on enable if the kernel supports it.
+    pub async fn set_enabled(&self, enabled: bool) {
+        let mut state = self.state.lock().await;
+        if !enabled {
+            *state = None;
+            return;
+        }
+        if state.is_some() {
+            return;
+        }
+        *state = Self::do_load().unwrap_or_else(|e| {
             warn!(
                 error = %e,
                 "kernel-side exec blocker not loaded — falling back to userspace post-exec kill",
             );
             None
         });
-        Self {
-            state: Arc::new(Mutex::new(inner)),
-        }
     }
 
     #[cfg(target_os = "linux")]
@@ -119,7 +131,7 @@ impl LsmHandle {
         anyhow::bail!("kernel exec blocker only on Linux")
     }
 
-    /// Re-sync the kernel maps with the current policy.  Cheap to call.
+    /// Replace kernel block lists, removing revoked and alert-only rules first.
     pub async fn sync(&self, policy: &PolicyHandle) {
         let mut guard = self.state.lock().await;
         let state = match guard.as_mut() {
@@ -128,19 +140,25 @@ impl LsmHandle {
         };
         #[cfg(target_os = "linux")]
         {
-            let rules: Vec<IocRule> = policy.read().rules().to_vec();
-            for r in &rules {
-                if let IocRule::Comm { value, .. } = r {
-                    let key = comm_key(value);
-                    let _ = state.blocked_comms.insert(key, 1, 0);
-                }
-            }
-            for r in &rules {
-                if let IocRule::Sha256 { value, .. } = r {
-                    if let Some(ino) = resolve_inode_for_hash(value) {
-                        let _ = state.blocked_inodes.insert(ino, 1, 0);
-                    }
-                }
+            let rules = policy.read().rules().to_vec();
+            let comms = block_comm_keys(&rules);
+            let inodes = rules
+                .iter()
+                .filter_map(|r| match r {
+                    IocRule::Sha256 {
+                        value,
+                        action: RuleAction::Block,
+                        ..
+                    } => resolve_inode_for_hash(value),
+                    _ => None,
+                })
+                .collect();
+            let result = reconcile_map(&mut state.blocked_comms, &comms)
+                .and_then(|()| reconcile_map(&mut state.blocked_inodes, &inodes));
+            if let Err(error) = result {
+                // A failed removal must never leave a revoked rule armed.
+                warn!(%error, "kernel policy reconciliation failed — detaching blocker and using userspace enforcement");
+                *guard = None;
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -149,6 +167,47 @@ impl LsmHandle {
             let _ = state;
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn block_comm_keys(rules: &[IocRule]) -> BTreeSet<[u8; 16]> {
+    rules
+        .iter()
+        .filter_map(|r| match r {
+            // Kernel comm cannot represent longer or embedded-NUL names. Do not
+            // silently broaden an exact match by truncating a backend rule.
+            IocRule::Comm {
+                value,
+                action: RuleAction::Block,
+                ..
+            } if value.len() <= 15 && !value.as_bytes().contains(&0) => Some(comm_key(value)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn key_changes<K: Copy + Ord>(current: &BTreeSet<K>, desired: &BTreeSet<K>) -> (Vec<K>, Vec<K>) {
+    (
+        current.difference(desired).copied().collect(),
+        desired.difference(current).copied().collect(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_map<K: aya::Pod + Copy + Ord>(
+    map: &mut aya::maps::HashMap<aya::maps::MapData, K, u8>,
+    desired: &BTreeSet<K>,
+) -> anyhow::Result<()> {
+    let current = map.keys().collect::<Result<BTreeSet<_>, _>>()?;
+    let (removed, added) = key_changes(&current, desired);
+    for key in removed {
+        map.remove(&key)?;
+    }
+    for key in added {
+        map.insert(key, 1, 0)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -169,4 +228,64 @@ fn comm_key(s: &str) -> [u8; 16] {
 #[cfg(target_os = "linux")]
 fn resolve_inode_for_hash(_hash: &str) -> Option<u64> {
     None
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_block_list_excludes_alert_and_unrepresentable_names() {
+        let rules = vec![
+            IocRule::Comm {
+                id: "a".into(),
+                value: "bash".into(),
+                action: RuleAction::Alert,
+            },
+            IocRule::Comm {
+                id: "b".into(),
+                value: "curl".into(),
+                action: RuleAction::Block,
+            },
+            IocRule::Comm {
+                id: "c".into(),
+                value: "1234567890123456".into(),
+                action: RuleAction::Block,
+            },
+        ];
+        assert_eq!(
+            block_comm_keys(&rules),
+            BTreeSet::from([*b"curl\0\0\0\0\0\0\0\0\0\0\0\0"])
+        );
+    }
+
+    #[test]
+    fn policy_replacement_removes_revoked_block_keys() {
+        let current = BTreeSet::from([
+            *b"bash\0\0\0\0\0\0\0\0\0\0\0\0",
+            *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
+        ]);
+        let desired = block_comm_keys(&[
+            IocRule::Comm {
+                id: "a".into(),
+                value: "bash".into(),
+                action: RuleAction::Alert,
+            },
+            IocRule::Comm {
+                id: "c".into(),
+                value: "wget".into(),
+                action: RuleAction::Block,
+            },
+        ]);
+        let (removed, added) = key_changes(&current, &desired);
+        assert_eq!(
+            removed,
+            vec![
+                *b"bash\0\0\0\0\0\0\0\0\0\0\0\0",
+                *b"curl\0\0\0\0\0\0\0\0\0\0\0\0"
+            ]
+        );
+        assert_eq!(added, vec![*b"wget\0\0\0\0\0\0\0\0\0\0\0\0"]);
+        assert_eq!(key_changes(&desired, &BTreeSet::new()).0, added);
+    }
 }
