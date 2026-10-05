@@ -172,7 +172,13 @@ fn install_file(target: &Path, bytes: &[u8], mode: u32) -> Result<Installed> {
     }
     #[cfg(not(unix))]
     let _ = mode;
-    std::fs::File::open(&new)?.sync_all()?;
+    // Windows requires write access for FlushFileBuffers (used by sync_all).
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&new)
+        .context("update: open new file for sync")?
+        .sync_all()
+        .context("update: sync new file")?;
 
     if target.exists() {
         let prev = prev_path(target);
