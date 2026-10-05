@@ -47,6 +47,9 @@ use crate::telemetry::{metrics::metrics, DropReason};
 const NORMAL_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const CATCH_UP_THRESHOLD: usize = 200;
 const CATCH_UP_PACING: Duration = Duration::from_millis(25);
+/// Shortest gap between two priority-triggered flushes, so a detection storm
+/// cannot turn into a request per event.
+const PRIORITY_MIN_GAP: Duration = Duration::from_millis(50);
 /// Bodies below this are sent as-is: gzip overhead outweighs the saving.
 const COMPRESS_MIN_BYTES: usize = 1024;
 /// Upper bound honoured for a server-sent `Retry-After`, so a bad value cannot
@@ -79,6 +82,9 @@ pub struct Transport {
     gzip_ok: AtomicBool,
     /// Seconds from the last `Retry-After`, consumed by the flush loop.
     retry_after_secs: AtomicU64,
+    /// Fired by the spool when a detection/prevention event is queued; cuts the
+    /// idle wait short (never the failure backoff).
+    priority_wake: Arc<tokio::sync::Notify>,
 }
 
 impl Transport {
@@ -92,8 +98,13 @@ impl Transport {
         // Fail-closed: ingest shares the control channel's pinned-TLS posture;
         // no plain-client fall-back.
         let client = crate::http::streaming_client()?;
+        let priority_wake = buffer
+            .lock()
+            .map_err(|e| anyhow::anyhow!("spool mutex poisoned: {e}"))?
+            .priority_wake();
         Ok(Self {
             buffer,
+            priority_wake,
             client,
             ingest_url,
             token,
@@ -124,14 +135,14 @@ impl Transport {
             match self.flush(catching_up).await {
                 FlushOutcome::Idle => {
                     metrics().set_transport_catching_up(false);
-                    tokio::time::sleep(NORMAL_FLUSH_INTERVAL).await;
+                    self.wait(NORMAL_FLUSH_INTERVAL).await;
                 }
                 FlushOutcome::Delivered => {
                     consecutive_failures = 0;
                     // Sequential requests deliberately bound inflight memory to
                     // one batch. In catch-up mode this still permits up to 40
                     // batches/s while backend latency applies natural pressure.
-                    tokio::time::sleep(if catching_up {
+                    self.wait(if catching_up {
                         CATCH_UP_PACING
                     } else {
                         NORMAL_FLUSH_INTERVAL
@@ -141,6 +152,18 @@ impl Transport {
                 FlushOutcome::Failed => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                 }
+            }
+        }
+    }
+
+    /// Wait for the next flush: the full interval, or until a priority event
+    /// arrives (then only [`PRIORITY_MIN_GAP`] from now, to bound the request
+    /// rate under a detection storm).
+    async fn wait(&self, interval: Duration) {
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            () = self.priority_wake.notified() => {
+                tokio::time::sleep(PRIORITY_MIN_GAP.min(interval)).await;
             }
         }
     }
@@ -723,7 +746,9 @@ mod tests {
         for _ in 0..events {
             spool.push(event()).unwrap();
         }
+        let priority_wake = spool.priority_wake();
         Transport {
+            priority_wake,
             buffer: Arc::new(Mutex::new(spool)),
             client: reqwest::Client::new(),
             ingest_url: url,
@@ -828,7 +853,9 @@ mod tests {
                 }
             };
             fill(&mut spool);
+            let priority_wake = spool.priority_wake();
             Transport {
+                priority_wake,
                 buffer: Arc::new(Mutex::new(spool)),
                 client: reqwest::Client::new(),
                 ingest_url: var("TRAPD_E2E_INGEST_URL"),

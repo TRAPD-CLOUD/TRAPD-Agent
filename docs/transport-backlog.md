@@ -21,9 +21,17 @@ existing jittered exponential backoff (1 second through 5 minutes); permanent
 4xx and partial acknowledgements keep their existing explicit accounting.
 
 The queue remains durable and acknowledgement is still idempotent by spool
-sequence. This intentionally avoids priority reordering: sequence gaps remain
-meaningful and a crash cannot create ambiguous priority-lane state. Near-real
-time is instead obtained by rapid catch-up plus source noise reduction.
+sequence, so delivery order never carried meaning for correctness (retry
+backoff already skips ineligible records). That makes a priority lane safe:
+`Detection` and `Prevention` events are selected into a batch ahead of bulk
+telemetry, up to three quarters of the batch while bulk is waiting, so a
+detection storm delays process/network events but cannot starve them. Unused
+slots go to the other class. A queued priority event also wakes the transport
+immediately (at most one flush per 50 ms) instead of waiting for the 1 s tick;
+the failure backoff is never shortened. Inside one batch events keep arrival
+order, and the lane is a selection rule over the same journal, so a crash has no
+extra state to recover. The backend sees `origin.sequence` gaps/reordering across
+batches for these classes, which the dedup on `event_id` already tolerates.
 
 Generic filesystem telemetry coalesces identical `(path, action)` notifications
 for two seconds and suppresses cache/editor temporary artifacts. Credential,
