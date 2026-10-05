@@ -354,6 +354,27 @@ mod ownership_regressions {
     }
 
     #[test]
+    fn unlisted_unmanaged_file_is_left_in_place_and_reported() {
+        let _serial = serialize();
+        let path = std::env::temp_dir().join(format!("trapd-win-foreign-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"someone else's file").unwrap();
+        let state = FsState::default();
+        plant_missing(std::slice::from_ref(&path), &state);
+        let config = Arc::new(RwLock::new(AgentConfig::default()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        reconcile_removed(&tx, "agent", "host", &config, &state);
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's file");
+        assert_eq!(
+            revoked_events(&mut rx),
+            vec![(path.display().to_string(), false)]
+        );
+        // Reported once only.
+        reconcile_removed(&tx, "agent", "host", &config, &state);
+        assert!(revoked_events(&mut rx).is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn registry_entries_are_not_treated_as_files() {
         let mut cfg = AgentConfig::default();
         assert!(!registry_decoys_requested(&cfg));
@@ -933,6 +954,39 @@ fn reconcile_removed(
     let desired: HashSet<PathBuf> = desired_file_paths(config).into_iter().collect();
     if let Ok(mut reported) = state.reported.lock() {
         reported.retain(|path| desired.contains(path));
+    }
+    // Unmanaged files (a file already sat at the path when it was listed, or a
+    // legacy install planted it without an ownership record) are never touched.
+    // Once the operator unlists such a path, tell the backend so the token does
+    // not linger: the file is left in place and no longer monitored.
+    let released: Vec<PathBuf> = match state.ignored.lock() {
+        Ok(mut ignored) => {
+            let gone: Vec<PathBuf> = ignored
+                .iter()
+                .filter(|path| !desired.contains(*path))
+                .cloned()
+                .collect();
+            for path in &gone {
+                ignored.remove(path);
+            }
+            gone
+        }
+        Err(_) => Vec::new(),
+    };
+    for path in released {
+        info!(path = %path.display(), "unmanaged honeytoken path released; file left in place");
+        send_prevention(
+            tx,
+            agent_id,
+            hostname,
+            EventAction::HoneytokenRevoked,
+            Severity::Info,
+            "honeytoken_revoke",
+            path.display().to_string(),
+            false,
+            "file is not managed by TRAPD; left in place and no longer monitored".to_string(),
+            serde_json::json!({ "kind": "windows_decoy_file", "preserved": true }),
+        );
     }
     let stale: Vec<(PathBuf, OwnedFile)> = match deployments().lock() {
         Ok(register) => register
