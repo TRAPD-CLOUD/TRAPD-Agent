@@ -1,0 +1,11 @@
+# Starts the apply helper when the agent stages a verified update. Debian
+# package copy of the unit install.sh writes inline.
+[Unit]
+Description=Watch for a staged TRAPD Agent update
+
+[Path]
+PathChanged=/var/lib/trapd/update/staged.offer.json
+Unit=trapd-agent-update.service
+
+[Install]
+WantedBy=multi-user.target

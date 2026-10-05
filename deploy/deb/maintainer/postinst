@@ -1,0 +1,95 @@
+#!/bin/sh
+set -e
+
+BIN=/usr/bin/trapd-agent
+ENV_DIR=/etc/trapd
+STATE_DIR=/var/lib/trapd
+LOG_DIR=/var/log/trapd
+BACKEND_URL_FILE=/usr/share/trapd-agent/backend_url
+
+warn() { echo "trapd-agent: warning: $*" >&2; }
+
+systemd_active() {
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+# Honour policy-rc.d (chroots, image builds) like invoke-rc.d would.
+start_allowed() {
+    [ -x /usr/sbin/policy-rc.d ] || return 0
+    /usr/sbin/policy-rc.d trapd-agent start >/dev/null 2>&1 && return 0
+    [ "$?" = 104 ]
+}
+
+case "$1" in
+configure)
+    for d in "$STATE_DIR" "$LOG_DIR"; do
+        if [ -L "$d" ]; then
+            echo "trapd-agent: refusing symlinked directory $d" >&2
+            exit 1
+        fi
+        install -d -m 0700 -o root -g root "$d"
+    done
+
+    # Only created when absent: an operator's edits (and a token, should they
+    # add one) survive upgrades. No enrollment token => the agent pairs.
+    if [ ! -e "$ENV_DIR/agent.env" ]; then
+        url="$(head -n 1 "$BACKEND_URL_FILE")"
+        (
+            umask 077
+            {
+                echo "TRAPD_BACKEND_URL=${url}"
+                echo "TRAPD_OUTPUT=file"
+                echo "RUST_LOG=info"
+            } > "$ENV_DIR/agent.env.new.$$"
+        )
+        chmod 0600 "$ENV_DIR/agent.env.new.$$"
+        mv -f "$ENV_DIR/agent.env.new.$$" "$ENV_DIR/agent.env"
+    fi
+
+    # Refresh the self-integrity baseline for the binary dpkg just unpacked, as
+    # install.sh does; otherwise selfprotect::binary_integrity treats the
+    # upgrade as tampering and the agent refuses to start.
+    (
+        umask 077
+        printf 'sha256:%s\n' "$(sha256sum "$BIN" | awk '{print $1}')" > "$ENV_DIR/binary.sha256.new.$$"
+    )
+    chmod 0600 "$ENV_DIR/binary.sha256.new.$$"
+    mv -f "$ENV_DIR/binary.sha256.new.$$" "$ENV_DIR/binary.sha256"
+
+    if systemd_active; then
+        systemctl daemon-reload || warn "systemctl daemon-reload failed"
+        systemctl enable trapd-agent.service trapd-agent-update.path >/dev/null 2>&1 \
+            || warn "could not enable trapd-agent units"
+        if start_allowed; then
+            if [ -n "$2" ]; then
+                # Upgrade/reinstall: run the new binary.
+                systemctl try-restart trapd-agent.service || warn "could not restart trapd-agent"
+                systemctl start trapd-agent-update.path || warn "could not start trapd-agent-update.path"
+            else
+                systemctl start trapd-agent.service trapd-agent-update.path \
+                    || warn "could not start trapd-agent (see: journalctl -u trapd-agent)"
+            fi
+        fi
+    fi
+
+    if [ -z "$2" ] && [ ! -e "$STATE_DIR/credentials.json" ]; then
+        if systemd_active && [ -z "${TRAPD_DEB_NO_WAIT:-}" ]; then
+            i=0
+            while [ "$i" -lt 20 ] && [ ! -s "$STATE_DIR/pairing.txt" ]; do
+                sleep 1
+                i=$((i + 1))
+            done
+        fi
+        echo
+        echo "TRAPD agent installed. It pairs this device with your account:"
+        if [ -s "$STATE_DIR/pairing.txt" ]; then
+            # Printable ASCII only, whatever the file holds.
+            head -n 10 "$STATE_DIR/pairing.txt" | tr -cd '[:print:]\n'
+        else
+            echo "  sudo cat $STATE_DIR/pairing.txt   (shows the code and the page to enter it on)"
+        fi
+    fi
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,39 @@
+#!/bin/sh
+set -e
+
+systemd_active() {
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+# Never recurse through a symlink planted where a data directory should be.
+remove_dir() {
+    if [ -L "$1" ]; then
+        rm -f "$1"
+    else
+        rm -rf "$1"
+    fi
+}
+
+case "$1" in
+remove|purge|abort-install|disappear)
+    # Files the signed updater leaves next to the binaries it swaps
+    # (agent/src/update/apply.rs: `<name>.prev`, `.<name>.new`); dpkg does not
+    # know them, so it would not remove them.
+    rm -f /usr/bin/trapd-agent.prev /usr/bin/.trapd-agent.new \
+          /usr/lib/trapd-agent/trapd-agent-exec.prev /usr/lib/trapd-agent/.trapd-agent-exec.new
+    rmdir /usr/lib/trapd-agent 2>/dev/null || true
+    if systemd_active; then
+        systemctl daemon-reload || true
+    fi
+    ;;
+esac
+
+if [ "$1" = purge ]; then
+    # Credentials, the mTLS key and staged updates: the device must pair again.
+    remove_dir /var/lib/trapd
+    remove_dir /var/log/trapd
+    remove_dir /etc/trapd
+    rmdir /etc/trapd-release 2>/dev/null || true
+fi
+
+exit 0

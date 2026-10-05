@@ -1,0 +1,35 @@
+#!/bin/sh
+# A script-based install (deploy/install.sh) puts the binary in /usr/local/bin
+# and its own unit in /etc/systemd/system, which would shadow the packaged unit
+# and leave two agents fighting over one state directory. Refuse instead of
+# guessing; the state directory (credentials) can be reused afterwards.
+set -e
+
+case "$1" in
+install)
+    if [ -e /usr/local/bin/trapd-agent ] || [ -e /etc/systemd/system/trapd-agent.service ]; then
+        cat >&2 <<MSG
+trapd-agent: a script-based install (install.sh) was found:
+  /usr/local/bin/trapd-agent and/or /etc/systemd/system/trapd-agent.service
+Remove it first, then install this package again:
+  sudo systemctl disable --now trapd-agent trapd-agent-update.path trapd-update.timer
+  sudo rm -f /usr/local/bin/trapd-agent /usr/local/bin/trapd-update \\
+             /etc/systemd/system/trapd-agent.service \\
+             /etc/systemd/system/trapd-agent-update.service \\
+             /etc/systemd/system/trapd-agent-update.path \\
+             /etc/systemd/system/trapd-update.service \\
+             /etc/systemd/system/trapd-update.timer
+  sudo systemctl daemon-reload
+The device credentials in /var/lib/trapd are kept and reused.
+MSG
+        exit 1
+    fi
+    ;;
+upgrade)
+    if [ -e /etc/systemd/system/trapd-agent.service ]; then
+        echo "trapd-agent: warning: /etc/systemd/system/trapd-agent.service overrides the packaged unit." >&2
+    fi
+    ;;
+esac
+
+exit 0
