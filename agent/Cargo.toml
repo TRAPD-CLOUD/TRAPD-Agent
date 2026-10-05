@@ -27,6 +27,9 @@ hex                = "0.4"
 walkdir            = "2"
 ed25519-dalek      = { version = "2", features = ["pkcs8", "pem"] }
 base64             = "0.22"
+# gzip request bodies (transport). Pure Rust (miniz_oxide): no C toolchain needed
+# for the Windows cross build, unlike zstd bindings.
+flate2             = "1"
 globset            = "0.4"
 ipnet              = { version = "2", features = ["serde"] }
 getrandom          = "0.3"

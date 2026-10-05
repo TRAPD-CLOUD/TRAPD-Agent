@@ -172,8 +172,9 @@ possible output.
 - Auth: bearer `agent_secret`.
 - Request body: JSON array of `AgentEvent`.
 - Batch size: up to 100 events, or 4 MiB, whichever comes first.
-- Flush interval: every 5 seconds, plus jittered exponential backoff (1 s → 5 min)
-  after a failed batch.
+- Flush interval: every 1 second (catch-up mode sends the next batch 25 ms after
+  a success while 200+ events are queued), plus jittered exponential backoff
+  (1 s → 5 min) after a failed batch.
 - Delivery is **at-least-once** — see "Idempotent ingest" below.
 
 **Response handling.** The three outcomes map to different queue actions, so the
