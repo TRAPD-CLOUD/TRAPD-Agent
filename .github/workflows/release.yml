@@ -7,10 +7,15 @@ on:
 
 permissions:
   contents: write
+  # Needed by the SignPath action (windows-package.yml) to read the uploaded
+  # unsigned artifact. A called workflow cannot hold more than its caller.
+  actions: read
 
 jobs:
   windows-msi:
     uses: ./.github/workflows/windows-package.yml
+    # Passes SIGNPATH_API_TOKEN (optional) to the called workflow.
+    secrets: inherit
 
   release:
     needs: windows-msi
@@ -104,6 +109,38 @@ jobs:
           # comment at the top of deploy/trapd-update.sh.
           cp deploy/trapd-update.sh trapd-update.sh
 
+      # Debian package with the hosted service's PUBLIC trust anchors baked in,
+      # so a double-click / `apt install ./x.deb` install pairs without any
+      # configuration. Values come from repository variables (never secrets) and
+      # go through env, not into the script text. Without all five variables no
+      # package is built; the web installer remains the way to install.
+      - name: Build Debian package (hosted trust anchors)
+        id: deb
+        env:
+          TRAPD_HOSTED_BACKEND_URL: ${{ vars.TRAPD_HOSTED_BACKEND_URL }}
+          TRAPD_HOSTED_CA_PEM: ${{ vars.TRAPD_HOSTED_CA_PEM }}
+          TRAPD_HOSTED_COMMAND_PUBKEY: ${{ vars.TRAPD_HOSTED_COMMAND_PUBKEY }}
+          TRAPD_HOSTED_RELEASE_PUBKEY: ${{ vars.TRAPD_HOSTED_RELEASE_PUBKEY }}
+        run: |
+          for v in TRAPD_HOSTED_BACKEND_URL TRAPD_HOSTED_CA_PEM TRAPD_HOSTED_COMMAND_PUBKEY TRAPD_HOSTED_RELEASE_PUBKEY; do
+            if [ -z "${!v}" ]; then
+              echo "::notice::Debian package skipped (repository variable ${v} not set)"
+              echo "built=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          mkdir trust
+          printf '%s\n' "${TRAPD_HOSTED_BACKEND_URL}" > trust/backend_url
+          printf '%s\n' "${TRAPD_HOSTED_CA_PEM}" > trust/ca.crt
+          printf '%s' "${TRAPD_HOSTED_COMMAND_PUBKEY}" | base64 -d > trust/command_signing.pub
+          printf '%s' "${TRAPD_HOSTED_RELEASE_PUBKEY}" | base64 -d > trust/release_signing.pub
+          # build-deb.sh fails on malformed anchors (key sizes, private keys, URL).
+          deploy/deb/build-deb.sh "${GITHUB_REF_NAME#v}" trapd-agent-linux-x86_64 trapd-agent-exec trust deb-out
+          deb_files=(deb-out/*.deb)
+          [ "${#deb_files[@]}" -eq 1 ] || { echo "::error::expected exactly one .deb in deb-out"; exit 1; }
+          cp "${deb_files[0]}" trapd-agent-linux-amd64.deb
+          echo "built=true" >> "$GITHUB_OUTPUT"
+
       - name: Generate SHA256 checksums
         run: |
           # Per-artifact checksum files consumed by install.sh / trapd-update,
@@ -116,6 +153,11 @@ jobs:
           sha256sum trapd-agent-exec               > trapd-agent-exec.sha256
           sha256sum trapd-update.sh                > trapd-update.sh.sha256
           sha256sum trapd-agent-windows-install.ps1 > trapd-agent-windows-install.ps1.sha256
+          extra=()
+          if [ "${{ steps.deb.outputs.built }}" = "true" ]; then
+            sha256sum trapd-agent-linux-amd64.deb > trapd-agent-linux-amd64.deb.sha256
+            extra+=(trapd-agent-linux-amd64.deb)
+          fi
           sha256sum \
             trapd-agent-linux-x86_64 \
             trapd-agent-windows-x86_64.exe \
@@ -123,6 +165,7 @@ jobs:
             trapd-agent-exec \
             trapd-update.sh \
             trapd-agent-windows-install.ps1 \
+            "${extra[@]}" \
             sbom-trapd-agent.cdx.json \
             sbom-trapd-agent-ebpf.cdx.json > SHA256SUMS
           cat SHA256SUMS
@@ -170,6 +213,8 @@ jobs:
             trapd-agent-windows-x86_64.msi.sha256
             trapd-agent-exec
             trapd-agent-exec.sha256
+            trapd-agent-linux-amd64.deb
+            trapd-agent-linux-amd64.deb.sha256
             trapd-update.sh
             trapd-update.sh.sha256
             trapd-agent-windows-install.ps1

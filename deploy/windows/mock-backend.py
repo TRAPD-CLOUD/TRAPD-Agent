@@ -104,6 +104,23 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(413)
             return
         body = json.loads(self.rfile.read(length))
+        # Device pairing (unauthenticated, like the real backend). Poll stays
+        # pending until the test creates the `approve-pairing` marker.
+        if self.path.endswith('/agents/pair/start'):
+            with lock:
+                with (args.root / 'requests.ndjson').open('a', encoding='utf-8') as stream:
+                    stream.write(json.dumps({'path': self.path, 'body': body, 'status': 200}) + '\n')
+            self.reply(200, {'device_code': 'pair_msi_test_device_code', 'user_code': 'ABCDE-FGHJK',
+                             'verification_uri': 'https://trapd.invalid/pair',
+                             'verification_uri_complete': 'https://trapd.invalid/pair?code=ABCDEFGHJK',
+                             'expires_in': 600, 'interval': 1})
+            return
+        if self.path.endswith('/agents/pair/poll'):
+            if (args.root / 'approve-pairing').exists():
+                self.reply(200, {'enrollment_token': 'test-enrollment-token', 'project_id': 'msi-test'})
+            else:
+                self.reply(400, {'error': 'authorization_pending'})
+            return
         status = 500 if self.path.endswith('/ingest/events') and (args.root / 'pause-ingest').exists() else 200
         if not self.path.endswith('/enroll') and self.headers.get('Authorization') != 'Bearer test-agent-secret':
             status = 401
