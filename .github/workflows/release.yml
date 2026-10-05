@@ -18,6 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify tag matches agent version
+        # The signed release statement carries the version the agent compares
+        # against its own, so a tag that disagrees with Cargo.toml would produce
+        # a release that is mis-ordered (or never offered) by the update logic.
+        run: |
+          crate_version="$(grep -m1 '^version' agent/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          if [ "v${crate_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match agent/Cargo.toml version v${crate_version}"
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
 
       # The eBPF crate pins its own nightly via trapd-agent-ebpf/rust-toolchain.toml.
@@ -116,6 +127,37 @@ jobs:
             sbom-trapd-agent-ebpf.cdx.json > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Sign release statements (self-update)
+        # One signed statement per updatable artifact: version, platform, URL,
+        # SHA-256 and size, signed with the offline release key. Agents refuse an
+        # update unless this signature verifies against the key provisioned on the
+        # host, so GitHub (or anyone with write access to it) cannot push code to
+        # the fleet. The key only ever lives in this secret.
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "${RELEASE_SIGNING_KEY}" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY not set - release is NOT signed and will not be offered for self-update"
+            : > release-statements.ndjson
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          : > release-statements.ndjson
+          # Linux: the eBPF object is version-coupled to the binary, so it is
+          # covered by the same signature and installed together with it.
+          cargo run --release -q -p xtask -- sign-release \
+            --version "${version}" --os linux --arch x86_64 \
+            --tag "${GITHUB_REF_NAME}" \
+            --asset-name trapd-agent-linux-x86_64 --file trapd-agent-linux-x86_64 \
+            --ebpf-asset-name trapd-agent-exec --ebpf-file trapd-agent-exec \
+            >> release-statements.ndjson
+          cargo run --release -q -p xtask -- sign-release \
+            --version "${version}" --os windows --arch x86_64 \
+            --tag "${GITHUB_REF_NAME}" \
+            --asset-name trapd-agent-windows-x86_64.exe --file trapd-agent-windows-x86_64.exe \
+            >> release-statements.ndjson
+          wc -l release-statements.ndjson
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -135,5 +177,28 @@ jobs:
             sbom-trapd-agent.cdx.json
             sbom-trapd-agent-ebpf.cdx.json
             SHA256SUMS
+            release-statements.ndjson
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - name: Register signed releases with the backend
+        # Registration never ships anything: the backend creates each release
+        # paused at 0 % and re-verifies the signature against its pinned key. An
+        # operator opts in to the rollout separately. Skipped when not configured.
+        env:
+          TRAPD_BACKEND_URL: ${{ secrets.TRAPD_BACKEND_URL }}
+          TRAPD_RELEASE_PUBLISH_TOKEN: ${{ secrets.TRAPD_RELEASE_PUBLISH_TOKEN }}
+          CHANNEL: ${{ contains(github.ref_name, '-') && 'beta' || 'stable' }}
+        run: |
+          if [ -z "${TRAPD_BACKEND_URL}" ] || [ -z "${TRAPD_RELEASE_PUBLISH_TOKEN}" ] || [ ! -s release-statements.ndjson ]; then
+            echo "::notice::backend registration skipped (not configured or nothing signed)"
+            exit 0
+          fi
+          while read -r line; do
+            body="$(printf '%s' "${line}" | jq -c --arg channel "${CHANNEL}" '. + {channel: $channel}')"
+            curl -fsS -X POST "${TRAPD_BACKEND_URL%/}/api/v1/agent-releases" \
+              -H "Authorization: Bearer ${TRAPD_RELEASE_PUBLISH_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "${body}"
+            echo
+          done < release-statements.ndjson

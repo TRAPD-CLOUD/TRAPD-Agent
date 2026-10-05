@@ -10,6 +10,8 @@
 //! `trapd-agent-ebpf/rust-toolchain.toml` and installed automatically by
 //! rustup when the eBPF crate is built.
 
+mod release;
+
 use std::{
     env,
     path::PathBuf,
@@ -23,13 +25,99 @@ fn main() -> ExitCode {
             let release = args.iter().any(|a| a == "--release");
             build_ebpf(release)
         }
+        Some("sign-release") => sign_release(&args[2..]),
+        Some("release-keygen") => release_keygen(),
         _ => usage(),
     }
 }
 
+/// `cargo xtask sign-release --version V --os O --arch A --tag T --asset-name N
+/// --file PATH` — prints one `{"payload","signature"}` JSON line. The key comes
+/// from the `RELEASE_SIGNING_KEY` environment variable (base64 32-byte seed),
+/// never from a CLI argument, so it cannot leak through process listings or CI
+/// command logs.
+fn sign_release(args: &[String]) -> ExitCode {
+    let get = |name: &str| -> Option<&str> {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+    };
+    let (Some(version), Some(os), Some(arch), Some(tag), Some(asset), Some(file)) = (
+        get("--version"),
+        get("--os"),
+        get("--arch"),
+        get("--tag"),
+        get("--asset-name"),
+        get("--file"),
+    ) else {
+        return usage();
+    };
+    let result = (|| -> Result<String, String> {
+        let seed = env::var("RELEASE_SIGNING_KEY")
+            .map_err(|_| "RELEASE_SIGNING_KEY is not set".to_string())?;
+        let key = release::signing_key(&seed)?;
+        let bytes = std::fs::read(file).map_err(|e| format!("read {file}: {e}"))?;
+        // Optional companion: both flags or neither.
+        let ebpf = match (get("--ebpf-asset-name"), get("--ebpf-file")) {
+            (Some(name), Some(path)) => Some((
+                name,
+                std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?,
+            )),
+            (None, None) => None,
+            _ => return Err("--ebpf-asset-name and --ebpf-file must be given together".into()),
+        };
+        let payload = release::statement(&release::Artifact {
+            version,
+            os,
+            arch,
+            tag,
+            asset_name: asset,
+            bytes: &bytes,
+            ebpf: ebpf.as_ref().map(|(n, b)| (*n, b.as_slice())),
+        })?;
+        let signature = release::sign(&key, &payload);
+        Ok(serde_json::json!({ "payload": payload, "signature": signature }).to_string())
+    })();
+    match result {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `cargo xtask release-keygen` — one-time, run offline. Prints the secret seed
+/// (store it as the `RELEASE_SIGNING_KEY` secret, nowhere else) and the public
+/// key (provision it to agents as `TRAPD_RELEASE_PUBKEY_B64` and to the backend
+/// as `TRAPD_RELEASE_SIGNING_PUBKEY`).
+fn release_keygen() -> ExitCode {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut seed = [0u8; 32];
+    if let Err(e) = getrandom::fill(&mut seed) {
+        eprintln!("error: no randomness available: {e}");
+        return ExitCode::FAILURE;
+    }
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    println!("RELEASE_SIGNING_KEY (secret) = {}", STANDARD.encode(seed));
+    println!(
+        "public key (base64)          = {}",
+        STANDARD.encode(key.verifying_key().to_bytes())
+    );
+    ExitCode::SUCCESS
+}
+
 fn usage() -> ExitCode {
     eprintln!(
-        "Usage:\n  cargo xtask build-ebpf [--release]\n\n\
+        "Usage:\n  cargo xtask build-ebpf [--release]\n  \
+         cargo xtask sign-release --version V --os O --arch A --tag T \\\n    \
+           --asset-name N --file PATH [--ebpf-asset-name N --ebpf-file PATH]\n    \
+           (key in $RELEASE_SIGNING_KEY)\n  \
+         cargo xtask release-keygen\n\n\
          Requirements:\n  \
            cargo binstall bpf-linker\n  \
          The pinned nightly toolchain + rust-src component are installed\n  \

@@ -30,6 +30,8 @@
 //! contract.
 
 use std::collections::HashSet;
+use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
@@ -45,6 +47,14 @@ use crate::telemetry::{metrics::metrics, DropReason};
 const NORMAL_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const CATCH_UP_THRESHOLD: usize = 200;
 const CATCH_UP_PACING: Duration = Duration::from_millis(25);
+/// Shortest gap between two priority-triggered flushes, so a detection storm
+/// cannot turn into a request per event.
+const PRIORITY_MIN_GAP: Duration = Duration::from_millis(50);
+/// Bodies below this are sent as-is: gzip overhead outweighs the saving.
+const COMPRESS_MIN_BYTES: usize = 1024;
+/// Upper bound honoured for a server-sent `Retry-After`, so a bad value cannot
+/// park the transport for hours.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 
 /// Optional per-event result envelope.
 ///
@@ -66,6 +76,15 @@ pub struct Transport {
     client: reqwest::Client,
     ingest_url: String,
     token: String,
+    /// Set once the backend has advertised `Accept-Encoding: gzip`. Compressing
+    /// before that would hand an older backend a body it cannot parse, which it
+    /// rejects with a permanent 4xx, and the batch would be dropped.
+    gzip_ok: AtomicBool,
+    /// Seconds from the last `Retry-After`, consumed by the flush loop.
+    retry_after_secs: AtomicU64,
+    /// Fired by the spool when a detection/prevention event is queued; cuts the
+    /// idle wait short (never the failure backoff).
+    priority_wake: Arc<tokio::sync::Notify>,
 }
 
 impl Transport {
@@ -79,11 +98,18 @@ impl Transport {
         // Fail-closed: ingest shares the control channel's pinned-TLS posture;
         // no plain-client fall-back.
         let client = crate::http::streaming_client()?;
+        let priority_wake = buffer
+            .lock()
+            .map_err(|e| anyhow::anyhow!("spool mutex poisoned: {e}"))?
+            .priority_wake();
         Ok(Self {
             buffer,
+            priority_wake,
             client,
             ingest_url,
             token,
+            gzip_ok: AtomicBool::new(false),
+            retry_after_secs: AtomicU64::new(0),
         })
     }
 
@@ -95,7 +121,11 @@ impl Transport {
 
         loop {
             if consecutive_failures > 0 {
-                let wait = backoff::jittered_delay(consecutive_failures);
+                // The server's own `Retry-After` is a floor, never shorter than
+                // our jittered backoff.
+                let server_hint =
+                    Duration::from_secs(self.retry_after_secs.swap(0, Ordering::Relaxed));
+                let wait = backoff::jittered_delay(consecutive_failures).max(server_hint);
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
@@ -105,14 +135,14 @@ impl Transport {
             match self.flush(catching_up).await {
                 FlushOutcome::Idle => {
                     metrics().set_transport_catching_up(false);
-                    tokio::time::sleep(NORMAL_FLUSH_INTERVAL).await;
+                    self.wait(NORMAL_FLUSH_INTERVAL).await;
                 }
                 FlushOutcome::Delivered => {
                     consecutive_failures = 0;
                     // Sequential requests deliberately bound inflight memory to
                     // one batch. In catch-up mode this still permits up to 40
                     // batches/s while backend latency applies natural pressure.
-                    tokio::time::sleep(if catching_up {
+                    self.wait(if catching_up {
                         CATCH_UP_PACING
                     } else {
                         NORMAL_FLUSH_INTERVAL
@@ -122,6 +152,18 @@ impl Transport {
                 FlushOutcome::Failed => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                 }
+            }
+        }
+    }
+
+    /// Wait for the next flush: the full interval, or until a priority event
+    /// arrives (then only [`PRIORITY_MIN_GAP`] from now, to bound the request
+    /// rate under a detection storm).
+    async fn wait(&self, interval: Duration) {
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            () = self.priority_wake.notified() => {
+                tokio::time::sleep(PRIORITY_MIN_GAP.min(interval)).await;
             }
         }
     }
@@ -148,19 +190,44 @@ impl Transport {
         let seqs: Vec<u64> = batch.iter().map(|e| e.seq).collect();
         let events: Vec<_> = batch.iter().map(|e| e.event.clone()).collect();
 
-        let started = Instant::now();
-        let response = self
+        let raw = match serde_json::to_vec(&events) {
+            Ok(raw) => raw,
+            Err(e) => {
+                warn!(error = %e, events = n, "Transport: batch serialisation failed — will retry");
+                metrics().transport_batch_failed();
+                if let Ok(mut buf) = self.buffer.lock() {
+                    buf.nack(&seqs);
+                }
+                return FlushOutcome::Failed;
+            }
+        };
+        let (body, compressed) = encode_body(raw, self.gzip_ok.load(Ordering::Relaxed));
+        let mut request = self
             .client
             .post(&self.ingest_url)
             .bearer_auth(&self.token)
-            .json(&events)
-            .send()
-            .await;
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if compressed {
+            request = request.header(reqwest::header::CONTENT_ENCODING, "gzip");
+        }
+
+        let started = Instant::now();
+        let response = request.body(body).send().await;
         metrics().set_transport_activity(
             n as u64,
             started.elapsed().as_millis() as u64,
             catching_up,
         );
+
+        if let Ok(resp) = &response {
+            if advertises_gzip(resp.headers()) {
+                self.gzip_ok.store(true, Ordering::Relaxed);
+            }
+            // Always overwrite (0 when absent) so a stale hint never outlives
+            // the response that sent it.
+            let hint = parse_retry_after(resp.headers()).map_or(0, |d| d.as_secs());
+            self.retry_after_secs.store(hint, Ordering::Relaxed);
+        }
 
         match response {
             Ok(resp) if resp.status().is_success() => {
@@ -197,7 +264,20 @@ impl Transport {
                 let status = resp.status();
                 metrics().transport_batch_failed();
 
-                if is_permanent(status.as_u16()) {
+                if compressed && status.as_u16() == 415 {
+                    // Something on the path refuses gzip. That says nothing
+                    // about the events themselves, so keep them and resend
+                    // uncompressed instead of dropping them as a permanent 4xx.
+                    warn!(
+                        events = n,
+                        "Transport: gzip refused (415) — disabling compression and retrying"
+                    );
+                    self.gzip_ok.store(false, Ordering::Relaxed);
+                    if let Ok(mut buf) = self.buffer.lock() {
+                        buf.nack(&seqs);
+                    }
+                    FlushOutcome::Failed
+                } else if is_permanent(status.as_u16()) {
                     // Retrying forever would block every event behind this
                     // batch. Remove it, but count the loss.
                     warn!(
@@ -292,6 +372,49 @@ fn partition_by_report(
 ///
 /// 408, 425 and 429 are 4xx but explicitly retryable — timeout, too-early and
 /// rate-limited all clear on their own.
+/// Compress `raw` when the backend is known to accept gzip and the body is big
+/// enough to benefit. Returns the bytes to send and whether they are gzip.
+fn encode_body(raw: Vec<u8>, gzip_ok: bool) -> (Vec<u8>, bool) {
+    if !gzip_ok || raw.len() < COMPRESS_MIN_BYTES {
+        return (raw, false);
+    }
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    match enc.write_all(&raw).and_then(|()| enc.finish()) {
+        // Keep the original if compression did not actually help.
+        Ok(c) if c.len() < raw.len() => (c, true),
+        _ => (raw, false),
+    }
+}
+
+/// Whether a response's `Accept-Encoding` lists the `gzip` coding.
+fn advertises_gzip(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|token| {
+            // "gzip;q=0" explicitly forbids it.
+            let mut parts = token.trim().split(';');
+            let coding = parts.next().unwrap_or("").trim();
+            let refused = parts.any(|p| p.trim().replace(' ', "") == "q=0");
+            coding.eq_ignore_ascii_case("gzip") && !refused
+        })
+}
+
+/// `Retry-After` as delta-seconds (HTTP-dates are ignored), capped at
+/// [`MAX_RETRY_AFTER`].
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+}
+
 fn is_permanent(status: u16) -> bool {
     (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
 }
@@ -462,5 +585,298 @@ mod tests {
         assert!(r.accepted.is_empty() && r.rejected.is_empty());
         let r: IngestResponse = serde_json::from_str(r#"{"status":"ok"}"#).unwrap();
         assert!(r.accepted.is_empty());
+    }
+
+    // ── Compression, Retry-After ────────────────────────────────────────────
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                reqwest::header::HeaderName::from_static(k),
+                reqwest::header::HeaderValue::from_static(v),
+            );
+        }
+        h
+    }
+
+    fn gunzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn small_or_unnegotiated_bodies_are_not_compressed() {
+        let big = vec![b'a'; 10_000];
+        assert_eq!(encode_body(big.clone(), false), (big.clone(), false));
+        let small = vec![b'a'; COMPRESS_MIN_BYTES - 1];
+        assert_eq!(encode_body(small.clone(), true), (small, false));
+    }
+
+    #[test]
+    fn negotiated_large_bodies_round_trip_through_gzip() {
+        let raw = br#"{"event":"process_exec","data":"abcdefghij"}"#.repeat(200);
+        let (body, compressed) = encode_body(raw.clone(), true);
+        assert!(compressed);
+        assert!(
+            body.len() < raw.len() / 4,
+            "repetitive JSON must shrink a lot"
+        );
+        assert_eq!(gunzip(&body), raw);
+    }
+
+    #[test]
+    fn incompressible_bodies_are_sent_as_is() {
+        // xorshift noise: gzip cannot shrink it, so the original must be kept.
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let raw: Vec<u8> = (0..4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 32) as u8
+            })
+            .collect();
+        assert_eq!(encode_body(raw.clone(), true), (raw, false));
+    }
+
+    #[test]
+    fn gzip_is_only_assumed_when_the_server_lists_it() {
+        assert!(advertises_gzip(&headers(&[("accept-encoding", "gzip")])));
+        assert!(advertises_gzip(&headers(&[(
+            "accept-encoding",
+            "br, GZIP"
+        )])));
+        assert!(advertises_gzip(&headers(&[
+            ("accept-encoding", "identity"),
+            ("accept-encoding", "gzip")
+        ])));
+        assert!(!advertises_gzip(&headers(&[(
+            "accept-encoding",
+            "gzip;q=0"
+        )])));
+        assert!(!advertises_gzip(&headers(&[(
+            "accept-encoding",
+            "gzip; q=0"
+        )])));
+        assert!(!advertises_gzip(&headers(&[(
+            "accept-encoding",
+            "identity"
+        )])));
+        assert!(!advertises_gzip(&headers(&[])));
+    }
+
+    #[test]
+    fn retry_after_is_delta_seconds_and_capped() {
+        let h = |v: &'static str| parse_retry_after(&headers(&[("retry-after", v)]));
+        assert_eq!(h("60"), Some(Duration::from_secs(60)));
+        assert_eq!(h(" 5 "), Some(Duration::from_secs(5)));
+        assert_eq!(h("86400"), Some(MAX_RETRY_AFTER));
+        assert_eq!(h("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        assert_eq!(h("soon"), None);
+        assert_eq!(parse_retry_after(&headers(&[])), None);
+    }
+
+    // ── Wire behaviour against a mock backend ───────────────────────────────
+
+    /// What the mock backend saw for one request.
+    struct Seen {
+        content_encoding: Option<String>,
+        body: Vec<u8>,
+    }
+
+    /// Serves one scripted response per connection, in order, and records each
+    /// request. `script` entries are full raw HTTP responses.
+    async fn mock_backend(script: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<Seen>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/v1/ingest/events",
+            listener.local_addr().unwrap()
+        );
+        let handle = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for response in script {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let (head_end, content_length) = loop {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "client closed before sending a full request");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                            .unwrap_or(0);
+                        break (pos + 4, len);
+                    }
+                };
+                while buf.len() < head_end + content_length {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                seen.push(Seen {
+                    content_encoding: head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-encoding:"))
+                        .map(|v| v.trim().to_string()),
+                    body: buf[head_end..head_end + content_length].to_vec(),
+                });
+                sock.write_all(response.as_bytes()).await.unwrap();
+            }
+            seen
+        });
+        (url, handle)
+    }
+
+    fn http(status: &str, extra: &str) -> String {
+        format!("HTTP/1.1 {status}\r\n{extra}Content-Length: 2\r\nConnection: close\r\n\r\n{{}}")
+    }
+
+    fn transport_for(url: String, events: usize) -> Transport {
+        let mut spool = Spool::in_memory(1000);
+        for _ in 0..events {
+            spool.push(event()).unwrap();
+        }
+        let priority_wake = spool.priority_wake();
+        Transport {
+            priority_wake,
+            buffer: Arc::new(Mutex::new(spool)),
+            client: reqwest::Client::new(),
+            ingest_url: url,
+            token: "secret_test".into(),
+            gzip_ok: AtomicBool::new(false),
+            retry_after_secs: AtomicU64::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn compression_starts_only_after_the_backend_advertises_it() {
+        let (url, backend) = mock_backend(vec![
+            http("202 Accepted", "Accept-Encoding: gzip\r\n"),
+            http("202 Accepted", "Accept-Encoding: gzip\r\n"),
+        ])
+        .await;
+        let t = transport_for(url, 40);
+
+        assert_eq!(t.flush(false).await, FlushOutcome::Delivered);
+        assert!(
+            t.gzip_ok.load(Ordering::Relaxed),
+            "advertisement is remembered"
+        );
+
+        for _ in 0..40 {
+            t.buffer.lock().unwrap().push(event()).unwrap();
+        }
+        assert_eq!(t.flush(false).await, FlushOutcome::Delivered);
+
+        let seen = backend.await.unwrap();
+        assert_eq!(
+            seen[0].content_encoding, None,
+            "first request must be plain"
+        );
+        let first: Vec<serde_json::Value> = serde_json::from_slice(&seen[0].body).unwrap();
+        assert_eq!(first.len(), 40);
+
+        assert_eq!(seen[1].content_encoding.as_deref(), Some("gzip"));
+        let second: Vec<serde_json::Value> =
+            serde_json::from_slice(&gunzip(&seen[1].body)).unwrap();
+        assert_eq!(second.len(), 40, "gzip body decodes to the same JSON array");
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_never_advertises_gzip_never_gets_it() {
+        let (url, backend) =
+            mock_backend(vec![http("202 Accepted", ""), http("202 Accepted", "")]).await;
+        let t = transport_for(url, 40);
+        t.flush(false).await;
+        for _ in 0..40 {
+            t.buffer.lock().unwrap().push(event()).unwrap();
+        }
+        t.flush(false).await;
+        let seen = backend.await.unwrap();
+        assert!(seen.iter().all(|s| s.content_encoding.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_415_for_gzip_keeps_the_events_and_turns_compression_off() {
+        let (url, backend) = mock_backend(vec![http("415 Unsupported Media Type", "")]).await;
+        let t = transport_for(url, 40);
+        t.gzip_ok.store(true, Ordering::Relaxed);
+
+        assert_eq!(t.flush(false).await, FlushOutcome::Failed);
+
+        assert!(!t.gzip_ok.load(Ordering::Relaxed));
+        assert_eq!(t.buffer.lock().unwrap().len(), 40, "nothing may be dropped");
+        let seen = backend.await.unwrap();
+        assert_eq!(seen[0].content_encoding.as_deref(), Some("gzip"));
+    }
+
+    #[tokio::test]
+    async fn retry_after_from_a_throttled_response_is_recorded_and_events_are_kept() {
+        let (url, _backend) =
+            mock_backend(vec![http("429 Too Many Requests", "Retry-After: 7\r\n")]).await;
+        let t = transport_for(url, 5);
+
+        assert_eq!(t.flush(false).await, FlushOutcome::Failed);
+
+        assert_eq!(t.retry_after_secs.load(Ordering::Relaxed), 7);
+        assert_eq!(t.buffer.lock().unwrap().len(), 5);
+    }
+
+    /// Real agent transport against a real ingest gateway (Postgres + Kafka).
+    ///
+    /// Run manually:
+    /// `TRAPD_E2E_INGEST_URL=http://127.0.0.1:8092/api/v1/ingest/events \
+    ///  TRAPD_E2E_TOKEN=secret_... TRAPD_E2E_AGENT_ID=agent_... \
+    ///  cargo test -p trapd-agent transport::tests::negotiates_gzip_with_a_real_gateway -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs a running gateway: TRAPD_E2E_INGEST_URL, TRAPD_E2E_TOKEN, TRAPD_E2E_AGENT_ID"]
+    async fn negotiates_gzip_with_a_real_gateway() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+        let agent_id = var("TRAPD_E2E_AGENT_ID");
+        let mut spool = Spool::in_memory(1000);
+        let t = {
+            let fill = |spool: &mut Spool| {
+                for _ in 0..40 {
+                    let mut e = event();
+                    e.agent_id = agent_id.clone();
+                    spool.push(e).unwrap();
+                }
+            };
+            fill(&mut spool);
+            let priority_wake = spool.priority_wake();
+            Transport {
+                priority_wake,
+                buffer: Arc::new(Mutex::new(spool)),
+                client: reqwest::Client::new(),
+                ingest_url: var("TRAPD_E2E_INGEST_URL"),
+                token: var("TRAPD_E2E_TOKEN"),
+                gzip_ok: AtomicBool::new(false),
+                retry_after_secs: AtomicU64::new(0),
+            }
+        };
+
+        assert_eq!(t.flush(false).await, FlushOutcome::Delivered, "plain batch");
+        assert!(
+            t.gzip_ok.load(Ordering::Relaxed),
+            "the real gateway must advertise gzip"
+        );
+
+        for _ in 0..40 {
+            let mut e = event();
+            e.agent_id = agent_id.clone();
+            t.buffer.lock().unwrap().push(e).unwrap();
+        }
+        assert_eq!(t.flush(false).await, FlushOutcome::Delivered, "gzip batch");
+        assert_eq!(t.buffer.lock().unwrap().len(), 0, "everything acknowledged");
     }
 }

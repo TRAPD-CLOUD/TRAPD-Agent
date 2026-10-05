@@ -117,6 +117,8 @@ impl Heartbeat {
         {
             Ok(resp) if resp.status().is_success() => {
                 debug!("Heartbeat sent successfully");
+                #[cfg(target_os = "linux")]
+                crate::update::confirm_healthy();
             }
             Ok(resp) => {
                 warn!("Heartbeat rejected by backend: HTTP {}", resp.status());

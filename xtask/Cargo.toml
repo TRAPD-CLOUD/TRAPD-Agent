@@ -7,3 +7,13 @@ publish = false
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
+
+# Release signing (cargo xtask sign-release / release-keygen). Build-time helper
+# only: none of these end up in the shipped agent binary.
+[dependencies]
+ed25519-dalek = "2"
+sha2          = "0.10"
+base64        = "0.22"
+hex           = "0.4"
+serde_json    = "1"
+getrandom     = "0.3"

@@ -164,6 +164,116 @@ fn peek_returns_entries_in_fifo_order() {
     assert_eq!(peeked, seqs, "delivery order must follow arrival order");
 }
 
+// ── Priority lane ────────────────────────────────────────────────────────────
+
+fn detection_event() -> AgentEvent {
+    let mut e = dummy_event();
+    e.class = EventClass::Detection;
+    e
+}
+
+#[test]
+fn detections_are_sent_ahead_of_older_bulk_telemetry() {
+    let mut s = Spool::in_memory(1_000);
+    for _ in 0..500 {
+        s.push(dummy_event()).unwrap();
+    }
+    let detection = s.push(detection_event()).unwrap();
+
+    let batch = s.peek_batch(100);
+    assert_eq!(batch.len(), 100);
+    assert!(
+        batch.iter().any(|e| e.seq == detection),
+        "a detection queued behind 500 bulk events must still be in the next batch"
+    );
+}
+
+#[test]
+fn a_detection_storm_cannot_starve_bulk_telemetry() {
+    let mut s = Spool::in_memory(1_000);
+    let bulk: Vec<u64> = (0..50).map(|_| s.push(dummy_event()).unwrap()).collect();
+    for _ in 0..300 {
+        s.push(detection_event()).unwrap();
+    }
+    let batch = s.peek_batch(100);
+    let bulk_in_batch = batch.iter().filter(|e| bulk.contains(&e.seq)).count();
+    assert_eq!(
+        bulk_in_batch, 25,
+        "a quarter of each batch stays reserved for bulk"
+    );
+    assert_eq!(batch.len(), 100);
+}
+
+#[test]
+fn unused_priority_slots_are_filled_with_bulk_and_vice_versa() {
+    let mut s = Spool::in_memory(1_000);
+    s.push(detection_event()).unwrap();
+    for _ in 0..200 {
+        s.push(dummy_event()).unwrap();
+    }
+    assert_eq!(
+        s.peek_batch(100).len(),
+        100,
+        "bulk fills what priority leaves"
+    );
+
+    let mut only_priority = Spool::in_memory(1_000);
+    for _ in 0..200 {
+        only_priority.push(detection_event()).unwrap();
+    }
+    assert_eq!(
+        only_priority.peek_batch(100).len(),
+        100,
+        "priority fills what bulk leaves"
+    );
+}
+
+#[test]
+fn a_batch_keeps_arrival_order_and_never_repeats_an_entry() {
+    let mut s = Spool::in_memory(1_000);
+    for i in 0..60 {
+        s.push(if i % 3 == 0 {
+            detection_event()
+        } else {
+            dummy_event()
+        })
+        .unwrap();
+    }
+    let seqs: Vec<u64> = s.peek_batch(40).iter().map(|e| e.seq).collect();
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(seqs, sorted, "ascending, no duplicates");
+}
+
+#[test]
+fn a_priority_event_wakes_the_transport_but_bulk_does_not() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut s = Spool::in_memory(10);
+        let wake = s.priority_wake();
+
+        s.push(dummy_event()).unwrap();
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+        assert!(
+            quiet.is_err(),
+            "bulk telemetry must not wake the transport early"
+        );
+
+        s.push(detection_event()).unwrap();
+        let woken =
+            tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+        assert!(
+            woken.is_ok(),
+            "a detection must wake it, even before it waits"
+        );
+    });
+}
+
 // ── Acknowledgement semantics ────────────────────────────────────────────────
 
 #[test]
@@ -527,7 +637,10 @@ fn a_journal_of_pure_garbage_does_not_crash_recovery() {
 
     let s = Spool::durable_at(dir.journal(), 100);
     assert_eq!(s.len(), 0);
-    assert!(s.corrupt_records() > 0, "garbage must be reported, not ignored");
+    assert!(
+        s.corrupt_records() > 0,
+        "garbage must be reported, not ignored"
+    );
 }
 
 #[test]

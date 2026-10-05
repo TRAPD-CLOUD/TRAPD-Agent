@@ -43,13 +43,16 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
+
+use tokio::sync::Notify;
 
 use tracing::{info, warn};
 
 use super::backoff;
 use super::journal::{self, JournalRecord, LineRead, RecordOutcome};
-use crate::schema::AgentEvent;
+use crate::schema::{AgentEvent, EventClass};
 use crate::telemetry::limits::{MAX_BATCH_BYTES, MAX_EVENT_BYTES, MAX_RECORD_BYTES};
 use crate::telemetry::{metrics::metrics, DropReason};
 
@@ -86,6 +89,12 @@ pub struct SpoolEntry {
     pub not_before: Option<Instant>,
 }
 
+/// Events the backend should see ahead of bulk telemetry: what the agent
+/// itself concluded (detections) and what it did about it (prevention).
+fn is_priority(event: &AgentEvent) -> bool {
+    matches!(event.class, EventClass::Detection | EventClass::Prevention)
+}
+
 impl SpoolEntry {
     fn is_eligible(&self, now: Instant) -> bool {
         self.not_before.is_none_or(|t| now >= t)
@@ -114,6 +123,9 @@ pub struct Spool {
     appends_since_compact: usize,
     appends_since_fsync: usize,
     fsyncs_total: u64,
+    /// Signalled when a priority event is enqueued, so the transport flushes
+    /// within milliseconds instead of waiting for its next tick.
+    priority_wake: Arc<Notify>,
     /// Test-only instrumentation: records which OS thread `push()` executed
     /// on, so a test can assert the blocking journal write happened off the
     /// async executor thread (i.e. inside `spawn_blocking`).
@@ -138,6 +150,7 @@ impl Spool {
             appends_since_compact: 0,
             appends_since_fsync: 0,
             fsyncs_total: 0,
+            priority_wake: Arc::new(Notify::new()),
             #[cfg(test)]
             last_push_thread: None,
         };
@@ -266,6 +279,7 @@ impl Spool {
             not_before: None,
         };
         self.bytes += entry.bytes as u64;
+        let priority = is_priority(&entry.event);
         self.mem.push_back(entry);
 
         self.enforce_caps();
@@ -274,7 +288,17 @@ impl Spool {
             self.compact();
         }
         self.publish();
+        if priority {
+            // Stores one permit if the transport is not waiting yet, so a
+            // wake-up between two flushes is never lost.
+            self.priority_wake.notify_one();
+        }
         Ok(seq)
+    }
+
+    /// Handle the transport waits on to learn that a priority event arrived.
+    pub fn priority_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.priority_wake)
     }
 
     /// Evict from the front until both caps are satisfied.
@@ -345,22 +369,44 @@ impl Spool {
     }
 
     pub(crate) fn peek_batch_at(&self, n: usize, now: Instant) -> Vec<SpoolEntry> {
-        let mut out = Vec::new();
+        // Priority events go first, but never take more than three quarters of a
+        // batch while bulk telemetry is waiting: a detection storm must delay
+        // process/network events, not starve them. Slots a class cannot fill are
+        // handed to the other, so a batch is only short when the queue is.
+        let priority_cap = n - n / 4;
+        let mut chosen = vec![false; self.mem.len()];
+        let mut count = 0usize;
         let mut bytes = 0usize;
-        for entry in self.mem.iter() {
-            if out.len() >= n {
-                break;
+
+        let mut take = |want_priority: Option<bool>, limit: usize, chosen: &mut Vec<bool>| {
+            for (i, entry) in self.mem.iter().enumerate() {
+                if count >= limit {
+                    break;
+                }
+                if chosen[i] || !entry.is_eligible(now) {
+                    continue;
+                }
+                if want_priority.is_some_and(|w| w != is_priority(&entry.event)) {
+                    continue;
+                }
+                if count > 0 && bytes + entry.bytes > MAX_BATCH_BYTES {
+                    break;
+                }
+                bytes += entry.bytes;
+                chosen[i] = true;
+                count += 1;
             }
-            if !entry.is_eligible(now) {
-                continue;
-            }
-            if !out.is_empty() && bytes + entry.bytes > MAX_BATCH_BYTES {
-                break;
-            }
-            bytes += entry.bytes;
-            out.push(entry.clone());
-        }
-        out
+        };
+        take(Some(true), priority_cap, &mut chosen);
+        take(Some(false), n, &mut chosen);
+        take(Some(true), n, &mut chosen);
+
+        self.mem
+            .iter()
+            .zip(chosen)
+            .filter(|(_, c)| *c)
+            .map(|(entry, _)| entry.clone())
+            .collect()
     }
 
     /// Remove acknowledged entries.

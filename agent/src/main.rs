@@ -35,6 +35,7 @@ mod schema;
 mod selfprotect;
 mod telemetry;
 mod transport;
+mod update;
 #[cfg(windows)]
 mod winsvc;
 
@@ -89,6 +90,13 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // `trapd-agent --apply-update` — helper started by the root-owned
+    // `trapd-agent-update.service`; applies (or rolls back) a staged update.
+    // The service itself cannot write its own binary (`ProtectSystem=strict`).
+    if std::env::args().nth(1).as_deref() == Some("--apply-update") {
+        return update::run_apply_helper();
+    }
 
     // `trapd-agent uninstall` — remove every host artifact the agent planted.
     // On Windows that is the honeytoken decoy files + the registry decoys;
@@ -531,6 +539,7 @@ async fn main() -> Result<()> {
         }));
         tokio::spawn(async move { config_puller.run().await });
 
+        let token_for_update = token.clone();
         let heartbeat = Heartbeat::new(
             &backend_url,
             agent_id.clone(),
@@ -539,6 +548,15 @@ async fn main() -> Result<()> {
             Arc::clone(&agent_config),
         )?;
         tokio::spawn(async move { heartbeat.run().await });
+
+        // Self-update is opt-in by key provisioning: without both pinned signing
+        // keys no update can be verified, so the updater is not started.
+        match update::Updater::new(&backend_url, agent_id.clone(), token_for_update) {
+            Ok(updater) => {
+                tokio::spawn(async move { updater.run().await });
+            }
+            Err(e) => info!(error = %e, "Self-update disabled"),
+        }
     }
 
     tokio::select! {
