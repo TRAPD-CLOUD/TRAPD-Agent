@@ -111,6 +111,10 @@ pub fn device_id_file() -> PathBuf {
 pub fn credentials_file() -> PathBuf {
     state_dir().join("credentials.json")
 }
+/// Human-readable device-pairing instructions (user code + URL, no secrets).
+pub fn pairing_file() -> PathBuf {
+    state_dir().join("pairing.txt")
+}
 
 /// Hash an untrusted on-disk token with bounded memory and IO. Links and
 /// special files are refused before reading; a concurrent growth is bounded

@@ -26,6 +26,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::paths;
 
+mod pairing;
+
 /// Persisted agent identity. `agent_secret` is a long-lived bearer credential
 /// (equivalent to a password) for every authenticated backend endpoint, so:
 /// - [`std::fmt::Debug`] is implemented by hand to redact it — the derived
@@ -90,7 +92,9 @@ enum AttemptError {
 
 /// Load persisted credentials, or enroll for the first time.
 ///
-/// Enrollment uses `TRAPD_ENROLL_TOKEN` (one-time token from the dashboard).
+/// Enrollment uses `TRAPD_ENROLL_TOKEN` (one-time token from the dashboard) or,
+/// when that is unset, device pairing (see [`pairing`]): the agent shows a short
+/// code (log + `pairing.txt`) that a signed-in user confirms in the web UI.
 /// Transient backend failures are retried with capped exponential backoff;
 /// `TRAPD_ENROLL_MAX_ATTEMPTS` bounds the retries (default: unlimited, i.e. the
 /// agent waits indefinitely for the backend to come back).
@@ -105,15 +109,12 @@ pub async fn load_or_enroll(
         return Ok(creds);
     }
 
-    // 2. First-run enrollment requires a token.
-    let enroll_token = std::env::var("TRAPD_ENROLL_TOKEN")
+    // 2. First-run enrollment: an explicit one-time token (admin path), or —
+    //    when none is configured — interactive device pairing, where a person
+    //    confirms a short code in the web UI and the backend hands us a token.
+    let env_token = std::env::var("TRAPD_ENROLL_TOKEN")
         .ok()
-        .filter(|t| !t.trim().is_empty())
-        .context(
-            "No valid credentials in the state directory and TRAPD_ENROLL_TOKEN is not set.\n\
-             To enroll this agent set TRAPD_ENROLL_TOKEN=<token from dashboard> \
-             (and TRAPD_BACKEND_URL=<url>) and restart.",
-        )?;
+        .filter(|t| !t.trim().is_empty());
 
     // The one-time enrollment token has now been captured into a local. Remove
     // it from the process environment so it is no longer exposed via
@@ -124,7 +125,9 @@ pub async fn load_or_enroll(
     // SAFETY: called before any collectors/worker tasks are spawned, while the
     // agent is still single-threaded, so no other thread can be reading the
     // environment concurrently.
-    unsafe { std::env::remove_var("TRAPD_ENROLL_TOKEN") };
+    if env_token.is_some() {
+        unsafe { std::env::remove_var("TRAPD_ENROLL_TOKEN") };
+    }
 
     let base = crate::http::normalize_base_url(backend_url);
     let enroll_url = format!("{base}/api/v1/agents/enroll");
@@ -133,6 +136,15 @@ pub async fn load_or_enroll(
     // than send the one-time token to a potentially MITM'd endpoint.
     let client = crate::http::control_client()
         .context("cannot build a secured control-channel client for enrollment")?;
+    let enroll_token = match env_token {
+        Some(token) => token,
+        None => {
+            info!("No TRAPD_ENROLL_TOKEN set — starting device pairing");
+            pairing::obtain_enrollment_token(&client, &base, device_id, hostname)
+                .await
+                .context("device pairing failed")?
+        }
+    };
     let max_attempts = max_attempts_from_env();
 
     info!(backend = %base, "Enrolling agent");
