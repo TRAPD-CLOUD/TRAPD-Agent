@@ -806,4 +806,50 @@ mod tests {
         assert_eq!(t.retry_after_secs.load(Ordering::Relaxed), 7);
         assert_eq!(t.buffer.lock().unwrap().len(), 5);
     }
+
+    /// Real agent transport against a real ingest gateway (Postgres + Kafka).
+    ///
+    /// Run manually:
+    /// `TRAPD_E2E_INGEST_URL=http://127.0.0.1:8092/api/v1/ingest/events \
+    ///  TRAPD_E2E_TOKEN=secret_... TRAPD_E2E_AGENT_ID=agent_... \
+    ///  cargo test -p trapd-agent transport::tests::negotiates_gzip_with_a_real_gateway -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs a running gateway: TRAPD_E2E_INGEST_URL, TRAPD_E2E_TOKEN, TRAPD_E2E_AGENT_ID"]
+    async fn negotiates_gzip_with_a_real_gateway() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+        let agent_id = var("TRAPD_E2E_AGENT_ID");
+        let mut spool = Spool::in_memory(1000);
+        let t = {
+            let fill = |spool: &mut Spool| {
+                for _ in 0..40 {
+                    let mut e = event();
+                    e.agent_id = agent_id.clone();
+                    spool.push(e).unwrap();
+                }
+            };
+            fill(&mut spool);
+            Transport {
+                buffer: Arc::new(Mutex::new(spool)),
+                client: reqwest::Client::new(),
+                ingest_url: var("TRAPD_E2E_INGEST_URL"),
+                token: var("TRAPD_E2E_TOKEN"),
+                gzip_ok: AtomicBool::new(false),
+                retry_after_secs: AtomicU64::new(0),
+            }
+        };
+
+        assert_eq!(t.flush(false).await, FlushOutcome::Delivered, "plain batch");
+        assert!(
+            t.gzip_ok.load(Ordering::Relaxed),
+            "the real gateway must advertise gzip"
+        );
+
+        for _ in 0..40 {
+            let mut e = event();
+            e.agent_id = agent_id.clone();
+            t.buffer.lock().unwrap().push(e).unwrap();
+        }
+        assert_eq!(t.flush(false).await, FlushOutcome::Delivered, "gzip batch");
+        assert_eq!(t.buffer.lock().unwrap().len(), 0, "everything acknowledged");
+    }
 }
