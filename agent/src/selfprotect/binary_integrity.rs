@@ -23,8 +23,16 @@ use tracing::{info, warn};
 
 use crate::paths;
 
-fn hash_store_path() -> PathBuf {
+/// Location of the baseline. Also used by the update helper, which must rewrite
+/// it whenever it swaps the binary (see `update::apply`).
+pub(crate) fn hash_store_path() -> PathBuf {
     paths::config_dir().join("binary.sha256")
+}
+
+/// The one place that defines the baseline file's content for a binary whose
+/// lower-case hex SHA-256 is `hash_hex`.
+pub(crate) fn baseline_line(hash_hex: &str) -> String {
+    format!("sha256:{hash_hex}")
 }
 fn pubkey_path() -> PathBuf {
     paths::config_dir().join("signing.pub")
@@ -47,7 +55,7 @@ fn sig_path() -> PathBuf {
 pub fn check() -> Result<()> {
     let exe = exe_path()?;
     let (hash_hex, hash_bytes) = sha256_of_file(&exe)?;
-    let hash_str = format!("sha256:{hash_hex}");
+    let hash_str = baseline_line(&hash_hex);
 
     info!(binary = %exe.display(), hash = %hash_str, "Binary integrity check started");
 

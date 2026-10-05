@@ -81,6 +81,12 @@ pub struct ApplyContext<'a> {
     /// Install path of the eBPF object (Linux). Required when the update ships
     /// one, since binary and object must be replaced together.
     pub ebpf_target: Option<&'a Path>,
+    /// The agent's binary self-integrity baseline (`binary.sha256`). The new
+    /// binary has a different hash, so the baseline is rewritten together with
+    /// it: the restarted agent aborts on a mismatch (`binary_integrity::check`).
+    /// Left alone when the file does not exist, since the agent then writes a
+    /// baseline for whatever binary it first runs as.
+    pub baseline: Option<&'a Path>,
     pub paths: &'a StagingPaths,
     pub health_timeout: Duration,
 }
@@ -285,6 +291,20 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
             return Err(e);
         }
     }
+    // The baseline is the signed digest of the file just installed. It is
+    // restored on rollback like the other files; a failed write aborts the
+    // update, because the new binary would refuse to start against the old one.
+    if let Some(baseline) = ctx.baseline.filter(|p| p.exists()) {
+        let line =
+            crate::selfprotect::binary_integrity::baseline_line(&hex::encode(verified.sha256));
+        match install_file(baseline, line.as_bytes(), 0o600) {
+            Ok(i) => installed.push(i),
+            Err(e) => {
+                let _ = abort_update(ctx, &installed, &verified.version);
+                return Err(e).context("update: refresh binary integrity baseline");
+            }
+        }
+    }
 
     if let Err(e) = platform.restart_service() {
         tracing::error!(error = %e, "update: restart failed, rolling back");
@@ -383,6 +403,8 @@ mod tests {
         _root: PathBuf,
         target: PathBuf,
         ebpf_target: PathBuf,
+        /// Self-integrity baseline of the OLD binary, as the installer wrote it.
+        baseline: PathBuf,
         paths: StagingPaths,
         release: SigningKey,
         command: SigningKey,
@@ -407,6 +429,10 @@ mod tests {
                 std::fs::write(&ebpf_target, b"OLD EBPF").unwrap();
             }
         }
+
+        let baseline = root.join("etc/binary.sha256");
+        std::fs::create_dir_all(baseline.parent().unwrap()).unwrap();
+        std::fs::write(&baseline, old_baseline()).unwrap();
 
         let release = SigningKey::from_bytes(&[1; 32]);
         let command = SigningKey::from_bytes(&[2; 32]);
@@ -443,13 +469,31 @@ mod tests {
             _root: root,
             target,
             ebpf_target,
+            baseline,
             paths,
             release,
             command,
         }
     }
 
-    fn run(env: &Env, platform: &FakePlatform, timeout_ms: u64) -> Result<Outcome> {
+    fn baseline_for(bytes: &[u8]) -> String {
+        crate::selfprotect::binary_integrity::baseline_line(&hex::encode(Sha256::digest(bytes)))
+    }
+
+    fn old_baseline() -> String {
+        baseline_for(b"OLD BINARY")
+    }
+
+    fn run(env: &Env, platform: &dyn Platform, timeout_ms: u64) -> Result<Outcome> {
+        run_with_baseline(env, platform, timeout_ms, Some(&env.baseline))
+    }
+
+    fn run_with_baseline(
+        env: &Env,
+        platform: &dyn Platform,
+        timeout_ms: u64,
+        baseline: Option<&Path>,
+    ) -> Result<Outcome> {
         let (rk, ck) = (env.release.verifying_key(), env.command.verifying_key());
         let ctx = ApplyContext {
             verify: VerifyContext {
@@ -463,6 +507,7 @@ mod tests {
             },
             target: &env.target,
             ebpf_target: Some(&env.ebpf_target),
+            baseline,
             paths: &env.paths,
             health_timeout: Duration::from_millis(timeout_ms),
         };
@@ -640,5 +685,115 @@ mod tests {
         );
         assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
         assert_eq!(std::fs::read(&env.ebpf_target).unwrap(), b"OLD EBPF");
+    }
+
+    // Regression: the restarted agent compares its own hash with
+    // `binary.sha256` and aborts on a mismatch (`binary_integrity::check`), so an
+    // update that leaves the old baseline in place can never become healthy.
+    #[test]
+    fn healthy_update_refreshes_the_integrity_baseline_to_the_new_binary() {
+        let env = setup(b"NEW BINARY", None);
+        let out = run(&env, &platform(&env, Some("0.5.0"), false), 2000).unwrap();
+        assert!(matches!(out, Outcome::Applied { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&env.baseline).unwrap(),
+            baseline_for(b"NEW BINARY")
+        );
+        assert_ne!(baseline_for(b"NEW BINARY"), old_baseline());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&env.baseline)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "baseline must stay private");
+        }
+    }
+
+    #[test]
+    fn baseline_is_already_fresh_when_the_new_agent_restarts() {
+        // The new agent checks the baseline right after the restart, i.e. before
+        // the health marker exists. Capture what it would see at that moment.
+        struct Probe {
+            inner: FakePlatform,
+            baseline: PathBuf,
+            seen: std::cell::RefCell<Option<String>>,
+        }
+        impl Platform for Probe {
+            fn restart_service(&self) -> Result<()> {
+                if self.inner.restarts.get() == 0 {
+                    *self.seen.borrow_mut() = std::fs::read_to_string(&self.baseline).ok();
+                }
+                self.inner.restart_service()
+            }
+        }
+        let env = setup(b"NEW BINARY", None);
+        let probe = Probe {
+            inner: platform(&env, Some("0.5.0"), false),
+            baseline: env.baseline.clone(),
+            seen: Default::default(),
+        };
+        run(&env, &probe, 2000).unwrap();
+        assert_eq!(
+            probe.seen.borrow().as_deref(),
+            Some(baseline_for(b"NEW BINARY").as_str())
+        );
+    }
+
+    #[test]
+    fn rollback_restores_the_old_integrity_baseline() {
+        // Otherwise the restored OLD binary would fail against the NEW baseline.
+        let env = setup(b"NEW BINARY", None);
+        let out = run(&env, &platform(&env, None, false), 300).unwrap();
+        assert!(matches!(out, Outcome::RolledBack { .. }));
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+        assert_eq!(
+            std::fs::read_to_string(&env.baseline).unwrap(),
+            old_baseline()
+        );
+    }
+
+    #[test]
+    fn failed_restart_restores_the_old_integrity_baseline() {
+        let env = setup(b"NEW BINARY", None);
+        let out = run(&env, &platform(&env, None, true), 300).unwrap();
+        assert!(matches!(out, Outcome::RolledBack { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&env.baseline).unwrap(),
+            old_baseline()
+        );
+    }
+
+    #[test]
+    fn missing_baseline_is_not_created() {
+        // First run writes it for whichever binary runs; the helper must not
+        // invent one.
+        let env = setup(b"NEW BINARY", None);
+        std::fs::remove_file(&env.baseline).unwrap();
+        let out = run(&env, &platform(&env, Some("0.5.0"), false), 2000).unwrap();
+        assert!(matches!(out, Outcome::Applied { .. }));
+        assert!(!env.baseline.exists());
+    }
+
+    #[test]
+    fn baseline_that_cannot_be_updated_aborts_before_restart() {
+        // A directory in place of the file makes the swap fail.
+        let env = setup(b"NEW BINARY", None);
+        std::fs::remove_file(&env.baseline).unwrap();
+        std::fs::create_dir(&env.baseline).unwrap();
+        let p = platform(&env, Some("0.5.0"), false);
+        let err = run(&env, &p, 300).unwrap_err();
+        assert!(err.to_string().contains("integrity baseline"), "{err:#}");
+        assert_eq!(
+            p.restarts.get(),
+            0,
+            "must not restart into an unverifiable binary"
+        );
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+        assert_eq!(
+            UpdateState::load(&env.paths).blocked_version.as_deref(),
+            Some("0.5.0")
+        );
     }
 }

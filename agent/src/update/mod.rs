@@ -266,6 +266,8 @@ pub fn run_apply_helper() -> Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("/usr/lib/trapd-agent/trapd-agent-exec"));
 
+    let baseline = crate::selfprotect::binary_integrity::hash_store_path();
+
     let ctx = ApplyContext {
         verify: VerifyContext {
             release_key: &release_key,
@@ -278,6 +280,7 @@ pub fn run_apply_helper() -> Result<()> {
         },
         target: &target,
         ebpf_target: Some(&ebpf_target),
+        baseline: Some(&baseline),
         paths: &paths,
         health_timeout: HEALTH_TIMEOUT,
     };
