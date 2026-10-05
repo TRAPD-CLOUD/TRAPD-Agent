@@ -141,6 +141,20 @@ pub struct OsInfo {
     pub timezone: Option<String>,
     pub boot_time_unix: u64,
     pub uptime_secs: u64,
+    /// Windows: full OS build incl. update revision ("10.0.26200.6584"). The
+    /// revision (UBR) is the patch level the backend matches against MSRC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    /// Windows: feature update name ("25H2").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_version: Option<String>,
+    /// Linux: os-release `ID` ("debian", "ubuntu", "rhel"), selects the
+    /// distribution security advisories used for package matching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distro_id: Option<String>,
+    /// Linux: os-release `VERSION_CODENAME` ("bookworm", "noble").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distro_codename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -92,6 +92,14 @@ pub fn gather_with_flags(
         ),
         boot_time_unix: System::boot_time(),
         uptime_secs: System::uptime(),
+        build: windows_build(),
+        display_version: registry::string(
+            CURRENT_VERSION_KEY,
+            "DisplayVersion",
+            RRF_SUBKEY_WOW6464KEY,
+        ),
+        distro_id: None,
+        distro_codename: None,
     };
     let compliance = compliance::assess(&software.packages, &software.source, &os, flags, cve_feed);
     let recon_profile =
@@ -286,4 +294,59 @@ fn interfaces() -> anyhow::Result<Vec<NetInterface>> {
         return Ok(out);
     }
     anyhow::bail!("adapter table repeatedly changed during inventory")
+}
+
+const CURRENT_VERSION_KEY: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+
+/// Full build "major.minor.build.ubr" (e.g. "10.0.26200.6584"). `None` unless
+/// every component is present, so the backend never matches a partial build.
+fn windows_build() -> Option<String> {
+    let major = registry::dword(
+        CURRENT_VERSION_KEY,
+        "CurrentMajorVersionNumber",
+        RRF_SUBKEY_WOW6464KEY,
+    )?;
+    let minor = registry::dword(
+        CURRENT_VERSION_KEY,
+        "CurrentMinorVersionNumber",
+        RRF_SUBKEY_WOW6464KEY,
+    )?;
+    let build = registry::string(
+        CURRENT_VERSION_KEY,
+        "CurrentBuildNumber",
+        RRF_SUBKEY_WOW6464KEY,
+    )?;
+    let ubr = registry::dword(CURRENT_VERSION_KEY, "UBR", RRF_SUBKEY_WOW6464KEY)?;
+    format_windows_build(major, minor, &build, ubr)
+}
+
+fn format_windows_build(major: u32, minor: u32, build: &str, ubr: u32) -> Option<String> {
+    let build = build.trim();
+    if build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("{major}.{minor}.{build}.{ubr}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_windows_build;
+
+    #[test]
+    fn formats_full_build_with_update_revision() {
+        assert_eq!(
+            format_windows_build(10, 0, "26200", 6584).as_deref(),
+            Some("10.0.26200.6584")
+        );
+        assert_eq!(
+            format_windows_build(10, 0, " 26100 ", 0).as_deref(),
+            Some("10.0.26100.0")
+        );
+    }
+
+    #[test]
+    fn rejects_non_numeric_build_numbers() {
+        assert_eq!(format_windows_build(10, 0, "", 1), None);
+        assert_eq!(format_windows_build(10, 0, "26200a", 1), None);
+    }
 }

@@ -541,6 +541,10 @@ fn gather_os() -> OsInfo {
         timezone: read_trim("/etc/timezone").or_else(read_timezone_symlink),
         boot_time_unix: System::boot_time(),
         uptime_secs: System::uptime(),
+        build: None,
+        display_version: None,
+        distro_id: osr.get("ID").cloned(),
+        distro_codename: osr.get("VERSION_CODENAME").cloned(),
     }
 }
 

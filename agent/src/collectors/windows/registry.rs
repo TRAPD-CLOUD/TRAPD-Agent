@@ -1,8 +1,28 @@
 //! Bounded registry reads shared by MSI configuration and Windows inventory.
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY_LOCAL_MACHINE, KEY_READ,
-    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
+
+pub fn dword(path: &str, name: &str, view: u32) -> Option<u32> {
+    let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let mut value = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: terminated strings; the out-buffer is a u32 and `size` its byte length.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_DWORD | view,
+            std::ptr::null_mut(),
+            (&mut value as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    (status == 0 && size == std::mem::size_of::<u32>() as u32).then_some(value)
+}
 
 pub fn string(path: &str, name: &str, view: u32) -> Option<String> {
     let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
