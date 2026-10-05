@@ -150,6 +150,31 @@ chmod 700 "$ENV_DIR"
 #                                    BOTH signed response-commands AND the remote
 #                                    config; without it remote config is rejected.
 
+# ── Release signing key (self-update trust anchor) ───────────────────────────
+# Raw 32-byte Ed25519 public key that signs release artifacts in CI. Distinct
+# from command_signing.pub on purpose: a compromised backend must not be able to
+# mint releases, and a compromised release pipeline must not be able to command
+# agents. Provide it out-of-band as base64 (never download it from the release
+# it is meant to authenticate).
+# NOT under ${ENV_DIR}: the agent can write there, and a key the agent can replace
+# is no trust anchor. /etc/trapd-release is read-only to the agent unit.
+RELEASE_KEY_DIR="/etc/trapd-release"
+RELEASE_KEY_FILE="${RELEASE_KEY_DIR}/release_signing.pub"
+if [[ -n "${TRAPD_RELEASE_PUBKEY_B64:-}" ]]; then
+    TMP_KEY="$(mktemp)"
+    printf '%s' "$TRAPD_RELEASE_PUBKEY_B64" | base64 -d > "$TMP_KEY" 2>/dev/null || true
+    if [[ "$(stat -c %s "$TMP_KEY")" == "32" ]]; then
+        install -d -m 0755 -o root -g root "$RELEASE_KEY_DIR"
+        install -m 0644 -o root -g root "$TMP_KEY" "$RELEASE_KEY_FILE"
+        echo "Release signing key installed."
+    else
+        echo "ERROR: TRAPD_RELEASE_PUBKEY_B64 must decode to exactly 32 bytes." >&2
+        rm -f "$TMP_KEY"
+        exit 1
+    fi
+    rm -f "$TMP_KEY"
+fi
+
 # ── Write agent.env (from env vars if provided) ──────────────────────────────
 ENV_FILE="${ENV_DIR}/agent.env"
 
@@ -287,6 +312,47 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+# ── Signed self-update: apply helper ─────────────────────────────────────────
+# The agent runs with ProtectSystem=strict and cannot write /usr/local/bin. It
+# only stages a verified update under /var/lib/trapd/update/. This path unit
+# starts a short-lived root helper (the *current* binary) that re-verifies the
+# signatures, swaps the binary, restarts the agent and rolls back if the new
+# version does not report healthy.
+APPLY_SERVICE_FILE="/etc/systemd/system/trapd-agent-update.service"
+APPLY_PATH_FILE="/etc/systemd/system/trapd-agent-update.path"
+
+cat > "$APPLY_SERVICE_FILE" <<'EOF'
+[Unit]
+Description=TRAPD Agent apply staged update
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/trapd-agent --apply-update
+Environment=TRAPD_STATE_DIR=/var/lib/trapd
+Environment=TRAPD_CONFIG_DIR=/etc/trapd
+Environment=TRAPD_LOG_DIR=/var/log/trapd
+Environment=RUST_LOG=info
+TimeoutStartSec=300
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/usr/local/bin /usr/lib/trapd-agent /var/lib/trapd /etc/trapd
+EOF
+
+cat > "$APPLY_PATH_FILE" <<'EOF'
+[Unit]
+Description=Watch for a staged TRAPD Agent update
+
+[Path]
+PathChanged=/var/lib/trapd/update/staged.offer.json
+Unit=trapd-agent-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 # ── Logrotate config ──────────────────────────────────────────────────────────
 cat > "$LOGROTATE_FILE" <<'EOF'
 /var/log/trapd/events.ndjson {
@@ -302,7 +368,15 @@ EOF
 # ── Enable services ───────────────────────────────────────────────────────────
 systemctl daemon-reload
 systemctl enable --now trapd-agent
-systemctl enable --now trapd-update.timer
+systemctl enable --now trapd-agent-update.path
+if [[ -f "$RELEASE_KEY_FILE" ]]; then
+    # Signed in-agent updates are active: retire the legacy checksum-only timer.
+    systemctl disable --now trapd-update.timer 2>/dev/null || true
+else
+    echo "WARNING: no release signing key (TRAPD_RELEASE_PUBKEY_B64): signed self-update"
+    echo "         is inactive; the legacy checksum-only update timer stays enabled."
+    systemctl enable --now trapd-update.timer
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
