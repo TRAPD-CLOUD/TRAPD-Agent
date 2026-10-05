@@ -17,7 +17,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
-use apply::{apply_staged, ApplyContext, Outcome, Platform, StagingPaths, UpdateState};
+#[cfg(target_os = "linux")]
+use apply::{apply_staged, ApplyContext, Outcome, Platform};
+use apply::{StagingPaths, UpdateState};
 use manifest::{verify_offer, UpdateOffer, VerifyContext};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(3600);
