@@ -94,7 +94,7 @@ const fn from_event(mut m: RuleMeta) -> RuleMeta {
     m
 }
 
-use DetectionMode::{Alert, Signal};
+use DetectionMode::{Alert, Shadow, Signal};
 use KeyStrategy::{Command, Path, Process, ProcessRemote, Subject};
 use Severity::{Critical, High, Low, Medium};
 
@@ -182,6 +182,35 @@ pub const RULES: &[RuleMeta] = &[
     rule("impact.cryptominer", IMPACT, "T1496", High, High, Alert, Process, HOUR),
     rule("creds.proc_mem_access", CREDS, "T1003.007", High, Critical, Alert, Process, TEN_MIN),
     container_bump(rule("container.escape_indicators", PRIVESC, "T1611", High, Critical, Alert, Command, TEN_MIN)),
+    // ── Windows (detection::windows_rules) ─────────────────────────────────
+    // Unambiguous attacker actions alert from day one; heuristics that touch
+    // tools admins also use start in shadow mode and are promoted per project
+    // once their shadow hit rate is known (`rule_modes`).
+    rule("credential_access.lsass_dump", CREDS, "T1003.001", Critical, Critical, Alert, Command, HOUR),
+    rule("credential_access.sam_hive_save", CREDS, "T1003.002", High, Critical, Alert, Command, HOUR),
+    rule("impact.shadow_copy_delete", IMPACT, "T1490", Critical, Critical, Alert, Command, HOUR),
+    rule("impact.recovery_disabled", IMPACT, "T1490", High, Critical, Alert, Command, HOUR),
+    rule("defense_evasion.defender_tamper", EVASION, "T1562.001", High, Critical, Alert, Command, HOUR),
+    rule("defense_evasion.eventlog_clear", EVASION, "T1070.001", High, Critical, Alert, Command, HOUR),
+    rule("lolbin.regsvr32_remote", EVASION, "T1218.010", High, Critical, Alert, Command, TEN_MIN),
+    rule("execution.powershell_download_exec", EXEC, "T1105", High, Critical, Shadow, Command, TEN_MIN),
+    rule("execution.powershell_encoded", EXEC, "T1059.001", Medium, High, Shadow, Command, TEN_MIN),
+    rule("lolbin.certutil_download", C2, "T1105", High, High, Shadow, Command, TEN_MIN),
+    rule("lolbin.mshta_remote", EVASION, "T1218.005", High, High, Shadow, Command, TEN_MIN),
+    rule("lolbin.rundll32_script", EVASION, "T1218.011", High, High, Shadow, Command, TEN_MIN),
+    rule("lolbin.rundll32_no_args", EVASION, "T1218.011", Medium, High, Shadow, Process, TEN_MIN),
+    rule("lolbin.bitsadmin_download", C2, "T1197", Medium, High, Shadow, Command, TEN_MIN),
+    rule("execution.wmic_process_create", EXEC, "T1047", Medium, High, Shadow, Command, TEN_MIN),
+    rule("execution.office_child_shell", EXEC, "T1204.002", High, Critical, Shadow, Command, TEN_MIN),
+    rule("webshell.windows_child_shell", PERSIST, "T1505.003", High, Critical, Shadow, Command, TEN_MIN),
+    rule("persistence.schtasks_user_path", PERSIST, "T1053.005", Medium, High, Shadow, Command, HOUR),
+    rule("persistence.service_user_path", PERSIST, "T1543.003", High, High, Shadow, Command, HOUR),
+    rule("persistence.run_key", PERSIST, "T1547.001", Medium, High, Shadow, Command, HOUR),
+    rule("defense_evasion.dll_sideload", EVASION, "T1574.002", Medium, High, Shadow, Path, HOUR),
+    rule("discovery.ad_trusts", DISCOVERY, "T1482", Low, Medium, Signal, Command, HOUR),
+    // ── Sensor / self-protection (Windows) ─────────────────────────────────
+    rule("selfprotect.etw_session_stopped", EVASION, "T1562.006", High, High, Alert, Subject, HOUR),
+    rule("selfprotect.audit_policy_changed", EVASION, "T1562.002", Medium, High, Alert, Subject, HOUR),
 ];
 
 /// Rule families whose individual ids are open-ended.
@@ -254,6 +283,57 @@ mod tests {
         let unknown = lookup("totally.new_rule");
         assert_eq!(unknown.max, High);
         assert!(!is_known("totally.new_rule"));
+    }
+
+    /// Rules that have no unit test naming them yet. A ratchet: the list may
+    /// only shrink. A new rule ships with a test that asserts its `rule_id`
+    /// (positive case) — and the benign corpus gate checks it stays quiet.
+    const UNTESTED: &[&str] = &[
+        // Pre-existing rules covered only indirectly (category or tracker
+        // tests); each needs a test asserting its id.
+        "beaconing.regular_interval",
+        "dns_tunnel.anomalous_query_volume",
+        "lateral.admin_port_sweep",
+        "revshell.interpreter_socket",
+        "fileless.memfd_exec",
+        "persistence.autostart_write",
+        "privesc.untracked_suid_exec",
+        "injection.ld_preload_runtime",
+        // Raised by the Windows ETW sensor / audit-policy monitor; covered by
+        // their module tests once those land.
+        "selfprotect.etw_session_stopped",
+        "selfprotect.audit_policy_changed",
+    ];
+
+    /// Fixture gate: every catalog rule is asserted by at least one test.
+    #[test]
+    fn every_rule_has_a_positive_test() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut tests = String::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") && !p.ends_with("detection/catalog.rs") {
+                    let src = std::fs::read_to_string(&p).unwrap();
+                    // Test code lives after the first `#[cfg(test)]`.
+                    if let Some(i) = src.find("#[cfg(test)]") {
+                        tests.push_str(&src[i..]);
+                    }
+                }
+            }
+        }
+        let missing: Vec<&str> = RULES
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| !tests.contains(&format!("\"{id}\"")) && !UNTESTED.contains(id))
+            .collect();
+        assert!(missing.is_empty(), "rules without a test asserting them: {missing:?}");
+        for id in UNTESTED {
+            assert!(!tests.contains(&format!("\"{id}\"")), "{id} is tested now; remove it from UNTESTED");
+        }
     }
 
     /// The JSON copy the backend vendors must match the compiled table.

@@ -34,6 +34,7 @@ mod ioa;
 mod ioc;
 mod netscan;
 pub mod replay;
+pub mod windows_rules;
 pub mod severity;
 pub mod sigma;
 mod stateful;
@@ -91,6 +92,9 @@ pub struct DetectionEngine {
     /// bits). Live it tracks `started.elapsed()`; replay sets it from event
     /// timestamps. Read by the helpers that do not take the clock explicitly.
     clock_bits: std::sync::atomic::AtomicU64,
+    /// Operator overrides of the catalog mode, per exact rule id (config
+    /// `rule_modes`): promote a shadow rule, or silence a noisy one.
+    rule_modes: RwLock<std::collections::HashMap<String, DetectionMode>>,
 }
 
 impl DetectionEngine {
@@ -126,6 +130,7 @@ impl DetectionEngine {
             file_events_seen: AtomicBool::new(false),
             started: Instant::now(),
             clock_bits: std::sync::atomic::AtomicU64::new(0),
+            rule_modes: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -137,6 +142,22 @@ impl DetectionEngine {
             }
             g.set_suppressions(rules);
         }
+    }
+
+    /// Replace the rule mode overrides (from the signed config).
+    pub fn set_rule_modes(&self, overrides: &[crate::config::RuleModeOverride]) {
+        if let Ok(mut m) = self.rule_modes.write() {
+            *m = overrides.iter().map(|o| (o.rule.clone(), o.mode)).collect();
+        }
+    }
+
+    /// The effective mode of a rule: operator override, else catalog.
+    fn effective_mode(&self, rule_id: &str, catalog: DetectionMode) -> DetectionMode {
+        self.rule_modes
+            .read()
+            .ok()
+            .and_then(|m| m.get(rule_id).copied())
+            .unwrap_or(catalog)
     }
 
     /// Toggle the statistical anomaly baseline at runtime (config-driven).
@@ -578,15 +599,26 @@ impl DetectionEngine {
             }
         }
         let mut input = severity::PolicyInput::from_meta(&meta, base, d.confidence, flags.clone());
+        let configured = self.effective_mode(&d.rule_id, meta.mode);
+        input.mode = if configured == DetectionMode::Shadow {
+            // Severity is still evaluated (it is what the finding *would* be).
+            DetectionMode::Alert
+        } else {
+            configured
+        };
         if let Some(mode) = d.mode {
             // A rule may demote itself to a signal; it can never promote a
             // catalog signal to an alert.
-            if meta.mode == DetectionMode::Alert {
+            if input.mode == DetectionMode::Alert && mode == DetectionMode::Signal {
                 input.mode = mode;
             }
         }
         let outcome = severity::evaluate(&input);
-        d.mode = Some(outcome.mode);
+        d.mode = Some(if configured == DetectionMode::Shadow {
+            DetectionMode::Shadow
+        } else {
+            outcome.mode
+        });
         d.base_severity = Some(base);
         d.severity_reasons = outcome.reasons;
         d.context_flags = flags;
@@ -642,6 +674,10 @@ impl DetectionEngine {
             }
         }
         for d in behavior::inspect_process_context(comm, exe, cmdline, ctx) {
+            out.push(self.detection(Severity::Info, d));
+        }
+        // Windows LOLBin / persistence / evasion rules (match `*.exe` only).
+        for d in windows_rules::inspect_process(comm, exe, cmdline, ctx) {
             out.push(self.detection(Severity::Info, d));
         }
 
@@ -1284,6 +1320,7 @@ mod tests {
             file_events_seen: AtomicBool::new(false),
             started: Instant::now(),
             clock_bits: std::sync::atomic::AtomicU64::new(0),
+            rule_modes: RwLock::new(std::collections::HashMap::new()),
         }
     }
 

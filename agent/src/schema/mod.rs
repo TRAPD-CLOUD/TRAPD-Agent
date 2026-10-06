@@ -884,6 +884,9 @@ pub enum DetectionMode {
     #[default]
     Alert,
     Signal,
+    /// Evaluated and counted, never emitted: a new rule proves itself on real
+    /// traffic before it may produce findings (counts ride the heartbeat).
+    Shadow,
 }
 
 /// Correlation keys for a finding. Process keys are `boot_id:pid:start_time`

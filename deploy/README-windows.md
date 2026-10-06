@@ -82,15 +82,18 @@ no independent release authenticity, and SmartScreen warns on download.
 | Data / path | Windows implementation |
 |---|---|
 | System snapshots | CPU, RAM, uptime and OS via sysinfo |
-| Process create/terminate | 3-second process polling, parent PID, executable, bounded command line, SHA256 and native creation FILETIME; detects observed PID reuse |
-| TCP connections and close | Native IPv4/IPv6 IP Helper tables, addresses, ports, owning PID and observed duration |
+| Process create/terminate | Real-time **ETW** (Microsoft-Windows-Kernel-Process): every start and stop with parent PID, image path, native creation time; command line, account and SHA256 enriched from the live process. Catches short-lived processes polling misses. Falls back to 3-second polling when ETW is disabled (`etw_enabled=false`) or the session cannot start. |
+| Image / DLL load | ETW image-load events; a protected-process image loaded from a user-writable folder raises a DLL side-load finding |
+| TCP connections | Real-time **ETW** (Microsoft-Windows-Kernel-Network) connect/accept with owning PID, or the native IP Helper tables when ETW is off |
+| DNS | Real-time **ETW** (Microsoft-Windows-DNS-Client) completed queries with the querying process — feeds IOC-domain and DNS-tunnel detection |
 | File changes | ReadDirectoryChangesW via notify, with live configuration reload |
 | File integrity | Periodic SHA256 baseline, content changes and deletion in the shared filesystem schema |
 | Authentication | Security events 4624/4625, target user and remote IP/port when the event supplies them; requires Windows audit policy |
 | Native logs | Security, System and Application event XML plus structured fields and persisted record cursors |
 | Interactive sessions | Session open/close via native Terminal Services API |
 | Inventory | OS/hardware, disks, native adapter addresses/MAC/status, machine software from both registry views, local users, TCP listeners, SBOM and CVE correlation |
-| Detection | Shared IOC, behaviour, IOA and Sigma engine; Windows process events project to product `windows`; signed config reloads Sigma and anomaly switches |
+| Detection | Shared IOC, behaviour, IOA and Sigma engine, plus Windows LOLBin / persistence / defense-evasion / credential-access rules (`detection/windows_rules.rs`); Windows process events project to product `windows`; signed config reloads Sigma, anomaly switches, suppressions and per-rule modes |
+| Coverage transparency | Heartbeat reports the effective sensor state (ETW session health, events lost, audit-policy state, how decoys are watched) and shadow-mode rule hit counts, so "not seen" is never shown as "did not happen" |
 | Backend | Shared enrollment, signed config, heartbeat, inventory and authenticated event ingest |
 | Delivery diagnostics | Persistent queue with restart recovery, telemetry report and `diagnostics telemetry` |
 | Honeytokens | File decoys with per-host generated bait, deployment/health events and ownership-verified cleanup during MSI removal (legacy registry decoys are removed, no longer planted) |
@@ -102,14 +105,22 @@ and registry container keys remain. Registered paths are considered for cleanup 
 after configuration removes them. On upgrade, legacy decoys without ownership records
 are preserved with a warning rather than adopted or deleted automatically.
 
-Polling can miss short-lived processes and connections. File notifications do
-not identify the accessing process or report every file read. Windows has no
-eBPF syscall, packet/DNS/TLS sensor, Linux rootkit/memory scanner, Linux CIS audit,
-generic Linux file/journal/syslog log-source readers, Linux session forensics,
-or Linux prevention/response enforcement in this package. Those capabilities
-must not be reported as implemented. The current fallback boot ID changes on
-agent restart; native process creation time still distinguishes PID reuse within
-a run. No custom kernel driver is installed.
+The ETW sensor is user-mode: no kernel driver is installed. It therefore does
+**not** see, and must not be reported as seeing, LSASS handle access (that needs
+the PPL/ELAM ETW-Ti provider) or an attacker with administrator rights who stops
+the `TRAPD-Agent` session itself — that stop *is* detected and reported, but not
+prevented. There is also no packet/TLS sensor, no Linux rootkit/memory scanner,
+no Linux CIS audit, no generic file/journal/syslog log-source readers, no Linux
+session forensics, and no Linux prevention/response enforcement in this package.
+When ETW is disabled, process polling falls back to its documented short-event
+gaps; cross-view gap detection between ETW and polling is not yet wired (polling
+is simply off while ETW runs). The current fallback boot ID changes on agent
+restart; native process creation time still distinguishes PID reuse within a run.
+
+ETW process-creation command lines are read from the live process, so a process
+that exits within microseconds may yield a start event without its command line
+(marked in `enrichment`); 4688 Security-event command lines (requiring the audit
+policy) remain a complementary source.
 
 Default file roots are `%SystemRoot%\System32\drivers\etc` and
 `%PUBLIC%\Documents`. Explicit Windows `fs_watch_paths` and `fim_paths` in signed

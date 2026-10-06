@@ -26,3 +26,8 @@ pub mod linux;
 
 #[cfg(target_os = "windows")]
 pub mod windows;
+
+// ETW record decoding for the Windows sensor; platform-neutral so it is
+// tested on every build host.
+#[cfg(any(target_os = "windows", test))]
+pub mod etw_map;

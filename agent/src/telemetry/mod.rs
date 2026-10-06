@@ -35,6 +35,7 @@
 // so dead code elsewhere in the agent is still reported.
 #![allow(dead_code)]
 
+pub mod coverage;
 pub mod diagnostics;
 pub mod drops;
 pub mod enrichment;

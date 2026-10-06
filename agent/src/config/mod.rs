@@ -350,6 +350,55 @@ pub struct AgentConfig {
     /// config without suppressions is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detection_suppressions: Vec<crate::detection::gate::SuppressionRule>,
+
+    // ── Fields below are trailing and omitted at their default, so a config
+    // that does not set them signs to the same bytes as before. Keep the
+    // order: the backend's canonical serialiser emits them in this order. ──
+
+    /// Per-project rule mode overrides (`shadow` / `signal` / `alert`), set
+    /// when a rule is promoted after its shadow period, or silenced.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_modes: Vec<RuleModeOverride>,
+    /// Windows: real-time ETW sensor (process, network, DNS). Default on;
+    /// off falls back to polling.
+    #[serde(default = "default_true", skip_serializing_if = "skip_if_true")]
+    pub etw_enabled: bool,
+    /// Windows: the agent may enable the advanced audit policy subcategories
+    /// it relies on (process creation with command line, file system for
+    /// decoys). Off by default — audit policy is often owned by GPO; the agent
+    /// then only reports the state.
+    #[serde(default, skip_serializing_if = "skip_if_false")]
+    pub windows_audit_policy_managed: bool,
+    /// Windows: learn tool usage and file habits locally to place decoys that
+    /// fit each user. Off by default (employee monitoring needs a legal basis
+    /// and, in Germany, works-council consent); switching it off deletes the
+    /// local profile.
+    #[serde(default, skip_serializing_if = "skip_if_false")]
+    pub deception_activity_learning_enabled: bool,
+    /// Windows: operator-approved adaptive decoys. The agent resolves each to
+    /// a concrete path locally and reports it after planting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adaptive_decoys: Vec<AdaptiveDecoy>,
+}
+
+/// One rule mode override (exact rule id).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleModeOverride {
+    pub rule: String,
+    pub mode: crate::schema::DetectionMode,
+}
+
+/// An approved adaptive decoy: which candidate (`id` from the recon profile),
+/// of which kind, for which user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdaptiveDecoy {
+    pub id: String,
+    pub kind: String,
+    pub user: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AgentConfig {
@@ -396,6 +445,11 @@ impl Default for AgentConfig {
             logs_enabled: default_logs_enabled(),
             logs_include_builtins: default_logs_include_builtins(),
             logs: Vec::new(),
+            rule_modes: Vec::new(),
+            etw_enabled: true,
+            windows_audit_policy_managed: false,
+            deception_activity_learning_enabled: false,
+            adaptive_decoys: Vec::new(),
         }
     }
 }

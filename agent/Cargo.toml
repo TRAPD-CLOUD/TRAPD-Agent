@@ -76,6 +76,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_System_EventLog",
     "Win32_System_RemoteDesktop",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Time",
 ] }
 roxmltree = "0.20"
 windows-service = "0.7"

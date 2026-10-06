@@ -35,6 +35,10 @@ pub struct RuleStats {
     pub alerts: u64,
     /// Findings emitted as non-alerting signals.
     pub signals: u64,
+    /// Findings of shadow-mode rules (evaluated, not emitted). Budgeted like
+    /// alerts: a rule that would be noisy here must not be promoted.
+    #[serde(default)]
+    pub shadow: u64,
     pub max_severity: Option<Severity>,
 }
 
@@ -93,10 +97,10 @@ impl Budget {
                     .rules
                     .get(rule)
                     .unwrap_or(&self.default_alerts_per_host_day);
-                let rate = stats.alerts as f64 / days;
+                let rate = (stats.alerts + stats.shadow) as f64 / days;
                 (rate > budget).then(|| BudgetViolation {
                     rule_id: rule.clone(),
-                    alerts: stats.alerts,
+                    alerts: stats.alerts + stats.shadow,
                     alerts_per_host_day: rate,
                     budget,
                 })
@@ -150,6 +154,13 @@ pub fn replay<R: BufRead>(engine: &DetectionEngine, reader: R) -> ReplayReport {
         let now = base + offset;
 
         let findings = engine.inspect_at(&event, now, offset.as_secs_f64());
+        for f in &findings {
+            if let EventData::Detection(d) = &f.data {
+                if d.mode == Some(DetectionMode::Shadow) {
+                    report.rules.entry(d.rule_id.clone()).or_default().shadow += 1;
+                }
+            }
+        }
         for emitted in engine.admit_at(findings, now) {
             record(&mut report, &emitted);
         }

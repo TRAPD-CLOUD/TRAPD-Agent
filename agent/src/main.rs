@@ -416,6 +416,9 @@ async fn main() -> Result<()> {
                 .map(|c| c.detection_suppressions.clone())
                 .unwrap_or_default(),
         );
+        if let Ok(c) = agent_config.read() {
+            engine.set_rule_modes(&c.rule_modes);
+        }
     }
     info!(
         iocs = engine.ioc_count(),
@@ -558,6 +561,7 @@ async fn main() -> Result<()> {
             sigma_engine.set_sigma_enabled(cfg.sigma_enabled);
             sigma_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
             sigma_engine.set_suppressions(cfg.detection_suppressions.clone());
+            sigma_engine.set_rule_modes(&cfg.rule_modes);
         }));
         tokio::spawn(async move { config_puller.run().await });
 

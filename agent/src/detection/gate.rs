@@ -197,6 +197,13 @@ impl FindingGate {
             }];
         };
 
+        // Shadow-mode rules are counted for the backend's promotion decision
+        // and never leave the agent (nor trigger auto-response).
+        if d.mode == Some(DetectionMode::Shadow) {
+            crate::telemetry::coverage::shadow_hit(&d.rule_id);
+            return Vec::new();
+        }
+
         if let Some(rule) = self
             .suppressions
             .iter()

@@ -232,9 +232,18 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     }
 
     spawn_collector!(SystemCollector::new());
-    spawn_collector!(ProcessCollector::new());
+    // Real-time ETW sensor (process, image load, network, DNS). Falls back to
+    // polling when disabled by config or when the session cannot start; the
+    // ETW collector returns an error, which the poller's latch then covers.
+    let etw_on = agent_config.read().map(|c| c.etw_enabled).unwrap_or(true);
+    if etw_on {
+        spawn_collector!(crate::collectors::windows::etw::EtwCollector);
+    }
+    if !etw_on {
+        spawn_collector!(ProcessCollector::new());
+        spawn_collector!(crate::collectors::windows::network::NetworkCollector);
+    }
     spawn_collector!(UserSessionCollector::new());
-    spawn_collector!(crate::collectors::windows::network::NetworkCollector);
     spawn_collector!(
         crate::collectors::windows::eventlog::EventLogCollector::new(Arc::clone(&agent_config))
     );
@@ -256,6 +265,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         engine.set_sigma_enabled(cfg.sigma_enabled);
         engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
         engine.set_suppressions(cfg.detection_suppressions.clone());
+        engine.set_rule_modes(&cfg.rule_modes);
     }
     Arc::clone(&engine).spawn_ioc_reloader(300);
 
@@ -359,6 +369,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             config_engine.set_sigma_enabled(cfg.sigma_enabled);
             config_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
             config_engine.set_suppressions(cfg.detection_suppressions.clone());
+            config_engine.set_rule_modes(&cfg.rule_modes);
         }));
         handles.push(tokio::spawn(async move { config_puller.run().await }));
 
