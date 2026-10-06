@@ -159,6 +159,14 @@ impl Installed {
 
 /// Write `bytes` next to `target`, fsync, and swap it in.
 fn install_file(target: &Path, bytes: &[u8], mode: u32) -> Result<Installed> {
+    // Windows can rename an existing directory out of the way and replace it
+    // with a file. Reject invalid install targets consistently on all hosts.
+    if target.exists() && !target.is_file() {
+        bail!(
+            "update: install target {} is not a regular file",
+            target.display()
+        );
+    }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).context("update: create install dir")?;
     }
