@@ -10,8 +10,11 @@ use windows_sys::Win32::System::EventLog::*;
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
 use crate::schema::{
-    AgentEvent, EventAction, EventClass, EventData, LogEventData, Severity, UserLogonData,
+    AgentEvent, EventAction, EventClass, EventData, HoneytokenAccessData, LogEventData, Severity,
+    UserLogonData,
 };
+use crate::detection::windows_decoy;
+use crate::schema::DetectionData;
 
 struct Handle(EVT_HANDLE);
 impl Drop for Handle {
@@ -206,6 +209,76 @@ fn parse(xml: &str, channel: &str) -> Result<(u64, LogEventData, Option<UserLogo
     Ok((record_id, data, auth))
 }
 
+/// Record the logon type of a 4624 success so later object-access events can
+/// be graded by session kind. Bounded to 4096 entries.
+fn capture_logon_type(fields: &serde_json::Map<String, serde_json::Value>, cache: &mut HashMap<String, u32>) {
+    let id = fields.get("EventID").and_then(|v| v.as_u64());
+    if id != Some(4624) {
+        return;
+    }
+    let get = |k: &str| fields.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let logon_id = get("TargetLogonId");
+    if let Ok(t) = get("LogonType").parse::<u32>() {
+        if !logon_id.is_empty() {
+            if cache.len() >= 4096 {
+                cache.clear();
+            }
+            cache.insert(logon_id.to_string(), t);
+        }
+    }
+}
+
+/// Grade a 4663 object-access event against the planted-decoy registry.
+/// Returns a honeytoken detection only when the access is on a decoy and the
+/// grader did not treat it as a pure verified-sweeper metadata touch.
+fn decoy_access(
+    fields: &serde_json::Map<String, serde_json::Value>,
+    logon_types: &HashMap<String, u32>,
+) -> Option<HoneytokenAccessData> {
+    if fields.get("EventID").and_then(|v| v.as_u64()) != Some(4663) {
+        return None;
+    }
+    let get = |k: &str| fields.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let object = get("ObjectName");
+    if object.is_empty() {
+        return None;
+    }
+    let decoy = windows_decoy::lookup_decoy(&object)?;
+    let logon_type = {
+        let id = get("SubjectLogonId");
+        (!id.is_empty()).then(|| logon_types.get(&id).copied()).flatten()
+    };
+    // Signature verification of the accessor is a follow-up; until then only
+    // explicitly configured allowlist names count as trusted (none here), so a
+    // sweeper is never auto-trusted on name alone.
+    let accessor = windows_decoy::accessor_from_4663(|k| get(k), logon_type, false);
+    let verdict = windows_decoy::grade(&decoy, &accessor, None);
+    Some(windows_decoy::to_access_data(&decoy, &accessor, &verdict))
+}
+
+/// Security-log clear (1102) or audit-policy change (4719): an attacker
+/// blinding the host. Raised as a self-protection detection.
+fn audit_tamper(fields: &serde_json::Map<String, serde_json::Value>) -> Option<DetectionData> {
+    let id = fields.get("EventID").and_then(|v| v.as_u64())?;
+    let (title, detail) = match id {
+        1102 => ("Security event log cleared", "The Windows Security log was cleared"),
+        4719 => ("System audit policy changed", "The system audit policy was changed"),
+        _ => return None,
+    };
+    Some(DetectionData {
+        rule_id: "selfprotect.audit_policy_changed".into(),
+        title: title.into(),
+        category: "defense_evasion".into(),
+        mitre_tactic: Some("TA0005 Defense Evasion".into()),
+        mitre_technique: Some(if id == 1102 { "T1070.001" } else { "T1562.002" }.into()),
+        confidence: 80,
+        subject: format!("event {id}"),
+        detail: detail.into(),
+        evidence: serde_json::json!({ "event_id": id }),
+        ..Default::default()
+    })
+}
+
 pub struct EventLogCollector {
     config: Arc<RwLock<AgentConfig>>,
 }
@@ -231,6 +304,10 @@ impl Collector for EventLogCollector {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        // Recent (SubjectLogonId -> LogonType) from 4624, so a 4663 decoy read
+        // can be graded by how its subject logged on (interactive vs. RDP vs.
+        // service). Bounded; oldest dropped on overflow.
+        let mut logon_types: HashMap<String, u32> = HashMap::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             ticker.tick().await;
@@ -273,6 +350,39 @@ impl Collector for EventLogCollector {
                 }
                 for xml in records {
                     let (record, data, auth) = parse(&xml, channel)?;
+                    if channel == "Security" {
+                        capture_logon_type(&data.fields, &mut logon_types);
+                        if cursor.is_some() {
+                            if let Some(det) = audit_tamper(&data.fields) {
+                                let ev = AgentEvent::new(
+                                    agent_id.clone(),
+                                    hostname.clone(),
+                                    EventClass::Detection,
+                                    EventAction::Detected,
+                                    Severity::High,
+                                    EventData::Detection(Box::new(det)),
+                                );
+                                if tx.send(ev).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        if cursor.is_some() {
+                            if let Some(hit) = decoy_access(&data.fields, &logon_types) {
+                                let ev = AgentEvent::new(
+                                    agent_id.clone(),
+                                    hostname.clone(),
+                                    EventClass::Detection,
+                                    EventAction::HoneytokenAccess,
+                                    Severity::Critical,
+                                    EventData::HoneytokenAccess(Box::new(hit)),
+                                );
+                                if tx.send(ev).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
                     // First start tails from the newest record, avoiding a full
                     // historical replay. Subsequent starts resume the cursor.
                     if cursor.is_some() {

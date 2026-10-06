@@ -579,6 +579,27 @@ impl Collector for HoneytokenCollector {
     }
 }
 
+/// Make a decoy auditable and register it so the 4663 object-access path can
+/// attribute reads to a process and account. Best-effort: on failure the decoy
+/// is still watched by the change-notification / last-access fallback.
+fn arm_decoy_audit(path: &Path) {
+    use crate::detection::windows_decoy::{register_decoy, DecoyInfo};
+    let owner_sid = super::decoy_audit::owner_sid(path).unwrap_or_default();
+    let audited = super::decoy_audit::set_read_audit_sacl(path);
+    register_decoy(DecoyInfo {
+        token_id: format!("winfs:{}", path.display()),
+        path: path.display().to_string(),
+        kind: "windows_decoy_file".to_string(),
+        owner_sid,
+    });
+    crate::telemetry::coverage::update(|c| {
+        // Only ever report a stronger mode; once any decoy is audited the host
+        // can attribute reads. The last-access poll remains the fallback.
+        let stronger = audited || c.decoy_detection.as_deref() == Some("audit");
+        c.decoy_detection = Some(if stronger { "audit" } else { "last_access" }.into());
+    });
+}
+
 /// A `honeytoken_paths` entry that names a registry location rather than a
 /// file. Older backends could list the legacy registry decoy key; such an entry
 /// is ignored (registry decoys are retired) and must never become a file path.
@@ -1047,6 +1068,7 @@ fn reconcile_removed(
         if let Ok(mut m) = state.planted.lock() {
             m.remove(&path);
         }
+        crate::detection::windows_decoy::forget_decoy(&path.display().to_string());
         info!(path = %path.display(), preserved, "honeytoken decoy retired");
         send_prevention(
             tx,
@@ -1105,6 +1127,7 @@ fn emit_fs_deployed(
     state: &FsState,
 ) {
     let sha256 = state.sha.lock().ok().and_then(|m| m.get(path).cloned());
+    arm_decoy_audit(path);
     send_prevention(
         tx,
         agent_id,

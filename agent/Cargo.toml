@@ -79,6 +79,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_Etw",
     "Win32_Storage_FileSystem",
     "Win32_System_Time",
+    "Win32_Security_Authorization",
 ] }
 roxmltree = "0.20"
 windows-service = "0.7"

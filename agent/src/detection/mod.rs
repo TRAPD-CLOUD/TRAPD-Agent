@@ -34,6 +34,8 @@ mod ioa;
 mod ioc;
 mod netscan;
 pub mod replay;
+#[cfg(any(windows, test))]
+pub mod windows_decoy;
 pub mod windows_rules;
 pub mod severity;
 pub mod sigma;

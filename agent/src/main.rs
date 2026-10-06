@@ -107,7 +107,8 @@ async fn main() -> Result<()> {
         {
             paths::init_state_dir();
             collectors::windows::honeytokens::uninstall(&config::load_persisted());
-            info!("Uninstall cleanup complete (honeytoken files + registry decoys removed)");
+            crate::deception::activity::ActivityStore::purge(&crate::deception::activity::state_path());
+            info!("Uninstall cleanup complete (honeytoken files + registry decoys + activity profile removed)");
         }
         #[cfg(not(target_os = "windows"))]
         info!("Uninstall: no local honeytoken artifacts on this platform — nothing to do");

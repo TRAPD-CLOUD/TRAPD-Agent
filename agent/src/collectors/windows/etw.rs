@@ -118,10 +118,31 @@ impl Collector for EtwCollector {
             }
         }
         // The session stopped: either we are shutting down, or something (a
-        // tampering actor, a provider reset) killed it. Surface it; the engine
-        // raises selfprotect.etw_session_stopped from the coverage change.
+        // tampering actor stopping the logger, a provider reset) killed it.
         coverage::update(|c| c.etw_session = Some(false));
         warn!("WindowsEtwCollector: ETW session ended");
+        let det = crate::schema::DetectionData {
+            rule_id: "selfprotect.etw_session_stopped".into(),
+            title: "TRAPD ETW telemetry session stopped".into(),
+            category: "defense_evasion".into(),
+            mitre_tactic: Some("TA0005 Defense Evasion".into()),
+            mitre_technique: Some("T1562.006".into()),
+            confidence: 80,
+            subject: SESSION_NAME.into(),
+            detail: "The real-time ETW session ended; process/network/DNS visibility is degraded until it restarts".into(),
+            evidence: serde_json::json!({ "session": SESSION_NAME }),
+            ..Default::default()
+        };
+        let _ = tx
+            .send(AgentEvent::new(
+                agent_id.clone(),
+                hostname.clone(),
+                EventClass::Detection,
+                EventAction::Detected,
+                Severity::High,
+                EventData::Detection(Box::new(det)),
+            ))
+            .await;
         Err(anyhow!("ETW session ended"))
     }
 }
@@ -431,6 +452,7 @@ impl DecodeState {
                     let pid = rec.int(&["ProcessID", "ProcessId"]).unwrap_or(0) as i32;
                     let enrich = self.enrich_process(pid);
                     if let Some(data) = etw_map::process_start(rec, &self.devices, enrich) {
+                        crate::deception::activity::record_exec(&data.username, &data.exe);
                         self.proc_images.insert(data.pid, data.exe.clone());
                         emit(
                             EventClass::Process,

@@ -16,6 +16,7 @@
 //! provided by the shared [`crate::collectors::system`] collector.
 
 pub mod etw;
+pub mod decoy_audit;
 pub mod eventlog;
 pub mod filesystem;
 pub mod honeytokens;

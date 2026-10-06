@@ -266,6 +266,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
         engine.set_suppressions(cfg.detection_suppressions.clone());
         engine.set_rule_modes(&cfg.rule_modes);
+        crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
     }
     Arc::clone(&engine).spawn_ioc_reloader(300);
 
@@ -332,6 +333,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             ticker.tick().await;
+            crate::deception::activity::persist();
             let report =
                 crate::telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
             if let Err(e) = report.write_atomic(&crate::telemetry::TelemetryReport::default_path())
@@ -370,6 +372,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             config_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
             config_engine.set_suppressions(cfg.detection_suppressions.clone());
             config_engine.set_rule_modes(&cfg.rule_modes);
+            crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
         }));
         handles.push(tokio::spawn(async move { config_puller.run().await }));
 
