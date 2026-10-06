@@ -102,3 +102,20 @@ Interaction between dpkg and the self-update:
   would warn; `lintian` was not run.
 - Not tested against a real systemd: the units pass `systemd-analyze verify`
   syntax-wise, the install paths were tested with a stubbed `systemctl`.
+
+## Honeytokens (opt-in)
+
+The packaged service keeps `/home` and `/root` read-only for the agent, so
+honeytoken decoys planted there fail. To allow them on a host that has
+honeytoken paths configured, enable the shipped drop-in (it is never enabled by
+the package, and it survives upgrades):
+
+```sh
+sudo install -D -m 0644 /usr/share/trapd-agent/deception.conf \
+     /etc/systemd/system/trapd-agent.service.d/deception.conf
+sudo systemctl daemon-reload && sudo systemctl restart trapd-agent
+```
+
+It sets `ProtectHome=false`, `ProtectSystem=full` and adds `CAP_DAC_OVERRIDE`,
+`CAP_CHOWN` and `CAP_FOWNER`. Remove the file (and reload) to go back to the
+read-only default. With `install.sh`, pass `TRAPD_ENABLE_DECEPTION=1`.

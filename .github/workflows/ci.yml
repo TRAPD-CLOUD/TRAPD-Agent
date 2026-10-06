@@ -12,6 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: REQUIRE_DOCKER=1 deploy/deb/test-deb.sh
+      - run: deploy/test-deception-dropin.sh
 
   build:
     runs-on: ubuntu-latest

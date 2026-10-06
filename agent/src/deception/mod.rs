@@ -206,6 +206,29 @@ pub struct Breadcrumb {
     pub append: bool,
 }
 
+/// A decoy write that fails with EROFS/EACCES/EPERM on a systemd host is almost
+/// always the unit's sandbox (read-only /home, no CAP_DAC_OVERRIDE), not a bad
+/// path. Say so, instead of leaving the operator with a bare "Read-only file
+/// system".
+#[cfg(target_os = "linux")]
+fn sandbox_hint(error: &anyhow::Error) -> &'static str {
+    let denied = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .filter_map(std::io::Error::raw_os_error)
+        .any(|code| code == libc::EROFS || code == libc::EACCES || code == libc::EPERM);
+    if denied {
+        " (the agent's systemd unit may block this location; enable the honeytoken drop-in, see deploy/trapd-agent-deception.conf)"
+    } else {
+        ""
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sandbox_hint(_error: &anyhow::Error) -> &'static str {
+    ""
+}
+
 /// Place a honeytoken with camouflage and record it in the register.
 ///
 /// Returns the persisted [`HoneytokenRecord`] on success. Fails (without side
@@ -296,8 +319,10 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
     let sha = hex::encode(Sha256::digest(&req.content));
     let size = req.content.len() as u64;
 
-    write_camouflaged(&target, &req.content, mode, owner, times)
-        .with_context(|| format!("write honeytoken to {}", target.display()))?;
+    write_camouflaged(&target, &req.content, mode, owner, times).map_err(|e| {
+        let hint = sandbox_hint(&e);
+        e.context(format!("write honeytoken to {}{hint}", target.display()))
+    })?;
 
     // Place cross-linking breadcrumbs that point at the token. A breadcrumb
     // failure must not unwind a token that is already on disk, so failures are
@@ -1112,6 +1137,21 @@ fn chown(_path: &Path, _uid: u32, _gid: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_hint_only_for_permission_style_errors() {
+        let erofs = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EROFS))
+            .context("create staging file");
+        assert!(sandbox_hint(&erofs).contains("trapd-agent-deception.conf"));
+        for code in [libc::EACCES, libc::EPERM] {
+            let e = anyhow::Error::from(std::io::Error::from_raw_os_error(code));
+            assert!(!sandbox_hint(&e).is_empty());
+        }
+        let enospc = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert_eq!(sandbox_hint(&enospc), "");
+        assert_eq!(sandbox_hint(&anyhow::anyhow!("not an io error")), "");
+    }
 
     fn scratch_dir() -> PathBuf {
         let nanos = std::time::SystemTime::now()
