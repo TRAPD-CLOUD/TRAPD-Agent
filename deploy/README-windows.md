@@ -93,7 +93,7 @@ no independent release authenticity, and SmartScreen warns on download.
 | Detection | Shared IOC, behaviour, IOA and Sigma engine; Windows process events project to product `windows`; signed config reloads Sigma and anomaly switches |
 | Backend | Shared enrollment, signed config, heartbeat, inventory and authenticated event ingest |
 | Delivery diagnostics | Persistent queue with restart recovery, telemetry report and `diagnostics telemetry` |
-| Honeytokens | File and registry decoys, deployment/health events and ownership-verified cleanup during MSI removal |
+| Honeytokens | File decoys with per-host generated bait, deployment/health events and ownership-verified cleanup during MSI removal (legacy registry decoys are removed, no longer planted) |
 
 Windows honeytoken ownership is persisted in `<state>/windows_honeytoken_deployments.json`.
 Cleanup removes only registered, unchanged artifacts; file identity and content are

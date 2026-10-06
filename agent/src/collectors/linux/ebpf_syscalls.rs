@@ -498,6 +498,7 @@ impl EbpfSyscallCollector {
                                 .unwrap_or(true)
                         })
                         .unwrap_or(false);
+                    honeytoken::set_kernel_arming_enabled(enabled);
                     reconcile_honeytokens(
                         &mut paths_map,
                         dirs_map.as_mut(),
@@ -517,10 +518,15 @@ impl EbpfSyscallCollector {
             let mut access_afd = access_afd;
             tokio::spawn(async move {
                 info!("eBPF honeytoken detection active");
+                honeytoken::set_kernel_consumer_running(true);
                 loop {
                     let mut guard = match access_afd.readable_mut().await {
                         Ok(g) => g,
-                        Err(_) => return,
+                        Err(_) => {
+                            warn!("honeytoken access ring buffer closed — detection stopped");
+                            honeytoken::set_kernel_consumer_running(false);
+                            return;
+                        }
                     };
                     let rb = guard.get_inner_mut();
                     while let Some(item) = rb.next() {

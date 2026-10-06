@@ -958,6 +958,17 @@ pub struct HoneytokenAccessData {
     /// `None` when `/proc` could not be read (e.g. the process already exited).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionContext>,
+    /// The accessor's executable is a verified sweeper (indexer, AV scanner,
+    /// backup tool). Its content reads are reported rather than suppressed;
+    /// outside an interactive session they are scored as info. Omitted when
+    /// false so older backends see an unchanged payload.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allowlisted_accessor: bool,
+    /// The agent judged this access a scheduled sweep: a verified sweeper, no
+    /// controlling terminal, launched by the init system or a job scheduler.
+    /// Recorded as info-level evidence; never alerted on or acted upon.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scheduled_sweep: bool,
 }
 
 /// Session / execution context of a process, captured from `/proc` at detection

@@ -85,6 +85,20 @@ enum ResponseLevel {
 }
 
 impl ResponseLevel {
+    /// The response actually taken for one access. A verified sweeper
+    /// (backup/AV/indexer) is never frozen, killed or isolated automatically:
+    /// a scheduled run gets no response at all, an interactive one an alert at
+    /// most. An operator decides on anything more disruptive.
+    fn for_access(self, data: &HoneytokenAccessData) -> Option<Self> {
+        if data.scheduled_sweep {
+            return None;
+        }
+        if data.allowlisted_accessor && self != ResponseLevel::None {
+            return Some(ResponseLevel::Alert);
+        }
+        Some(self)
+    }
+
     fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "none" => ResponseLevel::None,
@@ -262,7 +276,9 @@ impl Engine {
         if !self.prevention_enabled() {
             return;
         }
-        let level = self.honeytoken_response_level();
+        let Some(level) = self.honeytoken_response_level().for_access(data) else {
+            return;
+        };
         let pid = data.accessor.pid;
         let target = format!("{} (pid {})", data.path, pid);
 
@@ -2008,5 +2024,57 @@ mod tests {
         assert_eq!(ResponseLevel::parse("freeze"), ResponseLevel::Freeze);
         assert_eq!(ResponseLevel::parse("jail"), ResponseLevel::Freeze);
         assert_eq!(ResponseLevel::Freeze.as_str(), "freeze");
+    }
+
+    fn access(allowlisted: bool, tty: Option<&str>) -> crate::schema::HoneytokenAccessData {
+        crate::schema::HoneytokenAccessData {
+            token_id: "t".into(),
+            path: "/home/alice/.ssh/id_ed25519".into(),
+            kind: "ssh_private_key".into(),
+            access_kind: "open".into(),
+            open_flags: 0,
+            confidence: 100,
+            mitre_tactic: String::new(),
+            mitre_technique: String::new(),
+            accessor: crate::schema::ProcessLineage {
+                pid: 4242,
+                uid: 0,
+                gid: 0,
+                username: "root".into(),
+                comm: "restic".into(),
+                exe: None,
+                cmdline: None,
+                ancestors: Vec::new(),
+            },
+            session: tty.map(|t| crate::schema::SessionContext {
+                tty: Some(t.into()),
+                ..Default::default()
+            }),
+            allowlisted_accessor: allowlisted,
+            scheduled_sweep: allowlisted && tty.is_none(),
+        }
+    }
+
+    #[test]
+    fn verified_sweepers_are_never_disrupted_automatically() {
+        for level in [
+            ResponseLevel::Freeze,
+            ResponseLevel::Kill,
+            ResponseLevel::Isolate,
+        ] {
+            // Scheduled backup/AV run (as judged by the detector): no response.
+            assert_eq!(level.for_access(&access(true, None)), None);
+            // Same tool from a terminal: alert, but nothing disruptive.
+            assert_eq!(
+                level.for_access(&access(true, Some("pts/1"))),
+                Some(ResponseLevel::Alert)
+            );
+            // Anyone else gets the configured response.
+            assert_eq!(level.for_access(&access(false, None)), Some(level));
+        }
+        assert_eq!(
+            ResponseLevel::None.for_access(&access(true, Some("pts/1"))),
+            Some(ResponseLevel::None)
+        );
     }
 }

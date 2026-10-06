@@ -13,20 +13,23 @@
 //!     carries no read notification); on volumes where last-access updates are
 //!     disabled (`NtfsDisableLastAccessUpdate`) read detection degrades
 //!     gracefully to tamper detection only.
-//!   * **Registry** — decoy values under `HKLM\SOFTWARE\TRAPD\Honeytokens`
-//!     (`DatabasePassword`, `AdminCredentials`, `BackupKey`) are watched from a
-//!     dedicated thread blocking in `RegNotifyChangeKeyValue`; any change is
-//!     diffed against the expected values and raised.
+//!   * **Registry** — no longer planted. Earlier releases placed fixed values
+//!     under a product-named key; those self-identify, so this module only
+//!     retires the values a previous release recorded as its own.
 //!
-//! Resilience: a periodic sweep replants any decoy (file or registry value)
-//! that has been deleted, so the bait survives tampering. The agent's own
+//! Bait content is generated per decoy from a CSPRNG and the host's own
+//! identity (see [`windows_bait`]), so no two hosts or tenants share a greppable
+//! constant.
+//!
+//! Resilience: a periodic sweep replants any decoy file that has been deleted,
+//! so the bait survives tampering. The agent's own
 //! plant/replant writes are suppressed with a short per-path window — Windows
 //! change notifications carry no accessor PID, so self-exclusion works on time
 //! rather than identity (the accessor lineage in emitted events is likewise
 //! `unknown`).
 //!
 //! `trapd-agent.exe uninstall` calls [`uninstall`] to remove every decoy file
-//! and the whole registry key again.
+//! and any legacy registry decoy values again.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -42,18 +45,17 @@ use tracing::{debug, info, warn};
 
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
+use crate::deception::windows_bait::{self, HostIdentity, UnsupportedDecoy};
 use crate::schema::{
     AgentEvent, EventAction, EventClass, EventData, HoneytokenAccessData, PreventionEventData,
     ProcessLineage, Severity,
 };
 
-/// Registry key (under HKLM) holding the decoy values.
+/// Registry key (under HKLM) that held the legacy decoy values.
 const REGISTRY_SUBKEY: &str = "SOFTWARE\\TRAPD\\Honeytokens";
-/// Parent key, removed on uninstall when it has become empty.
-const REGISTRY_PARENT_SUBKEY: &str = "SOFTWARE\\TRAPD";
 
-/// Decoy registry values: names an attacker greps for, content that is
-/// believable but strictly fake.
+/// The legacy registry decoy values, kept only so cleanup can verify a value is
+/// still exactly what a previous release planted before deleting it.
 const REGISTRY_VALUES: &[(&str, &str)] = &[
     ("DatabasePassword", "Pr0d-MSSQL-2024!xK7q#v"),
     ("AdminCredentials", "CORP\\svc_backup:Sup3rS3cr3t#2024"),
@@ -375,14 +377,26 @@ mod ownership_regressions {
     }
 
     #[test]
+    fn last_access_setting_maps_to_detection_mode() {
+        assert_eq!(last_access_mode(None), "last_access");
+        assert_eq!(last_access_mode(Some(0)), "last_access");
+        assert_eq!(last_access_mode(Some(1)), "tamper_only");
+        assert_eq!(last_access_mode(Some(0x8000_0000)), "last_access"); // user, enabled
+        assert_eq!(last_access_mode(Some(0x8000_0001)), "tamper_only"); // user, disabled
+        assert_eq!(last_access_mode(Some(0x8000_0002)), "last_access"); // system, enabled
+        assert_eq!(last_access_mode(Some(0x8000_0003)), "tamper_only"); // system, disabled
+        assert!(read_detection_mode() == "last_access" || read_detection_mode() == "tamper_only");
+    }
+
+    #[test]
     fn registry_entries_are_not_treated_as_files() {
-        let mut cfg = AgentConfig::default();
-        assert!(!registry_decoys_requested(&cfg));
-        cfg.honeytoken_paths = vec![
-            "C:\\Data\\notes.txt".into(),
-            "HKLM\\SOFTWARE\\TRAPD\\Honeytokens".into(),
-        ];
-        assert!(registry_decoys_requested(&cfg));
+        let cfg = AgentConfig {
+            honeytoken_paths: vec![
+                "C:\\Data\\notes.txt".into(),
+                "HKLM\\SOFTWARE\\TRAPD\\Honeytokens".into(),
+            ],
+            ..AgentConfig::default()
+        };
         let config = Arc::new(RwLock::new(cfg));
         assert_eq!(
             desired_file_paths(&config),
@@ -411,6 +425,8 @@ struct FsState {
     /// Paths whose failure was already reported (one event per failure, not
     /// one per sweep). Cleared when the path is planted or leaves the config.
     reported: Mutex<HashSet<PathBuf>>,
+    /// The host the bait is tailored to (set once when the collector starts).
+    host: std::sync::OnceLock<HostIdentity>,
 }
 
 impl FsState {
@@ -494,6 +510,10 @@ impl Collector for HoneytokenCollector {
         hostname: String,
     ) -> Result<()> {
         let state = Arc::new(FsState::default());
+        let _ = state.host.set(HostIdentity {
+            hostname: hostname.clone(),
+            dns_domain: host_dns_domain(),
+        });
 
         // Retire decoys that left the config while the agent was down, then
         // plant so the bait exists before any watcher is armed.
@@ -515,16 +535,15 @@ impl Collector for HoneytokenCollector {
             }
         }
 
-        // Registry decoys + blocking RegNotifyChangeKeyValue monitor.
+        // Retire legacy registry decoys planted by earlier releases.
         {
             let tx = tx.clone();
             let agent_id = agent_id.clone();
             let hostname = hostname.clone();
-            let config = Arc::clone(&self.config);
             std::thread::Builder::new()
                 .name("trapd-reg-honeytokens".into())
-                .spawn(move || registry::monitor(tx, agent_id, hostname, config))
-                .context("spawn registry honeytoken monitor thread")?;
+                .spawn(move || registry::retire_legacy(tx, agent_id, hostname))
+                .context("spawn legacy registry decoy cleanup thread")?;
         }
 
         // Filesystem watcher (ReadDirectoryChangesW via `notify`), rebuilt when
@@ -561,17 +580,10 @@ impl Collector for HoneytokenCollector {
 }
 
 /// A `honeytoken_paths` entry that names a registry location rather than a
-/// file. Registry decoys are opt-in: they are planted only while the config
-/// lists an entry under [`REGISTRY_SUBKEY`] (`HKLM\SOFTWARE\TRAPD\Honeytokens`).
+/// file. Older backends could list the legacy registry decoy key; such an entry
+/// is ignored (registry decoys are retired) and must never become a file path.
 fn is_registry_entry(entry: &str) -> bool {
     entry.trim().to_ascii_lowercase().starts_with("hklm\\")
-}
-
-/// Whether the config asks for the registry decoys.
-fn registry_decoys_requested(cfg: &AgentConfig) -> bool {
-    cfg.honeytoken_paths
-        .iter()
-        .any(|entry| is_registry_entry(entry))
 }
 
 /// Every decoy *file* the operator listed, trimmed and deduplicated, whether or
@@ -651,7 +663,15 @@ fn plant_missing(paths: &[PathBuf], state: &FsState) -> Vec<PathBuf> {
                 continue;
             }
         }
-        let bait = bait_content(path);
+        let host = state.host.get().cloned().unwrap_or_default();
+        let bait = match bait_content(path, &host) {
+            Ok(bait) => bait,
+            Err(reason) => {
+                warn!(path = %path.display(), %reason, "honeytoken: no believable bait for this path");
+                state.fail(path, reason.to_string());
+                continue;
+            }
+        };
         let result = (|| -> Result<()> {
             // Exclusive creation refuses files and reparse points that appeared
             // after the existence check. Deny sharing until ownership is saved.
@@ -703,37 +723,30 @@ fn plant_missing(paths: &[PathBuf], state: &FsState) -> Vec<PathBuf> {
     created
 }
 
-/// Believable bait content for a decoy file, themed on its name. Strictly fake.
-fn bait_content(path: &Path) -> Vec<u8> {
+/// Bait for a decoy file, themed on its name and generated per decoy from the
+/// CSPRNG and the host's identity, so no two decoys share a constant.
+fn bait_content(path: &Path, host: &HostIdentity) -> Result<Vec<u8>, UnsupportedDecoy> {
     let name = path
         .file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let body = if name.contains("password") {
-        "# IT service accounts — DO NOT SHARE\r\n\
-         vpn.corp.local        svc_vpn      V?n2024!Spr1ng\r\n\
-         sql01.corp.local      sa           Pr0d-MSSQL-2024!xK7q\r\n\
-         backup01.corp.local   svc_backup   B4ckup#Rot8-2024\r\n\
-         fileserver.corp.local administrator Wint3r2024!Adm\r\n"
-            .to_string()
-    } else if name.contains("credential") {
-        "host,username,password,notes\r\n\
-         sql01.corp.local,sa,Pr0d-MSSQL-2024!xK7q,production database\r\n\
-         vpn.corp.local,svc_vpn,V?n2024!Spr1ng,site-to-site vpn\r\n\
-         backup01.corp.local,svc_backup,B4ckup#Rot8-2024,veeam console\r\n"
-            .to_string()
-    } else if name.contains("key") || name.contains("backup") {
-        "-----BEGIN BACKUP MASTER KEY-----\r\n\
-         QmFja3VwLU1hc3Rlci1LZXktMjAyNC0wMS0xNS1yb3RhdGVkLXF1YXJ0ZXJseQ==\r\n\
-         -----END BACKUP MASTER KEY-----\r\n"
-            .to_string()
-    } else {
-        format!(
-            "# {} — internal use only\r\nsee IT vault for rotation schedule\r\n",
-            path.display()
-        )
+    windows_bait::generate(&name, host)
+}
+
+/// The machine's DNS domain when it is domain-joined (`None` in a workgroup).
+fn host_dns_domain() -> Option<String> {
+    use windows_sys::Win32::System::SystemInformation::{
+        ComputerNameDnsDomain, GetComputerNameExW,
     };
-    body.into_bytes()
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    let ok = unsafe { GetComputerNameExW(ComputerNameDnsDomain, buf.as_mut_ptr(), &mut len) };
+    if ok == 0 || len == 0 || len as usize > buf.len() {
+        return None;
+    }
+    String::from_utf16(&buf[..len as usize])
+        .ok()
+        .filter(|domain| !domain.is_empty())
 }
 
 // ── Filesystem watch (ReadDirectoryChangesW via `notify`) ─────────────────────
@@ -905,6 +918,7 @@ async fn sweep(
     // and does its content digest still match? Catches tampering that happened
     // while the agent was down (no watcher event fired).
     if report_health {
+        let detection = read_detection_mode();
         for path in &paths {
             if !owns_path(path) {
                 continue;
@@ -928,11 +942,8 @@ async fn sweep(
                 (None, Some(_)) => (true, false),
             };
             emit_fs_health(
-                tx, agent_id, hostname, path, present, modified, expected, actual,
+                tx, agent_id, hostname, path, present, modified, expected, actual, detection,
             );
-        }
-        for (path, present, modified) in registry::health() {
-            emit_registry_health(tx, agent_id, hostname, &path, present, modified);
         }
     }
 }
@@ -1120,6 +1131,7 @@ fn emit_fs_health(
     modified: bool,
     expected_sha256: Option<String>,
     actual_sha256: Option<String>,
+    detection: &str,
 ) {
     let file_status = match (present, modified) {
         (false, _) => "missing",
@@ -1148,46 +1160,58 @@ fn emit_fs_health(
             "file_status": file_status,
             "expected_sha256": expected_sha256,
             "actual_sha256": actual_sha256,
+            "detection": detection,
         }),
     );
 }
 
-/// Report one registry decoy's health (same lifecycle contract as files).
-fn emit_registry_health(
-    tx: &Sender<AgentEvent>,
-    agent_id: &str,
-    hostname: &str,
-    path: &str,
-    present: bool,
-    modified: bool,
-) {
-    let file_status = match (present, modified) {
-        (false, _) => "missing",
-        (true, true) => "modified",
-        (true, false) => "present",
+/// What the decoy watch can actually see on this host, reported with health:
+///
+///   * `last_access` — changes, renames and deletion via change notifications,
+///     plus content reads via the NTFS last-access time. Best-effort: NTFS
+///     updates that time at most hourly, and no accessor identity is known.
+///   * `tamper_only` — last-access updates are disabled
+///     (`NtfsDisableLastAccessUpdate`, bit 0 set; user- or system-managed), so
+///     reads are invisible and only changes are detected.
+fn read_detection_mode() -> &'static str {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD,
     };
-    let healthy = present && !modified;
-    send_prevention(
-        tx,
-        agent_id,
-        hostname,
-        EventAction::HoneytokenHealth,
-        if healthy {
-            Severity::Info
-        } else {
-            Severity::High
-        },
-        "honeytoken_health",
-        path.to_string(),
-        healthy,
-        format!("windows registry decoy is {file_status}"),
-        serde_json::json!({
-            "kind": "windows_registry_key",
-            "present": present,
-            "modified": modified,
-            "file_status": file_status,
-        }),
-    );
+    let wide = |s: &str| {
+        s.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let key = wide("SYSTEM\\CurrentControlSet\\Control\\FileSystem");
+    let value = wide("NtfsDisableLastAccessUpdate");
+    let mut data: u32 = 0;
+    let mut len = std::mem::size_of::<u32>() as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut data as *mut u32 as *mut _,
+            &mut len,
+        )
+    };
+    last_access_mode(if rc == ERROR_SUCCESS {
+        Some(data)
+    } else {
+        None
+    })
+}
+
+/// Pure mapping of the `NtfsDisableLastAccessUpdate` value (absent = NTFS
+/// default, updates enabled).
+fn last_access_mode(value: Option<u32>) -> &'static str {
+    match value {
+        Some(v) if v & 1 == 1 => "tamper_only",
+        _ => "last_access",
+    }
 }
 
 /// Ship one prevention-class lifecycle event (deploy/health) to the pipeline.
@@ -1245,6 +1269,8 @@ fn emit_fs_event(
         mitre_technique: technique.to_string(),
         accessor: unknown_accessor(),
         session: None,
+        allowlisted_accessor: false,
+        scheduled_sweep: false,
     };
     send_detection(tx, agent_id, hostname, severity, data);
     warn!(path = %path.display(), access_kind, "HONEYTOKEN TRIGGERED (filesystem)");
@@ -1312,17 +1338,22 @@ fn send_detection(
     }
 }
 
-// ── Registry honeytokens (HKLM\SOFTWARE\TRAPD\Honeytokens) ────────────────────
+// ── Legacy registry decoys (retired) ──────────────────────────────────────────
+//
+// Earlier releases planted fixed decoy values under
+// `HKLM\SOFTWARE\TRAPD\Honeytokens`. A decoy whose location names the product
+// and whose contents are identical on every host identifies itself, and lets
+// an attacker who has seen one host recognise every tenant's. Registry decoys
+// are therefore no longer planted; this module only removes the values a
+// previous release recorded as its own (and only while unchanged).
 
 mod registry {
     use super::*;
 
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegNotifyChangeKeyValue, RegQueryValueExW,
-        RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_NOTIFY, KEY_QUERY_VALUE, KEY_SET_VALUE,
-        REG_NOTIFY_CHANGE_ATTRIBUTES, REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_NAME,
-        REG_NOTIFY_CHANGE_SECURITY, REG_OPTION_NON_VOLATILE, REG_SZ,
+        RegCloseKey, RegDeleteKeyW, RegDeleteValueW, RegOpenKeyExW, RegQueryInfoKeyW,
+        RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
     };
 
     /// NUL-terminated UTF-16 for the Win32 W-APIs.
@@ -1330,90 +1361,9 @@ mod registry {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Open-or-create the honeytoken key and make sure every decoy value is
-    /// present with its expected content. Returns the open key handle.
-    fn ensure_key_and_values() -> Result<HKEY, u32> {
-        let subkey = wide(super::REGISTRY_SUBKEY);
-        let mut hkey: HKEY = std::ptr::null_mut();
-        let rc = unsafe {
-            RegCreateKeyExW(
-                HKEY_LOCAL_MACHINE,
-                subkey.as_ptr(),
-                0,
-                std::ptr::null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_NOTIFY,
-                std::ptr::null(),
-                &mut hkey,
-                std::ptr::null_mut(),
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            return Err(rc);
-        }
-        restore_values(hkey);
-        Ok(hkey)
-    }
-
-    /// (Re)write every decoy value that is missing or has been tampered with.
-    /// Returns how many values were written.
-    fn restore_values(hkey: HKEY) -> usize {
-        let mut written = 0;
-        for (name, expected) in super::REGISTRY_VALUES {
-            let owned = deployments()
-                .lock()
-                .is_ok_and(|register| register.registry_values.contains(*name));
-            match read_value(hkey, name) {
-                Some(current) if current == *expected => {}
-                // Existing values are never adopted, even if their contents
-                // happen to equal our bait. An upgrade cannot prove provenance.
-                Some(_) if !owned => {
-                    debug!(
-                        value = name,
-                        "preserving preexisting registry value without a deployment record"
-                    );
-                }
-                None if !owned && !value_is_missing(hkey, name) => {
-                    warn!(value = name, "registry value exists or cannot be inspected; refusing to overwrite unowned value");
-                }
-                _ => {
-                    let wname = wide(name);
-                    let data: Vec<u16> = wide(expected);
-                    let bytes = data.len() * 2;
-                    let rc = unsafe {
-                        RegSetValueExW(
-                            hkey,
-                            wname.as_ptr(),
-                            0,
-                            REG_SZ,
-                            data.as_ptr() as *const u8,
-                            bytes as u32,
-                        )
-                    };
-                    if rc == ERROR_SUCCESS {
-                        if let Ok(mut register) = deployments().lock() {
-                            let was_owned = register.registry_values.contains(*name);
-                            register.registry_values.insert((*name).to_string());
-                            if let Err(error) = persist_deployments(&register) {
-                                if !was_owned {
-                                    register.registry_values.remove(*name);
-                                }
-                                warn!(%error, value = name, "could not persist registry decoy ownership; cleanup will preserve unregistered value");
-                            } else {
-                                written += 1;
-                            }
-                        }
-                    } else {
-                        warn!(value = name, rc, "honeytoken: cannot write registry decoy");
-                    }
-                }
-            }
-        }
-        written
-    }
-
     /// Only an explicit NOT_FOUND establishes absence. The content reader's
     /// None also covers wrong types, access failures and oversized values.
+    #[cfg(test)]
     fn value_is_missing(hkey: HKEY, name: &str) -> bool {
         let wname = wide(name);
         let mut len = 0u32;
@@ -1480,276 +1430,73 @@ mod registry {
         String::from_utf16(&units).ok()
     }
 
-    /// What the post-notification diff found per decoy value.
-    enum Discrepancy {
-        Deleted(&'static str),
-        Modified(&'static str),
-    }
-
-    fn diff_values(hkey: HKEY) -> Vec<Discrepancy> {
-        let mut out = Vec::new();
-        for (name, expected) in super::REGISTRY_VALUES {
-            if !deployments()
-                .lock()
-                .is_ok_and(|register| register.registry_values.contains(*name))
-            {
-                continue;
-            }
-            match read_value(hkey, name) {
-                None => out.push(Discrepancy::Deleted(name)),
-                Some(v) if v != *expected => out.push(Discrepancy::Modified(name)),
-                Some(_) => {}
-            }
-        }
-        out
-    }
-
-    /// Whether the honeytoken key itself still exists.
-    fn key_exists() -> bool {
-        use windows_sys::Win32::System::Registry::RegOpenKeyExW;
-        let subkey = wide(super::REGISTRY_SUBKEY);
-        let mut hkey: HKEY = std::ptr::null_mut();
+    /// `(values, subkeys)` held by an open key, or `None` when unknown.
+    fn key_counts(hkey: HKEY) -> Option<(u32, u32)> {
+        let mut subkeys = 0u32;
+        let mut values = 0u32;
         let rc = unsafe {
-            RegOpenKeyExW(
-                HKEY_LOCAL_MACHINE,
-                subkey.as_ptr(),
-                0,
-                KEY_NOTIFY,
-                &mut hkey,
+            RegQueryInfoKeyW(
+                hkey,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut subkeys,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut values,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         };
-        if rc == ERROR_SUCCESS {
-            unsafe { RegCloseKey(hkey) };
-            true
-        } else {
-            false
-        }
+        (rc == ERROR_SUCCESS).then_some((values, subkeys))
     }
 
-    /// On-host health of every registry decoy: `(path, present, modified)`.
-    /// Opens the key read-only; a missing key reports every value as missing.
-    pub fn health() -> Vec<(String, bool, bool)> {
-        use windows_sys::Win32::System::Registry::RegOpenKeyExW;
-        let subkey = wide(super::REGISTRY_SUBKEY);
-        let mut hkey: HKEY = std::ptr::null_mut();
-        let rc = unsafe {
-            RegOpenKeyExW(
-                HKEY_LOCAL_MACHINE,
-                subkey.as_ptr(),
-                0,
-                KEY_QUERY_VALUE,
-                &mut hkey,
-            )
-        };
-        let opened = rc == ERROR_SUCCESS;
-        let out = super::REGISTRY_VALUES
-            .iter()
-            .filter(|(name, _)| {
-                deployments()
-                    .lock()
-                    .is_ok_and(|register| register.registry_values.contains(*name))
-            })
-            .map(|(name, expected)| {
-                let path = format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY);
-                if !opened {
-                    return (path, false, false);
-                }
-                match read_value(hkey, name) {
-                    None => (path, false, false),
-                    Some(v) if v != *expected => (path, true, true),
-                    Some(_) => (path, true, false),
-                }
-            })
-            .collect();
-        if opened {
-            unsafe { RegCloseKey(hkey) };
-        }
-        out
-    }
-
-    /// Dedicated monitor thread: create the decoys, then block in
-    /// `RegNotifyChangeKeyValue` and raise a detection for every change that is
-    /// not our own restore. The key and its values are recreated whenever they
-    /// go missing (resilient against deletion).
-    pub fn monitor(
-        tx: Sender<AgentEvent>,
-        agent_id: String,
-        hostname: String,
-        config: Arc<RwLock<AgentConfig>>,
-    ) {
+    /// Retirement thread: remove the legacy decoy values, report each one as
+    /// revoked so the backend closes its token, and retry while any recorded
+    /// value could not be removed yet (e.g. the agent lacked rights).
+    pub fn retire_legacy(tx: Sender<AgentEvent>, agent_id: String, hostname: String) {
         loop {
-            if tx.is_closed() {
-                return;
-            }
-            let guard = config.read().unwrap_or_else(|error| error.into_inner());
-            if !guard.honeytoken_detection_enabled || !super::registry_decoys_requested(&guard) {
-                // Registry decoys are opt-in: retire any planted earlier
-                // (config no longer lists them) and stay idle.
-                let retire = !super::registry_decoys_requested(&guard);
-                drop(guard);
-                if retire {
-                    for path in cleanup() {
-                        super::send_prevention(
-                            &tx,
-                            &agent_id,
-                            &hostname,
-                            EventAction::HoneytokenRevoked,
-                            Severity::Info,
-                            "honeytoken_revoke",
-                            path,
-                            true,
-                            "windows registry decoy removed".to_string(),
-                            serde_json::json!({ "kind": "windows_registry_key" }),
-                        );
-                    }
-                }
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-            let ensured = ensure_key_and_values();
-            drop(guard);
-            let hkey = match ensured {
-                Ok(h) => h,
-                Err(rc) => {
-                    warn!(
-                        rc,
-                        "honeytoken: cannot create registry decoys (need admin rights?) — \
-                         retrying in 60s"
-                    );
-                    std::thread::sleep(Duration::from_secs(60));
-                    continue;
-                }
-            };
-            info!(
-                key = super::REGISTRY_SUBKEY,
-                values = super::REGISTRY_VALUES.len(),
-                "registry honeytokens ensured"
-            );
-            // Register each decoy value with the backend lifecycle mirror, so
-            // registry tokens show up in the dashboard before any trigger.
-            for (name, _) in super::REGISTRY_VALUES {
-                if !deployments()
-                    .lock()
-                    .is_ok_and(|register| register.registry_values.contains(*name))
-                {
-                    continue;
-                }
+            for (path, removed) in cleanup() {
                 super::send_prevention(
                     &tx,
                     &agent_id,
                     &hostname,
-                    EventAction::HoneytokenDeployed,
-                    Severity::Info,
-                    "honeytoken_deploy",
-                    format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY),
-                    true,
-                    "windows registry decoy planted by agent".to_string(),
-                    serde_json::json!({ "kind": "windows_registry_key" }),
+                    EventAction::HoneytokenRevoked,
+                    if removed {
+                        Severity::Info
+                    } else {
+                        Severity::Medium
+                    },
+                    "honeytoken_revoke",
+                    path,
+                    removed,
+                    if removed {
+                        "windows registry decoys are no longer supported; legacy value removed"
+                    } else {
+                        "legacy registry decoy was changed on the host; preserved and no longer monitored"
+                    }
+                    .to_string(),
+                    serde_json::json!({ "kind": "windows_registry_key", "preserved": !removed }),
                 );
             }
-            // Creating/restoring values above counts as a self-write.
-            let mut last_restore = Instant::now();
-
-            loop {
-                let rc = unsafe {
-                    RegNotifyChangeKeyValue(
-                        hkey,
-                        1, // watch the whole subtree
-                        REG_NOTIFY_CHANGE_NAME
-                            | REG_NOTIFY_CHANGE_LAST_SET
-                            | REG_NOTIFY_CHANGE_ATTRIBUTES
-                            | REG_NOTIFY_CHANGE_SECURITY,
-                        std::ptr::null_mut(),
-                        0, // synchronous: block this thread until a change
-                    )
-                };
-                // A config change while blocked in RegNotify must suppress the
-                // pending hit and all repairs before re-entering the outer gate.
-                let guard = config.read().unwrap_or_else(|error| error.into_inner());
-                if !guard.honeytoken_detection_enabled || !super::registry_decoys_requested(&guard)
-                {
-                    break;
-                }
-                if rc != ERROR_SUCCESS {
-                    warn!(rc, "honeytoken: RegNotifyChangeKeyValue failed — re-arming");
-                    break;
-                }
-
-                if !key_exists() {
-                    emit(
-                        &tx,
-                        &agent_id,
-                        &hostname,
-                        super::REGISTRY_SUBKEY,
-                        "registry_key_deleted",
-                    );
-                    break; // outer loop recreates the key
-                }
-
-                let discrepancies = diff_values(hkey);
-                if discrepancies.is_empty() {
-                    // Everything matches: either our own restore (suppressed) or
-                    // a change we cannot attribute to a specific value (e.g. a
-                    // value added and removed, or a subkey created).
-                    if last_restore.elapsed() > super::SELF_WRITE_SUPPRESSION {
-                        emit(
-                            &tx,
-                            &agent_id,
-                            &hostname,
-                            super::REGISTRY_SUBKEY,
-                            "registry_change",
-                        );
-                    }
-                    continue;
-                }
-                for d in &discrepancies {
-                    let (name, kind) = match d {
-                        Discrepancy::Deleted(n) => (*n, "registry_delete"),
-                        Discrepancy::Modified(n) => (*n, "registry_modify"),
-                    };
-                    let path = format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY);
-                    emit(&tx, &agent_id, &hostname, &path, kind);
-                }
-                restore_values(hkey);
-                last_restore = Instant::now();
+            let pending = deployments()
+                .lock()
+                .map(|register| register.registry_values.len())
+                .unwrap_or(0);
+            if pending == 0 || tx.is_closed() {
+                return;
             }
-
-            unsafe { RegCloseKey(hkey) };
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_secs(300));
         }
     }
 
-    /// Ship one registry honeytoken detection.
-    fn emit(tx: &Sender<AgentEvent>, agent_id: &str, hostname: &str, path: &str, kind: &str) {
-        let (severity, confidence) = match kind {
-            // The watched values only change when someone *writes* them — reads
-            // are invisible to RegNotifyChangeKeyValue — so every hit is tamper
-            // or recon-with-write, scored high.
-            "registry_key_deleted" => (Severity::Critical, 90),
-            "registry_delete" => (Severity::Critical, 90),
-            "registry_modify" => (Severity::Critical, 90),
-            _ => (Severity::High, 75),
-        };
-        let data = HoneytokenAccessData {
-            token_id: format!("winreg:{path}"),
-            path: path.to_string(),
-            kind: "windows_registry_key".to_string(),
-            access_kind: kind.to_string(),
-            open_flags: 0,
-            confidence,
-            mitre_tactic: "TA0006 Credential Access".to_string(),
-            mitre_technique: "T1552.002".to_string(),
-            accessor: super::unknown_accessor(),
-            session: None,
-        };
-        super::send_detection(tx, agent_id, hostname, severity, data);
-        warn!(path, kind, "HONEYTOKEN TRIGGERED (registry)");
-    }
-
     /// Remove the registry decoy values this agent planted (and only those, and
-    /// only while unchanged). Returns the paths no longer present. Idle (no
-    /// registry access) when nothing is registered.
-    pub fn cleanup() -> Vec<String> {
+    /// only while unchanged). Returns each value released from ownership with
+    /// `true` when it is gone, `false` when it was changed and preserved. Idle
+    /// (no registry access) when nothing is registered.
+    pub fn cleanup() -> Vec<(String, bool)> {
         let mut removed = Vec::new();
         if deployments()
             .lock()
@@ -1757,7 +1504,6 @@ mod registry {
         {
             return removed;
         }
-        use windows_sys::Win32::System::Registry::RegOpenKeyExW;
         let subkey = wide(super::REGISTRY_SUBKEY);
         let mut hkey: HKEY = std::ptr::null_mut();
         let rc = unsafe {
@@ -1780,28 +1526,59 @@ mod registry {
                             let wname = wide(name);
                             if unsafe { RegDeleteValueW(hkey, wname.as_ptr()) } == ERROR_SUCCESS {
                                 register.registry_values.remove(*name);
-                                removed.push(format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY));
+                                removed.push((
+                                    format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY),
+                                    true,
+                                ));
                             }
                         }
                         None => {
                             register.registry_values.remove(*name);
-                            removed.push(format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY));
+                            removed
+                                .push((format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY), true));
                         }
-                        Some(_) => warn!(
-                            value = name,
-                            "registry decoy changed; preserving value during cleanup"
-                        ),
+                        Some(_) => {
+                            // Someone changed it: preserve the value, give up
+                            // ownership so the retirement does not retry forever.
+                            warn!(
+                                value = name,
+                                "registry decoy changed; preserving value during cleanup"
+                            );
+                            register.registry_values.remove(*name);
+                            removed
+                                .push((format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY), false));
+                        }
                     }
                 }
                 if let Err(error) = persist_deployments(&register) {
                     warn!(%error, "could not persist registry cleanup register");
                 }
             }
+            // The empty `...\TRAPD\Honeytokens` key would itself remain a tell.
+            // Delete it only when it holds nothing at all. The check-then-delete
+            // is not atomic, but the key lives under HKLM\SOFTWARE, writable
+            // only by administrators, and no other component writes it.
+            let empty = key_counts(hkey) == Some((0, 0));
             unsafe { RegCloseKey(hkey) };
-            // Retain the container keys. RegDeleteKeyW deletes keys containing
-            // values, and a query-then-delete cannot protect concurrent writers.
-            // Removing only recorded values preserves every unowned artifact.
-        } else if rc != ERROR_FILE_NOT_FOUND {
+            if empty {
+                let rc = unsafe { RegDeleteKeyW(HKEY_LOCAL_MACHINE, subkey.as_ptr()) };
+                if rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND {
+                    warn!(rc, "could not delete the empty legacy registry decoy key");
+                }
+            }
+            // The parent `SOFTWARE\TRAPD` key also holds the installer's own
+            // `Agent` key and is managed by the MSI, never by this module.
+        } else if rc == ERROR_FILE_NOT_FOUND {
+            // The key is gone, so every recorded value is too.
+            if let Ok(mut register) = deployments().lock() {
+                for name in register.registry_values.drain() {
+                    removed.push((format!("HKLM\\{}\\{name}", super::REGISTRY_SUBKEY), true));
+                }
+                if let Err(error) = persist_deployments(&register) {
+                    warn!(%error, "could not persist registry cleanup register");
+                }
+            }
+        } else {
             warn!(rc, "could not open registry honeytokens for cleanup");
         }
         removed
@@ -1810,7 +1587,10 @@ mod registry {
     #[cfg(test)]
     mod parsing_regressions {
         use super::*;
-        use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER, REG_BINARY};
+        use windows_sys::Win32::System::Registry::{
+            RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_CURRENT_USER, REG_BINARY,
+            REG_OPTION_NON_VOLATILE,
+        };
 
         #[test]
         fn raw_malformed_registry_strings_are_rejected() {
@@ -1890,9 +1670,8 @@ mod registry {
 
 // ── Uninstall ─────────────────────────────────────────────────────────────────
 
-/// Remove every honeytoken artifact from this host: the decoy files (both the
-/// currently-configured set and the built-in defaults, so a config change
-/// between install and uninstall cannot strand a decoy) and the registry key.
+/// Remove every honeytoken artifact this agent recorded as its own: the decoy
+/// files (including ones that left the config) and legacy registry values.
 pub fn uninstall(cfg: &AgentConfig) {
     let _ = cfg; // Cleanup follows persisted ownership, including removed config paths.
     let Ok(mut register) = deployments().lock() else {

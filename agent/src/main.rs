@@ -861,6 +861,8 @@ fn spawn_honeytoken_health(
                         "file_status": health.status_label(),
                         "expected_sha256": rec.sha256,
                         "actual_sha256": health.actual_sha256,
+                        // Is anything actually watching this token?
+                        "detection": detection::honeytoken::kernel_detection_mode(),
                     }),
                 );
             }
