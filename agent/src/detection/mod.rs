@@ -122,7 +122,10 @@ impl DetectionEngine {
             ioa: Mutex::new(ioa::IoaEngine::new()),
             sigma: RwLock::new(Self::load_sigma_from_disk()),
             sigma_enabled: std::sync::atomic::AtomicBool::new(true),
-            baseline: Mutex::new(baseline::BaselineEngine::new()),
+            baseline: Mutex::new(baseline::BaselineEngine::load(
+                &crate::paths::state_dir().join("baseline.json"),
+                Instant::now(),
+            )),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             stateful: Mutex::new(stateful::StatefulRules::new()),
             gate: Mutex::new(gate::FindingGate::new()),
@@ -133,6 +136,17 @@ impl DetectionEngine {
             started: Instant::now(),
             clock_bits: std::sync::atomic::AtomicU64::new(0),
             rule_modes: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Persist the learned baseline so a restart does not re-alert on binaries
+    /// the user has run for weeks. Best-effort.
+    pub fn persist_baseline(&self) {
+        if let Ok(b) = self.baseline.lock() {
+            let path = crate::paths::state_dir().join("baseline.json");
+            if let Err(e) = b.save(&path) {
+                warn!(error = %e, "could not persist detection baseline");
+            }
         }
     }
 

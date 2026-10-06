@@ -508,10 +508,12 @@ async fn main() -> Result<()> {
     {
         let started = std::time::Instant::now();
         let report_path = telemetry::TelemetryReport::default_path();
+        let baseline_engine = std::sync::Arc::clone(&engine);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 ticker.tick().await;
+                baseline_engine.persist_baseline();
                 let report =
                     telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
                 if let Err(e) = report.write_atomic(&report_path) {

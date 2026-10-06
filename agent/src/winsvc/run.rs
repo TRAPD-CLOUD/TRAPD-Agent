@@ -329,11 +329,13 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     });
 
     let started = std::time::Instant::now();
+    let telemetry_engine = Arc::clone(&engine);
     handles.push(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             ticker.tick().await;
             crate::deception::activity::persist();
+            telemetry_engine.persist_baseline();
             let report =
                 crate::telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
             if let Err(e) = report.write_atomic(&crate::telemetry::TelemetryReport::default_path())

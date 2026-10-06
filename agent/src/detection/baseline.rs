@@ -16,7 +16,10 @@
 //! in the detection path.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::schema::DetectionData;
 
@@ -207,9 +210,126 @@ impl BaselineEngine {
     }
 }
 
+/// Durable snapshot of the baseline: the learned per-user binary sets and each
+/// user's exec-rate EWMA (mean/variance/count). The one-minute window position
+/// is deliberately not persisted — it resets on load, which at most delays one
+/// rate score, while the learned *distribution* survives. Persisting the binary
+/// sets is what matters: without it every restart re-alerts on binaries the
+/// user has run for weeks, which made the warm-up guarantee worthless.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct BaselineSnapshot {
+    #[serde(default)]
+    binaries: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    rates: HashMap<String, (f64, f64, u32)>,
+}
+
+const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
+
+impl BaselineEngine {
+    /// Reduce the engine to a serialisable snapshot.
+    pub fn snapshot(&self) -> BaselineSnapshot {
+        BaselineSnapshot {
+            binaries: self
+                .binaries
+                .iter()
+                .map(|(u, set)| (u.clone(), set.iter().cloned().collect()))
+                .collect(),
+            rates: self
+                .rates
+                .iter()
+                .map(|(u, p)| (u.clone(), (p.stat.mean, p.stat.var, p.stat.count)))
+                .collect(),
+        }
+    }
+
+    /// Rebuild from a snapshot, re-applying the entity/child bounds so a large
+    /// or hostile state file cannot blow the memory caps.
+    pub fn from_snapshot(snap: BaselineSnapshot, now: Instant) -> Self {
+        let mut binaries = HashMap::new();
+        for (user, bins) in snap.binaries.into_iter().take(MAX_ENTITIES) {
+            binaries.insert(user, bins.into_iter().take(MAX_CHILDREN).collect::<HashSet<_>>());
+        }
+        let mut rates = HashMap::new();
+        for (user, (mean, var, count)) in snap.rates.into_iter().take(MAX_ENTITIES) {
+            rates.insert(
+                user,
+                RateProfile {
+                    window_start: now,
+                    window_count: 0,
+                    stat: Ewma { mean, var, count, alpha: 0.3 },
+                },
+            );
+        }
+        Self { binaries, rates }
+    }
+
+    /// Load the persisted baseline, or an empty engine when none/too large/bad.
+    pub fn load(path: &Path, now: Instant) -> Self {
+        let within = std::fs::metadata(path).map(|m| m.len() <= MAX_STATE_BYTES).unwrap_or(false);
+        if !within {
+            return Self::new();
+        }
+        match std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+            Some(snap) => Self::from_snapshot(snap, now),
+            None => Self::new(),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::paths::write_atomic(path, &serde_json::to_vec(&self.snapshot())?, 0o600)
+    }
+}
+
 impl Default for BaselineEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_preserves_known_binaries_so_restart_does_not_realert() {
+        let now = Instant::now();
+        let mut e = BaselineEngine::new();
+        // Warm up: three known binaries for alice, then a fourth is novel.
+        for b in ["/bin/bash", "/usr/bin/ls", "/usr/bin/cat"] {
+            assert!(e.observe_exec("alice", b, now).is_none());
+        }
+        assert!(e.observe_exec("alice", "/usr/bin/curl", now).is_some(), "novel binary should alert before persist");
+        // Round-trip through a snapshot (a restart).
+        let restored = BaselineEngine::from_snapshot(e.snapshot(), now);
+        let mut restored = restored;
+        // Every previously-seen binary is still known: no re-alert.
+        for b in ["/bin/bash", "/usr/bin/ls", "/usr/bin/cat", "/usr/bin/curl"] {
+            assert!(restored.observe_exec("alice", b, now).is_none(), "{b} re-alerted after restart");
+        }
+        // A genuinely new one still alerts.
+        assert!(restored.observe_exec("alice", "/tmp/x", now).is_some());
+    }
+
+    #[test]
+    fn load_rejects_oversized_or_missing_state() {
+        let now = Instant::now();
+        let missing = std::env::temp_dir().join(format!("trapd-bl-{}.json", uuid::Uuid::new_v4()));
+        assert!(BaselineEngine::load(&missing, now).binaries.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_round_trips_on_disk() {
+        let now = Instant::now();
+        let path = std::env::temp_dir().join(format!("trapd-bl-{}.json", uuid::Uuid::new_v4()));
+        let mut e = BaselineEngine::new();
+        for b in ["a", "b", "c"] {
+            e.observe_exec("bob", b, now);
+        }
+        e.save(&path).unwrap();
+        let mut loaded = BaselineEngine::load(&path, now);
+        assert!(loaded.observe_exec("bob", "a", now).is_none());
+        std::fs::remove_file(path).ok();
     }
 }
 
