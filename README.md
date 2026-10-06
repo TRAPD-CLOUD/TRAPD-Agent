@@ -695,3 +695,7 @@ AGENTS.md                  Authoritative backend API & schema reference
 For contributor and backend-integration details — every event action, payload
 schema, command/policy/inventory format and endpoint contract — see
 **[`AGENTS.md`](AGENTS.md)**.
+
+## License
+
+The TRAPD agent is open source under the [Apache License 2.0](LICENSE).
