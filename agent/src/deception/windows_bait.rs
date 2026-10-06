@@ -616,7 +616,10 @@ mod tests {
                 // patterns may by chance, as in real files (see below).
                 for secret in &sa {
                     assert!(a.contains(secret.as_str()), "{name}: secret not embedded");
-                    assert!(!b.contains(secret.as_str()), "{name}: {secret} reused");
+                    assert!(
+                        !b.contains(secret.as_str()),
+                        "{name}: a generated secret was reused"
+                    );
                 }
             }
         }
