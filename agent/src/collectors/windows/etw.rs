@@ -372,11 +372,19 @@ fn interpret(in_type: u16, raw: Vec<u8>) -> EtwValue {
     };
     match in_type as i32 {
         TDH_INTYPE_UNICODESTRING => {
-            let u16s: Vec<u16> = raw
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .take_while(|&c| c != 0)
-                .collect();
+            // A step loop rather than `chunks_exact(2)`: avoids the 1.99
+            // `clippy::chunks_exact_to_as_chunks` lint without the unstable
+            // `as_chunks`, and stops at the first NUL.
+            let mut u16s = Vec::with_capacity(raw.len() / 2);
+            let mut i = 0;
+            while i + 1 < raw.len() {
+                let c = u16::from_le_bytes([raw[i], raw[i + 1]]);
+                if c == 0 {
+                    break;
+                }
+                u16s.push(c);
+                i += 2;
+            }
             EtwValue::Str(String::from_utf16_lossy(&u16s))
         }
         TDH_INTYPE_ANSISTRING => {
