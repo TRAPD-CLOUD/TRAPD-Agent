@@ -139,7 +139,9 @@ impl ActivityStore {
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             return;
         };
-        let key = dir.to_string_lossy().to_lowercase();
+        // Normalise the separator so the key matches regardless of whether the
+        // path arrived with `\` (Windows) or `/`: `cold_dirs` keys the same way.
+        let key = dir.to_string_lossy().replace('\\', "/").to_lowercase();
         let Some(u) = self.user(user, now) else {
             return;
         };

@@ -641,7 +641,10 @@ pub fn cold_dirs(
         if depth > 0 && files.len() >= 2 {
             let newest = files.iter().map(|f| f.modified_unix).max().unwrap_or(0);
             let oldest = files.iter().map(|f| f.modified_unix).min().unwrap_or(0);
-            let key = dir.to_string_lossy().to_lowercase();
+            // Normalise the separator (see `activity::observe_write`): the
+            // directory is re-joined with the platform separator, so on Windows
+            // the string can mix `/` and `\`; the hot-dir keys are `/`.
+            let key = dir.to_string_lossy().replace('\\', "/").to_lowercase();
             if now_unix - newest >= COLD_AFTER_DAYS * 86_400 && !hot_dirs.contains(&key) {
                 let name = dir
                     .file_name()
@@ -1039,12 +1042,17 @@ mod tests {
                 "Boxes".into(),
             ],
         );
+        // `synced_roots_from_children` joins with the platform separator, so
+        // build the expectation the same way rather than hard-coding `/`.
+        let join = |child: &str| {
+            Path::new("/Users/anna")
+                .join(child)
+                .to_string_lossy()
+                .into_owned()
+        };
         assert_eq!(
             roots,
-            vec![
-                "/Users/anna/OneDrive - Contoso GmbH".to_string(),
-                "/Users/anna/Dropbox".to_string()
-            ]
+            vec![join("OneDrive - Contoso GmbH"), join("Dropbox")]
         );
         // 2020-01-01T00:00:00Z = 132223104000000000 ticks.
         let t: u64 = 132_223_104_000_000_000;
