@@ -96,7 +96,7 @@ no independent release authenticity, and SmartScreen warns on download.
 | Coverage transparency | Heartbeat reports the effective sensor state (ETW session health, events lost, audit-policy state, how decoys are watched) and shadow-mode rule hit counts, so "not seen" is never shown as "did not happen" |
 | Backend | Shared enrollment, signed config, heartbeat, inventory and authenticated event ingest |
 | Delivery diagnostics | Persistent queue with restart recovery, telemetry report and `diagnostics telemetry` |
-| Honeytokens | File decoys with per-host generated bait, deployment/health events and ownership-verified cleanup during MSI removal (legacy registry decoys are removed, no longer planted) |
+| Honeytokens | Operator-listed file decoys **and** operator-approved adaptive decoys that fit each user (role, naming style, a cold directory the user owns but has not touched for weeks — never the desktop or a synced folder). Per-host generated bait, timestamp camouflage, not-content-indexed. Reads attributed to a process/account via a read-audit SACL + 4663 and graded (owner-interactive vs. foreign) to keep false alarms down. Deployment/health events and ownership-verified cleanup during MSI removal; legacy registry decoys removed, no longer planted. Adaptive learning is opt-in (`deception_activity_learning_enabled`), local-only, purged on disable/uninstall. |
 
 Windows honeytoken ownership is persisted in `<state>/windows_honeytoken_deployments.json`.
 Cleanup removes only registered, unchanged artifacts; file identity and content are

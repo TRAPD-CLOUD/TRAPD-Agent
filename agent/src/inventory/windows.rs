@@ -350,7 +350,7 @@ mod tests {
 /// Every local profile with its SID, folder redirection, sync roots and last
 /// use. Accounts come from sysinfo; per-user details from `ProfileList` and,
 /// when the user's hive is loaded, `HKEY_USERS\<SID>`.
-fn windows_user_profiles() -> Vec<crate::deception::windows_profiler::WindowsUserProfile> {
+pub(crate) fn windows_user_profiles() -> Vec<crate::deception::windows_profiler::WindowsUserProfile> {
     use crate::deception::windows_profiler::{
         expand_user_path, filetime_to_unix, synced_roots_from_children, WindowsUserProfile,
     };

@@ -22,7 +22,7 @@
 mod collect;
 #[cfg(windows)]
 #[path = "windows.rs"]
-mod collect;
+pub(crate) mod collect;
 pub mod compliance;
 
 use std::sync::Arc;
