@@ -109,6 +109,7 @@ pub struct Verdict {
     pub grade: Grade,
     pub confidence: u8,
     pub access_kind: &'static str,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub reasons: Vec<String>,
 }
 

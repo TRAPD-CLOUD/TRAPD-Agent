@@ -29,7 +29,9 @@ pub const KERNEL_PROCESS: u128 = 0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716;
 pub const KERNEL_NETWORK: u128 = 0x7dd42a49_5329_4832_8dfd_43d979153a88;
 pub const DNS_CLIENT: u128 = 0x1c95126e_7eea_49a9_a3fe_a378b03ddb4d;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x40;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const KERNEL_NETWORK_KEYWORDS: u64 = 0x10 | 0x20;
 
 /// One decoded property value.
@@ -50,6 +52,7 @@ pub struct EtwRecord {
     /// `EVENT_HEADER.ProcessId` — the process that *logged* the event.
     pub header_pid: u32,
     /// `EVENT_HEADER.TimeStamp` as FILETIME ticks.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub timestamp: i64,
     pub props: HashMap<String, EtwValue>,
 }

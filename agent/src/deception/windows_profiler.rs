@@ -494,9 +494,11 @@ pub trait DirProbe {
     fn entries(&self, dir: &Path) -> Vec<EntryInfo>;
 }
 
-/// Bounded real-filesystem probe.
+/// Bounded real-filesystem probe (used by the Windows inventory path).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct RealDirProbe;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const MAX_ENTRIES_PER_DIR: usize = 512;
 
 impl DirProbe for RealDirProbe {
@@ -537,6 +539,7 @@ fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
     false
 }
