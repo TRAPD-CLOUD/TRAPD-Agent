@@ -7,9 +7,18 @@
     <MediaTemplate EmbedCab="yes" />
     <Launch Condition="VersionNT64" Message="TRAPD requires 64-bit Windows." />
 
+    <!-- Hosted build only (build-msi.ps1 -TrustDir): the hosted backend is the
+         default. An existing registry value (earlier install) and an explicit
+         BACKENDURL=... on the command line both take precedence over it. -->
+    <?ifdef DefaultBackendUrl?>
+    <Property Id="BACKENDURL" Secure="yes" Value="$(var.DefaultBackendUrl)">
+      <RegistrySearch Id="ExistingBackend" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="raw" Bitness="always64" />
+    </Property>
+    <?else?>
     <Property Id="BACKENDURL" Secure="yes">
       <RegistrySearch Id="ExistingBackend" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="raw" Bitness="always64" />
     </Property>
+    <?endif?>
     <Property Id="ENROLLTOKEN" Secure="yes" Hidden="yes">
       <RegistrySearch Id="ExistingEnrollToken" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="raw" Bitness="always64" />
     </Property>
@@ -27,6 +36,26 @@
           <ServiceControl Id="ManageService" Name="trapd-agent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
           <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
         </Component>
+        <!-- Lives in Program Files (not user-writable): it is started elevated. -->
+        <Component Id="PairScript" Guid="D33A716E-0180-4E99-BB29-0F79C3AD16B2" Bitness="always64">
+          <File Id="PairScriptFile" Source="$(var.SourceDir)\pair.ps1" Name="pair.ps1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="StartMenuDir" Name="TRAPD">
+        <Component Id="PairShortcut" Guid="B4354B5F-DE7C-48F7-BDBB-2B58D832A4BF" Bitness="always64">
+          <Shortcut Id="PairShortcutLink" Name="Pair this computer with TRAPD"
+                    Description="Show the pairing code and open the TRAPD pairing page"
+                    Target="[SystemFolder]WindowsPowerShell\v1.0\powershell.exe"
+                    Arguments="-NoProfile -ExecutionPolicy Bypass -File &quot;[#PairScriptFile]&quot;"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder Id="RemoveStartMenuDir" On="uninstall" />
+          <!-- Keep shortcut bookkeeping outside the credential key. MSI
+               coalesces writes to a key; an unsecured first value can suppress
+               the security descriptor on a later secured value. -->
+          <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Installer" Name="PairShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="CommonAppDataFolder">
@@ -41,6 +70,18 @@
           <Component Id="DefaultConfig" Guid="7C6D5625-F935-45E3-8A13-A6278F92D2C8" Permanent="yes" NeverOverwrite="yes" Bitness="always64">
             <File Id="DefaultEnv" Source="$(var.SourceDir)\agent.env.default" Name="agent.env" KeyPath="yes" />
           </Component>
+          <?ifdef TrustDir?>
+          <!-- Hosted build only: public trust anchors of the hosted service.
+               NeverOverwrite + Permanent, like agent.env: anchors an operator
+               provisioned (self-hosted) are neither replaced nor removed. The
+               directory ACL (SYSTEM/Administrators only) is inherited. -->
+          <Component Id="TrustCa" Guid="11C6B491-5B19-4992-8D0C-4A76A2998CAB" Permanent="yes" NeverOverwrite="yes" Bitness="always64">
+            <File Id="TrustCaFile" Source="$(var.TrustDir)\ca.crt" Name="ca.crt" KeyPath="yes" />
+          </Component>
+          <Component Id="TrustCommandKey" Guid="19DD277F-FB2F-4CAB-BF83-55AEF98ED970" Permanent="yes" NeverOverwrite="yes" Bitness="always64">
+            <File Id="TrustCommandKeyFile" Source="$(var.TrustDir)\command_signing.pub" Name="command_signing.pub" KeyPath="yes" />
+          </Component>
+          <?endif?>
         </Directory>
         <Directory Id="STATEDIR" Name="state">
           <Component Id="StateDirectory" Guid="A7BD0384-9A98-4B66-BDA8-E1292C094696" Permanent="yes" Bitness="always64">
@@ -76,6 +117,10 @@
       <ComponentRef Id="AgentService" /><ComponentRef Id="DataDirectory" /><ComponentRef Id="ConfigDirectory" />
       <ComponentRef Id="DefaultConfig" /><ComponentRef Id="StateDirectory" /><ComponentRef Id="LogDirectory" />
       <ComponentRef Id="RegistryConfig" /><ComponentRef Id="BackendConfig" /><ComponentRef Id="EnrollmentConfig" />
+      <ComponentRef Id="PairScript" /><ComponentRef Id="PairShortcut" />
+      <?ifdef TrustDir?>
+      <ComponentRef Id="TrustCa" /><ComponentRef Id="TrustCommandKey" />
+      <?endif?>
     </Feature>
   </Package>
 </Wix>

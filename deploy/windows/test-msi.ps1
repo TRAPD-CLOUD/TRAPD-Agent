@@ -46,6 +46,12 @@ try {
     # First install has no backend properties: local collection must start
     # immediately, with no enrollment requirement.
     Invoke-Msi @('/i', "`"$Msi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'offline-install.log')`"")
+    # Check before enrollment too: shortcut bookkeeping must not create the
+    # credential key with inherited Users access ahead of RegistryConfig.
+    foreach ($rule in (Get-Acl 'HKLM:\SOFTWARE\TRAPD\Agent').Access) {
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($rule.AccessControlType -eq 'Allow' -and $sid -notin @('S-1-5-18', 'S-1-5-32-544')) { throw "Unexpected registry ACL on first install: $sid" }
+    }
     Wait-Until { (Get-Service trapd-agent -ErrorAction SilentlyContinue).Status -eq 'Running' } 'Offline service did not start.'
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'system' }).Count -gt 0 } 'Offline MSI produced no local telemetry.'
     Wait-Until { Test-Path (Join-Path $state 'inventory.json') } 'Offline inventory was not written.'
@@ -53,6 +59,33 @@ try {
     $offlineDevice = Get-Content -Raw (Join-Path $state 'device_id')
     Invoke-Msi @('/x', "`"$Msi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'offline-uninstall.log')`"")
     Wait-Until { $null -eq (Get-Service trapd-agent -ErrorAction SilentlyContinue) } 'Offline uninstall left the service.'
+
+    # Pairing mode (backend, no token): the agent publishes a code and waits for
+    # a person. It must still honour a service stop, otherwise MSI removal or
+    # upgrade of an unpaired agent would hang (regression: stop was ignored
+    # while enrolling).
+    Invoke-Msi @('/i', "`"$Msi`"", '/qn', '/norestart', "BACKENDURL=$url", '/L*v', "`"$(Join-Path $root 'pairing-install.log')`"")
+    Wait-Until { (Get-Service trapd-agent -ErrorAction SilentlyContinue).Status -eq 'Running' } 'Pairing-mode service did not start.'
+    $pairingFile = Join-Path $state 'pairing.txt'
+    Wait-Until { Test-Path $pairingFile } 'Agent did not publish pairing.txt.'
+    $pairing = Get-Content -Raw $pairingFile
+    if ($pairing -notmatch 'Code:\s+ABCDE-FGHJK') { throw 'pairing.txt does not show the pairing code.' }
+    if ($pairing -match 'pair_msi_test_device_code') { throw 'pairing.txt leaked the device code.' }
+    # The code is only for administrators (whoever sees it can approve the device).
+    foreach ($rule in (Get-Acl $pairingFile).Access) {
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($rule.AccessControlType -eq 'Allow' -and $sid -notin @('S-1-5-18', 'S-1-5-32-544')) { throw "Unexpected ACL on pairing.txt : $sid" }
+    }
+    $helper = Join-Path $env:ProgramFiles 'TRAPD Agent\pair.ps1'
+    $helperOut = (& $helper -NonInteractive -WaitSeconds 10 | Out-String)
+    if ($helperOut -notmatch 'ABCDE-FGHJK') { throw 'pair.ps1 did not show the pairing code.' }
+    if (-not (Test-Path (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'TRAPD\Pair this computer with TRAPD.lnk'))) { throw 'Pairing shortcut is missing.' }
+    if (@(Read-Requests | Where-Object { $_.path -like '*/agents/pair/start' }).Count -lt 1) { throw 'Agent did not start pairing at the backend.' }
+    Invoke-Msi @('/x', "`"$Msi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'pairing-uninstall.log')`"")
+    Wait-Until { $null -eq (Get-Service trapd-agent -ErrorAction SilentlyContinue) } 'Uninstall during pending pairing left the service.'
+    if (Test-Path $pairingFile) { throw 'pairing.txt survived the service stop.' }
+    if (Test-Path (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'TRAPD')) { throw 'Uninstall left the Start Menu folder.' }
+
     Invoke-Msi @('/i', "`"$Msi`"", '/qn', '/norestart', "BACKENDURL=$url", 'ENROLLTOKEN=test-enrollment-token', '/L*v', "`"$(Join-Path $root 'install.log')`"")
     Wait-Until { (Get-Service trapd-agent -ErrorAction SilentlyContinue).Status -eq 'Running' } 'MSI service did not start.'
     Wait-Until { Test-Path (Join-Path $state 'config_issued_at.json') } 'Signed configuration was not applied.'

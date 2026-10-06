@@ -662,6 +662,15 @@ The `release` GitHub Actions workflow triggers on tag push, builds the release
 binary, and publishes it to GitHub Releases. Installed agents pick it up within
 24 hours via the auto-updater.
 
+For the signed in-agent updater, hosts with `/etc/trapd/signing.pub` and
+`binary.sig` also require a signature over the new binary's raw SHA-256 digest.
+Set the optional `BINARY_SIGNING_KEY` release secret to the base64 32-byte
+Ed25519 seed matching that public key. `cargo xtask sign-release` embeds the
+result as `binary_signature` in the release payload before signing the payload
+with `RELEASE_SIGNING_KEY`. The helper verifies it before swapping files,
+installs it with the integrity baseline, and restores both on rollback. A
+missing or invalid replacement signature leaves the installed binary untouched.
+
 ---
 
 ## Repository layout

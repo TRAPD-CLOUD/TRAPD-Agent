@@ -81,6 +81,12 @@ pub struct ApplyContext<'a> {
     /// Install path of the eBPF object (Linux). Required when the update ships
     /// one, since binary and object must be replaced together.
     pub ebpf_target: Option<&'a Path>,
+    /// The agent's binary self-integrity baseline (`binary.sha256`). The new
+    /// binary has a different hash, so the baseline is rewritten together with
+    /// it: the restarted agent aborts on a mismatch (`binary_integrity::check`).
+    /// Left alone when the file does not exist, since the agent then writes a
+    /// baseline for whatever binary it first runs as.
+    pub baseline: Option<&'a Path>,
     pub paths: &'a StagingPaths,
     pub health_timeout: Duration,
 }
@@ -153,6 +159,14 @@ impl Installed {
 
 /// Write `bytes` next to `target`, fsync, and swap it in.
 fn install_file(target: &Path, bytes: &[u8], mode: u32) -> Result<Installed> {
+    // Windows can rename an existing directory out of the way and replace it
+    // with a file. Reject invalid install targets consistently on all hosts.
+    if target.exists() && !target.is_file() {
+        bail!(
+            "update: install target {} is not a regular file",
+            target.display()
+        );
+    }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).context("update: create install dir")?;
     }
@@ -272,6 +286,35 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
         }
     };
 
+    // Preserve the host's independently provisioned binary-signing trust
+    // anchor. Missing/invalid replacement signatures fail BEFORE any swap;
+    // never remove an old signature to bypass the startup integrity check.
+    let signature_install = match ctx.baseline.and_then(Path::parent) {
+        Some(config) if config.join("signing.pub").exists() => {
+            let target = config.join("binary.sig");
+            match verified.binary_signature {
+                Some(bytes) => {
+                    let raw = std::fs::read(config.join("signing.pub"))?;
+                    let raw: [u8; 32] = raw
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("update: signing.pub must be 32 raw bytes"))?;
+                    let key = ed25519_dalek::VerifyingKey::from_bytes(&raw)?;
+                    key.verify_strict(
+                        &verified.sha256,
+                        &ed25519_dalek::Signature::from_bytes(&bytes),
+                    )
+                    .context("update: invalid binary signature")?;
+                    Some((target, bytes))
+                }
+                None if target.exists() => {
+                    bail!("update: release is missing the required binary signature")
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+
     let _ = std::fs::remove_file(ctx.paths.healthy_marker());
     let mut installed = Vec::new();
     // Object first: if the binary install then fails, only the object needs undoing.
@@ -283,6 +326,28 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
         Err(e) => {
             let _ = abort_update(ctx, &installed, &verified.version);
             return Err(e);
+        }
+    }
+    if let Some((target, bytes)) = signature_install {
+        match install_file(&target, &bytes, 0o600) {
+            Ok(i) => installed.push(i),
+            Err(e) => {
+                let _ = abort_update(ctx, &installed, &verified.version);
+                return Err(e).context("update: refresh binary signature");
+            }
+        }
+    }
+    // The baseline is the signed digest of the file just installed. It is
+    // restored on rollback like the other files; a failed write aborts the
+    // update, because the new binary would refuse to start against the old one.
+    if let Some(baseline) = ctx.baseline.filter(|p| p.exists()) {
+        let line = crate::paths::binary_baseline_line(&hex::encode(verified.sha256));
+        match install_file(baseline, line.as_bytes(), 0o600) {
+            Ok(i) => installed.push(i),
+            Err(e) => {
+                let _ = abort_update(ctx, &installed, &verified.version);
+                return Err(e).context("update: refresh binary integrity baseline");
+            }
         }
     }
 
@@ -383,6 +448,8 @@ mod tests {
         _root: PathBuf,
         target: PathBuf,
         ebpf_target: PathBuf,
+        /// Self-integrity baseline of the OLD binary, as the installer wrote it.
+        baseline: PathBuf,
         paths: StagingPaths,
         release: SigningKey,
         command: SigningKey,
@@ -407,6 +474,10 @@ mod tests {
                 std::fs::write(&ebpf_target, b"OLD EBPF").unwrap();
             }
         }
+
+        let baseline = root.join("etc/binary.sha256");
+        std::fs::create_dir_all(baseline.parent().unwrap()).unwrap();
+        std::fs::write(&baseline, old_baseline()).unwrap();
 
         let release = SigningKey::from_bytes(&[1; 32]);
         let command = SigningKey::from_bytes(&[2; 32]);
@@ -443,13 +514,117 @@ mod tests {
             _root: root,
             target,
             ebpf_target,
+            baseline,
             paths,
             release,
             command,
         }
     }
 
-    fn run(env: &Env, platform: &FakePlatform, timeout_ms: u64) -> Result<Outcome> {
+    fn baseline_for(bytes: &[u8]) -> String {
+        crate::paths::binary_baseline_line(&hex::encode(Sha256::digest(bytes)))
+    }
+
+    fn old_baseline() -> String {
+        baseline_for(b"OLD BINARY")
+    }
+
+    fn provision_binary_signature(env: &Env, digest: &[u8], include_signature: bool) -> Vec<u8> {
+        let key = SigningKey::from_bytes(&[3; 32]);
+        let config = env.baseline.parent().unwrap();
+        std::fs::write(config.join("signing.pub"), key.verifying_key().to_bytes()).unwrap();
+        let old = key.sign(&Sha256::digest(b"OLD BINARY")).to_bytes().to_vec();
+        std::fs::write(config.join("binary.sig"), &old).unwrap();
+        if include_signature {
+            let offer: UpdateOffer =
+                serde_json::from_slice(&std::fs::read(env.paths.offer()).unwrap()).unwrap();
+            let mut directive: serde_json::Value = serde_json::from_str(&offer.payload).unwrap();
+            let mut release: serde_json::Value =
+                serde_json::from_str(directive["release"]["payload"].as_str().unwrap()).unwrap();
+            release["binary_signature"] =
+                serde_json::json!(STANDARD.encode(key.sign(digest).to_bytes()));
+            let payload = release.to_string();
+            directive["release"]["signature"] =
+                serde_json::json!(STANDARD.encode(env.release.sign(payload.as_bytes()).to_bytes()));
+            directive["release"]["payload"] = serde_json::json!(payload);
+            let payload = directive.to_string();
+            let signed = serde_json::json!({"signature": STANDARD.encode(env.command.sign(payload.as_bytes()).to_bytes()), "payload": payload});
+            std::fs::write(env.paths.offer(), signed.to_string()).unwrap();
+        }
+        old
+    }
+
+    #[test]
+    fn binary_signature_is_rotated_before_restart() {
+        let env = setup(b"NEW BINARY", None);
+        let old = provision_binary_signature(&env, &Sha256::digest(b"NEW BINARY"), true);
+        struct VerifyAtRestart<'a>(&'a Env);
+        impl Platform for VerifyAtRestart<'_> {
+            fn restart_service(&self) -> Result<()> {
+                let bytes = std::fs::read(self.0.baseline.with_file_name("binary.sig"))?;
+                let signature = ed25519_dalek::Signature::from_slice(&bytes)?;
+                SigningKey::from_bytes(&[3; 32])
+                    .verifying_key()
+                    .verify_strict(&Sha256::digest(std::fs::read(&self.0.target)?), &signature)?;
+                std::fs::write(self.0.paths.healthy_marker(), "0.5.0")?;
+                Ok(())
+            }
+        }
+        assert!(matches!(
+            run(&env, &VerifyAtRestart(&env), 0).unwrap(),
+            Outcome::Applied { .. }
+        ));
+        assert_ne!(
+            std::fs::read(env.baseline.with_file_name("binary.sig")).unwrap(),
+            old
+        );
+    }
+
+    #[test]
+    fn binary_signature_is_restored_on_rollback() {
+        let env = setup(b"NEW BINARY", None);
+        let old = provision_binary_signature(&env, &Sha256::digest(b"NEW BINARY"), true);
+        assert!(matches!(
+            run(&env, &platform(&env, None, false), 0).unwrap(),
+            Outcome::RolledBack { .. }
+        ));
+        assert_eq!(
+            std::fs::read(env.baseline.with_file_name("binary.sig")).unwrap(),
+            old
+        );
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+    }
+
+    #[test]
+    fn missing_or_wrong_binary_signature_aborts_before_swap() {
+        for include_signature in [false, true] {
+            let env = setup(b"NEW BINARY", None);
+            let old = provision_binary_signature(
+                &env,
+                &Sha256::digest(b"WRONG BINARY"),
+                include_signature,
+            );
+            let p = platform(&env, Some("0.5.0"), false);
+            assert!(run(&env, &p, 0).is_err());
+            assert_eq!(p.restarts.get(), 0);
+            assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+            assert_eq!(
+                std::fs::read(env.baseline.with_file_name("binary.sig")).unwrap(),
+                old
+            );
+        }
+    }
+
+    fn run(env: &Env, platform: &dyn Platform, timeout_ms: u64) -> Result<Outcome> {
+        run_with_baseline(env, platform, timeout_ms, Some(&env.baseline))
+    }
+
+    fn run_with_baseline(
+        env: &Env,
+        platform: &dyn Platform,
+        timeout_ms: u64,
+        baseline: Option<&Path>,
+    ) -> Result<Outcome> {
         let (rk, ck) = (env.release.verifying_key(), env.command.verifying_key());
         let ctx = ApplyContext {
             verify: VerifyContext {
@@ -463,6 +638,7 @@ mod tests {
             },
             target: &env.target,
             ebpf_target: Some(&env.ebpf_target),
+            baseline,
             paths: &env.paths,
             health_timeout: Duration::from_millis(timeout_ms),
         };
@@ -640,5 +816,115 @@ mod tests {
         );
         assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
         assert_eq!(std::fs::read(&env.ebpf_target).unwrap(), b"OLD EBPF");
+    }
+
+    // Regression: the restarted agent compares its own hash with
+    // `binary.sha256` and aborts on a mismatch (`binary_integrity::check`), so an
+    // update that leaves the old baseline in place can never become healthy.
+    #[test]
+    fn healthy_update_refreshes_the_integrity_baseline_to_the_new_binary() {
+        let env = setup(b"NEW BINARY", None);
+        let out = run(&env, &platform(&env, Some("0.5.0"), false), 2000).unwrap();
+        assert!(matches!(out, Outcome::Applied { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&env.baseline).unwrap(),
+            baseline_for(b"NEW BINARY")
+        );
+        assert_ne!(baseline_for(b"NEW BINARY"), old_baseline());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&env.baseline)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "baseline must stay private");
+        }
+    }
+
+    #[test]
+    fn baseline_is_already_fresh_when_the_new_agent_restarts() {
+        // The new agent checks the baseline right after the restart, i.e. before
+        // the health marker exists. Capture what it would see at that moment.
+        struct Probe {
+            inner: FakePlatform,
+            baseline: PathBuf,
+            seen: std::cell::RefCell<Option<String>>,
+        }
+        impl Platform for Probe {
+            fn restart_service(&self) -> Result<()> {
+                if self.inner.restarts.get() == 0 {
+                    *self.seen.borrow_mut() = std::fs::read_to_string(&self.baseline).ok();
+                }
+                self.inner.restart_service()
+            }
+        }
+        let env = setup(b"NEW BINARY", None);
+        let probe = Probe {
+            inner: platform(&env, Some("0.5.0"), false),
+            baseline: env.baseline.clone(),
+            seen: Default::default(),
+        };
+        run(&env, &probe, 2000).unwrap();
+        assert_eq!(
+            probe.seen.borrow().as_deref(),
+            Some(baseline_for(b"NEW BINARY").as_str())
+        );
+    }
+
+    #[test]
+    fn rollback_restores_the_old_integrity_baseline() {
+        // Otherwise the restored OLD binary would fail against the NEW baseline.
+        let env = setup(b"NEW BINARY", None);
+        let out = run(&env, &platform(&env, None, false), 300).unwrap();
+        assert!(matches!(out, Outcome::RolledBack { .. }));
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+        assert_eq!(
+            std::fs::read_to_string(&env.baseline).unwrap(),
+            old_baseline()
+        );
+    }
+
+    #[test]
+    fn failed_restart_restores_the_old_integrity_baseline() {
+        let env = setup(b"NEW BINARY", None);
+        let out = run(&env, &platform(&env, None, true), 300).unwrap();
+        assert!(matches!(out, Outcome::RolledBack { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&env.baseline).unwrap(),
+            old_baseline()
+        );
+    }
+
+    #[test]
+    fn missing_baseline_is_not_created() {
+        // First run writes it for whichever binary runs; the helper must not
+        // invent one.
+        let env = setup(b"NEW BINARY", None);
+        std::fs::remove_file(&env.baseline).unwrap();
+        let out = run(&env, &platform(&env, Some("0.5.0"), false), 2000).unwrap();
+        assert!(matches!(out, Outcome::Applied { .. }));
+        assert!(!env.baseline.exists());
+    }
+
+    #[test]
+    fn baseline_that_cannot_be_updated_aborts_before_restart() {
+        // A directory in place of the file makes the swap fail.
+        let env = setup(b"NEW BINARY", None);
+        std::fs::remove_file(&env.baseline).unwrap();
+        std::fs::create_dir(&env.baseline).unwrap();
+        let p = platform(&env, Some("0.5.0"), false);
+        let err = run(&env, &p, 300).unwrap_err();
+        assert!(err.to_string().contains("integrity baseline"), "{err:#}");
+        assert_eq!(
+            p.restarts.get(),
+            0,
+            "must not restart into an unverifiable binary"
+        );
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+        assert_eq!(
+            UpdateState::load(&env.paths).blocked_version.as_deref(),
+            Some("0.5.0")
+        );
     }
 }

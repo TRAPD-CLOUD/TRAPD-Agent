@@ -1,0 +1,23 @@
+# Root helper that applies an update the agent has staged and verified. Debian
+# package copy of the unit install.sh writes inline (deploy/install.sh,
+# "Signed self-update: apply helper"); only the install paths differ
+# (/usr/bin instead of /usr/local/bin). Keep the two in sync.
+[Unit]
+Description=TRAPD Agent apply staged update
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/trapd-agent --apply-update
+Environment=TRAPD_STATE_DIR=/var/lib/trapd
+Environment=TRAPD_CONFIG_DIR=/etc/trapd
+Environment=TRAPD_LOG_DIR=/var/log/trapd
+Environment=RUST_LOG=info
+TimeoutStartSec=300
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# The helper swaps the running binary (std::env::current_exe, i.e. /usr/bin) and
+# the eBPF object next to it, so exactly those two directories are writable.
+ReadWritePaths=/usr/bin /usr/lib/trapd-agent /var/lib/trapd /etc/trapd

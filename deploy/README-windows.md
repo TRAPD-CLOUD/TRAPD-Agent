@@ -9,13 +9,42 @@ rejected. Configuration and device identity survive upgrade and uninstall.
 
 ## Install
 
-Double-click the MSI or install from an elevated PowerShell prompt:
+### Home users: double-click, then pair
+
+The release MSI of the hosted TRAPD service is the installer: no separate
+bootstrapper `.exe` is needed. It carries the hosted backend URL and its public
+trust anchors (`ca.crt`, `command_signing.pub`), so nothing has to be configured.
+
+1. Double-click `trapd-agent-windows-x86_64.msi` and accept the UAC prompt.
+2. Open **Start menu → TRAPD → Pair this computer with TRAPD** (accept UAC again).
+   It shows the pairing code and opens the pairing page in your browser.
+3. Sign in to TRAPD, check that the hostname is this computer, and confirm.
+   The agent then enrolls by itself.
+
+The code is only visible to administrators on purpose: whoever sees it can
+approve this computer into their own workspace. The helper
+(`C:\Program Files\TRAPD Agent\pair.ps1`) elevates itself for that reason. If your
+standard account elevates through a different administrator account, the browser
+may open for that account; type the displayed code at the pairing page instead.
+Until you confirm, the agent waits (and still stops, upgrades and uninstalls
+normally); local collection starts after pairing.
+
+A generic MSI (built without trust anchors, e.g. in forks or for self-hosted
+setups) has no default backend: provision `ca.crt` and `command_signing.pub` and
+pass `BACKENDURL` as described below. Anchors already present in
+`C:\ProgramData\TRAPD\config` are never overwritten or removed by the MSI, so a
+self-hosted installation can use either flavour. The flip side: a rotated
+hosted CA is not replaced by an MSI upgrade.
+
+### Managed or silent install
+
+Install from an elevated PowerShell prompt:
 
 ```powershell
 msiexec.exe /i .\trapd-agent-windows-x86_64.msi /qn /norestart
 ```
 
-This immediately starts local collection and writes
+On a generic MSI this immediately starts local collection and writes
 `C:\ProgramData\TRAPD\logs\events.ndjson`. Without a configured backend,
 the agent collects in offline mode. To connect it, provision these files in
 `C:\ProgramData\TRAPD\config` before installing or restart the service after
@@ -43,8 +72,10 @@ configured. First enrollment needs a reachable backend and a valid token.
 An optional `trapd-agent-windows-install.ps1` release selector downloads the MSI
 and its checksum, with `-Channel stable` (default) or `-Channel beta`. It invokes
 Windows Installer; it does not replace service binaries independently. SHA256
-checks integrity. Offline-key manifest signing and Authenticode signing remain
-unconfigured, so the checksum alone provides no independent release authenticity.
+checks integrity. The MSI is Authenticode-signed only when SignPath is configured
+(see "Signing" below); the unsigned executable inside it and the offline-key
+manifest signing are separate. Without a signature, the checksum alone provides
+no independent release authenticity, and SmartScreen warns on download.
 
 ## Collected data and platform coverage
 
@@ -112,14 +143,44 @@ cargo build --release --target x86_64-pc-windows-msvc --manifest-path agent/Carg
 .\deploy\windows\build-msi.ps1 -AgentExe target\x86_64-pc-windows-msvc\release\trapd-agent.exe
 ```
 
+To bake the hosted anchors locally, put `ca.crt` (PEM), `command_signing.pub`
+(raw 32 bytes) and `backend_url` (plain https URL) into a directory and pass
+`-TrustDir <dir>` to `build-msi.ps1`; it rejects anything else (private keys,
+stray text, non-https or oddly quoted URLs). `verify-baked-msi.ps1` checks a
+built package without installing it. The Windows agent does not use a release
+key (the signed self-updater is Linux-only), so none is packaged.
+
 `.github/workflows/windows-package.yml` builds and tests on a native Windows
-runner. `deploy/windows/test-msi.ps1` installs the MSI and checks service startup,
+runner. The acceptance test runs on the generic MSI (it asserts that an install
+without a backend never contacts one); the hosted MSI differs only by the two
+trust files and the default `BACKENDURL`. It is built when the repository
+variables `TRAPD_HOSTED_BACKEND_URL`, `TRAPD_HOSTED_CA_PEM` and
+`TRAPD_HOSTED_COMMAND_PUBKEY` (base64 of the raw key) are all set; all values are
+public. `deploy/windows/test-msi.ps1` installs the MSI and checks service startup,
 offline collection, ACLs, a pinned TLS test backend, signed configuration, process/Sigma/TCP/file/FIM/
 event-log telemetry, heartbeat, inventory, durable replay after an outage and
 restart, MSI repair, failed-upgrade rollback, major upgrade, downgrade rejection and uninstall. The release job waits
 for that acceptance job before publishing the MSI. Test logs are uploaded as CI
 artifacts. Running this test requires an isolated Windows machine with admin
 rights; it installs a service and generates synthetic security telemetry.
+
+## Signing (SignPath, optional)
+
+The workflow signs the final MSI through the SignPath GitHub action when
+`secrets.SIGNPATH_API_TOKEN` and the repository variables
+`SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG` and `SIGNPATH_SIGNING_POLICY_SLUG`
+are set (`SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` is optional). Otherwise it logs a
+notice and ships the unsigned MSI. The signed package replaces the unsigned one
+before the checksum is taken, and the job fails if the signature is not valid.
+The calling workflow must pass the secret (`secrets: inherit`) and grant the job
+`actions: read` for the SignPath action. SignPath's artifact configuration must
+sign `*.msi` inside the uploaded `unsigned-msi` artifact.
+
+Not covered yet: the `trapd-agent.exe` inside the MSI and the standalone
+`trapd-agent-windows-x86_64.exe` asset are unsigned (signing the executable
+changes its hash, which the signed release statement covers, so it has to happen
+before that statement is created), and there is no signed self-update on Windows;
+updates ship as a new MSI.
 
 Packaging references: [WiX services](https://docs.firegiant.com/wix/schema/wxs/serviceinstall/),
 [utility service recovery](https://docs.firegiant.com/wix/schema/util/serviceconfig/),

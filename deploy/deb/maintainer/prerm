@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+systemd_active() {
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+case "$1" in
+remove|deconfigure)
+    if systemd_active; then
+        # Path unit first so no new apply run starts while the agent goes down.
+        systemctl stop trapd-agent-update.path trapd-agent.service || true
+        systemctl disable trapd-agent.service trapd-agent-update.path >/dev/null 2>&1 || true
+    fi
+    # State survives removal, but a pairing session belongs to the stopped
+    # process. Also handles old agents and unclean termination.
+    if [ ! -L /var/lib/trapd ]; then
+        rm -f /var/lib/trapd/pairing.txt
+    fi
+    ;;
+upgrade|failed-upgrade)
+    # postinst restarts the new binary; stopping here would only lengthen the gap.
+    ;;
+esac
+
+exit 0

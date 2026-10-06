@@ -5,6 +5,14 @@ jobs:
   windows-msi:
     uses: ./.github/workflows/windows-package.yml
 
+  # Builds the Debian package from dummy binaries and installs / upgrades /
+  # purges it in ubuntu and debian containers (needs Docker on the runner).
+  deb-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: REQUIRE_DOCKER=1 deploy/deb/test-deb.sh
+
   build:
     runs-on: ubuntu-latest
     steps:

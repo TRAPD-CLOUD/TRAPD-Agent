@@ -171,9 +171,19 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         let backend_url = crate::http::normalize_base_url(
             &std::env::var("TRAPD_BACKEND_URL").unwrap_or_default(),
         );
-        let creds = crate::enrollment::load_or_enroll(&backend_url, &device_id, &hostname)
-            .await
-            .context("Failed to obtain agent credentials")?;
+        // Pairing can wait for a person indefinitely. The SCM stop (service
+        // stop, MSI upgrade/removal) must still be honoured during that wait,
+        // otherwise Windows Installer's ServiceControl hangs on an unpaired
+        // agent. Dropping the future cancels pairing and removes pairing.txt.
+        let creds = tokio::select! {
+            creds = crate::enrollment::load_or_enroll(&backend_url, &device_id, &hostname) => {
+                creds.context("Failed to obtain agent credentials")?
+            }
+            _ = stop.recv() => {
+                info!("stop requested before enrollment completed");
+                return Ok(());
+            }
+        };
         (
             backend_url,
             creds.agent_id.clone(),

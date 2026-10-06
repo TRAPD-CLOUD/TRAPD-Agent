@@ -1,10 +1,17 @@
 name: Windows MSI
 on:
   workflow_call:
+    secrets:
+      # Optional. Only needed for Authenticode signing through SignPath; without
+      # it the MSI is built unsigned. The caller must pass it (`secrets: inherit`).
+      SIGNPATH_API_TOKEN:
+        required: false
 
 jobs:
   package:
     runs-on: windows-latest
+    # A hung service stop (see test-msi.ps1) must fail the job, not run for hours.
+    timeout-minutes: 60
     env:
       DOTNET_ROLL_FORWARD: Major
     steps:
@@ -28,7 +35,11 @@ jobs:
           dotnet tool install --global wix --version 4.0.6
           wix extension add -g WixToolset.Util.wixext/4.0.6
           python -m pip install cryptography==44.0.3
-      - name: Build MSI
+      # The acceptance test runs against the generic MSI: it asserts that an
+      # install without a backend never contacts one, which a hosted default
+      # backend would (by design) contradict. The hosted build below differs from
+      # it only by the two trust files and the default BACKENDURL.
+      - name: Build MSI (generic)
         run: ./deploy/windows/build-msi.ps1 -AgentExe target/x86_64-pc-windows-msvc/release/trapd-agent.exe
       - name: Install MSI and verify telemetry and lifecycle
         run: ./deploy/windows/test-msi.ps1 -Msi dist/trapd-agent-windows-x86_64.msi -AgentExe target/x86_64-pc-windows-msvc/release/trapd-agent.exe
@@ -38,6 +49,80 @@ jobs:
         with:
           name: windows-msi-test-results
           path: msi-test-results/
+
+      # Hosted flavour: public trust anchors and default backend baked in, so a
+      # double-click install pairs without any configuration. Only public values
+      # (repository variables) are used; with none set the generic MSI ships.
+      - name: Stage hosted trust anchors
+        id: trust
+        env:
+          TRAPD_HOSTED_BACKEND_URL: ${{ vars.TRAPD_HOSTED_BACKEND_URL }}
+          TRAPD_HOSTED_CA_PEM: ${{ vars.TRAPD_HOSTED_CA_PEM }}
+          TRAPD_HOSTED_COMMAND_PUBKEY: ${{ vars.TRAPD_HOSTED_COMMAND_PUBKEY }}
+        run: ./deploy/windows/stage-trust.ps1 -OutDir trust
+      - name: Build hosted MSI with baked trust anchors
+        if: steps.trust.outputs.baked == 'true'
+        run: |
+          ./deploy/windows/build-msi.ps1 -AgentExe target/x86_64-pc-windows-msvc/release/trapd-agent.exe -TrustDir trust -Output dist/hosted/trapd-agent-windows-x86_64.msi
+          ./deploy/windows/verify-baked-msi.ps1 -Msi dist/hosted/trapd-agent-windows-x86_64.msi -TrustDir trust
+          Move-Item -Force dist/hosted/trapd-agent-windows-x86_64.msi dist/trapd-agent-windows-x86_64.msi
+
+      # Authenticode signing through SignPath (optional, skipped until configured).
+      - name: Check SignPath configuration
+        id: signpath
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+        run: |
+          $required = 'SIGNPATH_API_TOKEN', 'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG', 'SIGNPATH_SIGNING_POLICY_SLUG'
+          $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          if ($missing.Count -gt 0) {
+            Write-Host "::notice::SignPath signing skipped (not configured: $($missing -join ', ')) - the MSI is unsigned."
+            'enabled=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            'enabled=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+      - name: Upload unsigned MSI for signing
+        id: upload-unsigned
+        if: steps.signpath.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-msi
+          path: dist/trapd-agent-windows-x86_64.msi
+          retention-days: 1
+          if-no-files-found: error
+      - name: Sign MSI with SignPath
+        if: steps.signpath.outputs.enabled == 'true'
+        # Third-party action that receives the SignPath token: pinned to a commit.
+        # SHA is tag v3.0 (2026-09-10) of signpath/github-action-submit-signing-request;
+        # the latest GitHub release is v2 (c92b958760219087e01f8d67a1669ed57afe2627),
+        # same inputs. Re-resolve with `gh api repos/signpath/github-action-submit-signing-request/git/ref/tags/<tag>`.
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/signed
+      - name: Replace MSI with the signed package
+        if: steps.signpath.outputs.enabled == 'true'
+        run: |
+          $signed = @(Get-ChildItem dist/signed -Recurse -File -Filter *.msi)
+          if ($signed.Count -ne 1) { throw "Expected exactly one signed MSI, found $($signed.Count)." }
+          $sig = Get-AuthenticodeSignature $signed[0].FullName
+          if ($sig.Status -ne 'Valid') { throw "Signed MSI has an invalid Authenticode signature: $($sig.Status)." }
+          Write-Host "Signed by: $($sig.SignerCertificate.Subject)"
+          Copy-Item -Force $signed[0].FullName dist/trapd-agent-windows-x86_64.msi
+          # The trust files must have survived signing unchanged.
+          if ('${{ steps.trust.outputs.baked }}' -eq 'true') {
+            ./deploy/windows/verify-baked-msi.ps1 -Msi dist/trapd-agent-windows-x86_64.msi -TrustDir trust
+          }
+
       - name: Stage release assets
         run: |
           Copy-Item target/x86_64-pc-windows-msvc/release/trapd-agent.exe dist/trapd-agent-windows-x86_64.exe
