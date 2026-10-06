@@ -18,6 +18,10 @@
 #   sudo TRAPD_BACKEND_URL=https://api.example.com \
 #        TRAPD_ENROLL_TOKEN=enroll_xxxx \
 #        bash install.sh
+#
+# Optional: TRAPD_ENABLE_DECEPTION=1 also installs the systemd drop-in that lets
+# the agent plant honeytoken decoys in /home, /root, /srv and /opt (see
+# deploy/trapd-agent-deception.conf). Off by default; an existing drop-in is kept.
 set -euo pipefail
 
 REPO="trapd-cloud/trapd-agent"
@@ -30,6 +34,8 @@ UPDATE_BIN="/usr/local/bin/trapd-update"
 SERVICE_FILE="/etc/systemd/system/trapd-agent.service"
 UPDATE_SERVICE_FILE="/etc/systemd/system/trapd-update.service"
 UPDATE_TIMER_FILE="/etc/systemd/system/trapd-update.timer"
+DECEPTION_DROPIN_DIR="/etc/systemd/system/trapd-agent.service.d"
+DECEPTION_DROPIN_FILE="${DECEPTION_DROPIN_DIR}/deception.conf"
 LOGROTATE_FILE="/etc/logrotate.d/trapd"
 ENV_DIR="/etc/trapd"
 LOG_DIR="/var/log/trapd"
@@ -104,6 +110,9 @@ verify_checksum "$TMP_BINARY" "${DOWNLOAD_URL}.sha256"
 chmod +x "$TMP_BINARY"
 mv -f "$TMP_BINARY" "$INSTALL_BIN"
 echo "Installed to ${INSTALL_BIN}"
+# mv from /tmp keeps the temp-file SELinux label, which the service may not be
+# allowed to execute. No-op where restorecon is absent (non-SELinux hosts).
+command -v restorecon &>/dev/null && restorecon -F "$INSTALL_BIN" || true
 
 # Refresh the self-integrity baseline to the freshly installed binary, so a
 # re-install over an existing (now-stale) baseline doesn't make the agent flag
@@ -122,6 +131,7 @@ if curl -fL "$EBPF_URL" -o "$TMP_EBPF" 2>/dev/null; then
     verify_checksum "$TMP_EBPF" "${EBPF_URL}.sha256"
     chmod 644 "$TMP_EBPF"
     mv -f "$TMP_EBPF" "$EBPF_INSTALL_BIN"
+    command -v restorecon &>/dev/null && restorecon -F "$EBPF_INSTALL_BIN" || true
     echo "eBPF program installed to ${EBPF_INSTALL_BIN}"
 else
     echo "WARNING: eBPF binary not found in release — kernel-side pre-exec blocking disabled." >&2
@@ -272,6 +282,27 @@ SystemCallArchitectures=native
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# ── Optional: honeytoken drop-in (opt-in) ────────────────────────────────────
+# The base unit above is read-only for /home and /root, so decoys planted there
+# fail. Installed only on request, because it widens what a compromised agent
+# could modify. Kept on later runs, so a re-install does not silently drop it.
+if [[ "${TRAPD_ENABLE_DECEPTION:-}" == "1" ]]; then
+    install -d -m 0755 "$DECEPTION_DROPIN_DIR"
+    cat > "$DECEPTION_DROPIN_FILE" <<'EOF'
+# Opt-in: lets the agent plant honeytoken decoys on this host. Keep identical to
+# the [Service] section of deploy/trapd-agent-deception.conf (checked in CI).
+[Service]
+ProtectSystem=full
+ProtectHome=false
+# Merged with the base unit's CapabilityBoundingSet.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+EOF
+    chmod 644 "$DECEPTION_DROPIN_FILE"
+    echo "Honeytoken drop-in installed (${DECEPTION_DROPIN_FILE})."
+elif [[ -f "$DECEPTION_DROPIN_FILE" ]]; then
+    echo "Keeping existing honeytoken drop-in (${DECEPTION_DROPIN_FILE})."
+fi
 
 # ── Install trapd-update script ──────────────────────────────────────────────
 # Downloaded from the release (like the agent binary) rather than generated

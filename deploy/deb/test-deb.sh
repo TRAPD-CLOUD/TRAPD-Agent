@@ -60,9 +60,10 @@ LIST="$(dpkg-deb --contents "$DEB1")"
 for p in ./usr/bin/trapd-agent ./usr/lib/trapd-agent/trapd-agent-exec ./etc/trapd/ca.crt \
          ./etc/trapd/command_signing.pub ./etc/trapd-release/release_signing.pub \
          ./usr/lib/systemd/system/trapd-agent.service ./usr/lib/systemd/system/trapd-agent-update.path \
-         ./usr/lib/systemd/system/trapd-agent-update.service ./etc/logrotate.d/trapd; do
+         ./usr/lib/systemd/system/trapd-agent-update.service ./etc/logrotate.d/trapd ./usr/share/trapd-agent/deception.conf; do
     grep -q " ${p}\$" <<<"$LIST" && ok "contains $p" || fail "missing $p"
 done
+! grep -q "systemd/system/trapd-agent.service.d" <<<"$LIST" && ok "deception drop-in is not enabled by the package" || fail "package enables the deception drop-in"
 ! grep -qE ' \./.*(agent\.key|credentials|\.env|\.pem|\.key)$' <<<"$LIST" && ok "no key/credential/env file shipped" || fail "unexpected sensitive file in package"
 ! grep -qE '^[-d]......[sS]|^[-d].....[sS]' <<<"$LIST" && ok "no setuid/setgid entries" || fail "setuid entry"
 [[ "$(dpkg-deb --fsys-tarfile "$DEB1" | tar -t | grep -c .)" -gt 5 ]] && ok "tar readable" || fail "tar"

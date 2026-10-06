@@ -107,6 +107,8 @@ install -m 0644 "$TRUST_DIR/release_signing.pub" "$ROOT/etc/trapd-release/releas
 printf '%s\n' "$BACKEND_URL" > "$ROOT/usr/share/trapd-agent/backend_url"
 chmod 0644 "$ROOT/usr/share/trapd-agent/backend_url"
 install -m 0644 "$DEPLOY_DIR/trapd.logrotate" "$ROOT/etc/logrotate.d/trapd"
+# Opt-in honeytoken drop-in: shipped, never enabled by the package.
+install -m 0644 "$DEPLOY_DIR/trapd-agent-deception.conf" "$ROOT/usr/share/trapd-agent/deception.conf"
 
 for s in preinst postinst prerm postrm; do
     install -m 0755 "$HERE/maintainer/$s" "$ROOT/DEBIAN/$s"
