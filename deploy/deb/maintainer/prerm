@@ -12,6 +12,11 @@ remove|deconfigure)
         systemctl stop trapd-agent-update.path trapd-agent.service || true
         systemctl disable trapd-agent.service trapd-agent-update.path >/dev/null 2>&1 || true
     fi
+    # State survives removal, but a pairing session belongs to the stopped
+    # process. Also handles old agents and unclean termination.
+    if [ ! -L /var/lib/trapd ]; then
+        rm -f /var/lib/trapd/pairing.txt
+    fi
     ;;
 upgrade|failed-upgrade)
     # postinst restarts the new binary; stopping here would only lengthen the gap.

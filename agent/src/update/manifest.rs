@@ -46,6 +46,10 @@ struct ReleaseStatement {
     url: String,
     sha256: String,
     size: u64,
+    /// Base64 Ed25519 signature over the raw binary SHA-256 digest, verified
+    /// against the host's optional `signing.pub` by the apply helper.
+    #[serde(default)]
+    binary_signature: Option<String>,
     /// Linux only: the kernel-side eBPF object shipped with this version. Its
     /// map layout is coupled to the userspace binary, so both are covered by the
     /// one release signature and installed (and rolled back) together.
@@ -96,6 +100,7 @@ pub struct VerifiedUpdate {
     pub url: String,
     pub sha256: [u8; 32],
     pub size: u64,
+    pub binary_signature: Option<[u8; 64]>,
     /// Companion eBPF object (Linux), installed together with the binary.
     pub ebpf: Option<VerifiedArtifact>,
     pub issued_at: i64,
@@ -208,6 +213,16 @@ pub fn verify_offer(
     }
 
     let main = validate_artifact(&release.url, &release.sha256, release.size)?;
+    let binary_signature = release
+        .binary_signature
+        .map(|s| {
+            base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or(Reject::Malformed("binary_signature"))
+        })
+        .transpose()?;
     let ebpf = match release.ebpf {
         None => None,
         Some(_) if release.os != "linux" => return Err(Reject::Malformed("ebpf")),
@@ -219,6 +234,7 @@ pub fn verify_offer(
         url: main.url,
         sha256: main.sha256,
         size: main.size,
+        binary_signature,
         ebpf,
         issued_at: directive.issued_at,
     })

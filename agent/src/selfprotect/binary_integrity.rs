@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::paths;
+use crate::paths::binary_baseline_line as baseline_line;
 
 /// Location of the baseline. Also used by the update helper, which must rewrite
 /// it whenever it swaps the binary (see `update::apply`).
@@ -29,11 +30,6 @@ pub(crate) fn hash_store_path() -> PathBuf {
     paths::config_dir().join("binary.sha256")
 }
 
-/// The one place that defines the baseline file's content for a binary whose
-/// lower-case hex SHA-256 is `hash_hex`.
-pub(crate) fn baseline_line(hash_hex: &str) -> String {
-    format!("sha256:{hash_hex}")
-}
 fn pubkey_path() -> PathBuf {
     paths::config_dir().join("signing.pub")
 }

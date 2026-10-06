@@ -76,6 +76,13 @@ fn sign_release(args: &[String]) -> ExitCode {
             bytes: &bytes,
             ebpf: ebpf.as_ref().map(|(n, b)| (*n, b.as_slice())),
         })?;
+        let payload = match env::var("BINARY_SIGNING_KEY") {
+            Ok(seed) if !seed.trim().is_empty() => {
+                let binary_key = release::signing_key(&seed)?;
+                release::add_binary_signature(&payload, &bytes, &binary_key)?
+            }
+            _ => payload,
+        };
         let signature = release::sign(&key, &payload);
         Ok(serde_json::json!({ "payload": payload, "signature": signature }).to_string())
     })();

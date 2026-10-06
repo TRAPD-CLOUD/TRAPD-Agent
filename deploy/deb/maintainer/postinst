@@ -29,6 +29,8 @@ configure)
         fi
         install -d -m 0700 -o root -g root "$d"
     done
+    # Never print a previous installation's code, including after a crash.
+    rm -f "$STATE_DIR/pairing.txt"
 
     # Only created when absent: an operator's edits (and a token, should they
     # add one) survive upgrades. No enrollment token => the agent pairs.

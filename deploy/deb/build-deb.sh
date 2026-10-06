@@ -54,9 +54,10 @@ for f in ca.crt command_signing.pub release_signing.pub backend_url; do
     [[ -f "$TRUST_DIR/$f" && ! -L "$TRUST_DIR/$f" ]] || die "missing trust anchor: $TRUST_DIR/$f"
 done
 
-grep -q -- '-----BEGIN CERTIFICATE-----' "$TRUST_DIR/ca.crt" \
-    && grep -q -- '-----END CERTIFICATE-----' "$TRUST_DIR/ca.crt" \
-    || die "ca.crt is not a PEM certificate"
+if ! grep -q -- '-----BEGIN CERTIFICATE-----' "$TRUST_DIR/ca.crt" \
+    || ! grep -q -- '-----END CERTIFICATE-----' "$TRUST_DIR/ca.crt"; then
+    die "ca.crt is not a PEM certificate"
+fi
 if grep -q 'PRIVATE KEY' "$TRUST_DIR/ca.crt"; then
     die "ca.crt contains a private key - refusing to package it"
 fi

@@ -178,6 +178,9 @@ jobs:
         # the fleet. The key only ever lives in this secret.
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          # Optional independent key matching /etc/trapd/signing.pub. Signs the
+          # raw binary digest; the signature is embedded in the release payload.
+          BINARY_SIGNING_KEY: ${{ secrets.BINARY_SIGNING_KEY }}
         run: |
           if [ -z "${RELEASE_SIGNING_KEY}" ]; then
             echo "::warning::RELEASE_SIGNING_KEY not set - release is NOT signed and will not be offered for self-update"

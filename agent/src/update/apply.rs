@@ -278,6 +278,35 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
         }
     };
 
+    // Preserve the host's independently provisioned binary-signing trust
+    // anchor. Missing/invalid replacement signatures fail BEFORE any swap;
+    // never remove an old signature to bypass the startup integrity check.
+    let signature_install = match ctx.baseline.and_then(Path::parent) {
+        Some(config) if config.join("signing.pub").exists() => {
+            let target = config.join("binary.sig");
+            match verified.binary_signature {
+                Some(bytes) => {
+                    let raw = std::fs::read(config.join("signing.pub"))?;
+                    let raw: [u8; 32] = raw
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("update: signing.pub must be 32 raw bytes"))?;
+                    let key = ed25519_dalek::VerifyingKey::from_bytes(&raw)?;
+                    key.verify_strict(
+                        &verified.sha256,
+                        &ed25519_dalek::Signature::from_bytes(&bytes),
+                    )
+                    .context("update: invalid binary signature")?;
+                    Some((target, bytes))
+                }
+                None if target.exists() => {
+                    bail!("update: release is missing the required binary signature")
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+
     let _ = std::fs::remove_file(ctx.paths.healthy_marker());
     let mut installed = Vec::new();
     // Object first: if the binary install then fails, only the object needs undoing.
@@ -291,12 +320,20 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
             return Err(e);
         }
     }
+    if let Some((target, bytes)) = signature_install {
+        match install_file(&target, &bytes, 0o600) {
+            Ok(i) => installed.push(i),
+            Err(e) => {
+                let _ = abort_update(ctx, &installed, &verified.version);
+                return Err(e).context("update: refresh binary signature");
+            }
+        }
+    }
     // The baseline is the signed digest of the file just installed. It is
     // restored on rollback like the other files; a failed write aborts the
     // update, because the new binary would refuse to start against the old one.
     if let Some(baseline) = ctx.baseline.filter(|p| p.exists()) {
-        let line =
-            crate::selfprotect::binary_integrity::baseline_line(&hex::encode(verified.sha256));
+        let line = crate::paths::binary_baseline_line(&hex::encode(verified.sha256));
         match install_file(baseline, line.as_bytes(), 0o600) {
             Ok(i) => installed.push(i),
             Err(e) => {
@@ -477,11 +514,97 @@ mod tests {
     }
 
     fn baseline_for(bytes: &[u8]) -> String {
-        crate::selfprotect::binary_integrity::baseline_line(&hex::encode(Sha256::digest(bytes)))
+        crate::paths::binary_baseline_line(&hex::encode(Sha256::digest(bytes)))
     }
 
     fn old_baseline() -> String {
         baseline_for(b"OLD BINARY")
+    }
+
+    fn provision_binary_signature(env: &Env, digest: &[u8], include_signature: bool) -> Vec<u8> {
+        let key = SigningKey::from_bytes(&[3; 32]);
+        let config = env.baseline.parent().unwrap();
+        std::fs::write(config.join("signing.pub"), key.verifying_key().to_bytes()).unwrap();
+        let old = key.sign(&Sha256::digest(b"OLD BINARY")).to_bytes().to_vec();
+        std::fs::write(config.join("binary.sig"), &old).unwrap();
+        if include_signature {
+            let offer: UpdateOffer =
+                serde_json::from_slice(&std::fs::read(env.paths.offer()).unwrap()).unwrap();
+            let mut directive: serde_json::Value = serde_json::from_str(&offer.payload).unwrap();
+            let mut release: serde_json::Value =
+                serde_json::from_str(directive["release"]["payload"].as_str().unwrap()).unwrap();
+            release["binary_signature"] =
+                serde_json::json!(STANDARD.encode(key.sign(digest).to_bytes()));
+            let payload = release.to_string();
+            directive["release"]["signature"] =
+                serde_json::json!(STANDARD.encode(env.release.sign(payload.as_bytes()).to_bytes()));
+            directive["release"]["payload"] = serde_json::json!(payload);
+            let payload = directive.to_string();
+            let signed = serde_json::json!({"signature": STANDARD.encode(env.command.sign(payload.as_bytes()).to_bytes()), "payload": payload});
+            std::fs::write(env.paths.offer(), signed.to_string()).unwrap();
+        }
+        old
+    }
+
+    #[test]
+    fn binary_signature_is_rotated_before_restart() {
+        let env = setup(b"NEW BINARY", None);
+        let old = provision_binary_signature(&env, &Sha256::digest(b"NEW BINARY"), true);
+        struct VerifyAtRestart<'a>(&'a Env);
+        impl Platform for VerifyAtRestart<'_> {
+            fn restart_service(&self) -> Result<()> {
+                let bytes = std::fs::read(self.0.baseline.with_file_name("binary.sig"))?;
+                let signature = ed25519_dalek::Signature::from_slice(&bytes)?;
+                SigningKey::from_bytes(&[3; 32])
+                    .verifying_key()
+                    .verify_strict(&Sha256::digest(std::fs::read(&self.0.target)?), &signature)?;
+                std::fs::write(self.0.paths.healthy_marker(), "0.5.0")?;
+                Ok(())
+            }
+        }
+        assert!(matches!(
+            run(&env, &VerifyAtRestart(&env), 0).unwrap(),
+            Outcome::Applied { .. }
+        ));
+        assert_ne!(
+            std::fs::read(env.baseline.with_file_name("binary.sig")).unwrap(),
+            old
+        );
+    }
+
+    #[test]
+    fn binary_signature_is_restored_on_rollback() {
+        let env = setup(b"NEW BINARY", None);
+        let old = provision_binary_signature(&env, &Sha256::digest(b"NEW BINARY"), true);
+        assert!(matches!(
+            run(&env, &platform(&env, None, false), 0).unwrap(),
+            Outcome::RolledBack { .. }
+        ));
+        assert_eq!(
+            std::fs::read(env.baseline.with_file_name("binary.sig")).unwrap(),
+            old
+        );
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+    }
+
+    #[test]
+    fn missing_or_wrong_binary_signature_aborts_before_swap() {
+        for include_signature in [false, true] {
+            let env = setup(b"NEW BINARY", None);
+            let old = provision_binary_signature(
+                &env,
+                &Sha256::digest(b"WRONG BINARY"),
+                include_signature,
+            );
+            let p = platform(&env, Some("0.5.0"), false);
+            assert!(run(&env, &p, 0).is_err());
+            assert_eq!(p.restarts.get(), 0);
+            assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+            assert_eq!(
+                std::fs::read(env.baseline.with_file_name("binary.sig")).unwrap(),
+                old
+            );
+        }
     }
 
     fn run(env: &Env, platform: &dyn Platform, timeout_ms: u64) -> Result<Outcome> {

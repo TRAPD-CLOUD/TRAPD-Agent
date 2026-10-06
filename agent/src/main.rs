@@ -208,9 +208,20 @@ async fn main() -> Result<()> {
     } else {
         let backend_url =
             http::normalize_base_url(&std::env::var("TRAPD_BACKEND_URL").unwrap_or_default());
-        let creds = enrollment::load_or_enroll(&backend_url, &device_id, &hostname)
-            .await
-            .context("Failed to obtain agent credentials")?;
+        let creds = tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT during enrollment, shutting down");
+                return Ok(());
+            }
+            _ = terminate_signal() => {
+                info!("Received SIGTERM during enrollment, shutting down");
+                return Ok(());
+            }
+            result = enrollment::load_or_enroll(&backend_url, &device_id, &hostname) => {
+                result.context("Failed to obtain agent credentials")?
+            }
+        };
         let agent_id = creds.agent_id.clone();
         let token = creds.agent_secret.clone();
         let project_id = creds.project_id.clone();

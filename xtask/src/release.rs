@@ -84,6 +84,19 @@ pub fn sign(key: &SigningKey, payload: &str) -> String {
     STANDARD.encode(key.sign(payload.as_bytes()).to_bytes())
 }
 
+/// Embed the independent digest signature before signing the release payload.
+pub fn add_binary_signature(
+    payload: &str,
+    bytes: &[u8],
+    key: &SigningKey,
+) -> Result<String, String> {
+    let mut statement: serde_json::Value =
+        serde_json::from_str(payload).map_err(|e| e.to_string())?;
+    statement["binary_signature"] =
+        serde_json::json!(STANDARD.encode(key.sign(&Sha256::digest(bytes)).to_bytes()));
+    Ok(statement.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +127,26 @@ mod tests {
         );
         let keys: Vec<_> = v["ebpf"].as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys, ["sha256", "size", "url"]);
+    }
+
+    #[test]
+    fn embedded_binary_signature_verifies_the_raw_digest() {
+        let key = SigningKey::from_bytes(&[3; 32]);
+        let payload =
+            add_binary_signature(&statement(&artifact(b"binary")).unwrap(), b"binary", &key)
+                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let bytes = STANDARD
+            .decode(v["binary_signature"].as_str().unwrap())
+            .unwrap();
+        let sig = ed25519_dalek::Signature::from_slice(&bytes).unwrap();
+        key.verifying_key()
+            .verify_strict(&Sha256::digest(b"binary"), &sig)
+            .unwrap();
+        assert!(key
+            .verifying_key()
+            .verify_strict(&Sha256::digest(b"other"), &sig)
+            .is_err());
     }
 
     #[test]

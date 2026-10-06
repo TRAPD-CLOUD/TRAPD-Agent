@@ -77,6 +77,7 @@ check "operator edit still there after upgrade" grep -qx '# local edit' /etc/tra
 
 echo "== signed updater leftovers are cleaned on remove"
 touch /usr/bin/trapd-agent.prev /usr/bin/.trapd-agent.new /usr/lib/trapd-agent/trapd-agent-exec.prev
+echo EXPIRED-CODE > /var/lib/trapd/pairing.txt
 : > /tmp/systemctl.log
 PATH="$STUB:$PATH" dpkg -r trapd-agent >/dev/null 2>&1 && ok "remove succeeds" || fail "remove"
 check "agent and path unit stopped" grep -qx 'stop trapd-agent-update.path trapd-agent.service' /tmp/systemctl.log
@@ -86,6 +87,11 @@ check ".prev/.new leftovers removed" \
     bash -c '[ ! -e /usr/bin/trapd-agent.prev ] && [ ! -e /usr/bin/.trapd-agent.new ] && [ ! -e /usr/lib/trapd-agent ]'
 check "agent.env kept on remove" test -f /etc/trapd/agent.env
 check "state directory kept on remove" test -d /var/lib/trapd
+check "expired pairing instructions removed" bash -c '[ ! -e /var/lib/trapd/pairing.txt ]'
+
+echo EXPIRED-CODE > /var/lib/trapd/pairing.txt
+PATH="$STUB:$PATH" dpkg -i "$V1" >/tmp/reinstall.log 2>&1 && ok "reinstall after removal succeeds" || fail "reinstall after removal"
+check "reinstall never prints an old pairing code" bash -c '! grep -q EXPIRED-CODE /tmp/reinstall.log'
 
 echo "== purge removes identity and config"
 echo '{}' > /var/lib/trapd/credentials.json

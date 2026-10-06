@@ -276,10 +276,15 @@ impl PairingFile {
         let target = path_buf.clone();
         // World-readable on purpose: it holds nothing secret and lets a
         // non-root user read the code. Atomic so a reader never sees a torn file.
-        tokio::task::spawn_blocking(move || paths::write_atomic(&target, text.as_bytes(), 0o644))
-            .await
-            .context("join pairing file write task")??;
-        Ok(Self { path: path_buf })
+        // Keep ownership inside the blocking task too: cancellation while the
+        // write runs must drop the returned guard and remove the file.
+        tokio::task::spawn_blocking(move || {
+            let guard = Self { path: path_buf };
+            paths::write_atomic(&target, text.as_bytes(), 0o644)?;
+            Ok::<_, anyhow::Error>(guard)
+        })
+        .await
+        .context("join pairing file write task")?
     }
 }
 

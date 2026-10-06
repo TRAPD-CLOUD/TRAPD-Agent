@@ -116,6 +116,11 @@ pub fn pairing_file() -> PathBuf {
     state_dir().join("pairing.txt")
 }
 
+/// Shared by startup integrity checks and the cross-platform update helper.
+pub(crate) fn binary_baseline_line(hash_hex: &str) -> String {
+    format!("sha256:{hash_hex}")
+}
+
 /// Hash an untrusted on-disk token with bounded memory and IO. Links and
 /// special files are refused before reading; a concurrent growth is bounded
 /// by the reader as well as the initial size check.
