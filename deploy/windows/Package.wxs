@@ -51,7 +51,10 @@
                     Arguments="-NoProfile -ExecutionPolicy Bypass -File &quot;[#PairScriptFile]&quot;"
                     WorkingDirectory="INSTALLFOLDER" />
           <RemoveFolder Id="RemoveStartMenuDir" On="uninstall" />
-          <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="PairShortcut" Type="integer" Value="1" KeyPath="yes" />
+          <!-- Keep shortcut bookkeeping outside the credential key. MSI
+               coalesces writes to a key; an unsecured first value can suppress
+               the security descriptor on a later secured value. -->
+          <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Installer" Name="PairShortcut" Type="integer" Value="1" KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>

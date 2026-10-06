@@ -46,6 +46,12 @@ try {
     # First install has no backend properties: local collection must start
     # immediately, with no enrollment requirement.
     Invoke-Msi @('/i', "`"$Msi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'offline-install.log')`"")
+    # Check before enrollment too: shortcut bookkeeping must not create the
+    # credential key with inherited Users access ahead of RegistryConfig.
+    foreach ($rule in (Get-Acl 'HKLM:\SOFTWARE\TRAPD\Agent').Access) {
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($rule.AccessControlType -eq 'Allow' -and $sid -notin @('S-1-5-18', 'S-1-5-32-544')) { throw "Unexpected registry ACL on first install: $sid" }
+    }
     Wait-Until { (Get-Service trapd-agent -ErrorAction SilentlyContinue).Status -eq 'Running' } 'Offline service did not start.'
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'system' }).Count -gt 0 } 'Offline MSI produced no local telemetry.'
     Wait-Until { Test-Path (Join-Path $state 'inventory.json') } 'Offline inventory was not written.'
