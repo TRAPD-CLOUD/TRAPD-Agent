@@ -6,6 +6,7 @@ param([Parameter(Mandatory)][string]$Msi, [Parameter(Mandatory)][string]$TrustDi
 $ErrorActionPreference = 'Stop'
 $Msi = (Resolve-Path $Msi).Path
 $TrustDir = (Resolve-Path $TrustDir).Path
+$installer = $db = $view = $record = $null
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('trapd-baked-' + [guid]::NewGuid())
 New-Item -ItemType Directory -Force $tmp | Out-Null
 try {
@@ -32,5 +33,15 @@ try {
     if ($actual -ne $expected) { throw "Default BACKENDURL '$actual' differs from the staged '$expected'." }
     Write-Host "Baked MSI verified: anchors identical, default backend $actual."
 } finally {
+    # The Windows Installer COM objects keep the MSI open until they are released.
+    # This script runs inside the caller's PowerShell process, so without this the
+    # package stays locked and the next step cannot move it.
+    if ($view) { try { $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null } catch { } }
+    foreach ($o in @($record, $view, $db, $installer)) {
+        if ($o) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($o) }
+    }
+    $record = $view = $db = $installer = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

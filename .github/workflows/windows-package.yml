@@ -65,7 +65,11 @@ jobs:
         run: |
           ./deploy/windows/build-msi.ps1 -AgentExe target/x86_64-pc-windows-msvc/release/trapd-agent.exe -TrustDir trust -Output dist/hosted/trapd-agent-windows-x86_64.msi
           ./deploy/windows/verify-baked-msi.ps1 -Msi dist/hosted/trapd-agent-windows-x86_64.msi -TrustDir trust
-          Move-Item -Force dist/hosted/trapd-agent-windows-x86_64.msi dist/trapd-agent-windows-x86_64.msi
+          # Defender or a straggling handle can briefly hold a fresh MSI: retry the move.
+          for ($i = 1; $i -le 5; $i++) {
+              try { Move-Item -Force dist/hosted/trapd-agent-windows-x86_64.msi dist/trapd-agent-windows-x86_64.msi -ErrorAction Stop; break }
+              catch { if ($i -eq 5) { throw }; Start-Sleep -Seconds 3 }
+          }
 
       # Authenticode signing through SignPath (optional, skipped until configured).
       - name: Check SignPath configuration
