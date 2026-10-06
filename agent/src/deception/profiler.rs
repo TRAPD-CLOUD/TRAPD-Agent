@@ -75,7 +75,7 @@ pub struct HostPersona {
 pub struct TokenCandidate {
     /// Stable family discriminator: `ssh_private_key`, `aws_credentials`,
     /// `pgpass`, `my_cnf`, `docker_config`, `kube_config`, `webroot_env`,
-    /// `root_backup_keys`, `passwords_kdbx`, `shell_history`.
+    /// `root_backup_keys`, `shell_history`, … (see [`GENERATABLE_KINDS`]).
     pub kind: String,
     /// Absolute path where the genuine artefact would live — i.e. where the
     /// attacker will look, and therefore where the token must go.
@@ -112,7 +112,12 @@ pub fn build_profile_with_host(
 pub trait FsProbe {
     fn is_dir(&self, path: &str) -> bool;
     fn exists(&self, path: &str) -> bool;
+    /// Names of the directories directly inside `path`, sorted.
+    fn subdirs(&self, path: &str) -> Vec<String>;
 }
+
+/// Upper bound on directory entries read per [`FsProbe::subdirs`] call.
+const MAX_SUBDIRS: usize = 256;
 
 struct RealFs;
 impl FsProbe for RealFs {
@@ -122,6 +127,53 @@ impl FsProbe for RealFs {
     fn exists(&self, path: &str) -> bool {
         Path::new(path).exists()
     }
+    fn subdirs(&self, path: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .take(MAX_SUBDIRS)
+            .flatten()
+            // file_type() does not follow symlinks: a link is never a profile.
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+/// Kinds the backend can generate faithfully (frontend/lib/api/honeytoken/
+/// bait.ts `SUPPORTED_BAIT_KINDS`). Proposing anything else would either fail
+/// at deploy time or, worse, invite a hand-made stand-in that betrays itself.
+const GENERATABLE_KINDS: &[&str] = &[
+    "aws_credentials",
+    "ssh_private_key",
+    "pgpass",
+    "my_cnf",
+    "webroot_env",
+    "kube_config",
+    "docker_config",
+    "git_credentials",
+    "shadow_backup",
+    "jwt",
+    "jwt_token",
+    "browser_logins",
+    "root_backup_keys",
+    "shell_history",
+    "pdf_doc",
+];
+
+/// The Firefox profile that holds the user's saved logins: the
+/// `*.default-release` profile current Firefox creates, else a legacy
+/// `*.default` one. `logins.json` lives inside it, never next to profiles.ini.
+fn firefox_profile(fs: &dyn FsProbe, firefox_dir: &str) -> Option<String> {
+    let profiles = fs.subdirs(firefox_dir);
+    profiles
+        .iter()
+        .find(|p| p.ends_with(".default-release"))
+        .or_else(|| profiles.iter().find(|p| p.ends_with(".default")))
+        .map(|p| format!("{firefox_dir}/{p}"))
 }
 
 /// Test entry: build candidates against an injected [`FsProbe`] with no host
@@ -319,10 +371,12 @@ pub fn build_profile_full(
         // Browser credential stores — only proposed where the browser's own
         // profile directory already exists, so the placement is never a tell.
         let firefox_dir = format!("{home}/.mozilla/firefox");
-        if fs.is_dir(&firefox_dir) {
+        if let Some(profile) = firefox_profile(fs, &firefox_dir)
+            .filter(|profile| !fs.exists(&format!("{profile}/logins.json")))
+        {
             candidates.push(TokenCandidate {
                 kind: "browser_logins".into(),
-                path: format!("{firefox_dir}/logins.json"),
+                path: format!("{profile}/logins.json"),
                 mitre_technique: "T1555.003".into(),
                 rationale: "a Firefox profile exists — logins.json holds saved site credentials"
                     .into(),
@@ -331,39 +385,6 @@ pub fn build_profile_full(
                     "dir:~/.mozilla/firefox".into(),
                 ],
                 score: score(72, 1.0),
-                mode: 0o600,
-                mimic_neighbor: true,
-            });
-        }
-        let chrome_dir = format!("{home}/.config/google-chrome/Default");
-        if fs.is_dir(&chrome_dir) {
-            candidates.push(TokenCandidate {
-                kind: "browser_logins".into(),
-                path: format!("{chrome_dir}/Login Data"),
-                mitre_technique: "T1555.003".into(),
-                rationale: "a Chrome profile exists — 'Login Data' holds saved site credentials"
-                    .into(),
-                context: vec![
-                    format!("user:{}", user.username),
-                    "dir:~/.config/google-chrome".into(),
-                ],
-                score: score(72, 1.0),
-                mode: 0o600,
-                mimic_neighbor: true,
-            });
-        }
-
-        // A password-bearing Office document is bait that doubles as an
-        // out-of-band canary: opening it fetches a remote tracking pixel.
-        let documents = format!("{home}/Documents");
-        if fs.is_dir(&documents) {
-            candidates.push(TokenCandidate {
-                kind: "office_doc".into(),
-                path: format!("{documents}/Passwords.docx"),
-                mitre_technique: "T1552.001".into(),
-                rationale: "user keeps a ~/Documents folder — a 'Passwords.docx' is irresistible loot and can carry a tracking pixel".into(),
-                context: vec![format!("user:{}", user.username), "dir:~/Documents".into()],
-                score: score(60, 1.0),
                 mode: 0o600,
                 mimic_neighbor: true,
             });
@@ -410,23 +431,6 @@ pub fn build_profile_full(
             mimic_neighbor: true,
         });
     }
-    for backup_dir in ["/opt/backups", "/var/backups"] {
-        if fs.is_dir(backup_dir) {
-            candidates.push(TokenCandidate {
-                kind: "passwords_kdbx".into(),
-                path: format!("{backup_dir}/passwords.kdbx"),
-                mitre_technique: "T1083".into(),
-                rationale: format!(
-                    "{backup_dir} exists — a KeePass vault in a backup dir is prime loot"
-                ),
-                context: vec![format!("dir:{backup_dir}")],
-                score: score(92, 1.0),
-                mode: 0o600,
-                mimic_neighbor: true,
-            });
-            break; // one vault candidate is enough
-        }
-    }
 
     // A "backup" of /etc/shadow is loot an attacker hunts after escalation. We
     // never touch the real /etc/shadow — the bait is a copy in a backup dir.
@@ -446,6 +450,13 @@ pub fn build_profile_full(
         }
     }
 
+    // Only what the backend can produce as the genuine artefact. A
+    // `browser_logins` bait is Firefox JSON, so it only fits a `logins.json`
+    // (Chrome's `Login Data` is an SQLite database).
+    candidates.retain(|c| {
+        GENERATABLE_KINDS.contains(&c.kind.as_str())
+            && (c.kind != "browser_logins" || c.path.ends_with("/logins.json"))
+    });
     // Highest score first; stable tie-break on path for deterministic output.
     candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
 
@@ -582,6 +593,18 @@ mod tests {
         }
         fn exists(&self, path: &str) -> bool {
             self.dirs.contains(path) || self.files.contains(path)
+        }
+        fn subdirs(&self, path: &str) -> Vec<String> {
+            let prefix = format!("{path}/");
+            let mut names: Vec<String> = self
+                .dirs
+                .iter()
+                .filter_map(|d| d.strip_prefix(&prefix))
+                .filter(|rest| !rest.contains('/'))
+                .map(str::to_string)
+                .collect();
+            names.sort();
+            names
         }
     }
 
@@ -730,11 +753,13 @@ mod tests {
     }
 
     #[test]
-    fn browser_and_office_and_shadow_archetypes() {
+    fn browser_and_shadow_archetypes() {
         let users = vec![user("alice", "/home/alice")];
         let fs = FakeFs::new(
             &[
                 "/home/alice/.mozilla/firefox",
+                "/home/alice/.mozilla/firefox/k3j9x2ab.default-release",
+                "/home/alice/.mozilla/firefox/Crash Reports",
                 "/home/alice/.config/google-chrome/Default",
                 "/home/alice/Documents",
                 "/var/backups",
@@ -742,20 +767,17 @@ mod tests {
             &[],
         );
         let p = build_profile_with(&users, &software(&[]), &fs);
-        let kinds: HashSet<&str> = p.candidates.iter().map(|c| c.kind.as_str()).collect();
-        assert!(
-            kinds.contains("browser_logins"),
-            "firefox/chrome stores proposed"
-        );
-        assert!(kinds.contains("office_doc"), "office tracking doc proposed");
-        assert!(kinds.contains("shadow_backup"), "shadow backup proposed");
-        // Two browser_logins candidates (firefox + chrome).
+        let logins: Vec<&str> = p
+            .candidates
+            .iter()
+            .filter(|c| c.kind == "browser_logins")
+            .map(|c| c.path.as_str())
+            .collect();
+        // Inside the real profile, where Firefox keeps it; never at Chrome's
+        // SQLite `Login Data`, which JSON bait could not imitate.
         assert_eq!(
-            p.candidates
-                .iter()
-                .filter(|c| c.kind == "browser_logins")
-                .count(),
-            2
+            logins,
+            vec!["/home/alice/.mozilla/firefox/k3j9x2ab.default-release/logins.json"]
         );
         let shadow = p
             .candidates
@@ -764,6 +786,44 @@ mod tests {
             .unwrap();
         assert_eq!(shadow.path, "/var/backups/shadow.bak");
         assert_eq!(shadow.mitre_technique, "T1003.008");
+    }
+
+    #[test]
+    fn only_kinds_the_backend_can_generate_are_proposed() {
+        let users = vec![user("alice", "/home/alice")];
+        let fs = FakeFs::new(
+            &[
+                "/home/alice/Documents",
+                "/home/alice/.mozilla/firefox",
+                "/var/backups",
+                "/opt/backups",
+                "/root",
+            ],
+            &[],
+        );
+        let p = build_profile_with(&users, &software(&["nginx", "git", "postgresql"]), &fs);
+        assert!(!p.candidates.is_empty());
+        for c in &p.candidates {
+            assert!(GENERATABLE_KINDS.contains(&c.kind.as_str()), "{}", c.kind);
+        }
+        let kinds: HashSet<&str> = p.candidates.iter().map(|c| c.kind.as_str()).collect();
+        assert!(!kinds.contains("office_doc") && !kinds.contains("passwords_kdbx"));
+        // No Firefox profile directory yet → no logins.json bait at all.
+        assert!(!kinds.contains("browser_logins"));
+    }
+
+    #[test]
+    fn existing_firefox_logins_are_never_shadowed() {
+        let users = vec![user("alice", "/home/alice")];
+        let fs = FakeFs::new(
+            &[
+                "/home/alice/.mozilla/firefox",
+                "/home/alice/.mozilla/firefox/abcd1234.default",
+            ],
+            &["/home/alice/.mozilla/firefox/abcd1234.default/logins.json"],
+        );
+        let p = build_profile_with(&users, &software(&[]), &fs);
+        assert!(p.candidates.iter().all(|c| c.kind != "browser_logins"));
     }
 
     #[test]

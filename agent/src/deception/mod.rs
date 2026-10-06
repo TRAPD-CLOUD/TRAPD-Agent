@@ -48,6 +48,8 @@
 pub mod profiler;
 pub mod registry;
 pub mod validate;
+#[cfg(any(windows, test))]
+pub mod windows_bait;
 
 use std::fs;
 #[cfg(any(test, not(target_os = "linux")))]

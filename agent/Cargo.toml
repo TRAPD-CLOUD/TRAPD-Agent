@@ -61,7 +61,7 @@ inotify = "0.10"
 
 # Windows agent dependencies (Windows only):
 #  - filesystem honeytoken monitoring (ReadDirectoryChangesW via `notify`)
-#  - registry honeytokens (RegNotifyChangeKeyValue via windows-sys)
+#  - registry access (agent settings, legacy registry decoy cleanup) via windows-sys
 #  - service integration (register/run/stop under the SCM via windows-service)
 [target.'cfg(windows)'.dependencies]
 notify      = "8"

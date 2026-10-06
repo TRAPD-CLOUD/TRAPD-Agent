@@ -10,7 +10,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - Main binary: `agent/src/main.rs` builds `trapd-agent`.
 - Current package version: `trapd-agent` `0.2.0`.
 - Primary output: structured JSON events, written locally as NDJSON and/or sent to the backend.
-- Platform focus: Linux and Windows x64. Windows sensing in `agent/src/collectors/windows/` includes process polling (native creation FILETIME), IPv4/IPv6 owner-PID TCP tables, ReadDirectoryChangesW file events and bounded SHA256 FIM, persisted Security/System/Application event-log cursors, native WTS sessions and file/registry honeytokens. `winsvc/run.rs` wires the shared detection engine, enrollment, signed config, heartbeat, inventory, persistent queue and ingest. Windows inventory uses sysinfo, native adapters and both installed-software registry views. Linux-only eBPF, packet/DNS/TLS sensors, rootkit/memory scanning, session forensics and prevention enforcement remain gated out; polling has documented short-event gaps. `deploy/windows/Package.wxs` and `build-msi.ps1` build the native MSVC x64 MSI; Windows CI installs it and verifies telemetry, TLS/backend contracts, ACLs, repair, upgrade/rollback and removal. MSI manages the automatic LocalSystem service, protected ProgramFiles binary and ProgramData directories; config/state/logs survive removal. Use MSI uninstall for MSI installations; its `cleanup` verb revokes decoys without independently managing SCM. See `deploy/README-windows.md` for the coverage matrix and build/install instructions.
+- Platform focus: Linux and Windows x64. Windows sensing in `agent/src/collectors/windows/` includes process polling (native creation FILETIME), IPv4/IPv6 owner-PID TCP tables, ReadDirectoryChangesW file events and bounded SHA256 FIM, persisted Security/System/Application event-log cursors, native WTS sessions and file honeytokens (legacy registry decoys are only cleaned up). `winsvc/run.rs` wires the shared detection engine, enrollment, signed config, heartbeat, inventory, persistent queue and ingest. Windows inventory uses sysinfo, native adapters and both installed-software registry views. Linux-only eBPF, packet/DNS/TLS sensors, rootkit/memory scanning, session forensics and prevention enforcement remain gated out; polling has documented short-event gaps. `deploy/windows/Package.wxs` and `build-msi.ps1` build the native MSVC x64 MSI; Windows CI installs it and verifies telemetry, TLS/backend contracts, ACLs, repair, upgrade/rollback and removal. MSI manages the automatic LocalSystem service, protected ProgramFiles binary and ProgramData directories; config/state/logs survive removal. Use MSI uninstall for MSI installations; its `cleanup` verb revokes decoys without independently managing SCM. See `deploy/README-windows.md` for the coverage matrix and build/install instructions.
 
 ## Important Paths
 
@@ -1307,12 +1307,16 @@ leaves the list is retired: deleted only while its identity and content still
 match what was planted (a modified file is preserved and ownership dropped),
 reported as `prevention.honeytoken_revoked` (`success=false` when preserved).
 A path that cannot be planted (existing file, unwritable directory) is reported
-once as `prevention.honeytoken_deployed` with `success=false`. Registry decoys
-(`DatabasePassword`, `AdminCredentials`, `BackupKey` under
-`HKLM\SOFTWARE\TRAPD\Honeytokens`) are opt-in: they are planted only while the
-list contains an entry starting with `HKLM\` and are removed again when it no
-longer does. Both kinds report the same `HoneytokenAccess` detection event as
-Linux.
+once as `prevention.honeytoken_deployed` with `success=false`. Bait content is
+generated per decoy (`deception/windows_bait.rs`) from the OS CSPRNG and the
+host's identity (hostname prefix, DNS domain): no two decoys share a secret,
+server name or date. Binary-container extensions (`.xlsx`, `.kdbx`, `.docx`, …)
+are refused rather than filled with text. Registry decoys are **retired**: the
+former fixed values under `HKLM\SOFTWARE\TRAPD\Honeytokens` named the product
+and were identical on every host. The agent no longer plants them, ignores an
+`HKLM\` entry in the list, and removes the values it recorded as its own (only
+while unchanged), reporting each as `prevention.honeytoken_revoked`. Decoy
+files report the same `HoneytokenAccess` detection event as Linux.
 
 `logs_enabled` (default `true`) is the master switch for the generic log
 collector. An empty `logs` list auto-discovers the built-in catalogue

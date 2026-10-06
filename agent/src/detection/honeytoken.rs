@@ -7,9 +7,13 @@
 //! flags)`. Here we:
 //!
 //!   1. **harden against false positives** (2c) — drop accesses from the agent
-//!      itself (camouflage/integrity reads) and from legitimate filesystem
-//!      sweepers (mlocate/updatedb, AV scanners, backup tools). Without this the
-//!      detector would cry wolf and destroy operator trust;
+//!      itself (camouflage/integrity reads) and *metadata* sweeps by verified
+//!      sweepers (mlocate/updatedb, indexers, AV scanners, backup tools).
+//!      Content reads and tamper by those tools are never dropped — an
+//!      attacker can run `restic backup ~/.ssh` too. Only a provably scheduled
+//!      run (no terminal, launched by PID 1 or a job scheduler, judged by
+//!      executable path, not comm) is downgraded to info and flagged
+//!      `scheduled_sweep`; any other run keeps its full score;
 //!   2. **enrich with full process lineage** (2b) — walk `/proc` to attach the
 //!      accessor's exe/cmdline and its parent chain up toward PID 1, so the
 //!      backend can reconstruct *how* the process that touched the bait came to
@@ -120,23 +124,123 @@ impl Allowlist {
         }
     }
 
-    /// True when an access from `pid`/`comm` should be treated as benign.
-    pub fn is_allowed(&self, pid: i32, _comm: &str) -> bool {
+    /// Who the accessor is, as far as suppression is concerned. The verdict is
+    /// based on the agent PID and the accessor's executable *identity*, never
+    /// on its mutable comm.
+    pub fn classify(&self, pid: i32) -> AccessorClass {
         if pid as u32 == self.agent_pid {
-            return true; // the agent reading its own bait
+            return AccessorClass::Agent; // the agent reading its own bait
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(format!("/proc/{pid}/exe"))
+            let known = std::fs::metadata(format!("/proc/{pid}/exe"))
                 .ok()
-                .is_some_and(|meta| self.executables.contains(&(meta.dev(), meta.ino())))
+                .is_some_and(|meta| self.executables.contains(&(meta.dev(), meta.ino())));
+            if known {
+                return AccessorClass::Allowlisted;
+            }
         }
-        #[cfg(not(unix))]
-        {
-            false
+        AccessorClass::Other
+    }
+
+    /// True when an access from `pid` comes from the agent or a verified sweeper.
+    #[cfg(test)]
+    pub fn is_allowed(&self, pid: i32, _comm: &str) -> bool {
+        self.classify(pid) != AccessorClass::Other
+    }
+}
+
+/// Suppression verdict for an accessor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessorClass {
+    /// The agent itself (camouflage / integrity reads): always dropped.
+    Agent,
+    /// A verified sweeper executable (indexer, AV, backup tool).
+    Allowlisted,
+    /// Anything else.
+    Other,
+}
+
+/// Whether the in-kernel honeytoken sensor is actually watching: its access
+/// consumer runs *and* tokens are armed (detection enabled in config). Health
+/// reports carry this so the console never calls a host protected whose decoy
+/// sits on disk unwatched (e.g. the eBPF program failed to load).
+static KERNEL_CONSUMER_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static KERNEL_ARMING_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_kernel_consumer_running(running: bool) {
+    KERNEL_CONSUMER_RUNNING.store(running, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_kernel_arming_enabled(enabled: bool) {
+    KERNEL_ARMING_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `kernel` while the sensor watches the tokens, `none` otherwise. Reported in
+/// `prevention.honeytoken_health` as `details.detection`.
+pub fn kernel_detection_mode() -> &'static str {
+    use std::sync::atomic::Ordering::Relaxed;
+    if KERNEL_CONSUMER_RUNNING.load(Relaxed) && KERNEL_ARMING_ENABLED.load(Relaxed) {
+        "kernel"
+    } else {
+        "none"
+    }
+}
+
+/// Confidence of a content read by an allowlisted tool outside an interactive
+/// session: kept as evidence, scored far below a real intrusion signal.
+const SCHEDULED_SWEEPER_CONFIDENCE: u8 = 20;
+
+/// Wrappers a scheduler commonly puts between itself and the job.
+const JOB_WRAPPERS: &[&str] = &[
+    "sh",
+    "bash",
+    "dash",
+    "run-parts",
+    "nice",
+    "ionice",
+    "flock",
+    "timeout",
+    "env",
+    "chronic",
+];
+
+/// Executables that start scheduled jobs.
+const SCHEDULERS: &[&str] = &[
+    "/usr/sbin/cron",
+    "/usr/sbin/crond",
+    "/usr/sbin/anacron",
+    "/usr/sbin/atd",
+    "/usr/lib/systemd/systemd",
+    "/lib/systemd/systemd",
+    "/sbin/init",
+];
+
+/// Did a scheduler start this process? Walks up past job wrappers (judged by
+/// executable basename) to the first real ancestor, which must be PID 1 or a
+/// scheduler executable. Executable paths come from `/proc/<pid>/exe` and
+/// cannot be renamed like `comm`; an unknown lineage is not scheduled.
+fn launched_by_scheduler(ancestors: &[ProcessAncestor]) -> bool {
+    for ancestor in ancestors {
+        if ancestor.pid == 1 {
+            return true;
+        }
+        let Some(exe) = ancestor.exe.as_deref() else {
+            return false;
+        };
+        let exe = exe.trim_end_matches(" (deleted)");
+        if SCHEDULERS.contains(&exe) {
+            return true;
+        }
+        let base = exe.rsplit('/').next().unwrap_or(exe);
+        if !JOB_WRAPPERS.contains(&base) {
+            return false;
         }
     }
+    false
 }
 
 /// Authenticate both the executable and its canonical parent chain. Root
@@ -216,6 +320,16 @@ pub enum AccessKind {
 }
 
 impl AccessKind {
+    /// Metadata-only access: the token's contents were not read or changed.
+    /// Sweepers do this to every file they pass, so it is the only kind an
+    /// allowlisted tool may make silently.
+    pub fn is_metadata_only(self) -> bool {
+        matches!(
+            self,
+            Self::Stat | Self::Statx | Self::Readlink | Self::Getdents
+        )
+    }
+
     /// Decode the kernel-reported discriminator.
     pub fn from_u32(v: u32) -> Self {
         match v {
@@ -324,7 +438,8 @@ pub fn token_id_u64(id: &Uuid) -> u64 {
     u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
-/// Build the enriched detection event, or `None` if the access is allowlisted.
+/// Build the enriched detection event, or `None` when the access is the agent's
+/// own or a verified sweeper's metadata pass.
 ///
 /// `proc` abstracts `/proc` so lineage enrichment is unit-testable; production
 /// passes [`RealProc`].
@@ -335,10 +450,28 @@ pub fn build_access_event(
     allowlist: &Allowlist,
     proc: &dyn ProcInfo,
 ) -> Option<AgentEvent> {
-    if allowlist.is_allowed(hit.pid, hit.comm) {
-        return None;
+    let class = allowlist.classify(hit.pid);
+    match class {
+        AccessorClass::Agent => return None,
+        AccessorClass::Allowlisted if hit.access_kind.is_metadata_only() => return None,
+        _ => {}
     }
+    build_event(
+        agent_id,
+        hostname,
+        hit,
+        class == AccessorClass::Allowlisted,
+        proc,
+    )
+}
 
+fn build_event(
+    agent_id: &str,
+    hostname: &str,
+    hit: &AccessHit<'_>,
+    allowlisted: bool,
+    proc: &dyn ProcInfo,
+) -> Option<AgentEvent> {
     let accessor = ProcessLineage {
         pid: hit.pid,
         uid: hit.uid,
@@ -352,7 +485,7 @@ pub fn build_access_event(
 
     let (label, severity, confidence, tactic, technique) = hit.access_kind.describe();
 
-    let data = HoneytokenAccessData {
+    let mut data = HoneytokenAccessData {
         token_id: hit.token_id.to_string(),
         path: hit.path.to_string(),
         kind: hit.kind.to_string(),
@@ -365,6 +498,21 @@ pub fn build_access_event(
         // Session/forensic context (issue #32, point 5): who/where the accessor
         // ran. The remote IP is correlated later by the engine's flight recorder.
         session: proc.session(hit.pid),
+        allowlisted_accessor: allowlisted,
+        scheduled_sweep: false,
+    };
+
+    // A backup/AV tool reading the bait on its schedule is expected. The same
+    // tool started any other way (terminal, `ssh host cmd`, a reverse shell)
+    // is how an attacker would exfiltrate with it, so it keeps its full score.
+    let interactive = data.session.as_ref().is_some_and(|s| s.tty.is_some());
+    data.scheduled_sweep =
+        allowlisted && !interactive && launched_by_scheduler(&data.accessor.ancestors);
+    let severity = if data.scheduled_sweep {
+        data.confidence = SCHEDULED_SWEEPER_CONFIDENCE;
+        Severity::Info
+    } else {
+        severity
     };
 
     Some(AgentEvent::new(
@@ -550,6 +698,8 @@ mod tests {
     struct FakeProc {
         ppid: HashMap<i32, i32>,
         comm: HashMap<i32, String>,
+        exe: HashMap<i32, String>,
+        tty: Option<String>,
     }
     impl ProcInfo for FakeProc {
         fn ppid(&self, pid: i32) -> Option<i32> {
@@ -558,8 +708,8 @@ mod tests {
         fn comm(&self, pid: i32) -> Option<String> {
             self.comm.get(&pid).cloned()
         }
-        fn exe(&self, _pid: i32) -> Option<String> {
-            None
+        fn exe(&self, pid: i32) -> Option<String> {
+            self.exe.get(&pid).cloned()
         }
         fn cmdline(&self, _pid: i32) -> Option<String> {
             None
@@ -568,7 +718,11 @@ mod tests {
             "tester".into()
         }
         fn session(&self, _pid: i32) -> Option<SessionContext> {
-            None // keep lineage tests independent of the host's /proc
+            // Keep lineage tests independent of the host's /proc.
+            self.tty.as_ref().map(|tty| SessionContext {
+                tty: Some(tty.clone()),
+                ..SessionContext::default()
+            })
         }
     }
 
@@ -582,7 +736,12 @@ mod tests {
         comm.insert(50, "bash".to_string());
         comm.insert(10, "sshd".to_string());
         comm.insert(1, "systemd".to_string());
-        FakeProc { ppid, comm }
+        FakeProc {
+            ppid,
+            comm,
+            exe: HashMap::new(),
+            tty: None,
+        }
     }
 
     #[test]
@@ -751,5 +910,180 @@ mod tests {
                 _ => panic!("wrong payload"),
             }
         }
+    }
+
+    /// An allowlist that verifies the running test executable as a sweeper,
+    /// standing in for an installed backup tool.
+    #[cfg(target_os = "linux")]
+    fn sweeper_allowlist() -> (Allowlist, i32) {
+        use std::os::unix::fs::MetadataExt;
+        let pid = std::process::id();
+        let meta = std::fs::metadata(format!("/proc/{pid}/exe")).unwrap();
+        let mut al = Allowlist::new(pid + 1, &[]);
+        al.executables.insert((meta.dev(), meta.ino()));
+        (al, pid as i32)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sweeper_hit(pid: i32, access_kind: AccessKind) -> AccessHit<'static> {
+        AccessHit {
+            pid,
+            uid: 0,
+            gid: 0,
+            comm: "restic",
+            open_flags: 0,
+            token_id: "tok-bk",
+            path: "/home/alice/.ssh/id_ed25519",
+            kind: "ssh_private_key",
+            access_kind,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sweeper_metadata_pass_is_suppressed() {
+        let (al, pid) = sweeper_allowlist();
+        for kind in [
+            AccessKind::Stat,
+            AccessKind::Statx,
+            AccessKind::Readlink,
+            AccessKind::Getdents,
+        ] {
+            assert!(
+                build_access_event("a", "h", &sweeper_hit(pid, kind), &al, &fake()).is_none(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A `/proc` where `pid` was started through `chain` (nearest parent
+    /// first): `(pid, comm, exe)` per ancestor.
+    fn lineage(pid: i32, chain: &[(i32, &str, &str)]) -> FakeProc {
+        let mut proc = fake();
+        let mut child = pid;
+        for (ancestor, comm, exe) in chain {
+            proc.ppid.insert(child, *ancestor);
+            proc.comm.insert(*ancestor, comm.to_string());
+            proc.exe.insert(*ancestor, exe.to_string());
+            child = *ancestor;
+        }
+        proc
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verdict(proc: &FakeProc, pid: i32, al: &Allowlist) -> (Severity, HoneytokenAccessData) {
+        let ev = build_access_event("a", "h", &sweeper_hit(pid, AccessKind::Openat), al, proc)
+            .expect("a content read is never suppressed");
+        match ev.data {
+            EventData::HoneytokenAccess(d) => (ev.severity, *d),
+            _ => panic!("wrong payload"),
+        }
+    }
+
+    /// Regression: the allowlist used to drop *every* access by a sweeper, so
+    /// `restic backup ~/.ssh` exfiltrated a decoy without a trace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scheduled_sweeper_content_read_is_reported_as_info() {
+        let (al, pid) = sweeper_allowlist();
+        for proc in [
+            // cron → sh -c → restic
+            lineage(
+                pid,
+                &[
+                    (70, "sh", "/usr/bin/dash"),
+                    (60, "cron", "/usr/sbin/cron"),
+                    (1, "systemd", "/usr/lib/systemd/systemd"),
+                ],
+            ),
+            // systemd timer → restic
+            lineage(pid, &[(1, "systemd", "/usr/lib/systemd/systemd")]),
+            // systemd --user → nice → borg
+            lineage(
+                pid,
+                &[
+                    (90, "nice", "/usr/bin/nice"),
+                    (80, "systemd", "/usr/lib/systemd/systemd"),
+                ],
+            ),
+        ] {
+            let (severity, d) = verdict(&proc, pid, &al);
+            assert!(matches!(severity, Severity::Info));
+            assert!(d.allowlisted_accessor && d.scheduled_sweep);
+            assert_eq!(d.confidence, SCHEDULED_SWEEPER_CONFIDENCE);
+            assert_eq!(d.access_kind, "open");
+        }
+    }
+
+    /// The same verified tool started by anything but a scheduler is how an
+    /// attacker would exfiltrate with it: full score, never `scheduled_sweep`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sweeper_started_any_other_way_keeps_full_score() {
+        let (al, pid) = sweeper_allowlist();
+        let mut with_tty = lineage(pid, &[(60, "cron", "/usr/sbin/cron")]);
+        with_tty.tty = Some("pts/3".into());
+        for (case, proc) in [
+            // `ssh host 'restic backup ~/.ssh'`: no TTY, but sshd lineage.
+            (
+                "ssh without tty",
+                lineage(
+                    pid,
+                    &[
+                        (50, "bash", "/usr/bin/bash"),
+                        (10, "sshd", "/usr/sbin/sshd"),
+                    ],
+                ),
+            ),
+            // Reverse shell that renamed itself: comm says cron, exe does not.
+            (
+                "renamed reverse shell",
+                lineage(pid, &[(80, "cron", "/usr/bin/python3")]),
+            ),
+            (
+                "web shell",
+                lineage(
+                    pid,
+                    &[
+                        (70, "sh", "/usr/bin/dash"),
+                        (60, "php-fpm8.2", "/usr/sbin/php-fpm8.2"),
+                    ],
+                ),
+            ),
+            ("unknown lineage", fake()),
+            ("terminal", with_tty),
+        ] {
+            let (severity, d) = verdict(&proc, pid, &al);
+            assert!(matches!(severity, Severity::Critical), "{case}");
+            assert!(d.allowlisted_accessor && !d.scheduled_sweep, "{case}");
+            assert_eq!(d.confidence, 100, "{case}");
+        }
+    }
+
+    #[test]
+    fn ordinary_access_is_not_flagged_as_allowlisted() {
+        let al = Allowlist::new(999, &[]);
+        let hit = AccessHit {
+            pid: 100,
+            uid: 1000,
+            gid: 1000,
+            comm: "restic", // a renamed binary gains nothing
+            open_flags: 0,
+            token_id: "t",
+            path: "/home/alice/.ssh/id_ed25519",
+            kind: "ssh_private_key",
+            access_kind: AccessKind::Openat,
+        };
+        let ev = build_access_event("a", "h", &hit, &al, &fake()).unwrap();
+        assert!(matches!(ev.severity, Severity::Critical));
+        match ev.data {
+            EventData::HoneytokenAccess(d) => assert!(!d.allowlisted_accessor),
+            _ => panic!("wrong payload"),
+        }
+        // And the flag stays off the wire when false.
+        let wire = serde_json::to_value(build_access_event("a", "h", &hit, &al, &fake()).unwrap())
+            .unwrap();
+        assert!(wire.to_string().find("allowlisted_accessor").is_none());
+        assert!(wire.to_string().find("scheduled_sweep").is_none());
     }
 }
