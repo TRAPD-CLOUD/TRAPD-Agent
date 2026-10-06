@@ -114,6 +114,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `trapd-agent replay <events.ndjson> [--budget <file>]` — evaluate recorded
+    // telemetry with a fresh detection engine on its original timeline and
+    // report the findings per rule (noise budgets for rule changes). Offline
+    // and side-effect free: it touches no state, credentials or backend.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("replay") {
+            std::process::exit(detection::replay::run_cli(&args[2..]));
+        }
+    }
+
     // `trapd-agent diagnostics telemetry` — report on the running agent's
     // pipeline. Read-only and side-effect free, so it must run before any of
     // the start-up work below (which would fight the live agent for the state

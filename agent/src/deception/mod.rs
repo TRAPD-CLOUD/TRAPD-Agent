@@ -50,6 +50,13 @@ pub mod registry;
 pub mod validate;
 #[cfg(any(windows, test))]
 pub mod windows_bait;
+// Adaptive Windows decoys: local activity learning, naming style and placement.
+#[cfg(any(windows, test))]
+pub mod activity;
+#[cfg(any(windows, test))]
+pub mod naming;
+#[cfg(any(windows, test))]
+pub mod windows_profiler;
 
 use std::fs;
 #[cfg(any(test, not(target_os = "linux")))]

@@ -34,7 +34,10 @@ use crate::inventory::{NetInterface, SoftwareInventory, UserAccount};
 /// v2 adds the [`HostPersona`] so the backend can generate content that is
 /// *consistent* across every token on a host (same internal hostname, domain,
 /// subnet and usernames a real artefact would reference).
-pub const RECON_PROFILE_SCHEMA: u32 = 2;
+///
+/// v3 adds the Windows decoy candidates (`windows_candidates`, `role_signals`):
+/// on Windows the Unix-path `candidates` are always empty.
+pub const RECON_PROFILE_SCHEMA: u32 = 3;
 
 /// The condensed recon view derived from inventory, sent to the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +48,33 @@ pub struct ReconProfile {
     pub persona: HostPersona,
     /// Token candidates, sorted by descending [`TokenCandidate::score`].
     pub candidates: Vec<TokenCandidate>,
+    /// Windows: adaptive decoy proposals (no local paths, see
+    /// `windows_profiler`). Empty on Linux.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows_candidates: Vec<WindowsCandidateWire>,
+    /// Windows: per-user roles derived from evidence (tool names only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub role_signals: Vec<RoleSignalWire>,
+}
+
+/// Wire form of a Windows decoy candidate (mirrors
+/// `windows_profiler::WindowsDecoyCandidate`; kept here so the Linux build
+/// carries the schema without the Windows profiler).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowsCandidateWire {
+    pub id: String,
+    pub kind: String,
+    pub user: String,
+    pub location_class: String,
+    pub score: u8,
+    pub mitre_technique: String,
+    pub rationale: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoleSignalWire {
+    pub user: String,
+    pub roles: Vec<String>,
 }
 
 /// Stable, host-wide facts the backend should weave into every token so the
@@ -461,6 +491,8 @@ pub fn build_profile_full(
     candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
 
     ReconProfile {
+        windows_candidates: Vec::new(),
+        role_signals: Vec::new(),
         schema_version: RECON_PROFILE_SCHEMA,
         persona: derive_persona(users, hostname, interfaces),
         candidates,
