@@ -47,23 +47,19 @@ pub fn gather_with_flags(
         package_count: packages.len(),
         packages,
     };
-    let users = Users::new_with_refreshed_list()
+    let profiles = windows_user_profiles();
+    let now_unix = chrono::Utc::now().timestamp();
+    let users = profiles
         .iter()
-        .map(|u| UserAccount {
-            username: u.name().into(),
+        .map(|p| UserAccount {
+            username: p.name.clone(),
             uid: 0,
             gid: 0,
-            home: registry::string(
-                &format!(
-                    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{}",
-                    **u.id()
-                ),
-                "ProfileImagePath",
-                RRF_SUBKEY_WOW6464KEY,
-            )
-            .unwrap_or_default(),
+            home: p.profile_dir.clone(),
             shell: String::new(),
-            is_human: true,
+            // Service, system and stale profiles are not people; earlier
+            // releases marked every account human.
+            is_human: crate::deception::windows_profiler::is_human_profile(p, now_unix),
         })
         .collect::<Vec<_>>();
     let network = match interfaces() {
@@ -103,7 +99,7 @@ pub fn gather_with_flags(
     };
     let compliance = compliance::assess(&software.packages, &software.source, &os, flags, cve_feed);
     let recon_profile =
-        crate::deception::build_profile_with_host(&users, &software, &hostname, &network);
+        windows_recon_profile(&users, &profiles, &software, &hostname, &network, now_unix);
     let hardware = HardwareInfo {
         vendor: registry::string(
             "HARDWARE\\DESCRIPTION\\System\\BIOS",
@@ -349,4 +345,100 @@ mod tests {
         assert_eq!(format_windows_build(10, 0, "", 1), None);
         assert_eq!(format_windows_build(10, 0, "26200a", 1), None);
     }
+}
+
+/// Every local profile with its SID, folder redirection, sync roots and last
+/// use. Accounts come from sysinfo; per-user details from `ProfileList` and,
+/// when the user's hive is loaded, `HKEY_USERS\<SID>`.
+pub(crate) fn windows_user_profiles() -> Vec<crate::deception::windows_profiler::WindowsUserProfile> {
+    use crate::deception::windows_profiler::{
+        expand_user_path, filetime_to_unix, synced_roots_from_children, WindowsUserProfile,
+    };
+    use registry::Hive;
+    const PROFILE_LIST: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
+    Users::new_with_refreshed_list()
+        .iter()
+        .map(|u| {
+            let sid = u.id().to_string();
+            let key = format!("{PROFILE_LIST}\\{sid}");
+            let profile_dir = registry::string(&key, "ProfileImagePath", RRF_SUBKEY_WOW6464KEY).unwrap_or_default();
+            let last_use_unix = match (
+                registry::dword(&key, "LocalProfileLoadTimeHigh", RRF_SUBKEY_WOW6464KEY),
+                registry::dword(&key, "LocalProfileLoadTimeLow", RRF_SUBKEY_WOW6464KEY),
+            ) {
+                (Some(h), Some(l)) => filetime_to_unix(h, l),
+                _ => None,
+            };
+            let documents_dir = registry::string_in(
+                Hive::Users,
+                &format!("{sid}\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders"),
+                "Personal",
+                registry::NO_EXPAND,
+            )
+            .and_then(|raw| expand_user_path(&raw, &profile_dir));
+            let mut synced_roots = Vec::new();
+            for account in registry::subkeys_in(Hive::Users, &format!("{sid}\\Software\\Microsoft\\OneDrive\\Accounts"), 0) {
+                if let Some(folder) = registry::string_in(
+                    Hive::Users,
+                    &format!("{sid}\\Software\\Microsoft\\OneDrive\\Accounts\\{account}"),
+                    "UserFolder",
+                    0,
+                ) {
+                    synced_roots.push(folder);
+                }
+            }
+            if !profile_dir.is_empty() {
+                let children: Vec<String> = std::fs::read_dir(&profile_dir)
+                    .map(|rd| {
+                        rd.take(256)
+                            .flatten()
+                            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                            .filter_map(|e| e.file_name().into_string().ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                synced_roots.extend(synced_roots_from_children(&profile_dir, &children));
+            }
+            synced_roots.sort();
+            synced_roots.dedup();
+            WindowsUserProfile {
+                name: u.name().to_string(),
+                sid,
+                profile_dir,
+                documents_dir,
+                synced_roots,
+                last_use_unix,
+            }
+        })
+        .collect()
+}
+
+/// The recon profile for a Windows host: persona as on Linux, but decoy
+/// candidates from the Windows profiler (the Unix-path candidates would name
+/// `C:\\Users\\x/.ssh` and are never proposed here).
+fn windows_recon_profile(
+    users: &[UserAccount],
+    profiles: &[crate::deception::windows_profiler::WindowsUserProfile],
+    software: &SoftwareInventory,
+    hostname: &str,
+    network: &[NetInterface],
+    now_unix: i64,
+) -> crate::deception::ReconProfile {
+    use crate::deception::windows_profiler::{build_candidates, ProfilerInput, RealDirProbe};
+    let mut profile = crate::deception::build_profile_with_host(users, software, hostname, network);
+    profile.candidates.clear();
+    let names: Vec<String> = software.packages.iter().map(|p| p.name.clone()).collect();
+    let activity = crate::deception::activity::current_summaries();
+    let (candidates, signals) = build_candidates(
+        &ProfilerInput {
+            users: profiles,
+            software: &names,
+            activity: &activity,
+            now_unix,
+        },
+        &RealDirProbe,
+    );
+    profile.windows_candidates = candidates;
+    profile.role_signals = signals;
+    profile
 }

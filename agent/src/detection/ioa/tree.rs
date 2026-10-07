@@ -64,11 +64,17 @@ pub const WEB_SERVERS: &[&str] = &[
 const PKG_MANAGERS: &[&str] = &[
     "dpkg", "apt", "apt-get", "aptitude", "unattended-upgr", "unattended-upgrade", "rpm",
     "dnf", "yum", "zypper", "pacman", "snapd", "flatpak", "apk", "packagekitd",
+    // Windows installers and servicing.
+    "msiexec.exe", "tiworker.exe", "trustedinstaller.exe", "wuauclt.exe", "usoclient.exe",
+    "winget.exe", "choco.exe", "setuphost.exe",
 ];
 /// Configuration-management agents.
 const CONFIG_MGMT: &[&str] = &[
     "ansible-playboo", "ansible-playbook", "ansible", "puppet", "chef-client", "salt-minion",
     "salt-call", "cloud-init",
+    // Windows management agents (ConfigMgr, Intune, Group Policy, DSC).
+    "ccmexec.exe", "agentexecutor.exe", "microsoft.management.services.intunewindowsagent.exe",
+    "intunemanagementextension.exe", "gpscript.exe", "omsagent.exe",
 ];
 
 /// What a collector knows about a process's identity at exec time.
@@ -118,9 +124,27 @@ fn boot_prefix() -> &'static str {
     })
 }
 
+/// The `root` policy flag. Windows has no numeric uid (collectors report 0
+/// for every process), so there the equivalent is the SYSTEM account; without
+/// this every Windows finding was bumped as if it ran as root.
+fn is_privileged(node: &ProcNode) -> bool {
+    let windows = node.username.contains('\\') || node.exe.to_ascii_lowercase().ends_with(".exe");
+    if windows {
+        let u = node.username.to_ascii_lowercase();
+        return u == "nt authority\\system" || u == "system";
+    }
+    node.uid == 0
+}
+
 fn comm_in(comm: &str, set: &[&str]) -> bool {
-    let base = comm.rsplit('/').next().unwrap_or(comm);
-    set.iter().any(|s| *s == base || (s.len() >= 6 && base.starts_with(s)))
+    let base = comm.rsplit(['/', '\\']).next().unwrap_or(comm);
+    set.iter().any(|s| {
+        // Windows image names are case-insensitive (`CcmExec.exe`).
+        if s.ends_with(".exe") {
+            return base.eq_ignore_ascii_case(s);
+        }
+        *s == base || (s.len() >= 6 && base.starts_with(s))
+    })
 }
 
 /// One process in the tree.  After an `exec` the image fields (`exe`,
@@ -503,7 +527,7 @@ impl ProcessTree {
             ctx.root_key = Some(process_key(root.pid, root.start_ticks));
         }
 
-        if node.uid == 0 {
+        if is_privileged(node) {
             ctx.flags.push(crate::detection::severity::FLAG_ROOT);
         }
         let ancestors = &chain[1..];
@@ -567,6 +591,21 @@ mod tests {
 
     fn t() -> ProcessTree {
         ProcessTree::new()
+    }
+
+    #[test]
+    fn windows_root_flag_and_management_lineage() {
+        let mut tree = t();
+        let now = Instant::now();
+        tree.on_create(500, 4, 0, "NT AUTHORITY\\SYSTEM", "CcmExec.exe", "C:\\Windows\\CCM\\CcmExec.exe", "", None, now);
+        tree.on_create(600, 500, 0, "NT AUTHORITY\\SYSTEM", "powershell.exe", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "", None, now);
+        tree.on_create(700, 4, 0, "CORP\\anna", "powershell.exe", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "", None, now);
+        let managed = tree.context(600).unwrap();
+        assert!(managed.flags.contains(&crate::detection::severity::FLAG_ROOT));
+        assert!(managed.flags.contains(&crate::detection::severity::FLAG_CONFIG_MGMT_LINEAGE));
+        let user = tree.context(700).unwrap();
+        assert!(!user.flags.contains(&crate::detection::severity::FLAG_ROOT), "uid 0 on Windows is not root");
+        assert!(!user.flags.contains(&crate::detection::severity::FLAG_CONFIG_MGMT_LINEAGE));
     }
 
     #[test]

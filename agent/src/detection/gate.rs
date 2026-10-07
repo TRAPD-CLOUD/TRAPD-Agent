@@ -24,6 +24,11 @@ use crate::schema::{AgentEvent, DetectionData, DetectionMode, EventData, Severit
 
 use super::severity::FLAG_SUPPRESSION_DOWNGRADE;
 
+/// Rule-id prefixes whose findings a suppression may lower but never drop.
+/// The backend refuses such suppressions; this is the agent's own guard in
+/// case a signed config carries one anyway (defense in depth).
+const UNDROPPABLE_PREFIXES: &[&str] = &["deception."];
+
 /// Max distinct findings tracked; the least recently seen is evicted (and its
 /// pending aggregate flushed) beyond this.
 const MAX_ENTRIES: usize = 8_192;
@@ -192,12 +197,28 @@ impl FindingGate {
             }];
         };
 
+        // Shadow-mode rules are counted for the backend's promotion decision
+        // and never leave the agent (nor trigger auto-response).
+        if d.mode == Some(DetectionMode::Shadow) {
+            crate::telemetry::coverage::shadow_hit(&d.rule_id);
+            return Vec::new();
+        }
+
         if let Some(rule) = self
             .suppressions
             .iter()
             .find(|r| r.matches(d, event.timestamp))
         {
-            match rule.action {
+            let action = if rule.action == SuppressionAction::Drop
+                && UNDROPPABLE_PREFIXES
+                    .iter()
+                    .any(|p| d.rule_id.starts_with(p))
+            {
+                SuppressionAction::Downgrade
+            } else {
+                rule.action
+            };
+            match action {
                 SuppressionAction::Drop => {
                     crate::telemetry::metrics::metrics().detection_suppressed();
                     return Vec::new();
@@ -515,6 +536,23 @@ mod tests {
             action,
             expires_at: None,
         }
+    }
+
+    #[test]
+    fn deception_findings_are_never_dropped() {
+        let mut r = rule(SuppressionAction::Drop);
+        r.rule = "deception.*".into();
+        r.exe = None;
+        r.user = None;
+        r.remote = None;
+        let mut g = FindingGate::new();
+        g.set_suppressions(vec![r]);
+        let out = g.admit(
+            det("deception.honeytoken_tamper", "k", Severity::High),
+            Instant::now(),
+        );
+        assert_eq!(out.len(), 1, "a drop must degrade to a downgrade");
+        assert_eq!(out[0].event.severity, Severity::Medium);
     }
 
     #[test]

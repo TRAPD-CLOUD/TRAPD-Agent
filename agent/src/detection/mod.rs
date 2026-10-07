@@ -33,6 +33,10 @@ pub mod honeytoken;
 mod ioa;
 mod ioc;
 mod netscan;
+pub mod replay;
+#[cfg(any(windows, test))]
+pub mod windows_decoy;
+pub mod windows_rules;
 pub mod severity;
 pub mod sigma;
 mod stateful;
@@ -86,6 +90,13 @@ pub struct DetectionEngine {
     ebpf_connect_seen: AtomicBool,
     file_events_seen: AtomicBool,
     started: Instant,
+    /// Seconds on the analytics clock of the event being inspected (`f64`
+    /// bits). Live it tracks `started.elapsed()`; replay sets it from event
+    /// timestamps. Read by the helpers that do not take the clock explicitly.
+    clock_bits: std::sync::atomic::AtomicU64,
+    /// Operator overrides of the catalog mode, per exact rule id (config
+    /// `rule_modes`): promote a shadow rule, or silence a noisy one.
+    rule_modes: RwLock<std::collections::HashMap<String, DetectionMode>>,
 }
 
 impl DetectionEngine {
@@ -111,7 +122,10 @@ impl DetectionEngine {
             ioa: Mutex::new(ioa::IoaEngine::new()),
             sigma: RwLock::new(Self::load_sigma_from_disk()),
             sigma_enabled: std::sync::atomic::AtomicBool::new(true),
-            baseline: Mutex::new(baseline::BaselineEngine::new()),
+            baseline: Mutex::new(baseline::BaselineEngine::load(
+                &crate::paths::state_dir().join("baseline.json"),
+                Instant::now(),
+            )),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             stateful: Mutex::new(stateful::StatefulRules::new()),
             gate: Mutex::new(gate::FindingGate::new()),
@@ -120,6 +134,19 @@ impl DetectionEngine {
             ebpf_connect_seen: AtomicBool::new(false),
             file_events_seen: AtomicBool::new(false),
             started: Instant::now(),
+            clock_bits: std::sync::atomic::AtomicU64::new(0),
+            rule_modes: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Persist the learned baseline so a restart does not re-alert on binaries
+    /// the user has run for weeks. Best-effort.
+    pub fn persist_baseline(&self) {
+        if let Ok(b) = self.baseline.lock() {
+            let path = crate::paths::state_dir().join("baseline.json");
+            if let Err(e) = b.save(&path) {
+                warn!(error = %e, "could not persist detection baseline");
+            }
         }
     }
 
@@ -131,6 +158,22 @@ impl DetectionEngine {
             }
             g.set_suppressions(rules);
         }
+    }
+
+    /// Replace the rule mode overrides (from the signed config).
+    pub fn set_rule_modes(&self, overrides: &[crate::config::RuleModeOverride]) {
+        if let Ok(mut m) = self.rule_modes.write() {
+            *m = overrides.iter().map(|o| (o.rule.clone(), o.mode)).collect();
+        }
+    }
+
+    /// The effective mode of a rule: operator override, else catalog.
+    fn effective_mode(&self, rule_id: &str, catalog: DetectionMode) -> DetectionMode {
+        self.rule_modes
+            .read()
+            .ok()
+            .and_then(|m| m.get(rule_id).copied())
+            .unwrap_or(catalog)
     }
 
     /// Toggle the statistical anomaly baseline at runtime (config-driven).
@@ -226,10 +269,24 @@ impl DetectionEngine {
     /// Detections we raise ourselves are skipped to avoid feedback loops, and
     /// so is everything the agent process (or a child it spawned) does.
     pub fn inspect(&self, event: &AgentEvent) -> Vec<AgentEvent> {
+        self.inspect_at(event, Instant::now(), self.started.elapsed().as_secs_f64())
+    }
+
+    /// [`Self::inspect`] with an injected clock: `now` drives every windowed
+    /// analytic and `elapsed_secs` the stateful single-host rules. Replay uses
+    /// it to evaluate recorded telemetry on its original timeline instead of
+    /// compressing hours of activity into one instant (which would inflate
+    /// every rate- and burst-based rule).
+    pub fn inspect_at(
+        &self,
+        event: &AgentEvent,
+        now: Instant,
+        elapsed_secs: f64,
+    ) -> Vec<AgentEvent> {
         if matches!(event.class, EventClass::Detection) {
             return Vec::new();
         }
-        let now = Instant::now();
+        self.clock_bits.store(elapsed_secs.to_bits(), Relaxed);
 
         // Stateful IOA correlation runs first: it keeps the process tree
         // current (so this event's own process resolves), yields the acting
@@ -272,8 +329,7 @@ impl DetectionEngine {
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
                     if let Ok(mut baseline) = self.baseline.lock() {
-                        if let Some(d) = baseline.observe_exec(&p.username, &p.exe, Instant::now())
-                        {
+                        if let Some(d) = baseline.observe_exec(&p.username, &p.exe, now) {
                             out.push(self.detection(Severity::Info, d));
                         }
                     }
@@ -301,7 +357,7 @@ impl DetectionEngine {
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
                     if let Ok(mut b) = self.baseline.lock() {
-                        if let Some(d) = b.observe_exec(&p.username, &p.exe, Instant::now()) {
+                        if let Some(d) = b.observe_exec(&p.username, &p.exe, now) {
                             out.push(self.detection(Severity::Info, d));
                         }
                     }
@@ -315,13 +371,13 @@ impl DetectionEngine {
                 // record per flow), and only while no eBPF connect telemetry
                 // reports the same connections.
                 if n.state != "closed" && !self.ebpf_connect_seen.load(Relaxed) {
-                    self.inspect_network(&n.dst_addr, n.dst_port, &mut out);
+                    self.inspect_network(&n.dst_addr, n.dst_port, elapsed_secs, &mut out);
                 }
             }
             EventData::NetworkSocket(n) => match n.op.as_str() {
                 "connect" => {
                     self.ebpf_connect_seen.store(true, Relaxed);
-                    self.inspect_network(&n.addr, n.port, &mut out);
+                    self.inspect_network(&n.addr, n.port, elapsed_secs, &mut out);
                 }
                 // An inbound peer is only an IOC question; cadence and scan
                 // analytics are about where *we* connect to.
@@ -331,7 +387,7 @@ impl DetectionEngine {
             // `DnsData` carries only the resolver address. Domain analytics
             // run on the resolved name from `DnsResolution`.
             EventData::DnsResolution(r) => {
-                self.inspect_domain(&r.qname, &mut out);
+                self.inspect_domain(&r.qname, elapsed_secs, &mut out);
             }
             EventData::FileOpen(f) => {
                 self.file_events_seen.store(true, Relaxed);
@@ -347,7 +403,7 @@ impl DetectionEngine {
             EventData::FileChmod(c) => {
                 if c.mode & 0o111 != 0 && is_temp_path(&c.path) {
                     if let Ok(mut st) = self.stateful.lock() {
-                        st.observe_chmod_exec(&c.path, self.started.elapsed().as_secs_f64());
+                        st.observe_chmod_exec(&c.path, elapsed_secs);
                     }
                 }
             }
@@ -357,7 +413,7 @@ impl DetectionEngine {
             EventData::UserLogon(l) => {
                 let src = l.src_addr.as_deref().unwrap_or("");
                 let hit = self.stateful.lock().ok().and_then(|mut st| {
-                    st.observe_logon(&l.username, src, l.success, self.started.elapsed().as_secs_f64())
+                    st.observe_logon(&l.username, src, l.success, elapsed_secs)
                 });
                 if let Some(d) = hit {
                     out.push(self.detection(Severity::Info, d));
@@ -433,10 +489,14 @@ impl DetectionEngine {
     /// Pass findings through the gate (suppression + aggregation). Only what
     /// this returns may be emitted.
     pub fn admit(&self, findings: Vec<AgentEvent>) -> Vec<gate::Emitted> {
+        self.admit_at(findings, Instant::now())
+    }
+
+    /// [`Self::admit`] with an injected clock (replay).
+    pub fn admit_at(&self, findings: Vec<AgentEvent>, now: Instant) -> Vec<gate::Emitted> {
         if findings.is_empty() {
             return Vec::new();
         }
-        let now = Instant::now();
         match self.gate.lock() {
             Ok(mut g) => findings.into_iter().flat_map(|f| g.admit(f, now)).collect(),
             Err(e) => {
@@ -487,9 +547,14 @@ impl DetectionEngine {
 
     /// Aggregate updates that are due (or everything pending, on shutdown).
     pub fn flush_findings(&self, force: bool) -> Vec<gate::Emitted> {
+        self.flush_findings_at(Instant::now(), force)
+    }
+
+    /// [`Self::flush_findings`] with an injected clock (replay).
+    pub fn flush_findings_at(&self, now: Instant, force: bool) -> Vec<gate::Emitted> {
         self.gate
             .lock()
-            .map(|mut g| g.flush(Instant::now(), force))
+            .map(|mut g| g.flush(now, force))
             .unwrap_or_default()
     }
 
@@ -550,15 +615,26 @@ impl DetectionEngine {
             }
         }
         let mut input = severity::PolicyInput::from_meta(&meta, base, d.confidence, flags.clone());
+        let configured = self.effective_mode(&d.rule_id, meta.mode);
+        input.mode = if configured == DetectionMode::Shadow {
+            // Severity is still evaluated (it is what the finding *would* be).
+            DetectionMode::Alert
+        } else {
+            configured
+        };
         if let Some(mode) = d.mode {
             // A rule may demote itself to a signal; it can never promote a
             // catalog signal to an alert.
-            if meta.mode == DetectionMode::Alert {
+            if input.mode == DetectionMode::Alert && mode == DetectionMode::Signal {
                 input.mode = mode;
             }
         }
         let outcome = severity::evaluate(&input);
-        d.mode = Some(outcome.mode);
+        d.mode = Some(if configured == DetectionMode::Shadow {
+            DetectionMode::Shadow
+        } else {
+            outcome.mode
+        });
         d.base_severity = Some(base);
         d.severity_reasons = outcome.reasons;
         d.context_flags = flags;
@@ -616,11 +692,15 @@ impl DetectionEngine {
         for d in behavior::inspect_process_context(comm, exe, cmdline, ctx) {
             out.push(self.detection(Severity::Info, d));
         }
+        // Windows LOLBin / persistence / evasion rules (match `*.exe` only).
+        for d in windows_rules::inspect_process(comm, exe, cmdline, ctx) {
+            out.push(self.detection(Severity::Info, d));
+        }
 
         // Session-level stateful rules.
         let base = comm.rsplit('/').next().unwrap_or(comm);
         let session = ctx.and_then(|c| c.root_key.clone().or_else(|| c.parent_key.clone()));
-        let now = self.started.elapsed().as_secs_f64();
+        let now = self.clock();
         if let Ok(mut st) = self.stateful.lock() {
             if let Some(session) = &session {
                 if let Some(d) = st.observe_exec_recon(session, base, cmdline, now) {
@@ -640,6 +720,11 @@ impl DetectionEngine {
         }
     }
 
+    /// The analytics clock of the event currently being inspected.
+    fn clock(&self) -> f64 {
+        f64::from_bits(self.clock_bits.load(Relaxed))
+    }
+
     /// Remember a systemd unit written in this session, so a following
     /// `systemctl enable` escalates it.
     fn note_unit_write(&self, d: &DetectionData, ctx: Option<&ProcContext>) {
@@ -651,7 +736,7 @@ impl DetectionEngine {
             return;
         };
         if let Ok(mut st) = self.stateful.lock() {
-            st.observe_unit_write(&session, &d.subject, self.started.elapsed().as_secs_f64());
+            st.observe_unit_write(&session, &d.subject, self.clock());
         }
     }
 
@@ -763,9 +848,15 @@ impl DetectionEngine {
         }
     }
 
-    fn inspect_network(&self, dst_addr: &str, dst_port: u16, out: &mut Vec<AgentEvent>) {
+    fn inspect_network(
+        &self,
+        dst_addr: &str,
+        dst_port: u16,
+        elapsed_secs: f64,
+        out: &mut Vec<AgentEvent>,
+    ) {
         self.inspect_ioc_ip(dst_addr, dst_port, out);
-        self.inspect_network_behaviour(dst_addr, dst_port, out);
+        self.inspect_network_behaviour(dst_addr, dst_port, elapsed_secs, out);
     }
 
     /// IOC: a connection to / from a known-bad IP.
@@ -795,8 +886,14 @@ impl DetectionEngine {
     }
 
     /// Cadence / scan / IMDS analytics over outbound connections.
-    fn inspect_network_behaviour(&self, dst_addr: &str, dst_port: u16, out: &mut Vec<AgentEvent>) {
-        let now = self.started.elapsed().as_secs_f64();
+    fn inspect_network_behaviour(
+        &self,
+        dst_addr: &str,
+        dst_port: u16,
+        elapsed_secs: f64,
+        out: &mut Vec<AgentEvent>,
+    ) {
+        let now = elapsed_secs;
 
         // Beaconing cadence analysis (skip loopback / unspecified noise).
         if is_routable(dst_addr) {
@@ -910,7 +1007,7 @@ impl DetectionEngine {
     #[cfg(not(target_os = "linux"))]
     fn inspect_file_open(&self, _path: &str, _comm: &str, _out: &mut Vec<AgentEvent>) {}
 
-    fn inspect_domain(&self, domain: &str, out: &mut Vec<AgentEvent>) {
+    fn inspect_domain(&self, domain: &str, elapsed_secs: f64, out: &mut Vec<AgentEvent>) {
         let matched = self.iocs.read().ok().and_then(|i| i.match_domain(domain));
         if let Some(matched) = matched {
             out.push(self.detection(
@@ -931,7 +1028,7 @@ impl DetectionEngine {
         }
 
         // DNS-tunneling cadence / label-length analysis.
-        let now = self.started.elapsed().as_secs_f64();
+        let now = elapsed_secs;
         let verdict = self
             .dns_tunnel
             .lock()
@@ -1238,6 +1335,8 @@ mod tests {
             ebpf_connect_seen: AtomicBool::new(false),
             file_events_seen: AtomicBool::new(false),
             started: Instant::now(),
+            clock_bits: std::sync::atomic::AtomicU64::new(0),
+            rule_modes: RwLock::new(std::collections::HashMap::new()),
         }
     }
 

@@ -107,11 +107,23 @@ async fn main() -> Result<()> {
         {
             paths::init_state_dir();
             collectors::windows::honeytokens::uninstall(&config::load_persisted());
-            info!("Uninstall cleanup complete (honeytoken files + registry decoys removed)");
+            crate::deception::activity::ActivityStore::purge(&crate::deception::activity::state_path());
+            info!("Uninstall cleanup complete (honeytoken files + registry decoys + activity profile removed)");
         }
         #[cfg(not(target_os = "windows"))]
         info!("Uninstall: no local honeytoken artifacts on this platform — nothing to do");
         return Ok(());
+    }
+
+    // `trapd-agent replay <events.ndjson> [--budget <file>]` — evaluate recorded
+    // telemetry with a fresh detection engine on its original timeline and
+    // report the findings per rule (noise budgets for rule changes). Offline
+    // and side-effect free: it touches no state, credentials or backend.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("replay") {
+            std::process::exit(detection::replay::run_cli(&args[2..]));
+        }
     }
 
     // `trapd-agent diagnostics telemetry` — report on the running agent's
@@ -405,6 +417,9 @@ async fn main() -> Result<()> {
                 .map(|c| c.detection_suppressions.clone())
                 .unwrap_or_default(),
         );
+        if let Ok(c) = agent_config.read() {
+            engine.set_rule_modes(&c.rule_modes);
+        }
     }
     info!(
         iocs = engine.ioc_count(),
@@ -493,10 +508,12 @@ async fn main() -> Result<()> {
     {
         let started = std::time::Instant::now();
         let report_path = telemetry::TelemetryReport::default_path();
+        let baseline_engine = std::sync::Arc::clone(&engine);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 ticker.tick().await;
+                baseline_engine.persist_baseline();
                 let report =
                     telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
                 if let Err(e) = report.write_atomic(&report_path) {
@@ -547,6 +564,7 @@ async fn main() -> Result<()> {
             sigma_engine.set_sigma_enabled(cfg.sigma_enabled);
             sigma_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
             sigma_engine.set_suppressions(cfg.detection_suppressions.clone());
+            sigma_engine.set_rule_modes(&cfg.rule_modes);
         }));
         tokio::spawn(async move { config_puller.run().await });
 

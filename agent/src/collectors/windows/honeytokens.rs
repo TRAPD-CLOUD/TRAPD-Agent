@@ -579,6 +579,27 @@ impl Collector for HoneytokenCollector {
     }
 }
 
+/// Make a decoy auditable and register it so the 4663 object-access path can
+/// attribute reads to a process and account. Best-effort: on failure the decoy
+/// is still watched by the change-notification / last-access fallback.
+fn arm_decoy_audit(path: &Path) {
+    use crate::detection::windows_decoy::{register_decoy, DecoyInfo};
+    let owner_sid = super::decoy_audit::owner_sid(path).unwrap_or_default();
+    let audited = super::decoy_audit::set_read_audit_sacl(path);
+    register_decoy(DecoyInfo {
+        token_id: format!("winfs:{}", path.display()),
+        path: path.display().to_string(),
+        kind: "windows_decoy_file".to_string(),
+        owner_sid,
+    });
+    crate::telemetry::coverage::update(|c| {
+        // Only ever report a stronger mode; once any decoy is audited the host
+        // can attribute reads. The last-access poll remains the fallback.
+        let stronger = audited || c.decoy_detection.as_deref() == Some("audit");
+        c.decoy_detection = Some(if stronger { "audit" } else { "last_access" }.into());
+    });
+}
+
 /// A `honeytoken_paths` entry that names a registry location rather than a
 /// file. Older backends could list the legacy registry decoy key; such an entry
 /// is ignored (registry decoys are retired) and must never become a file path.
@@ -883,6 +904,7 @@ async fn sweep(
     // watcher; the sweep restores the bait so it keeps working) and re-register
     // the restored token with the backend (status back to `active`).
     let recreated = plant_missing(&paths, state);
+    plant_adaptive(config, state);
     report_plant_failures(tx, agent_id, hostname, state);
     if !recreated.is_empty() {
         info!(
@@ -1047,6 +1069,7 @@ fn reconcile_removed(
         if let Ok(mut m) = state.planted.lock() {
             m.remove(&path);
         }
+        crate::detection::windows_decoy::forget_decoy(&path.display().to_string());
         info!(path = %path.display(), preserved, "honeytoken decoy retired");
         send_prevention(
             tx,
@@ -1105,6 +1128,7 @@ fn emit_fs_deployed(
     state: &FsState,
 ) {
     let sha256 = state.sha.lock().ok().and_then(|m| m.get(path).cloned());
+    arm_decoy_audit(path);
     send_prevention(
         tx,
         agent_id,
@@ -1694,4 +1718,129 @@ pub fn uninstall(cfg: &AgentConfig) {
     }
     drop(register);
     registry::cleanup();
+}
+
+// ── Adaptive decoys (operator-approved, resolved on the host) ───────────────
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SetFileTime(
+        handle: *mut std::ffi::c_void,
+        creation: *const [u32; 2],
+        last_access: *const [u32; 2],
+        last_write: *const [u32; 2],
+    ) -> i32;
+}
+
+/// Unix seconds → Win32 FILETIME (two u32 halves).
+fn unix_to_filetime(unix: i64) -> [u32; 2] {
+    let ticks = ((unix + 11_644_473_600).max(0) as u64) * 10_000_000;
+    [ticks as u32, (ticks >> 32) as u32]
+}
+
+/// Plant the operator-approved adaptive decoys that are not yet present.
+///
+/// Each approved entry (candidate id + kind + user) is resolved **on the host**
+/// to a concrete path: the Windows profiler re-derives the candidates for the
+/// current inventory and activity, matches the id, picks a cold directory and a
+/// file name in the user's style, and the agent renders the kind's bait and
+/// plants it — with the write time set inside the neighbouring files' range and
+/// marked not-content-indexed so Windows Search never reads it. Registered for
+/// 4663 attribution like every decoy. Resolution failures are reported once.
+fn plant_adaptive(config: &Arc<RwLock<AgentConfig>>, state: &FsState) {
+    use crate::deception::windows_profiler::{
+        build_candidates, kind_spec, resolve_file, resolve_placement, ProfilerInput, RealDirProbe,
+    };
+    let approved = match config.read() {
+        Ok(c) if c.honeytoken_detection_enabled && !c.adaptive_decoys.is_empty() => c.adaptive_decoys.clone(),
+        _ => return,
+    };
+    let profiles = crate::inventory::collect::windows_user_profiles();
+    let software: Vec<String> = Vec::new(); // kept light; activity is the strong signal
+    let activity = crate::deception::activity::current_summaries();
+    let now_unix = chrono::Utc::now().timestamp();
+    let input = ProfilerInput { users: &profiles, software: &software, activity: &activity, now_unix };
+    let (candidates, _signals) = build_candidates(&input, &RealDirProbe);
+
+    for entry in &approved {
+        let Some(cand) = candidates.iter().find(|c| c.id == entry.id && c.kind == entry.kind) else {
+            state.fail(Path::new(&entry.id), "approved decoy no longer fits this host (profile changed)");
+            continue;
+        };
+        let Some(user) = profiles.iter().find(|u| u.name == cand.user) else { continue };
+        let Some(spec) = kind_spec(&cand.kind) else { continue };
+        let act = activity.get(&user.name.to_lowercase());
+        let Some(place) = resolve_placement(spec, user, act, now_unix, &RealDirProbe) else {
+            state.fail(Path::new(&entry.id), "no cold directory available for this decoy");
+            continue;
+        };
+        let style = act.and_then(|a| a.naming).unwrap_or_default();
+        let pick = u64::from_le_bytes(Sha256::digest(cand.id.as_bytes())[..8].try_into().unwrap());
+        let Some(resolved) = resolve_file(spec, &place, &style, pick) else { continue };
+        if resolved.path.symlink_metadata().is_ok() {
+            continue; // already planted (or a real file is there — never overwrite)
+        }
+        let host = state.host.get().cloned().unwrap_or_default();
+        let bait = match crate::deception::windows_bait::generate_kind(&cand.kind, &host) {
+            Ok(b) => b,
+            Err(reason) => {
+                state.fail(&resolved.path, reason.to_string());
+                continue;
+            }
+        };
+        if let Err(e) = plant_adaptive_file(&resolved.path, &bait, resolved.mimic_unix) {
+            warn!(path = %resolved.path.display(), error = %e, "adaptive decoy plant failed");
+            state.fail(&resolved.path, format!("plant failed: {e}"));
+            continue;
+        }
+        if let Ok(mut m) = state.sha.lock() {
+            m.insert(resolved.path.clone(), sha256_hex(&bait));
+        }
+        state.mark_planted(&resolved.path);
+        arm_decoy_audit(&resolved.path);
+        info!(path = %resolved.path.display(), kind = %cand.kind, "adaptive decoy planted");
+    }
+}
+
+/// Create one adaptive decoy file: exclusive create, mark not-content-indexed,
+/// camouflage the timestamps, record ownership. Mirrors `plant_missing`'s
+/// safety (never overwrites; durable ownership record before returning Ok).
+fn plant_adaptive_file(path: &Path, bait: &[u8], mimic_unix: i64) -> Result<()> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x2000;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .custom_flags(0x0020_0000 | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED)
+        .attributes(FILE_ATTRIBUTE_NOT_CONTENT_INDEXED)
+        .open(path)?;
+    file.write_all(bait)?;
+    file.sync_all()?;
+    let ft = unix_to_filetime(mimic_unix);
+    // Set created + last-write to the mimic time; leave last-access to the OS.
+    unsafe {
+        SetFileTime(file.as_raw_handle(), &ft, std::ptr::null(), &ft);
+    }
+    let record = OwnedFile {
+        identity: file_identity(&file)?,
+        sha256: sha256_hex(bait),
+    };
+    let mut register = deployments()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment register poisoned"))?;
+    let previous = register.files.insert(path.to_path_buf(), record);
+    if let Err(error) = persist_deployments(&register) {
+        register.files.remove(path);
+        if let Some(previous) = previous {
+            register.files.insert(path.to_path_buf(), previous);
+        }
+        return Err(error);
+    }
+    Ok(())
 }

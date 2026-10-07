@@ -1,8 +1,29 @@
 //! Bounded registry reads shared by MSI configuration and Windows inventory.
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY_LOCAL_MACHINE, KEY_READ,
-    RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS,
+    KEY_READ, RRF_NOEXPAND, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
+
+/// Which hive a read targets.
+#[derive(Clone, Copy)]
+pub enum Hive {
+    LocalMachine,
+    /// `HKEY_USERS`: per-user keys under `<SID>\…`, present while the
+    /// user's profile hive is loaded (logged on, or a service holds it).
+    Users,
+}
+
+impl Hive {
+    fn key(self) -> HKEY {
+        match self {
+            Hive::LocalMachine => HKEY_LOCAL_MACHINE,
+            Hive::Users => HKEY_USERS,
+        }
+    }
+}
+
+/// Expand-suppressing flag for [`string_in`].
+pub const NO_EXPAND: u32 = RRF_NOEXPAND;
 
 pub fn dword(path: &str, name: &str, view: u32) -> Option<u32> {
     let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
@@ -25,13 +46,21 @@ pub fn dword(path: &str, name: &str, view: u32) -> Option<u32> {
 }
 
 pub fn string(path: &str, name: &str, view: u32) -> Option<String> {
+    string_in(Hive::LocalMachine, path, name, view)
+}
+
+/// A string value from `hive`. `REG_EXPAND_SZ` values are returned
+/// unexpanded when `view` contains `RRF_NOEXPAND` (needed for per-user
+/// values that reference *that* user's `%USERPROFILE%`, not the service's).
+pub fn string_in(hive: Hive, path: &str, name: &str, view: u32) -> Option<String> {
+    let root = hive.key();
     let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
     let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     let mut size = 0u32;
     // SAFETY: terminated strings and valid out-parameters; null data queries size.
     let status = unsafe {
         RegGetValueW(
-            HKEY_LOCAL_MACHINE,
+            root,
             path.as_ptr(),
             name.as_ptr(),
             RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | view,
@@ -47,7 +76,7 @@ pub fn string(path: &str, name: &str, view: u32) -> Option<String> {
     // SAFETY: buffer capacity is the byte count returned by the first call.
     let status = unsafe {
         RegGetValueW(
-            HKEY_LOCAL_MACHINE,
+            root,
             path.as_ptr(),
             name.as_ptr(),
             RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | view,
@@ -67,19 +96,16 @@ pub fn string(path: &str, name: &str, view: u32) -> Option<String> {
 }
 
 pub fn subkeys(path: &str, view: u32) -> Vec<String> {
+    subkeys_in(Hive::LocalMachine, path, view)
+}
+
+pub fn subkeys_in(hive: Hive, path: &str, view: u32) -> Vec<String> {
     let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
     let mut key = std::ptr::null_mut();
     let mut names = Vec::new();
     // SAFETY: key is a valid out-pointer and the returned handle is always closed.
     unsafe {
-        if RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            path.as_ptr(),
-            0,
-            KEY_READ | view,
-            &mut key,
-        ) != 0
-        {
+        if RegOpenKeyExW(hive.key(), path.as_ptr(), 0, KEY_READ | view, &mut key) != 0 {
             return names;
         }
         for index in 0..8192 {

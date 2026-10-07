@@ -30,6 +30,11 @@ struct HeartbeatPayload {
     agent_version: String,
     timestamp: chrono::DateTime<Utc>,
     metrics: Metrics,
+    /// What the sensors can currently see (empty object when unknown).
+    coverage: crate::telemetry::coverage::Coverage,
+    /// Findings of shadow-mode rules since the last accepted beat.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    shadow_hits: std::collections::BTreeMap<String, u64>,
 }
 
 /// Live host resource utilisation sampled at beat time.
@@ -106,6 +111,8 @@ impl Heartbeat {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             timestamp: Utc::now(),
             metrics,
+            coverage: crate::telemetry::coverage::snapshot(),
+            shadow_hits: crate::telemetry::coverage::take_shadow_hits(),
         };
         match self
             .client
@@ -122,9 +129,11 @@ impl Heartbeat {
             }
             Ok(resp) => {
                 warn!("Heartbeat rejected by backend: HTTP {}", resp.status());
+                crate::telemetry::coverage::restore_shadow_hits(payload.shadow_hits);
             }
             Err(e) => {
                 warn!("Heartbeat request failed: {e}");
+                crate::telemetry::coverage::restore_shadow_hits(payload.shadow_hits);
             }
         }
     }
