@@ -146,10 +146,7 @@ impl Collector for NetworkCollector {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
         loop {
             ticker.tick().await;
-            if crate::telemetry::coverage::snapshot().etw_network_active() {
-                known.clear();
-                continue;
-            }
+            let etw_active = crate::telemetry::coverage::snapshot().etw_network_active();
             let rows = match tokio::task::spawn_blocking(snapshot).await? {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -167,7 +164,7 @@ impl Collector for NetworkCollector {
                     .get(&key)
                     .map(|(_, since)| *since)
                     .unwrap_or_else(Instant::now);
-                if !known.contains_key(&key) {
+                if !etw_active && !known.contains_key(&key) {
                     let event = AgentEvent::new(
                         agent_id.clone(),
                         hostname.clone(),
@@ -181,6 +178,12 @@ impl Collector for NetworkCollector {
                     }
                 }
                 current.insert(key, (row, since));
+            }
+            if etw_active {
+                // ETW owns emission (start and close). Keep the snapshot fresh
+                // so a later ETW outage does not re-announce live connections.
+                known = current;
+                continue;
             }
             for (key, (mut row, since)) in known {
                 if current.contains_key(&key) {

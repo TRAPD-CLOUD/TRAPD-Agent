@@ -154,11 +154,15 @@ pub fn replay<R: BufRead>(engine: &DetectionEngine, reader: R) -> ReplayReport {
         let now = base + offset;
 
         if matches!(event.class, crate::schema::EventClass::Detection) {
-            for emitted in engine.admit_external_at(event, now) {
-                record(&mut report, &emitted);
-            }
-            for emitted in engine.flush_findings_at(now, false) {
-                record(&mut report, &emitted);
+            // Raw honeytoken evidence is replayed; stored findings are not, so
+            // the report reflects what the current rules would emit.
+            if matches!(event.data, EventData::HoneytokenAccess(_)) {
+                for emitted in engine.admit_external_at(event, now) {
+                    record(&mut report, &emitted);
+                }
+                for emitted in engine.flush_findings_at(now, false) {
+                    record(&mut report, &emitted);
+                }
             }
             continue;
         }
@@ -310,6 +314,28 @@ mod tests {
         assert_eq!(report.skipped_lines, 1);
         assert_eq!(report.hosts.len(), 1);
         assert!((report.host_days() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn stored_detection_findings_are_not_replayed_as_current_output() {
+        use crate::schema::{DetectionData, EventAction, EventClass};
+        let event = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Detection,
+            EventAction::Detected,
+            Severity::High,
+            EventData::Detection(Box::new(DetectionData {
+                rule_id: "removed.rule".into(),
+                title: "stale".into(),
+                ..Default::default()
+            })),
+        );
+        let engine = DetectionEngine::new("a".into(), "h".into());
+        let report = replay(&engine, ndjson(&[event]).as_bytes());
+        assert_eq!(report.events, 1);
+        assert_eq!(report.total_alerts(), 0);
+        assert!(!report.rules.contains_key("removed.rule"));
     }
 
     #[test]

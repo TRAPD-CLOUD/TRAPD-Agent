@@ -10,6 +10,8 @@ const MAX_CHILDREN: usize = 64;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PROFILE_BYTES: usize = 4 * 1024 * 1024;
 const DAY: u64 = 86_400;
+/// A once-seen candidate that has not recurred for this long no longer holds a slot.
+const PENDING_TTL: u64 = 14 * DAY;
 const RATE_WARMUP: u32 = 5;
 const RATE_Z_THRESHOLD: f64 = 4.0;
 
@@ -157,6 +159,18 @@ impl BaselineEngine {
         let known = profile.confirmed.contains(&exe);
         let mature = profile.confirmed.len() >= 3 && wall.saturating_sub(profile.first_seen) >= DAY;
         if !known && eligible {
+            if profile.pending.len() >= MAX_CHILDREN && !profile.pending.contains_key(&exe) {
+                let stale: Vec<String> = profile
+                    .pending
+                    .iter()
+                    .filter(|(_, c)| wall.saturating_sub(c.last_seen) > PENDING_TTL)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in stale {
+                    profile.pending.remove(&key);
+                    self.profile_bytes = self.profile_bytes.saturating_sub(key.len() + 128);
+                }
+            }
             if !profile.pending.contains_key(&exe)
                 && profile.pending.len() < MAX_CHILDREN
                 && self.profile_bytes + exe.len() + 128 <= MAX_PROFILE_BYTES
@@ -371,6 +385,21 @@ pub struct BaselineSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_candidates_do_not_block_learning_forever() {
+        let mut b = BaselineEngine::new();
+        let t = Instant::now();
+        for i in 0..MAX_CHILDREN {
+            b.observe_exec_at("alice", &format!("/opt/once{i}"), t, 100_000, true);
+        }
+        assert_eq!(b.profiles["alice"].pending.len(), MAX_CHILDREN);
+        let later = 100_000 + PENDING_TTL + 1;
+        b.observe_exec_at("alice", "/bin/new", t, later, true);
+        let pending = &b.profiles["alice"].pending;
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key("/bin/new"));
+    }
 
     #[test]
     fn rejected_candidates_release_their_capacity() {
