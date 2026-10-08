@@ -543,6 +543,24 @@ mod tests {
             for xml in read("Security", Some(cursor)).unwrap() {
                 let (record, data, _) = parse(&xml, "Security").unwrap();
                 cursor = cursor.max(record);
+                if data.fields.get("EventID").and_then(|v| v.as_u64()) == Some(4663) {
+                    let f = |k: &str| {
+                        data.fields
+                            .get(k)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let object = f("ObjectName");
+                    if object.contains("trapd-4663") {
+                        eprintln!(
+                            "4663 raw: object={object:?} pid={} mask={} process={:?}",
+                            f("ProcessId"),
+                            f("AccessMask"),
+                            f("ProcessName")
+                        );
+                    }
+                }
                 if data.fields.get("EventID").and_then(|v| v.as_u64()) != Some(4663)
                     || !data
                         .fields
