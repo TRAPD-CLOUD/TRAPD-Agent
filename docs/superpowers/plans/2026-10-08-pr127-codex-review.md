@@ -16,3 +16,7 @@ Follow-up review on 344bcbe:
 - [x] Keep only backend management IPs in EngineConfig; read current signed-config allowances at every isolation action. Reuse one allowlist builder for commands, general automatic response and honeytoken response. Verify additions/removals, management IP preservation, command additions and invalid config IPs through actual firewall command arguments.
 
 Verification of the first fixes: 1074 Linux unit tests and 16 integration tests passed; Linux/Windows Clippy, changed-module formatting and both release builds passed. All five jobs in both CI runs 37781716898 and 37781706934 passed, including native Windows firewall and MSI acceptance. CodeQL run 37781707639 passed for Rust, Python and Actions. Follow-up changes require fresh verification.
+
+Follow-up review on 20dfcb0:
+
+- [x] Confirm update health on successful Windows heartbeats, using the existing shared confirmation hook. Native MSI acceptance stages a synthetic offer while the updater has no release key, checks that rejected heartbeats do not confirm health, then checks that an accepted heartbeat writes exactly the current version. Pause heartbeat responses using the existing mock-backend outage-marker pattern; use the supported five-second cadence in the test fixture.

@@ -124,7 +124,6 @@ impl Heartbeat {
         {
             Ok(resp) if resp.status().is_success() => {
                 debug!("Heartbeat sent successfully");
-                #[cfg(target_os = "linux")]
                 crate::update::confirm_healthy();
             }
             Ok(resp) => {
@@ -228,9 +227,7 @@ fn count_processes() -> usize {
 #[cfg(not(target_os = "linux"))]
 fn count_processes() -> usize {
     use sysinfo::{ProcessRefreshKind, RefreshKind};
-    System::new_with_specifics(
-        RefreshKind::new().with_processes(ProcessRefreshKind::new()),
-    )
-    .processes()
-    .len()
+    System::new_with_specifics(RefreshKind::new().with_processes(ProcessRefreshKind::new()))
+        .processes()
+        .len()
 }

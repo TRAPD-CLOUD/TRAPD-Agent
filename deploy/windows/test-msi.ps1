@@ -156,6 +156,27 @@ try {
     Wait-Until { @(Read-Requests | Where-Object { $_.path -like '*/heartbeat' -and $_.status -eq 200 }).Count -gt 0 } 'No authenticated heartbeat.'
     Wait-Until { @(Read-Requests | Where-Object { $_.path -eq '/api/v1/ingest/events' -and $_.status -eq 200 }).Count -gt 0 } 'No authenticated TLS ingest.'
 
+    # The generic package has no release key, so no updater/helper consumes
+    # this synthetic staging marker. Exercise the real heartbeat confirmation.
+    $updateDir = Join-Path $state 'update'
+    New-Item -ItemType Directory -Force $updateDir | Out-Null
+    $stagedOffer = Join-Path $updateDir 'staged.offer.json'
+    $healthyMarker = Join-Path $updateDir 'healthy'
+    if ((Test-Path $stagedOffer) -or (Test-Path $healthyMarker)) { throw 'Unexpected update state before heartbeat acceptance.' }
+    $pauseHeartbeat = Join-Path $root 'pause-heartbeat'
+    New-Item -ItemType File $pauseHeartbeat | Out-Null
+    $failedBefore = @(Read-Requests | Where-Object { $_.path -like '*/heartbeat' -and $_.status -eq 500 }).Count
+    Wait-Until { @(Read-Requests | Where-Object { $_.path -like '*/heartbeat' -and $_.status -eq 500 }).Count -gt $failedBefore } 'Heartbeat outage was not exercised.' 30
+    $failedBefore = @(Read-Requests | Where-Object { $_.path -like '*/heartbeat' -and $_.status -eq 500 }).Count
+    '{}' | Set-Content $stagedOffer
+    Wait-Until { @(Read-Requests | Where-Object { $_.path -like '*/heartbeat' -and $_.status -eq 500 }).Count -gt $failedBefore } 'No rejected heartbeat with staged update.' 30
+    if (Test-Path $healthyMarker) { throw 'A failed heartbeat confirmed update health.' }
+    Remove-Item $pauseHeartbeat
+    Wait-Until { Test-Path $healthyMarker } 'Successful Windows heartbeat did not confirm the update.' 30
+    $expectedVersion = ((& $AgentExe --version) -replace '^trapd-agent v', '').Trim()
+    if ((Get-Content -Raw $healthyMarker).Trim() -ne $expectedVersion) { throw 'Heartbeat confirmed the wrong update version.' }
+    Remove-Item $stagedOffer, $healthyMarker
+
     # Outage across a service restart must replay the durable queue with the
     # same event IDs, then acknowledge it when ingest resumes.
     New-Item -ItemType File (Join-Path $root 'pause-ingest') | Out-Null
