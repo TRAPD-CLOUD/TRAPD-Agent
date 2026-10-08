@@ -284,6 +284,28 @@ pub fn evaluate(reg: &dyn Registry) -> Vec<CisFinding> {
         ));
     }
 
+    // Command lines of short-lived processes: ETW reads them from the live
+    // process and misses ones that exit first; 4688 carries them regardless.
+    if reg.dword(
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Audit",
+        "ProcessCreationIncludeCmdLine_Enabled",
+    ) == Some(1)
+    {
+        out.push(pass(
+            "WIN-AUDIT-CMDLINE",
+            "Process-creation events include the command line",
+            2,
+            "enabled by policy (also needs Audit Process Creation = Success)",
+        ));
+    } else {
+        out.push(fail(
+            "WIN-AUDIT-CMDLINE",
+            "Process-creation events include the command line",
+            2,
+            "not enabled: short-lived processes (certutil, bitsadmin) reach detection without a command line",
+        ));
+    }
+
     // Platform integrity and patching.
     match reg.dword(
         "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
@@ -376,6 +398,16 @@ mod tests {
         fn dword(&self, key: &str, name: &str) -> Option<u32> {
             self.0.get(&(key.to_string(), name.to_string())).copied()
         }
+    }
+
+    #[test]
+    fn command_line_auditing_is_judged_from_the_policy_value() {
+        let key = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Audit";
+        let on = Fake(HashMap::new()).with(key, "ProcessCreationIncludeCmdLine_Enabled", 1);
+        assert_eq!(status(&evaluate(&on), "WIN-AUDIT-CMDLINE"), "pass");
+        assert_eq!(status(&evaluate(&Fake(HashMap::new())), "WIN-AUDIT-CMDLINE"), "fail");
+        let off = Fake(HashMap::new()).with(key, "ProcessCreationIncludeCmdLine_Enabled", 0);
+        assert_eq!(status(&evaluate(&off), "WIN-AUDIT-CMDLINE"), "fail");
     }
 
     fn status(findings: &[CisFinding], id: &str) -> String {

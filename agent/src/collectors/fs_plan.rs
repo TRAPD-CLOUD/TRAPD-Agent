@@ -146,6 +146,14 @@ pub fn is_user_noise(normalised_path: &str) -> bool {
         || normalised_path.contains("\\$recycle.bin\\")
 }
 
+/// Scratch files whose content says nothing about user data being encrypted:
+/// anything under `AppData\Local\Temp` and `.tmp` files. Windows and installers
+/// create compressed or random temp files constantly, so an entropy check on
+/// them is pure noise. Mass modification and ransom extensions still apply.
+pub fn is_scratch_file(normalised_path: &str) -> bool {
+    normalised_path.contains("\\appdata\\local\\temp\\") || normalised_path.ends_with(".tmp")
+}
+
 /// Never filtered or coalesced: persistence and name-resolution targets.
 pub fn is_security_critical(normalised_path: &str) -> bool {
     normalised_path.contains("\\microsoft\\windows\\start menu\\programs\\startup\\")
@@ -237,7 +245,10 @@ impl Planner {
                     }
                 }
                 Change::Modified => {
-                    if !is_compressed_by_nature(&norm) && self.throttle.allow(&norm, now) {
+                    if !is_compressed_by_nature(&norm)
+                        && !is_scratch_file(&norm)
+                        && self.throttle.allow(&norm, now)
+                    {
                         out.push(Action::EntropyCheck {
                             path: path.to_string(),
                         });
@@ -366,6 +377,29 @@ mod tests {
         )
         .iter()
         .any(|x| matches!(x, Action::EntropyCheck { .. })));
+    }
+
+    #[test]
+    fn temp_scratch_files_are_never_entropy_checked() {
+        // Windows/installers write random-looking .tmp files all day; a real host
+        // reported "ransomware" for AppData\Local\Temp\TmpBB81.tmp.
+        let t = Instant::now();
+        let mut p = Planner::new(roots(), t);
+        for path in [
+            "C:\\Users\\bob\\AppData\\Local\\Temp\\TmpBB81.tmp",
+            "C:\\Users\\bob\\Documents\\~draft.tmp",
+        ] {
+            assert!(
+                !plan(&mut p, Change::Modified, path, t)
+                    .iter()
+                    .any(|x| matches!(x, Action::EntropyCheck { .. })),
+                "{path}"
+            );
+        }
+        // A document still is.
+        assert!(plan(&mut p, Change::Modified, "C:\\Users\\bob\\Documents\\a.txt", t)
+            .iter()
+            .any(|x| matches!(x, Action::EntropyCheck { .. })));
     }
 
     #[test]
