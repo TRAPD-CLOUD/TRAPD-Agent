@@ -663,6 +663,11 @@ mod tests {
             Instant::now(),
         );
 
+        // Windows rejects an ancestor rename while a descendant has an open
+        // handle. Remove the nested directory first, requiring its tamper
+        // event to close that old watch, before replacing the ancestor.
+        std::fs::remove_dir(&config).unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &config, "delete").await;
         std::fs::rename(&install, directory.0.join("install-old")).unwrap();
         expect_tamper(&mut rx, &mut watches, &mut planner, &install, "delete").await;
         std::fs::create_dir_all(&config).unwrap();
