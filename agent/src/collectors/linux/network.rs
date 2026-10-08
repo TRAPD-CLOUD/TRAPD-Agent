@@ -80,14 +80,18 @@ fn build_inode_pid_map() -> HashMap<u64, (i32, u64)> {
         }
         // Do not assign a reused PID's sockets to the older generation.
         if crate::telemetry::identity::process_start_time(pid) == Some(start) {
-            for inode in inodes { map.insert(inode, (pid, start)); }
+            for inode in inodes {
+                map.insert(inode, (pid, start));
+            }
         }
     }
     map
 }
 
-fn resolve_pid_name(inode: u64, inode_map: &HashMap<u64, (i32, u64)>)
-    -> (Option<i32>, Option<u64>, Option<String>) {
+fn resolve_pid_name(
+    inode: u64,
+    inode_map: &HashMap<u64, (i32, u64)>,
+) -> (Option<i32>, Option<u64>, Option<String>) {
     let (pid, start) = match inode_map.get(&inode) {
         Some(&(pid, start)) => (pid, start),
         None => return (None, None, None),
@@ -108,6 +112,7 @@ fn resolve_pid_name(inode: u64, inode_map: &HashMap<u64, (i32, u64)>)
 /// flow's lifetime — the duration dimension of "netflow depth".
 #[derive(Clone)]
 struct FlowInfo {
+    inode: u64,
     first_seen: Instant,
     protocol: String,
     src_addr: String,
@@ -117,13 +122,43 @@ struct FlowInfo {
     pid: Option<i32>,
     process_start_time: Option<u64>,
     process: Option<String>,
+    /// Historical conflict guard; never enriches current observations.
+    owner: (Option<i32>, Option<u64>),
     /// Cumulative byte/packet/rtt counters from the most recent INET_DIAG poll
     /// (joined by socket inode at observation time; empty for UDP).
     stats: super::inet_diag::FlowStats,
 }
 
 impl FlowInfo {
+    fn owner(&self) -> (Option<i32>, Option<u64>) {
+        let pid = self.owner.0.or(self.pid.filter(|pid| *pid > 0));
+        (
+            pid,
+            self.owner
+                .1
+                .or(self.process_start_time.filter(|start| *start > 0)),
+        )
+    }
+
+    fn conflicts_with(&self, observed: &Self) -> bool {
+        let (pid, start) = self.owner();
+        let next_pid = observed.pid.filter(|pid| *pid > 0);
+        pid.zip(next_pid).is_some_and(|(old, new)| old != new)
+            || (pid.is_some()
+                && pid == next_pid
+                && start
+                    .zip(observed.process_start_time.filter(|start| *start > 0))
+                    .is_some_and(|(old, new)| old != new))
+    }
+
     fn connection_event(&self, state: &str, duration_ms: Option<u64>) -> NetworkConnectionData {
+        // A close record may retain the last observed owner. Live observations
+        // remain unknown when attribution is missing; history cannot authorize.
+        let (pid, process_start_time) = if state == "closed" {
+            self.owner()
+        } else {
+            (self.pid, self.process_start_time)
+        };
         NetworkConnectionData {
             protocol: self.protocol.clone(),
             src_addr: self.src_addr.clone(),
@@ -131,8 +166,8 @@ impl FlowInfo {
             dst_addr: self.dst_addr.clone(),
             dst_port: self.dst_port,
             state: state.to_string(),
-            pid: self.pid,
-            process_start_time: self.process_start_time,
+            pid,
+            process_start_time,
             process: self.process.clone(),
             duration_ms,
             bytes_sent: self.stats.bytes_sent,
@@ -195,6 +230,7 @@ impl Collector for NetworkCollector {
                     continue; // self-exclusion
                 }
                 let flow = FlowInfo {
+                    inode: entry.inode,
                     first_seen: Instant::now(),
                     protocol: "tcp".to_string(),
                     src_addr: entry.local_address.ip().to_string(),
@@ -204,6 +240,7 @@ impl Collector for NetworkCollector {
                     pid,
                     process_start_time,
                     process,
+                    owner: (None, None),
                     stats: diag.get(&entry.inode).copied().unwrap_or_default(),
                 };
                 let key = flow_key(&flow);
@@ -241,6 +278,7 @@ impl Collector for NetworkCollector {
                     continue; // self-exclusion
                 }
                 let flow = FlowInfo {
+                    inode: entry.inode,
                     first_seen: Instant::now(),
                     protocol: "udp".to_string(),
                     src_addr: entry.local_address.ip().to_string(),
@@ -250,6 +288,7 @@ impl Collector for NetworkCollector {
                     pid,
                     process_start_time,
                     process,
+                    owner: (None, None),
                     stats: super::inet_diag::FlowStats::default(),
                 };
                 let key = flow_key(&flow);
@@ -272,12 +311,12 @@ impl Collector for NetworkCollector {
     }
 }
 
-/// Stable key for a flow (protocol, 4-tuple and process generation). Built from parsed fields, so it
+/// Stable socket key (protocol, 4-tuple and inode). Built from parsed fields, so it
 /// is unambiguous for IPv6 (which would break a naive colon-split of a string).
 fn flow_key(f: &FlowInfo) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{:?}|{:?}",
-        f.protocol, f.src_addr, f.src_port, f.dst_addr, f.dst_port, f.pid, f.process_start_time
+        "{}|{}|{}|{}|{}|{}",
+        f.protocol, f.src_addr, f.src_port, f.dst_addr, f.dst_port, f.inode
     )
 }
 
@@ -298,10 +337,26 @@ async fn reconcile(
 ) -> Result<(), ()> {
     // New flows + carry-forward of first_seen for surviving flows.
     for (key, flow) in next.iter_mut() {
-        match prev.remove(key) {
+        // Inode zero provides no socket identity. Preserve separate records
+        // rather than guessing continuity from an ambiguous endpoint tuple.
+        let compatible =
+            flow.inode != 0 && prev.get(key).is_some_and(|old| !old.conflicts_with(flow));
+        match compatible.then(|| prev.remove(key)).flatten() {
             Some(existing) => {
                 // Surviving flow — preserve its original first-seen timestamp.
                 flow.first_seen = existing.first_seen;
+                let owner = existing.owner();
+                flow.owner = (
+                    flow.pid.filter(|pid| *pid > 0).or(owner.0),
+                    flow.process_start_time
+                        .filter(|start| *start > 0)
+                        .or(owner.1),
+                );
+                flow.stats.bytes_sent = flow.stats.bytes_sent.or(existing.stats.bytes_sent);
+                flow.stats.bytes_recv = flow.stats.bytes_recv.or(existing.stats.bytes_recv);
+                flow.stats.packets_sent = flow.stats.packets_sent.or(existing.stats.packets_sent);
+                flow.stats.packets_recv = flow.stats.packets_recv.or(existing.stats.packets_recv);
+                flow.stats.rtt_us = flow.stats.rtt_us.or(existing.stats.rtt_us);
             }
             None => {
                 // Newly observed flow — emit the start record.
@@ -350,12 +405,23 @@ mod tests {
     #[test]
     fn flow_start_and_close_keep_the_observed_process_generation() {
         let observed = flow("203.0.113.7", 443, Instant::now());
-        assert_eq!(observed.connection_event("established", None).process_start_time, Some(100));
-        assert_eq!(observed.connection_event("closed", Some(20)).process_start_time, Some(100));
+        assert_eq!(
+            observed
+                .connection_event("established", None)
+                .process_start_time,
+            Some(100)
+        );
+        assert_eq!(
+            observed
+                .connection_event("closed", Some(20))
+                .process_start_time,
+            Some(100)
+        );
     }
 
     fn flow(dst: &str, port: u16, first_seen: Instant) -> FlowInfo {
         FlowInfo {
+            inode: 1000,
             first_seen,
             protocol: "tcp".into(),
             src_addr: "10.0.0.2".into(),
@@ -365,6 +431,7 @@ mod tests {
             pid: Some(42),
             process_start_time: Some(100),
             process: Some("curl".into()),
+            owner: (None, None),
             stats: super::super::inet_diag::FlowStats::default(),
         }
     }
@@ -374,6 +441,147 @@ mod tests {
             EventData::NetworkConnection(c) => c,
             _ => panic!("expected NetworkConnection"),
         }
+    }
+
+    #[tokio::test]
+    async fn attribution_gaps_keep_one_flow_lifetime_and_counters_without_authorizing_unknown() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let started = Instant::now() - std::time::Duration::from_millis(50);
+        let mut original = flow("203.0.113.7", 443, started);
+        original.pid = None;
+        original.process_start_time = None;
+        original.process = None;
+        original.stats.bytes_sent = Some(100);
+        let mut prev = HashMap::from([(flow_key(&original), original)]);
+        let mut attributed = flow("203.0.113.7", 443, Instant::now());
+        attributed.stats.bytes_sent = Some(200);
+        reconcile(
+            &mut prev,
+            HashMap::from([(flow_key(&attributed), attributed)]),
+            "established",
+            &tx,
+            "a",
+            "h",
+        )
+        .await
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "enrichment is not a second connection"
+        );
+        let mut unknown = flow("203.0.113.7", 443, Instant::now());
+        unknown.pid = None;
+        unknown.process_start_time = None;
+        unknown.process = None;
+        reconcile(
+            &mut prev,
+            HashMap::from([(flow_key(&unknown), unknown)]),
+            "established",
+            &tx,
+            "a",
+            "h",
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        let tracked = prev.values().next().unwrap();
+        assert_eq!(tracked.first_seen, started);
+        assert_eq!(tracked.stats.bytes_sent, Some(200));
+        assert_eq!(tracked.connection_event("established", None).pid, None);
+        assert_eq!(
+            tracked
+                .connection_event("established", None)
+                .process_start_time,
+            None
+        );
+        reconcile(&mut prev, HashMap::new(), "established", &tx, "a", "h")
+            .await
+            .unwrap();
+        let closed = rx.try_recv().unwrap();
+        assert_eq!(conn(&closed).state, "closed");
+        assert!(conn(&closed).duration_ms.unwrap() >= 50);
+        assert_eq!(conn(&closed).bytes_sent, Some(200));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn attribution_gap_does_not_hide_a_changed_known_generation_or_pid() {
+        for changed_pid in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let original = flow("203.0.113.7", 443, Instant::now());
+            let mut prev = HashMap::from([(flow_key(&original), original)]);
+            let mut unknown = flow("203.0.113.7", 443, Instant::now());
+            unknown.pid = None;
+            unknown.process_start_time = None;
+            reconcile(
+                &mut prev,
+                HashMap::from([(flow_key(&unknown), unknown)]),
+                "established",
+                &tx,
+                "a",
+                "h",
+            )
+            .await
+            .unwrap();
+            assert!(rx.try_recv().is_err());
+            let mut changed = flow("203.0.113.7", 443, Instant::now());
+            if changed_pid {
+                changed.pid = Some(43);
+                changed.process_start_time = None;
+            } else {
+                changed.process_start_time = Some(200);
+            }
+            reconcile(
+                &mut prev,
+                HashMap::from([(flow_key(&changed), changed)]),
+                "established",
+                &tx,
+                "a",
+                "h",
+            )
+            .await
+            .unwrap();
+            let events = [rx.try_recv().unwrap(), rx.try_recv().unwrap()];
+            assert!(events.iter().any(|event| conn(event).state == "closed"));
+            assert!(events
+                .iter()
+                .any(|event| conn(event).state == "established"));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn separate_socket_inodes_do_not_merge_shared_udp_tuples_or_owners() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut first = flow("0.0.0.0", 0, Instant::now());
+        first.protocol = "udp".into();
+        first.pid = None;
+        first.process_start_time = None;
+        let mut second = first.clone();
+        second.inode += 1;
+        let mut prev = HashMap::from([
+            (flow_key(&first), first.clone()),
+            (flow_key(&second), second.clone()),
+        ]);
+        assert_eq!(prev.len(), 2);
+        first.pid = Some(42);
+        first.process_start_time = Some(100);
+        second.pid = Some(43);
+        second.process_start_time = Some(200);
+        reconcile(
+            &mut prev,
+            HashMap::from([(flow_key(&first), first), (flow_key(&second), second)]),
+            "open",
+            &tx,
+            "a",
+            "h",
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(prev.len(), 2);
+        assert!(prev.values().any(|flow| flow.pid == Some(42)));
+        assert!(prev.values().any(|flow| flow.pid == Some(43)));
     }
 
     #[tokio::test]
