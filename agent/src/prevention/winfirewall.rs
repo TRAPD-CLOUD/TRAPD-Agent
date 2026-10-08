@@ -419,6 +419,178 @@ pub(super) fn ensure_enforcing() -> Result<()> {
     Firewall::open()?.ensure_enforcing()
 }
 
+/// Read the configured DNS servers on active interfaces, using the same native
+/// IPHelper API and bounded, aligned storage as Windows interface inventory.
+/// This is not a lookup and never changes adapter or resolver configuration.
+pub(super) fn management_dns_servers() -> Result<Vec<IpAddr>> {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS},
+        NetworkManagement::IpHelper::{
+            GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
+        },
+        Networking::WinSock::AF_UNSPEC,
+    };
+    let mut bytes = 15 * 1024u32;
+    for _ in 0..3 {
+        anyhow::ensure!(
+            bytes <= 4 * 1024 * 1024,
+            "OS DNS adapter table exceeds size ceiling"
+        );
+        let mut buffer = vec![0u64; (bytes as usize).div_ceil(8)];
+        // SAFETY: aligned owned storage covers SizePointer. Include both DNS
+        // and unicast addresses to refuse forwarders bound to a local LAN IP.
+        let status = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+                std::ptr::null(),
+                buffer.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        match status {
+            ERROR_BUFFER_OVERFLOW => continue,
+            ERROR_NO_DATA => return Ok(Vec::new()),
+            ERROR_SUCCESS => return dns_servers_from_adapters(&buffer),
+            _ => bail!("OS DNS adapter query failed (status {status})"),
+        }
+    }
+    bail!("OS DNS adapter table repeatedly changed")
+}
+
+fn dns_servers_from_adapters(buffer: &[u64]) -> Result<Vec<IpAddr>> {
+    use windows_sys::Win32::NetworkManagement::{
+        IpHelper::{
+            IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_DNS_SERVER_ADDRESS_XP,
+            IP_ADAPTER_UNICAST_ADDRESS_LH,
+        },
+        Ndis::IfOperStatusUp,
+    };
+    let start = buffer.as_ptr() as usize;
+    let end = start + std::mem::size_of_val(buffer);
+    let within = |ptr: usize, size: usize| ptr >= start && ptr <= end && size <= end - ptr;
+    let mut adapter = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    let mut servers = Vec::new();
+    let mut local_ips = Vec::new();
+    let mut adapters = 0;
+    let mut addresses = 0;
+    let mut unicast_addresses = 0;
+    // SAFETY: every structure and socket pointer is range checked before an
+    // unaligned read. Storage stays alive, counts bound malformed/cyclic lists.
+    unsafe {
+        while !adapter.is_null() {
+            anyhow::ensure!(adapters < 1024, "OS DNS adapter count exceeds limit");
+            anyhow::ensure!(
+                within(
+                    adapter as usize,
+                    std::mem::size_of::<IP_ADAPTER_ADDRESSES_LH>()
+                ),
+                "invalid OS DNS adapter pointer"
+            );
+            let current = std::ptr::read_unaligned(adapter);
+            adapters += 1;
+            if current.OperStatus == IfOperStatusUp {
+                let mut unicast = current.FirstUnicastAddress;
+                while !unicast.is_null() {
+                    anyhow::ensure!(
+                        unicast_addresses < 4096,
+                        "OS DNS unicast address count exceeds limit"
+                    );
+                    anyhow::ensure!(
+                        within(
+                            unicast as usize,
+                            std::mem::size_of::<IP_ADAPTER_UNICAST_ADDRESS_LH>()
+                        ),
+                        "invalid OS DNS unicast pointer"
+                    );
+                    let current_unicast = std::ptr::read_unaligned(unicast);
+                    unicast_addresses += 1;
+                    local_ips.push(adapter_socket_ip(buffer, current_unicast.Address)?);
+                    unicast = current_unicast.Next;
+                }
+                let mut dns = current.FirstDnsServerAddress;
+                while !dns.is_null() {
+                    anyhow::ensure!(addresses < 4096, "OS DNS address count exceeds limit");
+                    anyhow::ensure!(
+                        within(
+                            dns as usize,
+                            std::mem::size_of::<IP_ADAPTER_DNS_SERVER_ADDRESS_XP>()
+                        ),
+                        "invalid OS DNS server pointer"
+                    );
+                    let current_dns = std::ptr::read_unaligned(dns);
+                    addresses += 1;
+                    let ip = adapter_socket_ip(buffer, current_dns.Address)?;
+                    if !servers.contains(&ip) {
+                        anyhow::ensure!(servers.len() < 256, "OS DNS resolver count exceeds limit");
+                        servers.push(ip);
+                    }
+                    dns = current_dns.Next;
+                }
+            }
+            adapter = current.Next;
+        }
+    }
+    for server in &servers {
+        anyhow::ensure!(!local_ips.iter().any(|local| local.to_canonical() == server.to_canonical()), "management DNS resolver {server} is bound to a local interface; cannot prove upstream coverage, use a literal backend");
+    }
+    servers.sort();
+    Ok(servers)
+}
+
+/// Decode both DNS-server and unicast sockets only inside their owned adapter
+/// buffer. Native list data must not authorize reads outside this allocation.
+fn adapter_socket_ip(
+    buffer: &[u64],
+    socket: windows_sys::Win32::Networking::WinSock::SOCKET_ADDRESS,
+) -> Result<IpAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6};
+    let start = buffer.as_ptr() as usize;
+    let end = start + std::mem::size_of_val(buffer);
+    let within = |ptr: usize, size: usize| ptr >= start && ptr <= end && size <= end - ptr;
+    anyhow::ensure!(
+        !socket.lpSockaddr.is_null()
+            && socket.iSockaddrLength >= 2
+            && within(socket.lpSockaddr as usize, 2),
+        "invalid OS DNS socket pointer or length"
+    );
+    // SAFETY: check the family first, then the full declared socket size and
+    // address range before an unaligned read. The borrowed buffer stays alive.
+    unsafe {
+        let family = std::ptr::read_unaligned(socket.lpSockaddr.cast::<u16>());
+        match family {
+            AF_INET => {
+                anyhow::ensure!(
+                    socket.iSockaddrLength >= std::mem::size_of::<SOCKADDR_IN>() as i32
+                        && within(
+                            socket.lpSockaddr as usize,
+                            std::mem::size_of::<SOCKADDR_IN>()
+                        ),
+                    "invalid OS DNS IPv4 socket"
+                );
+                let addr = std::ptr::read_unaligned(socket.lpSockaddr.cast::<SOCKADDR_IN>());
+                Ok(IpAddr::V4(Ipv4Addr::from(
+                    addr.sin_addr.S_un.S_addr.to_ne_bytes(),
+                )))
+            }
+            AF_INET6 => {
+                anyhow::ensure!(
+                    socket.iSockaddrLength >= std::mem::size_of::<SOCKADDR_IN6>() as i32
+                        && within(
+                            socket.lpSockaddr as usize,
+                            std::mem::size_of::<SOCKADDR_IN6>()
+                        ),
+                    "invalid OS DNS IPv6 socket"
+                );
+                let addr = std::ptr::read_unaligned(socket.lpSockaddr.cast::<SOCKADDR_IN6>());
+                Ok(IpAddr::V6(Ipv6Addr::from(addr.sin6_addr.u.Byte)))
+            }
+            _ => bail!("unsupported OS DNS socket family {family}"),
+        }
+    }
+}
+
 pub(super) fn block(target: &IpNet) -> Result<String> {
     block_with_ttl(target, None, "")
 }
@@ -558,6 +730,222 @@ pub(crate) fn expire_due_blocks() -> Result<Vec<ExpiredBlock>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dns_adapter_fixture() -> Vec<u64> {
+        use windows_sys::Win32::{
+            NetworkManagement::{
+                IpHelper::{IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_DNS_SERVER_ADDRESS_XP},
+                Ndis::{IfOperStatusDown, IfOperStatusUp},
+            },
+            Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6},
+        };
+        let mut buffer = vec![0u64; 512];
+        // SAFETY: the 4 KiB allocation covers two adapters, two DNS nodes and
+        // both socket structures. Unaligned writes need no alignment promise.
+        unsafe {
+            let adapter = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+            let down = adapter.add(1);
+            let dns = down.add(1).cast::<IP_ADAPTER_DNS_SERVER_ADDRESS_XP>();
+            let socket_v4 = dns.add(2).cast::<SOCKADDR_IN>();
+            let socket_v6 = socket_v4.add(1).cast::<SOCKADDR_IN6>();
+            std::ptr::write_unaligned(
+                adapter,
+                IP_ADAPTER_ADDRESSES_LH {
+                    Next: down,
+                    FirstDnsServerAddress: dns,
+                    OperStatus: IfOperStatusUp,
+                    ..Default::default()
+                },
+            );
+            std::ptr::write_unaligned(
+                down,
+                IP_ADAPTER_ADDRESSES_LH {
+                    // An inactive interface cannot provide live DNS coverage.
+                    FirstDnsServerAddress: std::ptr::dangling_mut(),
+                    FirstUnicastAddress: std::ptr::dangling_mut(),
+                    OperStatus: IfOperStatusDown,
+                    ..Default::default()
+                },
+            );
+            let mut v4 = SOCKADDR_IN {
+                sin_family: AF_INET,
+                ..Default::default()
+            };
+            v4.sin_addr.S_un.S_addr = u32::from_ne_bytes([192, 0, 2, 53]);
+            std::ptr::write_unaligned(socket_v4, v4);
+            let mut v6 = SOCKADDR_IN6 {
+                sin6_family: AF_INET6,
+                ..Default::default()
+            };
+            v6.sin6_addr.u.Byte = "2001:db8::53"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets();
+            std::ptr::write_unaligned(socket_v6, v6);
+            let mut first = IP_ADAPTER_DNS_SERVER_ADDRESS_XP {
+                Next: dns.add(1),
+                ..Default::default()
+            };
+            first.Address.lpSockaddr = socket_v4.cast();
+            first.Address.iSockaddrLength = std::mem::size_of::<SOCKADDR_IN>() as i32;
+            std::ptr::write_unaligned(dns, first);
+            let mut second = IP_ADAPTER_DNS_SERVER_ADDRESS_XP::default();
+            second.Address.lpSockaddr = socket_v6.cast();
+            second.Address.iSockaddrLength = std::mem::size_of::<SOCKADDR_IN6>() as i32;
+            std::ptr::write_unaligned(dns.add(1), second);
+        }
+        buffer
+    }
+
+    #[test]
+    fn dns_adapter_parser_rejects_local_lan_forwarders_even_when_explicitly_allowed() {
+        use windows_sys::Win32::NetworkManagement::{
+            IpHelper::{IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH},
+            Ndis::IfOperStatusUp,
+        };
+        for (v6, same_adapter) in [(false, true), (true, true), (false, false), (true, false)] {
+            let mut buffer = dns_adapter_fixture();
+            // SAFETY: spare aligned fixture storage holds the unicast node;
+            // its socket points at the already initialized v4/v6 DNS address.
+            unsafe {
+                let first = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+                let adapter = if same_adapter { first } else { first.add(1) };
+                let dns = (*first).FirstDnsServerAddress.add(usize::from(v6));
+                let unicast = buffer
+                    .as_mut_ptr()
+                    .add(256)
+                    .cast::<IP_ADAPTER_UNICAST_ADDRESS_LH>();
+                std::ptr::write_unaligned(
+                    unicast,
+                    IP_ADAPTER_UNICAST_ADDRESS_LH {
+                        Address: (*dns).Address,
+                        ..Default::default()
+                    },
+                );
+                (*adapter).FirstUnicastAddress = unicast;
+                (*adapter).OperStatus = IfOperStatusUp;
+                if !same_adapter {
+                    (*adapter).FirstDnsServerAddress = std::ptr::null_mut();
+                }
+            }
+            let expected: IpAddr = if v6 { "2001:db8::53" } else { "192.0.2.53" }
+                .parse()
+                .unwrap();
+            assert!(firewall::require_management_dns(
+                "control.example.test",
+                &[expected],
+                &[expected]
+            )
+            .is_ok());
+            let error = dns_servers_from_adapters(&buffer).unwrap_err();
+            assert!(error.to_string().contains("local"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn dns_adapter_parser_rejects_ipv4_mapped_local_forwarders() {
+        use windows_sys::Win32::{
+            NetworkManagement::IpHelper::{IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH},
+            Networking::WinSock::SOCKADDR_IN6,
+        };
+        let mut buffer = dns_adapter_fixture();
+        // SAFETY: all pointers refer to the owned fixture. Its IPv4 socket is
+        // local; the DNS entry names the same host with an IPv4-mapped IPv6 IP.
+        unsafe {
+            let adapter = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+            let dns = (*adapter).FirstDnsServerAddress;
+            let unicast = buffer
+                .as_mut_ptr()
+                .add(256)
+                .cast::<IP_ADAPTER_UNICAST_ADDRESS_LH>();
+            std::ptr::write_unaligned(
+                unicast,
+                IP_ADAPTER_UNICAST_ADDRESS_LH {
+                    Address: (*dns).Address,
+                    ..Default::default()
+                },
+            );
+            (*adapter).FirstUnicastAddress = unicast;
+            (*adapter).FirstDnsServerAddress = (*dns).Next;
+            let socket = (*(*dns).Next).Address.lpSockaddr.cast::<SOCKADDR_IN6>();
+            (*socket).sin6_addr.u.Byte = "::ffff:192.0.2.53"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets();
+        }
+        assert!(dns_servers_from_adapters(&buffer)
+            .unwrap_err()
+            .to_string()
+            .contains("local"));
+    }
+
+    #[test]
+    fn dns_adapter_parser_reads_both_families_and_ignores_inactive_interfaces() {
+        let buffer = dns_adapter_fixture();
+        let servers = dns_servers_from_adapters(&buffer).unwrap();
+        assert_eq!(
+            servers,
+            vec![
+                "192.0.2.53".parse::<IpAddr>().unwrap(),
+                "2001:db8::53".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn dns_adapter_parser_rejects_invalid_sockets_and_bounded_list_cycles() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
+        };
+        for failure in [
+            "pointer",
+            "length",
+            "family",
+            "cycle",
+            "unicast_pointer",
+            "unicast_cycle",
+            "unicast_socket",
+        ] {
+            let mut buffer = dns_adapter_fixture();
+            // SAFETY: fixture owns valid pointers; mutate only its first node.
+            unsafe {
+                let adapter = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+                let dns = (*adapter).FirstDnsServerAddress;
+                let unicast = buffer
+                    .as_mut_ptr()
+                    .add(256)
+                    .cast::<IP_ADAPTER_UNICAST_ADDRESS_LH>();
+                match failure {
+                    "pointer" => (*dns).Address.lpSockaddr = std::ptr::dangling_mut(),
+                    "length" => (*dns).Address.iSockaddrLength = -1,
+                    "family" => {
+                        std::ptr::write_unaligned((*dns).Address.lpSockaddr.cast::<u16>(), 0)
+                    }
+                    "cycle" => (*dns).Next = dns,
+                    "unicast_pointer" => (*adapter).FirstUnicastAddress = std::ptr::dangling_mut(),
+                    _ => {
+                        std::ptr::write_unaligned(
+                            unicast,
+                            IP_ADAPTER_UNICAST_ADDRESS_LH {
+                                Next: if failure == "unicast_cycle" {
+                                    unicast
+                                } else {
+                                    std::ptr::null_mut()
+                                },
+                                Address: (*dns).Address,
+                                ..Default::default()
+                            },
+                        );
+                        (*adapter).FirstUnicastAddress = unicast;
+                        if failure == "unicast_socket" {
+                            (*unicast).Address.lpSockaddr = std::ptr::dangling_mut();
+                        }
+                    }
+                }
+            }
+            assert!(dns_servers_from_adapters(&buffer).is_err(), "{failure}");
+        }
+    }
 
     struct Cleanup<'a> {
         firewall: &'a Firewall,

@@ -14,9 +14,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::fs_heuristics::{
-    is_compressed_by_nature, is_expected_self_write, CheckThrottle, Coalescer, MassModification,
-};
+use super::fs_heuristics::{is_compressed_by_nature, CheckThrottle, Coalescer, MassModification};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
@@ -200,30 +198,23 @@ impl Planner {
         self.roots.generic = generic;
     }
 
-    pub fn plan(
-        &mut self,
-        change: Change,
-        path: &str,
-        now: Instant,
-        update_in_flight: bool,
-    ) -> Vec<Action> {
+    pub fn plan(&mut self, change: Change, path: &str, now: Instant) -> Vec<Action> {
         let norm = normalise(path);
         let mut out = Vec::new();
 
         // Agent configuration: any foreign change is critical.
         if is_tamper_path(&norm, &self.roots.tamper) {
-            let file = norm.rsplit('\\').next().unwrap_or(&norm);
-            if !is_expected_self_write(file, update_in_flight) {
-                let action = match change {
-                    Change::Deleted | Change::RenamedFrom => "delete",
-                    Change::Created | Change::RenamedTo => "create",
-                    Change::Modified | Change::Attrib => "modify",
-                };
-                out.push(Action::Tamper {
-                    path: path.to_string(),
-                    action,
-                });
-            }
+            // Staging presence cannot authenticate the author of a change.
+            // Windows updates stop the service before mutating protected files.
+            let action = match change {
+                Change::Deleted | Change::RenamedFrom => "delete",
+                Change::Created | Change::RenamedTo => "create",
+                Change::Modified | Change::Attrib => "modify",
+            };
+            out.push(Action::Tamper {
+                path: path.to_string(),
+                action,
+            });
         }
 
         // Backup sabotage is evaluated on its own roots, not only user data.
@@ -297,7 +288,7 @@ mod tests {
     }
 
     fn plan(p: &mut Planner, c: Change, path: &str, t: Instant) -> Vec<Action> {
-        p.plan(c, path, t, false)
+        p.plan(c, path, t)
     }
 
     #[test]
@@ -574,7 +565,7 @@ mod tests {
         ] {
             for change in [Change::Created, Change::Modified, Change::Deleted] {
                 let path = format!("C:\\ProgramData\\TRAPD\\config\\{name}");
-                let actions = planner.plan(change, &path, now, false);
+                let actions = planner.plan(change, &path, now);
                 assert!(
                     matches!(actions.as_slice(), [Action::Tamper { .. }]),
                     "{path}: {actions:?}"
@@ -584,14 +575,34 @@ mod tests {
     }
 
     #[test]
-    fn only_in_flight_update_integrity_writes_are_excused() {
-        let t = Instant::now();
-        let mut p = Planner::new(roots(), t);
-        let baseline = "C:\\ProgramData\\TRAPD\\config\\binary.sha256";
-        let foreign = p.plan(Change::Modified, baseline, t, false);
-        assert!(matches!(foreign.as_slice(), [Action::Tamper { .. }]));
-        let updating = p.plan(Change::Modified, baseline, t, true);
-        assert!(updating.is_empty());
+    fn an_unsigned_staged_offer_cannot_excuse_integrity_or_binary_tamper() {
+        let directory =
+            std::env::temp_dir().join(format!("trapd-untrusted-stage-{}", uuid::Uuid::new_v4()));
+        let staging = crate::update::apply::StagingPaths::new(&directory);
+        std::fs::create_dir_all(&staging.dir).unwrap();
+        std::fs::write(staging.offer(), b"unsigned invalid update marker").unwrap();
+        assert!(staging.offer().exists());
+        let now = Instant::now();
+        let mut protected = roots();
+        protected
+            .tamper
+            .push(normalise_root("C:\\Program Files\\TRAPD Agent"));
+        let mut planner = Planner::new(protected, now);
+        for path in [
+            "C:\\ProgramData\\TRAPD\\config\\binary.sha256",
+            "C:\\ProgramData\\TRAPD\\config\\binary.sig",
+            "C:\\ProgramData\\TRAPD\\config\\.binary.sha256.tmp.42",
+            "C:\\Program Files\\TRAPD Agent\\trapd-agent.exe",
+        ] {
+            for change in [Change::Created, Change::Modified, Change::Deleted] {
+                let actions = planner.plan(change, path, now);
+                assert!(
+                    matches!(actions.as_slice(), [Action::Tamper { .. }]),
+                    "{path}: {actions:?}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -588,7 +588,6 @@ impl Collector for FilesystemCollector {
                                     change,
                                     &path,
                                     std::time::Instant::now(),
-                                    crate::update::update_in_flight(),
                                 );
                                 for action in actions {
                                     let event = match action {
@@ -667,12 +666,7 @@ mod tests {
             enqueue_relevant(Ok(event), &tx, |p| relevant_path(p, &roots));
             let changes = rx.try_recv().unwrap().unwrap();
             assert_eq!(changes, vec![(Change::Created, path.clone())]);
-            let actions = planner.plan(
-                Change::Created,
-                &path.to_string_lossy(),
-                Instant::now(),
-                false,
-            );
+            let actions = planner.plan(Change::Created, &path.to_string_lossy(), Instant::now());
             assert_eq!(
                 actions
                     .iter()
@@ -739,7 +733,7 @@ mod tests {
                 for (change, path) in changes {
                     watches.rearm(change, &path);
                     count += planner
-                        .plan(change, &path.to_string_lossy(), Instant::now(), false)
+                        .plan(change, &path.to_string_lossy(), Instant::now())
                         .iter()
                         .filter(|action| matches!(action, Action::RansomExtension { .. }))
                         .count();
@@ -904,10 +898,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_integrity_changes_are_reported_immediately_after_watch_start() {
+    async fn native_unsigned_staging_cannot_suppress_live_integrity_or_binary_tamper() {
         let directory =
             TestDirectory(std::env::temp_dir().join(format!("trapd-fs-{}", uuid::Uuid::new_v4())));
         std::fs::create_dir_all(&directory.0).unwrap();
+        let staging = crate::update::apply::StagingPaths::new(&directory.0);
+        std::fs::create_dir_all(&staging.dir).unwrap();
+        std::fs::write(staging.offer(), b"unsigned invalid update marker").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let mut watches =
             FilesystemWatches::new(&[], &[], std::slice::from_ref(&directory.0), tx).unwrap();
@@ -918,7 +915,13 @@ mod tests {
             },
             Instant::now(),
         );
-        for name in ["binary.sha256", "binary.version", "binary.sig"] {
+        for name in [
+            "binary.sha256",
+            "binary.version",
+            "binary.sig",
+            ".binary.sha256.tmp.42",
+            "trapd-agent.exe",
+        ] {
             let path = directory.0.join(name);
             std::fs::write(&path, b"foreign creation").unwrap();
             expect_tamper(&mut rx, &mut watches, &mut planner, &path, "create").await;
@@ -948,8 +951,7 @@ mod tests {
                 };
                 for (change, path) in notification {
                     watches.rearm(change, &path);
-                    let actions =
-                        planner.plan(change, &path.to_string_lossy(), Instant::now(), false);
+                    let actions = planner.plan(change, &path.to_string_lossy(), Instant::now());
                     if actions.iter().any(|action| {
                         matches!(action,
                             Action::Tamper { path, action }

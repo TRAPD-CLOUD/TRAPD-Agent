@@ -225,32 +225,6 @@ impl CheckThrottle {
     }
 }
 
-/// Whether a change inside the agent's own directories is the agent (or its
-/// update helper) doing its job rather than tampering.
-///
-///   * Configuration directory: the integrity baseline and version record are
-///     written on upgrade, and every atomic write goes through a dot-prefixed
-///     temporary sibling. Initial integrity checks finish before collectors
-///     start, so process age never excuses later changes.
-///   * Install directory: the binary is renamed, replaced and restored only
-///     while a verified update is being applied.
-///
-/// Anything else, at any time, is reported.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub fn is_expected_self_write(file_name: &str, update_in_flight: bool) -> bool {
-    let lower = file_name.to_ascii_lowercase();
-    let is_atomic_temp = lower.starts_with('.') && lower.contains(".tmp.");
-    let is_baseline = matches!(
-        lower.as_str(),
-        "binary.sha256" | "binary.version" | "binary.sig"
-    );
-    let is_binary_swap = matches!(
-        lower.as_str(),
-        "trapd-agent.exe" | "trapd-agent.exe.prev" | ".trapd-agent.exe.new"
-    );
-    (is_atomic_temp || is_baseline || is_binary_swap) && update_in_flight
-}
-
 // ── Event construction ────────────────────────────────────────────────────────
 
 pub fn indicator_event(
@@ -487,25 +461,6 @@ mod tests {
             t.allow("a", t0 + Duration::from_secs(6)),
             "interval elapsed"
         );
-    }
-
-    #[test]
-    fn only_agent_owned_files_are_excused_and_only_at_the_right_time() {
-        for name in [
-            "binary.sha256",
-            "binary.version",
-            "binary.sig",
-            ".binary.sha256.tmp.4242",
-            "trapd-agent.exe",
-            "trapd-agent.exe.prev",
-        ] {
-            assert!(!is_expected_self_write(name, false));
-            assert!(is_expected_self_write(name, true));
-        }
-        // Anything else in the directory is always tamper.
-        assert!(!is_expected_self_write("command_signing.pub", true));
-        assert!(!is_expected_self_write("agent.env", true));
-        assert!(!is_expected_self_write("policy.json", true));
     }
 
     #[test]

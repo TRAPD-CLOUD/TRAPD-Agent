@@ -206,6 +206,15 @@ impl Engine {
             Some(host) => super::runtime::resolve_management_ips(host).await?,
             None => Vec::new(),
         };
+        // Query native DNS before taking the signed-config lock. Reject an
+        // unsafe hostname isolation before any command/automatic path mutates
+        // firewall state; cached backend IPs alone cannot preserve recovery.
+        let dns = match &self.cfg.management_host {
+            Some(host) => {
+                super::runtime::management_dns_servers(host, self.cfg.net_backend).await?
+            }
+            None => None,
+        };
         let cfg = self
             .cfg_handle
             .read()
@@ -214,12 +223,16 @@ impl Engine {
             cfg.prevention_enabled,
             "prevention was disabled before isolation"
         );
-        allow.extend(
-            cfg.isolation_allowlist_ips
-                .iter()
-                .filter_map(|ip| ip.parse::<std::net::IpAddr>().ok()),
-        );
-        allow.extend_from_slice(additional);
+        let mut explicit: Vec<std::net::IpAddr> = cfg
+            .isolation_allowlist_ips
+            .iter()
+            .filter_map(|ip| ip.parse().ok())
+            .collect();
+        explicit.extend_from_slice(additional);
+        if let (Some(host), Some(dns)) = (&self.cfg.management_host, dns) {
+            super::firewall::require_management_dns(host, &dns, &explicit)?;
+        }
+        allow.extend(explicit);
         allow.sort();
         allow.dedup();
         Ok(allow)
@@ -2010,6 +2023,71 @@ mod tests {
             Arc::new(RwLock::new(AgentConfig::default())),
         );
         (engine, rx)
+    }
+
+    #[tokio::test]
+    async fn isolation_dns_preflight_rejects_before_any_firewall_mutation() {
+        use crate::prevention::network::tests::{no_calls, setup};
+        use crate::prevention::runtime::tests::fake_management_dns;
+        let (mut engine, mut audit_rx) = test_engine();
+        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.management_host = Some("control.example.test".into());
+        engine.cfg_handle.write().unwrap().prevention_enabled = true;
+        let backend = "192.0.2.1".parse().unwrap();
+        let dns = "192.0.2.53".parse().unwrap();
+        let dns_v6 = "2001:db8::53".parse().unwrap();
+        for servers in [Ok(vec![dns, dns_v6]), Ok(vec![]), Err("OS DNS unavailable")] {
+            let _fixture = fake_management_dns([Ok(vec![backend])].into(), servers);
+            setup(false);
+            engine.cmd_isolate(vec![dns], "dns-preflight").await;
+            assert!(no_calls(), "DNS preflight failure must preserve rules");
+            let EventData::Prevention(audit) = audit_rx.try_recv().unwrap().data else {
+                panic!("audit");
+            };
+            assert!(!audit.success);
+            assert!(audit.reason.contains("DNS"), "{}", audit.reason);
+        }
+        // A backend address must not implicitly authorize a DNS-server exception.
+        let _fixture = fake_management_dns([Ok(vec![backend])].into(), Ok(vec![backend]));
+        setup(false);
+        engine.cmd_isolate(vec![], "dns-preflight").await;
+        assert!(no_calls());
+    }
+
+    #[tokio::test]
+    async fn isolation_dns_preflight_accepts_explicit_resolvers_and_literal_backends() {
+        use crate::prevention::network::tests::{called, setup};
+        use crate::prevention::runtime::tests::fake_management_dns;
+        let (mut engine, _) = test_engine();
+        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.management_host = Some("control.example.test".into());
+        engine.cfg_handle.write().unwrap().prevention_enabled = true;
+        let backend = "192.0.2.1".parse().unwrap();
+        let dns = "192.0.2.53".parse().unwrap();
+        let dns_v6 = "2001:db8::53".parse().unwrap();
+        let _fixture = fake_management_dns(
+            [Ok(vec![backend]), Ok(vec![backend])].into(),
+            Ok(vec![dns, dns_v6]),
+        );
+        engine.cfg_handle.write().unwrap().isolation_allowlist_ips = vec![dns.to_string()];
+        let allow = engine.isolation_allowlist(&[dns_v6]).await.unwrap();
+        assert_eq!(allow.len(), 3);
+        assert!(allow.contains(&backend) && allow.contains(&dns) && allow.contains(&dns_v6));
+        setup(false);
+        engine
+            .cmd_isolate(vec![dns_v6], "dns-preflight-allowed")
+            .await;
+        assert!(called(
+            "iptables",
+            &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.53", "-j", "ACCEPT"]
+        ));
+        assert!(called(
+            "ip6tables",
+            &["-A", "TRAPD_ISOLATE", "-d", "2001:db8::53", "-j", "ACCEPT"]
+        ));
+        engine.cfg.management_host = Some("2001:db8::1".into());
+        let allow = engine.isolation_allowlist(&[]).await.unwrap();
+        assert!(allow.contains(&"2001:db8::1".parse().unwrap()));
     }
 
     #[tokio::test]

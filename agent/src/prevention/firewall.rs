@@ -18,6 +18,25 @@ pub const GROUP: &str = "TRAPD-Containment";
 pub const ISOLATE_OUT: &str = "TRAPD-ISOLATE-OUT";
 pub const ISOLATE_IN: &str = "TRAPD-ISOLATE-IN";
 
+/// Hostname management requires explicit remote resolver coverage. Local DNS
+/// forwarders cannot establish that their upstream survives host isolation.
+/// This validates the existing IP-allowlist contract; it adds no exceptions.
+pub fn require_management_dns(
+    host: &str,
+    servers: &[IpAddr],
+    explicit: &[IpAddr],
+) -> anyhow::Result<()> {
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    anyhow::ensure!(!servers.is_empty(), "management DNS has no configured remote resolvers; use a literal backend or explicitly configure DNS");
+    for server in servers {
+        anyhow::ensure!(!server.is_loopback() && !server.is_unspecified() && !server.is_multicast(), "management DNS resolver {server} cannot prove remote upstream coverage; use a literal backend");
+        anyhow::ensure!(explicit.contains(server), "management DNS resolver {server} must be explicitly allowed by isolation_allowlist_ips or the signed command");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     In,
@@ -338,6 +357,23 @@ mod tests {
                 },
             }
         })
+    }
+
+    #[test]
+    fn management_dns_requires_every_resolver_explicitly_allowlisted() {
+        let resolver = "192.0.2.53".parse().unwrap();
+        let resolver_v6 = "2001:db8::53".parse().unwrap();
+        let servers = [resolver, resolver_v6];
+        assert!(require_management_dns("control.example.test", &servers, &[]).is_err());
+        assert!(require_management_dns("control.example.test", &servers, &[resolver]).is_err());
+        assert!(require_management_dns("control.example.test", &servers, &servers).is_ok());
+        assert!(require_management_dns("control.example.test", &[], &servers).is_err());
+        // Literal backends do not depend on DNS, even with an empty OS list.
+        assert!(require_management_dns("192.0.2.1", &[], &[]).is_ok());
+        assert!(require_management_dns("2001:db8::1", &[], &[]).is_ok());
+        // Loopback forwarding alone does not establish remote DNS reachability.
+        let loopback = "127.0.0.1".parse().unwrap();
+        assert!(require_management_dns("control.example.test", &[loopback], &[loopback]).is_err());
     }
 
     #[test]

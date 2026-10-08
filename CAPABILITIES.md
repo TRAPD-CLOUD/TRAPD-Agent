@@ -41,8 +41,14 @@ else on Windows is type-checked and unit-tested on shared logic only.
 | SIEM forwarding | ✅ | ✅ |
 | Forensic snapshot on freeze | ✅ `/proc` incl. open files | ✅ exe, cwd, cmdline, logon session; open handles not enumerated |
 
-Known Windows limits: isolation does not allow DNS or DHCP unless the resolver is
-in `isolation_allowlist_ips`; isolation and IP blocks persist across a reboot
+Known Windows limits: hostname-based isolation requires all active remote DNS
+resolvers in `isolation_allowlist_ips` or the signed command allowlist. The agent
+rejects isolation when that prerequisite cannot be established, including local
+DNS forwarders with unknown upstreams. Literal backend addresses need no DNS.
+The check covers active adapter resolvers; additional NRPT/DoH/VPN routing
+targets require explicit configuration. Address changes during existing
+isolation are not automatically reconciled.
+DHCP still requires explicit allowances; isolation and IP blocks persist across a reboot
 (they are persistent firewall rules, removed by `deisolate` / `unblock_ip` or explicit uninstall). Windows IP blocks with a TTL store their deadline in each rule and are reconciled before enrollment and every five seconds, including offline and pending-pairing modes; upgrades preserve containment.
 Isolation reads current signed-config allowances at action time, alongside backend management IPs and explicit command allowances.
 Windows quarantine refuses multiply-linked files, files larger than 1 GiB

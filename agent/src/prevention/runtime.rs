@@ -248,6 +248,37 @@ fn validate_management_ips(mut out: Vec<std::net::IpAddr>) -> Result<Vec<std::ne
     Ok(out)
 }
 
+/// Only Windows enforces the explicit resolver prerequisite. Literal backend
+/// addresses need no DNS. Keep native discovery outside Tokio/config locks.
+pub(super) async fn management_dns_servers(
+    host: &str,
+    _backend: super::network::Backend,
+) -> Result<Option<Vec<std::net::IpAddr>>> {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    if let Some(servers) = tests::management_dns(host) {
+        return servers.map(Some);
+    }
+    #[cfg(windows)]
+    {
+        if !matches!(_backend, super::network::Backend::WindowsFirewall) {
+            return Ok(None);
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(super::winfirewall::management_dns_servers),
+        )
+        .await
+        .context("OS DNS discovery timed out")?
+        .context("OS DNS discovery task failed")?
+        .map(Some)
+    }
+    #[cfg(not(windows))]
+    Ok(None)
+}
+
 fn backend_host(url: &str) -> Option<String> {
     let url = reqwest::Url::parse(url).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -271,8 +302,12 @@ pub(crate) mod tests {
     use std::collections::VecDeque;
 
     type Answers = VecDeque<std::result::Result<Vec<std::net::IpAddr>, &'static str>>;
+    struct ManagementFixture {
+        answers: Answers,
+        dns: Option<std::result::Result<Vec<std::net::IpAddr>, &'static str>>,
+    }
     thread_local! {
-        static MANAGEMENT_ANSWERS: RefCell<Option<Answers>> = const { RefCell::new(None) };
+        static MANAGEMENT_ANSWERS: RefCell<Option<ManagementFixture>> = const { RefCell::new(None) };
     }
 
     pub(crate) struct ManagementAnswers;
@@ -283,8 +318,34 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn fake_management_answers(answers: Answers) -> ManagementAnswers {
-        MANAGEMENT_ANSWERS.with(|slot| *slot.borrow_mut() = Some(answers));
+        MANAGEMENT_ANSWERS
+            .with(|slot| *slot.borrow_mut() = Some(ManagementFixture { answers, dns: None }));
         ManagementAnswers
+    }
+
+    pub(crate) fn fake_management_dns(
+        answers: Answers,
+        dns: std::result::Result<Vec<std::net::IpAddr>, &'static str>,
+    ) -> ManagementAnswers {
+        MANAGEMENT_ANSWERS.with(|slot| {
+            *slot.borrow_mut() = Some(ManagementFixture {
+                answers,
+                dns: Some(dns),
+            })
+        });
+        ManagementAnswers
+    }
+
+    pub(super) fn management_dns(host: &str) -> Option<Result<Vec<std::net::IpAddr>>> {
+        if host != "control.example.test" {
+            return None;
+        }
+        MANAGEMENT_ANSWERS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|fixture| fixture.dns.clone())
+                .map(|dns| dns.map_err(anyhow::Error::msg))
+        })
     }
 
     pub(super) fn management_answer(host: &str) -> Option<Result<Vec<std::net::IpAddr>>> {
@@ -292,8 +353,9 @@ pub(crate) mod tests {
             return None;
         }
         MANAGEMENT_ANSWERS.with(|slot| {
-            slot.borrow_mut().as_mut().map(|answers| {
-                answers
+            slot.borrow_mut().as_mut().map(|fixture| {
+                fixture
+                    .answers
                     .pop_front()
                     .expect("unexpected management DNS lookup")
                     .map_err(anyhow::Error::msg)

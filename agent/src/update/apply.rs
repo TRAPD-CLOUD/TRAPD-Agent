@@ -117,7 +117,7 @@ pub trait Platform {
     fn restart_service(&self) -> Result<()>;
 
     /// Stop the agent service and wait until it has exited. Called before a
-    /// rollback puts the previous files back: Windows cannot delete the image of
+    /// Windows installation and before rollback: Windows cannot delete the image of
     /// a running service, so the failed version must be gone first. A no-op on
     /// platforms where replacing a running file is safe (Unix: rename over it).
     fn stop_service(&self) -> Result<()> {
@@ -721,19 +721,38 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
         return recover_update(ctx, platform, &recovery);
     }
 
-    let _ = std::fs::remove_file(ctx.paths.healthy_marker());
     let mut recovery = Recovery {
         version: verified.version.clone(),
         previous_version: ctx.verify.current_version.to_string(),
         installed: Vec::new(),
         signed_directive_sha256: hex::encode(Sha256::digest(offer.payload.as_bytes())),
     };
+    // The verification context uses the helper's actual OS. On Windows the
+    // service must be fully stopped before any protected file changes; a staged
+    // offer is never authority to suppress tamper detection in a live collector.
+    if ctx.verify.os == "windows" {
+        // Even an interrupted stop or an installation failure before the first
+        // swap must leave a durable route to restarting the original service.
+        recovery.save(ctx.paths)?;
+        platform
+            .stop_service()
+            .context("update: installation requires a confirmed service stop; recovery retained")?;
+    }
+    let _ = std::fs::remove_file(ctx.paths.healthy_marker());
     let mut install = |target: &Path, bytes: &[u8], mode| -> Result<()> {
         if let Err(error) = install_file(target, bytes, mode, &mut recovery, ctx.paths, ctx.target)
         {
-            abort_update(ctx, &recovery.installed, &verified.version).with_context(|| {
-                format!("update: install failed ({error}); rollback incomplete")
-            })?;
+            if ctx.verify.os == "windows" {
+                // The forward stop also requires restarting the restored service.
+                // Keep the durable recovery journal until that restart succeeds.
+                recover_update(ctx, platform, &recovery).with_context(|| {
+                    format!("update: install failed ({error}); recovery incomplete")
+                })?;
+            } else {
+                abort_update(ctx, &recovery.installed, &verified.version).with_context(|| {
+                    format!("update: install failed ({error}); rollback incomplete")
+                })?;
+            }
             return Err(error);
         }
         Ok(())
@@ -951,6 +970,202 @@ mod tests {
             std::fs::write(env.paths.offer(), signed.to_string()).unwrap();
         }
         old
+    }
+
+    fn setup_windows() -> Env {
+        let env = setup(b"NEW BINARY", None);
+        let offer: UpdateOffer =
+            serde_json::from_slice(&std::fs::read(env.paths.offer()).unwrap()).unwrap();
+        let mut directive: serde_json::Value = serde_json::from_str(&offer.payload).unwrap();
+        let mut release: serde_json::Value =
+            serde_json::from_str(directive["release"]["payload"].as_str().unwrap()).unwrap();
+        release["os"] = serde_json::json!("windows");
+        let release = release.to_string();
+        directive["release"]["payload"] = serde_json::json!(release);
+        directive["release"]["signature"] =
+            serde_json::json!(STANDARD.encode(env.release.sign(release.as_bytes()).to_bytes()));
+        let payload = directive.to_string();
+        let offer = serde_json::json!({
+            "payload": payload,
+            "signature": STANDARD.encode(env.command.sign(payload.as_bytes()).to_bytes()),
+        });
+        std::fs::write(env.paths.offer(), offer.to_string()).unwrap();
+        env
+    }
+
+    struct WindowsPlatform<'a> {
+        env: &'a Env,
+        stopped_binaries: std::cell::RefCell<Vec<Vec<u8>>>,
+        journal_entries_at_stop: std::cell::RefCell<Vec<Option<usize>>>,
+        restarts: Cell<u32>,
+        fail_stop: bool,
+        fail_restart: bool,
+    }
+
+    impl<'a> WindowsPlatform<'a> {
+        fn new(env: &'a Env) -> Self {
+            Self {
+                env,
+                stopped_binaries: Default::default(),
+                journal_entries_at_stop: Default::default(),
+                restarts: Cell::new(0),
+                fail_stop: false,
+                fail_restart: false,
+            }
+        }
+    }
+
+    impl Platform for WindowsPlatform<'_> {
+        fn stop_service(&self) -> Result<()> {
+            let journal = std::fs::read(self.env.paths.recovery())
+                .ok()
+                .map(|bytes| serde_json::from_slice::<Recovery>(&bytes).unwrap());
+            self.journal_entries_at_stop
+                .borrow_mut()
+                .push(journal.map(|recovery| recovery.installed.len()));
+            self.stopped_binaries
+                .borrow_mut()
+                .push(std::fs::read(&self.env.target)?);
+            if self.fail_stop {
+                bail!("service stop failed");
+            }
+            Ok(())
+        }
+
+        fn restart_service(&self) -> Result<()> {
+            self.restarts.set(self.restarts.get() + 1);
+            if self.fail_restart {
+                bail!("service restart failed");
+            }
+            std::fs::write(self.env.paths.healthy_marker(), "0.5.0")?;
+            Ok(())
+        }
+    }
+
+    fn run_windows(env: &Env, platform: &dyn Platform) -> Result<Outcome> {
+        run_for_os(env, platform, 0, Some(&env.baseline), "0.4.4", "windows")
+    }
+
+    #[test]
+    fn windows_install_stops_before_protected_files_change() {
+        let env = setup_windows();
+        let p = WindowsPlatform::new(&env);
+        assert!(matches!(
+            run_windows(&env, &p).unwrap(),
+            Outcome::Applied { .. }
+        ));
+        assert_eq!(*p.stopped_binaries.borrow(), vec![b"OLD BINARY".to_vec()]);
+        assert_eq!(*p.journal_entries_at_stop.borrow(), vec![Some(0)]);
+        assert_eq!(p.restarts.get(), 1);
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"NEW BINARY");
+        assert_eq!(
+            std::fs::read_to_string(&env.baseline).unwrap(),
+            baseline_for(b"NEW BINARY")
+        );
+    }
+
+    #[test]
+    fn windows_invalid_staging_never_stops_the_service() {
+        for invalid_offer in [false, true] {
+            let env = setup_windows();
+            let invalid = if invalid_offer {
+                env.paths.offer()
+            } else {
+                env.paths.artifact()
+            };
+            std::fs::write(invalid, b"unsigned invalid contents").unwrap();
+            let p = WindowsPlatform::new(&env);
+            assert!(run_windows(&env, &p).is_err());
+            assert!(p.stopped_binaries.borrow().is_empty());
+            assert_eq!(p.restarts.get(), 0);
+            assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+            assert!(!env.paths.recovery().exists());
+        }
+    }
+
+    #[test]
+    fn windows_failed_forward_stop_retains_unmodified_installation_for_recovery() {
+        let env = setup_windows();
+        let mut p = WindowsPlatform::new(&env);
+        p.fail_stop = true;
+        assert!(run_windows(&env, &p).is_err());
+        assert_eq!(*p.stopped_binaries.borrow(), vec![b"OLD BINARY".to_vec()]);
+        assert_eq!(p.restarts.get(), 0);
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+        assert_eq!(
+            std::fs::read_to_string(&env.baseline).unwrap(),
+            old_baseline()
+        );
+        assert!(!prev_path(&env.target).exists());
+        let recovery: Recovery =
+            serde_json::from_slice(&std::fs::read(env.paths.recovery()).unwrap()).unwrap();
+        assert!(recovery.installed.is_empty());
+        assert!(env.paths.offer().exists());
+        assert!(env.paths.artifact().exists());
+        assert!(UpdateState::load(&env.paths).blocked_version.is_none());
+        p.fail_stop = false;
+        assert!(matches!(
+            run_windows(&env, &p).unwrap(),
+            Outcome::RolledBack { .. }
+        ));
+        assert_eq!(p.restarts.get(), 1);
+        assert!(!env.paths.recovery().exists());
+        assert_eq!(
+            UpdateState::load(&env.paths).blocked_version.as_deref(),
+            Some("0.5.0")
+        );
+    }
+
+    #[test]
+    fn windows_first_install_failure_retains_empty_journal_until_service_restarts() {
+        let env = setup_windows();
+        std::fs::create_dir(env.target.with_file_name(".trapd-agent.new")).unwrap();
+        let mut p = WindowsPlatform::new(&env);
+        p.fail_restart = true;
+        assert!(run_windows(&env, &p).is_err());
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+        assert_eq!(p.restarts.get(), 1);
+        let recovery: Recovery =
+            serde_json::from_slice(&std::fs::read(env.paths.recovery()).unwrap()).unwrap();
+        assert!(recovery.installed.is_empty());
+        assert!(env.paths.offer().exists());
+        assert!(UpdateState::load(&env.paths).blocked_version.is_none());
+        p.fail_restart = false;
+        assert!(matches!(
+            run_windows(&env, &p).unwrap(),
+            Outcome::RolledBack { .. }
+        ));
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+        assert!(!env.paths.recovery().exists());
+    }
+
+    #[test]
+    fn windows_partial_install_restarts_restored_service_and_retains_failed_restart_recovery() {
+        for fail_restart in [false, true] {
+            let env = setup_windows();
+            std::fs::remove_file(&env.baseline).unwrap();
+            std::fs::create_dir(&env.baseline).unwrap();
+            let mut p = WindowsPlatform::new(&env);
+            p.fail_restart = fail_restart;
+            assert!(run_windows(&env, &p).is_err());
+            assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+            assert_eq!(p.restarts.get(), 1);
+            if fail_restart {
+                assert!(env.paths.recovery().exists());
+                assert!(env.paths.offer().exists());
+                assert!(UpdateState::load(&env.paths).blocked_version.is_none());
+                p.fail_restart = false;
+                assert!(matches!(
+                    run_windows(&env, &p).unwrap(),
+                    Outcome::RolledBack { .. }
+                ));
+            }
+            assert!(!env.paths.recovery().exists());
+            assert_eq!(
+                UpdateState::load(&env.paths).blocked_version.as_deref(),
+                Some("0.5.0")
+            );
+        }
     }
 
     #[test]
@@ -1489,6 +1704,24 @@ mod tests {
         baseline: Option<&Path>,
         current_version: &str,
     ) -> Result<Outcome> {
+        run_for_os(
+            env,
+            platform,
+            timeout_ms,
+            baseline,
+            current_version,
+            "linux",
+        )
+    }
+
+    fn run_for_os(
+        env: &Env,
+        platform: &dyn Platform,
+        timeout_ms: u64,
+        baseline: Option<&Path>,
+        current_version: &str,
+        os: &str,
+    ) -> Result<Outcome> {
         let (rk, ck) = (env.release.verifying_key(), env.command.verifying_key());
         let ctx = ApplyContext {
             verify: VerifyContext {
@@ -1496,7 +1729,7 @@ mod tests {
                 command_key: &ck,
                 agent_id: "agent-1",
                 current_version,
-                os: "linux",
+                os,
                 arch: "x86_64",
                 last_issued_at: 0,
             },

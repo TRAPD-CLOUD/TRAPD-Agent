@@ -286,13 +286,6 @@ fn rand_u32() -> u32 {
     u32::from_le_bytes(b)
 }
 
-/// Whether a verified update is staged or being applied. Other components use
-/// it to tell the update helper's file changes from tampering.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub fn update_in_flight() -> bool {
-    staging().offer().exists()
-}
-
 /// Called by the heartbeat after a successful beat. While an update is being
 /// applied (staged offer still present) this tells the helper that the new
 /// version came up and can reach the backend.
