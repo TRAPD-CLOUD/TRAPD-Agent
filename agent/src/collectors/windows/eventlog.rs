@@ -503,7 +503,14 @@ mod tests {
     #[ignore = "requires elevated native Windows with Audit File System success enabled"]
     fn native_4663_self_read_is_suppressed_and_foreign_read_alerts() {
         use super::super::decoy_audit;
-        let path = std::env::temp_dir().join(format!("trapd-4663-{}.txt", uuid::Uuid::new_v4()));
+        // Runners expose TEMP as an 8.3 short name (RUNNER~1) while other
+        // processes are audited under the long name; register the long form.
+        let canonical = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let temp = std::path::PathBuf::from(canonical.trim_start_matches(r"\\?\"));
+        let path = temp.join(format!("trapd-4663-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"native audit fixture").unwrap();
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
