@@ -91,7 +91,12 @@ pub struct OutOfBandSpec {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandPayload {
     /// Send SIGKILL to the given PID.
-    KillPid { pid: i32 },
+    KillPid {
+        pid: i32,
+        /// Observed generation; required on Windows. Omission preserves legacy signatures.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_start_time: Option<u64>,
+    },
     /// Enable full host isolation. `allowlist_ips` are the only destinations
     /// reachable in addition to the management channel.
     IsolateNetwork {
@@ -167,9 +172,17 @@ pub enum CommandPayload {
     /// Freeze a process by SIGSTOP — suspend it (without killing) so it cannot
     /// react or destroy evidence while it is investigated. A forensic snapshot is
     /// captured and audited. Resume with `ThawPid` or terminate with `KillPid`.
-    FreezePid { pid: i32 },
+    FreezePid {
+        pid: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_start_time: Option<u64>,
+    },
     /// Resume a previously-frozen process (SIGCONT).
-    ThawPid { pid: i32 },
+    ThawPid {
+        pid: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_start_time: Option<u64>,
+    },
     // ── Real-Time Response (RTR) ─────────────────────────────────────────────
     /// Execute a signed remediation script. `script_b64` is base64 of the script
     /// body, run via `interpreter` (default `/bin/sh -c`). Gated by `rtr_enabled`.
@@ -469,6 +482,33 @@ mod cross_lang_tests {
                 let changed: CommandEnvelope =
                     serde_json::from_str(&wire.replace("123456789", "123456790")).unwrap();
                 assert!(verify_canonical(&key.verifying_key(), &changed, &signature).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn process_commands_sign_generation_and_preserve_legacy_omission() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[43; 32]);
+        for kind in ["kill_pid", "freeze_pid", "thaw_pid"] {
+            let legacy = format!(
+                r#"{{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"22222222-2222-2222-2222-222222222222","payload":{{"kind":"{kind}","pid":1234}}}}"#
+            );
+            let observed = legacy.replace(
+                "\"pid\":1234",
+                "\"pid\":1234,\"process_start_time\":123456789",
+            );
+            for wire in [&legacy, &observed] {
+                let envelope: CommandEnvelope = serde_json::from_str(wire).unwrap();
+                assert_eq!(serde_json::to_string(&envelope).unwrap(), *wire);
+                let signature = base64::engine::general_purpose::STANDARD
+                    .encode(key.sign(wire.as_bytes()).to_bytes());
+                assert!(verify_canonical(&key.verifying_key(), &envelope, &signature).is_ok());
+                if wire == &observed {
+                    let tampered: CommandEnvelope =
+                        serde_json::from_str(&wire.replace("123456789", "123456790")).unwrap();
+                    assert!(verify_canonical(&key.verifying_key(), &tampered, &signature).is_err());
+                }
             }
         }
     }

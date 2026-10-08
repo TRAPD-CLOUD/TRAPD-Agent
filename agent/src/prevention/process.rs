@@ -27,21 +27,15 @@ use super::policy::{Match, PolicyHandle, RuleAction};
 
 /// Send SIGKILL to the given PID.  Errors if the process is gone or we lack
 /// permission (in which case the audit event records `success=false`).
-#[cfg(target_os = "linux")]
-pub fn kill_pid(pid: i32) -> Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    kill(Pid::from_raw(pid), Signal::SIGKILL).with_context(|| format!("SIGKILL pid={pid} failed"))
-}
-
-#[cfg(windows)]
-pub fn kill_pid(pid: i32) -> Result<()> {
-    super::winproc::terminate(pid, crate::telemetry::identity::process_start_time(pid))
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-pub fn kill_pid(_pid: i32) -> Result<()> {
-    anyhow::bail!("process kill is not implemented on this platform")
+pub fn kill_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if observed_start.is_none() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        return kill(Pid::from_raw(pid), Signal::SIGKILL)
+            .with_context(|| format!("SIGKILL pid={pid} failed"));
+    }
+    kill_observed(pid, observed_start)
 }
 
 /// Kill the process an exec event describes. Where the event carries the
@@ -76,6 +70,22 @@ pub fn freeze_observed(pid: i32, observed_start: Option<u64>) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         signal_observed(pid, observed_start, libc::SIGSTOP)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (pid, observed_start);
+        anyhow::bail!("process control unsupported")
+    }
+}
+
+pub fn thaw_observed(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        super::winproc::resume(pid, observed_start)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        signal_observed(pid, observed_start, libc::SIGCONT)
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
@@ -127,39 +137,27 @@ fn signal_observed(pid: i32, observed_start: Option<u64>, signal: i32) -> Result
 /// suspended (not killed), so it cannot react or destroy evidence while a
 /// snapshot is taken and an operator decides what to do ("freeze, snapshot, then
 /// decide" — issue #32, point 5). Resume with [`thaw_pid`].
-#[cfg(target_os = "linux")]
-pub fn freeze_pid(pid: i32) -> Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    kill(Pid::from_raw(pid), Signal::SIGSTOP).with_context(|| format!("SIGSTOP pid={pid} failed"))
-}
-
-#[cfg(windows)]
-pub fn freeze_pid(pid: i32) -> Result<()> {
-    super::winproc::suspend(pid, crate::telemetry::identity::process_start_time(pid))
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-pub fn freeze_pid(_pid: i32) -> Result<()> {
-    anyhow::bail!("process freeze is not implemented on this platform")
+pub fn freeze_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if observed_start.is_none() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        return kill(Pid::from_raw(pid), Signal::SIGSTOP)
+            .with_context(|| format!("SIGSTOP pid={pid} failed"));
+    }
+    freeze_observed(pid, observed_start)
 }
 
 /// Resume a previously-frozen process by sending SIGCONT.
-#[cfg(target_os = "linux")]
-pub fn thaw_pid(pid: i32) -> Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    kill(Pid::from_raw(pid), Signal::SIGCONT).with_context(|| format!("SIGCONT pid={pid} failed"))
-}
-
-#[cfg(windows)]
-pub fn thaw_pid(pid: i32) -> Result<()> {
-    super::winproc::resume(pid, crate::telemetry::identity::process_start_time(pid))
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-pub fn thaw_pid(_pid: i32) -> Result<()> {
-    anyhow::bail!("process thaw is not implemented on this platform")
+pub fn thaw_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if observed_start.is_none() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        return kill(Pid::from_raw(pid), Signal::SIGCONT)
+            .with_context(|| format!("SIGCONT pid={pid} failed"));
+    }
+    thaw_observed(pid, observed_start)
 }
 
 /// Look up the parent's comm by PPID.

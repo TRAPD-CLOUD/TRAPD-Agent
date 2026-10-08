@@ -919,8 +919,11 @@ impl Engine {
             return;
         }
         match &env.payload {
-            CommandPayload::KillPid { pid } => {
-                self.cmd_kill_pid(*pid, &cmd_id);
+            CommandPayload::KillPid {
+                pid,
+                process_start_time,
+            } => {
+                self.cmd_kill_pid(*pid, *process_start_time, &cmd_id);
             }
             CommandPayload::IsolateNetwork { allowlist_ips } => {
                 self.cmd_isolate(allowlist_ips.clone(), &cmd_id).await;
@@ -981,11 +984,17 @@ impl Engine {
             CommandPayload::RevokeHoneytoken { path } => {
                 self.cmd_revoke_honeytoken(path, &cmd_id);
             }
-            CommandPayload::FreezePid { pid } => {
-                self.cmd_freeze_pid(*pid, &cmd_id);
+            CommandPayload::FreezePid {
+                pid,
+                process_start_time,
+            } => {
+                self.cmd_freeze_pid(*pid, *process_start_time, &cmd_id);
             }
-            CommandPayload::ThawPid { pid } => {
-                self.cmd_thaw_pid(*pid, &cmd_id);
+            CommandPayload::ThawPid {
+                pid,
+                process_start_time,
+            } => {
+                self.cmd_thaw_pid(*pid, *process_start_time, &cmd_id);
             }
             CommandPayload::RunScript {
                 interpreter,
@@ -1223,7 +1232,13 @@ impl Engine {
     /// `CommandRejected` audit event and returns `false` so the caller bails
     /// out **before** any signal is sent. Rejects broadcast selectors
     /// (`pid <= 0`), init (`pid == 1`) and the agent's own PID (issue #59).
-    fn accept_target_pid(&self, pid: i32, kind: &str, cmd_id: &str) -> bool {
+    fn accept_target_pid(
+        &self,
+        pid: i32,
+        process_start_time: Option<u64>,
+        kind: &str,
+        cmd_id: &str,
+    ) -> bool {
         let own_pid = std::process::id() as i32;
         if is_valid_target_pid(pid, own_pid) {
             return true;
@@ -1240,9 +1255,31 @@ impl Engine {
             ),
             None,
             Some(cmd_id.into()),
-            json!({ "pid": pid, "rejected": "invalid_target_pid" }),
+            json!({ "pid": pid, "process_start_time": process_start_time, "rejected": "invalid_target_pid" }),
         );
         false
+    }
+
+    fn process_action_succeeded(
+        &self,
+        result: anyhow::Result<()>,
+        pid: i32,
+        process_start_time: Option<u64>,
+        kind: &str,
+        cmd_id: &str,
+    ) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.audit.emit(
+                    EventAction::CommandRejected, Severity::Medium, kind,
+                    pid.to_string(), false, format!("process action refused or failed: {error}"),
+                    None, Some(cmd_id.into()),
+                    json!({ "pid": pid, "process_start_time": process_start_time, "source": "command" }),
+                );
+                false
+            }
+        }
     }
 
     /// Read up to `cap` bytes of `pid`'s memory, anonymous-executable regions
@@ -1385,59 +1422,59 @@ impl Engine {
 
     /// Freeze a process (SIGSTOP) on operator command and audit a forensic
     /// snapshot of it while it is suspended (issue #32, point 5).
-    fn cmd_freeze_pid(&self, pid: i32, cmd_id: &str) {
+    fn cmd_freeze_pid(&self, pid: i32, process_start_time: Option<u64>, cmd_id: &str) {
         use crate::schema::{EventAction, Severity};
-        if !self.accept_target_pid(pid, "process_freeze", cmd_id) {
+        if !self.accept_target_pid(pid, process_start_time, "process_freeze", cmd_id) {
             return;
         }
-        let frozen = process::freeze_pid(pid).is_ok();
-        let snapshot = forensics::capture_snapshot(pid, frozen);
+        if !self.process_action_succeeded(
+            process::freeze_pid(pid, process_start_time),
+            pid,
+            process_start_time,
+            "process_freeze",
+            cmd_id,
+        ) {
+            return;
+        }
+        let snapshot = forensics::capture_snapshot(pid, true);
         self.audit.emit(
             EventAction::ProcessFrozen,
-            if frozen {
-                Severity::High
-            } else {
-                Severity::Medium
-            },
+            Severity::High,
             "process_freeze",
             pid.to_string(),
-            frozen,
-            if frozen {
-                format!("pid {pid} frozen (SIGSTOP) for forensic capture")
-            } else {
-                format!("freeze of pid {pid} failed (process may have exited)")
-            },
+            true,
+            format!("pid {pid} frozen (SIGSTOP) for forensic capture"),
             None,
             Some(cmd_id.into()),
-            json!({ "pid": pid, "frozen": frozen, "snapshot": snapshot }),
+            json!({ "pid": pid, "process_start_time": process_start_time, "frozen": true, "snapshot": snapshot }),
         );
     }
 
     /// Resume a previously-frozen process (SIGCONT) on operator command.
-    fn cmd_thaw_pid(&self, pid: i32, cmd_id: &str) {
+    fn cmd_thaw_pid(&self, pid: i32, process_start_time: Option<u64>, cmd_id: &str) {
         use crate::schema::{EventAction, Severity};
-        if !self.accept_target_pid(pid, "process_thaw", cmd_id) {
+        if !self.accept_target_pid(pid, process_start_time, "process_thaw", cmd_id) {
             return;
         }
-        let thawed = process::thaw_pid(pid).is_ok();
+        if !self.process_action_succeeded(
+            process::thaw_pid(pid, process_start_time),
+            pid,
+            process_start_time,
+            "process_thaw",
+            cmd_id,
+        ) {
+            return;
+        }
         self.audit.emit(
             EventAction::ProcessThawed,
-            if thawed {
-                Severity::Info
-            } else {
-                Severity::Medium
-            },
+            Severity::Info,
             "process_thaw",
             pid.to_string(),
-            thawed,
-            if thawed {
-                format!("pid {pid} resumed (SIGCONT)")
-            } else {
-                format!("thaw of pid {pid} failed (process may have exited)")
-            },
+            true,
+            format!("pid {pid} resumed (SIGCONT)"),
             None,
             Some(cmd_id.into()),
-            json!({ "pid": pid, "thawed": thawed }),
+            json!({ "pid": pid, "process_start_time": process_start_time, "thawed": true }),
         );
     }
 
@@ -1662,30 +1699,29 @@ impl Engine {
         );
     }
 
-    fn cmd_kill_pid(&self, pid: i32, cmd_id: &str) {
-        if !self.accept_target_pid(pid, "process_block", cmd_id) {
+    fn cmd_kill_pid(&self, pid: i32, process_start_time: Option<u64>, cmd_id: &str) {
+        if !self.accept_target_pid(pid, process_start_time, "process_block", cmd_id) {
             return;
         }
-        let res = process::kill_pid(pid);
-        let success = res.is_ok();
-        let reason = match res {
-            Ok(_) => format!("SIGKILL delivered to pid {pid}"),
-            Err(e) => format!("kill failed: {e:#}"),
-        };
+        if !self.process_action_succeeded(
+            process::kill_pid(pid, process_start_time),
+            pid,
+            process_start_time,
+            "process_block",
+            cmd_id,
+        ) {
+            return;
+        }
         self.audit.emit(
             crate::schema::EventAction::ProcessBlocked,
-            if success {
-                crate::schema::Severity::High
-            } else {
-                crate::schema::Severity::Medium
-            },
+            crate::schema::Severity::High,
             "process_block",
             pid.to_string(),
-            success,
-            reason,
+            true,
+            format!("SIGKILL delivered to pid {pid}"),
             None,
             Some(cmd_id.into()),
-            json!({ "pid": pid, "source": "command" }),
+            json!({ "pid": pid, "process_start_time": process_start_time, "source": "command" }),
         );
     }
 
@@ -2374,6 +2410,175 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", windows))]
+    fn process_command(
+        kind: &str,
+        pid: i32,
+        generation: Option<u64>,
+    ) -> crate::prevention::commands::CommandEnvelope {
+        let mut payload = serde_json::json!({ "kind": kind, "pid": pid });
+        if let Some(start) = generation {
+            payload["process_start_time"] = serde_json::json!(start);
+        }
+        serde_json::from_value(serde_json::json!({
+            "command_id": uuid::Uuid::new_v4(), "issued_at": chrono::Utc::now(),
+            "expires_at": chrono::Utc::now() + chrono::Duration::minutes(1),
+            "agent_id": "test-agent", "nonce": uuid::Uuid::new_v4(), "payload": payload,
+        }))
+        .unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn manual_process_commands_reject_wrong_generations_without_collecting_snapshots() {
+        for kind in ["kill_pid", "freeze_pid", "thaw_pid"] {
+            for stale in [false, true] {
+                let mut child = ChildFixture::new();
+                let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+                let generation = if stale { start + 1 } else { 0 };
+                let (engine, mut rx) = test_engine();
+                engine
+                    .handle(process_command(kind, child.pid(), Some(generation)))
+                    .await;
+                let event = rx.try_recv().unwrap();
+                assert!(matches!(event.action, EventAction::CommandRejected));
+                let EventData::Prevention(audit) = event.data else {
+                    panic!("audit")
+                };
+                assert!(!audit.success);
+                assert_eq!(audit.details["process_start_time"], generation);
+                assert!(
+                    audit.details.get("snapshot").is_none(),
+                    "refusal must not inspect a different generation"
+                );
+                assert!(child.0.try_wait().unwrap().is_none());
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn manual_process_commands_reject_missing_windows_generations() {
+        for kind in ["kill_pid", "freeze_pid", "thaw_pid"] {
+            let mut child = ChildFixture::new();
+            let (engine, mut rx) = test_engine();
+            engine
+                .handle(process_command(kind, child.pid(), None))
+                .await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::CommandRejected));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(!audit.success);
+            assert_eq!(
+                audit.details.get("process_start_time"),
+                Some(&serde_json::Value::Null)
+            );
+            assert!(audit.details.get("snapshot").is_none());
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn manual_process_commands_control_the_observed_child_and_preserve_linux_legacy() {
+        let legacy_modes = if cfg!(windows) {
+            vec![false]
+        } else {
+            vec![false, true]
+        };
+        for legacy in legacy_modes {
+            // This child would exit in one second unless freeze actually stops it.
+            #[cfg(windows)]
+            let mut command = {
+                let mut c = std::process::Command::new("ping");
+                c.args(["-n", "2", "127.0.0.1"]);
+                c
+            };
+            #[cfg(target_os = "linux")]
+            let mut command = {
+                let mut c = std::process::Command::new("sleep");
+                c.arg("1");
+                c
+            };
+            let mut child = ChildFixture(
+                command
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+            let generation = (!legacy).then_some(start);
+            let (engine, mut rx) = test_engine();
+            engine
+                .handle(process_command("freeze_pid", child.pid(), generation))
+                .await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::ProcessFrozen));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(audit.success);
+            assert_eq!(
+                audit.details["process_start_time"],
+                serde_json::json!(generation)
+            );
+            assert_eq!(audit.details["snapshot"]["frozen"], true);
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "freeze must stop the short-lived child"
+            );
+
+            engine
+                .handle(process_command("thaw_pid", child.pid(), generation))
+                .await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::ProcessThawed));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(audit.success);
+            assert_eq!(
+                audit.details["process_start_time"],
+                serde_json::json!(generation)
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while child.0.try_wait().unwrap().is_none() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("thaw must allow the child to exit");
+
+            let mut target = ChildFixture::new();
+            let start = crate::telemetry::identity::process_start_time(target.pid()).unwrap();
+            let generation = (!legacy).then_some(start);
+            engine
+                .handle(process_command("kill_pid", target.pid(), generation))
+                .await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::ProcessBlocked));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(audit.success);
+            assert_eq!(
+                audit.details["process_start_time"],
+                serde_json::json!(generation)
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while target.0.try_wait().unwrap().is_none() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("kill must terminate the observed child");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
     async fn automatic_execution_never_kills_an_unknown_or_reused_generation() {
         for stale in [false, true] {
@@ -2543,7 +2748,7 @@ mod tests {
         let own = std::process::id() as i32;
         for &pid in &[-1, 0, 1, own] {
             let (engine, mut rx) = test_engine();
-            engine.cmd_kill_pid(pid, "cmd-1");
+            engine.cmd_kill_pid(pid, None, "cmd-1");
 
             let ev = rx.try_recv().expect("a rejection event must be emitted");
             assert!(
@@ -2569,12 +2774,12 @@ mod tests {
     fn cmd_freeze_and_thaw_reject_dangerous_targets() {
         for &pid in &[-1, 0, 1] {
             let (engine, mut rx) = test_engine();
-            engine.cmd_freeze_pid(pid, "cmd-f");
+            engine.cmd_freeze_pid(pid, None, "cmd-f");
             let ev = rx.try_recv().expect("freeze rejection event");
             assert!(matches!(ev.action, EventAction::CommandRejected));
 
             let (engine, mut rx) = test_engine();
-            engine.cmd_thaw_pid(pid, "cmd-t");
+            engine.cmd_thaw_pid(pid, None, "cmd-t");
             let ev = rx.try_recv().expect("thaw rejection event");
             assert!(matches!(ev.action, EventAction::CommandRejected));
         }

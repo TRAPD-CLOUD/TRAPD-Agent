@@ -27,7 +27,7 @@ else on Windows is type-checked and unit-tested on shared logic only.
 | FIM (periodic hashing) | ✅ | ✅ |
 | Process-memory injection scan | ✅ maps: RWX, memfd, deleted exec | ✅ `VirtualQueryEx`: thread started in unbacked executable memory (alert), injected PE (alert), RWX alone (context) |
 | Rootkit cross-view detection | ✅ | ⏳ not planned: depends on `/proc`, `getdents`, `sock_diag` |
-| Process kill / freeze (with PID-reuse guard) | ✅ automatic `SIGKILL` / `SIGSTOP` through a generation-checked pidfd | ✅ `TerminateProcess` / idempotent `NtSuspendProcess` bound to creation time; core system processes are never targets |
+| Process kill / freeze (with PID-reuse guard) | ✅ automatic `SIGKILL` / `SIGSTOP` through a generation-checked pidfd | ✅ `TerminateProcess` / idempotent `NtSuspendProcess` bound to creation time; manual kill/freeze/thaw require the signed observed generation; core system processes are never targets |
 | Network containment (block IP, isolate) | ✅ nftables / iptables, current backend DNS/config allowances | ✅ native `INetFwPolicy2` / `INetFwRule`, current backend DNS/config allowances, requires every active profile to enforce local rules; preserves profile defaults; native CI |
 | File quarantine + restore | ✅ move + `chmod 000` + `chattr +i` | ✅ SYSTEM ownership + protected DACL, original owner/DACL restored; pins paths and copies into a fresh protected object, preserving NTFS data streams; native CI |
 | Auto-response, signed command channel, RTR | ✅ | ✅ PowerShell via `-EncodedCommand`; memory collection via `ReadProcessMemory` requires the signed observed process generation (LSASS and other protected processes refused) |
@@ -45,8 +45,9 @@ Known Windows limits: isolation does not allow DNS or DHCP unless the resolver i
 in `isolation_allowlist_ips`; isolation and IP blocks persist across a reboot
 (they are persistent firewall rules, removed by `deisolate` / `unblock_ip` or explicit uninstall). Windows IP blocks with a TTL store their deadline in each rule and are reconciled before enrollment and every five seconds, including offline and pending-pairing modes; upgrades preserve containment.
 Isolation reads current signed-config allowances at action time, alongside backend management IPs and explicit command allowances.
-Windows quarantine refuses files larger than 1 GiB including their data streams
-and filesystems that cannot enumerate those streams safely.
+Windows quarantine refuses multiply-linked files, files larger than 1 GiB
+including their data streams, and filesystems that cannot enumerate those
+streams safely.
 
 ---
 
