@@ -115,10 +115,17 @@ impl Updater {
             return Ok(());
         }
 
-        // A verified update is already waiting for the apply helper. Re-offering
-        // it every hour would re-download the artifact for nothing; only retry
-        // once it has been sitting there long enough to suggest the helper is
-        // not installed or not running.
+        // The replay watermark already covers this offer. Windows must retry
+        // its staged artifact directly, before the fresh-offer skip or polling
+        // for a directive that would be rejected as a replay.
+        #[cfg(windows)]
+        if resume_staged_update(&self.paths, windows::spawn_apply_helper)? {
+            return Ok(());
+        }
+
+        // Linux's path unit watches a staged offer. Avoid re-downloading it
+        // while the helper is expected to run; stale staging may be re-offered.
+        // Windows relaunches its existing artifact in the branch above.
         if staged_within(&self.paths, STAGED_RETRY_AFTER) {
             return Ok(());
         }
@@ -207,6 +214,21 @@ impl Updater {
         }
         Ok(())
     }
+}
+
+/// Resume a Windows staged update after a failed launch or an early helper
+/// exit. The helper re-verifies the existing offer, replay watermark and bytes;
+/// retrying never changes the accepted directive or download state.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resume_staged_update(
+    paths: &StagingPaths,
+    launch: impl FnOnce(&std::path::Path) -> Result<()>,
+) -> Result<bool> {
+    if paths.recovery().exists() || !paths.offer().is_file() {
+        return Ok(false);
+    }
+    launch(&paths.dir).context("update: relaunch staged apply helper")?;
+    Ok(true)
 }
 
 fn staged_within(paths: &StagingPaths, window: Duration) -> bool {
@@ -342,6 +364,66 @@ pub fn run_apply_helper() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_helper_launch_failure_retries_without_changing_replay_watermark() {
+        let paths = StagingPaths {
+            dir: std::env::temp_dir().join(format!("trapd-relaunch-{}", uuid::Uuid::new_v4())),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.offer(), b"existing signed offer").unwrap();
+        std::fs::write(paths.artifact(), b"existing verified artifact").unwrap();
+        UpdateState {
+            last_issued_at: 500,
+            blocked_version: None,
+        }
+        .save(&paths)
+        .unwrap();
+        assert!(staged_within(&paths, STAGED_RETRY_AFTER));
+        assert!(resume_staged_update(&paths, |dir| {
+            assert_eq!(dir, paths.dir);
+            anyhow::bail!("process launch failed")
+        })
+        .is_err());
+        let launched = std::cell::Cell::new(false);
+        assert!(resume_staged_update(&paths, |dir| {
+            assert_eq!(dir, paths.dir);
+            launched.set(true);
+            Ok(())
+        })
+        .unwrap());
+        assert!(launched.get());
+        // Also retry an early helper exit before it can create recovery.json.
+        assert!(!paths.recovery().exists());
+        assert!(resume_staged_update(&paths, |_| Ok(())).unwrap());
+        assert_eq!(UpdateState::load(&paths).last_issued_at, 500);
+        assert_eq!(
+            std::fs::read(paths.offer()).unwrap(),
+            b"existing signed offer"
+        );
+        assert_eq!(
+            std::fs::read(paths.artifact()).unwrap(),
+            b"existing verified artifact"
+        );
+        std::fs::remove_dir_all(paths.dir).unwrap();
+    }
+
+    #[test]
+    fn staged_helper_retry_does_not_replace_pending_recovery_or_poll_empty_staging() {
+        let paths = StagingPaths {
+            dir: std::env::temp_dir().join(format!("trapd-relaunch-{}", uuid::Uuid::new_v4())),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        assert!(!resume_staged_update(&paths, |_| panic!("no offer to apply")).unwrap());
+        std::fs::write(paths.offer(), b"offer").unwrap();
+        std::fs::write(paths.recovery(), b"recovery").unwrap();
+        assert!(!resume_staged_update(&paths, |_| panic!(
+            "recovery has a separate guarded launch path"
+        ))
+        .unwrap());
+        assert_eq!(std::fs::read(paths.recovery()).unwrap(), b"recovery");
+        std::fs::remove_dir_all(paths.dir).unwrap();
+    }
 
     #[test]
     fn pending_recovery_never_expires_into_a_new_download() {

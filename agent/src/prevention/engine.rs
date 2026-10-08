@@ -66,7 +66,7 @@ fn is_valid_target_pid(pid: i32, own_pid: i32) -> bool {
 #[derive(Clone)]
 pub struct EngineConfig {
     pub net_backend: Backend,
-    pub default_isolation_allowlist: Vec<std::net::IpAddr>,
+    pub management_ips: Vec<std::net::IpAddr>,
 }
 
 /// Escalating honeytoken-access response, parsed from `AgentConfig::honeytoken_response`.
@@ -194,6 +194,28 @@ impl Engine {
             .read()
             .map(|c| c.prevention_enabled)
             .unwrap_or(false)
+    }
+
+    /// Only backend addresses are cached. Signed-config allowances are read
+    /// at the action boundary so additions AND removals apply without restart.
+    fn isolation_allowlist(
+        &self,
+        additional: &[std::net::IpAddr],
+    ) -> anyhow::Result<Vec<std::net::IpAddr>> {
+        let cfg = self
+            .cfg_handle
+            .read()
+            .map_err(|_| anyhow::anyhow!("isolation config lock poisoned"))?;
+        let mut allow = self.cfg.management_ips.clone();
+        allow.extend(
+            cfg.isolation_allowlist_ips
+                .iter()
+                .filter_map(|ip| ip.parse::<std::net::IpAddr>().ok()),
+        );
+        allow.extend_from_slice(additional);
+        allow.sort();
+        allow.dedup();
+        Ok(allow)
     }
 
     async fn sync_kernel_prevention(&self) {
@@ -368,10 +390,10 @@ impl Engine {
             actions.push(if killed { "kill" } else { "kill_failed" });
         }
         if matches!(level, ResponseLevel::Isolate) {
-            let mut allow = self.cfg.default_isolation_allowlist.clone();
-            allow.sort();
-            allow.dedup();
-            isolated = network::isolate(self.cfg.net_backend, &allow).is_ok();
+            isolated = self
+                .isolation_allowlist(&[])
+                .and_then(|allow| network::isolate(self.cfg.net_backend, &allow))
+                .is_ok();
             actions.push(if isolated {
                 "isolate"
             } else {
@@ -589,10 +611,10 @@ impl Engine {
         }
 
         if matches!(decision.action, AutoAction::Isolate) {
-            let mut allow = self.cfg.default_isolation_allowlist.clone();
-            allow.sort();
-            allow.dedup();
-            isolated = network::isolate(self.cfg.net_backend, &allow).is_ok();
+            isolated = self
+                .isolation_allowlist(&[])
+                .and_then(|allow| network::isolate(self.cfg.net_backend, &allow))
+                .is_ok();
             actions.push(if isolated {
                 "isolate"
             } else {
@@ -1613,12 +1635,10 @@ impl Engine {
     }
 
     fn cmd_isolate(&self, mut allow: Vec<std::net::IpAddr>, cmd_id: &str) {
-        for ip in &self.cfg.default_isolation_allowlist {
-            if !allow.contains(ip) {
-                allow.push(*ip);
-            }
-        }
-        let res = network::isolate(self.cfg.net_backend, &allow);
+        let res = self.isolation_allowlist(&allow).and_then(|current| {
+            allow = current;
+            network::isolate(self.cfg.net_backend, &allow)
+        });
         let (success, reason) = match res {
             Ok(_) => (
                 true,
@@ -1893,12 +1913,86 @@ mod tests {
             audit,
             EngineConfig {
                 net_backend: Backend::None,
-                default_isolation_allowlist: vec![],
+                management_ips: vec![],
             },
             Arc::new(HoneytokenStore::load_from(ht_path)),
             Arc::new(RwLock::new(AgentConfig::default())),
         );
         (engine, rx)
+    }
+
+    #[tokio::test]
+    async fn isolation_uses_live_allowlist_for_commands_and_automatic_responses() {
+        use crate::prevention::network::tests::{called, setup};
+        let (mut engine, _audit_rx) = test_engine();
+        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.management_ips = vec!["2001:db8::1".parse().unwrap()];
+        {
+            let mut cfg = engine.cfg_handle.write().unwrap();
+            cfg.prevention_enabled = true;
+            cfg.honeytoken_response = "isolate".into();
+            cfg.isolation_allowlist_ips = vec!["192.0.2.10".into()];
+        }
+        setup(false);
+        engine.cmd_isolate(vec![], "initial");
+        assert!(called(
+            "iptables",
+            &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.10", "-j", "ACCEPT"]
+        ));
+        engine.cfg_handle.write().unwrap().isolation_allowlist_ips =
+            vec!["192.0.2.20".into(), "invalid".into()];
+        for response_path in ["command", "automatic", "honeytoken"] {
+            setup(false);
+            match response_path {
+                "command" => engine.cmd_isolate(vec!["192.0.2.30".parse().unwrap()], "updated"),
+                "automatic" => engine.execute_auto(
+                    "test-rule",
+                    "test",
+                    "test",
+                    &Targets {
+                        pid: None,
+                        process_start_time: None,
+                        file_path: None,
+                    },
+                    &response::Decision {
+                        action: AutoAction::Isolate,
+                        reason: "test".into(),
+                    },
+                ),
+                _ => {
+                    let mut data = access(false, None);
+                    data.accessor.pid = 0;
+                    engine.respond_honeytoken(&data).await;
+                }
+            }
+            assert!(
+                called(
+                    "ip6tables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "2001:db8::1", "-j", "ACCEPT"]
+                ),
+                "{response_path}"
+            );
+            assert!(
+                called(
+                    "iptables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.20", "-j", "ACCEPT"]
+                ),
+                "{response_path}"
+            );
+            assert!(
+                !called(
+                    "iptables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.10", "-j", "ACCEPT"]
+                ),
+                "removed allowance on {response_path}"
+            );
+            if response_path == "command" {
+                assert!(called(
+                    "iptables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.30", "-j", "ACCEPT"]
+                ));
+            }
+        }
     }
 
     #[cfg(windows)]

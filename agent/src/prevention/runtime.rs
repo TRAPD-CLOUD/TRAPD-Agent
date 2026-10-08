@@ -50,11 +50,11 @@ pub async fn start(
         warn!(error = %e, "could not initialise the network containment backend — IP/isolation actions will fail");
     }
 
-    let allowlist = build_isolation_allowlist(backend_url, &cfg_handle);
+    let management_ips = resolve_management_ips(backend_url);
 
     let engine_cfg = EngineConfig {
         net_backend: backend,
-        default_isolation_allowlist: allowlist,
+        management_ips,
     };
 
     let verifier = match Verifier::new(&command_pubkey_path(), agent_id.to_string(), &nonce_store())
@@ -219,10 +219,7 @@ fn detection_mode() -> String {
     }
 }
 
-fn build_isolation_allowlist(
-    backend_url: &str,
-    cfg: &Arc<RwLock<AgentConfig>>,
-) -> Vec<std::net::IpAddr> {
+fn resolve_management_ips(backend_url: &str) -> Vec<std::net::IpAddr> {
     let mut out: Vec<std::net::IpAddr> = Vec::new();
 
     if let Some(host) = backend_host(backend_url) {
@@ -231,16 +228,6 @@ fn build_isolation_allowlist(
         } else if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:443")) {
             for a in addrs {
                 out.push(a.ip());
-            }
-        }
-    }
-
-    if let Ok(c) = cfg.read() {
-        for raw in &c.isolation_allowlist_ips {
-            if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
-                if !out.contains(&ip) {
-                    out.push(ip);
-                }
             }
         }
     }
@@ -270,8 +257,7 @@ mod tests {
 
     #[test]
     fn ipv6_backend_remains_reachable_during_isolation() {
-        let cfg = Arc::new(RwLock::new(AgentConfig::default()));
-        let allow = build_isolation_allowlist("https://[2001:db8::1]:8443/api", &cfg);
+        let allow = resolve_management_ips("https://[2001:db8::1]:8443/api");
         assert_eq!(
             allow,
             vec!["2001:db8::1".parse::<std::net::IpAddr>().unwrap()]

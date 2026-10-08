@@ -441,7 +441,7 @@ fn run_output(bin: &str, args: &[&str]) -> CapturedOutput {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     #[derive(Default)]
@@ -476,7 +476,7 @@ mod tests {
             })
         })
     }
-    fn setup(fail_v6: bool) {
+    pub(crate) fn setup(fail_v6: bool) {
         FIREWALL.with(|f| {
             *f.borrow_mut() = Some(Firewall {
                 fail_v6,
@@ -484,7 +484,7 @@ mod tests {
             })
         });
     }
-    fn called(bin: &str, args: &[&str]) -> bool {
+    pub(crate) fn called(bin: &str, args: &[&str]) -> bool {
         FIREWALL.with(|f| {
             f.borrow()
                 .as_ref()
