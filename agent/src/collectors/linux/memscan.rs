@@ -209,8 +209,8 @@ pub fn is_jit_runtime(exe: &str) -> bool {
 
 pub struct MemScanCollector {
     cfg: Arc<RwLock<AgentConfig>>,
-    /// Already-reported `pid:rule:region` keys, so a standing condition is
-    /// emitted once rather than every interval. Pruned as PIDs disappear.
+    /// Already-reported `pid:start:rule:region` keys, so standing conditions
+    /// are emitted once per generation, pruned as generations disappear.
     seen: HashSet<String>,
 }
 
@@ -259,12 +259,14 @@ impl Collector for MemScanCollector {
                 continue;
             }
 
-            let mut live: HashSet<i32> = HashSet::new();
+            let mut live: HashSet<(i32, u64)> = HashSet::new();
             for pid in live_pids() {
                 if pid == own_pid {
                     continue;
                 }
-                live.insert(pid);
+                if let Some(start) = crate::telemetry::identity::process_start_time(pid) {
+                    live.insert((pid, start));
+                }
                 for (severity, det) in self.scan_pid(pid) {
                     let event = AgentEvent::new(
                         agent_id.clone(),
@@ -281,10 +283,10 @@ impl Collector for MemScanCollector {
             }
             // Forget findings for processes that have since exited.
             self.seen.retain(|k| {
-                k.split_once(':')
-                    .and_then(|(p, _)| p.parse::<i32>().ok())
-                    .map(|p| live.contains(&p))
-                    .unwrap_or(false)
+                let mut fields = k.split(':');
+                fields.next().and_then(|p| p.parse::<i32>().ok())
+                    .zip(fields.next().and_then(|s| s.parse::<u64>().ok()))
+                    .is_some_and(|generation| live.contains(&generation))
             });
         }
     }
@@ -293,6 +295,9 @@ impl Collector for MemScanCollector {
 impl MemScanCollector {
     /// Scan one pid's maps + environ, returning *new* detections (deduped).
     fn scan_pid(&mut self, pid: i32) -> Vec<(Severity, DetectionData)> {
+        let Some(start) = crate::telemetry::identity::process_start_time(pid) else {
+            return Vec::new();
+        };
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
@@ -312,13 +317,11 @@ impl MemScanCollector {
                     // (a JIT-like allocator keeps creating fresh regions);
                     // file-backed findings stay per region.
                     let key = if f.rule_id == "memory.anon_exec" {
-                        format!("{pid}:{}:{}", f.rule_id, region.is_write())
+                        format!("{pid}:{start}:{}:{}", f.rule_id, region.is_write())
                     } else {
-                        format!("{pid}:{}:{:#x}", f.rule_id, region.start)
+                        format!("{pid}:{start}:{}:{:#x}", f.rule_id, region.start)
                     };
-                    if self.seen.insert(key) {
-                        out.push((f.severity, finding_to_detection(pid, &comm, &f)));
-                    }
+                    out.push((key, f.severity, finding_to_detection(pid, &comm, &f)));
                 }
             }
         }
@@ -326,9 +329,8 @@ impl MemScanCollector {
         if let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) {
             if let Some(val) = ld_preload_from_environ(&environ) {
                 if is_suspicious_preload(&val) {
-                    let key = format!("{pid}:ld_preload:{val}");
-                    if self.seen.insert(key) {
-                        out.push((Severity::High, DetectionData {
+                    let key = format!("{pid}:{start}:ld_preload:{val}");
+                    out.push((key, Severity::High, DetectionData {
                             rule_id: "injection.ld_preload_runtime".into(),
                             title: "LD_PRELOAD injection from a non-standard path".into(),
                             category: "memory".into(),
@@ -340,12 +342,20 @@ impl MemScanCollector {
                             evidence: serde_json::json!({ "pid": pid, "comm": comm, "ld_preload": val }),
                             ..Default::default()
                         }));
-                    }
                 }
             }
         }
 
-        out
+        // Reuse during maps/environ reads invalidates the complete scan. Do
+        // not publish or commit dedup state until the same generation is known.
+        if crate::telemetry::identity::process_start_time(pid) != Some(start) {
+            return Vec::new();
+        }
+        out.into_iter().filter_map(|(key, severity, mut finding)| {
+            if !self.seen.insert(key) { return None; }
+            finding.evidence["process_start_time"] = serde_json::json!(start);
+            Some((severity, finding))
+        }).collect()
     }
 }
 
@@ -383,6 +393,29 @@ mod tests {
             classify_region(&r).is_none(),
             "a file-backed r-x text segment is benign"
         );
+    }
+
+    #[test]
+    fn native_scan_carries_the_observed_process_generation() {
+        let mut child = std::process::Command::new("sleep").arg("60")
+            .env("LD_PRELOAD", "/tmp/trapd-test-missing-preload.so")
+            .stderr(std::process::Stdio::null()).spawn().unwrap();
+        let pid = child.id() as i32;
+        let start = crate::telemetry::identity::process_start_time(pid).unwrap();
+        // The loader needs a moment to exec the child and install environ.
+        let mut findings = Vec::new();
+        let cfg = Arc::new(RwLock::new(AgentConfig::default()));
+        let mut collector = MemScanCollector::new(cfg);
+        for _ in 0..100 {
+            findings = collector.scan_pid(pid);
+            if findings.iter().any(|(_, d)| d.rule_id == "injection.ld_preload_runtime") { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = child.kill(); let _ = child.wait();
+        let (_, finding) = findings.into_iter()
+            .find(|(_, d)| d.rule_id == "injection.ld_preload_runtime").unwrap();
+        assert_eq!(finding.evidence["pid"], pid);
+        assert_eq!(finding.evidence["process_start_time"], start);
     }
 
     #[test]

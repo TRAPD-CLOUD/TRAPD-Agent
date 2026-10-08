@@ -20,6 +20,7 @@
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 use tracing::{debug, info};
@@ -39,6 +40,9 @@ pub struct TailedLine {
     pub inode: u64,
     pub start_offset: u64,
     pub checkpoint: FileCheckpoint,
+    /// Fields resolved from the same open file generation. An empty list
+    /// deliberately clears any previous generation's W3C header.
+    pub w3c_fields: Option<Arc<Vec<String>>>,
 }
 
 /// Open file + cursor for a single path.
@@ -59,6 +63,7 @@ pub struct FileTail {
     /// returns EOF so unread bytes on the rotated file are not dropped.
     pending_switch: Option<((u64, u64), String)>,
     reached_eof: bool,
+    w3c_fields: Option<Arc<Vec<String>>>,
 }
 
 impl FileTail {
@@ -80,6 +85,11 @@ impl FileTail {
             known: checkpoint.is_some(),
             pending_switch: None,
             reached_eof: false,
+            w3c_fields: matches!(
+                source.parser.to_ascii_lowercase().as_str(),
+                "iis" | "iis_w3c" | "w3c"
+            )
+            .then(|| Arc::new(Vec::new())),
         };
         if let Some(cp) = checkpoint {
             tail.offset = cp.offset;
@@ -125,6 +135,7 @@ impl FileTail {
             inode,
             start_offset,
             checkpoint: self.checkpoint_at(self.offset)?,
+            w3c_fields: self.w3c_fields.clone(),
         })
     }
 
@@ -154,6 +165,11 @@ impl FileTail {
         let mut cursor = start;
         let mut out = Vec::with_capacity(framed.len());
         for line in framed {
+            if let Some(fields) = &mut self.w3c_fields {
+                if let Some(header) = line.as_str().strip_prefix("#Fields:") {
+                    *fields = Arc::new(header.split_whitespace().map(str::to_string).collect());
+                }
+            }
             let start_offset = cursor;
             cursor += line.consumed_len as u64;
             let mut checkpoint = template.clone();
@@ -163,6 +179,7 @@ impl FileTail {
                 inode,
                 start_offset,
                 checkpoint,
+                w3c_fields: self.w3c_fields.clone(),
             });
         }
         Ok(out)
@@ -315,6 +332,9 @@ impl FileTail {
         let mut f = OpenOptions::new().read(true).open(path)?;
         let len = f.metadata()?.len();
         let pos = offset.min(len);
+        if self.w3c_fields.is_some() {
+            self.w3c_fields = Some(Arc::new(w3c_fields_before(&mut f, pos, self.max_line)?));
+        }
         f.seek(SeekFrom::Start(pos))?;
         self.file = Some(f);
         self.open_inode = Some(ident);
@@ -324,6 +344,54 @@ impl FileTail {
         self.known = true;
         Ok(())
     }
+}
+
+/// Search backwards for the latest complete directive before the resume
+/// cursor. Reading from this handle also works for renamed/rotated logs and
+/// prevents borrowing a header from the replacement path. Memory stays bounded
+/// even when an untrusted log contains an arbitrarily long physical line.
+fn w3c_fields_before(
+    file: &mut File,
+    mut cursor: u64,
+    max_line: usize,
+) -> std::io::Result<Vec<String>> {
+    let mut carry = Vec::new();
+    let mut discard_suffix = false;
+    while cursor > 0 {
+        let count = cursor.min(64 * 1024) as usize;
+        cursor -= count as u64;
+        file.seek(SeekFrom::Start(cursor))?;
+        let mut bytes = vec![0; count];
+        file.read_exact(&mut bytes)?;
+        bytes.extend_from_slice(&carry);
+        let has_newline = bytes.contains(&b'\n');
+        let mut lines = bytes.rsplit(|b| *b == b'\n').peekable();
+        let mut first = true;
+        let mut prefix = &[][..];
+        while let Some(line) = lines.next() {
+            if lines.peek().is_none() && cursor > 0 {
+                prefix = line;
+                break;
+            }
+            if !(first && discard_suffix) && line.len() <= max_line {
+                if let Some(header) = line.strip_prefix(b"#Fields:") {
+                    return Ok(String::from_utf8_lossy(header)
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect());
+                }
+            }
+            first = false;
+        }
+        if prefix.len() > max_line || (discard_suffix && !has_newline) {
+            carry.clear();
+            discard_suffix = true;
+        } else {
+            carry = prefix.to_vec();
+            discard_suffix = false;
+        }
+    }
+    Ok(Vec::new())
 }
 
 /// Stable identity of the file at `path`: `(device, inode)` on Unix, `(volume
@@ -555,6 +623,64 @@ mod tests {
         write(&path, " suffix\n");
         let mut resumed = FileTail::new(&src, path, Some(&cp));
         assert_eq!(resumed.poll().unwrap()[0].line.as_str(), "prefix suffix");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resumed_w3c_header_search_crosses_chunks_and_skips_oversized_lines() {
+        let dir = tmpdir();
+        let path = dir.join("iis.log");
+        let old = "#Fields: s-ip c-ip\n";
+        let current = "#Fields: c-ip s-ip\n";
+        // Place a directive across the 64 KiB backwards-reader boundary and
+        // a hostile long line before the cursor. Neither changes its meaning.
+        let text = format!(
+            "{old}{}{current}{}\n",
+            "x\n".repeat(32_763),
+            "x".repeat(130_000)
+        );
+        std::fs::write(&path, &text).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(
+            w3c_fields_before(&mut file, text.len() as u64, 256).unwrap(),
+            vec!["c-ip", "s-ip"]
+        );
+        assert_eq!(
+            w3c_fields_before(&mut file, old.len() as u64, 256).unwrap(),
+            vec!["s-ip", "c-ip"]
+        );
+        assert!(w3c_fields_before(&mut file, 0, 256).unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn w3c_rotation_uses_each_generation_header_and_clears_missing_headers() {
+        let dir = tmpdir();
+        let path = dir.join("iis.log");
+        std::fs::write(&path, "#Fields: c-ip s-ip\n203.0.113.1 10.0.0.1\n").unwrap();
+        let src =
+            LogSourceConfig::file("iis", &path.to_string_lossy(), "iis").read_from_beginning();
+        let mut tail = FileTail::new(&src, path.clone(), None);
+        tail.poll().unwrap();
+        let cp = tail.checkpoint().unwrap();
+        drop(tail);
+        std::fs::rename(&path, dir.join("iis.log.1")).unwrap();
+        write(&dir.join("iis.log.1"), "203.0.113.2 10.0.0.2\n");
+        write(&path, "10.0.0.3 203.0.113.3\n");
+        let mut resumed = FileTail::new(&src, path, Some(&cp));
+        let mut lines = Vec::new();
+        for _ in 0..4 {
+            lines.extend(resumed.poll().unwrap());
+        }
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].w3c_fields.as_ref().unwrap().as_slice(),
+            &["c-ip", "s-ip"]
+        );
+        assert!(
+            lines[1].w3c_fields.as_ref().unwrap().is_empty(),
+            "replacement log must not inherit the rotated header"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

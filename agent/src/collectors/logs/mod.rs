@@ -296,6 +296,11 @@ async fn run_file_source(
                     watches[i].pending_start = None;
                 }
                 let previous_end = watches[i].pending_end.clone();
+                if let (SourceFramer::W3c(w), Some(fields)) =
+                    (&mut watches[i].framer, rec.w3c_fields)
+                {
+                    w.restore_fields(fields);
+                }
                 let logical_records = watches[i].framer.push(&rec.line.as_str());
                 let pending = watches[i].framer.has_pending();
                 let count = logical_records.len();
@@ -632,6 +637,42 @@ impl SourceFramer {
 mod tests {
     use super::*;
     use crate::schema::{EventAction, EventClass, EventData};
+
+    #[tokio::test]
+    async fn iis_resume_restores_custom_fields_at_the_checkpoint() {
+        for header in [
+            "#Fields: date time c-ip cs-method cs-uri-stem cs-uri-query s-port cs-username s-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken\n",
+            "#Fields: date time c-ip s-ip cs-method cs-uri-stem sc-status\n",
+        ] {
+            let dir = std::env::temp_dir().join(format!("trapd_iis_resume_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("iis.log");
+            std::fs::write(&path, header).unwrap();
+            let src = LogSourceConfig::file("iis", &path.to_string_lossy(), "iis").read_from_beginning();
+            let mut previous = FileTail::new(&src, path.clone(), None);
+            previous.poll().unwrap();
+            let cp = previous.checkpoint().unwrap();
+            drop(previous);
+            let line = if header.split_whitespace().count() == 16 {
+                "2026-10-08 12:00:01 203.0.113.9 GET /a - 443 - 10.0.0.5 curl/8 - 200 0 0 12\n"
+            } else {
+                "2026-10-08 12:00:01 203.0.113.9 10.0.0.5 GET /a 200\n"
+            };
+            use std::io::Write;
+            std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(line.as_bytes()).unwrap();
+            let store = Arc::new(Mutex::new(CheckpointStore::load(dir.join("cp.json"))));
+            store.lock().unwrap().put_file(file_key(&src.name, &path.to_string_lossy()), cp);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let task = tokio::spawn(run_file_source(src, tx, store, "a".into(), "h".into()));
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+            task.abort();
+            let _ = task.await;
+            let EventData::Log(log) = event.data else { panic!("expected log") };
+            assert_eq!(log.fields["remote_addr"], "203.0.113.9", "resume must keep the custom client IP column");
+            assert_eq!(log.fields["server_ip"], "10.0.0.5");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn file_generation_change_flushes_pending_audit_into_empty_file() {

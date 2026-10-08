@@ -27,12 +27,12 @@ else on Windows is type-checked and unit-tested on shared logic only.
 | FIM (periodic hashing) | ✅ | ✅ |
 | Process-memory injection scan | ✅ maps: RWX, memfd, deleted exec | ✅ `VirtualQueryEx`: thread started in unbacked executable memory (alert), injected PE (alert), RWX alone (context) |
 | Rootkit cross-view detection | ✅ | ⏳ not planned: depends on `/proc`, `getdents`, `sock_diag` |
-| Process kill / freeze (with PID-reuse guard) | ✅ `SIGKILL` / `SIGSTOP` | ✅ `TerminateProcess` / `NtSuspendProcess` bound to creation time; core system processes are never targets |
-| Network containment (block IP, isolate) | ✅ nftables / iptables | ✅ Windows Firewall block rules only (never rewrites profile defaults); CI for rule syntax |
-| File quarantine + restore | ✅ move + `chmod 000` + `chattr +i` | ✅ move + SYSTEM/Administrators-only DACL, original DACL restored; CI |
+| Process kill / freeze (with PID-reuse guard) | ✅ automatic `SIGKILL` / `SIGSTOP` through a generation-checked pidfd | ✅ `TerminateProcess` / idempotent `NtSuspendProcess` bound to creation time; core system processes are never targets |
+| Network containment (block IP, isolate) | ✅ nftables / iptables | ✅ native `INetFwPolicy2` / `INetFwRule`, requires every active profile to enforce local rules; preserves profile defaults; native CI |
+| File quarantine + restore | ✅ move + `chmod 000` + `chattr +i` | ✅ SYSTEM ownership + protected DACL, original owner/DACL restored; pins paths and copies into a fresh protected object, preserving NTFS data streams; native CI |
 | Auto-response, signed command channel, RTR | ✅ | ✅ PowerShell via `-EncodedCommand`; memory collection via `ReadProcessMemory` (LSASS and other protected processes refused) |
 | Pre-exec kernel blocking | 🟡 tracepoint kill (not LSM) | ⏳ none: post-creation kill only (needs a driver) |
-| Signed self-update with rollback | ✅ systemd path unit | ✅ service launches an apply helper (runs from a copy), SCM restart, rollback stops the service first |
+| Signed self-update with rollback | ✅ systemd path unit, authenticated recovery targets | ✅ copied apply helper, verified SCM stop, durable recovery retains staging/backups until restore and restart succeed |
 | Binary self-integrity | ✅ | ✅ re-baselines when the product version changed (MSI upgrade) |
 | Inventory (hardware, software, ports) | ✅ | ✅ registry software, native TCP table |
 | Hardening assessment | ✅ CIS-style (sysctl, SSH) | ✅ `WIN-*` checks (UAC, firewall, Defender policy, WDigest, LSA PPL, NTLM, SMB1, RDP NLA, LLMNR, script-block logging, Secure Boot) |
@@ -44,6 +44,8 @@ else on Windows is type-checked and unit-tested on shared logic only.
 Known Windows limits: isolation does not allow DNS or DHCP unless the resolver is
 in `isolation_allowlist_ips`; isolation and IP blocks persist across a reboot
 (they are ordinary firewall rules, removed by `deisolate` / `unblock_ip`).
+Windows quarantine refuses files larger than 1 GiB including their data streams
+and filesystems that cannot enumerate those streams safely.
 
 ---
 
@@ -373,4 +375,3 @@ and cross-view rootkit and manipulation detection (§2b: hidden
 processes/sockets/files/mounts/logins, kernel modules, package-verified
 binary integrity, `diagnostics rootkit`). Previous revision covered the
 loss-transparent telemetry pipeline._
-

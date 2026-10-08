@@ -104,6 +104,17 @@ impl Updater {
     }
 
     async fn check_once(&self) -> Result<()> {
+        // A failed stop/restore/restart must keep its original signed offer and
+        // artifact. A later release cannot supersede an unfinished recovery.
+        if self.paths.recovery().exists() {
+            #[cfg(windows)]
+            if !file_is_fresh(&self.paths.recovery(), Duration::from_secs(300)) {
+                windows::spawn_apply_helper(&self.paths.dir)
+                    .context("update: relaunch pending recovery helper")?;
+            }
+            return Ok(());
+        }
+
         // A verified update is already waiting for the apply helper. Re-offering
         // it every hour would re-download the artifact for nothing; only retry
         // once it has been sitting there long enough to suggest the helper is
@@ -199,7 +210,11 @@ impl Updater {
 }
 
 fn staged_within(paths: &StagingPaths, window: Duration) -> bool {
-    std::fs::metadata(paths.offer())
+    paths.recovery().exists() || file_is_fresh(&paths.offer(), window)
+}
+
+fn file_is_fresh(path: &std::path::Path, window: Duration) -> bool {
+    std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
@@ -327,6 +342,21 @@ pub fn run_apply_helper() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_recovery_never_expires_into_a_new_download() {
+        let dir =
+            std::env::temp_dir().join(format!("trapd-recovery-test-{}", uuid::Uuid::new_v4()));
+        let paths = StagingPaths { dir };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.offer(), b"{}").unwrap();
+        std::fs::write(paths.recovery(), b"{}").unwrap();
+        assert!(
+            staged_within(&paths, Duration::ZERO),
+            "recovery must preserve its signed offer indefinitely"
+        );
+        std::fs::remove_dir_all(paths.dir).unwrap();
+    }
 
     #[test]
     fn staged_update_is_in_flight_only_while_fresh() {

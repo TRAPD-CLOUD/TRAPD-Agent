@@ -1,6 +1,6 @@
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
         bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, map, tracepoint},
@@ -70,6 +70,8 @@ pub struct HoneytokenAccessEvent {
     pub filename_len: u32,
     /// Which syscall family tripped the gate — one of the `ACCESS_*` constants.
     pub access_kind:  u32,
+    /// Original access timestamp; appended so older userspace field offsets remain valid.
+    pub observed_monotonic_ns: u64,
 }
 
 /// 512 KiB – openat is frequent; ring buffer drops gracefully under load.
@@ -181,6 +183,7 @@ pub(crate) fn emit_honeytoken_buf(
             ev.filename     = *path;
             ev.filename_len = path_len;
             ev.access_kind  = access_kind;
+            ev.observed_monotonic_ns = unsafe { bpf_ktime_get_ns() };
             entry.submit(0);
         } else {
             crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);
@@ -313,6 +316,7 @@ fn emit_honeytoken_token(token_id: u64, flags: u64, ino: u64, access_kind: u32) 
         ev.filename     = [0u8; PATH_LEN];
         ev.filename_len = 0;
         ev.access_kind  = access_kind;
+        ev.observed_monotonic_ns = unsafe { bpf_ktime_get_ns() };
         entry.submit(0);
     } else {
         crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);

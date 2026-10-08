@@ -253,6 +253,7 @@ pub fn network_connection(
         dst_port,
         state: if inbound { "accepted" } else { "established" }.into(),
         pid,
+        process_start_time: None,
         process,
         duration_ms: None,
         bytes_sent: None,

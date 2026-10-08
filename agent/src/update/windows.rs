@@ -117,10 +117,20 @@ impl Platform for ScmPlatform {
 /// the service so that stopping the service for the swap does not take the
 /// helper down with it.
 pub fn spawn_apply_helper(staging_dir: &std::path::Path) -> Result<()> {
-    let current = std::env::current_exe().context("update: locate the running binary")?;
     let helper = staging_dir.join("apply-helper.exe");
-    let _ = std::fs::remove_file(&helper);
-    std::fs::copy(&current, &helper).context("update: copy the apply helper")?;
+    if staging_dir.join("recovery.json").exists() {
+        // Reuse the known-good helper, rather than copying the failed release
+        // currently running in the service over our automatic recovery path.
+        if !helper.is_file() {
+            let previous = super::apply::prev_path(&installed_binary_path()?);
+            std::fs::copy(previous, &helper)
+                .context("update: recover helper from previous binary")?;
+        }
+    } else {
+        let current = std::env::current_exe().context("update: locate the running binary")?;
+        let _ = std::fs::remove_file(&helper);
+        std::fs::copy(&current, &helper).context("update: copy the apply helper")?;
+    }
     std::process::Command::new(&helper)
         .arg("--apply-update")
         .stdin(std::process::Stdio::null())

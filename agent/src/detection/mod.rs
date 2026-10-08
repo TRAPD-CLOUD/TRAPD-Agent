@@ -1482,6 +1482,7 @@ mod tests {
                 dst_port: port,
                 state: "established".into(),
                 pid: None,
+                process_start_time: None,
                 process: None,
                 duration_ms: None,
                 bytes_sent: None,

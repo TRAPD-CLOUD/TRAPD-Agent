@@ -1,23 +1,8 @@
-//! Windows Firewall containment: pure rule construction.
+//! Windows Firewall containment: pure address and profile logic.
 //!
-//! Everything here is platform-neutral (no process spawning, no registry) so the
-//! address arithmetic and the `netsh` argument vectors are unit-tested on every
-//! CI platform; only `network.rs` executes them, and only on Windows.
-//!
-//! Design notes:
-//!
-//!   * Containment uses **explicit block rules only**. Windows Firewall lets a
-//!     block rule override any allow rule, so "isolate" cannot be built as
-//!     "allow list + default deny" without rewriting the profile defaults,
-//!     which are GPO-managed on domain hosts and would be silently reverted.
-//!     Instead isolation blocks the *complement* of the allow-list (see
-//!     [`complement_ranges`]) — the same observable behaviour as the Linux
-//!     nftables chain, with nothing of the operator's policy touched.
-//!   * Every rule carries the [`GROUP`] so an operator can audit or remove the
-//!     agent's rules in one step, and a fixed, space-free name so deletion never
-//!     depends on `netsh` quoting.
-//!   * Inputs are typed (`IpAddr` / `IpNet`) before they reach an argument, so no
-//!     operator- or backend-supplied string is ever interpolated into a rule.
+//! Platform-neutral policy arithmetic, exercised on both Linux and Windows.
+//! Native COM rule management lives in `winfirewall.rs`. Isolation blocks the
+//! complement of the allowlist without rewriting operator or GPO defaults.
 
 // Pure logic compiled everywhere so it is tested on every CI platform; only the
 // Windows build calls it.
@@ -52,54 +37,13 @@ impl Direction {
 ///
 /// `target` must already be a validated IP or CIDR; the only characters that
 /// can occur are hex digits, `.`, `:` and `/`, and the last is replaced so the
-/// name is a single token on every `netsh` version.
+/// name stays stable across API and diagnostic views.
 pub fn block_rule_name(target: &str, dir: Direction) -> String {
     format!(
         "TRAPD-BLOCK-{}-{}",
         dir.as_str().to_ascii_uppercase(),
         target.replace('/', "_")
     )
-}
-
-/// `netsh` arguments creating one block rule.
-pub fn add_block_args(name: &str, dir: Direction, remote: &str, description: &str) -> Vec<String> {
-    vec![
-        "advfirewall".into(),
-        "firewall".into(),
-        "add".into(),
-        "rule".into(),
-        format!("name={name}"),
-        format!("dir={}", dir.as_str()),
-        "action=block".into(),
-        format!("remoteip={remote}"),
-        "protocol=any".into(),
-        "profile=any".into(),
-        "enable=yes".into(),
-        format!("group={GROUP}"),
-        format!("description={description}"),
-    ]
-}
-
-/// `netsh` arguments that exit 0 only if a rule with `name` exists.
-pub fn show_rule_args(name: &str) -> Vec<String> {
-    vec![
-        "advfirewall".into(),
-        "firewall".into(),
-        "show".into(),
-        "rule".into(),
-        format!("name={name}"),
-    ]
-}
-
-/// `netsh` arguments deleting every rule called `name`.
-pub fn delete_rule_args(name: &str) -> Vec<String> {
-    vec![
-        "advfirewall".into(),
-        "firewall".into(),
-        "delete".into(),
-        "rule".into(),
-        format!("name={name}"),
-    ]
 }
 
 /// Registry locations of the per-profile firewall switch: the local setting and
@@ -116,7 +60,21 @@ pub fn profile_enforcing(policy: Option<u32>, local: Option<u32>) -> bool {
     policy.or(local).map(|v| v != 0).unwrap_or(true)
 }
 
-/// Format a remote address for `remoteip=`: single host, CIDR, or `a-b` range.
+/// Require enforcing firewall state for every active network profile.
+/// The caller obtains the active mask from INetFwPolicy2, and combines local
+/// native state with group policy before constructing `profiles`.
+pub fn active_profiles_enforcing(active: u32, profiles: &[(u32, bool)]) -> bool {
+    active != 0
+        && active & !7 == 0
+        && [1, 2, 4].into_iter().all(|profile| {
+            active & profile == 0
+                || profiles
+                    .iter()
+                    .any(|(p, enabled)| *p == profile && *enabled)
+        })
+}
+
+/// Format a remote address for the native RemoteAddresses property: single host, CIDR, or `a-b` range.
 pub fn remote_for(target: &IpNet) -> String {
     if target.prefix_len() == target.max_prefix_len() {
         target.addr().to_string()
@@ -126,7 +84,7 @@ pub fn remote_for(target: &IpNet) -> String {
 }
 
 /// Inclusive address ranges covering every address that is **not** in `keep`
-/// and not loopback, as `netsh` `remoteip` tokens (`a-b`), IPv4 and IPv6.
+/// and not loopback, as Firewall API address tokens (`a-b`), IPv4 and IPv6.
 ///
 /// Loopback stays reachable on purpose (local IPC, the agent's own loopback
 /// services), matching the Linux `oif lo accept` rule.
@@ -295,21 +253,31 @@ mod tests {
     }
 
     #[test]
-    fn block_rule_arguments_are_typed_tokens_without_shell_metacharacters() {
+    fn block_rule_names_and_addresses_are_stable() {
         let net: IpNet = "203.0.113.0/24".parse().unwrap();
-        let name = block_rule_name("203.0.113.0/24", Direction::Out);
-        assert_eq!(name, "TRAPD-BLOCK-OUT-203.0.113.0_24");
-        let args = add_block_args(
-            &name,
-            Direction::Out,
-            &remote_for(&net),
-            "TRAPD containment",
+        assert_eq!(
+            block_rule_name("203.0.113.0/24", Direction::Out),
+            "TRAPD-BLOCK-OUT-203.0.113.0_24"
         );
-        assert!(args.contains(&"action=block".to_string()));
-        assert!(args.contains(&"remoteip=203.0.113.0/24".to_string()));
-        assert!(args.contains(&"dir=out".to_string()));
-        assert!(args.contains(&format!("group={GROUP}")));
-        assert!(args.iter().all(|a| !a.contains(['&', '|', ';', '\n', '"'])));
+        assert_eq!(remote_for(&net), "203.0.113.0/24");
+    }
+
+    #[test]
+    fn inactive_enabled_profile_cannot_hide_disabled_active_profile() {
+        assert!(!active_profiles_enforcing(
+            4,
+            &[(1, true), (2, true), (4, false)]
+        ));
+    }
+
+    #[test]
+    fn every_active_profile_must_enforce() {
+        let profiles = [(1, true), (2, false), (4, true)];
+        assert!(active_profiles_enforcing(5, &profiles));
+        assert!(!active_profiles_enforcing(3, &profiles));
+        assert!(!active_profiles_enforcing(0, &profiles));
+        assert!(!active_profiles_enforcing(8, &profiles));
+        assert!(!active_profiles_enforcing(4, &[(1, true)]));
     }
 
     #[test]

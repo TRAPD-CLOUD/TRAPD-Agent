@@ -301,7 +301,6 @@ mod tests {
         "fileless.memfd_exec",
         "persistence.autostart_write",
         "privesc.untracked_suid_exec",
-        "injection.ld_preload_runtime",
         // Raised by the Windows ETW sensor / audit-policy monitor; covered by
         // their module tests once those land.
         "selfprotect.etw_session_stopped",

@@ -7,7 +7,7 @@
 //! unit-tested on every CI host. The collectors own only the I/O: how events are
 //! obtained and how paths are normalised before they are passed in.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::schema::{
@@ -115,24 +115,18 @@ pub fn has_ransom_extension(path: &str) -> bool {
 /// turn a single large save into a "mass modification".
 #[derive(Default)]
 pub struct MassModification {
-    seen: VecDeque<(Instant, String)>,
+    seen: HashMap<String, Instant>,
 }
 
 impl MassModification {
     /// Record a modification. Returns the number of distinct paths once the
     /// threshold is crossed (and resets, so a burst alerts once).
     pub fn record(&mut self, path: &str, now: Instant) -> Option<usize> {
-        self.seen.push_back((now, path.to_string()));
-        while self
-            .seen
-            .front()
-            .is_some_and(|(t, _)| now.duration_since(*t) > MASS_MOD_WINDOW)
-        {
-            self.seen.pop_front();
-        }
-        let distinct: HashSet<&str> = self.seen.iter().map(|(_, p)| p.as_str()).collect();
-        if distinct.len() >= MASS_MOD_THRESHOLD {
-            let n = distinct.len();
+        self.seen
+            .retain(|_, last| now.duration_since(*last) <= MASS_MOD_WINDOW);
+        self.seen.insert(path.to_string(), now);
+        if self.seen.len() >= MASS_MOD_THRESHOLD {
+            let n = self.seen.len();
             self.seen.clear();
             Some(n)
         } else {
@@ -281,6 +275,7 @@ pub fn indicator_event(
         EventAction::RansomwareIndicator,
         Severity::High,
         EventData::RansomwareIndicator(RansomwareIndicatorData {
+            process_start_time: None,
             indicator_type: indicator_type.to_string(),
             path,
             pid: None,
@@ -417,6 +412,30 @@ mod tests {
                 .record(&format!("/f{i}"), t0 + Duration::from_secs(5 * i as u64))
                 .is_none());
         }
+    }
+
+    #[test]
+    fn repeated_modifications_keep_one_timestamp_and_refresh_the_window() {
+        let now = Instant::now();
+        let mut m = MassModification::default();
+        for i in 0..2_000 {
+            assert_eq!(m.record("/one.db", now + Duration::from_micros(i)), None);
+        }
+        assert_eq!(
+            m.seen.len(),
+            1,
+            "notification history must stay bounded by paths"
+        );
+        m.record("/one.db", now + Duration::from_secs(9));
+        let mut fired = None;
+        for i in 0..MASS_MOD_THRESHOLD - 1 {
+            fired = m.record(&format!("/{i}"), now + Duration::from_secs(11));
+        }
+        assert_eq!(
+            fired,
+            Some(MASS_MOD_THRESHOLD),
+            "the last modification is still in the window"
+        );
     }
 
     #[test]

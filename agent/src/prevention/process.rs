@@ -36,7 +36,7 @@ pub fn kill_pid(pid: i32) -> Result<()> {
 
 #[cfg(windows)]
 pub fn kill_pid(pid: i32) -> Result<()> {
-    super::winproc::terminate(pid, None)
+    super::winproc::terminate(pid, crate::telemetry::identity::process_start_time(pid))
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -48,14 +48,79 @@ pub fn kill_pid(_pid: i32) -> Result<()> {
 /// process start time (Windows) the kill is bound to that identity, so a PID
 /// reused since the event cannot be hit.
 fn kill_exec(exec: &ExecEventData) -> Result<()> {
+    kill_observed(exec.pid, exec.process_start_time)
+}
+
+/// Control exactly the observed process generation. Unknown identity fails closed.
+pub fn kill_observed(pid: i32, observed_start: Option<u64>) -> Result<()> {
     #[cfg(windows)]
     {
-        super::winproc::terminate(exec.pid, exec.process_start_time)
+        super::winproc::terminate(pid, observed_start)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        kill_pid(exec.pid)
+        signal_observed(pid, observed_start, libc::SIGKILL)
     }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (pid, observed_start);
+        anyhow::bail!("process control unsupported")
+    }
+}
+
+pub fn freeze_observed(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        super::winproc::suspend(pid, observed_start)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        signal_observed(pid, observed_start, libc::SIGSTOP)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (pid, observed_start);
+        anyhow::bail!("process control unsupported")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_observed(pid: i32, observed_start: Option<u64>, signal: i32) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let expected = observed_start
+        .filter(|t| *t > 0)
+        .ok_or_else(|| anyhow::anyhow!("unknown observed identity for pid {pid}; refusing"))?;
+    anyhow::ensure!(
+        pid > 1 && pid != std::process::id() as i32,
+        "unsafe target pid {pid}"
+    );
+    // Open the generation-stable kernel reference BEFORE the comparison. If
+    // reuse occurs before opening the start check rejects it; after opening the
+    // pidfd cannot address a replacement. Old kernels fail closed.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("pidfd_open");
+    }
+    // SAFETY: successful pidfd_open transferred one valid owned descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    anyhow::ensure!(
+        crate::telemetry::identity::process_start_time(pid) == Some(expected),
+        "pid {pid} belongs to a different or unknown process; refusing"
+    );
+    // SAFETY: valid pidfd, signal, no siginfo and no flags.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error()).context("pidfd_send_signal");
+    }
+    Ok(())
 }
 
 /// Freeze a process by sending SIGSTOP — the "jail" response. The process is
@@ -71,7 +136,7 @@ pub fn freeze_pid(pid: i32) -> Result<()> {
 
 #[cfg(windows)]
 pub fn freeze_pid(pid: i32) -> Result<()> {
-    super::winproc::suspend(pid, None)
+    super::winproc::suspend(pid, crate::telemetry::identity::process_start_time(pid))
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -89,7 +154,7 @@ pub fn thaw_pid(pid: i32) -> Result<()> {
 
 #[cfg(windows)]
 pub fn thaw_pid(pid: i32) -> Result<()> {
-    super::winproc::resume(pid, None)
+    super::winproc::resume(pid, crate::telemetry::identity::process_start_time(pid))
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -245,6 +310,25 @@ pub fn enforce_exec(
 mod tests {
     use super::super::policy::{IocRule, PolicyStore};
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_kill_rejects_unknown_and_stale_generations() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start = crate::telemetry::identity::process_start_time(pid).unwrap();
+        assert!(kill_observed(pid, None).is_err());
+        assert!(kill_observed(pid, Some(start + 1)).is_err());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "unrelated generation must survive"
+        );
+        kill_observed(pid, Some(start)).expect("terminate exact generation using pidfd");
+        assert!(!child.wait().unwrap().success());
+    }
 
     #[test]
     fn comm_only_policy_does_not_hash_executables() {

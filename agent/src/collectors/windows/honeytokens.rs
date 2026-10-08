@@ -1348,6 +1348,7 @@ fn describe_fs(access_kind: &str) -> (Severity, u8, &'static str, &'static str) 
 fn unknown_accessor() -> ProcessLineage {
     ProcessLineage {
         pid: -1,
+        process_start_time: None,
         uid: 0,
         gid: 0,
         username: "unknown".to_string(),

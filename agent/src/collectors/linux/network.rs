@@ -36,7 +36,7 @@ impl Default for NetworkCollector {
     }
 }
 
-fn build_inode_pid_map() -> HashMap<u64, i32> {
+fn build_inode_pid_map() -> HashMap<u64, (i32, u64)> {
     let mut map = HashMap::new();
 
     let proc_dir = match fs::read_dir("/proc") {
@@ -52,6 +52,10 @@ fn build_inode_pid_map() -> HashMap<u64, i32> {
             Err(_) => continue,
         };
 
+        let Some(start) = crate::telemetry::identity::process_start_time(pid) else {
+            continue;
+        };
+        let mut inodes = Vec::new();
         let fd_path = format!("/proc/{pid}/fd");
         let fd_dir = match fs::read_dir(&fd_path) {
             Ok(d) => d,
@@ -70,25 +74,33 @@ fn build_inode_pid_map() -> HashMap<u64, i32> {
                 .and_then(|s| s.strip_suffix(']'))
             {
                 if let Ok(inode) = inode_str.parse::<u64>() {
-                    map.insert(inode, pid);
+                    inodes.push(inode);
                 }
             }
+        }
+        // Do not assign a reused PID's sockets to the older generation.
+        if crate::telemetry::identity::process_start_time(pid) == Some(start) {
+            for inode in inodes { map.insert(inode, (pid, start)); }
         }
     }
     map
 }
 
-fn resolve_pid_name(inode: u64, inode_map: &HashMap<u64, i32>) -> (Option<i32>, Option<String>) {
-    let pid = match inode_map.get(&inode) {
-        Some(&p) => p,
-        None => return (None, None),
+fn resolve_pid_name(inode: u64, inode_map: &HashMap<u64, (i32, u64)>)
+    -> (Option<i32>, Option<u64>, Option<String>) {
+    let (pid, start) = match inode_map.get(&inode) {
+        Some(&(pid, start)) => (pid, start),
+        None => return (None, None, None),
     };
+    if crate::telemetry::identity::process_start_time(pid) != Some(start) {
+        return (None, None, None);
+    }
 
     let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|s| s.trim().to_string())
         .ok();
 
-    (Some(pid), comm)
+    (Some(pid), Some(start), comm)
 }
 
 /// The per-flow facts needed to emit both the start and the close record. Stored
@@ -103,6 +115,7 @@ struct FlowInfo {
     dst_addr: String,
     dst_port: u16,
     pid: Option<i32>,
+    process_start_time: Option<u64>,
     process: Option<String>,
     /// Cumulative byte/packet/rtt counters from the most recent INET_DIAG poll
     /// (joined by socket inode at observation time; empty for UDP).
@@ -119,6 +132,7 @@ impl FlowInfo {
             dst_port: self.dst_port,
             state: state.to_string(),
             pid: self.pid,
+            process_start_time: self.process_start_time,
             process: self.process.clone(),
             duration_ms,
             bytes_sent: self.stats.bytes_sent,
@@ -176,7 +190,7 @@ impl Collector for NetworkCollector {
                 if entry.state != TcpState::Established {
                     continue;
                 }
-                let (pid, process) = resolve_pid_name(entry.inode, &inode_map);
+                let (pid, process_start_time, process) = resolve_pid_name(entry.inode, &inode_map);
                 if pid == Some(agent_pid) {
                     continue; // self-exclusion
                 }
@@ -188,6 +202,7 @@ impl Collector for NetworkCollector {
                     dst_addr: entry.remote_address.ip().to_string(),
                     dst_port: entry.remote_address.port(),
                     pid,
+                    process_start_time,
                     process,
                     stats: diag.get(&entry.inode).copied().unwrap_or_default(),
                 };
@@ -221,7 +236,7 @@ impl Collector for NetworkCollector {
 
             let mut new_udp: HashMap<String, FlowInfo> = HashMap::new();
             for entry in &udp_entries {
-                let (pid, process) = resolve_pid_name(entry.inode, &inode_map);
+                let (pid, process_start_time, process) = resolve_pid_name(entry.inode, &inode_map);
                 if pid == Some(agent_pid) {
                     continue; // self-exclusion
                 }
@@ -233,6 +248,7 @@ impl Collector for NetworkCollector {
                     dst_addr: entry.remote_address.ip().to_string(),
                     dst_port: entry.remote_address.port(),
                     pid,
+                    process_start_time,
                     process,
                     stats: super::inet_diag::FlowStats::default(),
                 };
@@ -256,12 +272,12 @@ impl Collector for NetworkCollector {
     }
 }
 
-/// Stable key for a flow (proto + 4-tuple). Built from the parsed fields, so it
+/// Stable key for a flow (protocol, 4-tuple and process generation). Built from parsed fields, so it
 /// is unambiguous for IPv6 (which would break a naive colon-split of a string).
 fn flow_key(f: &FlowInfo) -> String {
     format!(
-        "{}|{}|{}|{}|{}",
-        f.protocol, f.src_addr, f.src_port, f.dst_addr, f.dst_port
+        "{}|{}|{}|{}|{}|{:?}|{:?}",
+        f.protocol, f.src_addr, f.src_port, f.dst_addr, f.dst_port, f.pid, f.process_start_time
     )
 }
 
@@ -331,6 +347,13 @@ async fn emit(
 mod tests {
     use super::*;
 
+    #[test]
+    fn flow_start_and_close_keep_the_observed_process_generation() {
+        let observed = flow("203.0.113.7", 443, Instant::now());
+        assert_eq!(observed.connection_event("established", None).process_start_time, Some(100));
+        assert_eq!(observed.connection_event("closed", Some(20)).process_start_time, Some(100));
+    }
+
     fn flow(dst: &str, port: u16, first_seen: Instant) -> FlowInfo {
         FlowInfo {
             first_seen,
@@ -340,6 +363,7 @@ mod tests {
             dst_addr: dst.into(),
             dst_port: port,
             pid: Some(42),
+            process_start_time: Some(100),
             process: Some("curl".into()),
             stats: super::super::inet_diag::FlowStats::default(),
         }

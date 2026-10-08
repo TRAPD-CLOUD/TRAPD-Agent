@@ -25,8 +25,8 @@ use std::time::Instant;
 use crate::schema::{AgentEvent, DetectionData, EventData};
 
 use chains::{Correlator, EventFacts};
-use tree::ProcessTree;
 pub use tree::ProcContext;
+use tree::ProcessTree;
 pub(crate) use tree::WEB_SERVERS;
 
 /// Shells whose appearance can anchor an execution chain.
@@ -420,6 +420,7 @@ mod tests {
                 dst_port: 443,
                 state: "established".into(),
                 pid: Some(pid),
+                process_start_time: None,
                 process: None,
                 duration_ms: None,
                 bytes_sent: None,

@@ -138,7 +138,7 @@ pub struct Engine {
     /// Bounded flight recorder of recent telemetry, pulled into a honeytoken
     /// response as the accessor session's pre-history (issue #32, point 5).
     recorder: Arc<FlightRecorder>,
-    /// Cooldown register for automated detection-response, keyed `rule_id:pid`.
+    /// Cooldown register for automated responses, keyed by rule and process generation.
     auto_cooldown: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
     /// Shared kick to the eBPF reconciler + health checker, pulsed right after a
     /// honeytoken deploy/revoke so arming and the on-disk verification run
@@ -305,7 +305,7 @@ impl Engine {
         // killing it, capture its state while it cannot react, and leave the
         // kill/thaw decision to an operator (issue #32, point 5).
         if matches!(level, ResponseLevel::Freeze) && pid > 0 {
-            frozen = process::freeze_pid(pid).is_ok();
+            frozen = process::freeze_observed(pid, data.accessor.process_start_time).is_ok();
             actions.push(if frozen { "freeze" } else { "freeze_failed" });
             // Snapshot regardless — a process that raced to exit is itself signal.
             snapshot = Some(forensics::capture_snapshot(pid, frozen));
@@ -313,7 +313,7 @@ impl Engine {
 
         // Above `alert` (kill/isolate), terminate the accessing process.
         if matches!(level, ResponseLevel::Kill | ResponseLevel::Isolate) && pid > 0 {
-            killed = process::kill_pid(pid).is_ok();
+            killed = process::kill_observed(pid, data.accessor.process_start_time).is_ok();
             actions.push(if killed { "kill" } else { "kill_failed" });
         }
         if matches!(level, ResponseLevel::Isolate) {
@@ -370,6 +370,7 @@ impl Engine {
                 "path": data.path,
                 "kind": data.kind,
                 "accessor_pid": pid,
+                "process_start_time": data.accessor.process_start_time,
                 "accessor_comm": data.accessor.comm,
                 "accessor_uid": data.accessor.uid,
                 "open_flags": data.open_flags,
@@ -405,7 +406,10 @@ impl Engine {
     /// precisely on the source.
     async fn auto_respond_ransomware(&self, event: &AgentEvent, r: &RansomwareIndicatorData) {
         let targets = Targets {
-            pid: r.pid.filter(|p| *p > 1),
+            pid: r
+                .pid
+                .filter(|p| is_valid_target_pid(*p, std::process::id() as i32)),
+            process_start_time: r.process_start_time,
             file_path: r.path.clone(),
         };
         let subject = r
@@ -467,7 +471,11 @@ impl Engine {
         }
 
         // Cooldown so a repeating detection cannot storm the same action.
-        let key = format!("{rule_id}:{}", targets.pid.unwrap_or(0));
+        let key = format!(
+            "{rule_id}:{}:{:?}",
+            targets.pid.unwrap_or(0),
+            targets.process_start_time
+        );
         {
             let mut cd = self.auto_cooldown.lock().await;
             let now = Instant::now();
@@ -509,7 +517,7 @@ impl Engine {
             if let Some(pid) = targets.pid {
                 let own_pid = std::process::id() as i32;
                 if is_valid_target_pid(pid, own_pid) {
-                    killed = process::kill_pid(pid).is_ok();
+                    killed = process::kill_observed(pid, targets.process_start_time).is_ok();
                     actions.push(if killed { "kill" } else { "kill_failed" });
                 } else {
                     actions.push("kill_skipped_self");
@@ -519,7 +527,8 @@ impl Engine {
 
         if matches!(decision.action, AutoAction::Quarantine) {
             if let Some(path) = &targets.file_path {
-                quarantined = quarantine::quarantine(Path::new(path)).is_ok();
+                quarantined = response::validated_quarantine_path(path)
+                    .is_some_and(|path| quarantine::quarantine_automatic(Path::new(&path)).is_ok());
                 actions.push(if quarantined {
                     "quarantine"
                 } else {
@@ -573,6 +582,7 @@ impl Engine {
                 "action": decision.action.as_str(),
                 "reason": decision.reason,
                 "target_pid": targets.pid,
+                "process_start_time": targets.process_start_time,
                 "target_path": targets.file_path,
                 "actions": actions,
                 "killed": killed,
@@ -609,8 +619,16 @@ impl Engine {
             Some(m) => m,
             None => return,
         };
-        self.enforce_net_match(addr, data.dst_port, data.pid, m, "flow", None)
-            .await;
+        self.enforce_net_match(
+            addr,
+            data.dst_port,
+            data.pid,
+            data.process_start_time,
+            m,
+            "flow",
+            None,
+        )
+        .await;
     }
 
     /// Inline IoC enforcement on a resolved DNS answer. A backend-pushed
@@ -627,7 +645,7 @@ impl Engine {
         };
         for ip in &data.resolved_ips {
             if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                self.enforce_net_match(addr, 0, None, m.clone(), "dns", Some(&data.qname))
+                self.enforce_net_match(addr, 0, None, None, m.clone(), "dns", Some(&data.qname))
                     .await;
             }
         }
@@ -637,11 +655,13 @@ impl Engine {
     /// `addr` on `Block`, optionally SIGKILL the connecting `pid`, and audit the
     /// outcome. Best-effort — a missing firewall backend or a vanished process
     /// is recorded, never fatal.
+    #[allow(clippy::too_many_arguments)]
     async fn enforce_net_match(
         &self,
         addr: std::net::IpAddr,
         port: u16,
         pid: Option<i32>,
+        process_start_time: Option<u64>,
         m: Match,
         source: &str,
         qname: Option<&str>,
@@ -677,7 +697,7 @@ impl Engine {
             if let Some(pid) = pid {
                 let own_pid = std::process::id() as i32;
                 if is_valid_target_pid(pid, own_pid) {
-                    killed = process::kill_pid(pid).is_ok();
+                    killed = process::kill_observed(pid, process_start_time).is_ok();
                 }
             }
         }
@@ -715,6 +735,7 @@ impl Engine {
                 "blocked": blocked_now,
                 "killed": killed,
                 "target_pid": pid,
+                "process_start_time": process_start_time,
             }),
         );
     }
@@ -1781,7 +1802,8 @@ mod tests {
     use crate::deception::HoneytokenStore;
     use crate::prevention::audit::AuditEmitter;
     use crate::prevention::network::Backend;
-    use crate::prevention::policy::{PolicyHandle, PolicyStore};
+    use crate::prevention::policy::{Match, PolicyHandle, PolicyStore, RuleAction};
+    use crate::prevention::response::{self, AutoAction, Targets};
     use crate::schema::{AgentEvent, EventAction, EventData};
     use std::sync::{Arc, RwLock};
     use tokio::sync::mpsc;
@@ -1809,6 +1831,128 @@ mod tests {
             Arc::new(RwLock::new(AgentConfig::default())),
         );
         (engine, rx)
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    struct ChildFixture(std::process::Child);
+
+    #[cfg(any(target_os = "linux", windows))]
+    impl ChildFixture {
+        fn new() -> Self {
+            #[cfg(windows)]
+            let mut command = {
+                let mut c = std::process::Command::new("ping");
+                c.args(["-n", "60", "127.0.0.1"]);
+                c
+            };
+            #[cfg(target_os = "linux")]
+            let mut command = {
+                let mut c = std::process::Command::new("sleep");
+                c.arg("60");
+                c
+            };
+            Self(
+                command
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+        fn pid(&self) -> i32 {
+            self.0.id() as i32
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    impl Drop for ChildFixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn automatic_execution_never_kills_an_unknown_or_reused_generation() {
+        for stale in [false, true] {
+            let mut child = ChildFixture::new();
+            let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+            let (engine, mut rx) = test_engine();
+            engine.execute_auto(
+                "memory.inject",
+                "memory",
+                "fixture",
+                &Targets {
+                    pid: Some(child.pid()),
+                    process_start_time: stale.then_some(start + 1),
+                    file_path: None,
+                },
+                &response::Decision {
+                    action: AutoAction::Kill,
+                    reason: "test fixture".into(),
+                },
+            );
+            let EventData::Prevention(audit) = rx.try_recv().unwrap().data else {
+                panic!("audit");
+            };
+            assert!(!audit.success);
+            assert_eq!(audit.details["killed"], false);
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn honeytoken_actions_never_control_an_unknown_or_reused_generation() {
+        for level in ["kill", "freeze"] {
+            for stale in [false, true] {
+                let mut child = ChildFixture::new();
+                let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+                let (engine, mut rx) = test_engine();
+                engine.cfg_handle.write().unwrap().honeytoken_response = level.into();
+                let mut data = access(false, None);
+                data.accessor.pid = child.pid();
+                data.accessor.process_start_time = stale.then_some(start + 1);
+                engine.respond_honeytoken(&data).await;
+                let EventData::Prevention(audit) = rx.try_recv().unwrap().data else {
+                    panic!("audit");
+                };
+                assert_eq!(audit.details["killed"], false);
+                assert_eq!(audit.details["frozen"], false);
+                assert!(child.0.try_wait().unwrap().is_none());
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn network_actions_never_kill_an_unknown_or_reused_generation() {
+        for stale in [false, true] {
+            let mut child = ChildFixture::new();
+            let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+            let (engine, mut rx) = test_engine();
+            engine
+                .enforce_net_match(
+                    "203.0.113.7".parse().unwrap(),
+                    443,
+                    Some(child.pid()),
+                    stale.then_some(start + 1),
+                    Match {
+                        rule_id: "fixture".into(),
+                        action: RuleAction::Block,
+                        reason: "fixture".into(),
+                    },
+                    "flow",
+                    None,
+                )
+                .await;
+            let EventData::Prevention(audit) = rx.try_recv().unwrap().data else {
+                panic!("audit");
+            };
+            assert_eq!(audit.details["killed"], false);
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
     }
 
     #[tokio::test]
@@ -1882,7 +2026,8 @@ mod tests {
         // The agent must never target itself via the command channel.
         assert!(!is_valid_target_pid(own, own), "own pid");
         // A real, individual, foreign PID is accepted.
-        assert!(is_valid_target_pid(2, own));
+        assert_eq!(is_valid_target_pid(2, own), !cfg!(windows));
+        assert_eq!(is_valid_target_pid(4, own), !cfg!(windows));
         assert!(is_valid_target_pid(31337, own));
     }
 
@@ -1959,6 +2104,7 @@ mod tests {
             dst_port: 443,
             state: "established".into(),
             pid: Some(424242),
+            process_start_time: None,
             process: Some("curl".into()),
             duration_ms: None,
             bytes_sent: None,
@@ -1993,6 +2139,7 @@ mod tests {
             dst_port: 443,
             state: "established".into(),
             pid: Some(1234),
+            process_start_time: None,
             process: Some("firefox".into()),
             duration_ms: None,
             bytes_sent: None,
@@ -2090,6 +2237,7 @@ mod tests {
             mitre_technique: String::new(),
             accessor: crate::schema::ProcessLineage {
                 pid: 4242,
+                process_start_time: None,
                 uid: 0,
                 gid: 0,
                 username: "root".into(),

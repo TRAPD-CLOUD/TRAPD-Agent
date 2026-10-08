@@ -356,6 +356,20 @@ The agent applies the same rule internally: its `/proc` poller reports a
 recycled PID as a termination followed by a creation, rather than seeing the
 PID in two consecutive polls and emitting neither.
 
+On Windows, `process_start_time` is the native process-creation FILETIME.
+Network connections, honeytoken accessor lineage and ransomware indicators
+also carry an optional observed `process_start_time`. Automatic process control
+requires that generation and compares it against the action handle (Windows)
+or a PID-stable pidfd (Linux); missing identity only permits an alert.
+
+Linux honeytoken kernel events append their original `bpf_ktime_get_ns` timestamp.
+Older kernel objects still decode as access telemetry but lack an identity that
+can authorize automatic process control. Attribution requires the end of the
+observed `/proc` creation tick to precede that timestamp and a stable start time
+across enrichment. Creation-tick ambiguity, and processes started after host
+suspend whose boottime starts exceed the monotonic event time, conservatively
+remain unattributed; the detection is retained and destructive control is denied.
+
 ### Partial enrichment
 
 `/proc` enrichment happens *after* the kernel event, so a short-lived process —

@@ -8,6 +8,7 @@
 //! * the auditd event-id aggregator ([`AuditAggregator`]) — `SYSCALL` +
 //!   `EXECVE` + `PATH` + `EOE` share one `msg=audit(epoch:serial)`.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -198,49 +199,25 @@ impl MultilineAggregator {
 /// record.
 #[derive(Default)]
 pub struct W3cAggregator {
-    fields: Vec<String>,
+    fields: Arc<Vec<String>>,
 }
 
-/// IIS's default column set, used when a file is tailed from the middle (after
-/// an agent restart) and its `#Fields:` header was never seen.
-const IIS_DEFAULT_FIELDS: &[&str] = &[
-    "date",
-    "time",
-    "s-ip",
-    "cs-method",
-    "cs-uri-stem",
-    "cs-uri-query",
-    "s-port",
-    "cs-username",
-    "c-ip",
-    "cs(User-Agent)",
-    "cs(Referer)",
-    "sc-status",
-    "sc-substatus",
-    "sc-win32-status",
-    "time-taken",
-];
-
 impl W3cAggregator {
+    pub fn restore_fields(&mut self, fields: Arc<Vec<String>>) {
+        self.fields = fields;
+    }
+
     pub fn push(&mut self, line: &str) -> Vec<String> {
         let line = line.trim_end();
         if let Some(rest) = line.strip_prefix("#Fields:") {
-            self.fields = rest.split_whitespace().map(str::to_string).collect();
+            self.fields = Arc::new(rest.split_whitespace().map(str::to_string).collect());
             return Vec::new();
         }
         if line.is_empty() || line.starts_with('#') {
             return Vec::new();
         }
         let values: Vec<&str> = line.split(' ').collect();
-        let names: Vec<&str> = if self.fields.is_empty() {
-            if values.len() != IIS_DEFAULT_FIELDS.len() {
-                // Not the default layout and no header: refuse to guess.
-                return vec![line.to_string()];
-            }
-            IIS_DEFAULT_FIELDS.to_vec()
-        } else {
-            self.fields.iter().map(String::as_str).collect()
-        };
+        let names: Vec<&str> = self.fields.iter().map(String::as_str).collect();
         if names.len() != values.len() {
             // A malformed or truncated line keeps its original text.
             return vec![line.to_string()];
@@ -446,14 +423,10 @@ mod tests {
     }
 
     #[test]
-    fn w3c_without_a_header_falls_back_to_iis_defaults_only_when_the_shape_matches() {
+    fn w3c_without_a_header_keeps_raw_data_instead_of_guessing_the_column_order() {
         let mut a = W3cAggregator::default();
         let line = "2026-10-08 12:00:01 10.0.0.5 GET /a - 443 - 203.0.113.9 curl/8 - 200 0 0 12";
-        let out = a.push(line);
-        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
-        assert_eq!(v["cs-uri-stem"], "/a");
-        assert_eq!(v["sc-status"], "200");
-        // Anything else without a header is kept verbatim.
+        assert_eq!(a.push(line), vec![line.to_string()]);
         assert_eq!(a.push("one two three"), vec!["one two three".to_string()]);
     }
 }

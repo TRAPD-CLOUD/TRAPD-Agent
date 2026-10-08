@@ -2,8 +2,8 @@
 //! contract as the Linux `kill(2)` path.
 //!
 //! * A bare PID is not an identity on Windows either; PIDs are reused quickly.
-//!   When the caller knows the creation time (the exec event carries it), the
-//!   handle is opened, the creation FILETIME compared, and only then acted on —
+//!   Every destructive call requires the observed creation time. The handle
+//!   is opened, its creation FILETIME compared, and only then acted on —
 //!   so a response aimed at a process that already exited can never hit the
 //!   unrelated process that inherited its PID.
 //! * Core system processes are refused ([`super::winguard`]). The decision is
@@ -13,17 +13,46 @@
 //!   closed): an unattributable process is not terminated blind.
 
 use anyhow::{anyhow, bail, Result};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE,
 };
 
 use super::winguard;
 
 /// Owned process handle, closed on drop.
 struct Process(HANDLE);
+
+// SAFETY: owned process handles can be used/closed from any Windows thread;
+// transfers remain exclusive and the suspension map serializes mutations.
+unsafe impl Send for Process {}
+
+/// One retained HANDLE per suspension the agent owns. The handle pins the
+/// generation, while the lock prevents concurrent commands incrementing twice.
+struct Suspension {
+    handle: Process,
+    frozen: bool,
+}
+
+fn suspended() -> &'static Mutex<HashMap<(i32, u64), Suspension>> {
+    static STATE: OnceLock<Mutex<HashMap<(i32, u64), Suspension>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn still_running(p: &Process) -> bool {
+    // SAFETY: retained handles include SYNCHRONIZE; zero timeout never blocks.
+    // Waiting also handles a terminated process whose real exit code is 259
+    // (STILL_ACTIVE), which GetExitCodeProcess alone cannot distinguish.
+    unsafe {
+        windows_sys::Win32::System::Threading::WaitForSingleObject(p.0, 0)
+            == windows_sys::Win32::Foundation::WAIT_TIMEOUT
+    }
+}
 
 impl Drop for Process {
     fn drop(&mut self) {
@@ -93,8 +122,9 @@ fn open_target(pid: i32, access: u32, expected_start: Option<u64>) -> Result<Pro
     Ok(process)
 }
 
-/// Terminate `pid` (optionally only if its creation time still matches).
+/// Terminate `pid` only if its observed creation time still matches.
 pub fn terminate(pid: i32, expected_start: Option<u64>) -> Result<()> {
+    require_generation(pid, expected_start)?;
     let p = open_target(pid, PROCESS_TERMINATE, expected_start)?;
     // SAFETY: valid handle with PROCESS_TERMINATE access.
     if unsafe { TerminateProcess(p.0, 1) } == 0 {
@@ -129,9 +159,14 @@ fn ntdll_fn(name: &[u8]) -> Result<NtProcessFn> {
     }
 }
 
-fn nt_call(pid: i32, symbol: &[u8], expected_start: Option<u64>, verb: &str) -> Result<()> {
+fn require_generation(pid: i32, expected_start: Option<u64>) -> Result<u64> {
+    expected_start
+        .filter(|start| *start > 0)
+        .ok_or_else(|| anyhow!("unknown observed identity for pid {pid}; refusing"))
+}
+
+fn nt_call(p: &Process, pid: i32, symbol: &[u8], verb: &str) -> Result<()> {
     let f = ntdll_fn(symbol)?;
-    let p = open_target(pid, PROCESS_SUSPEND_RESUME, expected_start)?;
     // SAFETY: valid handle with PROCESS_SUSPEND_RESUME access.
     let status = unsafe { f(p.0) };
     if status < 0 {
@@ -140,14 +175,62 @@ fn nt_call(pid: i32, symbol: &[u8], expected_start: Option<u64>, verb: &str) -> 
     Ok(())
 }
 
-/// Suspend every thread of `pid` — the "freeze" response.
+/// Suspend once per observed process generation. Repeated freezes are idempotent.
 pub fn suspend(pid: i32, expected_start: Option<u64>) -> Result<()> {
-    nt_call(pid, b"NtSuspendProcess\0", expected_start, "suspend")
+    let start = require_generation(pid, expected_start)?;
+    let p = open_target(
+        pid,
+        PROCESS_SUSPEND_RESUME | PROCESS_SYNCHRONIZE,
+        Some(start),
+    )?;
+    let mut state = suspended()
+        .lock()
+        .map_err(|_| anyhow!("suspension state poisoned"))?;
+    state.retain(|_, p| still_running(&p.handle));
+    if state.get(&(pid, start)).is_some_and(|p| p.frozen) {
+        return Ok(());
+    }
+    nt_call(&p, pid, b"NtSuspendProcess\0", "suspend")?;
+    state.insert(
+        (pid, start),
+        Suspension {
+            handle: p,
+            frozen: true,
+        },
+    );
+    Ok(())
 }
 
-/// Resume a process frozen by [`suspend`].
+/// Thaw a verified generation from an explicitly signed operator command.
+/// Tracked repeated thaws are idempotent. An untracked generation is allowed
+/// one native resume so an operator can recover freezes across agent restart.
 pub fn resume(pid: i32, expected_start: Option<u64>) -> Result<()> {
-    nt_call(pid, b"NtResumeProcess\0", expected_start, "resume")
+    let start = require_generation(pid, expected_start)?;
+    let current = open_target(
+        pid,
+        PROCESS_SUSPEND_RESUME | PROCESS_SYNCHRONIZE,
+        Some(start),
+    )?;
+    let mut state = suspended()
+        .lock()
+        .map_err(|_| anyhow!("suspension state poisoned"))?;
+    state.retain(|_, p| still_running(&p.handle));
+    if let Some(p) = state.get_mut(&(pid, start)) {
+        if p.frozen {
+            nt_call(&p.handle, pid, b"NtResumeProcess\0", "resume")?;
+            p.frozen = false;
+        }
+        return Ok(());
+    }
+    nt_call(&current, pid, b"NtResumeProcess\0", "resume")?;
+    state.insert(
+        (pid, start),
+        Suspension {
+            handle: current,
+            frozen: false,
+        },
+    );
+    Ok(())
 }
 
 /// File name of the image `pid` runs (the Windows analogue of Linux `comm`),
@@ -339,9 +422,7 @@ pub fn thread_start_addresses() -> std::collections::HashMap<i32, Vec<u64>> {
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
-    use windows_sys::Win32::System::Threading::{
-        OpenThread, THREAD_QUERY_INFORMATION, THREAD_QUERY_LIMITED_INFORMATION,
-    };
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_QUERY_INFORMATION};
 
     let mut out: HashMap<i32, Vec<u64>> = HashMap::new();
     // SAFETY: the snapshot handle is closed on every path; `entry` is a
@@ -355,11 +436,9 @@ pub fn thread_start_addresses() -> std::collections::HashMap<i32, Vec<u64>> {
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
         let mut more = Thread32First(snapshot, &mut entry);
         while more != 0 {
-            // Limited access is enough on current Windows; fall back for older.
-            let mut handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, entry.th32ThreadID);
-            if handle.is_null() {
-                handle = OpenThread(THREAD_QUERY_INFORMATION, 0, entry.th32ThreadID);
-            }
+            // ThreadQuerySetWin32StartAddress needs QUERY_INFORMATION; a
+            // limited handle can open successfully and still reject the query.
+            let handle = OpenThread(THREAD_QUERY_INFORMATION, 0, entry.th32ThreadID);
             if !handle.is_null() {
                 let mut start: usize = 0;
                 let status = NtQueryInformationThread(
@@ -490,6 +569,92 @@ mod tests {
         resume(child.id() as i32, Some(start)).expect("resume");
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn unknown_generation_never_terminates_or_suspends() {
+        let mut child = sleeper();
+        assert!(terminate(child.id() as i32, None).is_err());
+        assert!(suspend(child.id() as i32, None).is_err());
+        assert!(child.try_wait().unwrap().is_none());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn repeated_freeze_requires_only_one_thaw() {
+        let mut child = Command::new("ping")
+            .args(["-n", "2", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start = start_of(&child);
+        suspend(pid, Some(start)).unwrap();
+        suspend(pid, Some(start)).unwrap();
+        resume(pid, Some(start)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("one thaw after repeated freezes must let the child complete");
+    }
+
+    #[test]
+    fn a_thawed_generation_can_be_frozen_again() {
+        let mut child = Command::new("ping")
+            .args(["-n", "2", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start = start_of(&child);
+        suspend(pid, Some(start)).unwrap();
+        resume(pid, Some(start)).unwrap();
+        suspend(pid, Some(start)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let alive = child.try_wait().unwrap().is_none();
+        let thawed = resume(pid, Some(start));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            alive,
+            "second freeze must actually suspend the previously thawed child"
+        );
+        thawed.unwrap();
+    }
+
+    #[test]
+    fn repeated_thaw_does_not_release_a_foreign_suspension() {
+        let mut child = Command::new("ping")
+            .args(["-n", "2", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start = start_of(&child);
+        suspend(pid, Some(start)).unwrap();
+        resume(pid, Some(start)).unwrap();
+        let foreign = open_target(pid, PROCESS_SUSPEND_RESUME, Some(start)).unwrap();
+        nt_call(&foreign, pid, b"NtSuspendProcess\0", "foreign suspend").unwrap();
+        resume(pid, Some(start)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = nt_call(&foreign, pid, b"NtResumeProcess\0", "foreign resume");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            alive,
+            "repeated thaw must preserve another owner's suspend count"
+        );
     }
 
     #[test]

@@ -62,6 +62,16 @@ fn table(family: u32) -> Result<Vec<u32>> {
 }
 
 pub fn snapshot() -> Result<Vec<NetworkConnectionData>> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes();
+    let starts: HashMap<i32, u64> = system
+        .processes()
+        .keys()
+        .filter_map(|pid| {
+            let pid = pid.as_u32() as i32;
+            crate::telemetry::identity::process_start_time(pid).map(|start| (pid, start))
+        })
+        .collect();
     let mut out = Vec::new();
     for (family, row_size) in [
         (AF_INET as u32, std::mem::size_of::<MIB_TCPROW_OWNER_PID>()),
@@ -116,6 +126,11 @@ pub fn snapshot() -> Result<Vec<NetworkConnectionData>> {
                 dst_port,
                 state: if state == 2 { "listen" } else { "established" }.into(),
                 pid: i32::try_from(pid).ok(),
+                process_start_time: i32::try_from(pid).ok().and_then(|pid| {
+                    starts.get(&pid).copied().filter(|start| {
+                        crate::telemetry::identity::process_start_time(pid) == Some(*start)
+                    })
+                }),
                 process: None,
                 duration_ms: None,
                 bytes_sent: None,
@@ -158,7 +173,12 @@ impl Collector for NetworkCollector {
             for row in rows.into_iter().filter(|r| r.state == "established") {
                 let key = format!(
                     "{}:{}:{}:{}:{}:{:?}",
-                    row.protocol, row.src_addr, row.src_port, row.dst_addr, row.dst_port, row.pid
+                    row.protocol,
+                    row.src_addr,
+                    row.src_port,
+                    row.dst_addr,
+                    row.dst_port,
+                    (row.pid, row.process_start_time)
                 );
                 let since = known
                     .get(&key)
@@ -205,5 +225,22 @@ impl Collector for NetworkCollector {
             }
             known = current;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_tcp_snapshot_binds_socket_owner_to_observed_generation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pid = std::process::id() as i32;
+        let expected = crate::telemetry::identity::process_start_time(pid).unwrap();
+        let rows = snapshot().unwrap();
+        let row = rows.iter().find(|row| row.pid == Some(pid) && row.src_port == port)
+            .expect("own TCP listener is visible in the native owner-PID table");
+        assert_eq!(row.process_start_time, Some(expected));
     }
 }

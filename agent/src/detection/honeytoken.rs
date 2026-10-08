@@ -270,6 +270,8 @@ fn trusted_executable(path: &std::path::Path) -> Option<(u64, u64)> {
 /// The raw kernel-reported access, before enrichment.
 pub struct AccessHit<'a> {
     pub pid: i32,
+    /// Original bpf_ktime_get_ns timestamp; legacy kernel events have none.
+    pub observed_monotonic_ns: Option<u64>,
     pub uid: u32,
     pub gid: u32,
     pub comm: &'a str,
@@ -494,6 +496,30 @@ fn normalized_hit<'a>(hit: &AccessHit<'a>) -> AccessHit<'a> {
     }
 }
 
+/// /proc rounds creation times down to a boot-clock tick. Require the END
+/// of that tick to precede the original kernel timestamp, so reuse within the
+/// same tick cannot authorize action. Boottime is never less than monotonic:
+/// after suspend this may conservatively decline attribution, never accept a
+/// process born after the recorded access. Legacy records have no timestamp.
+fn generation_before_access(start: u64, observed_ns: u64, ticks_per_second: u64) -> bool {
+    start > 0 && observed_ns > 0 && ticks_per_second > 0
+        && (u128::from(start) + 1) * 1_000_000_000
+            <= u128::from(observed_ns) * u128::from(ticks_per_second)
+}
+
+fn observed_access_generation(hit: &AccessHit<'_>, proc: &dyn ProcInfo) -> Option<u64> {
+    let observed = hit.observed_monotonic_ns?;
+    let start = proc.process_start_time(hit.pid)?;
+    #[cfg(target_os = "linux")]
+    let ticks = {
+        // SAFETY: sysconf has no pointers and queries a constant property.
+        u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let ticks = 0;
+    generation_before_access(start, observed, ticks).then_some(start)
+}
+
 fn build_event(
     agent_id: &str,
     hostname: &str,
@@ -503,8 +529,10 @@ fn build_event(
 ) -> Option<AgentEvent> {
     let normalized = normalized_hit(hit);
     let hit = &normalized;
-    let accessor = ProcessLineage {
+    let observed_start = observed_access_generation(hit, proc);
+    let mut accessor = ProcessLineage {
         pid: hit.pid,
+        process_start_time: None,
         uid: hit.uid,
         gid: hit.gid,
         username: proc.username(hit.uid),
@@ -513,6 +541,8 @@ fn build_event(
         cmdline: proc.cmdline(hit.pid),
         ancestors: build_ancestry(hit.pid, proc),
     };
+    accessor.process_start_time = observed_start
+        .filter(|start| proc.process_start_time(hit.pid) == Some(*start));
 
     let (label, severity, confidence, tactic, technique) = hit.access_kind.describe();
 
@@ -605,6 +635,7 @@ fn build_ancestry(pid: i32, proc: &dyn ProcInfo) -> Vec<ProcessAncestor> {
 /// Process-info source. Abstracted so the lineage walk is testable without a
 /// live `/proc`.
 pub trait ProcInfo {
+    fn process_start_time(&self, _pid: i32) -> Option<u64> { None }
     fn ppid(&self, pid: i32) -> Option<i32>;
     fn comm(&self, pid: i32) -> Option<String>;
     fn exe(&self, pid: i32) -> Option<String>;
@@ -619,6 +650,9 @@ pub trait ProcInfo {
 pub struct RealProc;
 
 impl ProcInfo for RealProc {
+    fn process_start_time(&self, pid: i32) -> Option<u64> {
+        crate::telemetry::identity::process_start_time(pid)
+    }
     fn ppid(&self, pid: i32) -> Option<i32> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         parse_stat_ppid(&stat)
@@ -757,12 +791,14 @@ mod tests {
     /// In-memory `/proc` for lineage tests.
     struct FakeProc {
         ppid: HashMap<i32, i32>,
+        start: Option<u64>,
         comm: HashMap<i32, String>,
         exe: HashMap<i32, String>,
         tty: Option<String>,
         session_resolved: bool,
     }
     impl ProcInfo for FakeProc {
+        fn process_start_time(&self, _pid: i32) -> Option<u64> { self.start }
         fn ppid(&self, pid: i32) -> Option<i32> {
             self.ppid.get(&pid).copied()
         }
@@ -799,11 +835,38 @@ mod tests {
         comm.insert(1, "systemd".to_string());
         FakeProc {
             ppid,
+            start: None,
             comm,
             exe: HashMap::new(),
             tty: None,
             session_resolved: false,
         }
+    }
+
+    #[test]
+    fn access_generation_rejects_reused_and_ambiguous_start_ticks() {
+        assert!(generation_before_access(100, 1_020_000_000, 100));
+        assert!(!generation_before_access(103, 1_020_000_000, 100));
+        assert!(!generation_before_access(101, 1_019_000_000, 100));
+        assert!(!generation_before_access(100, 1_005_000_000, 100));
+        assert!(!generation_before_access(100, 0, 100));
+        assert!(!generation_before_access(0, 1_020_000_000, 100));
+        assert!(!generation_before_access(100, 1_020_000_000, 0));
+        // /proc boottime tick after suspend is ahead of original monotonic;
+        // conservative rejection preserves the bystander rather than guessing.
+        assert!(!generation_before_access(10_000, 1_020_000_000, 100));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn honeytoken_generation_is_bound_to_original_access() {
+        let mut proc = fake(); proc.start = Some(1);
+        let hit = AccessHit { pid: 100, observed_monotonic_ns: Some(2_000_000_000),
+            uid: 1000, gid: 1000, comm: "cat", open_flags: 0, token_id: "t",
+            path: "/tmp/token", kind: "test", access_kind: AccessKind::Openat };
+        let event = build_event("a", "h", &hit, false, &proc).unwrap();
+        let EventData::HoneytokenAccess(data) = event.data else { panic!("payload"); };
+        assert_eq!(data.accessor.process_start_time, Some(1));
     }
 
     #[test]
@@ -820,6 +883,7 @@ mod tests {
         let al = Allowlist::new(999, &[]);
         let hit = AccessHit {
             pid: 999, // the agent itself
+            observed_monotonic_ns: None,
             uid: 0,
             gid: 0,
             comm: "trapd-agent",
@@ -873,6 +937,7 @@ mod tests {
         let al = Allowlist::new(999, &[]);
         let hit = AccessHit {
             pid: 100,
+            observed_monotonic_ns: None,
             uid: 1000,
             gid: 1000,
             comm: "cat",
@@ -919,6 +984,7 @@ mod tests {
         let al = Allowlist::new(999, &[]);
         let mk = |k| AccessHit {
             pid: 100,
+            observed_monotonic_ns: None,
             uid: 1000,
             gid: 1000,
             comm: "x",
@@ -955,6 +1021,7 @@ mod tests {
         let al = Allowlist::new(999, &[]);
         let hit = AccessHit {
             pid: 100,
+            observed_monotonic_ns: None,
             uid: 1000,
             gid: 1000,
             comm: "find",
@@ -990,6 +1057,7 @@ mod tests {
         ] {
             let hit = AccessHit {
                 pid: 100,
+            observed_monotonic_ns: None,
                 uid: 1000,
                 gid: 1000,
                 comm: "sh",
@@ -1026,6 +1094,7 @@ mod tests {
     fn sweeper_hit(pid: i32, access_kind: AccessKind) -> AccessHit<'static> {
         AccessHit {
             pid,
+            observed_monotonic_ns: None,
             uid: 0,
             gid: 0,
             comm: "restic",
@@ -1164,6 +1233,7 @@ mod tests {
         let al = Allowlist::new(999, &[]);
         let hit = AccessHit {
             pid: 100,
+            observed_monotonic_ns: None,
             uid: 1000,
             gid: 1000,
             comm: "restic", // a renamed binary gains nothing

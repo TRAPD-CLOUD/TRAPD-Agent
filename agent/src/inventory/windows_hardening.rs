@@ -18,7 +18,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use super::compliance::CisFinding;
-use crate::prevention::netsh;
+use crate::prevention::firewall;
 
 /// Read-only access to `HKLM` DWORD values.
 pub trait Registry {
@@ -91,16 +91,16 @@ pub fn evaluate(reg: &dyn Registry) -> Vec<CisFinding> {
 
     // Windows Defender Firewall, per profile (group policy overrides local).
     let mut off = Vec::new();
-    for profile in netsh::FIREWALL_PROFILES {
+    for profile in firewall::FIREWALL_PROFILES {
         let policy = reg.dword(
-            &format!("{}\\{profile}", netsh::FIREWALL_POLICY_PROFILES),
+            &format!("{}\\{profile}", firewall::FIREWALL_POLICY_PROFILES),
             "EnableFirewall",
         );
         let local = reg.dword(
-            &format!("{}\\{profile}", netsh::FIREWALL_LOCAL_PROFILES),
+            &format!("{}\\{profile}", firewall::FIREWALL_LOCAL_PROFILES),
             "EnableFirewall",
         );
-        if !netsh::profile_enforcing(policy, local) {
+        if !firewall::profile_enforcing(policy, local) {
             off.push(profile);
         }
     }
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn group_policy_firewall_off_beats_a_local_on_and_names_the_profile() {
         let f = evaluate(&Fake::default().with(
-            &format!("{}\\PublicProfile", netsh::FIREWALL_POLICY_PROFILES),
+            &format!("{}\\PublicProfile", firewall::FIREWALL_POLICY_PROFILES),
             "EnableFirewall",
             0,
         ));

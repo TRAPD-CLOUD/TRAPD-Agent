@@ -485,6 +485,7 @@ fn test_honeytoken_access_event_with_session_roundtrip() {
         mitre_technique: "T1552.001".to_string(),
         accessor: ProcessLineage {
             pid: 4242,
+            process_start_time: None,
             uid: 1000,
             gid: 1000,
             username: "alice".to_string(),

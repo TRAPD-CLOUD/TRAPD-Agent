@@ -8,7 +8,7 @@
 //!   4. `chmod 000` and `chattr +i` (immutable) so the payload can't run or
 //!      be tampered with without explicit root removal of the `+i` flag.
 //!      On Windows the DACL is replaced by SYSTEM + Administrators only and the
-//!      file is marked read-only; the original DACL is kept in the record.
+//!      owner is SYSTEM; the original owner and DACL are kept in the record.
 //!   5. Append a `QuarantineRecord` to the JSON index for restoration.
 //!
 //! Restore reverses every step.  Both write to the index atomically.
@@ -38,7 +38,8 @@ pub struct QuarantineRecord {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
-    /// Windows only: the file's original DACL (SDDL), re-applied on restore.
+    /// Windows only: original owner + DACL (SDDL), re-applied on restore.
+    /// Older records contain only a DACL and remain compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_descriptor: Option<String>,
     pub quarantined_at: DateTime<Utc>,
@@ -74,6 +75,59 @@ impl QuarantineIndex {
 
 /// Quarantine a file.  Returns the record (also persisted to the index).
 pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
+    #[cfg(windows)]
+    {
+        // An explicitly signed operator target may use aliases. Resolve them
+        // before pinning; automatic-only OS exclusions do not apply here.
+        let resolved = fs::canonicalize(path).context("resolve signed quarantine target")?;
+        let mut source = super::winquarantine::Source::pin(&resolved)?;
+        quarantine_inner(&resolved, Some(&mut source))
+    }
+    #[cfg(not(windows))]
+    quarantine_inner(path)
+}
+
+/// Windows copies a fresh object to revoke even previously granted source
+/// handles. Bound primary + alternate data streams before hashing/copying so
+/// sparse or enormous files cannot exhaust the state volume or stall collection.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn checked_windows_copy_size(sizes: impl IntoIterator<Item = u64>) -> Result<u64> {
+    const MAX_COPY_BYTES: u64 = 1 << 30;
+    let mut total = 0u64;
+    for size in sizes {
+        total = total
+            .checked_add(size)
+            .context("quarantine stream sizes overflow")?;
+    }
+    if total > MAX_COPY_BYTES {
+        bail!("Windows quarantine exceeds the aggregate 1 GiB copy limit");
+    }
+    Ok(total)
+}
+
+/// Automatic targets are untrusted. Windows retains all source/parent handles
+/// through validation and copying so a junction or leaf replacement cannot
+/// redirect privileged file operations after canonicalization.
+pub fn quarantine_automatic(path: &Path) -> Result<QuarantineRecord> {
+    #[cfg(windows)]
+    {
+        let mut source = super::winquarantine::Source::pin(path)?;
+        let validated = super::response::validated_quarantine_path(
+            path.to_str().context("quarantine target is not Unicode")?,
+        )
+        .context("automatic quarantine target is protected or invalid")?;
+        quarantine_inner(Path::new(&validated), Some(&mut source))
+    }
+    #[cfg(not(windows))]
+    {
+        quarantine_inner(path)
+    }
+}
+
+fn quarantine_inner(
+    path: &Path,
+    #[cfg(windows)] native: Option<&mut super::winquarantine::Source>,
+) -> Result<QuarantineRecord> {
     if !path.exists() {
         bail!("quarantine target does not exist: {}", path.display());
     }
@@ -90,23 +144,35 @@ pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
     let (mode, uid, gid) = (0u32, 0u32, 0u32);
 
     let sha = sha256_of(path)?;
-    let original_security = capture_security(path);
+    let original_security = capture_security(path)?;
 
     fs::create_dir_all(quarantine_dir()).context("create quarantine dir")?;
     let _ = set_mode(&quarantine_dir(), 0o700);
     #[cfg(windows)]
-    if let Err(e) = crate::winacl::set_dacl(&quarantine_dir(), crate::winacl::PRIVATE_DIR_SDDL) {
-        warn!(error = %e, "cannot restrict the quarantine directory to SYSTEM/Administrators");
-    }
+    crate::winacl::set_file_security(&quarantine_dir(), "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+        .context("restrict quarantine directory owner and DACL")?;
 
+    let id = Uuid::new_v4();
+    #[cfg(windows)]
+    let stored = quarantine_dir().join(if native.is_some() {
+        format!("{sha}-{id}.bin")
+    } else {
+        format!("{sha}.bin")
+    });
+    #[cfg(not(windows))]
     let stored = quarantine_dir().join(format!("{sha}.bin"));
 
-    move_or_copy(path, &stored)?;
-
-    lock_down(&stored);
+    #[cfg(windows)]
+    if let Some(source) = native.as_ref() {
+        source.copy_to(&stored)?;
+    } else {
+        move_into_quarantine(path, &stored, &original_security)?;
+    }
+    #[cfg(not(windows))]
+    move_into_quarantine(path, &stored, &original_security)?;
 
     let record = QuarantineRecord {
-        id: Uuid::new_v4(),
+        id,
         original_path: path.to_string_lossy().into_owned(),
         stored_path: stored.to_string_lossy().into_owned(),
         sha256: sha,
@@ -120,6 +186,16 @@ pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
 
     let mut idx = QuarantineIndex::load();
     idx.records.push(record.clone());
+    #[cfg(windows)]
+    if let Err(error) = idx.save() {
+        if let Some(source) = native {
+            source
+                .cancel(&stored)
+                .context("undo unindexed automatic quarantine")?;
+        }
+        return Err(error);
+    }
+    #[cfg(not(windows))]
     idx.save()?;
 
     info!(
@@ -153,7 +229,12 @@ pub fn restore(quarantine_id: &Uuid) -> Result<QuarantineRecord> {
 
     move_or_copy(stored, original)?;
 
-    restore_attributes(original, &record);
+    if let Err(error) = restore_attributes(original, &record) {
+        // Preserve the indexed stored location when original security cannot be
+        // restored. The index has not yet been removed on disk.
+        move_or_copy(original, stored).context("return failed restore to quarantine")?;
+        return Err(error);
+    }
 
     idx.save()?;
     info!(
@@ -176,6 +257,29 @@ fn sha256_of(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Protect the Windows source before publishing a predictable stored path. A
+/// same-volume rename preserves that owner/DACL; cross-volume copies receive
+/// the protected directory ACL and are explicitly assigned SYSTEM ownership.
+fn move_into_quarantine(src: &Path, dst: &Path, original_security: &Option<String>) -> Result<()> {
+    #[cfg(windows)]
+    lock_down(src)?;
+    let result = move_or_copy(src, dst).and_then(|()| lock_down(dst));
+    #[cfg(windows)]
+    if let Err(error) = result {
+        if !src.exists() && dst.exists() {
+            move_or_copy(dst, src).context("undo failed quarantine movement")?;
+        }
+        if let Some(sddl) = original_security {
+            crate::winacl::set_file_security(src, sddl)
+                .context("restore original security after failed quarantine movement")?;
+        }
+        return Err(error);
+    }
+    #[cfg(not(windows))]
+    let _ = original_security;
+    result
 }
 
 fn move_or_copy(src: &Path, dst: &Path) -> Result<()> {
@@ -244,7 +348,7 @@ fn chown(_p: &Path, _u: u32, _g: u32) -> Result<()> {
 
 /// Make the stored payload unusable and tamper-resistant: `chmod 000` +
 /// `chattr +i` on Linux, a SYSTEM/Administrators-only DACL on Windows.
-fn lock_down(stored: &Path) {
+fn lock_down(stored: &Path) -> Result<()> {
     #[cfg(not(windows))]
     {
         if let Err(e) = set_mode(stored, 0o000) {
@@ -256,10 +360,10 @@ fn lock_down(stored: &Path) {
     }
     #[cfg(windows)]
     {
-        if let Err(e) = crate::winacl::set_dacl(stored, crate::winacl::PRIVATE_FILE_SDDL) {
-            warn!(path = %stored.display(), error = %e, "locking down the quarantined file failed");
-        }
+        crate::winacl::set_file_security(stored, crate::winacl::QUARANTINE_FILE_SDDL)
+            .context("assign SYSTEM ownership and restrict quarantined payload")?;
     }
+    Ok(())
 }
 
 fn unlock(stored: &Path) {
@@ -275,25 +379,21 @@ fn unlock(stored: &Path) {
 }
 
 /// Original ACL of `path` (Windows); Unix keeps mode/uid/gid instead.
-fn capture_security(path: &Path) -> Option<String> {
+fn capture_security(path: &Path) -> Result<Option<String>> {
     #[cfg(windows)]
     {
-        match crate::winacl::get_dacl(path) {
-            Ok(sddl) => Some(sddl),
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "cannot capture the original DACL");
-                None
-            }
-        }
+        crate::winacl::get_file_security(path)
+            .map(Some)
+            .context("capture original owner and DACL before quarantine")
     }
     #[cfg(not(windows))]
     {
         let _ = path;
-        None
+        Ok(None)
     }
 }
 
-fn restore_attributes(original: &Path, record: &QuarantineRecord) {
+fn restore_attributes(original: &Path, record: &QuarantineRecord) -> Result<()> {
     #[cfg(not(windows))]
     {
         let _ = set_mode(original, record.mode);
@@ -303,9 +403,8 @@ fn restore_attributes(original: &Path, record: &QuarantineRecord) {
     {
         match &record.security_descriptor {
             Some(sddl) => {
-                if let Err(e) = crate::winacl::set_dacl(original, sddl) {
-                    warn!(path = %original.display(), error = %e, "restoring the original DACL failed");
-                }
+                crate::winacl::set_file_security(original, sddl)
+                    .context("restore original owner and DACL")?;
             }
             None => warn!(
                 path = %original.display(),
@@ -313,6 +412,7 @@ fn restore_attributes(original: &Path, record: &QuarantineRecord) {
             ),
         }
     }
+    Ok(())
 }
 
 /// Toggle the ext-family `i` (immutable) attribute via `chattr(1)`.
@@ -353,6 +453,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_copy_budget_counts_all_streams_and_rejects_overflow() {
+        assert_eq!(checked_windows_copy_size([1 << 30]).unwrap(), 1 << 30);
+        assert_eq!(checked_windows_copy_size([7, 0, 11]).unwrap(), 18);
+        assert!(checked_windows_copy_size([1 << 29, (1 << 29) + 1]).is_err());
+        assert!(checked_windows_copy_size([u64::MAX, 1]).is_err());
+    }
+
+    #[test]
     fn records_written_before_the_security_descriptor_field_still_load() {
         let legacy = r#"{"records":[{"id":"3f2b6f0e-6e4e-4f0e-9d58-0a1a2b3c4d5e",
             "original_path":"/tmp/x","stored_path":"/var/lib/trapd/quarantine/ab.bin",
@@ -379,31 +487,129 @@ mod windows_tests {
     use super::*;
 
     #[test]
+    fn failed_quarantine_move_restores_the_original_owner_and_dacl() {
+        let dir = std::env::temp_dir().join(format!("trapd-q-failed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("payload.exe");
+        std::fs::write(&victim, b"payload").unwrap();
+        let original = crate::winacl::get_file_security(&victim).unwrap();
+        let target = dir.join("missing-parent/payload.bin");
+        assert!(move_into_quarantine(&victim, &target, &Some(original.clone())).is_err());
+        assert!(victim.exists());
+        let after = crate::winacl::get_file_security(&victim).unwrap();
+        assert_eq!(after.split("D:").next(), original.split("D:").next());
+        assert_eq!(after.split('(').count(), original.split('(').count());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn quarantine_locks_the_payload_down_and_restore_brings_it_back() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            READ_CONTROL, WRITE_DAC,
+        };
         let dir = std::env::temp_dir().join(format!("trapd-q-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let victim = dir.join("dropper.exe");
         std::fs::write(&victim, b"MZ-not-really").unwrap();
-        let before = crate::winacl::get_dacl(&victim).unwrap();
+        let zone = |path: &Path| {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(":Zone.Identifier");
+            PathBuf::from(p)
+        };
+        std::fs::write(zone(&victim), b"[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+        let before = crate::winacl::get_file_security(&victim).unwrap();
+        let retained = fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&victim)
+            .unwrap();
+
+        // Positively verify the old grant controls the original before it is
+        // delete-pending. Restore its descriptor before capturing the record.
+        // SAFETY: the retained handle grants WRITE_DAC; null DACL affects only
+        // this temporary original file.
+        assert_eq!(
+            unsafe {
+                SetSecurityInfo(
+                    retained.as_raw_handle() as _,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null::<ACL>(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        assert_ne!(crate::winacl::get_file_security(&victim).unwrap(), before);
+        crate::winacl::set_file_security(&victim, &before).unwrap();
 
         let record = quarantine(&victim).expect("quarantine");
-        assert!(!victim.exists(), "the file must have left its location");
+        // A pre-existing handle delays directory-entry removal. Delete-pending
+        // must already prevent new data access, even while metadata exists.
+        let denied =
+            fs::File::open(&victim).expect_err("pending original must reject new data opens");
+        assert!(
+            matches!(denied.raw_os_error(), Some(5 | 303)),
+            "expected ACCESS_DENIED or DELETE_PENDING, got {denied}"
+        );
         let stored = Path::new(&record.stored_path);
         assert!(stored.exists());
-        let locked = crate::winacl::get_dacl(stored).unwrap();
+        assert_eq!(
+            std::fs::read(zone(stored)).unwrap(),
+            b"[ZoneTransfer]\r\nZoneId=3\r\n"
+        );
+        let locked = crate::winacl::get_file_security(stored).unwrap();
         assert!(
-            locked.starts_with("D:P") && !locked.contains(";;;WD)"),
+            locked.starts_with("O:SY"),
+            "quarantine owner must be SYSTEM: {locked}"
+        );
+        assert!(
+            locked.contains("D:P") && !locked.contains(";;;WD)"),
             "{locked}"
         );
         assert!(
             record.security_descriptor.is_some(),
             "original DACL recorded"
         );
+        // The pre-granted handle still addresses the original generation. A
+        // rename would have the same file identity and fail this assertion.
+        let stored_handle = fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(stored)
+            .unwrap();
+        assert_ne!(
+            super::super::winquarantine::file_identity(&retained).unwrap(),
+            super::super::winquarantine::file_identity(&stored_handle).unwrap()
+        );
+        assert_eq!(crate::winacl::get_file_security(stored).unwrap(), locked);
+        drop(stored_handle);
+        drop(retained);
+        assert!(
+            !victim.exists(),
+            "the original disappears after its last handle closes"
+        );
 
         let restored = restore(&record.id).expect("restore");
         assert_eq!(restored.sha256, record.sha256);
         assert_eq!(std::fs::read(&victim).unwrap(), b"MZ-not-really");
-        let after = crate::winacl::get_dacl(&victim).unwrap();
+        assert_eq!(
+            std::fs::read(zone(&victim)).unwrap(),
+            b"[ZoneTransfer]\r\nZoneId=3\r\n"
+        );
+        let after = crate::winacl::get_file_security(&victim).unwrap();
+        assert_eq!(
+            after.split("D:").next(),
+            before.split("D:").next(),
+            "original owner restored"
+        );
         assert_eq!(
             after.split('(').count(),
             before.split('(').count(),

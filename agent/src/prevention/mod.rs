@@ -24,8 +24,8 @@ pub mod policy;
 pub mod audit;
 pub mod command_puller;
 pub mod engine;
+pub mod firewall;
 pub mod lsm_loader;
-pub mod netsh;
 pub mod network;
 pub mod process;
 pub mod quarantine;
@@ -33,6 +33,10 @@ pub mod response;
 pub mod rtr;
 pub mod runtime;
 pub mod software;
+#[cfg(windows)]
+pub mod winfirewall;
+#[cfg(windows)]
+mod winquarantine;
 pub mod winguard;
 #[cfg(windows)]
 pub mod winproc;
