@@ -126,6 +126,9 @@ pub fn ransom_roots<'a>(
         {
             continue;
         }
+        // A later ancestor subsumes earlier child watches too; registry/account
+        // enumeration order must not create duplicate recursive coverage.
+        roots.retain(|existing| !existing.starts_with(&root));
         if roots.len() > MAX_EXTRA_ROOTS {
             return (roots, true);
         }
@@ -505,6 +508,25 @@ mod tests {
             t
         )
         .is_empty());
+    }
+
+    #[test]
+    fn overlapping_profile_roots_are_deduplicated_in_either_order() {
+        for profiles in [
+            ["D:\\People\\alice", "D:\\People\\alice\\Documents"],
+            ["D:\\People\\alice\\Documents", "D:\\People\\alice"],
+        ] {
+            assert_eq!(
+                ransom_roots(
+                    profiles.map(|path| ("S-1-5-21-1-2-3-1001", path)),
+                    "C:\\Users"
+                ),
+                (
+                    vec!["c:\\users\\".to_string(), "d:\\people\\alice\\".to_string()],
+                    false
+                )
+            );
+        }
     }
 
     #[test]
