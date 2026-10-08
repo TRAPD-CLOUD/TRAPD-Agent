@@ -10,6 +10,8 @@
 pub mod apply;
 pub mod download;
 pub mod manifest;
+#[cfg(windows)]
+pub mod windows;
 
 use std::time::Duration;
 
@@ -18,7 +20,8 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 
 #[cfg(target_os = "linux")]
-use apply::{apply_staged, ApplyContext, Outcome, Platform};
+use apply::Platform;
+use apply::{apply_staged, ApplyContext, Outcome};
 use apply::{StagingPaths, UpdateState};
 use manifest::{verify_offer, UpdateOffer, VerifyContext};
 
@@ -183,6 +186,14 @@ impl Updater {
             0o600,
         )?;
         info!(version = %verified.version, "update: staged, waiting for the apply helper");
+        // Linux has a root path unit watching the staged offer; Windows has no
+        // equivalent, so the service starts the helper itself. The helper
+        // re-verifies everything, so launching it grants a compromised agent
+        // nothing it could not already stage.
+        #[cfg(windows)]
+        if let Err(e) = windows::spawn_apply_helper(&self.paths.dir) {
+            warn!(error = %e, "update: could not start the apply helper; the staged update is retried later");
+        }
         Ok(())
     }
 }
@@ -200,6 +211,13 @@ fn rand_u32() -> u32 {
     let mut b = [0u8; 4];
     let _ = getrandom::fill(&mut b);
     u32::from_le_bytes(b)
+}
+
+/// Whether a verified update is staged or being applied. Other components use
+/// it to tell the update helper's file changes from tampering.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn update_in_flight() -> bool {
+    staging().offer().exists()
 }
 
 /// Called by the heartbeat after a successful beat. While an update is being
@@ -244,7 +262,6 @@ struct CredentialsFile {
 
 /// `trapd-agent --apply-update`: run by a root unit (Linux) or spawned by the
 /// service (Windows). Applies the staged update, or rolls it back.
-#[cfg(target_os = "linux")]
 pub fn run_apply_helper() -> Result<()> {
     let paths = staging();
     if !paths.offer().exists() {
@@ -259,12 +276,24 @@ pub fn run_apply_helper() -> Result<()> {
     let release_key = crate::prevention::commands::load_verifying_key(&release_pubkey_path())?;
     let command_key =
         crate::prevention::commands::load_verifying_key(&crate::prevention::command_pubkey_path())?;
+
+    // Linux replaces the binary the helper itself runs from; Windows runs the
+    // helper from a copy and takes the install path from the SCM.
+    #[cfg(target_os = "linux")]
     let target = std::env::current_exe().context("update: locate running binary")?;
+    #[cfg(windows)]
+    let target = windows::installed_binary_path()?;
+
     // Where `install.sh` puts the eBPF object (first entry of the loaders' search
-    // path). Overridable for non-standard layouts.
-    let ebpf_target = std::env::var_os("TRAPD_EBPF_INSTALL_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/usr/lib/trapd-agent/trapd-agent-exec"));
+    // path). Overridable for non-standard layouts. Linux only.
+    #[cfg(target_os = "linux")]
+    let ebpf_target = Some(
+        std::env::var_os("TRAPD_EBPF_INSTALL_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr/lib/trapd-agent/trapd-agent-exec")),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let ebpf_target: Option<std::path::PathBuf> = None;
 
     let baseline = crate::selfprotect::binary_integrity::hash_store_path();
 
@@ -279,12 +308,16 @@ pub fn run_apply_helper() -> Result<()> {
             last_issued_at: 0,
         },
         target: &target,
-        ebpf_target: Some(&ebpf_target),
+        ebpf_target: ebpf_target.as_deref(),
         baseline: Some(&baseline),
         paths: &paths,
         health_timeout: HEALTH_TIMEOUT,
     };
-    match apply_staged(&ctx, &SystemdPlatform)? {
+    #[cfg(target_os = "linux")]
+    let platform = SystemdPlatform;
+    #[cfg(windows)]
+    let platform = windows::ScmPlatform;
+    match apply_staged(&ctx, &platform)? {
         Outcome::Applied { version } => info!(%version, "update: applied"),
         Outcome::RolledBack { attempted } => error!(%attempted, "update: rolled back"),
     }

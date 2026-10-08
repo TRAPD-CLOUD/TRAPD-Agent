@@ -38,7 +38,7 @@ mod reader;
 mod syslog;
 
 use checkpoint::{file_key, journal_key, CheckpointStore, JournalCheckpoint};
-use framing::{AuditAggregator, MultilineAggregator};
+use framing::{AuditAggregator, MultilineAggregator, W3cAggregator};
 use reader::{expand_paths, FileTail, RateLimiter};
 
 /// Debounce for the on-disk offset file.
@@ -571,6 +571,7 @@ enum SourceFramer {
     Pass,
     Multiline(MultilineAggregator),
     Audit(AuditAggregator),
+    W3c(W3cAggregator),
 }
 
 impl SourceFramer {
@@ -579,6 +580,12 @@ impl SourceFramer {
             return Self::Audit(AuditAggregator::new(
                 src.multiline.as_ref().map(|m| m.max_lines).unwrap_or(64),
             ));
+        }
+        if matches!(
+            src.parser.to_ascii_lowercase().as_str(),
+            "iis" | "iis_w3c" | "w3c"
+        ) {
+            return Self::W3c(W3cAggregator::default());
         }
         if let Some(ml) = &src.multiline {
             return Self::Multiline(MultilineAggregator::new(ml));
@@ -591,6 +598,7 @@ impl SourceFramer {
             Self::Pass => vec![line.to_string()],
             Self::Multiline(m) => m.push(line).into_iter().collect(),
             Self::Audit(a) => a.push(line),
+            Self::W3c(w) => w.push(line),
         }
     }
 
@@ -599,6 +607,7 @@ impl SourceFramer {
             Self::Pass => false,
             Self::Multiline(m) => m.has_pending(),
             Self::Audit(a) => a.has_pending(),
+            Self::W3c(_) => false,
         }
     }
 
@@ -607,6 +616,7 @@ impl SourceFramer {
             Self::Pass => None,
             Self::Multiline(m) => m.flush(),
             Self::Audit(a) => a.flush(),
+            Self::W3c(w) => w.flush(),
         }
     }
 

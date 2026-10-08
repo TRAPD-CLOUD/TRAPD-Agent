@@ -58,7 +58,9 @@ const AUTO_RESPONSE_COOLDOWN: Duration = Duration::from_secs(30);
 /// ([`Engine::execute_auto`]) and the command handlers, so a target rejected by one
 /// is rejected by the other (issue #59).
 fn is_valid_target_pid(pid: i32, own_pid: i32) -> bool {
-    pid > 1 && pid != own_pid
+    // PID 4 is the Windows `System` process, the analogue of init.
+    let first_valid = if cfg!(windows) { 4 } else { 1 };
+    pid > first_valid && pid != own_pid
 }
 
 #[derive(Clone)]
@@ -241,6 +243,15 @@ impl Engine {
                 match &event.data {
                     EventData::ProcessExec(exec) => {
                         let _ = process::enforce_exec(exec, &self.policy, &self.audit);
+                    }
+                    // Windows has no exec-time kernel event; the process sensor
+                    // (ETW, or the poller) reports creation. The Linux poller
+                    // also emits `ProcessCreate`, but there eBPF already
+                    // enforces `ProcessExec`, so only Windows acts on it.
+                    #[cfg(windows)]
+                    EventData::ProcessCreate(create) => {
+                        let exec = process::exec_from_create(create);
+                        let _ = process::enforce_exec(&exec, &self.policy, &self.audit);
                     }
                     // Inline IoC enforcement on the network plane (Phase 0): a
                     // backend-pushed Ip/Cidr/Port/Domain rule now actively drops
@@ -938,13 +949,17 @@ impl Engine {
             Err(_) => return self.rtr_refuse("rtr_run_script", "script", cmd_id),
         };
 
-        let (prog, flag) = response_rtr::shell_invocation(interpreter);
+        let prog = response_rtr::interpreter(interpreter);
+        let script_args = response_rtr::script_args(&prog, &script);
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 300));
 
+        // `kill_on_drop`: the timeout below drops this future, and the script
+        // must stop with it rather than keep running unobserved after the
+        // result was reported as timed out.
         let run = tokio::process::Command::new(&prog)
-            .arg(flag)
-            .arg(&script)
+            .args(&script_args)
             .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
             .output();
 
         let (success, code, stdout, stderr, note) = match tokio::time::timeout(timeout, run).await {
@@ -1122,21 +1137,12 @@ impl Engine {
         false
     }
 
-    /// Dump a process's readable memory (anonymous-executable regions first) as
-    /// a capped base64 artifact. Requires CAP_SYS_PTRACE / root to read
-    /// `/proc/<pid>/mem`; partial reads are returned best-effort.
-    fn cmd_collect_process_memory(&self, pid: i32, max_bytes: Option<u64>, cmd_id: &str) {
+    /// Read up to `cap` bytes of `pid`'s memory, anonymous-executable regions
+    /// first. Returns the bytes, the number of regions read and a note for the
+    /// audit trail when the process memory could not be opened.
+    #[cfg(not(windows))]
+    fn read_process_memory(pid: i32, cap: u64) -> (Vec<u8>, usize, &'static str) {
         use std::io::{Read, Seek, SeekFrom};
-
-        if !self.accept_target_pid(pid, "rtr_collect_memory", cmd_id) {
-            return;
-        }
-
-        let (enabled, default_max) = self.rtr_settings();
-        if !enabled {
-            return self.rtr_refuse("rtr_collect_memory", format!("pid {pid}"), cmd_id);
-        }
-        let cap = max_bytes.unwrap_or(default_max).min(default_max);
 
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
         let regions = response_rtr::dumpable_regions(&maps, cap);
@@ -1156,9 +1162,48 @@ impl Engine {
                 }
             }
         }
+        let note = if mem.is_err() {
+            " (/proc/<pid>/mem unreadable — need CAP_SYS_PTRACE)"
+        } else {
+            ""
+        };
+        (buf, regions.len(), note)
+    }
+
+    #[cfg(windows)]
+    fn read_process_memory(pid: i32, cap: u64) -> (Vec<u8>, usize, &'static str) {
+        match super::winproc::dump_memory(pid, cap) {
+            Ok(dump) => (dump.bytes, dump.regions, ""),
+            Err(e) => {
+                warn!(pid, error = %format!("{e:#}"), "process memory collection refused or failed");
+                (
+                    Vec::new(),
+                    0,
+                    " (process could not be opened for reading, or is a protected system process)",
+                )
+            }
+        }
+    }
+
+    /// Dump a process's readable memory (anonymous-executable regions first) as
+    /// a capped base64 artifact. Requires CAP_SYS_PTRACE / root to read
+    /// `/proc/<pid>/mem`; partial reads are returned best-effort.
+    fn cmd_collect_process_memory(&self, pid: i32, max_bytes: Option<u64>, cmd_id: &str) {
+        if !self.accept_target_pid(pid, "rtr_collect_memory", cmd_id) {
+            return;
+        }
+
+        let (enabled, default_max) = self.rtr_settings();
+        if !enabled {
+            return self.rtr_refuse("rtr_collect_memory", format!("pid {pid}"), cmd_id);
+        }
+        let cap = max_bytes.unwrap_or(default_max).min(default_max);
+
+        let (buf, region_count, unreadable_note) = Self::read_process_memory(pid, cap);
 
         let art = response_rtr::cap_and_encode(&buf, cap as usize);
         let success = !buf.is_empty();
+        let regions_len = region_count;
         self.audit.emit(
             if success {
                 EventAction::CommandAccepted
@@ -1175,19 +1220,13 @@ impl Engine {
             success,
             format!(
                 "dumped {} bytes from {} region(s) of pid {pid}{}",
-                art.returned_len,
-                regions.len(),
-                if mem.is_err() {
-                    " (/proc/<pid>/mem unreadable — need CAP_SYS_PTRACE)"
-                } else {
-                    ""
-                }
+                art.returned_len, regions_len, unreadable_note
             ),
             None,
             Some(cmd_id.into()),
             json!({
                 "pid": pid,
-                "regions": regions.len(),
+                "regions": regions_len,
                 "memory_b64": art.b64,
                 "total_len": art.total_len,
                 "truncated": art.truncated,

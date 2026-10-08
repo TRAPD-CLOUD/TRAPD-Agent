@@ -55,6 +55,14 @@ if ($TrustDir) {
     if ((Get-Item -LiteralPath $keyPath).Length -ne 32) { throw 'command_signing.pub must be exactly 32 raw bytes (Ed25519).' }
 
     $wixArgs += @('-d', "TrustDir=$TrustDir", '-d', "DefaultBackendUrl=$url")
+
+    # Optional release-signing key: enables signed self-update on the host.
+    $releaseKeyPath = Join-Path $TrustDir 'release_signing.pub'
+    if (Test-Path -LiteralPath $releaseKeyPath -PathType Leaf) {
+        if ((Get-Item -LiteralPath $releaseKeyPath).Length -ne 32) { throw 'release_signing.pub must be exactly 32 raw bytes (Ed25519).' }
+        $wixArgs += @('-d', 'HasReleaseKey=1')
+        Write-Host 'Baking the release-signing key (signed self-update enabled).'
+    }
     Write-Host "Baking hosted trust anchors for $url ($($blocks.Count) CA certificate(s))."
 }
 

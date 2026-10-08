@@ -34,6 +34,7 @@ use tracing::info;
 use crate::config::AgentConfig;
 use crate::schema::{AgentEvent, DetectionData, EventAction, EventClass, EventData, Severity};
 
+use super::super::mem_finding::{finding_to_detection, MemFinding};
 use super::super::Collector;
 
 /// One line of `/proc/<pid>/maps`, parsed into the fields we classify on.
@@ -65,18 +66,6 @@ impl MapRegion {
     fn is_memfd(&self) -> bool {
         self.path.starts_with("/memfd:")
     }
-}
-
-/// A classified memory finding (rule + scoring), independent of any I/O.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemFinding {
-    pub rule_id: &'static str,
-    pub title: &'static str,
-    pub technique: &'static str,
-    pub confidence: u8,
-    pub severity: Severity,
-    /// Human description of the offending region.
-    pub region: String,
 }
 
 /// Parse `/proc/<pid>/maps` content into regions. Malformed lines are skipped.
@@ -192,21 +181,6 @@ pub fn is_suspicious_preload(value: &str) -> bool {
         .split([' ', ':'])
         .filter(|s| !s.is_empty())
         .any(|lib| lib.starts_with('/') && !TRUSTED_LIB_PREFIXES.iter().any(|p| lib.starts_with(p)))
-}
-
-fn finding_to_detection(pid: i32, comm: &str, f: &MemFinding) -> DetectionData {
-    DetectionData {
-        rule_id: f.rule_id.to_string(),
-        title: f.title.to_string(),
-        category: "memory".into(),
-        mitre_tactic: Some("TA0005 Defense Evasion".into()),
-        mitre_technique: Some(f.technique.to_string()),
-        confidence: f.confidence,
-        subject: format!("pid {pid} ({comm})"),
-        detail: format!("PID {pid} ({comm}): {}", f.region),
-        evidence: serde_json::json!({ "pid": pid, "comm": comm, "region": f.region }),
-        ..Default::default()
-    }
 }
 
 /// Runtimes that legitimately map writable+executable anonymous memory (JIT

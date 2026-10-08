@@ -294,7 +294,21 @@ fn harden_dir_perms(dir: &Path) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows: restrict the directory to `SYSTEM` + `Administrators`, the analogue
+/// of `0700` root. The MSI already does this for its own directories; this
+/// covers installs that did not come from the MSI. Skipped when not elevated,
+/// where the lock-down would shut the calling user out of their own state.
+#[cfg(windows)]
+fn harden_dir_perms(dir: &Path) {
+    if !crate::winacl::is_elevated() {
+        return;
+    }
+    if let Err(e) = crate::winacl::set_dacl(dir, crate::winacl::PRIVATE_DIR_SDDL) {
+        warn!(dir = %dir.display(), error = %e, "could not restrict the state directory to SYSTEM/Administrators");
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn harden_dir_perms(_dir: &Path) {}
 
 /// Atomically write `contents` to `path` (write to a temp file in the same

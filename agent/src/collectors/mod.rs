@@ -21,6 +21,21 @@ pub trait Collector: Send + Sync + 'static {
 // OS-neutral collectors (sysinfo-backed), shared by every platform build.
 pub mod system;
 
+// Ransomware / coalescing / tamper-timing rules shared by the Linux and Windows
+// filesystem collectors.
+pub mod fs_heuristics;
+pub mod fs_plan;
+
+// Memory-scan finding shared by the Linux and Windows scanners.
+pub mod mem_finding;
+
+// Generic log collector (file tail, journal, syslog → parsers → events), shared by
+// Linux and Windows; each platform supplies its own built-in source catalogue.
+pub mod logs;
+
+// Windows memory classification rules (pure; the scanner does the I/O).
+pub mod win_mem_rules;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 

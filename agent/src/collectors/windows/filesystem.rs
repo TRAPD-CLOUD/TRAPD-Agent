@@ -6,16 +6,19 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::Sender;
 
+use crate::collectors::fs_heuristics as heur;
+use crate::collectors::fs_plan::{self, Action, Change, Planner, Roots};
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
 use crate::schema::{
-    AgentEvent, EventAction, EventClass, EventData, FilesystemEventData, FilesystemOperation,
-    FilesystemSource, IntegrityStatus, Severity,
+    AgentEvent, AgentTamperData, EventAction, EventClass, EventData, FilesystemEventData,
+    FilesystemOperation, FilesystemSource, IntegrityStatus, Severity,
 };
 
 const MAX_FILES: usize = 10_000;
@@ -144,6 +147,75 @@ fn event(
     )
 }
 
+/// Locations watched for their named detections, in addition to the configured
+/// telemetry paths: user data for ransomware behaviour, backup folders for
+/// sabotage, and the agent's own configuration for tamper.
+struct DetectionRoots {
+    ransom: Vec<PathBuf>,
+    backup: Vec<PathBuf>,
+    /// The agent's configuration and install directories: any foreign change is
+    /// tamper (a replaced binary, a swapped signing key, an edited policy).
+    tamper: Vec<PathBuf>,
+}
+
+fn detection_roots() -> DetectionRoots {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let on_drive = |dir: &str| PathBuf::from(format!("{drive}\\{dir}"));
+    DetectionRoots {
+        ransom: vec![on_drive("Users")],
+        backup: vec![on_drive("Backup"), on_drive("Backups")],
+        tamper: std::iter::once(crate::paths::config_dir().to_path_buf())
+            .chain(
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|p| p.to_path_buf())),
+            )
+            .collect(),
+    }
+}
+
+fn change_for(kind: &EventKind, paths: &[PathBuf]) -> Vec<(Change, PathBuf)> {
+    let first = || paths.first().cloned();
+    match kind {
+        EventKind::Create(_) => paths.iter().map(|p| (Change::Created, p.clone())).collect(),
+        EventKind::Remove(_) => paths.iter().map(|p| (Change::Deleted, p.clone())).collect(),
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => first()
+            .map(|p| (Change::RenamedFrom, p))
+            .into_iter()
+            .collect(),
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => first()
+            .map(|p| (Change::RenamedTo, p))
+            .into_iter()
+            .collect(),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            let mut out = Vec::new();
+            if let Some(from) = paths.first() {
+                out.push((Change::RenamedFrom, from.clone()));
+            }
+            if let Some(to) = paths.get(1) {
+                out.push((Change::RenamedTo, to.clone()));
+            }
+            out
+        }
+        EventKind::Modify(ModifyKind::Metadata(_)) => {
+            paths.iter().map(|p| (Change::Attrib, p.clone())).collect()
+        }
+        EventKind::Modify(_) => paths
+            .iter()
+            .map(|p| (Change::Modified, p.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn operation_for(change: Change) -> FilesystemOperation {
+    match change {
+        Change::Created | Change::RenamedTo => FilesystemOperation::Created,
+        Change::Deleted | Change::RenamedFrom => FilesystemOperation::Deleted,
+        Change::Modified | Change::Attrib => FilesystemOperation::Modified,
+    }
+}
+
 pub struct FilesystemCollector {
     config: Arc<RwLock<AgentConfig>>,
 }
@@ -176,6 +248,33 @@ impl Collector for FilesystemCollector {
         )?;
         let defaults = AgentConfig::default();
         let mut watched: Vec<PathBuf> = Vec::new();
+
+        // Named-detection roots are fixed for the process lifetime. A missing
+        // root (no backup folder on this host) is normal and silent.
+        let started = std::time::Instant::now();
+        let detect = detection_roots();
+        let mut roots = Roots::default();
+        let mut register = |path: &PathBuf, mode: RecursiveMode, into: &mut Vec<String>| {
+            if !path.exists() {
+                return;
+            }
+            match watcher.watch(path, mode) {
+                Ok(()) => into.push(fs_plan::normalise_root(&path.to_string_lossy())),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "Windows detection watch unavailable")
+                }
+            }
+        };
+        for p in &detect.ransom {
+            register(p, RecursiveMode::Recursive, &mut roots.ransom);
+        }
+        for p in &detect.backup {
+            register(p, RecursiveMode::Recursive, &mut roots.backup);
+        }
+        for p in &detect.tamper {
+            register(p, RecursiveMode::NonRecursive, &mut roots.tamper);
+        }
+        let mut planner = Planner::new(roots, std::time::Instant::now());
         let baseline_path = crate::paths::state_dir().join("windows_fim_baseline.json");
         let saved: Baseline = std::fs::metadata(&baseline_path)
             .ok()
@@ -202,6 +301,9 @@ impl Collector for FilesystemCollector {
                                 Err(e) => tracing::warn!(path = %root.display(), error = %e, "Windows file watch unavailable"),
                             }
                         }
+                        planner.set_generic_roots(
+                            watched.iter().map(|p| fs_plan::normalise_root(&p.to_string_lossy())).collect(),
+                        );
                     }
                     if cfg.fim_enabled && (first || last_scan.elapsed().as_secs() >= cfg.fim_interval_secs.max(10)) {
                         let roots = windows_paths(&cfg.fim_paths, &defaults.fim_paths);
@@ -236,14 +338,51 @@ impl Collector for FilesystemCollector {
                 Some(result) = notify_rx.recv() => {
                     match result {
                         Ok(notification) => {
-                            let operation = match notification.kind {
-                                EventKind::Create(_) => FilesystemOperation::Created,
-                                EventKind::Remove(_) => FilesystemOperation::Deleted,
-                                EventKind::Modify(_) => FilesystemOperation::Modified,
-                                _ => continue,
-                            };
-                            for path in notification.paths {
-                                if tx.send(event(&agent_id, &hostname, path.to_string_lossy().into_owned(), operation, FilesystemSource::Realtime, None, None)).await.is_err() { return Ok(()); }
+                            for (change, path) in change_for(&notification.kind, &notification.paths) {
+                                let path = path.to_string_lossy().into_owned();
+                                let actions = planner.plan(
+                                    change,
+                                    &path,
+                                    std::time::Instant::now(),
+                                    started.elapsed(),
+                                    crate::update::update_in_flight(),
+                                );
+                                for action in actions {
+                                    let event = match action {
+                                        Action::Generic { path, change } => Some(event(
+                                            &agent_id, &hostname, path, operation_for(change),
+                                            FilesystemSource::Realtime, None, None,
+                                        )),
+                                        Action::Tamper { path, action } => Some(AgentEvent::new(
+                                            agent_id.clone(), hostname.clone(),
+                                            EventClass::Filesystem, EventAction::AgentTamper, Severity::Critical,
+                                            EventData::AgentTamper(AgentTamperData { path, action: action.to_string() }),
+                                        )),
+                                        Action::RansomExtension { path } => {
+                                            Some(heur::suspicious_extension_event(&agent_id, &hostname, &path))
+                                        }
+                                        Action::BackupDeletion { path } => {
+                                            Some(heur::backup_deletion_event(&agent_id, &hostname, &path))
+                                        }
+                                        Action::WriteRate { rate } => {
+                                            Some(heur::high_write_rate_event(&agent_id, &hostname, rate as u64))
+                                        }
+                                        Action::EntropyCheck { path } => {
+                                            // Reading the file is blocking I/O: keep it off the runtime.
+                                            let probe = path.clone();
+                                            let entropy = tokio::task::spawn_blocking(move || heur::file_entropy(&probe))
+                                                .await
+                                                .ok()
+                                                .flatten();
+                                            entropy
+                                                .filter(|e| *e >= heur::ENTROPY_THRESHOLD)
+                                                .map(|e| heur::high_entropy_event(&agent_id, &hostname, &path, e))
+                                        }
+                                    };
+                                    if let Some(event) = event {
+                                        if tx.send(event).await.is_err() { return Ok(()); }
+                                    }
+                                }
                             }
                         }
                         Err(e) => {

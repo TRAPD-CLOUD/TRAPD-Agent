@@ -168,6 +168,7 @@ pub fn gather_with_flags(
         users,
         security_posture: SecurityPosture {
             listening_ports,
+            kernel_modules: super::windows_drivers::loaded(),
             ..Default::default()
         },
         recon_profile,

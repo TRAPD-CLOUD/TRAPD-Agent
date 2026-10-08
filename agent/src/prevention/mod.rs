@@ -21,26 +21,21 @@
 pub mod commands;
 pub mod policy;
 
-#[cfg(target_os = "linux")]
 pub mod audit;
-#[cfg(target_os = "linux")]
 pub mod command_puller;
-#[cfg(target_os = "linux")]
 pub mod engine;
-#[cfg(target_os = "linux")]
 pub mod lsm_loader;
-#[cfg(target_os = "linux")]
+pub mod netsh;
 pub mod network;
-#[cfg(target_os = "linux")]
 pub mod process;
-#[cfg(target_os = "linux")]
 pub mod quarantine;
-#[cfg(target_os = "linux")]
 pub mod response;
-#[cfg(target_os = "linux")]
 pub mod rtr;
-#[cfg(target_os = "linux")]
+pub mod runtime;
 pub mod software;
+pub mod winguard;
+#[cfg(windows)]
+pub mod winproc;
 
 use std::path::PathBuf;
 

@@ -30,6 +30,23 @@ pub(crate) fn hash_store_path() -> PathBuf {
     paths::config_dir().join("binary.sha256")
 }
 
+/// Windows only: the product version the baseline was recorded for.
+fn version_store_path() -> PathBuf {
+    paths::config_dir().join("binary.version")
+}
+
+/// Whether a baseline mismatch is a legitimate upgrade rather than tampering.
+///
+/// Windows only. The MSI replaces the executable without knowing about this
+/// agent-written baseline (Linux's installer deletes it), so after an MSI
+/// upgrade the old digest no longer matches. A mismatch is therefore accepted
+/// — and re-baselined, with a warning — when the baseline was recorded for a
+/// *different product version* than the one now running. A swapped binary that
+/// still reports the recorded version (the tampering case) is still refused.
+fn mismatch_is_upgrade(platform_allows: bool, recorded: Option<&str>, running: &str) -> bool {
+    platform_allows && recorded.is_some_and(|v| v.trim() != running)
+}
+
 fn pubkey_path() -> PathBuf {
     paths::config_dir().join("signing.pub")
 }
@@ -66,7 +83,22 @@ pub fn check() -> Result<()> {
         })?;
         let stored = stored.trim();
 
-        if stored != hash_str {
+        let running_version = env!("CARGO_PKG_VERSION");
+        if stored != hash_str
+            && mismatch_is_upgrade(
+                cfg!(windows),
+                std::fs::read_to_string(version_store_path())
+                    .ok()
+                    .as_deref(),
+                running_version,
+            )
+        {
+            warn!(
+                "Binary differs from the baseline recorded for another product \
+                 version; treating it as an upgrade and re-recording the baseline"
+            );
+            write_baseline(&hash_file, &hash_str)?;
+        } else if stored != hash_str {
             bail!(
                 "BINARY INTEGRITY VIOLATION: hash mismatch for {}\n  \
                  baseline: {stored}\n  \
@@ -76,13 +108,15 @@ pub fn check() -> Result<()> {
             );
         }
         info!("Binary SHA256 ✓  (matches stored baseline)");
+        record_version();
     } else {
         // First run: create the baseline directory + file.  Best-effort: if the
         // config directory is not writable (non-root test run) we warn rather
         // than abort, so the agent still comes up.
         match write_baseline(&hash_file, &hash_str) {
             Ok(()) => {
-                info!(path = %hash_file.display(), "Binary hash baseline written (first run)")
+                info!(path = %hash_file.display(), "Binary hash baseline written (first run)");
+                record_version();
             }
             Err(e) => warn!(
                 path = %hash_file.display(),
@@ -94,6 +128,24 @@ pub fn check() -> Result<()> {
     }
 
     verify_ed25519_signature(&hash_bytes)
+}
+
+/// Windows: remember which product version the baseline belongs to.
+fn record_version() {
+    if !cfg!(windows) {
+        return;
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    let path = version_store_path();
+    if std::fs::read_to_string(&path)
+        .map(|v| v.trim() == version)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if let Err(e) = paths::write_atomic(&path, version.as_bytes(), 0o600) {
+        warn!(path = %path.display(), error = %e, "could not record the baseline's product version");
+    }
 }
 
 fn write_baseline(hash_file: &Path, hash_str: &str) -> Result<()> {
@@ -193,4 +245,21 @@ fn sha256_of_file(path: &Path) -> Result<(String, Vec<u8>)> {
     }
     let digest = hasher.finalize();
     Ok((hex::encode(digest.as_slice()), digest.to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_version_change_on_windows_excuses_a_baseline_mismatch() {
+        // Tampering: same recorded version, different bytes -> never excused.
+        assert!(!mismatch_is_upgrade(true, Some("0.6.10\n"), "0.6.10"));
+        // MSI upgrade: baseline was recorded for another version.
+        assert!(mismatch_is_upgrade(true, Some("0.6.9"), "0.6.10"));
+        // No version record: strict, exactly the Linux behaviour.
+        assert!(!mismatch_is_upgrade(true, None, "0.6.10"));
+        // Linux never relaxes the check.
+        assert!(!mismatch_is_upgrade(false, Some("0.6.9"), "0.6.10"));
+    }
 }

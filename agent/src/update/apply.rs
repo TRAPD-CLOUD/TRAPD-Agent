@@ -101,6 +101,14 @@ pub enum Outcome {
 pub trait Platform {
     /// Restart the agent service so it picks up the new binary.
     fn restart_service(&self) -> Result<()>;
+
+    /// Stop the agent service and wait until it has exited. Called before a
+    /// rollback puts the previous files back: Windows cannot delete the image of
+    /// a running service, so the failed version must be gone first. A no-op on
+    /// platforms where replacing a running file is safe (Unix: rename over it).
+    fn stop_service(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Path next to `target` used for the previous version of the file.
@@ -353,6 +361,7 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
 
     if let Err(e) = platform.restart_service() {
         tracing::error!(error = %e, "update: restart failed, rolling back");
+        let _ = platform.stop_service();
         abort_update(ctx, &installed, &verified.version)?;
         let _ = platform.restart_service();
         return Ok(Outcome::RolledBack {
@@ -367,6 +376,7 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
         })
     } else {
         tracing::error!(version = %verified.version, "update: new agent not healthy in time, rolling back");
+        let _ = platform.stop_service();
         abort_update(ctx, &installed, &verified.version)?;
         let _ = platform.restart_service();
         Ok(Outcome::RolledBack {
@@ -578,6 +588,36 @@ mod tests {
             std::fs::read(env.baseline.with_file_name("binary.sig")).unwrap(),
             old
         );
+    }
+
+    #[test]
+    fn rollback_stops_the_failed_version_before_restoring_files() {
+        // Windows cannot delete a running service image, so the stop has to
+        // happen while the *new* binary is still at the install path.
+        let env = setup(b"NEW BINARY", None);
+        struct Order<'a> {
+            env: &'a Env,
+            seen_at_stop: std::cell::RefCell<Option<Vec<u8>>>,
+        }
+        impl Platform for Order<'_> {
+            fn restart_service(&self) -> Result<()> {
+                Ok(())
+            }
+            fn stop_service(&self) -> Result<()> {
+                *self.seen_at_stop.borrow_mut() = Some(std::fs::read(&self.env.target)?);
+                Ok(())
+            }
+        }
+        let p = Order {
+            env: &env,
+            seen_at_stop: Default::default(),
+        };
+        assert!(matches!(
+            run(&env, &p, 0).unwrap(),
+            Outcome::RolledBack { .. }
+        ));
+        assert_eq!(p.seen_at_stop.borrow().as_deref(), Some(&b"NEW BINARY"[..]));
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
     }
 
     #[test]

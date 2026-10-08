@@ -1,4 +1,5 @@
-//! Network containment via `nft` (preferred) or `iptables` (fallback).
+//! Network containment via `nft` (preferred) or `iptables` (fallback) on Linux
+//! and Windows Defender Firewall (`netsh advfirewall`) on Windows.
 //!
 //! The agent owns a dedicated table/chain so its rules can be inspected,
 //! audited and torn down without touching operator-managed policy:
@@ -15,6 +16,10 @@
 //!
 //! All shell-outs are quoted via `std::process::Command::arg()` to avoid
 //! injection: input is parsed by `ipnet::IpNet` / `IpAddr` first.
+//!
+//! The Windows backend builds explicit block rules only (see [`super::netsh`]):
+//! it never rewrites the firewall profile defaults, so a GPO-managed policy is
+//! neither overridden nor left in a half-restored state if the agent dies.
 
 use std::net::IpAddr;
 use std::process::Command;
@@ -33,9 +38,21 @@ const IPT_CHAIN: &str = "TRAPD_BLOCK";
 pub enum Backend {
     Nft,
     Iptables,
+    #[cfg(windows)]
+    WindowsFirewall,
     None,
 }
 
+#[cfg(windows)]
+pub fn detect_backend() -> Backend {
+    if win::netsh_path().is_file() {
+        Backend::WindowsFirewall
+    } else {
+        Backend::None
+    }
+}
+
+#[cfg(not(windows))]
 pub fn detect_backend() -> Backend {
     if Command::new("nft").arg("--version").output().is_ok() {
         Backend::Nft
@@ -86,7 +103,9 @@ pub fn ensure_chains(backend: Backend) -> Result<()> {
             }
             Ok(())
         }
-        Backend::None => bail!("no firewall backend available (need nft or iptables)"),
+        #[cfg(windows)]
+        Backend::WindowsFirewall => win::ensure_enforcing(),
+        Backend::None => bail!("no firewall backend available (need nft, iptables or netsh)"),
     }
 }
 
@@ -121,6 +140,8 @@ pub fn block_ip(backend: Backend, target: &str) -> Result<String> {
             info!(target, tool = opt, "iptables drop rule added");
             Ok(format!("{opt}:{target}"))
         }
+        #[cfg(windows)]
+        Backend::WindowsFirewall => win::block(&parsed, target),
         Backend::None => bail!("no firewall backend"),
     }
 }
@@ -179,6 +200,8 @@ pub fn unblock_ip(backend: Backend, target: &str) -> Result<()> {
             info!(target, tool = opt, "iptables drop rule removed");
             Ok(())
         }
+        #[cfg(windows)]
+        Backend::WindowsFirewall => win::unblock(target),
         Backend::None => bail!("no firewall backend"),
     }
 }
@@ -254,6 +277,8 @@ pub fn isolate(backend: Backend, allowlist_ips: &[IpAddr]) -> Result<()> {
             info!(allow = allowlist_ips.len(), "host isolated (iptables)");
             Ok(())
         }
+        #[cfg(windows)]
+        Backend::WindowsFirewall => win::isolate(allowlist_ips),
         Backend::None => bail!("no firewall backend"),
     }
 }
@@ -287,7 +312,183 @@ pub fn deisolate(backend: Backend) -> Result<()> {
             info!("host isolation lifted (iptables)");
             Ok(())
         }
+        #[cfg(windows)]
+        Backend::WindowsFirewall => win::deisolate(),
         Backend::None => bail!("no firewall backend"),
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    //! `netsh advfirewall` execution. The rule construction is in
+    //! [`super::super::netsh`]; this module only runs it and reads the
+    //! language-independent firewall state from the registry.
+
+    use std::path::PathBuf;
+
+    use anyhow::{anyhow, bail, Context, Result};
+    use windows_sys::Win32::System::Registry::RRF_SUBKEY_WOW6464KEY;
+
+    use super::super::netsh::{self, Direction};
+    use super::{info, warn, IpAddr, NetTarget};
+    use crate::collectors::windows::registry;
+
+    use super::super::netsh::{
+        FIREWALL_LOCAL_PROFILES, FIREWALL_POLICY_PROFILES, FIREWALL_PROFILES,
+    };
+
+    /// Absolute path, so a poisoned `PATH` can never substitute the binary the
+    /// SYSTEM service executes.
+    pub(super) fn netsh_path() -> PathBuf {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        PathBuf::from(root).join("System32").join("netsh.exe")
+    }
+
+    fn run_netsh(args: &[String]) -> Result<()> {
+        let out = std::process::Command::new(netsh_path())
+            .args(args)
+            .output()
+            .context("failed to spawn netsh")?;
+        if !out.status.success() {
+            // netsh reports errors on stdout, localised; keep it for the audit
+            // trail but never parse it.
+            bail!(
+                "netsh {} exited {}: {}",
+                args.get(2).map(String::as_str).unwrap_or(""),
+                out.status,
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn rule_exists(name: &str) -> bool {
+        std::process::Command::new(netsh_path())
+            .args(netsh::show_rule_args(name))
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Delete `name` if present. Absence is success (idempotent); a failed
+    /// delete of an existing rule is an error, so a rule is never left behind
+    /// while reporting success.
+    fn delete_if_present(name: &str) -> Result<bool> {
+        if !rule_exists(name) {
+            return Ok(false);
+        }
+        run_netsh(&netsh::delete_rule_args(name))?;
+        Ok(true)
+    }
+
+    /// Fail unless at least one firewall profile is actually enforcing: block
+    /// rules on a disabled firewall would be reported as success while
+    /// containing nothing.
+    pub(super) fn ensure_enforcing() -> Result<()> {
+        let enforcing = FIREWALL_PROFILES.iter().any(|profile| {
+            let policy = registry::dword(
+                &format!("{FIREWALL_POLICY_PROFILES}\\{profile}"),
+                "EnableFirewall",
+                RRF_SUBKEY_WOW6464KEY,
+            );
+            let local = registry::dword(
+                &format!("{FIREWALL_LOCAL_PROFILES}\\{profile}"),
+                "EnableFirewall",
+                RRF_SUBKEY_WOW6464KEY,
+            );
+            netsh::profile_enforcing(policy, local)
+        });
+        if !enforcing {
+            bail!("Windows Defender Firewall is disabled on every profile; block rules would not be enforced");
+        }
+        Ok(())
+    }
+
+    pub(super) fn block(parsed: &NetTarget, target: &str) -> Result<String> {
+        ensure_enforcing()?;
+        let net = match parsed {
+            NetTarget::Ip(ip) => ipnet::IpNet::from(*ip),
+            NetTarget::Cidr(n) => *n,
+        };
+        let remote = netsh::remote_for(&net);
+        for dir in [Direction::Out, Direction::In] {
+            let name = netsh::block_rule_name(target, dir);
+            // Re-adding an existing block must not stack duplicates.
+            delete_if_present(&name)?;
+            run_netsh(&netsh::add_block_args(
+                &name,
+                dir,
+                &remote,
+                "TRAPD containment: blocked indicator",
+            ))
+            .inspect_err(|_| {
+                // Never leave a half-installed pair behind.
+                let _ = delete_if_present(&netsh::block_rule_name(target, Direction::Out));
+            })?;
+        }
+        info!(target, "windows firewall block rules added");
+        Ok(format!("netsh:{target}"))
+    }
+
+    pub(super) fn unblock(target: &str) -> Result<()> {
+        let mut removed = 0;
+        let mut failures = Vec::new();
+        for dir in [Direction::Out, Direction::In] {
+            match delete_if_present(&netsh::block_rule_name(target, dir)) {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(e) => failures.push(format!("{e:#}")),
+            }
+        }
+        if !failures.is_empty() {
+            bail!("unblock failed: {}", failures.join("; "));
+        }
+        if removed == 0 {
+            warn!(target, "no matching windows firewall rule to unblock");
+        } else {
+            info!(target, removed, "windows firewall rules removed");
+        }
+        Ok(())
+    }
+
+    pub(super) fn isolate(allow: &[IpAddr]) -> Result<()> {
+        ensure_enforcing()?;
+        let ranges = netsh::complement_ranges(allow).join(",");
+        // Replace, never stack: re-isolating with a new allow-list swaps the set.
+        for (name, dir) in [
+            (netsh::ISOLATE_OUT, Direction::Out),
+            (netsh::ISOLATE_IN, Direction::In),
+        ] {
+            delete_if_present(name)?;
+            if let Err(e) = run_netsh(&netsh::add_block_args(
+                name,
+                dir,
+                &ranges,
+                "TRAPD containment: host isolated",
+            )) {
+                // Fail closed on the *rules*, open on connectivity: a partial
+                // isolation is reported as failure and rolled back so the
+                // operator is never told a half-contained host is contained.
+                let _ = deisolate();
+                return Err(anyhow!("isolation rule {name} failed: {e:#}"));
+            }
+        }
+        info!(allow = allow.len(), "host isolated (windows firewall)");
+        Ok(())
+    }
+
+    pub(super) fn deisolate() -> Result<()> {
+        let mut failures = Vec::new();
+        for name in [netsh::ISOLATE_OUT, netsh::ISOLATE_IN] {
+            if let Err(e) = delete_if_present(name) {
+                failures.push(format!("{name}: {e:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            bail!("deisolation failed: {}", failures.join("; "));
+        }
+        info!("host isolation lifted (windows firewall)");
+        Ok(())
     }
 }
 
@@ -478,5 +679,100 @@ mod tests {
             "ip6tables",
             &["-D", "TRAPD_BLOCK", "-d", "2001:db8::2", "-j", "DROP"]
         ));
+    }
+}
+
+/// Native Windows Firewall acceptance. Ignored by default: it changes the host's
+/// firewall rule set (briefly) and needs an elevated token, so CI runs it as an
+/// explicit step. It never enables a rule that could cut the runner's own
+/// connectivity: rules are created disabled.
+#[cfg(all(test, windows))]
+mod windows_native {
+    use super::super::netsh;
+    use std::process::Command;
+
+    fn exists(name: &str) -> bool {
+        Command::new(super::win::netsh_path())
+            .args(netsh::show_rule_args(name))
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    #[ignore = "modifies Windows Firewall rules; run explicitly on an elevated CI host"]
+    fn native_netsh_accepts_the_generated_rule_syntax_and_deletes_it_again() {
+        let allow: Vec<std::net::IpAddr> = vec![
+            "192.0.2.10".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+        let ranges = netsh::complement_ranges(&allow).join(",");
+        let name = "TRAPD-NATIVE-TEST-ISOLATE";
+        let _ = Command::new(super::win::netsh_path())
+            .args(netsh::delete_rule_args(name))
+            .output();
+
+        let mut args = netsh::add_block_args(
+            name,
+            netsh::Direction::Out,
+            &ranges,
+            "TRAPD native test - disabled",
+        );
+        // Never enforce: this only proves the syntax (a long mixed v4/v6 range
+        // list) is accepted by the real netsh.
+        for a in &mut args {
+            if a == "enable=yes" {
+                *a = "enable=no".into();
+            }
+        }
+        let out = Command::new(super::win::netsh_path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "netsh rejected the rule: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(exists(name), "rule must exist after add");
+
+        let out = Command::new(super::win::netsh_path())
+            .args(netsh::delete_rule_args(name))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(!exists(name), "rule must be gone after delete");
+    }
+
+    #[test]
+    #[ignore = "modifies Windows Firewall rules; run explicitly on an elevated CI host"]
+    fn native_block_and_unblock_an_unroutable_test_address() {
+        use super::{block_ip, detect_backend, unblock_ip, Backend};
+        let backend = detect_backend();
+        assert!(matches!(backend, Backend::WindowsFirewall));
+        // 203.0.113.0/24 is TEST-NET-3 (RFC 5737): never routed, safe to block.
+        let target = "203.0.113.77";
+        block_ip(backend, target).expect("block");
+        assert!(exists(&netsh::block_rule_name(
+            target,
+            netsh::Direction::Out
+        )));
+        assert!(exists(&netsh::block_rule_name(
+            target,
+            netsh::Direction::In
+        )));
+        // Adding the same block again must replace, not stack, the rule.
+        block_ip(backend, target).expect("re-block");
+        unblock_ip(backend, target).expect("unblock");
+        assert!(!exists(&netsh::block_rule_name(
+            target,
+            netsh::Direction::Out
+        )));
+        assert!(!exists(&netsh::block_rule_name(
+            target,
+            netsh::Direction::In
+        )));
+        // Unblocking something that is not blocked is a no-op, not an error.
+        unblock_ip(backend, target).expect("idempotent unblock");
     }
 }

@@ -9,6 +9,44 @@ Legend: ✅ implemented · 🟡 partial · ⏳ planned · 🧪 feature-gated/ker
 
 ---
 
+## 0. Platform matrix: Linux vs. Windows
+
+Windows is a first-class platform. Status below is what the **code** does; items
+marked "CI" are exercised by native Windows tests on the CI runner, everything
+else on Windows is type-checked and unit-tested on shared logic only.
+
+| Capability | Linux | Windows |
+|---|---|---|
+| Process / network / DNS telemetry | ✅ eBPF | ✅ ETW (+ poller fallback), CI |
+| Authentication / security events | ✅ auth.log, auditd | ✅ Security / System / Application event logs |
+| Generic log collector (file tail, rotation, parsers) | ✅ | ✅ IIS / http.sys (W3C), nginx, Apache, PostgreSQL, MySQL; real file identity for rotation. No journal / syslog-socket sources |
+| Detection engine, Sigma, IOA, baseline | ✅ | ✅ same engine |
+| Honeytokens (deploy / detect / respond) | ✅ | ✅ file + registry decoys, 4663 audit |
+| Ransomware indicators (entropy, mass-write, extension, backup deletion) | ✅ | ✅ shared heuristics (`fs_heuristics`, `fs_plan`) over user profiles |
+| Agent / binary tamper detection | ✅ `/etc/trapd`, state dir | ✅ config dir + install dir (`Program Files`), update-aware |
+| FIM (periodic hashing) | ✅ | ✅ |
+| Process-memory injection scan | ✅ maps: RWX, memfd, deleted exec | ✅ `VirtualQueryEx`: thread started in unbacked executable memory (alert), injected PE (alert), RWX alone (context) |
+| Rootkit cross-view detection | ✅ | ⏳ not planned: depends on `/proc`, `getdents`, `sock_diag` |
+| Process kill / freeze (with PID-reuse guard) | ✅ `SIGKILL` / `SIGSTOP` | ✅ `TerminateProcess` / `NtSuspendProcess` bound to creation time; core system processes are never targets |
+| Network containment (block IP, isolate) | ✅ nftables / iptables | ✅ Windows Firewall block rules only (never rewrites profile defaults); CI for rule syntax |
+| File quarantine + restore | ✅ move + `chmod 000` + `chattr +i` | ✅ move + SYSTEM/Administrators-only DACL, original DACL restored; CI |
+| Auto-response, signed command channel, RTR | ✅ | ✅ PowerShell via `-EncodedCommand`; memory collection via `ReadProcessMemory` (LSASS and other protected processes refused) |
+| Pre-exec kernel blocking | 🟡 tracepoint kill (not LSM) | ⏳ none: post-creation kill only (needs a driver) |
+| Signed self-update with rollback | ✅ systemd path unit | ✅ service launches an apply helper (runs from a copy), SCM restart, rollback stops the service first |
+| Binary self-integrity | ✅ | ✅ re-baselines when the product version changed (MSI upgrade) |
+| Inventory (hardware, software, ports) | ✅ | ✅ registry software, native TCP table |
+| Hardening assessment | ✅ CIS-style (sysctl, SSH) | ✅ `WIN-*` checks (UAC, firewall, Defender policy, WDigest, LSA PPL, NTLM, SMB1, RDP NLA, LLMNR, script-block logging, Secure Boot) |
+| Kernel module / driver inventory | ✅ | ✅ loaded drivers (signature `signed` / `unknown`) |
+| Package operations (install / remove) | ✅ apt / dnf | ⏳ not supported |
+| SIEM forwarding | ✅ | ✅ |
+| Forensic snapshot on freeze | ✅ `/proc` incl. open files | ✅ exe, cwd, cmdline, logon session; open handles not enumerated |
+
+Known Windows limits: isolation does not allow DNS or DHCP unless the resolver is
+in `isolation_allowlist_ips`; isolation and IP blocks persist across a reboot
+(they are ordinary firewall rules, removed by `deisolate` / `unblock_ip`).
+
+---
+
 ## 1. Kernel & userspace telemetry (eBPF)
 
 The agent ships **18 eBPF programs**, all ring-buffer based and consumed by the
@@ -328,7 +366,7 @@ Provisioned files under `<config>` (default `/etc/trapd`): `ca.crt`, `agent.crt`
 
 ---
 
-_Last updated: 2026-09-08 — adds the generic Linux log collector
+_Last updated: 2026-10-08 — adds the platform matrix (§0) and Windows parity work (prevention, containment, quarantine, self-update, memory scan, ransomware heuristics, log collector, hardening). Earlier: 2026-09-08 — adds the generic Linux log collector
 (§6b: file/journal/syslog pipeline, inode-aware rotation, parsers for
 nginx/apache/postgres/mysql/docker/ssh/sudo/auditd, persisted offsets)
 and cross-view rootkit and manipulation detection (§2b: hidden

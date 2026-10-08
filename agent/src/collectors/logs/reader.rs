@@ -205,7 +205,7 @@ impl FileTail {
         if !meta.is_file() {
             return Ok(());
         }
-        let ident = file_ident(&meta);
+        let ident = file_ident(&self.path, &meta);
         let fp = read_fingerprint(&self.path);
 
         if self.file.is_none() {
@@ -326,13 +326,43 @@ impl FileTail {
     }
 }
 
+/// Stable identity of the file at `path`: `(device, inode)` on Unix, `(volume
+/// serial, file index)` on Windows. Rotation is detected by this changing while
+/// the path stays the same, so it must not depend on anything a growing log
+/// changes (size, mtime).
 #[cfg(unix)]
-fn file_ident(meta: &Metadata) -> (u64, u64) {
+fn file_ident(_path: &Path, meta: &Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
 
-#[cfg(not(unix))]
-fn file_ident(meta: &Metadata) -> (u64, u64) {
+#[cfg(windows)]
+fn file_ident(path: &Path, _meta: &Metadata) -> (u64, u64) {
+    // `File::open` shares read/write/delete, so asking for the identity never
+    // blocks the writer from rotating the file.
+    windows_file_id(path).unwrap_or((0, 0))
+}
+
+#[cfg(windows)]
+fn windows_file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let file = File::open(path).ok()?;
+    // SAFETY: a valid handle owned by `file` for the duration of the call, and
+    // a zeroed out-parameter of the documented size.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    (ok != 0).then(|| {
+        (
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_ident(_path: &Path, meta: &Metadata) -> (u64, u64) {
     (0, meta.len())
 }
 
@@ -367,7 +397,7 @@ fn hunt_inode(dir: Option<&Path>, ident: (u64, u64)) -> Option<PathBuf> {
             continue;
         }
         let Ok(meta) = ent.metadata() else { continue };
-        if file_ident(&meta) == ident {
+        if file_ident(&path, &meta) == ident {
             return Some(path);
         }
     }
@@ -752,6 +782,45 @@ mod tests {
             lines.iter().map(|l| l.line.as_str()).collect::<Vec<_>>(),
             vec!["two"]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_native_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn ident(path: &Path) -> (u64, u64) {
+        file_ident(path, &std::fs::metadata(path).unwrap())
+    }
+
+    #[test]
+    fn file_identity_survives_growth_but_not_rotation() {
+        let dir = std::env::temp_dir().join(format!("trapd-ident-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a.log");
+        std::fs::write(&log, b"one\n").unwrap();
+        let first = ident(&log);
+        assert_ne!(first, (0, 0), "a real identity must be available");
+
+        // Appending changes size and mtime, never the identity.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"two\n")
+            .unwrap();
+        assert_eq!(ident(&log), first);
+
+        // Rotation: the old file keeps its identity under the new name, and the
+        // path now answers with a different one.
+        let rotated = dir.join("a.log.1");
+        std::fs::rename(&log, &rotated).unwrap();
+        std::fs::write(&log, b"fresh\n").unwrap();
+        assert_ne!(ident(&log), first, "new file at the same path");
+        assert_eq!(ident(&rotated), first, "rotated file keeps its identity");
+        assert_eq!(hunt_inode(Some(&dir), first), Some(rotated));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -443,12 +443,14 @@ pub fn assess(
         Vec::new()
     };
 
-    // These checks inspect Linux sysctls, SSH configuration and unix modes.
-    // An empty Windows result means unassessed, never a claimed passing CIS audit.
-    let cis_findings = if flags.cis && os.family == "linux" {
-        cis_checks()
-    } else {
-        Vec::new()
+    // Linux checks inspect sysctls, SSH configuration and unix modes; Windows
+    // checks read the registry settings that matter for an endpoint (UAC,
+    // firewall, credential protection, …). An empty result for any other
+    // platform means unassessed, never a claimed passing audit.
+    let cis_findings = match (flags.cis, os.family.as_str()) {
+        (true, "linux") => cis_checks(),
+        (true, "windows") => super::windows_hardening::checks(),
+        _ => Vec::new(),
     };
     let cis_fail_count = cis_findings.iter().filter(|f| f.status == "fail").count();
 

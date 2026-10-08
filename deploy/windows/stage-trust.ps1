@@ -5,7 +5,11 @@
 #   TRAPD_HOSTED_CA_PEM           PEM certificate(s) that pin the backend TLS
 #   TRAPD_HOSTED_COMMAND_PUBKEY   base64 of the raw 32-byte Ed25519 command-signing key
 #
-# Nothing is staged unless all three are set. Values are validated by
+# Optional:
+#   TRAPD_HOSTED_RELEASE_PUBKEY   base64 of the raw 32-byte Ed25519 release-signing key;
+#                                 enables signed self-update on the installed agent
+#
+# Nothing is staged unless all three required values are set. Values are validated by
 # build-msi.ps1, which fails the build on malformed input.
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$OutDir)
@@ -42,5 +46,13 @@ try {
     throw 'TRAPD_HOSTED_COMMAND_PUBKEY is not valid base64.'
 }
 [IO.File]::WriteAllBytes((Join-Path $OutDir 'command_signing.pub'), $key)
+if (-not [string]::IsNullOrWhiteSpace($env:TRAPD_HOSTED_RELEASE_PUBKEY)) {
+    try {
+        $releaseKey = [Convert]::FromBase64String($env:TRAPD_HOSTED_RELEASE_PUBKEY.Trim())
+    } catch {
+        throw 'TRAPD_HOSTED_RELEASE_PUBKEY is not valid base64.'
+    }
+    [IO.File]::WriteAllBytes((Join-Path $OutDir 'release_signing.pub'), $releaseKey)
+}
 Write-Host 'Staged hosted trust anchors (public values only).'
 Set-BakedFlag $true

@@ -56,6 +56,7 @@ pub fn parse(parser: &str, raw: &str) -> ParsedLog {
         "raw" | "none" => ParsedLog::raw(line),
         "json" => parse_json(line),
         "syslog" => parse_syslog(line),
+        "iis" | "iis_w3c" | "w3c" => parse_iis(line),
         "nginx_access" => parse_nginx_access(line),
         "nginx_error" => parse_nginx_error(line),
         "apache_access" => parse_nginx_access(line), // combined/clf is shared
@@ -425,6 +426,103 @@ fn overlay(dst: &mut ParsedLog, src: ParsedLog) {
 }
 
 // ── nginx / apache combined access ────────────────────────────────────────
+
+/// IIS / http.sys W3C extended-format record, already keyed by column name by
+/// the W3C framer. Mirrors the nginx/apache access parser so the same
+/// downstream rules (Sigma `webserver` logsource, 401/403 scoring) apply.
+fn parse_iis(line: &str) -> ParsedLog {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) else {
+        return ParsedLog::raw(line);
+    };
+    let get = |key: &str| -> Option<String> {
+        map.get(key)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    // W3C encodes spaces inside a value as `+`.
+    let decode = |v: String| v.replace('+', " ");
+
+    let mut p = ParsedLog {
+        username: get("cs-username"),
+        message: line.to_string(),
+        category: "web".into(),
+        ..Default::default()
+    };
+    // W3C logs are in UTC unless the site is configured for local time, which
+    // the format cannot express; UTC is the IIS default.
+    if let (Some(date), Some(time)) = (get("date"), get("time")) {
+        p.timestamp =
+            chrono::NaiveDateTime::parse_from_str(&format!("{date} {time}"), "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|t| Utc.from_utc_datetime(&t));
+    }
+    if let Some(v) = get("c-ip") {
+        p.put("remote_addr", v);
+    }
+    if let Some(v) = get("cs-method") {
+        p.put("method", v);
+    }
+    let stem = get("cs-uri-stem");
+    if let Some(stem) = &stem {
+        let uri = match get("cs-uri-query") {
+            Some(q) => format!("{stem}?{q}"),
+            None => stem.clone(),
+        };
+        p.put("uri", uri);
+    } else if let Some(uri) = get("cs-uri") {
+        // http.sys (HTTPERR) logs carry one combined field.
+        p.put("uri", uri);
+    }
+    if let Some(v) = get("cs-version") {
+        p.put("protocol", v);
+    }
+    if let Some(v) = get("sc-bytes") {
+        p.put("bytes", v);
+    }
+    if let Some(v) = get("cs(Referer)") {
+        p.put("referer", decode(v));
+    }
+    if let Some(v) = get("cs(User-Agent)") {
+        p.put("user_agent", decode(v));
+    }
+    if let Some(v) = get("s-sitename") {
+        p.put("site", v);
+    }
+    if let Some(v) = get("s-ip") {
+        p.put("server_ip", v);
+    }
+    if let Some(v) = get("s-port").and_then(|v| v.parse::<u64>().ok()) {
+        p.put_u64("server_port", v);
+    }
+    if let Some(v) = get("time-taken").and_then(|v| v.parse::<u64>().ok()) {
+        p.put_u64("duration_ms", v);
+    }
+    if let Some(v) = get("sc-win32-status").and_then(|v| v.parse::<u64>().ok()) {
+        p.put_u64("win32_status", v);
+    }
+    if let Some(v) = get("s-reason") {
+        // http.sys explains why it rejected a request.
+        p.put("reason", v);
+    }
+    let status = get("sc-status")
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(0);
+    if status != 0 {
+        p.put_u64("status", u64::from(status));
+    }
+    p.severity_hint = match status {
+        500..=599 => Some(Severity::High),
+        401 | 403 => Some(Severity::Medium),
+        400..=499 => Some(Severity::Low),
+        _ => Some(Severity::Info),
+    };
+    if status == 401 || status == 403 {
+        p.mitre_tactic = Some("TA0006 Credential Access".into());
+        p.mitre_technique = Some("T1110".into());
+    }
+    p
+}
 
 fn parse_nginx_access(line: &str) -> ParsedLog {
     parse_combined_access(line).unwrap_or_else(|| ParsedLog::raw(line))
@@ -1098,5 +1196,31 @@ mod tests {
         let p = parse("mysql", line);
         assert_eq!(p.category, "authentication");
         assert_eq!(p.severity_hint, Some(Severity::Medium));
+    }
+
+    #[test]
+    fn iis_records_map_onto_the_web_access_fields() {
+        let rec = r#"{"date":"2026-10-08","time":"12:00:01","c-ip":"203.0.113.9","cs-method":"POST","cs-uri-stem":"/admin/login.aspx","cs-uri-query":"next=%2F","sc-status":"401","cs(User-Agent)":"Mozilla/5.0+(Windows+NT+10.0)","time-taken":"42"}"#;
+        let p = parse("iis", rec);
+        assert_eq!(p.category, "web");
+        assert_eq!(p.fields["remote_addr"], "203.0.113.9");
+        assert_eq!(p.fields["method"], "POST");
+        assert_eq!(p.fields["uri"], "/admin/login.aspx?next=%2F");
+        assert_eq!(p.fields["status"], 401);
+        assert_eq!(p.fields["user_agent"], "Mozilla/5.0 (Windows NT 10.0)");
+        assert_eq!(p.fields["duration_ms"], 42);
+        assert_eq!(p.severity_hint, Some(Severity::Medium));
+        assert_eq!(p.mitre_technique.as_deref(), Some("T1110"));
+        let ts = p.timestamp.expect("timestamp");
+        assert_eq!(ts.to_rfc3339(), "2026-10-08T12:00:01+00:00");
+    }
+
+    #[test]
+    fn iis_server_errors_are_high_and_garbage_stays_raw() {
+        let p = parse("w3c", r#"{"sc-status":"500","cs-method":"GET"}"#);
+        assert_eq!(p.severity_hint, Some(Severity::High));
+        let raw = parse("iis", "not json at all");
+        assert_eq!(raw.message, "not json at all");
+        assert!(raw.fields.is_empty());
     }
 }

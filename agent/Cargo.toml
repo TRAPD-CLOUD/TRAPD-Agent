@@ -83,6 +83,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_WinTrust",
     "Win32_Security_Cryptography",
     "Win32_Security_Authentication_Identity",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Wdk",
+    "Wdk_System",
+    "Wdk_System_Threading",
 ] }
 roxmltree = "0.20"
 windows-service = "0.7"

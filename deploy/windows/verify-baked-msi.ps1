@@ -14,7 +14,9 @@ try {
     $p = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @('/a', "`"$Msi`"", '/qn', "TARGETDIR=`"$tmp`"") -Wait -PassThru
     if ($p.ExitCode -ne 0) { throw "Administrative extraction failed ($($p.ExitCode))." }
 
-    foreach ($name in @('ca.crt', 'command_signing.pub')) {
+    $names = @('ca.crt', 'command_signing.pub')
+    if (Test-Path -LiteralPath (Join-Path $TrustDir 'release_signing.pub')) { $names += 'release_signing.pub' }
+    foreach ($name in $names) {
         $found = @(Get-ChildItem -Path $tmp -Recurse -File -Filter $name)
         if ($found.Count -ne 1) { throw "Expected exactly one $name in the package, found $($found.Count)." }
         if ((Get-FileHash $found[0].FullName).Hash -ne (Get-FileHash (Join-Path $TrustDir $name)).Hash) {

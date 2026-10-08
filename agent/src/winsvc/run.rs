@@ -141,6 +141,14 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     load_msi_config();
     paths::init_state_dir();
 
+    // Self-integrity, like the Linux agent: refuse to run a binary that no
+    // longer matches its recorded digest (or whose signature fails). An MSI
+    // upgrade is recognised by its changed product version and re-baselined.
+    if let Err(e) = crate::selfprotect::binary_integrity::check() {
+        error!("{e:#}");
+        return Err(e);
+    }
+
     let device_id = load_or_create_device_id()
         .await
         .context("Failed to load/create device_id")?;
@@ -211,6 +219,37 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
 
+    // ── Prevention subsystem (active response) ────────────────────────────────
+    // Same runtime as the Linux agent: signed command channel, IoC enforcement
+    // and policy-driven auto-response. It needs the backend, so it is skipped
+    // offline; every action is gated on the live `prevention_enabled` flag.
+    let reconcile_signal = Arc::new(tokio::sync::Notify::new());
+    let prev_event_tx = if offline {
+        info!("Prevention subsystem disabled (offline mode)");
+        None
+    } else {
+        match crate::prevention::runtime::start(
+            &backend_url,
+            &agent_id,
+            &token,
+            &hostname,
+            tx.clone(),
+            Arc::clone(&agent_config),
+            reconcile_signal,
+        )
+        .await
+        {
+            Ok(prev_tx) => {
+                info!("Prevention subsystem started");
+                Some(prev_tx)
+            }
+            Err(e) => {
+                warn!(error = %e, "prevention subsystem failed to start — continuing in telemetry-only mode");
+                None
+            }
+        }
+    };
+
     macro_rules! spawn_collector {
         ($collector:expr) => {{
             let mut c = $collector;
@@ -247,6 +286,15 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     // Honeytoken sentinel: decoy files (ReadDirectoryChangesW) + registry decoys
     // (RegNotifyChangeKeyValue), driven by the signed-config deception policy.
     spawn_collector!(HoneytokenCollector::new(Arc::clone(&agent_config)));
+    // Generic log collector: IIS / http.sys and the web servers and databases
+    // that run on Windows. Windows' own event logs have their own collector.
+    spawn_collector!(crate::collectors::logs::LogCollector::new(Arc::clone(
+        &agent_config
+    )));
+    // Periodic process-memory sweep (injection), gated by `memory_scan_enabled`.
+    spawn_collector!(crate::collectors::windows::memscan::MemScanCollector::new(
+        Arc::clone(&agent_config)
+    ));
 
     drop(tx);
 
@@ -284,6 +332,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     let buf_for_consumer = Arc::clone(&ring_buffer);
     let mode = output_mode;
     let consumer_engine = Arc::clone(&engine);
+    let prev_tx = prev_event_tx.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let mut consumer = tokio::spawn(async move {
         let mut shutting_down = false;
@@ -300,25 +349,32 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
                 event = rx.recv() => match event { Some(event) => event, None => break },
                 _ = flush_tick.tick() => {
                     for f in consumer_engine.flush_findings(false) {
-                        emit_finding(f, None, &mode, &buf_for_consumer, &siem).await;
+                        emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem).await;
                     }
                     continue;
                 }
             };
             if matches!(event.class, crate::schema::EventClass::Detection) {
                 for f in consumer_engine.admit_external(event) {
-                    emit_finding(f, None, &mode, &buf_for_consumer, &siem).await;
+                    emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem).await;
                 }
                 continue;
+            }
+            // Best-effort tee: a stalled enforcement engine must not stall
+            // telemetry, but a dropped tee is still counted.
+            if let Some(p) = &prev_tx {
+                crate::pipeline::try_tee(p, event.clone(), "prevention_tee");
+                crate::telemetry::metrics::metrics()
+                    .set_detection_queue_depth(p.max_capacity().saturating_sub(p.capacity()) as u64);
             }
             handle_event(&event, &mode, &buf_for_consumer).await;
             siem.forward(&event).await;
             for f in consumer_engine.admit(consumer_engine.inspect(&event)) {
-                emit_finding(f, None, &mode, &buf_for_consumer, &siem).await;
+                emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem).await;
             }
         }
         for f in consumer_engine.flush_findings(true) {
-            emit_finding(f, None, &mode, &buf_for_consumer, &siem).await;
+            emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem).await;
         }
     });
 
@@ -372,6 +428,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         }));
         handles.push(tokio::spawn(async move { config_puller.run().await }));
 
+        let token_for_update = token.clone();
         let heartbeat = Heartbeat::new(
             &backend_url,
             agent_id.clone(),
@@ -380,6 +437,13 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             Arc::clone(&agent_config),
         )?;
         handles.push(tokio::spawn(async move { heartbeat.run().await }));
+
+        // Signed self-update. Opt-in by key provisioning: without the pinned
+        // release and command keys no update can be verified, so it is not started.
+        match crate::update::Updater::new(&backend_url, agent_id.clone(), token_for_update) {
+            Ok(updater) => handles.push(tokio::spawn(async move { updater.run().await })),
+            Err(e) => info!(error = %e, "Self-update disabled"),
+        }
     }
 
     let consumer_finished = tokio::select! {

@@ -81,6 +81,13 @@
           <Component Id="TrustCommandKey" Guid="19DD277F-FB2F-4CAB-BF83-55AEF98ED970" Permanent="yes" NeverOverwrite="yes" Bitness="always64">
             <File Id="TrustCommandKeyFile" Source="$(var.TrustDir)\command_signing.pub" Name="command_signing.pub" KeyPath="yes" />
           </Component>
+          <?ifdef HasReleaseKey?>
+          <!-- Independent of the command key: a compromised backend can order
+               an update but cannot mint a release the agent will install. -->
+          <Component Id="TrustReleaseKey" Guid="5E3F6B58-1C0D-4B41-8A86-62C1B6C8E1D7" Permanent="yes" NeverOverwrite="yes" Bitness="always64">
+            <File Id="TrustReleaseKeyFile" Source="$(var.TrustDir)\release_signing.pub" Name="release_signing.pub" KeyPath="yes" />
+          </Component>
+          <?endif?>
           <?endif?>
         </Directory>
         <Directory Id="STATEDIR" Name="state">
@@ -120,6 +127,7 @@
       <ComponentRef Id="PairScript" /><ComponentRef Id="PairShortcut" />
       <?ifdef TrustDir?>
       <ComponentRef Id="TrustCa" /><ComponentRef Id="TrustCommandKey" />
+      <?ifdef HasReleaseKey?><ComponentRef Id="TrustReleaseKey" /><?endif?>
       <?endif?>
     </Feature>
   </Package>

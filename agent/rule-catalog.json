@@ -458,6 +458,19 @@
       "window_s": 3600
     },
     {
+      "base": "high",
+      "base_from_event": false,
+      "container_bump": false,
+      "dedup": "process",
+      "id": "memory.injected_pe",
+      "max": "critical",
+      "mode": "alert",
+      "root_bump": true,
+      "tactic": "TA0005 Defense Evasion",
+      "technique": "T1055.001",
+      "window_s": 3600
+    },
+    {
       "base": "low",
       "base_from_event": false,
       "container_bump": false,

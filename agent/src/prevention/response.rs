@@ -99,6 +99,53 @@ const NEVER_QUARANTINE: &[&str] = &[
     "/opt/trapd", "/var/lib/dpkg/", "/var/lib/rpm/", "/snap/",
 ];
 
+/// Windows OS and agent locations, matched on the part after the drive letter
+/// so a relocated or secondary drive is protected the same way, case-insensitively.
+const NEVER_QUARANTINE_WINDOWS: &[&str] = &[
+    "windows\\",
+    "program files\\trapd",
+    "programdata\\trapd\\",
+    "programdata\\microsoft\\",
+    "program files\\windowsapps\\",
+    "program files\\common files\\microsoft shared\\",
+];
+
+/// `X:\` or `X:/` — an absolute, local-drive Windows path. UNC and device paths
+/// (`\\server\share`, `\\?\`) are deliberately not accepted: a response must
+/// not move files on a remote share or through a device namespace.
+fn is_windows_drive_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// Whether `p` is inside the OS (or the agent itself) on Windows. `system_root`
+/// is the host's `%SystemRoot%`, protected even when it is not `X:\Windows`.
+fn is_windows_protected(p: &str, system_root: Option<&str>) -> bool {
+    if !is_windows_drive_path(p) {
+        return false;
+    }
+    let norm = p.replace('/', "\\").to_ascii_lowercase();
+    if let Some(root) = system_root {
+        let root = root.replace('/', "\\").to_ascii_lowercase();
+        let root = root.trim_end_matches('\\');
+        if !root.is_empty() && norm.starts_with(&format!("{root}\\")) {
+            return true;
+        }
+    }
+    let rest = &norm[3..];
+    NEVER_QUARANTINE_WINDOWS.iter().any(|d| rest.starts_with(d))
+}
+
+/// Absolute path on this host's conventions: POSIX root or a Windows drive path.
+fn is_absolute_target(p: &str) -> bool {
+    p.starts_with('/') || is_windows_drive_path(p)
+}
+
+fn is_never_quarantine(p: &str) -> bool {
+    NEVER_QUARANTINE.iter().any(|d| p.starts_with(d))
+        || is_windows_protected(p, std::env::var("SystemRoot").ok().as_deref())
+}
+
 /// Resolve the response targets from a detection's rule, `subject` and `evidence`.
 ///
 /// The acting PID is, in priority order: an explicit `evidence.pid`, an
@@ -127,7 +174,8 @@ pub fn targets_for_rule(rule_id: &str, subject: &str, evidence: &serde_json::Val
                 .and_then(|e| e.get("pid"))
                 .and_then(|v| v.as_i64())
         })
-        .filter(|p| *p > 1)
+        // Never init / PID 0; on Windows also never `System` (PID 4).
+        .filter(|p| *p > if cfg!(windows) { 4 } else { 1 })
         .map(|p| p as i32);
 
     // Rules whose subject *is* the malicious file.
@@ -145,8 +193,8 @@ pub fn targets_for_rule(rule_id: &str, subject: &str, evidence: &serde_json::Val
             (SUBJECT_IS_PAYLOAD.contains(&rule_id) || rule_id.starts_with("yara."))
                 .then(|| subject.to_string())
         })
-        .filter(|p| p.starts_with('/'))
-        .filter(|p| !NEVER_QUARANTINE.iter().any(|d| p.starts_with(d)));
+        .filter(|p| is_absolute_target(p))
+        .filter(|p| !is_never_quarantine(p));
 
     Targets { pid, file_path }
 }
@@ -470,5 +518,46 @@ mod tests {
         assert_eq!(dropped.file_path.as_deref(), Some("/home/u/.cache/x"));
         let none = targets_for_rule("x", "curl", &json!({}));
         assert_eq!(none.file_path, None);
+    }
+
+    #[test]
+    fn windows_drive_paths_are_quarantine_targets_but_the_os_is_not() {
+        let ev = json!({ "dropped_file": "C:\\Users\\bob\\AppData\\Local\\Temp\\payload.exe" });
+        let t = targets_for_rule("x", "x", &ev);
+        assert_eq!(
+            t.file_path.as_deref(),
+            Some("C:\\Users\\bob\\AppData\\Local\\Temp\\payload.exe")
+        );
+        // Windows paths are only meaningful (and only matched case-insensitively
+        // against the OS tree) on drive-letter form.
+        assert!(is_windows_protected("C:\\Windows\\System32\\cmd.exe", None));
+        assert!(is_windows_protected("d:/WINDOWS/system32/cmd.exe", None));
+        assert!(is_windows_protected(
+            "C:\\Program Files\\TRAPD\\trapd-agent.exe",
+            None
+        ));
+        assert!(is_windows_protected(
+            "C:\\ProgramData\\TRAPD\\state\\credentials.json",
+            None
+        ));
+        assert!(is_windows_protected("E:\\WINNT\\x.exe", Some("E:\\WINNT")));
+        assert!(!is_windows_protected(
+            "C:\\Users\\bob\\Windows\\x.exe",
+            None
+        ));
+        assert!(!is_windows_protected("C:\\Windows.old\\x.exe", None));
+    }
+
+    #[test]
+    fn unc_and_device_paths_are_never_quarantine_targets() {
+        for p in [
+            "\\\\server\\share\\x.exe",
+            "\\\\?\\C:\\x.exe",
+            "relative\\x.exe",
+            "C:x.exe",
+        ] {
+            let ev = json!({ "dropped_file": p });
+            assert!(targets_for_rule("x", "x", &ev).file_path.is_none(), "{p}");
+        }
     }
 }

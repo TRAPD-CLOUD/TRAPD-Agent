@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
-use globset::{Glob, GlobMatcher};
+use globset::GlobMatcher;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -135,11 +135,24 @@ pub struct PolicyStore {
     ports: Vec<(String, u16, RuleAction)>,
     domains: HashMap<String, (String, RuleAction)>,
     raw: Vec<IocRule>,
+    /// Windows semantics: process names and paths compare case-insensitively
+    /// and `\` separates path components. Fixed when the store is built, so
+    /// rules authored for Linux keep their exact-match behaviour there.
+    windows: bool,
 }
 
 impl PolicyStore {
     pub fn from_rules(rules: Vec<IocRule>) -> Result<Self> {
-        let mut store = PolicyStore::default();
+        Self::from_rules_for(rules, cfg!(windows))
+    }
+
+    /// Build a store with explicit platform matching semantics (tests exercise
+    /// the Windows rules on every platform through this).
+    pub(crate) fn from_rules_for(rules: Vec<IocRule>, windows: bool) -> Result<Self> {
+        let mut store = PolicyStore {
+            windows,
+            ..PolicyStore::default()
+        };
         for r in &rules {
             store.index(r)?;
         }
@@ -153,8 +166,9 @@ impl PolicyStore {
                 index_exact(&mut self.sha256, value.to_ascii_lowercase(), id, *action);
             }
             IocRule::Comm { id, value, action } => {
-                self.comm.insert(value.clone());
-                index_exact(&mut self.comm_rules, value.clone(), id, *action);
+                let name = self.fold(value);
+                self.comm.insert(name.clone());
+                index_exact(&mut self.comm_rules, name, id, *action);
             }
             IocRule::ParentChild {
                 parent,
@@ -163,10 +177,19 @@ impl PolicyStore {
                 action,
             } => {
                 self.parent_child
-                    .push((parent.clone(), child.clone(), id.clone(), *action));
+                    .push((self.fold(parent), self.fold(child), id.clone(), *action));
             }
             IocRule::PathGlob { id, value, action } => {
-                let g = Glob::new(value)
+                // Windows paths: `\` is a separator, not a glob escape, and names
+                // are case-insensitive.
+                let pattern = if self.windows {
+                    value.replace('\\', "/")
+                } else {
+                    value.clone()
+                };
+                let g = globset::GlobBuilder::new(&pattern)
+                    .case_insensitive(self.windows)
+                    .build()
                     .with_context(|| format!("invalid path glob in rule {id}: {value}"))?
                     .compile_matcher();
                 self.path_globs.push((id.clone(), g, *action));
@@ -181,11 +204,26 @@ impl PolicyStore {
         Ok(())
     }
 
+    /// Case-fold a process name on platforms where names are case-insensitive.
+    fn fold(&self, s: &str) -> String {
+        if self.windows {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    }
+
     pub fn rules(&self) -> &[IocRule] {
         &self.raw
     }
     pub fn has_sha256_rules(&self) -> bool {
         !self.sha256.is_empty()
+    }
+    /// Whether any rule needs the parent process name. Resolving it costs a
+    /// syscall (or a process-handle open on Windows) per process start, so it is
+    /// only done when a rule can use it.
+    pub fn has_parent_child_rules(&self) -> bool {
+        !self.parent_child.is_empty()
     }
     #[allow(dead_code)]
     pub fn comm_set(&self) -> &HashSet<String> {
@@ -216,7 +254,8 @@ impl PolicyStore {
             }
         }
 
-        if let Some((id, action)) = self.comm_rules.get(comm) {
+        let comm_key = self.fold(comm);
+        if let Some((id, action)) = self.comm_rules.get(&comm_key) {
             best = upgrade(
                 best,
                 Match {
@@ -227,8 +266,13 @@ impl PolicyStore {
             );
         }
 
+        let path_key = if self.windows {
+            std::borrow::Cow::Owned(exe_path.replace('\\', "/"))
+        } else {
+            std::borrow::Cow::Borrowed(exe_path)
+        };
         for (id, glob, action) in &self.path_globs {
-            if glob.is_match(exe_path) {
+            if glob.is_match(path_key.as_ref()) {
                 best = upgrade(
                     best,
                     Match {
@@ -241,8 +285,9 @@ impl PolicyStore {
         }
 
         if let Some(parent) = parent_comm {
+            let (parent_key, child_key) = (self.fold(parent), comm_key);
             for (p, c, id, action) in &self.parent_child {
-                if p == parent && c == comm {
+                if *p == parent_key && *c == child_key {
                     best = upgrade(
                         best,
                         Match {
@@ -454,5 +499,76 @@ mod tests {
         let matched = store.match_exec("/bin/bash", "bash", None, None).unwrap();
         assert_eq!(matched.action, RuleAction::Block);
         assert_eq!(matched.rule_id, "block");
+    }
+
+    #[test]
+    fn windows_matching_is_case_insensitive_and_separator_agnostic() {
+        let store = PolicyStore::from_rules_for(
+            vec![
+                IocRule::Comm {
+                    id: "comm".into(),
+                    value: "PowerShell.exe".into(),
+                    action: RuleAction::Block,
+                },
+                IocRule::PathGlob {
+                    id: "path".into(),
+                    value: "C:\\Users\\*\\AppData\\Local\\Temp\\**\\*.EXE".into(),
+                    action: RuleAction::Block,
+                },
+                IocRule::ParentChild {
+                    parent: "WINWORD.EXE".into(),
+                    child: "cmd.exe".into(),
+                    id: "pair".into(),
+                    action: RuleAction::Alert,
+                },
+            ],
+            true,
+        )
+        .unwrap();
+        let by_comm = store
+            .match_exec("C:\\Windows\\x.exe", "POWERSHELL.EXE", None, None)
+            .unwrap();
+        assert_eq!(by_comm.rule_id, "comm");
+        let by_path = store
+            .match_exec(
+                "c:\\users\\bob\\appdata\\local\\temp\\drop\\payload.exe",
+                "payload.exe",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(by_path.rule_id, "path");
+        let by_pair = store
+            .match_exec(
+                "C:\\Windows\\System32\\cmd.exe",
+                "CMD.EXE",
+                Some("winword.exe"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(by_pair.rule_id, "pair");
+    }
+
+    #[test]
+    fn unix_matching_stays_exact() {
+        let store = PolicyStore::from_rules_for(
+            vec![
+                IocRule::Comm {
+                    id: "comm".into(),
+                    value: "bash".into(),
+                    action: RuleAction::Block,
+                },
+                IocRule::PathGlob {
+                    id: "path".into(),
+                    value: "/tmp/**/*.sh".into(),
+                    action: RuleAction::Block,
+                },
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(store.match_exec("/bin/x", "BASH", None, None).is_none());
+        assert!(store.match_exec("/TMP/a/b.sh", "x", None, None).is_none());
+        assert!(store.match_exec("/tmp/a/b.sh", "x", None, None).is_some());
     }
 }
