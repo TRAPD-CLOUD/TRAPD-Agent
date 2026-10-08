@@ -21,7 +21,7 @@
 
 use serde::Serialize;
 
-use crate::schema::{HoneytokenAccessData, ProcessLineage};
+use crate::schema::{HoneytokenAccessData, HoneytokenAssessment, HoneytokenSensor, ProcessLineage};
 
 /// Windows access-mask bits (winnt.h) relevant to a file read.
 pub const FILE_READ_DATA: u32 = 0x0001;
@@ -40,6 +40,7 @@ pub struct DecoyInfo {
     pub kind: String,
     /// SID of the user the decoy belongs to (its placement owner).
     pub owner_sid: String,
+    pub audit_ready: bool,
 }
 
 /// The accessor as the 4663 event reports it.
@@ -88,7 +89,7 @@ fn basename(name: &str) -> String {
 
 fn is_sweeper(a: &Accessor) -> bool {
     let b = basename(&a.process_name);
-    a.signed_trusted && WINDOWS_SWEEPERS.iter().any(|s| b == *s || b.starts_with(s))
+    a.signed_trusted && a.logon_type == Some(5) && WINDOWS_SWEEPERS.contains(&b.as_str())
 }
 
 /// Grade of a decoy access, most benign first.
@@ -115,16 +116,39 @@ pub struct Verdict {
 
 fn classify_access(mask: u32) -> (&'static str, bool) {
     // Returns (access_kind, is_content_read).
-    if mask & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0 {
+    if mask
+        & (FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | 0x10
+            | 0x100
+            | 0x40000
+            | 0x80000
+            | 0x40000000
+            | 0x10000000)
+        != 0
+    {
         ("modify", false)
     } else if mask & DELETE != 0 {
         ("unlink", false)
-    } else if mask & (FILE_READ_DATA | FILE_EXECUTE) != 0 {
+    } else if mask == 0
+        || mask
+            & !(FILE_READ_DATA
+                | FILE_READ_EA
+                | FILE_READ_ATTRIBUTES
+                | FILE_EXECUTE
+                | 0x100000
+                | 0x20000)
+            != 0
+    {
+        ("unknown", true)
+    } else if mask & FILE_EXECUTE != 0 {
+        ("exec", false)
+    } else if mask & FILE_READ_DATA != 0 {
         ("open", true)
     } else if mask & (FILE_READ_ATTRIBUTES | FILE_READ_EA) != 0 {
         ("stat", false)
     } else {
-        ("open", true) // unknown bits: treat conservatively as a read
+        ("unknown", true)
     }
 }
 
@@ -137,7 +161,7 @@ pub fn grade(decoy: &DecoyInfo, a: &Accessor, unusual_hour: Option<bool>) -> Ver
 
     // Writes, renames and deletes are tamper, always a strong signal
     // regardless of who: nobody edits a decoy by accident.
-    if !content_read && matches!(access_kind, "modify" | "unlink") {
+    if !content_read && matches!(access_kind, "modify" | "unlink" | "exec") {
         return Verdict {
             grade: Grade::Foreign,
             confidence: 90,
@@ -155,7 +179,7 @@ pub fn grade(decoy: &DecoyInfo, a: &Accessor, unusual_hour: Option<bool>) -> Ver
         };
     }
 
-    if is_sweeper(a) {
+    if access_kind != "unknown" && is_sweeper(a) {
         reasons.push(format!(
             "verified sweeper {} read the content",
             basename(&a.process_name)
@@ -169,8 +193,8 @@ pub fn grade(decoy: &DecoyInfo, a: &Accessor, unusual_hour: Option<bool>) -> Ver
     }
 
     let owner = !a.subject_sid.is_empty() && a.subject_sid.eq_ignore_ascii_case(&decoy.owner_sid);
-    let interactive = matches!(a.logon_type, Some(2) | Some(10) | Some(11) | None);
-    if owner && interactive {
+    let interactive = matches!(a.logon_type, Some(2) | Some(10) | Some(11));
+    if access_kind != "unknown" && owner && interactive {
         let mut confidence = 70;
         reasons.push(
             "read by the decoy's owner in an interactive session (possibly legitimate)".into(),
@@ -210,17 +234,65 @@ pub fn grade(decoy: &DecoyInfo, a: &Accessor, unusual_hour: Option<bool>) -> Ver
     }
 }
 
+/// Only a read by this live Agent generation can be excluded. Historic PID
+/// reuse, missing source time, same basename elsewhere, writes and exec stay.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn is_agent_self_read(
+    a: &Accessor,
+    pid: i32,
+    exe: &str,
+    started: Option<u64>,
+    observed: Option<u64>,
+) -> bool {
+    let valid_time = matches!((started, observed), (Some(s), Some(t)) if s > 0 && t >= s);
+    a.pid == pid
+        && pid > 0
+        && !exe.is_empty()
+        && a.process_name.eq_ignore_ascii_case(exe)
+        && valid_time
+        && a.access_mask != 0
+        && a.access_mask
+            & !(FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | 0x100000 | 0x20000)
+            == 0
+        && a.access_mask & (FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA) != 0
+}
+
 /// Build the honeytoken detection payload for an access the grader did not
 /// drop. The engine's gate and severity policy then decide alert vs. signal
-/// (an `OwnerInteractive`/`Signal` grade rides as a non-alerting signal; a
-/// `Foreign` grade alerts). Returns `None` when the access is pure metadata by
-/// a verified sweeper (nothing worth recording).
+/// (`OwnerInteractive` is High/Alert, metadata or scheduled sweeps are Signals).
 pub fn to_access_data(decoy: &DecoyInfo, a: &Accessor, verdict: &Verdict) -> HoneytokenAccessData {
     let (tactic, technique) = match verdict.access_kind {
         "modify" | "unlink" => ("TA0040 Impact", "T1565.001"),
         _ => ("TA0006 Credential Access", "T1552.001"),
     };
     HoneytokenAccessData {
+        sensor: Some(HoneytokenSensor::WindowsAudit),
+        assessment: Some(match verdict.grade {
+            Grade::OwnerInteractive => HoneytokenAssessment::OwnerInteractive,
+            Grade::Signal if verdict.access_kind == "stat" => HoneytokenAssessment::Metadata,
+            Grade::Signal => HoneytokenAssessment::ScheduledSweep,
+            Grade::Foreign if matches!(verdict.access_kind, "modify" | "unlink" | "exec") => {
+                HoneytokenAssessment::Tamper
+            }
+            _ => HoneytokenAssessment::ContentAccess,
+        }),
+        assessment_reasons: {
+            let mut reasons = Vec::new();
+            if verdict.grade == Grade::OwnerInteractive {
+                if a.logon_type == Some(10) {
+                    reasons.push("remote_owner_session".into());
+                }
+                if verdict
+                    .reasons
+                    .iter()
+                    .any(|r| r.contains("usual active hours"))
+                {
+                    reasons.push("outside_learned_hours".into());
+                }
+            }
+            reasons
+        },
+        mode: None,
         token_id: decoy.token_id.clone(),
         path: decoy.path.clone(),
         kind: decoy.kind.clone(),
@@ -241,7 +313,7 @@ pub fn to_access_data(decoy: &DecoyInfo, a: &Accessor, verdict: &Verdict) -> Hon
         },
         session: None,
         allowlisted_accessor: is_sweeper(a),
-        scheduled_sweep: false,
+        scheduled_sweep: verdict.grade == Grade::Signal && is_sweeper(a),
     }
 }
 
@@ -254,6 +326,7 @@ mod tests {
             token_id: "winfs:abc".into(),
             path: "C:\\Users\\anna\\Documents\\IT\\Zugangsdaten.txt".into(),
             kind: "password_note".into(),
+            audit_ready: false,
             owner_sid: "S-1-5-21-1-2-3-1001".into(),
         }
     }
@@ -267,6 +340,135 @@ mod tests {
             logon_type: Some(2),
             signed_trusted: false,
         }
+    }
+
+    #[test]
+    fn unknown_or_attribute_mutation_masks_never_authorize_sweepers() {
+        for mask in [
+            0,
+            0x8000_0000,
+            FILE_READ_ATTRIBUTES | 0x100,
+            FILE_READ_DATA | 0x10,
+        ] {
+            let a = Accessor {
+                process_name: "C:\\Windows\\System32\\searchindexer.exe".into(),
+                signed_trusted: true,
+                logon_type: Some(5),
+                access_mask: mask,
+                ..Default::default()
+            };
+            let v = grade(&decoy(), &a, None);
+            assert_eq!(v.grade, Grade::Foreign, "mask {mask:x}");
+            assert_eq!(
+                crate::detection::honeytoken_policy::assess(
+                    &to_access_data(&decoy(), &a, &v),
+                    crate::schema::Severity::Critical
+                )
+                .mode,
+                crate::schema::DetectionMode::Alert
+            );
+        }
+    }
+
+    #[test]
+    fn execution_by_owner_or_verified_sweeper_is_always_tamper() {
+        let decoy = DecoyInfo {
+            token_id: "t".into(),
+            path: "C:\\bait.exe".into(),
+            kind: "note".into(),
+            audit_ready: false,
+            owner_sid: "owner".into(),
+        };
+        for (logon, exe) in [
+            (2, "C:\\app.exe"),
+            (5, "C:\\Windows\\System32\\searchindexer.exe"),
+        ] {
+            let a = Accessor {
+                process_name: exe.into(),
+                subject_sid: "owner".into(),
+                signed_trusted: true,
+                logon_type: Some(logon),
+                access_mask: FILE_EXECUTE | FILE_READ_DATA,
+                ..Default::default()
+            };
+            let v = grade(&decoy, &a, None);
+            assert_eq!(v.access_kind, "exec");
+            assert_eq!(v.grade, Grade::Foreign);
+            let data = to_access_data(&decoy, &a, &v);
+            assert_eq!(
+                crate::detection::honeytoken_policy::assess(&data, crate::schema::Severity::Low)
+                    .mode,
+                crate::schema::DetectionMode::Alert
+            );
+        }
+    }
+
+    #[test]
+    fn self_read_requires_current_generation_and_full_image_identity() {
+        let mut a = accessor(
+            "C:\\Program Files\\TRAPD\\trapd-agent.exe",
+            "S-1-5-18",
+            FILE_READ_DATA,
+        );
+        a.pid = 77;
+        assert!(is_agent_self_read(
+            &a,
+            77,
+            &a.process_name,
+            Some(100),
+            Some(101)
+        ));
+        assert!(!is_agent_self_read(
+            &a,
+            77,
+            &a.process_name,
+            Some(100),
+            Some(99)
+        ));
+        assert!(!is_agent_self_read(
+            &a,
+            77,
+            "C:\\Other\\trapd-agent.exe",
+            Some(100),
+            Some(101)
+        ));
+        assert!(!is_agent_self_read(
+            &a,
+            77,
+            &a.process_name,
+            None,
+            Some(101)
+        ));
+        a.access_mask |= FILE_WRITE_DATA;
+        assert!(!is_agent_self_read(
+            &a,
+            77,
+            &a.process_name,
+            Some(100),
+            Some(101)
+        ));
+    }
+
+    #[test]
+    fn audit_grade_survives_payload_and_unknown_sessions_are_not_owner_interactive() {
+        let mut a = accessor("notepad.exe", "S-1-5-21-1-2-3-1001", FILE_READ_DATA);
+        let verdict = grade(&decoy(), &a, None);
+        let data = to_access_data(&decoy(), &a, &verdict);
+        let outcome =
+            crate::detection::honeytoken_policy::assess(&data, crate::schema::Severity::Critical);
+        assert_eq!(outcome.severity, crate::schema::Severity::High);
+        a.logon_type = None;
+        assert_eq!(grade(&decoy(), &a, None).grade, Grade::Foreign);
+    }
+
+    #[test]
+    fn interactive_signed_backup_is_not_an_expected_sweep() {
+        let mut a = accessor("wbengine.exe", "S-1-5-18", FILE_READ_DATA);
+        a.signed_trusted = true;
+        a.logon_type = Some(10);
+        assert_eq!(grade(&decoy(), &a, None).grade, Grade::Foreign);
+        a.logon_type = None;
+        assert_eq!(grade(&decoy(), &a, None).grade, Grade::Foreign);
     }
 
     #[test]
@@ -328,6 +530,7 @@ mod tests {
             FILE_READ_DATA,
         );
         a.signed_trusted = true;
+        a.logon_type = Some(5);
         assert_eq!(grade(&decoy(), &a, None).grade, Grade::Signal);
         // Same name, unsigned → not trusted → graded as a foreign read.
         a.signed_trusted = false;
@@ -386,14 +589,19 @@ pub fn accessor_from_4663(
     logon_type: Option<u32>,
     signed_trusted: bool,
 ) -> Accessor {
-    let mask = field("AccessMask");
-    let mask = mask.trim().trim_start_matches("0x");
+    fn number(raw: &str) -> Option<u32> {
+        let raw = raw.trim();
+        if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            raw.parse().ok()
+        }
+    }
     Accessor {
         process_name: field("ProcessName"),
-        pid: i64::from_str_radix(field("ProcessId").trim().trim_start_matches("0x"), 16)
-            .ok()
-            .or_else(|| field("ProcessId").trim().parse().ok())
-            .unwrap_or(0) as i32,
+        pid: number(&field("ProcessId"))
+            .and_then(|v| i32::try_from(v).ok())
+            .unwrap_or(0),
         subject_user: {
             let d = field("SubjectDomainName");
             let u = field("SubjectUserName");
@@ -404,7 +612,7 @@ pub fn accessor_from_4663(
             }
         },
         subject_sid: field("SubjectUserSid"),
-        access_mask: u32::from_str_radix(mask, 16).unwrap_or(0),
+        access_mask: number(&field("AccessMask")).unwrap_or(0),
         logon_type,
         signed_trusted,
     }
@@ -425,7 +633,9 @@ fn registry() -> &'static Mutex<Registry> {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn register_decoy(info: DecoyInfo) {
     if let Ok(mut r) = registry().lock() {
-        r.by_path.insert(info.path.to_ascii_lowercase(), info);
+        if r.by_path.len() < 1024 || r.by_path.contains_key(&info.path.to_ascii_lowercase()) {
+            r.by_path.insert(info.path.to_ascii_lowercase(), info);
+        }
     }
 }
 
@@ -434,6 +644,17 @@ pub fn forget_decoy(path: &str) {
     if let Ok(mut r) = registry().lock() {
         r.by_path.remove(&path.to_ascii_lowercase());
     }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn audit_coverage() -> (usize, usize) {
+    registry()
+        .lock()
+        .map(|r| {
+            let ready = r.by_path.values().filter(|d| d.audit_ready).count();
+            (ready, r.by_path.len() - ready)
+        })
+        .unwrap_or_default()
 }
 
 /// The decoy at `path`, if one is registered there.
@@ -448,6 +669,21 @@ pub fn lookup_decoy(path: &str) -> Option<DecoyInfo> {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn decimal_pid_and_unknown_access_mask_are_not_misparsed() {
+        let data = accessor_from_4663(
+            |key| match key {
+                "ProcessId" => "4242".into(),
+                "AccessMask" => "invalid".into(),
+                _ => String::new(),
+            },
+            None,
+            false,
+        );
+        assert_eq!(data.pid, 4242);
+        assert_eq!(classify_access(data.access_mask), ("unknown", true));
+    }
 
     #[test]
     fn parses_4663_fields_and_hex_mask() {
@@ -472,6 +708,7 @@ mod registry_tests {
             token_id: "t".into(),
             path: "C:\\Users\\Anna\\Documents\\IT\\Zugang.txt".into(),
             kind: "password_note".into(),
+            audit_ready: false,
             owner_sid: "S-1-5-21-1-2-3-1001".into(),
         });
         assert!(lookup_decoy("c:\\users\\anna\\documents\\it\\zugang.txt").is_some());

@@ -48,10 +48,12 @@ struct UserActivity {
     /// lowercase directory path → last write (unix seconds)
     dirs: BTreeMap<String, i64>,
     /// recently saved file names (style inference only)
-    names: VecDeque<String>,
+    names: VecDeque<(i64, String)>,
     /// interactive activity per hour of day (local time unknown → UTC hour)
-    hours: [u32; 24],
+    hours: BTreeMap<i64, [u32; 24]>,
     first_seen_unix: i64,
+    #[serde(default)]
+    last_bootstrap_unix: i64,
 }
 
 /// What the profiler needs from a user's activity.
@@ -72,7 +74,7 @@ impl UserActivitySummary {
         if self.learning_days < 7 {
             return None;
         }
-        let total: u32 = self.hours.iter().sum();
+        let total: u64 = self.hours.iter().map(|n| *n as u64).sum();
         if total < 50 {
             return None;
         }
@@ -86,7 +88,7 @@ pub struct ActivityStore {
     #[serde(default)]
     users: BTreeMap<String, UserActivity>,
     #[serde(default)]
-    hostnames: BTreeSet<String>,
+    hostnames: BTreeMap<String, i64>,
 }
 
 fn basename(path: &str) -> String {
@@ -99,7 +101,12 @@ fn basename(path: &str) -> String {
 impl ActivityStore {
     fn user(&mut self, user: &str, now: i64) -> Option<&mut UserActivity> {
         let key = user.to_lowercase();
-        if key.is_empty() || key == "unknown" {
+        if now < 0
+            || key.is_empty()
+            || key == "unknown"
+            || key.len() > 256
+            || key.chars().any(char::is_control)
+        {
             return None;
         }
         if !self.users.contains_key(&key) && self.users.len() >= MAX_USERS {
@@ -115,7 +122,7 @@ impl ActivityStore {
     /// A process the user started. Only the executable's basename is kept.
     pub fn observe_exec(&mut self, user: &str, exe: &str, now: i64) {
         let tool = basename(exe);
-        if tool.is_empty() {
+        if tool.is_empty() || tool.len() > 256 || tool.chars().any(char::is_control) {
             return;
         }
         let Some(u) = self.user(user, now) else {
@@ -124,12 +131,14 @@ impl ActivityStore {
         if !u.tools.contains_key(&tool) && u.tools.len() >= MAX_TOOLS_PER_USER {
             return;
         }
-        *u.tools
-            .entry(tool)
-            .or_default()
-            .entry(now / DAY)
-            .or_insert(0) += 1;
-        u.hours[((now % DAY) / 3600) as usize] += 1;
+        let days = u.tools.entry(tool).or_default();
+        days.retain(|day, _| *day >= now / DAY - RETENTION_DAYS && *day <= now / DAY);
+        let count = days.entry(now / DAY).or_insert(0);
+        *count = count.saturating_add(1);
+        u.hours
+            .retain(|day, _| *day >= now / DAY - RETENTION_DAYS && *day <= now / DAY);
+        let count = &mut u.hours.entry(now / DAY).or_insert([0; 24])[((now % DAY) / 3600) as usize];
+        *count = count.saturating_add(1);
     }
 
     /// A file the user saved. Keeps the directory's last-write time and the
@@ -142,6 +151,13 @@ impl ActivityStore {
         // Normalise the separator so the key matches regardless of whether the
         // path arrived with `\` (Windows) or `/`: `cold_dirs` keys the same way.
         let key = dir.to_string_lossy().replace('\\', "/").to_lowercase();
+        if key.len() > 1024
+            || name.len() > 512
+            || key.chars().any(char::is_control)
+            || name.chars().any(char::is_control)
+        {
+            return;
+        }
         let Some(u) = self.user(user, now) else {
             return;
         };
@@ -158,7 +174,7 @@ impl ActivityStore {
         }
         u.dirs.insert(key, now);
         if !name.starts_with('~') && !name.starts_with('.') {
-            u.names.push_back(name);
+            u.names.push_back((now, name));
             while u.names.len() > MAX_NAME_SAMPLES {
                 u.names.pop_front();
             }
@@ -167,20 +183,31 @@ impl ActivityStore {
 
     /// An internal host name resolved on this machine (first label only).
     pub fn observe_hostname(&mut self, qname: &str) {
+        self.observe_hostname_at(qname, now_unix());
+    }
+
+    pub fn observe_hostname_at(&mut self, qname: &str, now: i64) {
         let label = qname
             .trim_end_matches('.')
             .split('.')
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        if label.is_empty() || label.len() > 63 || self.hostnames.len() >= MAX_HOSTNAMES {
+        if now < 0
+            || label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            || (!self.hostnames.contains_key(&label) && self.hostnames.len() >= MAX_HOSTNAMES)
+        {
             return;
         }
-        self.hostnames.insert(label);
+        self.hostnames.insert(label, now);
     }
 
-    pub fn known_hostnames(&self) -> &BTreeSet<String> {
-        &self.hostnames
+    pub fn known_hostnames(&self) -> BTreeSet<String> {
+        self.hostnames.keys().cloned().collect()
     }
 
     /// Drop everything older than the retention window.
@@ -188,13 +215,21 @@ impl ActivityStore {
         let horizon_day = (now - RETENTION_DAYS * DAY) / DAY;
         for u in self.users.values_mut() {
             for days in u.tools.values_mut() {
-                days.retain(|d, _| *d >= horizon_day);
+                days.retain(|d, _| *d > horizon_day && *d <= now / DAY);
             }
             u.tools.retain(|_, days| !days.is_empty());
-            u.dirs.retain(|_, t| *t >= now - RETENTION_DAYS * DAY);
+            u.dirs
+                .retain(|_, t| *t >= now - RETENTION_DAYS * DAY && *t <= now);
+            u.names
+                .retain(|(t, _)| *t >= now - RETENTION_DAYS * DAY && *t <= now);
+            u.hours
+                .retain(|day, _| *day > horizon_day && *day <= now / DAY);
         }
-        self.users
-            .retain(|_, u| !u.tools.is_empty() || !u.dirs.is_empty() || !u.names.is_empty());
+        self.users.retain(|_, u| {
+            !u.tools.is_empty() || !u.dirs.is_empty() || !u.names.is_empty() || !u.hours.is_empty()
+        });
+        self.hostnames
+            .retain(|_, t| *t >= now - RETENTION_DAYS * DAY && *t <= now);
     }
 
     pub fn summary(&self, user: &str, now: i64) -> Option<UserActivitySummary> {
@@ -207,9 +242,8 @@ impl ActivityStore {
                 (
                     t.clone(),
                     days.iter()
-                        .filter(|(d, _)| **d >= horizon_day)
-                        .map(|(_, c)| *c)
-                        .sum(),
+                        .filter(|(d, _)| **d > horizon_day && **d <= now / DAY)
+                        .fold(0u32, |sum, (_, c)| sum.saturating_add(*c)),
                 )
             })
             .filter(|(_, c): &(String, u32)| *c > 0)
@@ -217,16 +251,31 @@ impl ActivityStore {
         let hot_dirs = u
             .dirs
             .iter()
-            .filter(|(_, t)| now - **t < COLD_AFTER_DAYS * DAY)
+            .filter(|(_, t)| **t <= now && now - **t < COLD_AFTER_DAYS * DAY)
             .map(|(d, _)| d.clone())
             .collect();
-        let names: Vec<&String> = u.names.iter().collect();
+        let names: Vec<&String> = u
+            .names
+            .iter()
+            .filter(|(t, _)| *t <= now && *t >= now - RETENTION_DAYS * DAY)
+            .map(|(_, name)| name)
+            .collect();
+        let mut hours = [0u32; 24];
+        for (_, daily) in u
+            .hours
+            .iter()
+            .filter(|(d, _)| **d > horizon_day && **d <= now / DAY)
+        {
+            for (out, count) in hours.iter_mut().zip(daily) {
+                *out = out.saturating_add(*count);
+            }
+        }
         Some(UserActivitySummary {
             tool_uses,
             hot_dirs,
             naming: (!names.is_empty()).then(|| NamingStyle::infer(&names)),
-            hours: u.hours,
-            learning_days: ((now - u.first_seen_unix) / DAY).max(0),
+            hours,
+            learning_days: ((now - u.first_seen_unix) / DAY).clamp(0, RETENTION_DAYS),
         })
     }
 
@@ -251,14 +300,75 @@ impl ActivityStore {
             tracing::warn!(path = %path.display(), "activity state too large; starting fresh");
             return Self::default();
         }
-        std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        use std::io::Read;
+        let Ok(file) = std::fs::File::open(path) else {
+            return Self::default();
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_STATE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MAX_STATE_BYTES
+        {
+            return Self::default();
+        }
+        let mut store: Self = serde_json::from_slice(&bytes).unwrap_or_default();
+        store.users = store
+            .users
+            .into_iter()
+            .filter(|(u, _)| !u.is_empty() && u.len() <= 256)
+            .take(MAX_USERS)
+            .collect();
+        for u in store.users.values_mut() {
+            u.tools = std::mem::take(&mut u.tools)
+                .into_iter()
+                .filter(|(t, _)| !t.is_empty() && t.len() <= 256)
+                .take(MAX_TOOLS_PER_USER)
+                .collect();
+            for days in u.tools.values_mut() {
+                *days = std::mem::take(days)
+                    .into_iter()
+                    .rev()
+                    .take(RETENTION_DAYS as usize + 1)
+                    .collect();
+            }
+            u.dirs = std::mem::take(&mut u.dirs)
+                .into_iter()
+                .filter(|(p, _)| p.len() <= 1024)
+                .take(MAX_DIRS_PER_USER)
+                .collect();
+            u.names = std::mem::take(&mut u.names)
+                .into_iter()
+                .filter(|(_, n)| n.len() <= 512)
+                .rev()
+                .take(MAX_NAME_SAMPLES)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            u.hours = std::mem::take(&mut u.hours)
+                .into_iter()
+                .rev()
+                .take(RETENTION_DAYS as usize + 1)
+                .collect();
+        }
+        store.hostnames = store
+            .hostnames
+            .into_iter()
+            .filter(|(h, _)| h.len() <= 63)
+            .take(MAX_HOSTNAMES)
+            .collect();
+        store
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        crate::paths::write_atomic(path, &serde_json::to_vec(self)?, 0o600)
+        let bytes = serde_json::to_vec(self)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_STATE_BYTES,
+            "activity state exceeds size limit"
+        );
+        crate::paths::write_atomic(path, &bytes, 0o600)
     }
 
     /// Remove the persisted state (learning disabled or agent uninstalled).
@@ -289,17 +399,15 @@ fn global() -> &'static std::sync::Mutex<ActivityStore> {
 /// leave a behavioural profile behind.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn set_enabled(on: bool) {
-    let was = ENABLED.swap(on, std::sync::atomic::Ordering::SeqCst);
-    if on == was {
-        return;
-    }
     if let Ok(mut store) = global().lock() {
-        if on {
+        let was = ENABLED.swap(on, std::sync::atomic::Ordering::SeqCst);
+        if on && !was {
             *store = ActivityStore::load(&state_path());
+            store.prune(now_unix());
             tracing::info!("deception activity learning enabled (local only)");
-        } else {
+        } else if !on {
             *store = ActivityStore::default();
-            ActivityStore::purge(&state_path());
+            ActivityStore::purge(&state_path()); // also on first startup with opt-in off
         }
     }
 }
@@ -321,6 +429,9 @@ fn now_unix() -> i64 {
 pub fn record_exec(user: &str, exe: &str) {
     if enabled() {
         if let Ok(mut s) = global().lock() {
+            if !enabled() {
+                return;
+            }
             s.observe_exec(user, exe, now_unix());
         }
     }
@@ -331,6 +442,9 @@ pub fn record_exec(user: &str, exe: &str) {
 pub fn record_write(user: &str, path: &Path) {
     if enabled() {
         if let Ok(mut s) = global().lock() {
+            if !enabled() {
+                return;
+            }
             s.observe_write(user, path, now_unix());
         }
     }
@@ -341,6 +455,9 @@ pub fn record_write(user: &str, path: &Path) {
 pub fn record_hostname(qname: &str) {
     if enabled() {
         if let Ok(mut s) = global().lock() {
+            if !enabled() {
+                return;
+            }
             s.observe_hostname(qname);
         }
     }
@@ -351,8 +468,20 @@ pub fn record_hostname(qname: &str) {
 pub fn bootstrap(user: &str, root: &Path) {
     if enabled() {
         if let Ok(mut s) = global().lock() {
-            if s.summary(user, now_unix()).is_none() {
-                bootstrap_from_disk(&mut s, user, root, now_unix());
+            if !enabled() {
+                return;
+            }
+            let now = now_unix();
+            let previous = s
+                .users
+                .get(&user.to_lowercase())
+                .map(|u| u.last_bootstrap_unix)
+                .unwrap_or(0);
+            if now.saturating_sub(previous) >= DAY {
+                bootstrap_from_disk(&mut s, user, root, now);
+                if let Some(u) = s.users.get_mut(&user.to_lowercase()) {
+                    u.last_bootstrap_unix = now;
+                }
             }
         }
     }
@@ -366,7 +495,13 @@ pub fn current_summaries() -> BTreeMap<String, UserActivitySummary> {
     }
     global()
         .lock()
-        .map(|s| s.summaries(now_unix()))
+        .map(|s| {
+            if enabled() {
+                s.summaries(now_unix())
+            } else {
+                BTreeMap::new()
+            }
+        })
         .unwrap_or_default()
 }
 
@@ -378,7 +513,13 @@ pub fn current_hostnames() -> BTreeSet<String> {
     }
     global()
         .lock()
-        .map(|s| s.known_hostnames().clone())
+        .map(|s| {
+            if enabled() {
+                s.known_hostnames()
+            } else {
+                BTreeSet::new()
+            }
+        })
         .unwrap_or_default()
 }
 
@@ -389,6 +530,9 @@ pub fn persist() {
         return;
     }
     if let Ok(mut s) = global().lock() {
+        if !enabled() {
+            return;
+        }
         s.prune(now_unix());
         if let Err(e) = s.save(&state_path()) {
             tracing::warn!(error = %e, "could not persist local activity profile");
@@ -436,12 +580,12 @@ pub fn bootstrap_from_disk(store: &mut ActivityStore, user: &str, root: &Path, n
             };
             // Only recent writes mark a directory hot; older files still teach
             // the naming style.
-            if now - mtime < RETENTION_DAYS * DAY {
+            if mtime <= now && now - mtime < RETENTION_DAYS * DAY {
                 store.observe_write(user, &entry.path(), mtime);
             } else if let Some(u) = store.user(user, now) {
                 let n = entry.file_name().to_string_lossy().into_owned();
                 if u.names.len() < MAX_NAME_SAMPLES && !n.starts_with('.') && !n.starts_with('~') {
-                    u.names.push_back(n);
+                    u.names.push_back((now, n));
                 }
             }
         }
@@ -453,6 +597,29 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_790_000_000;
+
+    #[test]
+    fn expired_names_hours_and_hostnames_are_actually_removed() {
+        let mut s = ActivityStore::default();
+        s.observe_exec("anna", "tool.exe", NOW - 31 * DAY);
+        s.observe_write(
+            "anna",
+            Path::new("/d/2020-01-01_secret.txt"),
+            NOW - 31 * DAY,
+        );
+        s.observe_hostname_at("old.internal", NOW - 31 * DAY);
+        s.prune(NOW);
+        assert!(s.summary("anna", NOW).is_none());
+        assert!(s.known_hostnames().is_empty());
+    }
+
+    #[test]
+    fn rollback_drops_future_activity_and_counters_saturate() {
+        let mut s = ActivityStore::default();
+        s.observe_exec("anna", "a.exe", NOW + DAY);
+        s.prune(NOW);
+        assert!(s.summary("anna", NOW).is_none());
+    }
 
     #[test]
     fn keeps_only_tool_basenames_and_counts_per_day() {

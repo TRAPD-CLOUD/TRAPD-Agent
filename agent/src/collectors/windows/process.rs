@@ -22,7 +22,7 @@ use std::time::SystemTime;
 use anyhow::Result;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind, Users};
+use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind};
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
 use tracing::info;
@@ -58,7 +58,6 @@ fn refresh_kind() -> ProcessRefreshKind {
 
 pub struct ProcessCollector {
     sys: System,
-    users: Users,
     initialized: bool,
     /// pid → name of every process seen in the previous poll.
     known: HashMap<i32, (String, Option<u64>)>,
@@ -70,7 +69,6 @@ impl ProcessCollector {
     pub fn new() -> Self {
         Self {
             sys: System::new(),
-            users: Users::new_with_refreshed_list(),
             initialized: false,
             known: HashMap::new(),
             hash_cache: HashMap::new(),
@@ -111,12 +109,8 @@ impl ProcessCollector {
     }
 
     fn username_of(&self, pid: Pid) -> String {
-        self.sys
-            .process(pid)
-            .and_then(|p| p.user_id())
-            .and_then(|uid| self.users.get_user_by_id(uid))
-            .map(|u| u.name().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+        crate::telemetry::identity::windows_process_account(pid.as_u32() as i32)
+            .unwrap_or_else(|| "unknown".into())
     }
 }
 
@@ -163,6 +157,15 @@ impl Collector for ProcessCollector {
                 })
                 .collect();
 
+            // Maintain cross-view state even while ETW owns process emissions.
+            if crate::telemetry::coverage::snapshot().etw_process_active() {
+                self.known = current;
+                self.initialized = true;
+                continue;
+            }
+            crate::telemetry::coverage::update(|c| c.process_sensor = Some("polling".into()));
+            crate::telemetry::metrics::metrics()
+                .set_collector_mode(crate::telemetry::metrics::CollectorMode::WindowsPolling);
             // First pass: absorb the already-running baseline without events.
             if !self.initialized {
                 self.known = current;
@@ -260,6 +263,7 @@ impl Collector for ProcessCollector {
                     process_start_time: start_time,
                     enrichment: notes.finish(0),
                 };
+                crate::deception::activity::record_exec(&data.username, &data.exe);
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),

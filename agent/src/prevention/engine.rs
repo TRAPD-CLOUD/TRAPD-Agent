@@ -90,7 +90,9 @@ impl ResponseLevel {
     /// a scheduled run gets no response at all, an interactive one an alert at
     /// most. An operator decides on anything more disruptive.
     fn for_access(self, data: &HoneytokenAccessData) -> Option<Self> {
-        if data.scheduled_sweep {
+        if crate::detection::honeytoken_policy::assess(data, Severity::Critical).mode
+            == crate::schema::DetectionMode::Signal
+        {
             return None;
         }
         if data.allowlisted_accessor && self != ResponseLevel::None {
@@ -2026,8 +2028,19 @@ mod tests {
         assert_eq!(ResponseLevel::Freeze.as_str(), "freeze");
     }
 
+    #[test]
+    fn metadata_access_never_kills_or_freezes() {
+        let mut data = access(false, None);
+        data.access_kind = "stat".into();
+        assert!(ResponseLevel::Kill.for_access(&data).is_none());
+    }
+
     fn access(allowlisted: bool, tty: Option<&str>) -> crate::schema::HoneytokenAccessData {
         crate::schema::HoneytokenAccessData {
+            sensor: None,
+            assessment: None,
+            assessment_reasons: Vec::new(),
+            mode: None,
             token_id: "t".into(),
             path: "/home/alice/.ssh/id_ed25519".into(),
             kind: "ssh_private_key".into(),

@@ -1,0 +1,455 @@
+[
+  {
+    "name": "foreign_read",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "open",
+      "open_flags": 0,
+      "confidence": 100,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "sensor": "windows_audit",
+      "assessment": "content_access"
+    },
+    "reported": "critical",
+    "severity": "critical",
+    "mode": "alert"
+  },
+  {
+    "name": "legacy_read",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "open",
+      "open_flags": 0,
+      "confidence": 100,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      }
+    },
+    "reported": "critical",
+    "severity": "critical",
+    "mode": "alert"
+  },
+  {
+    "name": "metadata_getdents",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "getdents",
+      "open_flags": 0,
+      "confidence": 100,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      }
+    },
+    "reported": "critical",
+    "severity": "low",
+    "mode": "signal"
+  },
+  {
+    "name": "metadata_stat",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "stat",
+      "open_flags": 0,
+      "confidence": 100,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      }
+    },
+    "reported": "critical",
+    "severity": "low",
+    "mode": "signal"
+  },
+  {
+    "name": "metadata_statx",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "statx",
+      "open_flags": 0,
+      "confidence": 100,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      }
+    },
+    "reported": "critical",
+    "severity": "low",
+    "mode": "signal"
+  },
+  {
+    "name": "metadata_readlink",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "readlink",
+      "open_flags": 0,
+      "confidence": 100,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      }
+    },
+    "reported": "critical",
+    "severity": "low",
+    "mode": "signal"
+  },
+  {
+    "name": "unattributed_atime",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "open",
+      "open_flags": 0,
+      "confidence": 100,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "sensor": "windows_last_access",
+      "assessment": "unattributed_access"
+    },
+    "reported": "critical",
+    "severity": "low",
+    "mode": "signal"
+  },
+  {
+    "name": "owner_read",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "open",
+      "open_flags": 0,
+      "confidence": 70,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "sensor": "windows_audit",
+      "assessment": "owner_interactive"
+    },
+    "reported": "critical",
+    "severity": "high",
+    "mode": "alert"
+  },
+  {
+    "name": "scheduled_sweep",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "open",
+      "open_flags": 0,
+      "confidence": 20,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "allowlisted_accessor": true,
+      "scheduled_sweep": true
+    },
+    "reported": "critical",
+    "severity": "low",
+    "mode": "signal"
+  },
+  {
+    "name": "spoofed_sweep",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "open",
+      "open_flags": 0,
+      "confidence": 100,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "scheduled_sweep": true
+    },
+    "reported": "critical",
+    "severity": "critical",
+    "mode": "alert"
+  },
+  {
+    "name": "tamper_modify",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "modify",
+      "open_flags": 0,
+      "confidence": 20,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "mode": "signal",
+      "scheduled_sweep": true,
+      "allowlisted_accessor": true
+    },
+    "reported": "critical",
+    "severity": "critical",
+    "mode": "alert"
+  },
+  {
+    "name": "tamper_unlink",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "unlink",
+      "open_flags": 0,
+      "confidence": 20,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "mode": "signal",
+      "scheduled_sweep": true,
+      "allowlisted_accessor": true
+    },
+    "reported": "critical",
+    "severity": "critical",
+    "mode": "alert"
+  },
+  {
+    "name": "tamper_rename",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "rename",
+      "open_flags": 0,
+      "confidence": 20,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "mode": "signal",
+      "scheduled_sweep": true,
+      "allowlisted_accessor": true
+    },
+    "reported": "critical",
+    "severity": "critical",
+    "mode": "alert"
+  },
+  {
+    "name": "tamper_hardlink",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "hardlink",
+      "open_flags": 0,
+      "confidence": 20,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "mode": "signal",
+      "scheduled_sweep": true,
+      "allowlisted_accessor": true
+    },
+    "reported": "critical",
+    "severity": "critical",
+    "mode": "alert"
+  },
+  {
+    "name": "tamper_exec",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "exec",
+      "open_flags": 0,
+      "confidence": 20,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "mode": "signal",
+      "scheduled_sweep": true,
+      "allowlisted_accessor": true
+    },
+    "reported": "critical",
+    "severity": "critical",
+    "mode": "alert"
+  },
+  {
+    "name": "future_enum",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "open",
+      "open_flags": 0,
+      "confidence": 100,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "sensor": "future_sensor",
+      "assessment": "future_assessment",
+      "mode": "signal"
+    },
+    "reported": "critical",
+    "severity": "critical",
+    "mode": "alert"
+  },
+  {
+    "name": "shadow_rejected",
+    "data": {
+      "token_id": "token-1",
+      "path": "C:\\Users\\alice\\decoy.txt",
+      "kind": "password_note",
+      "access_kind": "open",
+      "open_flags": 0,
+      "confidence": 100,
+      "mitre_tactic": "TA0006",
+      "mitre_technique": "T1552.001",
+      "accessor": {
+        "pid": 4242,
+        "uid": 0,
+        "gid": 0,
+        "username": "alice",
+        "comm": "reader",
+        "exe": "C:\\Tools\\reader.exe",
+        "ancestors": []
+      },
+      "mode": "shadow"
+    },
+    "reported": "critical",
+    "severity": "critical",
+    "mode": "alert"
+  }
+]

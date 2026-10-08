@@ -1,11 +1,12 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_probe_read_kernel, bpf_probe_read_user_str_bytes,
+        bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, map, tracepoint},
-    maps::{HashMap, RingBuf},
+    maps::{Array, HashMap, RingBuf},
     programs::{ProbeContext, TracePointContext},
+    EbpfContext,
 };
 
 use crate::{COMM_LEN, PATH_LEN};
@@ -88,25 +89,19 @@ static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 static HONEYTOKEN_PATHS: HashMap<[u8; PATH_LEN], u64> =
     HashMap::<[u8; PATH_LEN], u64>::with_max_entries(256, 0);
 
-/// Honeytoken match table: **inode number → token id**. Armed by userspace,
+/// Honeytoken match table: **(filesystem, inode) → token id**. Armed by userspace,
 /// which `stat()`s each deployed token to learn its inode. The `vfs_open` kprobe
 /// resolves the opened inode and matches here, so a content read fires
 /// **regardless of open flags and regardless of the path used** (symlink,
 /// relative, hardlink, bind-mount) — closing the residual gaps the path gate
 /// cannot see.
 #[map]
-static HONEYTOKEN_INODES: HashMap<u64, u64> = HashMap::<u64, u64>::with_max_entries(256, 0);
+static HONEYTOKEN_INODES: HashMap<[u64; 2], u64> = HashMap::<[u64; 2], u64>::with_max_entries(256, 0);
 
-// ── struct field offsets for the vfs_open inode walk (x86_64) ────────────────
-// The codebase reads kernel structs only by stable, documented offsets (see
-// dns.rs reading struct sock). `struct path` is two pointers, so `dentry` at +8
-// is rock-solid; `d_inode` / `i_ino` are the conventional x86_64 layout for
-// 4.x–6.x defconfig kernels. Every read is fail-safe: a wrong offset or bad
-// pointer yields a miss (no event), never a false positive. A BTF/CO-RE-driven
-// resolution is the portability hardening tracked for later.
-const PATH_DENTRY_OFFSET:   usize = 8;  // struct path { struct vfsmount *mnt; struct dentry *dentry; }
-const DENTRY_DINODE_OFFSET: usize = 48; // struct dentry.d_inode
-const INODE_IINO_OFFSET:    usize = 64; // struct inode.i_ino
+// Kernel-derived offsets: path.dentry, dentry.d_inode, inode.i_ino,
+// inode.i_sb, super_block.s_dev, file.f_flags; slot 6 says the inode kprobe is active.
+#[map]
+static HONEYTOKEN_LAYOUT: Array<u32> = Array::<u32>::with_max_entries(7, 0);
 
 /// Dedicated low-volume channel for honeytoken accesses. Separate from
 /// `FILE_OPEN_EVENTS` so a hit is never lost in openat traffic and so the
@@ -130,6 +125,8 @@ pub struct FdToken {
     /// `FD_KIND_FILE` (mmap target) or `FD_KIND_DIR` (getdents target).
     pub kind:     u32,
     pub _pad:     u32,
+    pub flags:    u64,
+    pub ino:      u64,
 }
 
 /// Scratch slot bridging a token `open`'s *enter* (where we know the path) to its
@@ -137,6 +134,14 @@ pub struct FdToken {
 /// the two tracepoints fire back-to-back on the same thread.
 #[map]
 static HT_OPEN_PENDING: HashMap<u64, FdToken> = HashMap::<u64, FdToken>::with_max_entries(4096, 0);
+
+/// Inode matches are candidates until the open syscall succeeds.
+#[map]
+static HT_INODE_PENDING: HashMap<u64, FdToken> = HashMap::<u64, FdToken>::with_max_entries(4096, 0);
+
+/// File mappings are evidence only after a successful sys_exit_mmap.
+#[map]
+static HT_MMAP_PENDING: HashMap<u64, FdToken> = HashMap::<u64, FdToken>::with_max_entries(4096, 0);
 
 /// Resolved fd table: `(tgid << 32 | fd) → FdToken`. Populated on a successful
 /// token open, consulted by `mmap`/`getdents64`, and pruned on `close` so a
@@ -206,7 +211,9 @@ pub(crate) fn check_honeytoken_user(path_uptr: u64, flags: u64, access_kind: u32
 /// The content-read *detection* itself is done by inode in the `vfs_open`
 /// kprobe, so this no longer emits an access event.
 #[inline(always)]
-pub(crate) fn track_open_for_fd(path_uptr: u64) {
+pub(crate) fn track_open_for_fd(path_uptr: u64, flags: u64) {
+    let _ = HT_INODE_PENDING.remove(&bpf_get_current_pid_tgid());
+    let _ = HT_OPEN_PENDING.remove(&bpf_get_current_pid_tgid());
     if path_uptr == 0 {
         return;
     }
@@ -214,20 +221,24 @@ pub(crate) fn track_open_for_fd(path_uptr: u64) {
     unsafe {
         let _ = bpf_probe_read_user_str_bytes(path_uptr as *const u8, &mut path);
     };
-    stash_open_pending(&path);
+    stash_open_pending(&path, flags);
 }
 
 /// If `path` is a tracked token file or token directory, record a pending fd
 /// binding for the current thread. A no-op for everything else.
 #[inline(always)]
-fn stash_open_pending(path: &[u8; PATH_LEN]) {
+fn stash_open_pending(path: &[u8; PATH_LEN], flags: u64) {
     let pid_tgid = bpf_get_current_pid_tgid();
     if let Some(&token_id) = unsafe { HONEYTOKEN_PATHS.get(path) } {
-        let v = FdToken { token_id, kind: FD_KIND_FILE, _pad: 0 };
-        let _ = HT_OPEN_PENDING.insert(&pid_tgid, &v, 0);
+        let v = FdToken { token_id, kind: FD_KIND_FILE, _pad: 0, flags, ino: 0 };
+        if HT_OPEN_PENDING.insert(&pid_tgid, &v, 0).is_err() {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);
+        }
     } else if let Some(&token_id) = unsafe { HONEYTOKEN_DIRS.get(path) } {
-        let v = FdToken { token_id, kind: FD_KIND_DIR, _pad: 0 };
-        let _ = HT_OPEN_PENDING.insert(&pid_tgid, &v, 0);
+        let v = FdToken { token_id, kind: FD_KIND_DIR, _pad: 0, flags, ino: 0 };
+        if HT_OPEN_PENDING.insert(&pid_tgid, &v, 0).is_err() {
+            crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);
+        }
     }
 }
 
@@ -236,11 +247,11 @@ fn stash_open_pending(path: &[u8; PATH_LEN]) {
 #[inline(always)]
 fn resolve_open_exit(ctx: &TracePointContext) {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let Some(tok) = (unsafe { HT_OPEN_PENDING.get(&pid_tgid) }).copied() else {
-        return;
-    };
-    // Consume the pending slot regardless of the syscall's outcome.
+    let inode = (unsafe { HT_INODE_PENDING.get(&pid_tgid) }).copied();
+    let path = (unsafe { HT_OPEN_PENDING.get(&pid_tgid) }).copied();
+    let _ = HT_INODE_PENDING.remove(&pid_tgid);
     let _ = HT_OPEN_PENDING.remove(&pid_tgid);
+    let Some(tok) = inode.or(path) else { return; };
     let ret: i64 = match unsafe { ctx.read_at(16) } {
         Ok(v) => v,
         Err(_) => return,
@@ -251,6 +262,10 @@ fn resolve_open_exit(ctx: &TracePointContext) {
     let tgid = (pid_tgid >> 32) & 0xFFFF_FFFF;
     let key = (tgid << 32) | (ret as u64 & 0xFFFF_FFFF);
     let _ = HONEYTOKEN_FDS.insert(&key, &tok, 0);
+    if tok.kind == FD_KIND_FILE && (inode.is_some() || HONEYTOKEN_LAYOUT.get(6).copied().unwrap_or(0) == 0 || tok.flags & 0x20_0000 != 0) {
+        // Positive syscall result is required; a failed open is not a read.
+        emit_honeytoken_token(tok.token_id, tok.flags, tok.ino, ACCESS_OPENAT);
+    }
 }
 
 /// Look the current thread's `fd` up in [`HONEYTOKEN_FDS`] and, when it points at
@@ -263,7 +278,15 @@ fn lookup_fd_and_emit(fd_raw: u64, want_kind: u32, access_kind: u32) {
     let key = (tgid << 32) | (fd_raw & 0xFFFF_FFFF);
     if let Some(tok) = (unsafe { HONEYTOKEN_FDS.get(&key) }).copied() {
         if tok.kind == want_kind {
-            emit_honeytoken_token(tok.token_id, access_kind);
+            if access_kind == ACCESS_MMAP {
+                // O_PATH and write-only FDs cannot be read through mmap.
+                if tok.flags & 0x20_0000 != 0 || tok.flags & 3 == 1 { return; }
+                if HT_MMAP_PENDING.insert(&pid_tgid, &tok, 0).is_err() {
+                    crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);
+                }
+            } else {
+                emit_honeytoken_token(tok.token_id, tok.flags, tok.ino, access_kind);
+            }
         }
     }
 }
@@ -272,7 +295,7 @@ fn lookup_fd_and_emit(fd_raw: u64, want_kind: u32, access_kind: u32) {
 /// userspace consumer resolves the path from its `token_id → path` index, so the
 /// empty `filename` here is fine.
 #[inline(always)]
-fn emit_honeytoken_token(token_id: u64, access_kind: u32) {
+fn emit_honeytoken_token(token_id: u64, flags: u64, ino: u64, access_kind: u32) {
     if let Some(mut entry) = HONEYTOKEN_ACCESS_EVENTS.reserve::<HoneytokenAccessEvent>(0) {
         let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
         let uid_gid = bpf_get_current_uid_gid();
@@ -284,8 +307,8 @@ fn emit_honeytoken_token(token_id: u64, access_kind: u32) {
         ev.gid          = (uid_gid >> 32) as u32;
         ev._pad         = 0;
         ev.token_id     = token_id;
-        ev.ino          = 0;
-        ev.flags        = 0;
+        ev.ino          = ino;
+        ev.flags        = flags;
         ev.comm         = comm;
         ev.filename     = [0u8; PATH_LEN];
         ev.filename_len = 0;
@@ -303,6 +326,9 @@ fn emit_honeytoken_token(token_id: u64, access_kind: u32) {
 ///   offset 48 │ u64  arg4  fd   (−1 for an anonymous mapping)
 #[inline(always)]
 pub(crate) fn check_mmap_honeytoken(ctx: &TracePointContext) {
+    let _ = HT_MMAP_PENDING.remove(&bpf_get_current_pid_tgid());
+    let flags: u64 = match unsafe { ctx.read_at(40) } { Ok(v) => v, Err(_) => return };
+    if flags & 0x20 != 0 { return; } // MAP_ANONYMOUS ignores even a positive fd.
     let fd_raw: u64 = match unsafe { ctx.read_at(48) } {
         Ok(v) => v,
         Err(_) => return,
@@ -333,6 +359,8 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
 
 #[inline(always)]
 fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
+    let _ = HT_INODE_PENDING.remove(&bpf_get_current_pid_tgid());
+    let _ = HT_OPEN_PENDING.remove(&bpf_get_current_pid_tgid());
     let filename_uptr: u64 = unsafe { ctx.read_at(24).map_err(|_| -1i64)? };
     if filename_uptr == 0 {
         return Ok(());
@@ -363,7 +391,7 @@ fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
     // matches by inode (robust against symlinks/relative/`..`). Here we only
     // remember a token file/dir open so the matching `sys_exit_openat` can bind
     // the returned fd for mmap/getdents correlation.
-    stash_open_pending(&path);
+    stash_open_pending(&path, flags);
 
     // ── Normal file-open telemetry (unchanged read-only suppression) ─────────
     // O_WRONLY=1, O_RDWR=2, O_CREAT=0x40, O_TRUNC=0x200 – skip pure read-only opens to
@@ -413,7 +441,8 @@ pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    track_open_for_fd(filename_uptr);
+    let flags: u64 = match unsafe { ctx.read_at(24) } { Ok(v) => v, Err(_) => return 0 };
+    track_open_for_fd(filename_uptr, flags);
     0
 }
 
@@ -434,7 +463,9 @@ pub fn sys_enter_openat2(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    track_open_for_fd(filename_uptr);
+    let how: u64 = match unsafe { ctx.read_at(32) } { Ok(v) => v, Err(_) => return 0 };
+    let flags: u64 = match unsafe { bpf_probe_read_user(how as *const u64) } { Ok(v) => v, Err(_) => return 0 };
+    track_open_for_fd(filename_uptr, flags);
     0
 }
 
@@ -573,7 +604,7 @@ pub fn sys_enter_close(ctx: TracePointContext) -> u32 {
 /// robust against symlinks, relative paths, `..` and hardlinks (all of which
 /// resolve to the same inode). All struct reads are fail-safe (a miss on error),
 /// so this never produces a false positive even on a kernel whose layout differs
-/// from the assumed offsets.
+/// from the verified running-kernel BTF layout.
 #[kprobe]
 pub fn vfs_open(ctx: ProbeContext) -> u32 {
     match try_vfs_open(&ctx) {
@@ -589,9 +620,15 @@ fn try_vfs_open(ctx: &ProbeContext) -> Result<(), i64> {
     if path.is_null() {
         return Ok(());
     }
+    let Some(&path_offset) = HONEYTOKEN_LAYOUT.get(0) else { return Ok(()); };
+    let Some(&dentry_offset) = HONEYTOKEN_LAYOUT.get(1) else { return Ok(()); };
+    let Some(&ino_offset) = HONEYTOKEN_LAYOUT.get(2) else { return Ok(()); };
+    let Some(&sb_offset) = HONEYTOKEN_LAYOUT.get(3) else { return Ok(()); };
+    let Some(&dev_offset) = HONEYTOKEN_LAYOUT.get(4) else { return Ok(()); };
+    if path_offset == 0 || path_offset > 4096 || dentry_offset > 4096 || ino_offset > 4096 || sb_offset > 4096 || dev_offset > 4096 { return Ok(()); }
     // path->dentry
     let dentry: *const u8 = unsafe {
-        bpf_probe_read_kernel((path as usize + PATH_DENTRY_OFFSET) as *const *const u8)
+        bpf_probe_read_kernel((path as usize + path_offset as usize) as *const *const u8)
             .unwrap_or(core::ptr::null())
     };
     if dentry.is_null() {
@@ -599,7 +636,7 @@ fn try_vfs_open(ctx: &ProbeContext) -> Result<(), i64> {
     }
     // dentry->d_inode
     let inode: *const u8 = unsafe {
-        bpf_probe_read_kernel((dentry as usize + DENTRY_DINODE_OFFSET) as *const *const u8)
+        bpf_probe_read_kernel((dentry as usize + dentry_offset as usize) as *const *const u8)
             .unwrap_or(core::ptr::null())
     };
     if inode.is_null() {
@@ -607,37 +644,91 @@ fn try_vfs_open(ctx: &ProbeContext) -> Result<(), i64> {
     }
     // inode->i_ino
     let ino: u64 = unsafe {
-        bpf_probe_read_kernel((inode as usize + INODE_IINO_OFFSET) as *const u64).unwrap_or(0)
+        bpf_probe_read_kernel((inode as usize + ino_offset as usize) as *const u64).unwrap_or(0)
     };
     if ino == 0 {
         return Ok(());
     }
 
-    let token_id = match unsafe { HONEYTOKEN_INODES.get(&ino) } {
+    let sb: *const u8 = unsafe { bpf_probe_read_kernel((inode as usize + sb_offset as usize) as *const *const u8).unwrap_or(core::ptr::null()) };
+    if sb.is_null() { return Ok(()); }
+    let dev: u32 = unsafe { bpf_probe_read_kernel((sb as usize + dev_offset as usize) as *const u32).unwrap_or(0) };
+    let key = [dev as u64, ino];
+    let token_id = match unsafe { HONEYTOKEN_INODES.get(&key) } {
         Some(&t) => t,
         None => return Ok(()),
     };
 
-    if let Some(mut entry) = HONEYTOKEN_ACCESS_EVENTS.reserve::<HoneytokenAccessEvent>(0) {
-        let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-        let uid_gid = bpf_get_current_uid_gid();
-        let comm = [0u8; COMM_LEN];
-        let comm = bpf_get_current_comm().unwrap_or(comm);
-        let ev = unsafe { entry.assume_init_mut() };
-        ev.pid          = pid;
-        ev.uid          = (uid_gid & 0xFFFF_FFFF) as u32;
-        ev.gid          = (uid_gid >> 32) as u32;
-        ev._pad         = 0;
-        ev.token_id     = token_id;
-        ev.ino          = ino;
-        ev.flags        = 0; // vfs_open does not carry the syscall flags cheaply
-        ev.comm         = comm;
-        ev.filename     = [0u8; PATH_LEN];
-        ev.filename_len = 0;
-        ev.access_kind  = ACCESS_OPENAT;
-        entry.submit(0);
-    } else {
+    let Some(&flags_offset) = HONEYTOKEN_LAYOUT.get(5) else { return Ok(()); };
+    if flags_offset > 4096 { return Ok(()); }
+    let file: *const u8 = ctx.arg(1).ok_or(-1i64)?;
+    if file.is_null() { return Ok(()); }
+    let flags: u32 = unsafe {
+        bpf_probe_read_kernel((file as usize + flags_offset as usize) as *const u32).map_err(|_| -1i64)?
+    };
+    let candidate = FdToken { token_id, kind: FD_KIND_FILE, _pad: 0, flags: flags as u64, ino };
+    if HT_INODE_PENDING.insert(&bpf_get_current_pid_tgid(), &candidate, 0).is_err() {
         crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);
     }
+
     Ok(())
+}
+
+/// Clear candidates from failed/prior exec before either exec syscall starts.
+#[tracepoint]
+pub fn honeytoken_enter_exec(ctx: TracePointContext) -> u32 {
+    let _ = HT_INODE_PENDING.remove(&bpf_get_current_pid_tgid());
+    let _ = ctx;
+    0
+}
+
+/// Successful exec, including alias paths and exec from a non-leader thread.
+#[tracepoint]
+pub fn honeytoken_process_exec(ctx: TracePointContext) -> u32 {
+    let old_pid: u32 = match unsafe { ctx.read_at(16) } { Ok(v) => v, Err(_) => return 0 };
+    let key = (bpf_get_current_pid_tgid() & 0xffff_ffff_0000_0000) | old_pid as u64;
+    let candidate = (unsafe { HT_INODE_PENDING.get(&key) }).copied();
+    let _ = HT_INODE_PENDING.remove(&key);
+    if let Some(tok) = candidate {
+        emit_honeytoken_token(tok.token_id, tok.flags, tok.ino, ACCESS_EXEC);
+    } else {
+        let location: u32 = match unsafe { ctx.read_at(8) } { Ok(v) => v, Err(_) => return 0 };
+        let address = (ctx.as_ptr() as usize) + (location & 0xffff) as usize;
+        let mut path = [0u8; PATH_LEN];
+        let length = unsafe { bpf_probe_read_kernel_str_bytes(address as *const u8, &mut path).map(|v| v.len()).unwrap_or(0) };
+        emit_honeytoken_buf(&path, length as u32, 0, ACCESS_EXEC);
+    }
+    0
+}
+
+/// Failed exec has no sched_process_exec; release its inode candidate.
+#[tracepoint]
+pub fn honeytoken_exit_exec(ctx: TracePointContext) -> u32 {
+    let result: i64 = match unsafe { ctx.read_at(16) } { Ok(v) => v, Err(_) => return 0 };
+    if result < 0 { let _ = HT_INODE_PENDING.remove(&bpf_get_current_pid_tgid()); }
+    0
+}
+
+/// Terminated threads must not retain a pending syscall correlation slot.
+#[tracepoint]
+pub fn honeytoken_process_exit(_ctx: TracePointContext) -> u32 {
+    let key = bpf_get_current_pid_tgid();
+    let _ = HT_INODE_PENDING.remove(&key);
+    let _ = HT_OPEN_PENDING.remove(&key);
+    let _ = HT_MMAP_PENDING.remove(&key);
+    0
+}
+
+#[tracepoint]
+pub fn sys_exit_mmap(ctx: TracePointContext) -> u32 {
+    let key = bpf_get_current_pid_tgid();
+    let candidate = (unsafe { HT_MMAP_PENDING.get(&key) }).copied();
+    let _ = HT_MMAP_PENDING.remove(&key);
+    let result: i64 = match unsafe { ctx.read_at(16) } { Ok(v) => v, Err(_) => return 0 };
+    if result >= 0 {
+        if let Some(tok) = candidate {
+            emit_honeytoken_token(tok.token_id, tok.flags, tok.ino, ACCESS_MMAP);
+        }
+    }
+    0
 }

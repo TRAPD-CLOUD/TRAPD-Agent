@@ -324,33 +324,11 @@ fn format_windows_build(major: u32, minor: u32, build: &str, ubr: u32) -> Option
     Some(format!("{major}.{minor}.{build}.{ubr}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::format_windows_build;
-
-    #[test]
-    fn formats_full_build_with_update_revision() {
-        assert_eq!(
-            format_windows_build(10, 0, "26200", 6584).as_deref(),
-            Some("10.0.26200.6584")
-        );
-        assert_eq!(
-            format_windows_build(10, 0, " 26100 ", 0).as_deref(),
-            Some("10.0.26100.0")
-        );
-    }
-
-    #[test]
-    fn rejects_non_numeric_build_numbers() {
-        assert_eq!(format_windows_build(10, 0, "", 1), None);
-        assert_eq!(format_windows_build(10, 0, "26200a", 1), None);
-    }
-}
-
 /// Every local profile with its SID, folder redirection, sync roots and last
 /// use. Accounts come from sysinfo; per-user details from `ProfileList` and,
 /// when the user's hive is loaded, `HKEY_USERS\<SID>`.
-pub(crate) fn windows_user_profiles() -> Vec<crate::deception::windows_profiler::WindowsUserProfile> {
+pub(crate) fn windows_user_profiles() -> Vec<crate::deception::windows_profiler::WindowsUserProfile>
+{
     use crate::deception::windows_profiler::{
         expand_user_path, filetime_to_unix, synced_roots_from_children, WindowsUserProfile,
     };
@@ -402,7 +380,7 @@ pub(crate) fn windows_user_profiles() -> Vec<crate::deception::windows_profiler:
             synced_roots.sort();
             synced_roots.dedup();
             WindowsUserProfile {
-                name: u.name().to_string(),
+                name: crate::telemetry::identity::windows_sid_account(&sid).unwrap_or_else(|| sid.clone()),
                 sid,
                 profile_dir,
                 documents_dir,
@@ -441,4 +419,27 @@ fn windows_recon_profile(
     profile.windows_candidates = candidates;
     profile.role_signals = signals;
     profile
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_windows_build;
+
+    #[test]
+    fn formats_full_build_with_update_revision() {
+        assert_eq!(
+            format_windows_build(10, 0, "26200", 6584).as_deref(),
+            Some("10.0.26200.6584")
+        );
+        assert_eq!(
+            format_windows_build(10, 0, " 26100 ", 0).as_deref(),
+            Some("10.0.26100.0")
+        );
+    }
+
+    #[test]
+    fn rejects_non_numeric_build_numbers() {
+        assert_eq!(format_windows_build(10, 0, "", 1), None);
+        assert_eq!(format_windows_build(10, 0, "26200a", 1), None);
+    }
 }

@@ -257,6 +257,119 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
     }
 }
 
+/// Qualified account identity prevents local/domain accounts sharing a baseline.
+#[cfg(windows)]
+pub fn windows_process_account(pid: i32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid <= 0 {
+        return None;
+    }
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if process.is_null() {
+            return None;
+        }
+        let mut token = std::ptr::null_mut();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+        CloseHandle(process);
+        if opened == 0 {
+            return None;
+        }
+        let mut bytes = 0;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut bytes);
+        if bytes < std::mem::size_of::<TOKEN_USER>() as u32 || bytes > 65_536 {
+            CloseHandle(token);
+            return None;
+        }
+        let mut buffer = vec![0u64; (bytes as usize).div_ceil(8)];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return None;
+        }
+        let sid = (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid;
+        qualified_sid_account(sid)
+    }
+}
+
+#[cfg(windows)]
+unsafe fn qualified_sid_account(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+    use windows_sys::Win32::Security::LookupAccountSidW;
+    let mut name = [0u16; 1024];
+    let mut domain = [0u16; 1024];
+    let mut n = name.len() as u32;
+    let mut d = domain.len() as u32;
+    let mut usage = 0;
+    if LookupAccountSidW(
+        std::ptr::null(),
+        sid,
+        name.as_mut_ptr(),
+        &mut n,
+        domain.as_mut_ptr(),
+        &mut d,
+        &mut usage,
+    ) == 0
+        || n == 0
+        || d == 0
+    {
+        return None;
+    }
+    Some(format!(
+        "{}\\{}",
+        String::from_utf16(&domain[..d as usize]).ok()?,
+        String::from_utf16(&name[..n as usize]).ok()?
+    ))
+}
+
+#[cfg(windows)]
+pub fn windows_sid_account(sid: &str) -> Option<String> {
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    let wide: Vec<u16> = sid.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let mut native = std::ptr::null_mut();
+        if ConvertStringSidToSidW(wide.as_ptr(), &mut native) == 0 {
+            return None;
+        }
+        let result = qualified_sid_account(native);
+        windows_sys::Win32::Foundation::LocalFree(native.cast());
+        result
+    }
+}
+
+#[cfg(windows)]
+pub fn windows_process_image(pid: i32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid <= 0 {
+        return None;
+    }
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if process.is_null() {
+            return None;
+        }
+        let mut image = vec![0u16; 32_768];
+        let mut size = image.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &mut size);
+        CloseHandle(process);
+        (ok != 0)
+            .then(|| String::from_utf16(&image[..size as usize]).ok())
+            .flatten()
+    }
+}
+
 /// Extract field 22 (`starttime`) from a `/proc/<pid>/stat` line.
 pub fn parse_start_time(stat: &str) -> Option<u64> {
     // Fields: pid (comm) state ppid ... starttime is the 22nd overall, i.e. the
@@ -480,5 +593,17 @@ mod tests {
         let back: ProcessKey = serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
         assert_eq!(k, back);
         assert!(k.same_process_as(&back));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_account_tests {
+    #[test]
+    fn own_account_is_qualified_and_invalid_pid_stays_unknown() {
+        let name = super::windows_process_account(std::process::id() as i32)
+            .expect("own account must resolve");
+        assert!(name.contains('\\'));
+        assert!(super::windows_process_account(0).is_none());
+        assert!(super::windows_process_account(-1).is_none());
     }
 }

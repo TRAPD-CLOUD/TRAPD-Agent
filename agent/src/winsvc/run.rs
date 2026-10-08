@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::collectors::system::SystemCollector;
 use crate::collectors::windows::honeytokens::HoneytokenCollector;
-use crate::collectors::windows::process::ProcessCollector;
+
 use crate::collectors::windows::users::UserSessionCollector;
 use crate::collectors::Collector;
 use crate::config::{self, AgentConfig, ConfigPuller};
@@ -232,17 +232,11 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     }
 
     spawn_collector!(SystemCollector::new());
-    // Real-time ETW sensor (process, image load, network, DNS). Falls back to
-    // polling when disabled by config or when the session cannot start; the
-    // ETW collector returns an error, which the poller's latch then covers.
-    let etw_on = agent_config.read().map(|c| c.etw_enabled).unwrap_or(true);
-    if etw_on {
-        spawn_collector!(crate::collectors::windows::etw::EtwCollector);
-    }
-    if !etw_on {
-        spawn_collector!(ProcessCollector::new());
-        spawn_collector!(crate::collectors::windows::network::NetworkCollector);
-    }
+    spawn_collector!(
+        crate::collectors::windows::sensor_supervisor::SensorSupervisor::new(Arc::clone(
+            &agent_config
+        ))
+    );
     spawn_collector!(UserSessionCollector::new());
     spawn_collector!(
         crate::collectors::windows::eventlog::EventLogCollector::new(Arc::clone(&agent_config))

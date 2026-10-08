@@ -351,6 +351,32 @@ impl_raw_event_pid! {
 
 // ── Collector ─────────────────────────────────────────────────────────────────
 
+struct HoneytokenCoverageGuard {
+    active: Arc<std::sync::Mutex<bool>>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+impl Default for HoneytokenCoverageGuard {
+    fn default() -> Self {
+        Self {
+            active: Arc::new(std::sync::Mutex::new(true)),
+            tasks: Vec::new(),
+        }
+    }
+}
+impl Drop for HoneytokenCoverageGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            *active = false;
+        }
+        for task in &self.tasks {
+            task.abort();
+        }
+        crate::telemetry::coverage::update(|c| c.clear_ebpf_attachments());
+        honeytoken::set_kernel_consumer_running(false);
+        honeytoken::set_kernel_arming_enabled(false);
+    }
+}
+
 pub struct EbpfSyscallCollector {
     ebpf_path: Option<String>,
     /// Live agent config — drives honeytoken-detection enable + accessor
@@ -400,6 +426,7 @@ impl EbpfSyscallCollector {
         tx: Sender<AgentEvent>,
         agent_id: String,
         hostname: String,
+        owner: &mut HoneytokenCoverageGuard,
     ) {
         let Some(paths_raw) = bpf.take_map("HONEYTOKEN_PATHS") else {
             info!(
@@ -429,7 +456,7 @@ impl EbpfSyscallCollector {
             });
         // Inode match table for the vfs_open content-read detector. Optional: an
         // older eBPF binary without it falls back to path-only coverage.
-        let inodes_map: Option<BpfHashMap<MapData, u64, u64>> = bpf
+        let inodes_map: Option<BpfHashMap<MapData, [u64; 2], u64>> = bpf
             .take_map("HONEYTOKEN_INODES")
             .and_then(|raw| match BpfHashMap::try_from(raw) {
                 Ok(m) => Some(m),
@@ -471,10 +498,11 @@ impl EbpfSyscallCollector {
             let mut paths_map = paths_map;
             let mut dirs_map = dirs_map;
             let mut inodes_map = inodes_map;
-            tokio::spawn(async move {
+            let active = Arc::clone(&owner.active);
+            let task = tokio::spawn(async move {
                 let mut armed: HashSet<[u8; PATH_LEN]> = HashSet::new();
                 let mut armed_dirs: HashSet<[u8; PATH_LEN]> = HashSet::new();
-                let mut armed_inodes: HashSet<u64> = HashSet::new();
+                let mut armed_inodes: HashSet<[u64; 2]> = HashSet::new();
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
                     // Either the periodic safety net fires, or the engine kicks us
@@ -498,6 +526,12 @@ impl EbpfSyscallCollector {
                                 .unwrap_or(true)
                         })
                         .unwrap_or(false);
+                    let Ok(active) = active.lock() else {
+                        return;
+                    };
+                    if !*active {
+                        return;
+                    }
                     honeytoken::set_kernel_arming_enabled(enabled);
                     reconcile_honeytokens(
                         &mut paths_map,
@@ -511,14 +545,24 @@ impl EbpfSyscallCollector {
                     );
                 }
             });
+            owner.tasks.push(task.abort_handle());
         }
 
         // Access consumer.
         {
             let mut access_afd = access_afd;
-            tokio::spawn(async move {
-                info!("eBPF honeytoken detection active");
-                honeytoken::set_kernel_consumer_running(true);
+            let active = Arc::clone(&owner.active);
+            let task = tokio::spawn(async move {
+                {
+                    let Ok(active) = active.lock() else {
+                        return;
+                    };
+                    if !*active {
+                        return;
+                    }
+                    info!("eBPF honeytoken detection active");
+                    honeytoken::set_kernel_consumer_running(true);
+                }
                 loop {
                     let mut guard = match access_afd.readable_mut().await {
                         Ok(g) => g,
@@ -587,6 +631,7 @@ impl EbpfSyscallCollector {
                     guard.clear_ready();
                 }
             });
+            owner.tasks.push(task.abort_handle());
         }
     }
 
@@ -658,22 +703,22 @@ fn path_key(path: &str) -> [u8; PATH_LEN] {
 ///   * `HONEYTOKEN_PATHS` (by path) — recon/tamper/linkat gates + open-time fd
 ///     stash for mmap/getdents;
 ///   * `HONEYTOKEN_DIRS` (by parent dir) — getdents directory recon;
-///   * `HONEYTOKEN_INODES` (by inode) — the `vfs_open` content-read detector,
+///   * `HONEYTOKEN_INODES` (by filesystem and inode) — the `vfs_open` content-read detector,
 ///     robust against symlinks/relative/hardlinks.
 #[allow(clippy::too_many_arguments)]
 fn reconcile_honeytokens(
     map: &mut BpfHashMap<MapData, [u8; PATH_LEN], u64>,
     mut dirs_map: Option<&mut BpfHashMap<MapData, [u8; PATH_LEN], u64>>,
-    mut inodes_map: Option<&mut BpfHashMap<MapData, u64, u64>>,
+    mut inodes_map: Option<&mut BpfHashMap<MapData, [u64; 2], u64>>,
     token_index: &TokenIndex,
     armed: &mut HashSet<[u8; PATH_LEN]>,
     armed_dirs: &mut HashSet<[u8; PATH_LEN]>,
-    armed_inodes: &mut HashSet<u64>,
+    armed_inodes: &mut HashSet<[u64; 2]>,
     enabled: bool,
 ) {
     let mut desired: StdHashMap<[u8; PATH_LEN], u64> = StdHashMap::new();
     let mut desired_dirs: StdHashMap<[u8; PATH_LEN], u64> = StdHashMap::new();
-    let mut desired_inodes: StdHashMap<u64, u64> = StdHashMap::new();
+    let mut desired_inodes: StdHashMap<[u64; 2], u64> = StdHashMap::new();
     let mut index: StdHashMap<u64, (String, String, String)> = StdHashMap::new();
 
     if enabled {
@@ -696,7 +741,10 @@ fn reconcile_honeytokens(
             // token must exist on disk to learn its inode; a vanished token is
             // simply not armed here (and surfaces as a tamper signal elsewhere).
             if let Ok(meta) = fs::metadata(&rec.path) {
-                desired_inodes.insert(meta.ino(), tid);
+                desired_inodes.insert(
+                    super::honeytoken_layout::inode_key(meta.dev(), meta.ino()),
+                    tid,
+                );
             }
         }
     }
@@ -743,7 +791,7 @@ fn reconcile_honeytokens(
                 armed_inodes.insert(*ino);
             }
         }
-        let stale_inodes: Vec<u64> = armed_inodes
+        let stale_inodes: Vec<[u64; 2]> = armed_inodes
             .iter()
             .filter(|k| !desired_inodes.contains_key(*k))
             .copied()
@@ -904,6 +952,7 @@ impl Collector for EbpfSyscallCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
+        let mut coverage_guard = HoneytokenCoverageGuard::default();
         let path = self
             .ebpf_path
             .as_deref()
@@ -937,12 +986,13 @@ impl Collector for EbpfSyscallCollector {
         // `open` is absent on arm64, `openat2` needs ≥ 5.6, `statx` needs ≥ 4.11.
         macro_rules! attach_tp_optional {
             ($cat:expr, $name:expr) => {{
+                crate::telemetry::coverage::update(|c| { c.ebpf_honeytoken_programs.insert($name.into(), false); });
                 match bpf
                     .program_mut($name)
                     .and_then(|p| TryInto::<&mut TracePoint>::try_into(p).ok())
                 {
                     Some(prog) => match prog.load().and_then(|_| prog.attach($cat, $name)) {
-                        Ok(_) => {}
+                        Ok(_) => { crate::telemetry::coverage::update(|c| { c.ebpf_honeytoken_programs.insert($name.into(), true); }); }
                         Err(e) => warn!(
                             tracepoint = format!("{}/{}", $cat, $name),
                             error = %e,
@@ -969,9 +1019,14 @@ impl Collector for EbpfSyscallCollector {
         attach_tp_optional!("syscalls", "sys_enter_linkat");
         // fd correlation for mmap (content read) + getdents64 (directory recon):
         // the exit hooks bind a token open's returned fd, close prunes it.
-        attach_tp_optional!("syscalls", "sys_exit_openat");
+        attach_tp!("syscalls", "sys_exit_openat");
+        crate::telemetry::coverage::update(|c| {
+            c.ebpf_honeytoken_programs
+                .insert("sys_exit_openat".into(), true);
+        });
         attach_tp_optional!("syscalls", "sys_exit_open");
         attach_tp_optional!("syscalls", "sys_exit_openat2");
+        attach_tp_optional!("syscalls", "sys_exit_mmap");
         attach_tp_optional!("syscalls", "sys_enter_getdents64");
         attach_tp_optional!("syscalls", "sys_enter_close");
         attach_tp!("syscalls", "sys_enter_connect");
@@ -1011,12 +1066,60 @@ impl Collector for EbpfSyscallCollector {
                 .context("failed to attach kprobe on udp_sendmsg")?;
         }
 
+        // These hooks use this object's token maps, unlike the separate exec collector.
+        for (program, category, hook) in [
+            ("honeytoken_enter_exec", "syscalls", "sys_enter_execve"),
+            ("honeytoken_enter_exec", "syscalls", "sys_enter_execveat"),
+            ("honeytoken_exit_exec", "syscalls", "sys_exit_execve"),
+            ("honeytoken_exit_exec", "syscalls", "sys_exit_execveat"),
+            ("honeytoken_process_exit", "sched", "sched_process_exit"),
+            ("honeytoken_process_exec", "sched", "sched_process_exec"),
+        ] {
+            let attached = bpf
+                .program_mut(program)
+                .and_then(|p| TryInto::<&mut TracePoint>::try_into(p).ok())
+                .is_some_and(|p| {
+                    // The same enter program is attached to two syscall hooks.
+                    let loaded = p.fd().is_ok() || p.load().is_ok();
+                    loaded && p.attach(category, hook).is_ok()
+                });
+            crate::telemetry::coverage::update(|c| {
+                c.ebpf_honeytoken_programs
+                    .insert(format!("{program}:{hook}"), attached);
+            });
+            if !attached {
+                warn!(
+                    program,
+                    hook, "honeytoken exec hook unavailable — coverage reduced"
+                );
+            }
+        }
+
         // ── Attach honeytoken inode kprobe (best-effort) ──────────────────────
         // The vfs_open kprobe is the canonical content-read detector (matches by
         // inode, robust against symlinks/relative/hardlinks). It is present only
         // in newer eBPF binaries and its failure must never take down the rest of
         // the telemetry, so we log and continue rather than bail.
-        match bpf.program_mut("vfs_open") {
+        crate::telemetry::coverage::update(|c| {
+            c.ebpf_honeytoken_inode = Some(false);
+            c.ebpf_honeytoken_programs
+                .insert("sys_enter_openat".into(), true);
+        });
+        // Old objects or missing BTF must never run a guessed inode walk.
+        let layout_ready = super::honeytoken_layout::running_offsets().is_some_and(|offsets| {
+            bpf.map_mut("HONEYTOKEN_LAYOUT")
+                .and_then(|m| aya::maps::Array::<_, u32>::try_from(m).ok())
+                .is_some_and(|mut layout| {
+                    offsets
+                        .iter()
+                        .enumerate()
+                        .all(|(i, offset)| layout.set(i as u32, *offset, 0).is_ok())
+                })
+        });
+        if !layout_ready {
+            warn!("kernel BTF layout unavailable; honeytoken reads use successful path opens only");
+        }
+        match bpf.program_mut("vfs_open").filter(|_| layout_ready) {
             Some(prog) => {
                 let attached = (|| -> Result<()> {
                     let prog: &mut KProbe = prog.try_into().context("vfs_open is not a KProbe")?;
@@ -1026,7 +1129,20 @@ impl Collector for EbpfSyscallCollector {
                     Ok(())
                 })();
                 match attached {
-                    Ok(()) => info!("eBPF honeytoken inode kprobe attached on vfs_open"),
+                    Ok(()) => {
+                        let active = bpf
+                            .map_mut("HONEYTOKEN_LAYOUT")
+                            .and_then(|m| aya::maps::Array::<_, u32>::try_from(m).ok())
+                            .is_some_and(|mut layout| layout.set(6, 1, 0).is_ok());
+                        crate::telemetry::coverage::update(|c| {
+                            c.ebpf_honeytoken_inode = Some(active)
+                        });
+                        if active {
+                            info!("eBPF honeytoken inode kprobe attached with verified kernel BTF");
+                        } else {
+                            warn!("inode probe attached but activation failed; path fallback remains enabled");
+                        }
+                    }
                     Err(e) => {
                         warn!(error = %e, "honeytoken vfs_open kprobe unavailable — inode content-read detection disabled")
                     }
@@ -1096,7 +1212,13 @@ impl Collector for EbpfSyscallCollector {
         // consumes HONEYTOKEN_ACCESS_EVENTS. Runs in its own tasks so the main
         // ring-buffer loop below is untouched; gracefully no-ops on an older
         // eBPF binary that lacks these maps.
-        self.spawn_honeytoken_tasks(&mut bpf, tx.clone(), agent_id.clone(), hostname.clone());
+        self.spawn_honeytoken_tasks(
+            &mut bpf,
+            tx.clone(),
+            agent_id.clone(),
+            hostname.clone(),
+            &mut coverage_guard,
+        );
 
         info!(
             "eBPF syscall tracer attached: 24 core tracepoints + 1 kprobe + \
@@ -1648,5 +1770,35 @@ impl Collector for EbpfSyscallCollector {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[tokio::test]
+    async fn honeytoken_tasks_are_cancelled_with_their_collector() {
+        let mut owner = HoneytokenCoverageGuard::default();
+        let active = Arc::clone(&owner.active);
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&writes);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let guard = active.lock().unwrap();
+                if !*guard {
+                    return;
+                }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        owner.tasks.push(task.abort_handle());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(writes.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        drop(owner);
+        let after = writes.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(after, writes.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 }

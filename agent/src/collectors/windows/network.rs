@@ -146,6 +146,10 @@ impl Collector for NetworkCollector {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
         loop {
             ticker.tick().await;
+            if crate::telemetry::coverage::snapshot().etw_network_active() {
+                known.clear();
+                continue;
+            }
             let rows = match tokio::task::spawn_blocking(snapshot).await? {
                 Ok(rows) => rows,
                 Err(e) => {

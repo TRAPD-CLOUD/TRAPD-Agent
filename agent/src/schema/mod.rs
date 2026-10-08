@@ -210,6 +210,9 @@ pub enum Severity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EventData {
+    // Must precede the legacy path-only FileEvent: journal/replay recovery must
+    // preserve the attribution and assessment of honeytoken evidence.
+    HoneytokenAccess(Box<HoneytokenAccessData>),
     ProcessCreate(ProcessCreateData),
     ProcessTerminate(ProcessTerminateData),
     // Boxed: with the P1 telemetry-depth fields (image hash, library inventory,
@@ -259,10 +262,6 @@ pub enum EventData {
     // ── Detection engine payload ────────────────────────────────────────
     // Boxed: correlation keys and gate metadata make this a large variant.
     Detection(Box<DetectionData>),
-    // ── Honeytoken access (deception) ───────────────────────────────────
-    // Boxed: the forensic session/lineage payload is much larger than the other
-    // variants, so boxing keeps `EventData` compact (clippy::large_enum_variant).
-    HoneytokenAccess(Box<HoneytokenAccessData>),
     // ── Observability ────────────────────────────────────────────────────────
     EbpfDrops(EbpfDropsData),
 }
@@ -929,6 +928,31 @@ pub struct CorrelationKeys {
 
 // ── Honeytoken access payload (deception, step 2) ─────────────────────────────
 
+/// Sensor provenance is distinct from the assessment of what it observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoneytokenSensor {
+    LinuxEbpf,
+    WindowsAudit,
+    WindowsLastAccess,
+    WindowsChange,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoneytokenAssessment {
+    Metadata,
+    ScheduledSweep,
+    OwnerInteractive,
+    ContentAccess,
+    Tamper,
+    UnattributedAccess,
+    #[serde(other)]
+    Unknown,
+}
+
 /// A honeytoken file was opened.  By construction no legitimate workflow reads a
 /// honeytoken, so this is a high-confidence intrusion signal.  The payload binds
 /// the access to its full process lineage (the "flight recorder" idea): the
@@ -936,6 +960,14 @@ pub struct CorrelationKeys {
 /// process that touched the bait came to exist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HoneytokenAccessData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensor: Option<HoneytokenSensor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<HoneytokenAssessment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assessment_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<DetectionMode>,
     /// Id of the deployed token (matches `HoneytokenRecord::id`).
     pub token_id: String,
     /// Absolute path of the token that was opened.

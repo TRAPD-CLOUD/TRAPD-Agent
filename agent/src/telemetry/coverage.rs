@@ -26,6 +26,12 @@ pub struct Coverage {
     /// ETW real-time session is running and delivering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etw_session: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etw_process_provider: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etw_network_provider: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etw_dns_provider: Option<bool>,
     /// Events the ETW session dropped (cumulative since start).
     #[serde(skip_serializing_if = "is_zero")]
     pub etw_events_lost: u64,
@@ -45,6 +51,34 @@ pub struct Coverage {
     /// `tamper_only`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decoy_detection: Option<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub decoy_audit_armed: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub decoy_audit_unavailable: u64,
+    /// Actual attachment results, not capabilities inferred from the OS.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ebpf_honeytoken_programs: BTreeMap<String, bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ebpf_honeytoken_inode: Option<bool>,
+}
+
+impl Coverage {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn clear_ebpf_attachments(&mut self) {
+        for active in self.ebpf_honeytoken_programs.values_mut() {
+            *active = false;
+        }
+        self.ebpf_honeytoken_inode = Some(false);
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn etw_process_active(&self) -> bool {
+        self.etw_session == Some(true) && self.etw_process_provider == Some(true)
+    }
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn etw_network_active(&self) -> bool {
+        self.etw_session == Some(true) && self.etw_network_provider == Some(true)
+    }
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -107,6 +141,36 @@ pub fn restore_shadow_hits(hits: BTreeMap<String, u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_or_stopped_ebpf_sensor_cannot_keep_attachment_claims() {
+        let mut c = Coverage {
+            ebpf_honeytoken_inode: Some(true),
+            ..Default::default()
+        };
+        c.ebpf_honeytoken_programs
+            .insert("sys_enter_open".into(), true);
+        c.ebpf_honeytoken_programs
+            .insert("sys_enter_openat2".into(), false);
+        c.clear_ebpf_attachments();
+        assert!(c.ebpf_honeytoken_programs.values().all(|active| !active));
+        assert_eq!(c.ebpf_honeytoken_inode, Some(false));
+    }
+
+    #[test]
+    fn partial_etw_coverage_keeps_the_missing_sensor_fallback() {
+        let mut c = Coverage::default();
+        assert!(!c.etw_process_active());
+        c.etw_session = Some(true);
+        c.etw_process_provider = Some(true);
+        assert!(c.etw_process_active());
+        assert!(!c.etw_network_active());
+        c.etw_network_provider = Some(true);
+        assert!(c.etw_network_active());
+        c.etw_session = Some(false);
+        assert!(!c.etw_process_active());
+        assert!(!c.etw_network_active());
+    }
 
     #[test]
     fn shadow_counters_take_and_restore() {

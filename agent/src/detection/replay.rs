@@ -153,6 +153,15 @@ pub fn replay<R: BufRead>(engine: &DetectionEngine, reader: R) -> ReplayReport {
         last_offset = offset;
         let now = base + offset;
 
+        if matches!(event.class, crate::schema::EventClass::Detection) {
+            for emitted in engine.admit_external_at(event, now) {
+                record(&mut report, &emitted);
+            }
+            for emitted in engine.flush_findings_at(now, false) {
+                record(&mut report, &emitted);
+            }
+            continue;
+        }
         let findings = engine.inspect_at(&event, now, offset.as_secs_f64());
         for f in &findings {
             if let EventData::Detection(d) = &f.data {
@@ -182,7 +191,10 @@ fn record(report: &mut ReplayReport, emitted: &super::gate::Emitted) {
     }
     let (rule, signal) = match &emitted.event.data {
         EventData::Detection(d) => (d.rule_id.clone(), d.mode == Some(DetectionMode::Signal)),
-        EventData::HoneytokenAccess(_) => ("deception.honeytoken_access".to_string(), false),
+        EventData::HoneytokenAccess(d) => (
+            "deception.honeytoken_access".to_string(),
+            d.mode == Some(DetectionMode::Signal),
+        ),
         _ => return,
     };
     let stats = report.rules.entry(rule).or_default();
@@ -298,6 +310,57 @@ mod tests {
         assert_eq!(report.skipped_lines, 1);
         assert_eq!(report.hosts.len(), 1);
         assert!((report.host_days() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn external_honeytoken_vectors_replay_with_identical_alert_and_signal_modes() {
+        use crate::schema::{EventAction, EventClass, HoneytokenAccessData};
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/honeytoken-assessment-vectors.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let data: HoneytokenAccessData = serde_json::from_value(case["data"].clone()).unwrap();
+            let event = AgentEvent::new(
+                "a".into(),
+                "h".into(),
+                EventClass::Detection,
+                EventAction::HoneytokenAccess,
+                Severity::Critical,
+                EventData::HoneytokenAccess(Box::new(data)),
+            );
+            let engine = DetectionEngine::new("a".into(), "h".into());
+            let report = replay(&engine, ndjson(&[event]).as_bytes());
+            let stats = report
+                .rules
+                .get("deception.honeytoken_access")
+                .expect("raw detection was omitted from replay");
+            assert_eq!(
+                stats.alerts,
+                u64::from(case["mode"] == "alert"),
+                "{}",
+                case["name"]
+            );
+            assert_eq!(
+                stats.signals,
+                u64::from(case["mode"] == "signal"),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn honeytoken_attack_corpus_is_not_hidden_by_the_benign_budget() {
+        let engine = DetectionEngine::new("a".into(), "h".into());
+        let report = replay(
+            &engine,
+            include_str!("../../tests/fixtures/honeytoken-attacks.ndjson").as_bytes(),
+        );
+        let stats = report.rules.get("deception.honeytoken_access").unwrap();
+        assert_eq!(stats.alerts, 11);
+        assert_eq!(stats.signals, 0);
+        assert_eq!(report.skipped_lines, 0);
     }
 
     #[test]

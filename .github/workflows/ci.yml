@@ -106,3 +106,9 @@ jobs:
       # Blocking: a verifier/compile failure in any eBPF program fails the PR.
       - name: Build eBPF programs (release)
         run: cargo xtask build-ebpf --release
+      - name: Build agent for native kernel acceptance
+        run: cargo build --release --manifest-path agent/Cargo.toml
+      - name: Native honeytoken inode and fallback acceptance
+        run: |
+          bash agent/tests/native_linux_honeytokens.sh inode
+          bash agent/tests/native_linux_honeytokens.sh fallback

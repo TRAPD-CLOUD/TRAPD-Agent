@@ -20,12 +20,11 @@ use std::path::Path;
 use windows_sys::core::{PCWSTR, PWSTR};
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE, LUID};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SetNamedSecurityInfoW,
-    SE_FILE_OBJECT,
+    BuildTrusteeWithSidW, ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW,
+    SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, SET_AUDIT_SUCCESS, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    AddAuditAccessAceEx, AdjustTokenPrivileges, GetLengthSid, InitializeAcl, LookupPrivilegeValueW,
-    ACL, ACL_REVISION, CONTAINER_INHERIT_ACE, LUID_AND_ATTRIBUTES, OBJECT_INHERIT_ACE, PSID,
+    AdjustTokenPrivileges, LookupPrivilegeValueW, ACL, LUID_AND_ATTRIBUTES, PSID,
     SACL_SECURITY_INFORMATION, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -128,38 +127,147 @@ pub fn set_read_audit_sacl(path: &Path) -> bool {
         if ConvertStringSidToSidW(everyone.as_ptr(), &mut sid) == 0 || sid.is_null() {
             return false;
         }
-        let sid_len = GetLengthSid(sid) as usize;
-        // ACL buffer: header + one audit ACE (ACE header + mask + SID body).
-        let acl_size = std::mem::size_of::<ACL>() + 16 + sid_len;
-        let mut buf = vec![0u8; acl_size];
-        let acl = buf.as_mut_ptr() as *mut ACL;
-        let ok = InitializeAcl(acl, acl_size as u32, ACL_REVISION) != 0
-            && AddAuditAccessAceEx(
-                acl,
-                ACL_REVISION,
-                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-                AUDIT_MASK,
-                sid,
-                1, // audit success
-                0, // not failure (a denied read is already logged elsewhere)
-            ) != 0;
-        let result = if ok {
-            SetNamedSecurityInfoW(
+        // Retrieve existing audit policy; failing to read it must never replace it.
+        let mut old: *mut ACL = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        let read = GetNamedSecurityInfoW(
+            wide(&path.to_string_lossy()).as_ptr(),
+            SE_FILE_OBJECT,
+            SACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut old,
+            &mut descriptor,
+        );
+        let mut entry: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        entry.grfAccessPermissions = AUDIT_MASK;
+        entry.grfAccessMode = SET_AUDIT_SUCCESS;
+        BuildTrusteeWithSidW(&mut entry.Trustee, sid);
+        let mut merged = std::ptr::null_mut();
+        let merged_ok =
+            read == ERROR_SUCCESS && SetEntriesInAclW(1, &entry, old, &mut merged) == ERROR_SUCCESS;
+        let result = merged_ok
+            && SetNamedSecurityInfoW(
                 wide(&path.to_string_lossy()).as_ptr() as PCWSTR as *mut _,
                 SE_FILE_OBJECT,
                 SACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null(),
-                acl,
-            ) == ERROR_SUCCESS
-        } else {
-            false
-        };
+                merged,
+            ) == ERROR_SUCCESS;
+        if !merged.is_null() {
+            LocalFree(merged as _);
+        }
+        if !descriptor.is_null() {
+            LocalFree(descriptor as _);
+        }
         LocalFree(sid as _);
         if !result {
             tracing::warn!(path = %path.display(), "could not set decoy read-audit SACL");
         }
         result
+    }
+}
+
+/// Query effective machine policy without changing operator-owned audit settings.
+pub fn file_audit_enabled() -> Option<bool> {
+    use windows_sys::Win32::Security::Authentication::Identity::{
+        AuditFree, AuditQuerySystemPolicy,
+    };
+    let guid = windows_sys::core::GUID::from_u128(0x0cce921d_69ae_11d9_bed3_505054503030);
+    unsafe {
+        let mut policy = std::ptr::null_mut();
+        if !AuditQuerySystemPolicy(&guid, 1, &mut policy) || policy.is_null() {
+            return None;
+        }
+        let enabled = (*policy).AuditingInformation & 1 != 0;
+        AuditFree(policy as _);
+        Some(enabled)
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    /// Elevated native test: an unrelated audit ACE survives repeated deployment.
+    #[test]
+    #[ignore = "requires native Windows SeSecurityPrivilege"]
+    fn native_audit_sacl_preserves_existing_ace() {
+        use windows_sys::Win32::Security::{GetAce, ACE_HEADER};
+        let path =
+            std::env::temp_dir().join(format!("trapd-audit-test-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"test bait").unwrap();
+        assert!(
+            enable_security_privilege(),
+            "run native audit test elevated"
+        );
+        unsafe {
+            let mut users: PSID = std::ptr::null_mut();
+            assert_ne!(
+                ConvertStringSidToSidW(wide("S-1-5-32-545").as_ptr(), &mut users),
+                0
+            );
+            let mut ace: EXPLICIT_ACCESS_W = std::mem::zeroed();
+            ace.grfAccessPermissions = 0x0001_0000; // unrelated delete-audit policy
+            ace.grfAccessMode = SET_AUDIT_SUCCESS;
+            BuildTrusteeWithSidW(&mut ace.Trustee, users);
+            let mut original = std::ptr::null_mut();
+            assert_eq!(
+                SetEntriesInAclW(1, &ace, std::ptr::null(), &mut original),
+                ERROR_SUCCESS
+            );
+            assert_eq!(
+                SetNamedSecurityInfoW(
+                    wide(&path.to_string_lossy()).as_ptr() as *mut _,
+                    SE_FILE_OBJECT,
+                    SACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    original
+                ),
+                ERROR_SUCCESS
+            );
+            let mut entry = std::ptr::null_mut();
+            assert_ne!(GetAce(original, 0, &mut entry), 0);
+            let header = &*entry.cast::<ACE_HEADER>();
+            let expected =
+                std::slice::from_raw_parts(entry.cast::<u8>(), header.AceSize as usize).to_vec();
+            LocalFree(original.cast());
+            LocalFree(users.cast());
+            for _ in 0..2 {
+                assert!(set_read_audit_sacl(&path));
+                let mut actual: *mut ACL = std::ptr::null_mut();
+                let mut descriptor = std::ptr::null_mut();
+                assert_eq!(
+                    GetNamedSecurityInfoW(
+                        wide(&path.to_string_lossy()).as_ptr(),
+                        SE_FILE_OBJECT,
+                        SACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut actual,
+                        &mut descriptor
+                    ),
+                    ERROR_SUCCESS
+                );
+                let mut preserved = false;
+                for i in 0..(*actual).AceCount {
+                    let mut entry = std::ptr::null_mut();
+                    assert_ne!(GetAce(actual, i as u32, &mut entry), 0);
+                    let header = &*entry.cast::<ACE_HEADER>();
+                    preserved |=
+                        std::slice::from_raw_parts(entry.cast::<u8>(), header.AceSize as usize)
+                            == expected;
+                }
+                LocalFree(descriptor.cast());
+                assert!(preserved, "deploy replaced unrelated audit policy");
+            }
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }
