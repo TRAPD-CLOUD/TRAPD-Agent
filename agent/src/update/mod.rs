@@ -10,6 +10,8 @@
 pub mod apply;
 pub mod download;
 pub mod manifest;
+#[cfg(windows)]
+pub mod windows;
 
 use std::time::Duration;
 
@@ -18,7 +20,8 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 
 #[cfg(target_os = "linux")]
-use apply::{apply_staged, ApplyContext, Outcome, Platform};
+use apply::Platform;
+use apply::{apply_staged, ApplyContext, Outcome};
 use apply::{StagingPaths, UpdateState};
 use manifest::{verify_offer, UpdateOffer, VerifyContext};
 
@@ -27,6 +30,30 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(3600);
 const STAGED_RETRY_AFTER: Duration = Duration::from_secs(6 * 3600);
 /// How long the helper waits for the new version's first good heartbeat.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
+const RECOVERY_GRACE: Duration = Duration::from_secs(300);
+
+fn next_check_delay(paths: &StagingPaths, normal: Duration, windows: bool) -> Duration {
+    if !windows {
+        return normal;
+    }
+    if !paths.recovery().exists() {
+        // Helper launch is asynchronous: its journal may appear immediately
+        // after this check. Do not sleep an hour through that crash window.
+        return if paths.offer().is_file() {
+            RECOVERY_GRACE
+        } else {
+            normal
+        };
+    }
+    // The next check must observe the guard's expiry, rather than the next
+    // hourly backend poll. After a launch/failure keep five minutes between
+    // attempts, giving a detached helper time to finish its health/SCM work.
+    file_age(&paths.recovery())
+        .and_then(|age| RECOVERY_GRACE.checked_sub(age))
+        .filter(|remaining| !remaining.is_zero())
+        .unwrap_or(RECOVERY_GRACE)
+        .max(Duration::from_secs(1))
+}
 
 /// Where the release public key lives.
 ///
@@ -96,15 +123,42 @@ impl Updater {
             if let Err(e) = self.check_once().await {
                 warn!(error = %e, "update: check failed");
             }
-            tokio::time::sleep(CHECK_INTERVAL + jitter).await;
+            tokio::time::sleep(next_check_delay(
+                &self.paths,
+                CHECK_INTERVAL + jitter,
+                cfg!(windows),
+            ))
+            .await;
         }
     }
 
     async fn check_once(&self) -> Result<()> {
-        // A verified update is already waiting for the apply helper. Re-offering
-        // it every hour would re-download the artifact for nothing; only retry
-        // once it has been sitting there long enough to suggest the helper is
-        // not installed or not running.
+        // A completed transaction may still have staging after a crash or a
+        // deletion failure. Finish that cleanup before recovery or helper
+        // launch, then continue polling for the next release in this check.
+        apply::resume_completed_staging(&self.paths)?;
+        // A failed stop/restore/restart must keep its original signed offer and
+        // artifact. A later release cannot supersede an unfinished recovery.
+        if self.paths.recovery().exists() {
+            #[cfg(windows)]
+            if !file_is_fresh(&self.paths.recovery(), RECOVERY_GRACE) {
+                windows::spawn_apply_helper(&self.paths.dir)
+                    .context("update: relaunch pending recovery helper")?;
+            }
+            return Ok(());
+        }
+
+        // The replay watermark already covers this offer. Windows must retry
+        // its staged artifact directly, before the fresh-offer skip or polling
+        // for a directive that would be rejected as a replay.
+        #[cfg(windows)]
+        if resume_staged_update(&self.paths, windows::spawn_apply_helper)? {
+            return Ok(());
+        }
+
+        // Linux's path unit watches a staged offer. Avoid re-downloading it
+        // while the helper is expected to run; stale staging may be re-offered.
+        // Windows relaunches its existing artifact in the branch above.
         if staged_within(&self.paths, STAGED_RETRY_AFTER) {
             return Ok(());
         }
@@ -171,6 +225,7 @@ impl Updater {
         // so a transient download failure can retry the same offer.
         UpdateState {
             last_issued_at: verified.issued_at,
+            completion: None,
             ..state
         }
         .save(&self.paths)?;
@@ -183,17 +238,46 @@ impl Updater {
             0o600,
         )?;
         info!(version = %verified.version, "update: staged, waiting for the apply helper");
+        // Linux has a root path unit watching the staged offer; Windows has no
+        // equivalent, so the service starts the helper itself. The helper
+        // re-verifies everything, so launching it grants a compromised agent
+        // nothing it could not already stage.
+        #[cfg(windows)]
+        if let Err(e) = windows::spawn_apply_helper(&self.paths.dir) {
+            warn!(error = %e, "update: could not start the apply helper; the staged update is retried later");
+        }
         Ok(())
     }
 }
 
+/// Resume a Windows staged update after a failed launch or an early helper
+/// exit. The helper re-verifies the existing offer, replay watermark and bytes;
+/// retrying never changes the accepted directive or download state.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resume_staged_update(
+    paths: &StagingPaths,
+    launch: impl FnOnce(&std::path::Path) -> Result<()>,
+) -> Result<bool> {
+    if paths.recovery().exists() || !paths.offer().is_file() {
+        return Ok(false);
+    }
+    launch(&paths.dir).context("update: relaunch staged apply helper")?;
+    Ok(true)
+}
+
 fn staged_within(paths: &StagingPaths, window: Duration) -> bool {
-    std::fs::metadata(paths.offer())
+    paths.recovery().exists() || file_is_fresh(&paths.offer(), window)
+}
+
+fn file_is_fresh(path: &std::path::Path, window: Duration) -> bool {
+    file_age(path).is_some_and(|age| age < window)
+}
+
+fn file_age(path: &std::path::Path) -> Option<Duration> {
+    std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .map(|age| age < window)
-        .unwrap_or(false)
 }
 
 fn rand_u32() -> u32 {
@@ -244,7 +328,6 @@ struct CredentialsFile {
 
 /// `trapd-agent --apply-update`: run by a root unit (Linux) or spawned by the
 /// service (Windows). Applies the staged update, or rolls it back.
-#[cfg(target_os = "linux")]
 pub fn run_apply_helper() -> Result<()> {
     let paths = staging();
     if !paths.offer().exists() {
@@ -259,12 +342,24 @@ pub fn run_apply_helper() -> Result<()> {
     let release_key = crate::prevention::commands::load_verifying_key(&release_pubkey_path())?;
     let command_key =
         crate::prevention::commands::load_verifying_key(&crate::prevention::command_pubkey_path())?;
+
+    // Linux replaces the binary the helper itself runs from; Windows runs the
+    // helper from a copy and takes the install path from the SCM.
+    #[cfg(target_os = "linux")]
     let target = std::env::current_exe().context("update: locate running binary")?;
+    #[cfg(windows)]
+    let target = windows::installed_binary_path()?;
+
     // Where `install.sh` puts the eBPF object (first entry of the loaders' search
-    // path). Overridable for non-standard layouts.
-    let ebpf_target = std::env::var_os("TRAPD_EBPF_INSTALL_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/usr/lib/trapd-agent/trapd-agent-exec"));
+    // path). Overridable for non-standard layouts. Linux only.
+    #[cfg(target_os = "linux")]
+    let ebpf_target = Some(
+        std::env::var_os("TRAPD_EBPF_INSTALL_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr/lib/trapd-agent/trapd-agent-exec")),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let ebpf_target: Option<std::path::PathBuf> = None;
 
     let baseline = crate::selfprotect::binary_integrity::hash_store_path();
 
@@ -279,12 +374,16 @@ pub fn run_apply_helper() -> Result<()> {
             last_issued_at: 0,
         },
         target: &target,
-        ebpf_target: Some(&ebpf_target),
+        ebpf_target: ebpf_target.as_deref(),
         baseline: Some(&baseline),
         paths: &paths,
         health_timeout: HEALTH_TIMEOUT,
     };
-    match apply_staged(&ctx, &SystemdPlatform)? {
+    #[cfg(target_os = "linux")]
+    let platform = SystemdPlatform;
+    #[cfg(windows)]
+    let platform = windows::ScmPlatform;
+    match apply_staged(&ctx, &platform)? {
         Outcome::Applied { version } => info!(%version, "update: applied"),
         Outcome::RolledBack { attempted } => error!(%attempted, "update: rolled back"),
     }
@@ -294,6 +393,189 @@ pub fn run_apply_helper() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_windows_recovery_is_checked_at_grace_expiry_instead_of_next_hour() {
+        let paths = StagingPaths {
+            dir: std::env::temp_dir().join(format!("trapd-retry-delay-{}", uuid::Uuid::new_v4())),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let journal = std::fs::File::create(paths.recovery()).unwrap();
+        journal
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(100)),
+            )
+            .unwrap();
+        let normal = CHECK_INTERVAL + Duration::from_secs(120);
+        let delay = next_check_delay(&paths, normal, true);
+        assert!(
+            delay > Duration::from_secs(198) && delay <= Duration::from_secs(201),
+            "delay={delay:?}"
+        );
+        assert_eq!(next_check_delay(&paths, normal, false), normal);
+        journal
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(301)),
+            )
+            .unwrap();
+        assert_eq!(next_check_delay(&paths, normal, true), RECOVERY_GRACE);
+        drop(journal);
+        std::fs::remove_file(paths.recovery()).unwrap();
+        assert_eq!(next_check_delay(&paths, normal, true), normal);
+        std::fs::write(paths.offer(), b"pending signed offer").unwrap();
+        assert_eq!(next_check_delay(&paths, normal, true), RECOVERY_GRACE);
+        assert_eq!(next_check_delay(&paths, normal, false), normal);
+        std::fs::remove_dir_all(paths.dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_staging_is_cleaned_before_polling_for_the_next_update() {
+        use sha2::{Digest, Sha256};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let paths = StagingPaths {
+            dir: std::env::temp_dir().join(format!("trapd-completion-{}", uuid::Uuid::new_v4())),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.offer(), b"completed signed offer").unwrap();
+        std::fs::write(paths.recovery(), b"completed recovery").unwrap();
+        std::fs::write(paths.artifact(), b"completed artifact").unwrap();
+        UpdateState {
+            last_issued_at: 500,
+            completion: Some(apply::CompletedUpdate {
+                offer_sha256: hex::encode(Sha256::digest(b"completed signed offer")),
+                outcome: Outcome::Applied {
+                    version: "0.5.0".into(),
+                },
+            }),
+            ..Default::default()
+        }
+        .save(&paths)
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/update", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let mut n = 0;
+            while !buf[..n].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                assert!(n < buf.len(), "request headers exceeded the test bound");
+                let read = socket.read(&mut buf[n..]).await.unwrap();
+                assert!(read > 0, "request ended before its headers");
+                n += read;
+            }
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("GET /update?"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-token"));
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let updater = Updater {
+            control: reqwest::Client::builder().no_proxy().build().unwrap(),
+            download: reqwest::Client::builder().no_proxy().build().unwrap(),
+            update_url: url,
+            token: "test-token".into(),
+            agent_id: "agent-1".into(),
+            release_key: key,
+            command_key: key,
+            paths,
+        };
+        tokio::time::timeout(Duration::from_secs(5), updater.check_once())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!updater.paths.offer().exists());
+        assert!(!updater.paths.recovery().exists());
+        assert!(!updater.paths.artifact().exists());
+        assert_eq!(UpdateState::load(&updater.paths).last_issued_at, 500);
+        std::fs::remove_dir_all(updater.paths.dir).unwrap();
+    }
+
+    #[test]
+    fn staged_helper_launch_failure_retries_without_changing_replay_watermark() {
+        let paths = StagingPaths {
+            dir: std::env::temp_dir().join(format!("trapd-relaunch-{}", uuid::Uuid::new_v4())),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.offer(), b"existing signed offer").unwrap();
+        std::fs::write(paths.artifact(), b"existing verified artifact").unwrap();
+        UpdateState {
+            last_issued_at: 500,
+            blocked_version: None,
+            completion: None,
+        }
+        .save(&paths)
+        .unwrap();
+        assert!(staged_within(&paths, STAGED_RETRY_AFTER));
+        assert!(resume_staged_update(&paths, |dir| {
+            assert_eq!(dir, paths.dir);
+            anyhow::bail!("process launch failed")
+        })
+        .is_err());
+        let launched = std::cell::Cell::new(false);
+        assert!(resume_staged_update(&paths, |dir| {
+            assert_eq!(dir, paths.dir);
+            launched.set(true);
+            Ok(())
+        })
+        .unwrap());
+        assert!(launched.get());
+        // Also retry an early helper exit before it can create recovery.json.
+        assert!(!paths.recovery().exists());
+        assert!(resume_staged_update(&paths, |_| Ok(())).unwrap());
+        assert_eq!(UpdateState::load(&paths).last_issued_at, 500);
+        assert_eq!(
+            std::fs::read(paths.offer()).unwrap(),
+            b"existing signed offer"
+        );
+        assert_eq!(
+            std::fs::read(paths.artifact()).unwrap(),
+            b"existing verified artifact"
+        );
+        std::fs::remove_dir_all(paths.dir).unwrap();
+    }
+
+    #[test]
+    fn staged_helper_retry_does_not_replace_pending_recovery_or_poll_empty_staging() {
+        let paths = StagingPaths {
+            dir: std::env::temp_dir().join(format!("trapd-relaunch-{}", uuid::Uuid::new_v4())),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        assert!(!resume_staged_update(&paths, |_| panic!("no offer to apply")).unwrap());
+        std::fs::write(paths.offer(), b"offer").unwrap();
+        std::fs::write(paths.recovery(), b"recovery").unwrap();
+        assert!(!resume_staged_update(&paths, |_| panic!(
+            "recovery has a separate guarded launch path"
+        ))
+        .unwrap());
+        assert_eq!(std::fs::read(paths.recovery()).unwrap(), b"recovery");
+        std::fs::remove_dir_all(paths.dir).unwrap();
+    }
+
+    #[test]
+    fn pending_recovery_never_expires_into_a_new_download() {
+        let dir =
+            std::env::temp_dir().join(format!("trapd-recovery-test-{}", uuid::Uuid::new_v4()));
+        let paths = StagingPaths { dir };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.offer(), b"{}").unwrap();
+        std::fs::write(paths.recovery(), b"{}").unwrap();
+        assert!(
+            staged_within(&paths, Duration::ZERO),
+            "recovery must preserve its signed offer indefinitely"
+        );
+        std::fs::remove_dir_all(paths.dir).unwrap();
+    }
 
     #[test]
     fn staged_update_is_in_flight_only_while_fresh() {

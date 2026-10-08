@@ -24,6 +24,8 @@ mod collect;
 #[path = "windows.rs"]
 pub(crate) mod collect;
 pub mod compliance;
+pub mod windows_drivers;
+pub mod windows_hardening;
 
 use std::sync::Arc;
 use std::sync::RwLock;

@@ -171,6 +171,7 @@ pub fn process_start(
         username,
         exe_sha256: enrich.exe_sha256,
         process_start_time: rec.int(&["CreateTime"]).filter(|t| *t > 0),
+        parent_start_time: None,
         enrichment: notes.finish(0),
     })
 }
@@ -253,6 +254,7 @@ pub fn network_connection(
         dst_port,
         state: if inbound { "accepted" } else { "established" }.into(),
         pid,
+        process_start_time: None,
         process,
         duration_ms: None,
         bytes_sent: None,

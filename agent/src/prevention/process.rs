@@ -27,54 +27,190 @@ use super::policy::{Match, PolicyHandle, RuleAction};
 
 /// Send SIGKILL to the given PID.  Errors if the process is gone or we lack
 /// permission (in which case the audit event records `success=false`).
-#[cfg(target_os = "linux")]
-pub fn kill_pid(pid: i32) -> Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    kill(Pid::from_raw(pid), Signal::SIGKILL).with_context(|| format!("SIGKILL pid={pid} failed"))
+pub fn kill_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if observed_start.is_none() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        return kill(Pid::from_raw(pid), Signal::SIGKILL)
+            .with_context(|| format!("SIGKILL pid={pid} failed"));
+    }
+    kill_observed(pid, observed_start)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn kill_pid(_pid: i32) -> Result<()> {
-    anyhow::bail!("process kill only implemented on Linux")
+/// Kill the process an exec event describes. Where the event carries the
+/// process start time (Windows) the kill is bound to that identity, so a PID
+/// reused since the event cannot be hit.
+fn kill_exec(exec: &ExecEventData) -> Result<()> {
+    kill_observed(exec.pid, exec.process_start_time)
+}
+
+/// Control exactly the observed process generation. Unknown identity fails closed.
+pub fn kill_observed(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        super::winproc::terminate(pid, observed_start)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        signal_observed(pid, observed_start, libc::SIGKILL)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (pid, observed_start);
+        anyhow::bail!("process control unsupported")
+    }
+}
+
+pub fn freeze_observed(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        super::winproc::suspend(pid, observed_start)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        signal_observed(pid, observed_start, libc::SIGSTOP)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (pid, observed_start);
+        anyhow::bail!("process control unsupported")
+    }
+}
+
+pub fn thaw_observed(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        super::winproc::resume(pid, observed_start)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        signal_observed(pid, observed_start, libc::SIGCONT)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (pid, observed_start);
+        anyhow::bail!("process control unsupported")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_observed(pid: i32, observed_start: Option<u64>, signal: i32) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let expected = observed_start
+        .filter(|t| *t > 0)
+        .ok_or_else(|| anyhow::anyhow!("unknown observed identity for pid {pid}; refusing"))?;
+    anyhow::ensure!(
+        pid > 1 && pid != std::process::id() as i32,
+        "unsafe target pid {pid}"
+    );
+    // Open the generation-stable kernel reference BEFORE the comparison. If
+    // reuse occurs before opening the start check rejects it; after opening the
+    // pidfd cannot address a replacement. Old kernels fail closed.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("pidfd_open");
+    }
+    // SAFETY: successful pidfd_open transferred one valid owned descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    anyhow::ensure!(
+        crate::telemetry::identity::process_start_time(pid) == Some(expected),
+        "pid {pid} belongs to a different or unknown process; refusing"
+    );
+    // SAFETY: valid pidfd, signal, no siginfo and no flags.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error()).context("pidfd_send_signal");
+    }
+    Ok(())
 }
 
 /// Freeze a process by sending SIGSTOP — the "jail" response. The process is
 /// suspended (not killed), so it cannot react or destroy evidence while a
 /// snapshot is taken and an operator decides what to do ("freeze, snapshot, then
 /// decide" — issue #32, point 5). Resume with [`thaw_pid`].
-#[cfg(target_os = "linux")]
-pub fn freeze_pid(pid: i32) -> Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    kill(Pid::from_raw(pid), Signal::SIGSTOP).with_context(|| format!("SIGSTOP pid={pid} failed"))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn freeze_pid(_pid: i32) -> Result<()> {
-    anyhow::bail!("process freeze only implemented on Linux")
+pub fn freeze_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if observed_start.is_none() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        return kill(Pid::from_raw(pid), Signal::SIGSTOP)
+            .with_context(|| format!("SIGSTOP pid={pid} failed"));
+    }
+    freeze_observed(pid, observed_start)
 }
 
 /// Resume a previously-frozen process by sending SIGCONT.
-#[cfg(target_os = "linux")]
-pub fn thaw_pid(pid: i32) -> Result<()> {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    kill(Pid::from_raw(pid), Signal::SIGCONT).with_context(|| format!("SIGCONT pid={pid} failed"))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn thaw_pid(_pid: i32) -> Result<()> {
-    anyhow::bail!("process thaw only implemented on Linux")
+pub fn thaw_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if observed_start.is_none() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        return kill(Pid::from_raw(pid), Signal::SIGCONT)
+            .with_context(|| format!("SIGCONT pid={pid} failed"));
+    }
+    thaw_observed(pid, observed_start)
 }
 
 /// Look up the parent's comm by PPID.
-fn parent_comm(ppid: i32) -> Option<String> {
+fn parent_comm(exec: &ExecEventData) -> Option<String> {
+    let ppid = exec.ppid;
     if ppid <= 0 {
         return None;
     }
-    let raw = std::fs::read_to_string(format!("/proc/{ppid}/comm")).ok()?;
-    Some(raw.trim().to_string())
+    #[cfg(windows)]
+    {
+        super::winproc::image_name_observed(ppid, exec.parent_start_time)
+    }
+    #[cfg(not(windows))]
+    {
+        let raw = std::fs::read_to_string(format!("/proc/{ppid}/comm")).ok()?;
+        Some(raw.trim().to_string())
+    }
+}
+
+/// Digest for a policy check when the collector supplied none. Linux can hash
+/// the image on demand; on Windows the process sensor already hashes every image
+/// it reports (size-capped, cached per path and mtime), so a missing digest
+/// means "unhashable" and an on-demand re-read would only race the process.
+fn fallback_digest(exe: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::collectors::linux::exehash::hash_for_policy(exe)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = exe;
+        None
+    }
+}
+
+/// View a Windows process-creation event as an exec event, so the policy engine
+/// has exactly one enforcement path on both platforms. `comm` is the image file
+/// name, the Windows analogue of the Linux process name.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn exec_from_create(create: &crate::schema::ProcessCreateData) -> ExecEventData {
+    ExecEventData {
+        pid: create.pid,
+        ppid: create.ppid,
+        uid: create.uid,
+        username: create.username.clone(),
+        comm: create.name.clone(),
+        exe: create.exe.clone(),
+        cmdline: create.cmdline.clone(),
+        exe_sha256: create.exe_sha256.clone(),
+        process_start_time: create.process_start_time,
+        parent_start_time: create.parent_start_time,
+        ..Default::default()
+    }
 }
 
 /// Enforce the current policy against a freshly-execed process.  Returns
@@ -92,21 +228,19 @@ pub fn enforce_exec(
             .as_ref()
             .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
             .cloned()
-            .or_else(|| {
-                #[cfg(target_os = "linux")]
-                {
-                    crate::collectors::linux::exehash::hash_for_policy(&exec.exe)
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    None
-                }
-            })
+            .or_else(|| fallback_digest(&exec.exe))
     } else {
         None
     };
 
-    let parent = parent_comm(exec.ppid);
+    // The parent's name is only needed to evaluate parent/child rules; look it up
+    // before matching just when such a rule exists, and for the audit record
+    // after a match otherwise.
+    let mut parent = if policy.read().has_parent_child_rules() {
+        parent_comm(exec)
+    } else {
+        None
+    };
 
     let m: Option<Match> =
         policy
@@ -114,6 +248,9 @@ pub fn enforce_exec(
             .match_exec(&exec.exe, &exec.comm, parent.as_deref(), sha.as_deref());
 
     let m = m?;
+    if parent.is_none() {
+        parent = parent_comm(exec);
+    }
 
     let details = serde_json::json!({
         "pid":     exec.pid,
@@ -128,9 +265,9 @@ pub fn enforce_exec(
 
     match m.action {
         RuleAction::Block => {
-            let killed = kill_pid(exec.pid).is_ok();
+            let killed = kill_exec(exec).is_ok();
             if killed {
-                info!(pid = exec.pid, exe = %exec.exe, rule = %m.rule_id, "blocked process by SIGKILL");
+                info!(pid = exec.pid, exe = %exec.exe, rule = %m.rule_id, "blocked process by policy");
             } else {
                 warn!(pid = exec.pid, exe = %exec.exe, rule = %m.rule_id, "kill failed (process may already be gone)");
             }
@@ -173,6 +310,43 @@ pub fn enforce_exec(
 mod tests {
     use super::super::policy::{IocRule, PolicyStore};
     use super::*;
+
+    #[test]
+    fn process_create_policy_view_preserves_observed_parent_generation() {
+        let create = crate::schema::ProcessCreateData {
+            pid: 100,
+            ppid: 50,
+            process_start_time: Some(20),
+            parent_start_time: Some(10),
+            ..Default::default()
+        };
+        let decoded: crate::schema::ProcessCreateData =
+            serde_json::from_slice(&serde_json::to_vec(&create).unwrap()).unwrap();
+        assert_eq!(exec_from_create(&decoded).parent_start_time, Some(10));
+        let mut legacy = serde_json::to_value(create).unwrap();
+        legacy.as_object_mut().unwrap().remove("parent_start_time");
+        let legacy: crate::schema::ProcessCreateData = serde_json::from_value(legacy).unwrap();
+        assert_eq!(exec_from_create(&legacy).parent_start_time, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_kill_rejects_unknown_and_stale_generations() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start = crate::telemetry::identity::process_start_time(pid).unwrap();
+        assert!(kill_observed(pid, None).is_err());
+        assert!(kill_observed(pid, Some(start + 1)).is_err());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "unrelated generation must survive"
+        );
+        kill_observed(pid, Some(start)).expect("terminate exact generation using pidfd");
+        assert!(!child.wait().unwrap().success());
+    }
 
     #[test]
     fn comm_only_policy_does_not_hash_executables() {
@@ -234,5 +408,147 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::super::policy::{IocRule, PolicyStore};
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn parent_child_block_requires_the_observed_parent_generation() {
+        let mut child = Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let ppid = std::process::id() as i32;
+        let parent_start = crate::telemetry::identity::process_start_time(ppid).unwrap();
+        let parent_name =
+            super::super::winproc::image_name_observed(ppid, Some(parent_start)).unwrap();
+        let policy = PolicyHandle::new(
+            PolicyStore::from_rules(vec![IocRule::ParentChild {
+                id: "bound-parent".into(),
+                parent: parent_name,
+                child: "ping.exe".into(),
+                action: RuleAction::Block,
+            }])
+            .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let audit = AuditEmitter::new(tx, "agent".into(), "host".into());
+        let mut exec = ExecEventData {
+            pid: child.id() as i32,
+            ppid,
+            comm: "ping.exe".into(),
+            process_start_time: crate::telemetry::identity::process_start_time(child.id() as i32),
+            ..Default::default()
+        };
+        for generation in [None, Some(0), Some(parent_start + 1)] {
+            exec.parent_start_time = generation;
+            assert!(enforce_exec(&exec, &policy, &audit).is_none());
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "unproven parent must not cause a child kill"
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        exec.parent_start_time = Some(parent_start);
+        assert_eq!(
+            enforce_exec(&exec, &policy, &audit).as_deref(),
+            Some("bound-parent")
+        );
+        child.wait().unwrap();
+        match rx.try_recv().unwrap().data {
+            crate::schema::EventData::Prevention(data) => assert!(data.success),
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    /// End to end on a real process: a Block rule written the way a Linux
+    /// operator would (lower-case name) kills the Windows image, bound to the
+    /// creation identity the process sensor reported.
+    #[test]
+    fn a_block_rule_kills_the_matching_process_and_audits_it() {
+        let mut child = Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let policy = PolicyHandle::new(
+            PolicyStore::from_rules(vec![IocRule::Comm {
+                id: "block-ping".into(),
+                value: "ping.exe".into(),
+                action: RuleAction::Block,
+            }])
+            .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let audit = AuditEmitter::new(tx, "agent".into(), "host".into());
+        let create = crate::schema::ProcessCreateData {
+            pid,
+            name: "PING.EXE".into(), // sensors report the on-disk casing
+            exe: "C:\\Windows\\System32\\PING.EXE".into(),
+            process_start_time: crate::telemetry::identity::process_start_time(pid),
+            ..Default::default()
+        };
+        let exec = exec_from_create(&create);
+        assert_eq!(
+            enforce_exec(&exec, &policy, &audit).as_deref(),
+            Some("block-ping")
+        );
+        assert!(child.wait().is_ok(), "the child must have been terminated");
+        match rx.try_recv().expect("audit event").data {
+            crate::schema::EventData::Prevention(d) => {
+                assert!(d.success, "kill must be reported as successful");
+                assert_eq!(d.kind, "process_block");
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_recycled_pid_is_not_killed() {
+        let mut child = Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let policy = PolicyHandle::new(
+            PolicyStore::from_rules(vec![IocRule::Comm {
+                id: "block-ping".into(),
+                value: "ping.exe".into(),
+                action: RuleAction::Block,
+            }])
+            .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let audit = AuditEmitter::new(tx, "agent".into(), "host".into());
+        // The event describes an older process that had this PID.
+        let stale_start = crate::telemetry::identity::process_start_time(pid).map(|t| t + 10_000);
+        let exec = exec_from_create(&crate::schema::ProcessCreateData {
+            pid,
+            name: "ping.exe".into(),
+            process_start_time: stale_start,
+            ..Default::default()
+        });
+        enforce_exec(&exec, &policy, &audit);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "bystander must survive"
+        );
+        match rx.try_recv().unwrap().data {
+            crate::schema::EventData::Prevention(d) => assert!(!d.success),
+            other => panic!("unexpected event {other:?}"),
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

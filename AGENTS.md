@@ -10,7 +10,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - Main binary: `agent/src/main.rs` builds `trapd-agent`.
 - Current package version: `trapd-agent` `0.2.0`.
 - Primary output: structured JSON events, written locally as NDJSON and/or sent to the backend.
-- Platform focus: Linux and Windows x64. Windows sensing in `agent/src/collectors/windows/` includes process polling (native creation FILETIME), IPv4/IPv6 owner-PID TCP tables, ReadDirectoryChangesW file events and bounded SHA256 FIM, persisted Security/System/Application event-log cursors, native WTS sessions and file honeytokens (legacy registry decoys are only cleaned up). `winsvc/run.rs` wires the shared detection engine, enrollment, signed config, heartbeat, inventory, persistent queue and ingest. Windows inventory uses sysinfo, native adapters and both installed-software registry views. Linux-only eBPF, packet/DNS/TLS sensors, rootkit/memory scanning, session forensics and prevention enforcement remain gated out; polling has documented short-event gaps. `deploy/windows/Package.wxs` and `build-msi.ps1` build the native MSVC x64 MSI; Windows CI installs it and verifies telemetry, TLS/backend contracts, ACLs, repair, upgrade/rollback and removal. MSI manages the automatic LocalSystem service, protected ProgramFiles binary and ProgramData directories; config/state/logs survive removal. Use MSI uninstall for MSI installations; its `cleanup` verb revokes decoys without independently managing SCM. See `deploy/README-windows.md` for the coverage matrix and build/install instructions.
+- Platform focus: Linux and Windows x64. Windows sensing in `agent/src/collectors/windows/` includes process polling (native creation FILETIME), IPv4/IPv6 owner-PID TCP tables, ReadDirectoryChangesW file events and bounded SHA256 FIM, persisted Security/System/Application event-log cursors, native WTS sessions and file honeytokens (legacy registry decoys are only cleaned up). `winsvc/run.rs` wires the shared detection engine, enrollment, signed config, heartbeat, inventory, persistent queue and ingest. Windows inventory uses sysinfo, native adapters and both installed-software registry views. Linux-only eBPF, packet/DNS/TLS sensors, rootkit/memory scanning, session forensics and prevention enforcement remain gated out; polling has documented short-event gaps. `deploy/windows/Package.wxs` and `build-msi.ps1` build the native MSVC x64 MSI; Windows CI installs it and verifies telemetry, TLS/backend contracts, ACLs, repair, upgrade/rollback and removal. MSI manages the automatic LocalSystem service, protected ProgramFiles binary and ProgramData directories; config/state/logs survive removal. Use MSI uninstall for MSI installations; its `cleanup` verb removes all TRAPD-owned containment firewall rules and revokes decoys after service stop, without independently managing SCM. See `deploy/README-windows.md` for the coverage matrix and build/install instructions.
 
 ## Important Paths
 
@@ -355,6 +355,28 @@ guessing either way.
 The agent applies the same rule internally: its `/proc` poller reports a
 recycled PID as a termination followed by a creation, rather than seeing the
 PID in two consecutive polls and emitting neither.
+
+On Windows, `process_start_time` is the native process-creation FILETIME.
+Network connections, honeytoken accessor lineage and ransomware indicators
+also carry an optional observed `process_start_time`. Automatic process control
+requires that generation and compares it against the action handle (Windows)
+or a PID-stable pidfd (Linux); missing identity only permits an alert.
+
+`kill_pid`, `freeze_pid`, `thaw_pid` and `collect_process_memory` commands can
+also carry a signed `process_start_time`. Windows requires that exact observed
+creation FILETIME on the action or memory-read handle; missing, zero or stale
+generations are refused without an action, snapshot or memory artifact.
+Legacy commands still decode and verify, and Linux retains legacy omission.
+Command producers must preserve the observed u64 exactly when signing, rather
+than rounding it through a floating-point representation.
+
+Linux honeytoken kernel events append their original `bpf_ktime_get_ns` timestamp.
+Older kernel objects still decode as access telemetry but lack an identity that
+can authorize automatic process control. Attribution requires the end of the
+observed `/proc` creation tick to precede that timestamp and a stable start time
+across enrichment. Creation-tick ambiguity, and processes started after host
+suspend whose boottime starts exceed the monotonic event time, conservatively
+remain unattributed; the detection is retained and destructive control is denied.
 
 ### Partial enrichment
 

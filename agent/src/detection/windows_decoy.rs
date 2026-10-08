@@ -303,6 +303,7 @@ pub fn to_access_data(decoy: &DecoyInfo, a: &Accessor, verdict: &Verdict) -> Hon
         mitre_technique: technique.to_string(),
         accessor: ProcessLineage {
             pid: a.pid,
+            process_start_time: None,
             uid: 0,
             gid: 0,
             username: a.subject_user.clone(),

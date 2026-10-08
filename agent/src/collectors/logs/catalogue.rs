@@ -1,16 +1,141 @@
-//! Built-in Linux security log catalogue.
+//! Built-in security log catalogue (Linux and Windows).
 //!
 //! Only sources whose paths exist (or whose journal units can be requested)
 //! are armed. A host without nginx simply does not grow an nginx tail — no
 //! error, no empty-file spam. Operators override the whole set by supplying
 //! an explicit `logs:` list.
+//!
+//! The Linux catalogue covers the distro logs, auditd, web servers, databases
+//! and the journal; the Windows catalogue covers IIS / http.sys and the web
+//! servers and databases that run on Windows. Windows security telemetry itself
+//! (the Security, System and Application event logs) has its own collector.
 
+#[cfg(not(windows))]
 use std::path::Path;
 
 use crate::config::{LogSourceConfig, MultilineConfig};
 
 /// Discover sources that look live on this host.
 pub fn discover() -> Vec<LogSourceConfig> {
+    #[cfg(windows)]
+    {
+        discover_windows()
+    }
+    #[cfg(not(windows))]
+    {
+        discover_unix()
+    }
+}
+
+/// One built-in Windows source, before it is checked against the filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct WindowsCandidate {
+    pub name: &'static str,
+    pub path: String,
+    pub parser: &'static str,
+    pub postgres_multiline: bool,
+}
+
+/// The Windows sources worth tailing, as paths on this host. Pure so the
+/// strings are tested everywhere; [`discover_windows`] keeps only those that
+/// exist. Globs cover versioned install directories (`Apache24`,
+/// `PostgreSQL\16`, `MySQL Server 8.0`) without hard-coding a version.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_candidates(
+    system_drive: &str,
+    program_files: &str,
+    program_data: &str,
+) -> Vec<WindowsCandidate> {
+    let c = |name, path: String, parser| WindowsCandidate {
+        name,
+        path,
+        parser,
+        postgres_multiline: false,
+    };
+    vec![
+        // IIS: one directory per site, one file per day. Several sites share a
+        // glob, so a new site is picked up without a restart.
+        c(
+            "iis",
+            format!("{system_drive}\\inetpub\\logs\\LogFiles\\W3SVC*\\u_ex*.log"),
+            "iis",
+        ),
+        // http.sys rejects malformed or abusive requests before IIS sees them.
+        c(
+            "iis_httperr",
+            format!("{system_drive}\\Windows\\System32\\LogFiles\\HTTPERR\\httperr*.log"),
+            "iis",
+        ),
+        c(
+            "nginx_access",
+            format!("{system_drive}\\nginx*\\logs\\access.log"),
+            "nginx_access",
+        ),
+        c(
+            "nginx_error",
+            format!("{system_drive}\\nginx*\\logs\\error.log"),
+            "nginx_error",
+        ),
+        c(
+            "apache_access",
+            format!("{system_drive}\\Apache*\\logs\\access.log"),
+            "apache_access",
+        ),
+        c(
+            "apache_error",
+            format!("{system_drive}\\Apache*\\logs\\error.log"),
+            "apache_error",
+        ),
+        c(
+            "xampp_apache_access",
+            format!("{system_drive}\\xampp\\apache\\logs\\access.log"),
+            "apache_access",
+        ),
+        c(
+            "xampp_apache_error",
+            format!("{system_drive}\\xampp\\apache\\logs\\error.log"),
+            "apache_error",
+        ),
+        WindowsCandidate {
+            postgres_multiline: true,
+            ..c(
+                "postgresql",
+                format!("{program_files}\\PostgreSQL\\*\\data\\log\\*.log"),
+                "postgresql",
+            )
+        },
+        c(
+            "mysql",
+            format!("{program_data}\\MySQL\\MySQL Server *\\Data\\*.err"),
+            "mysql",
+        ),
+    ]
+}
+
+#[cfg(windows)]
+fn discover_windows() -> Vec<LogSourceConfig> {
+    let env = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_string());
+    windows_candidates(
+        &env("SystemDrive", "C:"),
+        &env("ProgramFiles", "C:\\Program Files"),
+        &env("ProgramData", "C:\\ProgramData"),
+    )
+    .into_iter()
+    .filter(|cand| glob_exists(&cand.path))
+    .map(|cand| {
+        let src = LogSourceConfig::file(cand.name, &cand.path, cand.parser);
+        if cand.postgres_multiline {
+            src.with_multiline(MultilineConfig::postgres())
+        } else {
+            src
+        }
+    })
+    .collect()
+}
+
+#[cfg(not(windows))]
+fn discover_unix() -> Vec<LogSourceConfig> {
     let mut out = Vec::new();
 
     // Authentication — files first (sshd/sudo land here on Debian/RHEL).
@@ -121,6 +246,7 @@ pub fn discover() -> Vec<LogSourceConfig> {
     out
 }
 
+#[cfg(not(windows))]
 fn push_file(
     out: &mut Vec<LogSourceConfig>,
     name: &str,
@@ -137,6 +263,7 @@ fn push_file(
     }
 }
 
+#[cfg(not(windows))]
 fn push_first_file(
     out: &mut Vec<LogSourceConfig>,
     name: &str,
@@ -157,9 +284,12 @@ fn push_first_file(
 }
 
 fn glob_exists(pattern: &str) -> bool {
-    !super::reader::expand_paths(pattern, &[]).is_empty()
+    super::reader::expand_paths(pattern, &[])
+        .iter()
+        .any(|p| p.is_file())
 }
 
+#[cfg(not(windows))]
 fn journalctl_present() -> bool {
     std::process::Command::new("journalctl")
         .arg("--version")
@@ -221,5 +351,37 @@ mod tests {
         };
         let got = resolve(&cfg);
         assert!(got.iter().any(|s| s.name == "app"));
+    }
+
+    #[test]
+    fn windows_catalogue_paths_follow_the_host_layout_and_use_globs_for_versions() {
+        let c = windows_candidates("D:", "D:\\Program Files", "D:\\ProgramData");
+        let by = |name: &str| c.iter().find(|x| x.name == name).unwrap();
+        assert_eq!(
+            by("iis").path,
+            "D:\\inetpub\\logs\\LogFiles\\W3SVC*\\u_ex*.log"
+        );
+        assert_eq!(by("iis").parser, "iis");
+        assert_eq!(by("iis_httperr").parser, "iis");
+        assert!(by("postgresql")
+            .path
+            .starts_with("D:\\Program Files\\PostgreSQL\\*"));
+        assert!(by("postgresql").postgres_multiline);
+        assert!(by("mysql")
+            .path
+            .starts_with("D:\\ProgramData\\MySQL\\MySQL Server *"));
+        // Names are unique (an explicit source replaces a built-in by name).
+        let names: std::collections::HashSet<_> = c.iter().map(|x| x.name).collect();
+        assert_eq!(names.len(), c.len());
+        // Every parser the catalogue names is one the parser module knows.
+        for cand in &c {
+            assert!(
+                !super::super::parser::parse(cand.parser, "x")
+                    .message
+                    .is_empty(),
+                "{}",
+                cand.name
+            );
+        }
     }
 }

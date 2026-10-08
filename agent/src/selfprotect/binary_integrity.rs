@@ -55,10 +55,14 @@ pub fn check() -> Result<()> {
 
     info!(binary = %exe.display(), hash = %hash_str, "Binary integrity check started");
 
-    let hash_file = hash_store_path();
+    // A failed signature must never leave a new trusted baseline behind.
+    verify_ed25519_signature(&hash_bytes)?;
+    check_baseline(&exe, &hash_store_path(), &hash_str)
+}
 
+fn check_baseline(exe: &Path, hash_file: &Path, hash_str: &str) -> Result<()> {
     if hash_file.exists() {
-        let stored = std::fs::read_to_string(&hash_file).with_context(|| {
+        let stored = std::fs::read_to_string(hash_file).with_context(|| {
             format!(
                 "Cannot read binary hash baseline from {}",
                 hash_file.display()
@@ -80,9 +84,9 @@ pub fn check() -> Result<()> {
         // First run: create the baseline directory + file.  Best-effort: if the
         // config directory is not writable (non-root test run) we warn rather
         // than abort, so the agent still comes up.
-        match write_baseline(&hash_file, &hash_str) {
+        match write_baseline(hash_file, hash_str) {
             Ok(()) => {
-                info!(path = %hash_file.display(), "Binary hash baseline written (first run)")
+                info!(path = %hash_file.display(), "Binary hash baseline written (first run)");
             }
             Err(e) => warn!(
                 path = %hash_file.display(),
@@ -93,7 +97,7 @@ pub fn check() -> Result<()> {
         }
     }
 
-    verify_ed25519_signature(&hash_bytes)
+    Ok(())
 }
 
 fn write_baseline(hash_file: &Path, hash_str: &str) -> Result<()> {
@@ -193,4 +197,42 @@ fn sha256_of_file(path: &Path) -> Result<(String, Vec<u8>)> {
     }
     let digest = hasher.finalize();
     Ok((hex::encode(digest.as_slice()), digest.to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_self_reported_version_change_cannot_authorize_different_bytes() {
+        let root = std::env::temp_dir().join(format!("trapd-integrity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join("agent.exe");
+        let baseline = root.join("binary.sha256");
+        let original = baseline_line(&hex::encode(Sha256::digest(b"trusted binary v0.6.9")));
+        std::fs::write(&baseline, &original).unwrap();
+        std::fs::write(root.join("binary.version"), "0.6.9").unwrap();
+        std::fs::write(&exe, b"arbitrary replacement declaring version 99.0.0").unwrap();
+        let (hash, _) = sha256_of_file(&exe).unwrap();
+        let err = check_baseline(&exe, &baseline, &baseline_line(&hash)).unwrap_err();
+        assert!(err.to_string().contains("BINARY INTEGRITY VIOLATION"));
+        assert_eq!(std::fs::read_to_string(&baseline).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installer_reset_records_new_baseline_then_rejects_later_changes() {
+        let root = std::env::temp_dir().join(format!("trapd-integrity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join("agent.exe");
+        let baseline = root.join("binary.sha256");
+        let hash = baseline_line(&hex::encode(Sha256::digest(b"installed bytes")));
+        check_baseline(&exe, &baseline, &hash).unwrap();
+        assert_eq!(std::fs::read_to_string(&baseline).unwrap(), hash);
+        check_baseline(&exe, &baseline, &hash).unwrap();
+        let changed = baseline_line(&hex::encode(Sha256::digest(b"other bytes")));
+        assert!(check_baseline(&exe, &baseline, &changed).is_err());
+        assert_eq!(std::fs::read_to_string(&baseline).unwrap(), hash);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

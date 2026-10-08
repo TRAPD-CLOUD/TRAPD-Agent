@@ -42,13 +42,38 @@ pub fn entry() -> Result<()> {
         }
         Some("install") => install(),
         Some("uninstall") => uninstall(),
+        // Started by the service (from a copy of itself) after it staged a
+        // verified update; see `update::windows`.
+        Some("--apply-update") => {
+            run::init_tracing_file();
+            crate::paths::init_state_dir();
+            crate::update::run_apply_helper()
+        }
         Some("cleanup") => {
+            crate::prevention::winfirewall::cleanup()
+                .context("remove containment firewall rules")?;
             crate::collectors::windows::honeytokens::uninstall(&crate::config::load_persisted());
             Ok(())
         }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("telemetry") => {
             print!("{}", crate::telemetry::diagnostics::run());
             Ok(())
+        }
+        // The rule catalog (base / max severity, mode, dedup window per rule) as
+        // JSON — the file the backend seeds its catalog from.
+        Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("rule-catalog") => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::detection::catalog::to_json())?
+            );
+            Ok(())
+        }
+        // Evaluate recorded telemetry with a fresh detection engine on its
+        // original timeline and report findings per rule. Offline and
+        // side-effect free, exactly like the Linux verb.
+        Some("replay") => {
+            let args: Vec<String> = std::env::args().collect();
+            std::process::exit(crate::detection::replay::run_cli(&args[2..]));
         }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("config") => {
             println!(
@@ -222,6 +247,11 @@ fn uninstall() -> Result<()> {
             std::thread::sleep(Duration::from_secs(1));
         }
     }
+
+    if service.query_status()?.current_state != ServiceState::Stopped {
+        bail!("service did not stop; refusing uninstall while containment can be recreated");
+    }
+    crate::prevention::winfirewall::cleanup().context("remove containment firewall rules")?;
 
     // 2. Delete the service registration.
     service.delete().context("delete service")?;

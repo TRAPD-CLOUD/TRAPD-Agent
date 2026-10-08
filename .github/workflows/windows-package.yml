@@ -27,7 +27,11 @@ jobs:
       - name: Build native Windows agent with static CRT
         run: cargo build --release --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml
       - name: Check native Windows code
-        run: cargo clippy --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml -- -D warnings
+        run: cargo clippy --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml --all-targets -- -D warnings
+      - name: Native Windows Firewall containment rules
+        run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml native_windows_firewall_ -- --ignored --nocapture --test-threads=1
+      - name: Native Windows quarantine ownership and pinned file identity
+        run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml native_quarantine_ -- --ignored --nocapture --test-threads=1
       - name: Windows unit tests
         run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml --bin trapd-agent
       - name: Native sweeper directory trust boundary
@@ -82,6 +86,7 @@ jobs:
           TRAPD_HOSTED_BACKEND_URL: ${{ vars.TRAPD_HOSTED_BACKEND_URL }}
           TRAPD_HOSTED_CA_PEM: ${{ vars.TRAPD_HOSTED_CA_PEM }}
           TRAPD_HOSTED_COMMAND_PUBKEY: ${{ vars.TRAPD_HOSTED_COMMAND_PUBKEY }}
+          TRAPD_HOSTED_RELEASE_PUBKEY: ${{ vars.TRAPD_HOSTED_RELEASE_PUBKEY }}
         run: ./deploy/windows/stage-trust.ps1 -OutDir trust
       - name: Build hosted MSI with baked trust anchors
         if: steps.trust.outputs.baked == 'true'

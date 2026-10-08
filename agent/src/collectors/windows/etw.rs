@@ -575,7 +575,12 @@ impl DecodeState {
                     } else {
                         ProcessEnrichment::default()
                     };
-                    if let Some(data) = etw_map::process_start(rec, &self.devices, enrich) {
+                    if let Some(mut data) = etw_map::process_start(rec, &self.devices, enrich) {
+                        data.parent_start_time =
+                            crate::telemetry::identity::parent_generation_before_child(
+                                data.process_start_time,
+                                crate::telemetry::identity::process_start_time(data.ppid),
+                            );
                         crate::deception::activity::record_exec(&data.username, &data.exe);
                         if self.proc_images.len() >= 8192 {
                             self.proc_images.clear();
@@ -645,7 +650,18 @@ impl DecodeState {
                         })
                     })
                     .map(|(e, _)| e.rsplit('\\').next().unwrap_or(e).to_string());
-                if let Some(data) = etw_map::network_connection(rec, process) {
+                if let Some(mut data) = etw_map::network_connection(rec, process) {
+                    // A live creation time must precede this ETW record. A PID
+                    // recycled while the record waited cannot authorize action.
+                    data.process_start_time = data.pid.and_then(|pid| {
+                        crate::telemetry::identity::process_start_time(pid).filter(|start| {
+                            etw_map::same_process_generation(
+                                Some(*start),
+                                Some(*start),
+                                rec.timestamp,
+                            )
+                        })
+                    });
                     emit(
                         EventClass::Network,
                         EventAction::Connection,

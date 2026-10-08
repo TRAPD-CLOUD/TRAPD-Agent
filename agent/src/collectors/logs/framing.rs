@@ -8,6 +8,7 @@
 //! * the auditd event-id aggregator ([`AuditAggregator`]) — `SYSCALL` +
 //!   `EXECVE` + `PATH` + `EOE` share one `msg=audit(epoch:serial)`.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -188,6 +189,57 @@ impl MultilineAggregator {
     }
 }
 
+/// IIS and http.sys write the W3C Extended Log Format: a `#Fields:` directive
+/// names the columns, and every data line carries only values. The column order
+/// is configurable per site, so a line cannot be interpreted on its own.
+///
+/// This framer remembers the latest `#Fields:` directive and turns each data
+/// line into a flat JSON object keyed by column name, which the stateless `iis`
+/// parser then understands. Directives and other `#` comment lines produce no
+/// record.
+#[derive(Default)]
+pub struct W3cAggregator {
+    fields: Arc<Vec<String>>,
+}
+
+impl W3cAggregator {
+    pub fn restore_fields(&mut self, fields: Arc<Vec<String>>) {
+        self.fields = fields;
+    }
+
+    pub fn push(&mut self, line: &str) -> Vec<String> {
+        let line = line.trim_end();
+        if let Some(rest) = line.strip_prefix("#Fields:") {
+            self.fields = Arc::new(rest.split_whitespace().map(str::to_string).collect());
+            return Vec::new();
+        }
+        if line.is_empty() || line.starts_with('#') {
+            return Vec::new();
+        }
+        let values: Vec<&str> = line.split(' ').collect();
+        let names: Vec<&str> = self.fields.iter().map(String::as_str).collect();
+        if names.len() != values.len() {
+            // A malformed or truncated line keeps its original text.
+            return vec![line.to_string()];
+        }
+        let mut map = serde_json::Map::new();
+        for (name, value) in names.iter().zip(&values) {
+            // `-` is the format's "no value".
+            if *value != "-" {
+                map.insert((*name).to_string(), serde_json::Value::from(*value));
+            }
+        }
+        match serde_json::to_string(&serde_json::Value::Object(map)) {
+            Ok(json) => vec![json],
+            Err(_) => vec![line.to_string()],
+        }
+    }
+
+    pub fn flush(&mut self) -> Option<String> {
+        None
+    }
+}
+
 /// Groups consecutive audit records that share `msg=audit(epoch:serial)`.
 pub struct AuditAggregator {
     current_id: Option<String>,
@@ -330,5 +382,51 @@ mod tests {
             audit_event_id("type=SYSCALL msg=audit(1712345678.123:456): foo").as_deref(),
             Some("1712345678.123:456")
         );
+    }
+
+    #[test]
+    fn w3c_lines_become_keyed_records_using_the_latest_fields_directive() {
+        let mut a = W3cAggregator::default();
+        assert!(a
+            .push("#Software: Microsoft Internet Information Services 10.0")
+            .is_empty());
+        assert!(a
+            .push("#Fields: date time c-ip cs-method cs-uri-stem sc-status cs(User-Agent)")
+            .is_empty());
+        let out = a.push(
+            "2026-10-08 12:00:01 203.0.113.9 GET /admin/login.aspx 401 Mozilla/5.0+(Windows)",
+        );
+        assert_eq!(out.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(v["c-ip"], "203.0.113.9");
+        assert_eq!(v["cs-method"], "GET");
+        assert_eq!(v["sc-status"], "401");
+        assert_eq!(v["cs(User-Agent)"], "Mozilla/5.0+(Windows)");
+        // A new directive (log rolled over, site reconfigured) takes effect.
+        a.push("#Fields: date time c-ip");
+        let out = a.push("2026-10-08 12:00:02 198.51.100.1");
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(v["c-ip"], "198.51.100.1");
+        assert!(v.get("cs-method").is_none());
+    }
+
+    #[test]
+    fn w3c_dash_values_are_omitted_and_mismatched_lines_stay_raw() {
+        let mut a = W3cAggregator::default();
+        a.push("#Fields: date time c-ip cs-username");
+        let out = a.push("2026-10-08 12:00:01 203.0.113.9 -");
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert!(v.get("cs-username").is_none());
+        // Wrong column count: never guess, keep the original text.
+        let bad = "2026-10-08 12:00:01 203.0.113.9";
+        assert_eq!(a.push(bad), vec![bad.to_string()]);
+    }
+
+    #[test]
+    fn w3c_without_a_header_keeps_raw_data_instead_of_guessing_the_column_order() {
+        let mut a = W3cAggregator::default();
+        let line = "2026-10-08 12:00:01 10.0.0.5 GET /a - 443 - 203.0.113.9 curl/8 - 200 0 0 12";
+        assert_eq!(a.push(line), vec![line.to_string()]);
+        assert_eq!(a.push("one two three"), vec!["one two three".to_string()]);
     }
 }

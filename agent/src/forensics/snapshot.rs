@@ -50,7 +50,12 @@ pub trait SnapshotProc {
 /// Capture a snapshot of `pid` from `p`. `frozen` records whether the caller
 /// successfully suspended the process first.
 pub fn capture(p: &dyn SnapshotProc, pid: i32, frozen: bool) -> ProcessSnapshot {
-    let state = p.status(pid).as_deref().and_then(parse_state);
+    // Platforms without a `/proc/<pid>/status` still know what the caller did.
+    let state = p
+        .status(pid)
+        .as_deref()
+        .and_then(parse_state)
+        .or_else(|| frozen.then(|| "suspended".to_string()));
     let mut open_files = p.open_fds(pid);
     let open_files_total = open_files.len();
     open_files.truncate(MAX_OPEN_FILES);
@@ -108,6 +113,33 @@ mod tests {
             Some("T (stopped)")
         );
         assert_eq!(parse_state("No state here"), None);
+    }
+
+    #[test]
+    fn a_frozen_process_without_a_status_file_is_still_reported_suspended() {
+        struct NoStatus;
+        impl SnapshotProc for NoStatus {
+            fn status(&self, _: i32) -> Option<String> {
+                None
+            }
+            fn exe(&self, _: i32) -> Option<String> {
+                Some("C:\\Windows\\System32\\cmd.exe".into())
+            }
+            fn cwd(&self, _: i32) -> Option<String> {
+                None
+            }
+            fn cmdline(&self, _: i32) -> Option<String> {
+                None
+            }
+            fn open_fds(&self, _: i32) -> Vec<String> {
+                Vec::new()
+            }
+        }
+        assert_eq!(
+            capture(&NoStatus, 9, true).state.as_deref(),
+            Some("suspended")
+        );
+        assert_eq!(capture(&NoStatus, 9, false).state, None);
     }
 
     #[test]

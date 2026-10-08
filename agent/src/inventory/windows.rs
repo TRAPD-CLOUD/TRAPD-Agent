@@ -168,6 +168,7 @@ pub fn gather_with_flags(
         users,
         security_posture: SecurityPosture {
             listening_ports,
+            kernel_modules: super::windows_drivers::loaded(),
             ..Default::default()
         },
         recon_profile,
@@ -325,24 +326,51 @@ fn format_windows_build(major: u32, minor: u32, build: &str, ubr: u32) -> Option
 }
 
 /// Every local profile with its SID, folder redirection, sync roots and last
-/// use. Accounts come from sysinfo; per-user details from `ProfileList` and,
+/// use. Accounts and registered profiles are combined so logged-off domain or
+/// Entra profiles are included; per-user details come from `ProfileList` and,
 /// when the user's hive is loaded, `HKEY_USERS\<SID>`.
 pub(crate) fn windows_user_profiles() -> Vec<crate::deception::windows_profiler::WindowsUserProfile>
 {
+    const PROFILE_LIST: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
+    windows_user_profiles_from(
+        registry::Hive::LocalMachine,
+        PROFILE_LIST,
+        Users::new_with_refreshed_list()
+            .iter()
+            .map(|u| u.id().to_string())
+            .collect(),
+    )
+}
+
+fn windows_user_profiles_from(
+    hive: registry::Hive,
+    profile_list: &str,
+    accounts: Vec<String>,
+) -> Vec<crate::deception::windows_profiler::WindowsUserProfile> {
     use crate::deception::windows_profiler::{
         expand_user_path, filetime_to_unix, synced_roots_from_children, WindowsUserProfile,
     };
     use registry::Hive;
-    const PROFILE_LIST: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
-    Users::new_with_refreshed_list()
-        .iter()
-        .map(|u| {
-            let sid = u.id().to_string();
-            let key = format!("{PROFILE_LIST}\\{sid}");
-            let profile_dir = registry::string(&key, "ProfileImagePath", RRF_SUBKEY_WOW6464KEY).unwrap_or_default();
+    let mut sids: std::collections::BTreeSet<String> = accounts.into_iter().collect();
+    sids.extend(
+        registry::subkeys_in(hive, profile_list, KEY_WOW64_64KEY)
+            .into_iter()
+            .filter(|sid| {
+                // ProfileList also contains backup keys ending in .bak. Accept only
+                // SID-shaped names, never those backups or unrelated registry keys.
+                sid.strip_prefix("S-1-").is_some_and(|tail| {
+                    tail.split('-')
+                        .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+                })
+            }),
+    );
+    sids.into_iter()
+        .map(|sid| {
+            let key = format!("{profile_list}\\{sid}");
+            let profile_dir = registry::string_in(hive, &key, "ProfileImagePath", RRF_SUBKEY_WOW6464KEY).unwrap_or_default();
             let last_use_unix = match (
-                registry::dword(&key, "LocalProfileLoadTimeHigh", RRF_SUBKEY_WOW6464KEY),
-                registry::dword(&key, "LocalProfileLoadTimeLow", RRF_SUBKEY_WOW6464KEY),
+                registry::dword_in(hive, &key, "LocalProfileLoadTimeHigh", RRF_SUBKEY_WOW6464KEY),
+                registry::dword_in(hive, &key, "LocalProfileLoadTimeLow", RRF_SUBKEY_WOW6464KEY),
             ) {
                 (Some(h), Some(l)) => filetime_to_unix(h, l),
                 _ => None,
@@ -423,7 +451,111 @@ fn windows_recon_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::format_windows_build;
+    use super::{format_windows_build, windows_user_profiles_from};
+    use crate::collectors::windows::registry::Hive;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_CURRENT_USER,
+        KEY_SET_VALUE, KEY_WOW64_64KEY, REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+
+    struct ProfileRegistry(String);
+    impl Drop for ProfileRegistry {
+        fn drop(&mut self) {
+            let path: Vec<u16> = self.0.encode_utf16().chain(Some(0)).collect();
+            // Only remove this fixture's random per-user key, including on panic.
+            unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, path.as_ptr()) };
+        }
+    }
+
+    #[test]
+    fn registered_profiles_are_discovered_without_local_accounts_or_live_sessions() {
+        let fixture = ProfileRegistry(format!(
+            "SOFTWARE\\TRAPD-Profile-Test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let local = "S-1-5-21-1-2-3-1001";
+        let domain = "S-1-5-21-4-5-6-1002";
+        let entra = "S-1-12-1-1-2-3-4";
+        for (sid, folder) in [
+            (local, "C:\\Users\\local"),
+            (domain, "D:\\Profiles\\domain"),
+            (entra, "E:\\People\\entra"),
+            ("S-1-5-21-4-5-6-1002.bak", "D:\\Profiles\\old"),
+            ("unrelated", "D:\\Profiles\\invalid"),
+        ] {
+            let path: Vec<u16> = format!("{}\\{sid}", fixture.0)
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let name: Vec<u16> = "ProfileImagePath".encode_utf16().chain(Some(0)).collect();
+            let value: Vec<u16> = folder.encode_utf16().chain(Some(0)).collect();
+            let mut key = std::ptr::null_mut();
+            // The native fixture requires no HKLM/admin writes and never
+            // touches the machine's real ProfileList or user profile hives.
+            let status = unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    path.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_SET_VALUE | KEY_WOW64_64KEY,
+                    std::ptr::null(),
+                    &mut key,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, 0);
+            let status = unsafe {
+                RegSetValueExW(
+                    key,
+                    name.as_ptr(),
+                    0,
+                    REG_SZ,
+                    value.as_ptr().cast(),
+                    (value.len() * 2) as u32,
+                )
+            };
+            unsafe { RegCloseKey(key) };
+            assert_eq!(status, 0);
+        }
+        let profiles =
+            windows_user_profiles_from(Hive::CurrentUser, &fixture.0, vec![local.into()]);
+        assert_eq!(
+            profiles.len(),
+            3,
+            "deduplicate account/registry SIDs and reject backup/non-SID keys"
+        );
+        for (sid, expected) in [
+            (local, "C:\\Users\\local"),
+            (domain, "D:\\Profiles\\domain"),
+            (entra, "E:\\People\\entra"),
+        ] {
+            assert_eq!(
+                profiles
+                    .iter()
+                    .find(|profile| profile.sid == sid)
+                    .unwrap()
+                    .profile_dir,
+                expected
+            );
+        }
+        let (mut roots, _) = crate::collectors::fs_plan::ransom_roots(
+            profiles
+                .iter()
+                .map(|profile| (profile.sid.as_str(), profile.profile_dir.as_str())),
+            "C:\\Users",
+        );
+        roots.sort();
+        assert_eq!(
+            roots,
+            vec![
+                "c:\\users\\",
+                "d:\\profiles\\domain\\",
+                "e:\\people\\entra\\"
+            ]
+        );
+    }
 
     #[test]
     fn formats_full_build_with_update_revision() {

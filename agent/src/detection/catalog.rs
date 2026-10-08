@@ -158,6 +158,9 @@ pub const RULES: &[RuleMeta] = &[
     // ── Memory scanning ────────────────────────────────────────────────────
     rule("memory.memfd_exec", EVASION, "T1620", Critical, Critical, Alert, Process, HOUR),
     root_bump(rule("memory.anon_exec", EVASION, "T1055", High, Critical, Alert, Process, HOUR)),
+    // Windows: a PE image sitting in executable memory the process allocated
+    // itself — reflective DLL / PE injection.
+    root_bump(rule("memory.injected_pe", EVASION, "T1055.001", High, Critical, Alert, Process, HOUR)),
     // Long-lived daemons keep running deleted images after package upgrades.
     rule("memory.deleted_exec", EVASION, "T1620", Low, Medium, Signal, Process, HOUR),
     rule("injection.ld_preload_runtime", EVASION, "T1574.006", High, Critical, Alert, Process, HOUR),
@@ -298,7 +301,6 @@ mod tests {
         "fileless.memfd_exec",
         "persistence.autostart_write",
         "privesc.untracked_suid_exec",
-        "injection.ld_preload_runtime",
         // Raised by the Windows ETW sensor / audit-policy monitor; covered by
         // their module tests once those land.
         "selfprotect.etw_session_stopped",

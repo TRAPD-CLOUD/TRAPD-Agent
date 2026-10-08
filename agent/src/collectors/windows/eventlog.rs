@@ -292,7 +292,12 @@ fn decoy_access(
             .and_then(|s| s.is_unusual_hour(t.hour()))
     });
     let verdict = windows_decoy::grade(&decoy, &accessor, unusual);
-    Some(windows_decoy::to_access_data(&decoy, &accessor, &verdict))
+    let mut data = windows_decoy::to_access_data(&decoy, &accessor, &verdict);
+    // A reused PID's creation time follows the historic audit record. Unknown
+    // or unordered timestamps remain unattributed for destructive responses.
+    data.accessor.process_start_time = crate::telemetry::identity::process_start_time(accessor.pid)
+        .filter(|start| *start > 0 && observed_filetime.is_some_and(|observed| observed >= *start));
+    Some(data)
 }
 
 /// Security-log clear (1102) or audit-policy change (4719): an attacker

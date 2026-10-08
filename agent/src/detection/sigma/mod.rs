@@ -245,6 +245,7 @@ tags:
                 dst_port: 443,
                 state: "established".into(),
                 pid: None,
+                process_start_time: None,
                 process: None,
                 duration_ms: None,
                 bytes_sent: None,

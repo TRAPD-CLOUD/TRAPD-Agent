@@ -453,6 +453,7 @@ impl ProcessTree {
             };
             let mut entry = serde_json::json!({
                 "pid":  n.pid,
+                "process_start_time": n.start_ticks,
                 "comm": n.comm,
             });
             if !n.exe.is_empty() {

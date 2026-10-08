@@ -8,6 +8,8 @@ use windows_sys::Win32::System::Registry::{
 #[derive(Clone, Copy)]
 pub enum Hive {
     LocalMachine,
+    #[cfg(test)]
+    CurrentUser,
     /// `HKEY_USERS`: per-user keys under `<SID>\…`, present while the
     /// user's profile hive is loaded (logged on, or a service holds it).
     Users,
@@ -17,6 +19,8 @@ impl Hive {
     fn key(self) -> HKEY {
         match self {
             Hive::LocalMachine => HKEY_LOCAL_MACHINE,
+            #[cfg(test)]
+            Hive::CurrentUser => windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
             Hive::Users => HKEY_USERS,
         }
     }
@@ -26,6 +30,10 @@ impl Hive {
 pub const NO_EXPAND: u32 = RRF_NOEXPAND;
 
 pub fn dword(path: &str, name: &str, view: u32) -> Option<u32> {
+    dword_in(Hive::LocalMachine, path, name, view)
+}
+
+pub fn dword_in(hive: Hive, path: &str, name: &str, view: u32) -> Option<u32> {
     let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
     let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     let mut value = 0u32;
@@ -33,7 +41,7 @@ pub fn dword(path: &str, name: &str, view: u32) -> Option<u32> {
     // SAFETY: terminated strings; the out-buffer is a u32 and `size` its byte length.
     let status = unsafe {
         RegGetValueW(
-            HKEY_LOCAL_MACHINE,
+            hive.key(),
             path.as_ptr(),
             name.as_ptr(),
             RRF_RT_REG_DWORD | view,

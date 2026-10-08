@@ -285,6 +285,7 @@ mod tests {
                 username: "root".into(),
                 exe_sha256: None,
                 process_start_time: None,
+                parent_start_time: None,
                 enrichment: Default::default(),
             }),
         );

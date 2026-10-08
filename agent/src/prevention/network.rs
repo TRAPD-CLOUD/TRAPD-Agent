@@ -1,4 +1,5 @@
-//! Network containment via `nft` (preferred) or `iptables` (fallback).
+//! Network containment via `nft` (preferred) or `iptables` (fallback) on Linux
+//! and Windows Defender Firewall (native COM API) on Windows.
 //!
 //! The agent owns a dedicated table/chain so its rules can be inspected,
 //! audited and torn down without touching operator-managed policy:
@@ -15,6 +16,10 @@
 //!
 //! All shell-outs are quoted via `std::process::Command::arg()` to avoid
 //! injection: input is parsed by `ipnet::IpNet` / `IpAddr` first.
+//!
+//! The Windows backend builds explicit block rules only (see [`super::firewall`]):
+//! it never rewrites the firewall profile defaults, so a GPO-managed policy is
+//! neither overridden nor left in a half-restored state if the agent dies.
 
 use std::net::IpAddr;
 use std::process::Command;
@@ -33,9 +38,21 @@ const IPT_CHAIN: &str = "TRAPD_BLOCK";
 pub enum Backend {
     Nft,
     Iptables,
+    #[cfg(windows)]
+    WindowsFirewall,
     None,
 }
 
+#[cfg(windows)]
+pub fn detect_backend() -> Backend {
+    if super::winfirewall::Firewall::open().is_ok() {
+        Backend::WindowsFirewall
+    } else {
+        Backend::None
+    }
+}
+
+#[cfg(not(windows))]
 pub fn detect_backend() -> Backend {
     if Command::new("nft").arg("--version").output().is_ok() {
         Backend::Nft
@@ -86,7 +103,11 @@ pub fn ensure_chains(backend: Backend) -> Result<()> {
             }
             Ok(())
         }
-        Backend::None => bail!("no firewall backend available (need nft or iptables)"),
+        #[cfg(windows)]
+        Backend::WindowsFirewall => super::winfirewall::ensure_enforcing(),
+        Backend::None => {
+            bail!("no firewall backend available (need nft, iptables or Windows Firewall)")
+        }
     }
 }
 
@@ -121,8 +142,38 @@ pub fn block_ip(backend: Backend, target: &str) -> Result<String> {
             info!(target, tool = opt, "iptables drop rule added");
             Ok(format!("{opt}:{target}"))
         }
+        #[cfg(windows)]
+        Backend::WindowsFirewall => super::winfirewall::block(&parsed.as_net()),
         Backend::None => bail!("no firewall backend"),
     }
+}
+
+/// Windows rules carry their deadline durably; other backends retain the
+/// existing engine timer behavior.
+pub fn block_ip_with_ttl(
+    backend: Backend,
+    target: &str,
+    ttl: Option<u64>,
+    command_id: &str,
+) -> Result<String> {
+    #[cfg(windows)]
+    if matches!(backend, Backend::WindowsFirewall) {
+        return super::winfirewall::block_with_ttl(
+            &parse_ip_or_cidr(target)?.as_net(),
+            ttl,
+            command_id,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (ttl, command_id);
+    block_ip(backend, target)
+}
+
+#[cfg(windows)]
+pub(super) fn canonical_windows_target(target: &str) -> Result<String> {
+    Ok(super::firewall::remote_for(
+        &parse_ip_or_cidr(target)?.as_net().trunc(),
+    ))
 }
 
 pub fn unblock_ip(backend: Backend, target: &str) -> Result<()> {
@@ -179,6 +230,8 @@ pub fn unblock_ip(backend: Backend, target: &str) -> Result<()> {
             info!(target, tool = opt, "iptables drop rule removed");
             Ok(())
         }
+        #[cfg(windows)]
+        Backend::WindowsFirewall => super::winfirewall::unblock(&parsed.as_net()),
         Backend::None => bail!("no firewall backend"),
     }
 }
@@ -254,6 +307,8 @@ pub fn isolate(backend: Backend, allowlist_ips: &[IpAddr]) -> Result<()> {
             info!(allow = allowlist_ips.len(), "host isolated (iptables)");
             Ok(())
         }
+        #[cfg(windows)]
+        Backend::WindowsFirewall => super::winfirewall::isolate(allowlist_ips),
         Backend::None => bail!("no firewall backend"),
     }
 }
@@ -287,6 +342,8 @@ pub fn deisolate(backend: Backend) -> Result<()> {
             info!("host isolation lifted (iptables)");
             Ok(())
         }
+        #[cfg(windows)]
+        Backend::WindowsFirewall => super::winfirewall::deisolate(),
         Backend::None => bail!("no firewall backend"),
     }
 }
@@ -294,6 +351,16 @@ pub fn deisolate(backend: Backend) -> Result<()> {
 enum NetTarget {
     Ip(IpAddr),
     Cidr(IpNet),
+}
+
+#[cfg(windows)]
+impl NetTarget {
+    fn as_net(&self) -> IpNet {
+        match self {
+            Self::Ip(ip) => IpNet::from(*ip),
+            Self::Cidr(net) => *net,
+        }
+    }
 }
 
 fn parse_ip_or_cidr(s: &str) -> Result<NetTarget> {
@@ -374,7 +441,7 @@ fn run_output(bin: &str, args: &[&str]) -> CapturedOutput {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     #[derive(Default)]
@@ -409,7 +476,7 @@ mod tests {
             })
         })
     }
-    fn setup(fail_v6: bool) {
+    pub(crate) fn setup(fail_v6: bool) {
         FIREWALL.with(|f| {
             *f.borrow_mut() = Some(Firewall {
                 fail_v6,
@@ -417,7 +484,7 @@ mod tests {
             })
         });
     }
-    fn called(bin: &str, args: &[&str]) -> bool {
+    pub(crate) fn called(bin: &str, args: &[&str]) -> bool {
         FIREWALL.with(|f| {
             f.borrow()
                 .as_ref()
@@ -426,6 +493,9 @@ mod tests {
                 .iter()
                 .any(|(b, a)| b == bin && a == args)
         })
+    }
+    pub(crate) fn no_calls() -> bool {
+        FIREWALL.with(|f| f.borrow().as_ref().unwrap().calls.is_empty())
     }
     #[test]
     fn iptables_isolates_both_families_and_preserves_allowlists() {

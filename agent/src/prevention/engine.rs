@@ -58,13 +58,15 @@ const AUTO_RESPONSE_COOLDOWN: Duration = Duration::from_secs(30);
 /// ([`Engine::execute_auto`]) and the command handlers, so a target rejected by one
 /// is rejected by the other (issue #59).
 fn is_valid_target_pid(pid: i32, own_pid: i32) -> bool {
-    pid > 1 && pid != own_pid
+    // PID 4 is the Windows `System` process, the analogue of init.
+    let first_valid = if cfg!(windows) { 4 } else { 1 };
+    pid > first_valid && pid != own_pid
 }
 
 #[derive(Clone)]
 pub struct EngineConfig {
     pub net_backend: Backend,
-    pub default_isolation_allowlist: Vec<std::net::IpAddr>,
+    pub management_host: Option<String>,
 }
 
 /// Escalating honeytoken-access response, parsed from `AgentConfig::honeytoken_response`.
@@ -136,7 +138,7 @@ pub struct Engine {
     /// Bounded flight recorder of recent telemetry, pulled into a honeytoken
     /// response as the accessor session's pre-history (issue #32, point 5).
     recorder: Arc<FlightRecorder>,
-    /// Cooldown register for automated detection-response, keyed `rule_id:pid`.
+    /// Cooldown register for automated responses, keyed by rule and process generation.
     auto_cooldown: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
     /// Shared kick to the eBPF reconciler + health checker, pulsed right after a
     /// honeytoken deploy/revoke so arming and the on-disk verification run
@@ -194,6 +196,48 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    /// Resolve the backend and read signed-config allowances at the action
+    /// boundary so DNS rotation and config changes apply without restart.
+    async fn isolation_allowlist(
+        &self,
+        additional: &[std::net::IpAddr],
+    ) -> anyhow::Result<Vec<std::net::IpAddr>> {
+        let mut allow = match &self.cfg.management_host {
+            Some(host) => super::runtime::resolve_management_ips(host).await?,
+            None => Vec::new(),
+        };
+        // Query native DNS before taking the signed-config lock. Reject an
+        // unsafe hostname isolation before any command/automatic path mutates
+        // firewall state; cached backend IPs alone cannot preserve recovery.
+        let dns = match &self.cfg.management_host {
+            Some(host) => {
+                super::runtime::management_dns_servers(host, self.cfg.net_backend).await?
+            }
+            None => None,
+        };
+        let cfg = self
+            .cfg_handle
+            .read()
+            .map_err(|_| anyhow::anyhow!("isolation config lock poisoned"))?;
+        anyhow::ensure!(
+            cfg.prevention_enabled,
+            "prevention was disabled before isolation"
+        );
+        let mut explicit: Vec<std::net::IpAddr> = cfg
+            .isolation_allowlist_ips
+            .iter()
+            .filter_map(|ip| ip.parse().ok())
+            .collect();
+        explicit.extend_from_slice(additional);
+        if let (Some(host), Some(dns)) = (&self.cfg.management_host, dns) {
+            super::firewall::require_management_dns(host, &dns, &explicit)?;
+        }
+        allow.extend(explicit);
+        allow.sort();
+        allow.dedup();
+        Ok(allow)
+    }
+
     async fn sync_kernel_prevention(&self) {
         let enabled = self.prevention_enabled();
         self.kernel_blocker.set_enabled(enabled).await;
@@ -207,10 +251,61 @@ impl Engine {
         }
     }
 
-    /// Spawn the event-enforcement loop.  Consumes the receiver.
-    ///
-    /// Two enforcement paths ride this stream: IoC enforcement on `ProcessExec`,
-    /// and the policy-driven auto-response on a `HoneytokenAccess` detection.
+    /// Recover persistent Windows deadlines before consuming new responses.
+    #[cfg(windows)]
+    pub async fn start_firewall_expiry(self: Arc<Self>) {
+        if !matches!(self.cfg.net_backend, Backend::WindowsFirewall) {
+            return;
+        }
+        // Reconcile before starting command/event consumers, then retry even
+        // when prevention has been disabled since installing rules.
+        self.reconcile_firewall_expiry().await;
+        tokio::spawn(async move {
+            let period = Duration::from_secs(5);
+            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                self.reconcile_firewall_expiry().await;
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    async fn reconcile_firewall_expiry(&self) {
+        let mut blocked = self.blocked.lock().await;
+        let expired = match tokio::task::spawn_blocking(super::winfirewall::expire_due_blocks).await
+        {
+            Ok(Ok(expired)) => expired,
+            Ok(Err(error)) => {
+                warn!(%error, "firewall TTL reconciliation failed; will retry");
+                return;
+            }
+            Err(error) => {
+                warn!(%error, "firewall TTL reconciliation task failed; will retry");
+                return;
+            }
+        };
+        for expiry in expired {
+            blocked.retain(|key| {
+                network::canonical_windows_target(key).ok().as_deref()
+                    != Some(expiry.target.as_str())
+            });
+            self.audit.emit(
+                EventAction::IpUnblocked,
+                Severity::Info,
+                "ip_unblock",
+                expiry.target,
+                true,
+                "TTL expired",
+                None,
+                Some(expiry.command_id),
+                serde_json::Value::Null,
+            );
+        }
+    }
+
+    /// Spawn the event-enforcement loop. Consumes the receiver.
     pub fn spawn_event_loop(self: Arc<Self>, mut rx: Receiver<AgentEvent>) {
         tokio::spawn(async move {
             let mut config_tick = tokio::time::interval(Duration::from_millis(100));
@@ -241,6 +336,15 @@ impl Engine {
                 match &event.data {
                     EventData::ProcessExec(exec) => {
                         let _ = process::enforce_exec(exec, &self.policy, &self.audit);
+                    }
+                    // Windows has no exec-time kernel event; the process sensor
+                    // (ETW, or the poller) reports creation. The Linux poller
+                    // also emits `ProcessCreate`, but there eBPF already
+                    // enforces `ProcessExec`, so only Windows acts on it.
+                    #[cfg(windows)]
+                    EventData::ProcessCreate(create) => {
+                        let exec = process::exec_from_create(create);
+                        let _ = process::enforce_exec(&exec, &self.policy, &self.audit);
                     }
                     // Inline IoC enforcement on the network plane (Phase 0): a
                     // backend-pushed Ip/Cidr/Port/Domain rule now actively drops
@@ -294,7 +398,7 @@ impl Engine {
         // killing it, capture its state while it cannot react, and leave the
         // kill/thaw decision to an operator (issue #32, point 5).
         if matches!(level, ResponseLevel::Freeze) && pid > 0 {
-            frozen = process::freeze_pid(pid).is_ok();
+            frozen = process::freeze_observed(pid, data.accessor.process_start_time).is_ok();
             actions.push(if frozen { "freeze" } else { "freeze_failed" });
             // Snapshot regardless — a process that raced to exit is itself signal.
             snapshot = Some(forensics::capture_snapshot(pid, frozen));
@@ -302,14 +406,15 @@ impl Engine {
 
         // Above `alert` (kill/isolate), terminate the accessing process.
         if matches!(level, ResponseLevel::Kill | ResponseLevel::Isolate) && pid > 0 {
-            killed = process::kill_pid(pid).is_ok();
+            killed = process::kill_observed(pid, data.accessor.process_start_time).is_ok();
             actions.push(if killed { "kill" } else { "kill_failed" });
         }
         if matches!(level, ResponseLevel::Isolate) {
-            let mut allow = self.cfg.default_isolation_allowlist.clone();
-            allow.sort();
-            allow.dedup();
-            isolated = network::isolate(self.cfg.net_backend, &allow).is_ok();
+            isolated = self
+                .isolation_allowlist(&[])
+                .await
+                .and_then(|allow| network::isolate(self.cfg.net_backend, &allow))
+                .is_ok();
             actions.push(if isolated {
                 "isolate"
             } else {
@@ -359,6 +464,7 @@ impl Engine {
                 "path": data.path,
                 "kind": data.kind,
                 "accessor_pid": pid,
+                "process_start_time": data.accessor.process_start_time,
                 "accessor_comm": data.accessor.comm,
                 "accessor_uid": data.accessor.uid,
                 "open_flags": data.open_flags,
@@ -394,7 +500,10 @@ impl Engine {
     /// precisely on the source.
     async fn auto_respond_ransomware(&self, event: &AgentEvent, r: &RansomwareIndicatorData) {
         let targets = Targets {
-            pid: r.pid.filter(|p| *p > 1),
+            pid: r
+                .pid
+                .filter(|p| is_valid_target_pid(*p, std::process::id() as i32)),
+            process_start_time: r.process_start_time,
             file_path: r.path.clone(),
         };
         let subject = r
@@ -456,7 +565,11 @@ impl Engine {
         }
 
         // Cooldown so a repeating detection cannot storm the same action.
-        let key = format!("{rule_id}:{}", targets.pid.unwrap_or(0));
+        let key = format!(
+            "{rule_id}:{}:{:?}",
+            targets.pid.unwrap_or(0),
+            targets.process_start_time
+        );
         {
             let mut cd = self.auto_cooldown.lock().await;
             let now = Instant::now();
@@ -469,12 +582,13 @@ impl Engine {
             cd.retain(|_, t| now.duration_since(*t) < AUTO_RESPONSE_COOLDOWN);
         }
 
-        self.execute_auto(rule_id, category, subject, &targets, &decision);
+        self.execute_auto(rule_id, category, subject, &targets, &decision)
+            .await;
     }
 
     /// Execute a decided auto-response: kill / quarantine / isolate. Never the
     /// agent itself or pid ≤ 1. Best-effort — failures are audited, never fatal.
-    fn execute_auto(
+    async fn execute_auto(
         &self,
         rule_id: &str,
         category: &str,
@@ -498,7 +612,7 @@ impl Engine {
             if let Some(pid) = targets.pid {
                 let own_pid = std::process::id() as i32;
                 if is_valid_target_pid(pid, own_pid) {
-                    killed = process::kill_pid(pid).is_ok();
+                    killed = process::kill_observed(pid, targets.process_start_time).is_ok();
                     actions.push(if killed { "kill" } else { "kill_failed" });
                 } else {
                     actions.push("kill_skipped_self");
@@ -508,7 +622,8 @@ impl Engine {
 
         if matches!(decision.action, AutoAction::Quarantine) {
             if let Some(path) = &targets.file_path {
-                quarantined = quarantine::quarantine(Path::new(path)).is_ok();
+                quarantined = response::validated_quarantine_path(path)
+                    .is_some_and(|path| quarantine::quarantine_automatic(Path::new(&path)).is_ok());
                 actions.push(if quarantined {
                     "quarantine"
                 } else {
@@ -518,10 +633,11 @@ impl Engine {
         }
 
         if matches!(decision.action, AutoAction::Isolate) {
-            let mut allow = self.cfg.default_isolation_allowlist.clone();
-            allow.sort();
-            allow.dedup();
-            isolated = network::isolate(self.cfg.net_backend, &allow).is_ok();
+            isolated = self
+                .isolation_allowlist(&[])
+                .await
+                .and_then(|allow| network::isolate(self.cfg.net_backend, &allow))
+                .is_ok();
             actions.push(if isolated {
                 "isolate"
             } else {
@@ -562,6 +678,7 @@ impl Engine {
                 "action": decision.action.as_str(),
                 "reason": decision.reason,
                 "target_pid": targets.pid,
+                "process_start_time": targets.process_start_time,
                 "target_path": targets.file_path,
                 "actions": actions,
                 "killed": killed,
@@ -598,8 +715,16 @@ impl Engine {
             Some(m) => m,
             None => return,
         };
-        self.enforce_net_match(addr, data.dst_port, data.pid, m, "flow", None)
-            .await;
+        self.enforce_net_match(
+            addr,
+            data.dst_port,
+            data.pid,
+            data.process_start_time,
+            m,
+            "flow",
+            None,
+        )
+        .await;
     }
 
     /// Inline IoC enforcement on a resolved DNS answer. A backend-pushed
@@ -616,7 +741,7 @@ impl Engine {
         };
         for ip in &data.resolved_ips {
             if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
-                self.enforce_net_match(addr, 0, None, m.clone(), "dns", Some(&data.qname))
+                self.enforce_net_match(addr, 0, None, None, m.clone(), "dns", Some(&data.qname))
                     .await;
             }
         }
@@ -626,11 +751,13 @@ impl Engine {
     /// `addr` on `Block`, optionally SIGKILL the connecting `pid`, and audit the
     /// outcome. Best-effort — a missing firewall backend or a vanished process
     /// is recorded, never fatal.
+    #[allow(clippy::too_many_arguments)]
     async fn enforce_net_match(
         &self,
         addr: std::net::IpAddr,
         port: u16,
         pid: Option<i32>,
+        process_start_time: Option<u64>,
         m: Match,
         source: &str,
         qname: Option<&str>,
@@ -666,7 +793,7 @@ impl Engine {
             if let Some(pid) = pid {
                 let own_pid = std::process::id() as i32;
                 if is_valid_target_pid(pid, own_pid) {
-                    killed = process::kill_pid(pid).is_ok();
+                    killed = process::kill_observed(pid, process_start_time).is_ok();
                 }
             }
         }
@@ -704,6 +831,7 @@ impl Engine {
                 "blocked": blocked_now,
                 "killed": killed,
                 "target_pid": pid,
+                "process_start_time": process_start_time,
             }),
         );
     }
@@ -804,11 +932,14 @@ impl Engine {
             return;
         }
         match &env.payload {
-            CommandPayload::KillPid { pid } => {
-                self.cmd_kill_pid(*pid, &cmd_id);
+            CommandPayload::KillPid {
+                pid,
+                process_start_time,
+            } => {
+                self.cmd_kill_pid(*pid, *process_start_time, &cmd_id);
             }
             CommandPayload::IsolateNetwork { allowlist_ips } => {
-                self.cmd_isolate(allowlist_ips.clone(), &cmd_id);
+                self.cmd_isolate(allowlist_ips.clone(), &cmd_id).await;
             }
             CommandPayload::DeisolateNetwork => {
                 self.cmd_deisolate(&cmd_id);
@@ -866,11 +997,17 @@ impl Engine {
             CommandPayload::RevokeHoneytoken { path } => {
                 self.cmd_revoke_honeytoken(path, &cmd_id);
             }
-            CommandPayload::FreezePid { pid } => {
-                self.cmd_freeze_pid(*pid, &cmd_id);
+            CommandPayload::FreezePid {
+                pid,
+                process_start_time,
+            } => {
+                self.cmd_freeze_pid(*pid, *process_start_time, &cmd_id);
             }
-            CommandPayload::ThawPid { pid } => {
-                self.cmd_thaw_pid(*pid, &cmd_id);
+            CommandPayload::ThawPid {
+                pid,
+                process_start_time,
+            } => {
+                self.cmd_thaw_pid(*pid, *process_start_time, &cmd_id);
             }
             CommandPayload::RunScript {
                 interpreter,
@@ -886,8 +1023,12 @@ impl Engine {
             CommandPayload::ListDirectory { path } => {
                 self.cmd_list_directory(path, &cmd_id);
             }
-            CommandPayload::CollectProcessMemory { pid, max_bytes } => {
-                self.cmd_collect_process_memory(*pid, *max_bytes, &cmd_id);
+            CommandPayload::CollectProcessMemory {
+                pid,
+                max_bytes,
+                process_start_time,
+            } => {
+                self.cmd_collect_process_memory(*pid, *max_bytes, *process_start_time, &cmd_id);
             }
         }
     }
@@ -938,13 +1079,17 @@ impl Engine {
             Err(_) => return self.rtr_refuse("rtr_run_script", "script", cmd_id),
         };
 
-        let (prog, flag) = response_rtr::shell_invocation(interpreter);
+        let prog = response_rtr::interpreter(interpreter);
+        let script_args = response_rtr::script_args(&prog, &script);
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 300));
 
+        // `kill_on_drop`: the timeout below drops this future, and the script
+        // must stop with it rather than keep running unobserved after the
+        // result was reported as timed out.
         let run = tokio::process::Command::new(&prog)
-            .arg(flag)
-            .arg(&script)
+            .args(&script_args)
             .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
             .output();
 
         let (success, code, stdout, stderr, note) = match tokio::time::timeout(timeout, run).await {
@@ -1100,7 +1245,13 @@ impl Engine {
     /// `CommandRejected` audit event and returns `false` so the caller bails
     /// out **before** any signal is sent. Rejects broadcast selectors
     /// (`pid <= 0`), init (`pid == 1`) and the agent's own PID (issue #59).
-    fn accept_target_pid(&self, pid: i32, kind: &str, cmd_id: &str) -> bool {
+    fn accept_target_pid(
+        &self,
+        pid: i32,
+        process_start_time: Option<u64>,
+        kind: &str,
+        cmd_id: &str,
+    ) -> bool {
         let own_pid = std::process::id() as i32;
         if is_valid_target_pid(pid, own_pid) {
             return true;
@@ -1117,32 +1268,67 @@ impl Engine {
             ),
             None,
             Some(cmd_id.into()),
-            json!({ "pid": pid, "rejected": "invalid_target_pid" }),
+            json!({ "pid": pid, "process_start_time": process_start_time, "rejected": "invalid_target_pid" }),
         );
         false
     }
 
-    /// Dump a process's readable memory (anonymous-executable regions first) as
-    /// a capped base64 artifact. Requires CAP_SYS_PTRACE / root to read
-    /// `/proc/<pid>/mem`; partial reads are returned best-effort.
-    fn cmd_collect_process_memory(&self, pid: i32, max_bytes: Option<u64>, cmd_id: &str) {
+    fn process_action_succeeded(
+        &self,
+        result: anyhow::Result<()>,
+        pid: i32,
+        process_start_time: Option<u64>,
+        kind: &str,
+        cmd_id: &str,
+    ) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.audit.emit(
+                    EventAction::CommandRejected, Severity::Medium, kind,
+                    pid.to_string(), false, format!("process action refused or failed: {error}"),
+                    None, Some(cmd_id.into()),
+                    json!({ "pid": pid, "process_start_time": process_start_time, "source": "command" }),
+                );
+                false
+            }
+        }
+    }
+
+    /// Read up to `cap` bytes of `pid`'s memory, anonymous-executable regions
+    /// first. Returns the bytes, the number of regions read and a note for the
+    /// audit trail when the process memory could not be opened.
+    #[cfg(not(windows))]
+    fn read_process_memory(
+        pid: i32,
+        cap: u64,
+        expected_start: Option<u64>,
+    ) -> anyhow::Result<(Vec<u8>, usize, &'static str)> {
         use std::io::{Read, Seek, SeekFrom};
 
-        if !self.accept_target_pid(pid, "rtr_collect_memory", cmd_id) {
-            return;
-        }
-
-        let (enabled, default_max) = self.rtr_settings();
-        if !enabled {
-            return self.rtr_refuse("rtr_collect_memory", format!("pid {pid}"), cmd_id);
-        }
-        let cap = max_bytes.unwrap_or(default_max).min(default_max);
+        let verify_generation = || -> anyhow::Result<()> {
+            if let Some(expected) = expected_start {
+                anyhow::ensure!(
+                    expected > 0,
+                    "unknown observed identity for pid {pid}; refusing"
+                );
+                anyhow::ensure!(
+                    crate::telemetry::identity::process_start_time(pid) == Some(expected),
+                    "pid {pid} belongs to a different or unknown process; refusing"
+                );
+            }
+            Ok(())
+        };
+        verify_generation()?;
 
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
         let regions = response_rtr::dumpable_regions(&maps, cap);
 
         let mut buf = Vec::new();
         let mut mem = std::fs::File::open(format!("/proc/{pid}/mem"));
+        // Check again after opening: subsequent reads use the retained memory
+        // fd, which cannot switch to a recycled PID's address space.
+        verify_generation()?;
         if let Ok(f) = mem.as_mut() {
             for (start, end) in &regions {
                 if f.seek(SeekFrom::Start(*start)).is_err() {
@@ -1156,38 +1342,90 @@ impl Engine {
                 }
             }
         }
+        let note = if mem.is_err() {
+            " (/proc/<pid>/mem unreadable — need CAP_SYS_PTRACE)"
+        } else {
+            ""
+        };
+        Ok((buf, regions.len(), note))
+    }
+
+    #[cfg(windows)]
+    fn read_process_memory(
+        pid: i32,
+        cap: u64,
+        expected_start: Option<u64>,
+    ) -> anyhow::Result<(Vec<u8>, usize, &'static str)> {
+        let dump = super::winproc::dump_memory(pid, cap, expected_start)?;
+        Ok((dump.bytes, dump.regions, ""))
+    }
+
+    /// Dump a process's readable memory (anonymous-executable regions first) as
+    /// a capped base64 artifact. Requires CAP_SYS_PTRACE / root to read
+    /// `/proc/<pid>/mem`; partial reads are returned best-effort.
+    fn cmd_collect_process_memory(
+        &self,
+        pid: i32,
+        max_bytes: Option<u64>,
+        process_start_time: Option<u64>,
+        cmd_id: &str,
+    ) {
+        let refuse = |reason: String| {
+            self.audit.emit(
+                EventAction::CommandRejected,
+                Severity::Medium,
+                "rtr_collect_memory",
+                format!("pid {pid}"),
+                false,
+                reason,
+                None,
+                Some(cmd_id.into()),
+                json!({ "pid": pid, "process_start_time": process_start_time }),
+            );
+        };
+        if !is_valid_target_pid(pid, std::process::id() as i32) {
+            refuse(format!(
+                "refusing PID-targeted command: invalid target pid {pid}"
+            ));
+            return;
+        }
+
+        let (enabled, default_max) = self.rtr_settings();
+        if !enabled {
+            return refuse("RTR is disabled (set rtr_enabled=true to allow)".into());
+        }
+        let cap = max_bytes.unwrap_or(default_max).min(default_max);
+
+        let (buf, region_count, unreadable_note) =
+            match Self::read_process_memory(pid, cap, process_start_time) {
+                Ok(dump) => dump,
+                Err(e) => {
+                    return refuse(format!("process memory collection refused or failed: {e}"))
+                }
+            };
+        if buf.is_empty() {
+            return refuse(format!(
+                "no readable memory returned for pid {pid}{unreadable_note}"
+            ));
+        }
 
         let art = response_rtr::cap_and_encode(&buf, cap as usize);
-        let success = !buf.is_empty();
         self.audit.emit(
-            if success {
-                EventAction::CommandAccepted
-            } else {
-                EventAction::CommandRejected
-            },
-            if success {
-                Severity::Info
-            } else {
-                Severity::Medium
-            },
+            EventAction::CommandAccepted,
+            Severity::Info,
             "rtr_collect_memory",
             format!("pid {pid}"),
-            success,
+            true,
             format!(
                 "dumped {} bytes from {} region(s) of pid {pid}{}",
-                art.returned_len,
-                regions.len(),
-                if mem.is_err() {
-                    " (/proc/<pid>/mem unreadable — need CAP_SYS_PTRACE)"
-                } else {
-                    ""
-                }
+                art.returned_len, region_count, unreadable_note
             ),
             None,
             Some(cmd_id.into()),
             json!({
                 "pid": pid,
-                "regions": regions.len(),
+                "process_start_time": process_start_time,
+                "regions": region_count,
                 "memory_b64": art.b64,
                 "total_len": art.total_len,
                 "truncated": art.truncated,
@@ -1197,59 +1435,59 @@ impl Engine {
 
     /// Freeze a process (SIGSTOP) on operator command and audit a forensic
     /// snapshot of it while it is suspended (issue #32, point 5).
-    fn cmd_freeze_pid(&self, pid: i32, cmd_id: &str) {
+    fn cmd_freeze_pid(&self, pid: i32, process_start_time: Option<u64>, cmd_id: &str) {
         use crate::schema::{EventAction, Severity};
-        if !self.accept_target_pid(pid, "process_freeze", cmd_id) {
+        if !self.accept_target_pid(pid, process_start_time, "process_freeze", cmd_id) {
             return;
         }
-        let frozen = process::freeze_pid(pid).is_ok();
-        let snapshot = forensics::capture_snapshot(pid, frozen);
+        if !self.process_action_succeeded(
+            process::freeze_pid(pid, process_start_time),
+            pid,
+            process_start_time,
+            "process_freeze",
+            cmd_id,
+        ) {
+            return;
+        }
+        let snapshot = forensics::capture_snapshot(pid, true);
         self.audit.emit(
             EventAction::ProcessFrozen,
-            if frozen {
-                Severity::High
-            } else {
-                Severity::Medium
-            },
+            Severity::High,
             "process_freeze",
             pid.to_string(),
-            frozen,
-            if frozen {
-                format!("pid {pid} frozen (SIGSTOP) for forensic capture")
-            } else {
-                format!("freeze of pid {pid} failed (process may have exited)")
-            },
+            true,
+            format!("pid {pid} frozen (SIGSTOP) for forensic capture"),
             None,
             Some(cmd_id.into()),
-            json!({ "pid": pid, "frozen": frozen, "snapshot": snapshot }),
+            json!({ "pid": pid, "process_start_time": process_start_time, "frozen": true, "snapshot": snapshot }),
         );
     }
 
     /// Resume a previously-frozen process (SIGCONT) on operator command.
-    fn cmd_thaw_pid(&self, pid: i32, cmd_id: &str) {
+    fn cmd_thaw_pid(&self, pid: i32, process_start_time: Option<u64>, cmd_id: &str) {
         use crate::schema::{EventAction, Severity};
-        if !self.accept_target_pid(pid, "process_thaw", cmd_id) {
+        if !self.accept_target_pid(pid, process_start_time, "process_thaw", cmd_id) {
             return;
         }
-        let thawed = process::thaw_pid(pid).is_ok();
+        if !self.process_action_succeeded(
+            process::thaw_pid(pid, process_start_time),
+            pid,
+            process_start_time,
+            "process_thaw",
+            cmd_id,
+        ) {
+            return;
+        }
         self.audit.emit(
             EventAction::ProcessThawed,
-            if thawed {
-                Severity::Info
-            } else {
-                Severity::Medium
-            },
+            Severity::Info,
             "process_thaw",
             pid.to_string(),
-            thawed,
-            if thawed {
-                format!("pid {pid} resumed (SIGCONT)")
-            } else {
-                format!("thaw of pid {pid} failed (process may have exited)")
-            },
+            true,
+            format!("pid {pid} resumed (SIGCONT)"),
             None,
             Some(cmd_id.into()),
-            json!({ "pid": pid, "thawed": thawed }),
+            json!({ "pid": pid, "process_start_time": process_start_time, "thawed": true }),
         );
     }
 
@@ -1474,40 +1712,37 @@ impl Engine {
         );
     }
 
-    fn cmd_kill_pid(&self, pid: i32, cmd_id: &str) {
-        if !self.accept_target_pid(pid, "process_block", cmd_id) {
+    fn cmd_kill_pid(&self, pid: i32, process_start_time: Option<u64>, cmd_id: &str) {
+        if !self.accept_target_pid(pid, process_start_time, "process_block", cmd_id) {
             return;
         }
-        let res = process::kill_pid(pid);
-        let success = res.is_ok();
-        let reason = match res {
-            Ok(_) => format!("SIGKILL delivered to pid {pid}"),
-            Err(e) => format!("kill failed: {e:#}"),
-        };
+        if !self.process_action_succeeded(
+            process::kill_pid(pid, process_start_time),
+            pid,
+            process_start_time,
+            "process_block",
+            cmd_id,
+        ) {
+            return;
+        }
         self.audit.emit(
             crate::schema::EventAction::ProcessBlocked,
-            if success {
-                crate::schema::Severity::High
-            } else {
-                crate::schema::Severity::Medium
-            },
+            crate::schema::Severity::High,
             "process_block",
             pid.to_string(),
-            success,
-            reason,
+            true,
+            format!("SIGKILL delivered to pid {pid}"),
             None,
             Some(cmd_id.into()),
-            json!({ "pid": pid, "source": "command" }),
+            json!({ "pid": pid, "process_start_time": process_start_time, "source": "command" }),
         );
     }
 
-    fn cmd_isolate(&self, mut allow: Vec<std::net::IpAddr>, cmd_id: &str) {
-        for ip in &self.cfg.default_isolation_allowlist {
-            if !allow.contains(ip) {
-                allow.push(*ip);
-            }
-        }
-        let res = network::isolate(self.cfg.net_backend, &allow);
+    async fn cmd_isolate(&self, mut allow: Vec<std::net::IpAddr>, cmd_id: &str) {
+        let res = self.isolation_allowlist(&allow).await.and_then(|current| {
+            allow = current;
+            network::isolate(self.cfg.net_backend, &allow)
+        });
         let (success, reason) = match res {
             Ok(_) => (
                 true,
@@ -1629,14 +1864,16 @@ impl Engine {
     }
 
     async fn cmd_block_ip(&self, ip: &str, ttl_secs: Option<u64>, cmd_id: &str) {
-        let res = network::block_ip(self.cfg.net_backend, ip);
+        let mut blocked = self.blocked.lock().await;
+        let res = network::block_ip_with_ttl(self.cfg.net_backend, ip, ttl_secs, cmd_id);
         let (success, reason) = match &res {
             Ok(handle) => (true, format!("block rule installed ({handle})")),
             Err(e) => (false, format!("block_ip failed: {e:#}")),
         };
         if success {
-            self.blocked.lock().await.insert(ip.to_string());
+            blocked.insert(ip.to_string());
         }
+        drop(blocked);
         self.audit.emit(
             crate::schema::EventAction::IpBlocked,
             crate::schema::Severity::High,
@@ -1648,6 +1885,13 @@ impl Engine {
             Some(cmd_id.into()),
             json!({ "ttl_secs": ttl_secs }),
         );
+
+        // Windows expiry is driven by persistent rule metadata, including
+        // replacement commands, rather than a stale per-command sleep.
+        #[cfg(windows)]
+        if matches!(self.cfg.net_backend, Backend::WindowsFirewall) {
+            return;
+        }
 
         if let (true, Some(ttl)) = (success, ttl_secs) {
             let backend = self.cfg.net_backend;
@@ -1678,14 +1922,22 @@ impl Engine {
     }
 
     async fn cmd_unblock_ip(&self, ip: &str, cmd_id: &str) {
+        let mut blocked = self.blocked.lock().await;
         let res = network::unblock_ip(self.cfg.net_backend, ip);
         let (success, reason) = match res {
             Ok(_) => (true, format!("unblocked {ip}")),
             Err(e) => (false, format!("unblock failed: {e:#}")),
         };
         if success {
-            self.blocked.lock().await.remove(ip);
+            blocked.remove(ip);
+            #[cfg(windows)]
+            if let Ok(target) = network::canonical_windows_target(ip) {
+                blocked.retain(|key| {
+                    network::canonical_windows_target(key).ok().as_deref() != Some(target.as_str())
+                });
+            }
         }
+        drop(blocked);
         self.audit.emit(
             crate::schema::EventAction::IpUnblocked,
             crate::schema::Severity::Info,
@@ -1742,7 +1994,8 @@ mod tests {
     use crate::deception::HoneytokenStore;
     use crate::prevention::audit::AuditEmitter;
     use crate::prevention::network::Backend;
-    use crate::prevention::policy::{PolicyHandle, PolicyStore};
+    use crate::prevention::policy::{Match, PolicyHandle, PolicyStore, RuleAction};
+    use crate::prevention::response::{self, AutoAction, Targets};
     use crate::schema::{AgentEvent, EventAction, EventData};
     use std::sync::{Arc, RwLock};
     use tokio::sync::mpsc;
@@ -1764,12 +2017,728 @@ mod tests {
             audit,
             EngineConfig {
                 net_backend: Backend::None,
-                default_isolation_allowlist: vec![],
+                management_host: None,
             },
             Arc::new(HoneytokenStore::load_from(ht_path)),
             Arc::new(RwLock::new(AgentConfig::default())),
         );
         (engine, rx)
+    }
+
+    #[tokio::test]
+    async fn isolation_dns_preflight_rejects_before_any_firewall_mutation() {
+        use crate::prevention::network::tests::{no_calls, setup};
+        use crate::prevention::runtime::tests::fake_management_dns;
+        let (mut engine, mut audit_rx) = test_engine();
+        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.management_host = Some("control.example.test".into());
+        engine.cfg_handle.write().unwrap().prevention_enabled = true;
+        let backend = "192.0.2.1".parse().unwrap();
+        let dns = "192.0.2.53".parse().unwrap();
+        let dns_v6 = "2001:db8::53".parse().unwrap();
+        for servers in [Ok(vec![dns, dns_v6]), Ok(vec![]), Err("OS DNS unavailable")] {
+            let _fixture = fake_management_dns([Ok(vec![backend])].into(), servers);
+            setup(false);
+            engine.cmd_isolate(vec![dns], "dns-preflight").await;
+            assert!(no_calls(), "DNS preflight failure must preserve rules");
+            let EventData::Prevention(audit) = audit_rx.try_recv().unwrap().data else {
+                panic!("audit");
+            };
+            assert!(!audit.success);
+            assert!(audit.reason.contains("DNS"), "{}", audit.reason);
+        }
+        // A backend address must not implicitly authorize a DNS-server exception.
+        let _fixture = fake_management_dns([Ok(vec![backend])].into(), Ok(vec![backend]));
+        setup(false);
+        engine.cmd_isolate(vec![], "dns-preflight").await;
+        assert!(no_calls());
+    }
+
+    #[tokio::test]
+    async fn isolation_dns_preflight_accepts_explicit_resolvers_and_literal_backends() {
+        use crate::prevention::network::tests::{called, setup};
+        use crate::prevention::runtime::tests::fake_management_dns;
+        let (mut engine, _) = test_engine();
+        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.management_host = Some("control.example.test".into());
+        engine.cfg_handle.write().unwrap().prevention_enabled = true;
+        let backend = "192.0.2.1".parse().unwrap();
+        let dns = "192.0.2.53".parse().unwrap();
+        let dns_v6 = "2001:db8::53".parse().unwrap();
+        let _fixture = fake_management_dns(
+            [Ok(vec![backend]), Ok(vec![backend])].into(),
+            Ok(vec![dns, dns_v6]),
+        );
+        engine.cfg_handle.write().unwrap().isolation_allowlist_ips = vec![dns.to_string()];
+        let allow = engine.isolation_allowlist(&[dns_v6]).await.unwrap();
+        assert_eq!(allow.len(), 3);
+        assert!(allow.contains(&backend) && allow.contains(&dns) && allow.contains(&dns_v6));
+        setup(false);
+        engine
+            .cmd_isolate(vec![dns_v6], "dns-preflight-allowed")
+            .await;
+        assert!(called(
+            "iptables",
+            &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.53", "-j", "ACCEPT"]
+        ));
+        assert!(called(
+            "ip6tables",
+            &["-A", "TRAPD_ISOLATE", "-d", "2001:db8::53", "-j", "ACCEPT"]
+        ));
+        engine.cfg.management_host = Some("2001:db8::1".into());
+        let allow = engine.isolation_allowlist(&[]).await.unwrap();
+        assert!(allow.contains(&"2001:db8::1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn isolation_resolves_the_backend_hostname_at_action_time() {
+        let (mut engine, _) = test_engine();
+        engine.cfg.management_host = Some("localhost".into());
+        let allow = engine.isolation_allowlist(&[]).await.unwrap();
+        assert!(
+            allow.iter().any(std::net::IpAddr::is_loopback),
+            "backend DNS was not refreshed: {allow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolation_refreshes_rotated_dns_for_all_paths_and_fails_before_mutation() {
+        use crate::prevention::network::tests::{called, no_calls, setup};
+        use crate::prevention::runtime::tests::fake_management_answers;
+        let (mut engine, mut audit_rx) = test_engine();
+        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.management_host = Some("control.example.test".into());
+        {
+            let mut cfg = engine.cfg_handle.write().unwrap();
+            cfg.prevention_enabled = true;
+            cfg.honeytoken_response = "isolate".into();
+        }
+        let old = "192.0.2.1".parse().unwrap();
+        let new = "192.0.2.2".parse().unwrap();
+        let ipv6 = "2001:db8::2".parse().unwrap();
+        let _answers = fake_management_answers(
+            [
+                Ok(vec![old]),
+                Ok(vec![new, ipv6, new]),
+                Ok(vec![new, ipv6]),
+                Ok(vec![new, ipv6]),
+                Err("DNS unavailable"),
+                Ok(vec![]),
+            ]
+            .into(),
+        );
+        setup(false);
+        engine.cmd_isolate(vec![], "initial-dns").await;
+        assert!(called(
+            "iptables",
+            &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.1", "-j", "ACCEPT"]
+        ));
+        for path in ["command", "automatic", "honeytoken"] {
+            setup(false);
+            match path {
+                "command" => engine.cmd_isolate(vec![], "rotated-dns").await,
+                "automatic" => {
+                    engine
+                        .execute_auto(
+                            "dns-fixture",
+                            "test",
+                            "host",
+                            &Targets {
+                                pid: None,
+                                process_start_time: None,
+                                file_path: None,
+                            },
+                            &response::Decision {
+                                action: AutoAction::Isolate,
+                                reason: "fixture".into(),
+                            },
+                        )
+                        .await
+                }
+                _ => {
+                    let mut data = access(false, None);
+                    data.accessor.pid = 0;
+                    engine.respond_honeytoken(&data).await;
+                }
+            }
+            assert!(
+                called(
+                    "iptables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.2", "-j", "ACCEPT"]
+                ),
+                "{path}"
+            );
+            assert!(
+                called(
+                    "ip6tables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "2001:db8::2", "-j", "ACCEPT"]
+                ),
+                "{path}"
+            );
+            assert!(
+                !called(
+                    "iptables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.1", "-j", "ACCEPT"]
+                ),
+                "stale DNS allowance on {path}"
+            );
+        }
+        while audit_rx.try_recv().is_ok() {}
+        for cmd in ["failed-dns", "empty-dns"] {
+            setup(false);
+            engine
+                .cmd_isolate(vec!["198.51.100.1".parse().unwrap()], cmd)
+                .await;
+            assert!(no_calls(), "failed resolution must not alter rules");
+            let EventData::Prevention(audit) = audit_rx.try_recv().unwrap().data else {
+                panic!("audit");
+            };
+            assert!(!audit.success);
+        }
+    }
+
+    #[tokio::test]
+    async fn isolation_rechecks_live_prevention_setting_before_firewall_mutation() {
+        use crate::prevention::network::tests::{no_calls, setup};
+        let (mut engine, mut audit_rx) = test_engine();
+        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.management_host = Some("::1".into());
+        engine.cfg_handle.write().unwrap().prevention_enabled = false;
+        setup(false);
+        engine.cmd_isolate(vec![], "disabled-prevention").await;
+        assert!(no_calls());
+        let EventData::Prevention(audit) = audit_rx.try_recv().unwrap().data else {
+            panic!("audit");
+        };
+        assert!(!audit.success);
+    }
+
+    #[tokio::test]
+    async fn isolation_uses_live_allowlist_for_commands_and_automatic_responses() {
+        use crate::prevention::network::tests::{called, setup};
+        let (mut engine, _audit_rx) = test_engine();
+        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.management_host = Some("2001:db8::1".into());
+        {
+            let mut cfg = engine.cfg_handle.write().unwrap();
+            cfg.prevention_enabled = true;
+            cfg.honeytoken_response = "isolate".into();
+            cfg.isolation_allowlist_ips = vec!["192.0.2.10".into()];
+        }
+        setup(false);
+        engine.cmd_isolate(vec![], "initial").await;
+        assert!(called(
+            "iptables",
+            &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.10", "-j", "ACCEPT"]
+        ));
+        engine.cfg_handle.write().unwrap().isolation_allowlist_ips =
+            vec!["192.0.2.20".into(), "invalid".into()];
+        for response_path in ["command", "automatic", "honeytoken"] {
+            setup(false);
+            match response_path {
+                "command" => {
+                    engine
+                        .cmd_isolate(vec!["192.0.2.30".parse().unwrap()], "updated")
+                        .await
+                }
+                "automatic" => {
+                    engine
+                        .execute_auto(
+                            "test-rule",
+                            "test",
+                            "test",
+                            &Targets {
+                                pid: None,
+                                process_start_time: None,
+                                file_path: None,
+                            },
+                            &response::Decision {
+                                action: AutoAction::Isolate,
+                                reason: "test".into(),
+                            },
+                        )
+                        .await
+                }
+                _ => {
+                    let mut data = access(false, None);
+                    data.accessor.pid = 0;
+                    engine.respond_honeytoken(&data).await;
+                }
+            }
+            assert!(
+                called(
+                    "ip6tables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "2001:db8::1", "-j", "ACCEPT"]
+                ),
+                "{response_path}"
+            );
+            assert!(
+                called(
+                    "iptables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.20", "-j", "ACCEPT"]
+                ),
+                "{response_path}"
+            );
+            assert!(
+                !called(
+                    "iptables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.10", "-j", "ACCEPT"]
+                ),
+                "removed allowance on {response_path}"
+            );
+            if response_path == "command" {
+                assert!(called(
+                    "iptables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.30", "-j", "ACCEPT"]
+                ));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "blocks TEST-NET; requires elevated enforcing Windows host"]
+    async fn native_windows_firewall_engine_expiry_updates_dedup_and_audit() {
+        let (mut engine, mut audit_rx) = test_engine();
+        engine.cfg.net_backend = Backend::WindowsFirewall;
+        engine
+            .cmd_block_ip("203.0.113.81/32", Some(0), "command-expiry")
+            .await;
+        assert!(engine.blocked.lock().await.contains("203.0.113.81/32"));
+        let blocked_event = audit_rx.recv().await.unwrap();
+        assert!(matches!(blocked_event.action, EventAction::IpBlocked));
+        match blocked_event.data {
+            EventData::Prevention(data) => assert!(data.success),
+            _ => panic!("expected prevention audit"),
+        }
+        engine.reconcile_firewall_expiry().await;
+        assert!(engine.blocked.lock().await.is_empty());
+        let expired_event = audit_rx.recv().await.unwrap();
+        assert!(matches!(expired_event.action, EventAction::IpUnblocked));
+        match expired_event.data {
+            EventData::Prevention(data) => {
+                assert!(data.success);
+                assert_eq!(data.target, "203.0.113.81");
+                assert_eq!(data.command_id.as_deref(), Some("command-expiry"));
+            }
+            _ => panic!("expected prevention audit"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    struct ChildFixture(std::process::Child);
+
+    #[cfg(any(target_os = "linux", windows))]
+    impl ChildFixture {
+        fn new() -> Self {
+            #[cfg(windows)]
+            let mut command = {
+                let mut c = std::process::Command::new("ping");
+                c.args(["-n", "60", "127.0.0.1"]);
+                c
+            };
+            #[cfg(target_os = "linux")]
+            let mut command = {
+                let mut c = std::process::Command::new("sleep");
+                c.arg("60");
+                c
+            };
+            Self(
+                command
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+        fn pid(&self) -> i32 {
+            self.0.id() as i32
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    impl Drop for ChildFixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn memory_command(
+        pid: i32,
+        generation: Option<u64>,
+    ) -> crate::prevention::commands::CommandEnvelope {
+        let mut payload =
+            serde_json::json!({ "kind": "collect_process_memory", "pid": pid, "max_bytes": 4096 });
+        if let Some(start) = generation {
+            payload["process_start_time"] = serde_json::json!(start);
+        }
+        serde_json::from_value(serde_json::json!({
+            "command_id": uuid::Uuid::new_v4(),
+            "issued_at": chrono::Utc::now(),
+            "expires_at": chrono::Utc::now() + chrono::Duration::minutes(1),
+            "agent_id": "test-agent",
+            "nonce": uuid::Uuid::new_v4(),
+            "payload": payload,
+        }))
+        .unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn memory_commands_reject_zero_and_stale_generations_without_artifacts() {
+        let child = ChildFixture::new();
+        let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+        for generation in [0, start + 1] {
+            let (engine, mut rx) = test_engine();
+            engine.cfg_handle.write().unwrap().rtr_enabled = true;
+            let env = memory_command(child.pid(), Some(generation));
+            let command_id = env.command_id.to_string();
+            engine.handle(env).await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::CommandRejected));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(!audit.success);
+            assert_eq!(audit.command_id.as_deref(), Some(command_id.as_str()));
+            assert_eq!(audit.details["process_start_time"], generation);
+            assert!(
+                audit.details.get("memory_b64").is_none(),
+                "refusals must not include a memory artifact"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn memory_command_early_refusals_preserve_the_requested_generation() {
+        for (pid, enabled, reason) in [
+            (1, true, "invalid target"),
+            (54321, false, "RTR is disabled"),
+        ] {
+            let (engine, mut rx) = test_engine();
+            engine.cfg_handle.write().unwrap().rtr_enabled = enabled;
+            engine.handle(memory_command(pid, Some(7))).await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::CommandRejected));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(!audit.success);
+            assert!(audit.reason.contains(reason));
+            assert_eq!(audit.details["process_start_time"], 7);
+            assert!(audit.details.get("memory_b64").is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn memory_commands_reject_missing_generation_on_windows_without_an_artifact() {
+        let child = ChildFixture::new();
+        let (engine, mut rx) = test_engine();
+        engine.cfg_handle.write().unwrap().rtr_enabled = true;
+        engine.handle(memory_command(child.pid(), None)).await;
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(event.action, EventAction::CommandRejected));
+        let EventData::Prevention(audit) = event.data else {
+            panic!("audit")
+        };
+        assert!(!audit.success);
+        assert_eq!(
+            audit.details.get("process_start_time"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(audit.details.get("memory_b64").is_none());
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn memory_commands_read_the_observed_child_and_audit_the_generation() {
+        let child = ChildFixture::new();
+        let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+        let generations = if cfg!(windows) {
+            vec![Some(start)]
+        } else {
+            vec![Some(start), None]
+        };
+        for generation in generations {
+            let (engine, mut rx) = test_engine();
+            engine.cfg_handle.write().unwrap().rtr_enabled = true;
+            engine.handle(memory_command(child.pid(), generation)).await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::CommandAccepted));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(audit.success);
+            assert_eq!(
+                audit.details["process_start_time"],
+                serde_json::json!(generation)
+            );
+            let memory = audit.details["memory_b64"].as_str().unwrap();
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(memory)
+                .unwrap();
+            assert!(!bytes.is_empty());
+            assert!(bytes.len() <= 4096);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn process_command(
+        kind: &str,
+        pid: i32,
+        generation: Option<u64>,
+    ) -> crate::prevention::commands::CommandEnvelope {
+        let mut payload = serde_json::json!({ "kind": kind, "pid": pid });
+        if let Some(start) = generation {
+            payload["process_start_time"] = serde_json::json!(start);
+        }
+        serde_json::from_value(serde_json::json!({
+            "command_id": uuid::Uuid::new_v4(), "issued_at": chrono::Utc::now(),
+            "expires_at": chrono::Utc::now() + chrono::Duration::minutes(1),
+            "agent_id": "test-agent", "nonce": uuid::Uuid::new_v4(), "payload": payload,
+        }))
+        .unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn manual_process_commands_reject_wrong_generations_without_collecting_snapshots() {
+        for kind in ["kill_pid", "freeze_pid", "thaw_pid"] {
+            for stale in [false, true] {
+                let mut child = ChildFixture::new();
+                let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+                let generation = if stale { start + 1 } else { 0 };
+                let (engine, mut rx) = test_engine();
+                engine
+                    .handle(process_command(kind, child.pid(), Some(generation)))
+                    .await;
+                let event = rx.try_recv().unwrap();
+                assert!(matches!(event.action, EventAction::CommandRejected));
+                let EventData::Prevention(audit) = event.data else {
+                    panic!("audit")
+                };
+                assert!(!audit.success);
+                assert_eq!(audit.details["process_start_time"], generation);
+                assert!(
+                    audit.details.get("snapshot").is_none(),
+                    "refusal must not inspect a different generation"
+                );
+                assert!(child.0.try_wait().unwrap().is_none());
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn manual_process_commands_reject_missing_windows_generations() {
+        for kind in ["kill_pid", "freeze_pid", "thaw_pid"] {
+            let mut child = ChildFixture::new();
+            let (engine, mut rx) = test_engine();
+            engine
+                .handle(process_command(kind, child.pid(), None))
+                .await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::CommandRejected));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(!audit.success);
+            assert_eq!(
+                audit.details.get("process_start_time"),
+                Some(&serde_json::Value::Null)
+            );
+            assert!(audit.details.get("snapshot").is_none());
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn manual_process_commands_control_the_observed_child_and_preserve_linux_legacy() {
+        let legacy_modes = if cfg!(windows) {
+            vec![false]
+        } else {
+            vec![false, true]
+        };
+        for legacy in legacy_modes {
+            // This child would exit in one second unless freeze actually stops it.
+            #[cfg(windows)]
+            let mut command = {
+                let mut c = std::process::Command::new("ping");
+                c.args(["-n", "2", "127.0.0.1"]);
+                c
+            };
+            #[cfg(target_os = "linux")]
+            let mut command = {
+                let mut c = std::process::Command::new("sleep");
+                c.arg("1");
+                c
+            };
+            let mut child = ChildFixture(
+                command
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+            let generation = (!legacy).then_some(start);
+            let (engine, mut rx) = test_engine();
+            engine
+                .handle(process_command("freeze_pid", child.pid(), generation))
+                .await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::ProcessFrozen));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(audit.success);
+            assert_eq!(
+                audit.details["process_start_time"],
+                serde_json::json!(generation)
+            );
+            assert_eq!(audit.details["snapshot"]["frozen"], true);
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "freeze must stop the short-lived child"
+            );
+
+            engine
+                .handle(process_command("thaw_pid", child.pid(), generation))
+                .await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::ProcessThawed));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(audit.success);
+            assert_eq!(
+                audit.details["process_start_time"],
+                serde_json::json!(generation)
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while child.0.try_wait().unwrap().is_none() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("thaw must allow the child to exit");
+
+            let mut target = ChildFixture::new();
+            let start = crate::telemetry::identity::process_start_time(target.pid()).unwrap();
+            let generation = (!legacy).then_some(start);
+            engine
+                .handle(process_command("kill_pid", target.pid(), generation))
+                .await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::ProcessBlocked));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(audit.success);
+            assert_eq!(
+                audit.details["process_start_time"],
+                serde_json::json!(generation)
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while target.0.try_wait().unwrap().is_none() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("kill must terminate the observed child");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn automatic_execution_never_kills_an_unknown_or_reused_generation() {
+        for stale in [false, true] {
+            let mut child = ChildFixture::new();
+            let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+            let (engine, mut rx) = test_engine();
+            engine
+                .execute_auto(
+                    "memory.inject",
+                    "memory",
+                    "fixture",
+                    &Targets {
+                        pid: Some(child.pid()),
+                        process_start_time: stale.then_some(start + 1),
+                        file_path: None,
+                    },
+                    &response::Decision {
+                        action: AutoAction::Kill,
+                        reason: "test fixture".into(),
+                    },
+                )
+                .await;
+            let EventData::Prevention(audit) = rx.try_recv().unwrap().data else {
+                panic!("audit");
+            };
+            assert!(!audit.success);
+            assert_eq!(audit.details["killed"], false);
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn honeytoken_actions_never_control_an_unknown_or_reused_generation() {
+        for level in ["kill", "freeze"] {
+            for stale in [false, true] {
+                let mut child = ChildFixture::new();
+                let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+                let (engine, mut rx) = test_engine();
+                engine.cfg_handle.write().unwrap().honeytoken_response = level.into();
+                let mut data = access(false, None);
+                data.accessor.pid = child.pid();
+                data.accessor.process_start_time = stale.then_some(start + 1);
+                engine.respond_honeytoken(&data).await;
+                let EventData::Prevention(audit) = rx.try_recv().unwrap().data else {
+                    panic!("audit");
+                };
+                assert_eq!(audit.details["killed"], false);
+                assert_eq!(audit.details["frozen"], false);
+                assert!(child.0.try_wait().unwrap().is_none());
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn network_actions_never_kill_an_unknown_or_reused_generation() {
+        for stale in [false, true] {
+            let mut child = ChildFixture::new();
+            let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+            let (engine, mut rx) = test_engine();
+            engine
+                .enforce_net_match(
+                    "203.0.113.7".parse().unwrap(),
+                    443,
+                    Some(child.pid()),
+                    stale.then_some(start + 1),
+                    Match {
+                        rule_id: "fixture".into(),
+                        action: RuleAction::Block,
+                        reason: "fixture".into(),
+                    },
+                    "flow",
+                    None,
+                )
+                .await;
+            let EventData::Prevention(audit) = rx.try_recv().unwrap().data else {
+                panic!("audit");
+            };
+            assert_eq!(audit.details["killed"], false);
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
     }
 
     #[tokio::test]
@@ -1843,7 +2812,8 @@ mod tests {
         // The agent must never target itself via the command channel.
         assert!(!is_valid_target_pid(own, own), "own pid");
         // A real, individual, foreign PID is accepted.
-        assert!(is_valid_target_pid(2, own));
+        assert_eq!(is_valid_target_pid(2, own), !cfg!(windows));
+        assert_eq!(is_valid_target_pid(4, own), !cfg!(windows));
         assert!(is_valid_target_pid(31337, own));
     }
 
@@ -1856,7 +2826,7 @@ mod tests {
         let own = std::process::id() as i32;
         for &pid in &[-1, 0, 1, own] {
             let (engine, mut rx) = test_engine();
-            engine.cmd_kill_pid(pid, "cmd-1");
+            engine.cmd_kill_pid(pid, None, "cmd-1");
 
             let ev = rx.try_recv().expect("a rejection event must be emitted");
             assert!(
@@ -1882,12 +2852,12 @@ mod tests {
     fn cmd_freeze_and_thaw_reject_dangerous_targets() {
         for &pid in &[-1, 0, 1] {
             let (engine, mut rx) = test_engine();
-            engine.cmd_freeze_pid(pid, "cmd-f");
+            engine.cmd_freeze_pid(pid, None, "cmd-f");
             let ev = rx.try_recv().expect("freeze rejection event");
             assert!(matches!(ev.action, EventAction::CommandRejected));
 
             let (engine, mut rx) = test_engine();
-            engine.cmd_thaw_pid(pid, "cmd-t");
+            engine.cmd_thaw_pid(pid, None, "cmd-t");
             let ev = rx.try_recv().expect("thaw rejection event");
             assert!(matches!(ev.action, EventAction::CommandRejected));
         }
@@ -1920,6 +2890,7 @@ mod tests {
             dst_port: 443,
             state: "established".into(),
             pid: Some(424242),
+            process_start_time: None,
             process: Some("curl".into()),
             duration_ms: None,
             bytes_sent: None,
@@ -1954,6 +2925,7 @@ mod tests {
             dst_port: 443,
             state: "established".into(),
             pid: Some(1234),
+            process_start_time: None,
             process: Some("firefox".into()),
             duration_ms: None,
             bytes_sent: None,
@@ -2051,6 +3023,7 @@ mod tests {
             mitre_technique: String::new(),
             accessor: crate::schema::ProcessLineage {
                 pid: 4242,
+                process_start_time: None,
                 uid: 0,
                 gid: 0,
                 username: "root".into(),

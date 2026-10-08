@@ -293,6 +293,7 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
             // value that makes this process distinguishable from a later one
             // reusing its PID.
             process_start_time: Some(stat.starttime),
+            parent_start_time: None,
             enrichment: notes.finish(if kthread { 0 } else { 2 }),
         };
         out.insert(stat.pid, data);
@@ -548,9 +549,9 @@ mod tests {
             known(3, "recycled", Some(3)),
         ]);
         let after = HashMap::from([
-            seen(1, "init", Some(1)),   // unchanged
+            seen(1, "init", Some(1)),      // unchanged
             seen(3, "newthing", Some(30)), // recycled
-            seen(4, "fresh", Some(40)), // new
+            seen(4, "fresh", Some(40)),    // new
         ]);
 
         let diff = diff_processes(&before, &after);

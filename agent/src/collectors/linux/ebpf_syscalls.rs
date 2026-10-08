@@ -299,7 +299,9 @@ struct RawMemfdEvent {
     _pad: u32,
 }
 
-/// Matches `HoneytokenAccessEvent` in trapd-agent-ebpf/src/file_open.rs exactly.
+/// Stable prefix of `HoneytokenAccessEvent` in the kernel file_open sensor.
+/// New kernels append the original access timestamp; old objects still decode
+/// this prefix and explicitly leave generation attribution unknown.
 #[repr(C)]
 struct RawHoneytokenAccessEvent {
     pid: u32,
@@ -313,6 +315,14 @@ struct RawHoneytokenAccessEvent {
     filename: [u8; PATH_LEN],
     filename_len: u32,
     access_kind: u32,
+}
+
+/// Timestamp extension of the honeytoken kernel ABI. Legacy-sized records
+/// remain telemetry, with no process identity suitable for destructive action.
+fn honeytoken_observed_ns(bytes: &[u8]) -> Option<u64> {
+    let offset = std::mem::size_of::<RawHoneytokenAccessEvent>();
+    let value = u64::from_ne_bytes(bytes.get(offset..offset + 8)?.try_into().ok()?);
+    (value > 0).then_some(value)
 }
 
 // ── Event validation ──────────────────────────────────────────────────────────
@@ -611,6 +621,7 @@ impl EbpfSyscallCollector {
                         let allowlist = Allowlist::new(agent_pid, &extra);
                         let hit = AccessHit {
                             pid: ev.pid as i32,
+                            observed_monotonic_ns: honeytoken_observed_ns(&item),
                             uid: ev.uid,
                             gid: ev.gid,
                             comm: &comm,
@@ -1776,6 +1787,21 @@ impl Collector for EbpfSyscallCollector {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn honeytoken_timestamp_extension_is_backward_compatible() {
+        let mut old = vec![0_u8; std::mem::size_of::<RawHoneytokenAccessEvent>()];
+        old[..4].copy_from_slice(&123_u32.to_ne_bytes());
+        assert!(unsafe { read_raw::<RawHoneytokenAccessEvent>(&old) }.is_some());
+        assert_eq!(honeytoken_observed_ns(&old), None);
+        let mut current = old.clone();
+        current.extend_from_slice(&42_000_000_u64.to_ne_bytes());
+        assert_eq!(honeytoken_observed_ns(&current), Some(42_000_000));
+        assert_eq!(unsafe { read_raw::<RawHoneytokenAccessEvent>(&current) }.unwrap().pid, 123);
+        old.extend_from_slice(&0_u64.to_ne_bytes());
+        assert_eq!(honeytoken_observed_ns(&old), None);
+    }
+
     #[tokio::test]
     async fn honeytoken_tasks_are_cancelled_with_their_collector() {
         let mut owner = HoneytokenCoverageGuard::default();

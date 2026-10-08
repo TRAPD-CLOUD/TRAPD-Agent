@@ -303,6 +303,10 @@ pub struct ProcessCreateData {
     /// later one that reused its PID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_start_time: Option<u64>,
+    /// Observed parent's creation identity; absent when it cannot be bound to
+    /// a generation that already existed when this child was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_start_time: Option<u64>,
     /// Which `/proc` reads failed or were truncated while building this event.
     #[serde(default, flatten)]
     pub enrichment: crate::telemetry::Enrichment,
@@ -430,6 +434,10 @@ pub struct NetworkConnectionData {
     /// `established` / `open` on flow start; `closed` on the flow-end record.
     pub state: String,
     pub pid: Option<i32>,
+    /// Observed process generation: native creation FILETIME on Windows,
+    /// /proc start ticks on Linux. Missing identity never authorizes automatic control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
     pub process: Option<String>,
     /// Flow lifetime in milliseconds, measured from first observation to the
     /// flow-close record (set only on the `closed` event).
@@ -741,6 +749,10 @@ pub struct RansomwareIndicatorData {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<i32>,
+    /// Observed process generation: native creation FILETIME on Windows,
+    /// /proc start ticks on Linux. Missing identity never authorizes automatic control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comm: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1087,6 +1099,10 @@ impl NamespaceIds {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessLineage {
     pub pid: i32,
+    /// Observed process generation: native creation FILETIME on Windows,
+    /// /proc start ticks on Linux. Missing identity never authorizes automatic control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
     pub uid: u32,
     pub gid: u32,
     pub username: String,

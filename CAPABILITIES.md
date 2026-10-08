@@ -9,6 +9,54 @@ Legend: ✅ implemented · 🟡 partial · ⏳ planned · 🧪 feature-gated/ker
 
 ---
 
+## 0. Platform matrix: Linux vs. Windows
+
+Windows is a first-class platform. Status below is what the **code** does; items
+marked "CI" are exercised by native Windows tests on the CI runner, everything
+else on Windows is type-checked and unit-tested on shared logic only.
+
+| Capability | Linux | Windows |
+|---|---|---|
+| Process / network / DNS telemetry | ✅ eBPF | ✅ ETW (+ poller fallback), CI |
+| Authentication / security events | ✅ auth.log, auditd | ✅ Security / System / Application event logs |
+| Generic log collector (file tail, rotation, parsers) | ✅ | ✅ IIS / http.sys (W3C), nginx, Apache, PostgreSQL, MySQL; real file identity for rotation. No journal / syslog-socket sources |
+| Detection engine, Sigma, IOA, baseline | ✅ | ✅ same engine |
+| Honeytokens (deploy / detect / respond) | ✅ | ✅ file + registry decoys, 4663 audit |
+| Ransomware indicators (entropy, mass-write, extension, backup deletion) | ✅ | ✅ shared heuristics over registered local profile paths (including relocated/Entra profiles), plus the default Users tree; remote redirected folders need separate coverage |
+| Agent / binary tamper detection | ✅ `/etc/trapd`, state dir | ✅ config/install directories and their replacement; parent watches rearm protected paths, independent of generic scope changes; integrity-file changes reported immediately; update-aware |
+| FIM (periodic hashing) | ✅ | ✅ |
+| Process-memory injection scan | ✅ maps: RWX, memfd, deleted exec | ✅ `VirtualQueryEx`: thread started in unbacked executable memory (alert), injected PE (alert), RWX alone (context) |
+| Rootkit cross-view detection | ✅ | ⏳ not planned: depends on `/proc`, `getdents`, `sock_diag` |
+| Process kill / freeze (with PID-reuse guard) | ✅ automatic `SIGKILL` / `SIGSTOP` through a generation-checked pidfd | ✅ `TerminateProcess` / idempotent `NtSuspendProcess` bound to creation time; manual kill/freeze/thaw require the signed observed generation; core system processes are never targets |
+| Network containment (block IP, isolate) | ✅ nftables / iptables, current backend DNS/config allowances | ✅ native `INetFwPolicy2` / `INetFwRule`, current backend DNS/config allowances, requires every active profile to enforce local rules; preserves profile defaults; native CI |
+| File quarantine + restore | ✅ move + `chmod 000` + `chattr +i` | ✅ SYSTEM ownership + protected DACL, original owner/DACL restored; pins paths and copies into a fresh protected object, preserving NTFS data streams; native CI |
+| Auto-response, signed command channel, RTR | ✅ | ✅ PowerShell via `-EncodedCommand`; memory collection via `ReadProcessMemory` requires the signed observed process generation (LSASS and other protected processes refused) |
+| Pre-exec kernel blocking | 🟡 tracepoint kill (not LSM) | ⏳ none: post-creation kill only (needs a driver) |
+| Signed self-update with rollback | ✅ systemd path unit, authenticated recovery targets, resumable completion cleanup | ✅ copied apply helper with staged-launch retries, recovery checks at guard expiry, verified SCM stop, durable recovery and completion cleanup |
+| Binary self-integrity | ✅ | ✅ strict hash check; MSI resets the baseline within its installer transaction, signed updates refresh it with rollback |
+| Inventory (hardware, software, ports) | ✅ | ✅ registry software, native TCP table |
+| Hardening assessment | ✅ CIS-style (sysctl, SSH) | ✅ `WIN-*` checks (UAC, firewall, Defender policy, WDigest, LSA PPL, NTLM, SMB1, RDP NLA, LLMNR, script-block logging, Secure Boot) |
+| Kernel module / driver inventory | ✅ | ✅ loaded drivers (signature `signed` / `unknown`) |
+| Package operations (install / remove) | ✅ apt / dnf | ⏳ not supported |
+| SIEM forwarding | ✅ | ✅ |
+| Forensic snapshot on freeze | ✅ `/proc` incl. open files | ✅ exe, cwd, cmdline, logon session; open handles not enumerated |
+
+Known Windows limits: hostname-based isolation requires all active remote DNS
+resolvers in `isolation_allowlist_ips` or the signed command allowlist. The agent
+rejects isolation when that prerequisite cannot be established, including local
+DNS forwarders with unknown upstreams. Literal backend addresses need no DNS.
+The check covers active adapter resolvers; additional NRPT/DoH/VPN routing
+targets require explicit configuration. Address changes during existing
+isolation are not automatically reconciled.
+DHCP still requires explicit allowances; isolation and IP blocks persist across a reboot
+(they are persistent firewall rules, removed by `deisolate` / `unblock_ip` or explicit uninstall). Windows IP blocks with a TTL store their deadline in each rule and are reconciled before enrollment and every five seconds, including offline and pending-pairing modes; upgrades preserve containment.
+Isolation reads current signed-config allowances at action time, alongside backend management IPs and explicit command allowances.
+Windows quarantine refuses multiply-linked files, files larger than 1 GiB
+including their data streams, and filesystems that cannot enumerate those
+streams safely.
+
+---
+
 ## 1. Kernel & userspace telemetry (eBPF)
 
 The agent ships **18 eBPF programs**, all ring-buffer based and consumed by the
@@ -169,7 +217,7 @@ reject config from a backend not updated in lockstep.
 | File quarantine | ✅ | move + `chmod 000` + `chattr +i`, restore by id |
 | Auto-response playbooks | ✅ | opt-in, severity/confidence-gated, cooldown, allowlist, fully audited |
 | Signed command channel | ✅ | Ed25519, nonce + monotonic replay protection |
-| RTR (script exec, file/dir/memory collection) | ✅ | `rtr_enabled`-gated, signed, size-capped |
+| RTR (script exec, file/dir/memory collection) | ✅ | `rtr_enabled`-gated, signed, size-capped; Windows memory requests require an exact observed `process_start_time` FILETIME |
 | Kernel-side SHA-256 inode blocking | 🟡 | intentionally userspace post-exec today; ⏳ resolve SHA-256→inode for kernel map |
 | Real **BPF-LSM** enforcement | ⏳🧪 | replace tracepoint signal-kill with `lsm/bprm_check_security` etc. to close the exec race (kernel ≥5.7, `CONFIG_BPF_LSM`) |
 | Memory-injection **prevention** | ⏳🧪 | mmap/memfd/ptrace are detected; LSM-based blocking planned |
@@ -328,11 +376,10 @@ Provisioned files under `<config>` (default `/etc/trapd`): `ca.crt`, `agent.crt`
 
 ---
 
-_Last updated: 2026-09-08 — adds the generic Linux log collector
+_Last updated: 2026-10-08 — adds the platform matrix (§0) and Windows parity work (prevention, containment, quarantine, self-update, memory scan, ransomware heuristics, log collector, hardening). Earlier: 2026-09-08 — adds the generic Linux log collector
 (§6b: file/journal/syslog pipeline, inode-aware rotation, parsers for
 nginx/apache/postgres/mysql/docker/ssh/sudo/auditd, persisted offsets)
 and cross-view rootkit and manipulation detection (§2b: hidden
 processes/sockets/files/mounts/logins, kernel modules, package-verified
 binary integrity, `diagnostics rootkit`). Previous revision covered the
 loss-transparent telemetry pipeline._
-

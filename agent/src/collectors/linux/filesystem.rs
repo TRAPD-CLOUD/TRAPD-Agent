@@ -1,4 +1,3 @@
-use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -8,12 +7,12 @@ use inotify::{EventMask, Inotify, WatchMask};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, warn};
 
+use crate::collectors::fs_heuristics::{self as heur, Coalescer, MassModification};
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
 use crate::schema::{
     AgentEvent, AgentTamperData, DetectionData, EventAction, EventClass, EventData,
-    FilesystemEventData, FilesystemOperation, FilesystemSource, IntegrityStatus,
-    RansomwareIndicatorData, Severity,
+    FilesystemEventData, FilesystemOperation, FilesystemSource, IntegrityStatus, Severity,
 };
 
 // ── Watched path groups ───────────────────────────────────────────────────────
@@ -63,43 +62,6 @@ const WATCH_MASK: WatchMask = WatchMask::CREATE
     .union(WatchMask::MODIFY)
     .union(WatchMask::MOVED_FROM)
     .union(WatchMask::MOVED_TO);
-
-// ── Thresholds ────────────────────────────────────────────────────────────────
-
-/// Shannon entropy above this value (bits/byte) is treated as likely encrypted.
-const ENTROPY_THRESHOLD: f64 = 7.2;
-
-/// Maximum file size read for entropy analysis (8 MiB).
-const MAX_ENTROPY_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Emit a "high_write_rate" ransomware indicator after this many unique-path
-/// modifications within MASS_MOD_WINDOW.
-const MASS_MOD_THRESHOLD: usize = 50;
-const MASS_MOD_WINDOW: Duration = Duration::from_secs(10);
-const GENERIC_COALESCE_WINDOW: Duration = Duration::from_secs(2);
-
-/// Ransomware-associated file extension suffixes (lower-case).
-const RANSOM_EXTENSIONS: &[&str] = &[
-    ".locked",
-    ".encrypted",
-    ".crypt",
-    ".crypted",
-    ".crypto",
-    ".enc",
-    ".locky",
-    ".wannacry",
-    ".ryuk",
-    ".maze",
-    ".sodinokibi",
-    ".revil",
-    ".darkside",
-    ".conti",
-    ".lockbit",
-    ".babuk",
-    ".blackcat",
-    ".hive",
-    ".alphv",
-];
 
 // ── Collector struct ──────────────────────────────────────────────────────────
 
@@ -222,8 +184,8 @@ fn run_sync(
     let yara_scanner = crate::detection::yara_scanner::YaraScanner::load();
 
     // Sliding window for mass-modification (ransomware) detection.
-    let mut mod_window: VecDeque<Instant> = VecDeque::new();
-    let mut recently_emitted: HashMap<(String, &'static str), Instant> = HashMap::new();
+    let mut mod_window = MassModification::default();
+    let mut coalescer = Coalescer::default();
 
     let mut buf = [0u8; 4096];
     loop {
@@ -277,60 +239,22 @@ fn run_sync(
 
             // ── Ransomware: Shannon entropy on MODIFY ─────────────────────────
             if mask.contains(EventMask::MODIFY) {
-                if let Some(entropy) = compute_file_entropy(&path) {
-                    if entropy >= ENTROPY_THRESHOLD
-                        && send(&tx, AgentEvent::new(
-                            agent_id.clone(), hostname.clone(),
-                            EventClass::Filesystem, EventAction::RansomwareIndicator, Severity::High,
-                            EventData::RansomwareIndicator(RansomwareIndicatorData {
-                                indicator_type: "high_entropy".to_string(),
-                                path:           Some(path.clone()),
-                                pid:            None,
-                                comm:           None,
-                                entropy:        Some(entropy),
-                                write_rate:     None,
-                                details:        format!(
-                                    "Shannon entropy {entropy:.2} bits/byte (threshold {ENTROPY_THRESHOLD})"
-                                ),
-                            }),
-                        ))
-                    { return; }
+                if let Some(entropy) = heur::file_entropy(&path) {
+                    if entropy >= heur::ENTROPY_THRESHOLD
+                        && send(
+                            &tx,
+                            heur::high_entropy_event(&agent_id, &hostname, &path, entropy),
+                        )
+                    {
+                        return;
+                    }
                 }
 
-                // Track modification rate across the sliding window.
-                let now = Instant::now();
-                mod_window.push_back(now);
-                while mod_window
-                    .front()
-                    .is_some_and(|t| now.duration_since(*t) > MASS_MOD_WINDOW)
-                {
-                    mod_window.pop_front();
-                }
-                if mod_window.len() >= MASS_MOD_THRESHOLD {
-                    let rate = mod_window.len() as u64;
-                    mod_window.clear(); // reset to avoid alert flooding
+                // Distinct files modified inside the sliding window.
+                if let Some(rate) = mod_window.record(&path, Instant::now()) {
                     if send(
                         &tx,
-                        AgentEvent::new(
-                            agent_id.clone(),
-                            hostname.clone(),
-                            EventClass::Filesystem,
-                            EventAction::RansomwareIndicator,
-                            Severity::High,
-                            EventData::RansomwareIndicator(RansomwareIndicatorData {
-                                indicator_type: "high_write_rate".to_string(),
-                                path: None,
-                                pid: None,
-                                comm: None,
-                                entropy: None,
-                                write_rate: Some(rate),
-                                details: format!(
-                                    "{rate} file modifications in {}s (threshold {})",
-                                    MASS_MOD_WINDOW.as_secs(),
-                                    MASS_MOD_THRESHOLD,
-                                ),
-                            }),
-                        ),
+                        heur::high_write_rate_event(&agent_id, &hostname, rate as u64),
                     ) {
                         return;
                     }
@@ -339,27 +263,10 @@ fn run_sync(
 
             // ── Ransomware: suspicious extension on CREATE / RENAME ───────────
             if (mask.contains(EventMask::MOVED_TO) || mask.contains(EventMask::CREATE))
-                && has_ransom_extension(&path)
+                && heur::has_ransom_extension(&path)
                 && send(
                     &tx,
-                    AgentEvent::new(
-                        agent_id.clone(),
-                        hostname.clone(),
-                        EventClass::Filesystem,
-                        EventAction::RansomwareIndicator,
-                        Severity::High,
-                        EventData::RansomwareIndicator(RansomwareIndicatorData {
-                            indicator_type: "suspicious_extension".to_string(),
-                            path: Some(path.clone()),
-                            pid: None,
-                            comm: None,
-                            entropy: None,
-                            write_rate: None,
-                            details: format!(
-                                "File appeared with ransomware-associated extension: {path}"
-                            ),
-                        }),
-                    ),
+                    heur::suspicious_extension_event(&agent_id, &hostname, &path),
                 )
             {
                 return;
@@ -370,22 +277,7 @@ fn run_sync(
                 && is_backup_path(&path)
                 && send(
                     &tx,
-                    AgentEvent::new(
-                        agent_id.clone(),
-                        hostname.clone(),
-                        EventClass::Filesystem,
-                        EventAction::RansomwareIndicator,
-                        Severity::High,
-                        EventData::RansomwareIndicator(RansomwareIndicatorData {
-                            indicator_type: "backup_deletion".to_string(),
-                            path: Some(path.clone()),
-                            pid: None,
-                            comm: None,
-                            entropy: None,
-                            write_rate: None,
-                            details: format!("Backup path deleted or moved: {path}"),
-                        }),
-                    ),
+                    heur::backup_deletion_event(&agent_id, &hostname, &path),
                 )
             {
                 return;
@@ -413,7 +305,7 @@ fn run_sync(
 
             // ── Basic inotify event (always emitted) ──────────────────────────
             if let Some(action) = mask_to_action(mask) {
-                if suppress_generic_event(&path, &action, &mut recently_emitted, Instant::now()) {
+                if suppress_generic_event(&path, &action, &mut coalescer, Instant::now()) {
                     continue;
                 }
                 let operation = match action {
@@ -453,7 +345,7 @@ fn run_sync(
 fn suppress_generic_event(
     path: &str,
     action: &EventAction,
-    recent: &mut HashMap<(String, &'static str), Instant>,
+    coalescer: &mut Coalescer,
     now: Instant,
 ) -> bool {
     let critical = is_security_critical_path(path);
@@ -462,30 +354,13 @@ fn suppress_generic_event(
         || path.ends_with('~')
         || path.ends_with(".swp")
         || path.ends_with(".tmp");
-    if noisy && !critical {
-        return true;
-    }
-    if critical {
-        return false;
-    }
     let action_key = match action {
         EventAction::Create => "create",
         EventAction::Delete => "delete",
         EventAction::Modify => "modify",
         _ => "other",
     };
-    let key = (path.to_string(), action_key);
-    if recent
-        .get(&key)
-        .is_some_and(|last| now.duration_since(*last) < GENERIC_COALESCE_WINDOW)
-    {
-        return true;
-    }
-    recent.insert(key, now);
-    if recent.len() > 4096 {
-        recent.retain(|_, seen| now.duration_since(*seen) < GENERIC_COALESCE_WINDOW);
-    }
-    false
+    coalescer.suppress(path, action_key, critical, noisy, now)
 }
 
 fn is_security_critical_path(path: &str) -> bool {
@@ -664,35 +539,6 @@ fn run_token_fim(tx: tokio::sync::mpsc::Sender<AgentEvent>, agent_id: String, ho
     }
 }
 
-fn compute_file_entropy(path: &str) -> Option<f64> {
-    let meta = std::fs::metadata(path).ok()?;
-    let len = meta.len();
-    if len == 0 || len > MAX_ENTROPY_BYTES {
-        return None;
-    }
-    let data = std::fs::read(path).ok()?;
-    Some(shannon_entropy(&data))
-}
-
-fn shannon_entropy(data: &[u8]) -> f64 {
-    if data.is_empty() {
-        return 0.0;
-    }
-    let mut counts = [0u64; 256];
-    for &b in data {
-        counts[b as usize] += 1;
-    }
-    let len = data.len() as f64;
-    counts
-        .iter()
-        .filter(|&&c| c > 0)
-        .map(|&c| {
-            let p = c as f64 / len;
-            -p * p.log2()
-        })
-        .sum()
-}
-
 // ── Path classification helpers ───────────────────────────────────────────────
 
 fn is_backup_path(path: &str) -> bool {
@@ -701,11 +547,6 @@ fn is_backup_path(path: &str) -> bool {
 
 fn is_agent_config_path(path: &str) -> bool {
     AGENT_CONFIG_PATHS.iter().any(|&p| path.starts_with(p))
-}
-
-fn has_ransom_extension(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    RANSOM_EXTENSIONS.iter().any(|&ext| lower.ends_with(ext))
 }
 
 // ── Sensitive file-access detection ───────────────────────────────────────────
@@ -814,7 +655,7 @@ mod tests {
     #[test]
     fn repetitive_generic_events_are_coalesced() {
         let now = Instant::now();
-        let mut recent = HashMap::new();
+        let mut recent = Coalescer::default();
         assert!(!suppress_generic_event(
             "/tmp/trapd-detection-test",
             &EventAction::Modify,
@@ -831,14 +672,14 @@ mod tests {
             "/tmp/trapd-detection-test",
             &EventAction::Modify,
             &mut recent,
-            now + GENERIC_COALESCE_WINDOW
+            now + heur::GENERIC_COALESCE_WINDOW
         ));
     }
 
     #[test]
     fn critical_paths_are_never_coalesced_or_ignored() {
         let now = Instant::now();
-        let mut recent = HashMap::new();
+        let mut recent = Coalescer::default();
         for path in [
             "/etc/shadow",
             "/etc/ssh/sshd_config",
@@ -864,7 +705,7 @@ mod tests {
 
     #[test]
     fn cache_and_editor_artifacts_are_suppressed() {
-        let mut recent = HashMap::new();
+        let mut recent = Coalescer::default();
         let now = Instant::now();
         for path in ["/home/a/.cache/x", "/tmp/a.swp", "/tmp/a.tmp", "/tmp/a~"] {
             assert!(suppress_generic_event(

@@ -257,6 +257,15 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
     }
 }
 
+/// A parent PID still visible at collection may have been reused after the
+/// child's creation. Only bind a candidate generation demonstrably older
+/// than the child; missing, zero or equal timestamps remain unknown.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parent_generation_before_child(child: Option<u64>, parent: Option<u64>) -> Option<u64> {
+    let child = child.filter(|start| *start > 0)?;
+    parent.filter(|start| *start > 0 && *start < child)
+}
+
 /// Qualified account identity prevents local/domain accounts sharing a baseline.
 #[cfg(windows)]
 pub fn windows_process_account(pid: i32) -> Option<String> {
@@ -382,6 +391,21 @@ pub fn parse_start_time(stat: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_generation_must_predate_the_child() {
+        assert_eq!(parent_generation_before_child(Some(20), Some(10)), Some(10));
+        for (child, parent) in [
+            (None, Some(10)),
+            (Some(20), None),
+            (Some(0), Some(10)),
+            (Some(20), Some(0)),
+            (Some(20), Some(20)),
+            (Some(20), Some(21)),
+        ] {
+            assert_eq!(parent_generation_before_child(child, parent), None);
+        }
+    }
 
     #[test]
     fn sequences_are_strictly_increasing() {
