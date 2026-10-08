@@ -86,7 +86,9 @@ const NON_HUMAN_NAMES: &[&str] = &[
 /// `S-1-5-82-…` IIS app pools, `S-1-5-90-…` window manager, `S-1-5-96-…` font
 /// drivers.
 pub fn is_human_profile(p: &WindowsUserProfile, now_unix: i64) -> bool {
-    let name = p.name.to_ascii_lowercase();
+    // `name` may be `DOMAIN\\user`; the built-in account list holds bare names.
+    let lowered = p.name.to_ascii_lowercase();
+    let name = lowered.rsplit('\\').next().unwrap_or(&lowered).to_string();
     if !p.sid.starts_with("S-1-5-21-") {
         return false;
     }
@@ -1014,6 +1016,9 @@ mod tests {
         assert!(!is_human_profile(&sys, NOW));
         assert!(!is_human_profile(&user("defaultuser0"), NOW));
         assert!(!is_human_profile(&user("WDAGUtilityAccount"), NOW));
+        assert!(!is_human_profile(&user("HOST\\Guest"), NOW));
+        assert!(!is_human_profile(&user("HOST\\DefaultAccount"), NOW));
+        assert!(is_human_profile(&user("HOST\\anna"), NOW));
         let mut stale = user("old");
         stale.last_use_unix = Some(NOW - 200 * DAY);
         assert!(!is_human_profile(&stale, NOW));

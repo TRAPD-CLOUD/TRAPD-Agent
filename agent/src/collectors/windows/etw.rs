@@ -340,7 +340,9 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         return;
     };
     if let Some(decoded) = decode_record(record) {
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = sink.tx.try_send(decoded) {
+        // Full and Closed (consumer gone while ProcessTrace still delivers) both lose
+        // the record; neither may vanish without a named counter.
+        if sink.tx.try_send(decoded).is_err() {
             crate::telemetry::metrics::metrics()
                 .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
         }

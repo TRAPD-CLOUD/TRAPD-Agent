@@ -41,6 +41,64 @@ const MAX_HOSTNAMES: usize = 4_000;
 /// The persisted file is refused beyond this size (corruption / tampering).
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Pre-0.6.10 files stored `names` as strings, `hours` as one histogram and
+/// `hostnames` as a set. Both shapes load, so an upgrade keeps the learned
+/// profile; legacy entries are stamped "now" and age out normally.
+mod legacy {
+    use super::*;
+    use serde::Deserializer;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Names {
+        Current(VecDeque<(i64, String)>),
+        Legacy(VecDeque<String>),
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Hours {
+        // JSON object keys are strings and untagged buffering does not coerce
+        // them to integers, so parse the day index by hand.
+        Current(BTreeMap<String, [u32; 24]>),
+        Legacy([u32; 24]),
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Hostnames {
+        Current(BTreeMap<String, i64>),
+        Legacy(BTreeSet<String>),
+    }
+
+    pub fn names<'de, D: Deserializer<'de>>(d: D) -> Result<VecDeque<(i64, String)>, D::Error> {
+        Ok(match Names::deserialize(d)? {
+            Names::Current(v) => v,
+            Names::Legacy(v) => {
+                let now = now_unix();
+                v.into_iter().map(|n| (now, n)).collect()
+            }
+        })
+    }
+    pub fn hours<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<i64, [u32; 24]>, D::Error> {
+        Ok(match Hours::deserialize(d)? {
+            Hours::Current(v) => v
+                .into_iter()
+                .map(|(day, h)| day.parse().map(|day| (day, h)))
+                .collect::<Result<_, _>>()
+                .map_err(serde::de::Error::custom)?,
+            Hours::Legacy(h) => BTreeMap::from([(now_unix() / DAY, h)]),
+        })
+    }
+    pub fn hostnames<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, i64>, D::Error> {
+        Ok(match Hostnames::deserialize(d)? {
+            Hostnames::Current(v) => v,
+            Hostnames::Legacy(v) => {
+                let now = now_unix();
+                v.into_iter().map(|h| (h, now)).collect()
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct UserActivity {
     /// tool basename → (day index → count)
@@ -48,8 +106,10 @@ struct UserActivity {
     /// lowercase directory path → last write (unix seconds)
     dirs: BTreeMap<String, i64>,
     /// recently saved file names (style inference only)
+    #[serde(deserialize_with = "legacy::names")]
     names: VecDeque<(i64, String)>,
     /// interactive activity per hour of day (local time unknown → UTC hour)
+    #[serde(deserialize_with = "legacy::hours")]
     hours: BTreeMap<i64, [u32; 24]>,
     first_seen_unix: i64,
     #[serde(default)]
@@ -87,7 +147,7 @@ impl UserActivitySummary {
 pub struct ActivityStore {
     #[serde(default)]
     users: BTreeMap<String, UserActivity>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "legacy::hostnames")]
     hostnames: BTreeMap<String, i64>,
 }
 
@@ -597,6 +657,22 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_790_000_000;
+
+    #[test]
+    fn legacy_state_file_is_migrated_not_discarded() {
+        let json = r#"{"users":{"anna":{"tools":{"winscp.exe":{"20000":3}},"dirs":{},
+            "names":["report.docx"],"hours":[0,0,0,0,0,0,0,0,0,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "first_seen_unix":1}},"hostnames":["fileserver"]}"#;
+        let store: ActivityStore = serde_json::from_str(json).unwrap();
+        let u = &store.users["anna"];
+        assert!(u.tools.contains_key("winscp.exe"));
+        assert_eq!(u.names.len(), 1);
+        assert_eq!(u.hours.values().next().unwrap()[9], 5);
+        assert!(store.known_hostnames().contains("fileserver"));
+        let again: ActivityStore =
+            serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(again.users["anna"].names.len(), 1);
+    }
 
     #[test]
     fn expired_names_hours_and_hostnames_are_actually_removed() {

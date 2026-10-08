@@ -564,6 +564,16 @@ mod tests {
                     continue;
                 }
                 let hit = decoy_access(&data.fields, &HashMap::new(), data.log_timestamp, &devices);
+                eprintln!(
+                    "4663 read: pid={} (child={}, self={}) image={:?} mask={:#x} user={:?} hit={:?}",
+                    accessor.pid,
+                    child_pid,
+                    std::process::id(),
+                    accessor.process_name,
+                    accessor.access_mask,
+                    accessor.subject_user,
+                    hit.as_ref().map(|h| (&h.access_kind, h.confidence, &h.assessment)),
+                );
                 if accessor.pid == std::process::id() as i32 {
                     self_reads += 1;
                     assert!(
