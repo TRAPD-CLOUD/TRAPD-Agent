@@ -55,10 +55,10 @@ pub(super) fn file_identity(file: &File) -> Result<(u32, u32, u32)> {
     ))
 }
 
-fn require_single_link(file: &File) -> Result<()> {
+fn require_link_count(file: &File, expected: u32) -> Result<()> {
     let links = file_information(file)?.nNumberOfLinks;
-    if links != 1 {
-        bail!("quarantine source has {links} hard links; exactly one is required");
+    if links != expected {
+        bail!("quarantine source has {links} hard links; expected {expected}");
     }
     Ok(())
 }
@@ -220,7 +220,7 @@ impl Source {
         }
         // Deleting one name cannot contain a file reachable by another link.
         // Query the retained handle, never a separately resolved pathname.
-        require_single_link(&file)?;
+        require_link_count(&file, 1)?;
         let snapshot = stream_snapshot(&file)?;
         super::quarantine::checked_windows_copy_size(
             std::iter::once(metadata.len()).chain(snapshot.iter().map(|stream| stream.size)),
@@ -274,7 +274,7 @@ impl Source {
     }
 
     pub(super) fn copy_to(&self, destination: &Path) -> Result<()> {
-        require_single_link(&self.file)?;
+        require_link_count(&self.file, 1)?;
         let parents = Parents::pin(destination)?;
         let output = OpenOptions::new()
             .write(true)
@@ -295,14 +295,15 @@ impl Source {
                     .context("create protected quarantine data stream")?;
                 copy_stream(input, &output, stream.size)?;
             }
-            self.verify_source()?;
+            self.verify_source(1)?;
             self.mark_deleted(true)?;
             deletion_pending = true;
             // New ADS can be created independently of the main stream sharing
             // mode. Delete-pending closes that opening window; check the final
-            // complete list and link count before publishing a successful copy.
+            // complete list and require no surviving hard links before success.
+            // Windows excludes the pending-deletion name from nNumberOfLinks.
             // Share modes alone must not stand in for a hardlink-count check.
-            if let Err(error) = self.verify_source() {
+            if let Err(error) = self.verify_source(0) {
                 self.mark_deleted(false)
                     .context("undo quarantine deletion after source change")?;
                 deletion_pending = false;
@@ -327,8 +328,8 @@ impl Source {
         result
     }
 
-    fn verify_source(&self) -> Result<()> {
-        require_single_link(&self.file)?;
+    fn verify_source(&self, expected_links: u32) -> Result<()> {
+        require_link_count(&self.file, expected_links)?;
         let expected: Vec<_> = self
             .streams
             .iter()
