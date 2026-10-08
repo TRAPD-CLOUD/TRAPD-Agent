@@ -195,6 +195,10 @@ pub enum CommandPayload {
         pid: i32,
         #[serde(default)]
         max_bytes: Option<u64>,
+        /// Observed process generation: Windows creation FILETIME, Linux
+        /// start ticks. Required on Windows; omission preserves legacy signatures.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_start_time: Option<u64>,
     },
 }
 
@@ -445,6 +449,29 @@ mod cross_lang_tests {
     const ENV2: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"33333333-3333-3333-3333-333333333333","payload":{"kind":"upgrade_package","name":null}}"#;
     const SIG2: &str =
         "uT+YB5dgXErGwNAgxYmxM0D8tR/YxTVg+jximA8SABzjLu1BD8PQ37Am4M2gfFl1ywV+h3uAmdatRozsRUqVAg==";
+
+    #[test]
+    fn memory_command_generation_is_signed_and_legacy_omission_is_preserved() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[42; 32]);
+        const LEGACY: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"22222222-2222-2222-2222-222222222222","payload":{"kind":"collect_process_memory","pid":1234,"max_bytes":4096}}"#;
+        let observed = LEGACY.replace(
+            "\"max_bytes\":4096",
+            "\"max_bytes\":4096,\"process_start_time\":123456789",
+        );
+        for wire in [LEGACY, observed.as_str()] {
+            let envelope: CommandEnvelope = serde_json::from_str(wire).unwrap();
+            assert_eq!(serde_json::to_string(&envelope).unwrap(), wire);
+            let signature = base64::engine::general_purpose::STANDARD
+                .encode(key.sign(wire.as_bytes()).to_bytes());
+            assert!(verify_canonical(&key.verifying_key(), &envelope, &signature).is_ok());
+            if wire != LEGACY {
+                let changed: CommandEnvelope =
+                    serde_json::from_str(&wire.replace("123456789", "123456790")).unwrap();
+                assert!(verify_canonical(&key.verifying_key(), &changed, &signature).is_err());
+            }
+        }
+    }
 
     fn temp_path(suffix: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()

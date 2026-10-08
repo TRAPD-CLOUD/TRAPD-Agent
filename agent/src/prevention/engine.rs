@@ -1001,8 +1001,12 @@ impl Engine {
             CommandPayload::ListDirectory { path } => {
                 self.cmd_list_directory(path, &cmd_id);
             }
-            CommandPayload::CollectProcessMemory { pid, max_bytes } => {
-                self.cmd_collect_process_memory(*pid, *max_bytes, &cmd_id);
+            CommandPayload::CollectProcessMemory {
+                pid,
+                max_bytes,
+                process_start_time,
+            } => {
+                self.cmd_collect_process_memory(*pid, *max_bytes, *process_start_time, &cmd_id);
             }
         }
     }
@@ -1245,14 +1249,36 @@ impl Engine {
     /// first. Returns the bytes, the number of regions read and a note for the
     /// audit trail when the process memory could not be opened.
     #[cfg(not(windows))]
-    fn read_process_memory(pid: i32, cap: u64) -> (Vec<u8>, usize, &'static str) {
+    fn read_process_memory(
+        pid: i32,
+        cap: u64,
+        expected_start: Option<u64>,
+    ) -> anyhow::Result<(Vec<u8>, usize, &'static str)> {
         use std::io::{Read, Seek, SeekFrom};
+
+        let verify_generation = || -> anyhow::Result<()> {
+            if let Some(expected) = expected_start {
+                anyhow::ensure!(
+                    expected > 0,
+                    "unknown observed identity for pid {pid}; refusing"
+                );
+                anyhow::ensure!(
+                    crate::telemetry::identity::process_start_time(pid) == Some(expected),
+                    "pid {pid} belongs to a different or unknown process; refusing"
+                );
+            }
+            Ok(())
+        };
+        verify_generation()?;
 
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
         let regions = response_rtr::dumpable_regions(&maps, cap);
 
         let mut buf = Vec::new();
         let mut mem = std::fs::File::open(format!("/proc/{pid}/mem"));
+        // Check again after opening: subsequent reads use the retained memory
+        // fd, which cannot switch to a recycled PID's address space.
+        verify_generation()?;
         if let Ok(f) = mem.as_mut() {
             for (start, end) in &regions {
                 if f.seek(SeekFrom::Start(*start)).is_err() {
@@ -1271,66 +1297,85 @@ impl Engine {
         } else {
             ""
         };
-        (buf, regions.len(), note)
+        Ok((buf, regions.len(), note))
     }
 
     #[cfg(windows)]
-    fn read_process_memory(pid: i32, cap: u64) -> (Vec<u8>, usize, &'static str) {
-        match super::winproc::dump_memory(pid, cap) {
-            Ok(dump) => (dump.bytes, dump.regions, ""),
-            Err(e) => {
-                warn!(pid, error = %format!("{e:#}"), "process memory collection refused or failed");
-                (
-                    Vec::new(),
-                    0,
-                    " (process could not be opened for reading, or is a protected system process)",
-                )
-            }
-        }
+    fn read_process_memory(
+        pid: i32,
+        cap: u64,
+        expected_start: Option<u64>,
+    ) -> anyhow::Result<(Vec<u8>, usize, &'static str)> {
+        let dump = super::winproc::dump_memory(pid, cap, expected_start)?;
+        Ok((dump.bytes, dump.regions, ""))
     }
 
     /// Dump a process's readable memory (anonymous-executable regions first) as
     /// a capped base64 artifact. Requires CAP_SYS_PTRACE / root to read
     /// `/proc/<pid>/mem`; partial reads are returned best-effort.
-    fn cmd_collect_process_memory(&self, pid: i32, max_bytes: Option<u64>, cmd_id: &str) {
-        if !self.accept_target_pid(pid, "rtr_collect_memory", cmd_id) {
+    fn cmd_collect_process_memory(
+        &self,
+        pid: i32,
+        max_bytes: Option<u64>,
+        process_start_time: Option<u64>,
+        cmd_id: &str,
+    ) {
+        let refuse = |reason: String| {
+            self.audit.emit(
+                EventAction::CommandRejected,
+                Severity::Medium,
+                "rtr_collect_memory",
+                format!("pid {pid}"),
+                false,
+                reason,
+                None,
+                Some(cmd_id.into()),
+                json!({ "pid": pid, "process_start_time": process_start_time }),
+            );
+        };
+        if !is_valid_target_pid(pid, std::process::id() as i32) {
+            refuse(format!(
+                "refusing PID-targeted command: invalid target pid {pid}"
+            ));
             return;
         }
 
         let (enabled, default_max) = self.rtr_settings();
         if !enabled {
-            return self.rtr_refuse("rtr_collect_memory", format!("pid {pid}"), cmd_id);
+            return refuse("RTR is disabled (set rtr_enabled=true to allow)".into());
         }
         let cap = max_bytes.unwrap_or(default_max).min(default_max);
 
-        let (buf, region_count, unreadable_note) = Self::read_process_memory(pid, cap);
+        let (buf, region_count, unreadable_note) =
+            match Self::read_process_memory(pid, cap, process_start_time) {
+                Ok(dump) => dump,
+                Err(e) => {
+                    return refuse(format!("process memory collection refused or failed: {e}"))
+                }
+            };
+        if buf.is_empty() {
+            return refuse(format!(
+                "no readable memory returned for pid {pid}{unreadable_note}"
+            ));
+        }
 
         let art = response_rtr::cap_and_encode(&buf, cap as usize);
-        let success = !buf.is_empty();
-        let regions_len = region_count;
         self.audit.emit(
-            if success {
-                EventAction::CommandAccepted
-            } else {
-                EventAction::CommandRejected
-            },
-            if success {
-                Severity::Info
-            } else {
-                Severity::Medium
-            },
+            EventAction::CommandAccepted,
+            Severity::Info,
             "rtr_collect_memory",
             format!("pid {pid}"),
-            success,
+            true,
             format!(
                 "dumped {} bytes from {} region(s) of pid {pid}{}",
-                art.returned_len, regions_len, unreadable_note
+                art.returned_len, region_count, unreadable_note
             ),
             None,
             Some(cmd_id.into()),
             json!({
                 "pid": pid,
-                "regions": regions_len,
+                "process_start_time": process_start_time,
+                "regions": region_count,
                 "memory_b64": art.b64,
                 "total_len": art.total_len,
                 "truncated": art.truncated,
@@ -2202,6 +2247,129 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn memory_command(
+        pid: i32,
+        generation: Option<u64>,
+    ) -> crate::prevention::commands::CommandEnvelope {
+        let mut payload =
+            serde_json::json!({ "kind": "collect_process_memory", "pid": pid, "max_bytes": 4096 });
+        if let Some(start) = generation {
+            payload["process_start_time"] = serde_json::json!(start);
+        }
+        serde_json::from_value(serde_json::json!({
+            "command_id": uuid::Uuid::new_v4(),
+            "issued_at": chrono::Utc::now(),
+            "expires_at": chrono::Utc::now() + chrono::Duration::minutes(1),
+            "agent_id": "test-agent",
+            "nonce": uuid::Uuid::new_v4(),
+            "payload": payload,
+        }))
+        .unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn memory_commands_reject_zero_and_stale_generations_without_artifacts() {
+        let child = ChildFixture::new();
+        let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+        for generation in [0, start + 1] {
+            let (engine, mut rx) = test_engine();
+            engine.cfg_handle.write().unwrap().rtr_enabled = true;
+            let env = memory_command(child.pid(), Some(generation));
+            let command_id = env.command_id.to_string();
+            engine.handle(env).await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::CommandRejected));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(!audit.success);
+            assert_eq!(audit.command_id.as_deref(), Some(command_id.as_str()));
+            assert_eq!(audit.details["process_start_time"], generation);
+            assert!(
+                audit.details.get("memory_b64").is_none(),
+                "refusals must not include a memory artifact"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn memory_command_early_refusals_preserve_the_requested_generation() {
+        for (pid, enabled, reason) in [
+            (1, true, "invalid target"),
+            (54321, false, "RTR is disabled"),
+        ] {
+            let (engine, mut rx) = test_engine();
+            engine.cfg_handle.write().unwrap().rtr_enabled = enabled;
+            engine.handle(memory_command(pid, Some(7))).await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::CommandRejected));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(!audit.success);
+            assert!(audit.reason.contains(reason));
+            assert_eq!(audit.details["process_start_time"], 7);
+            assert!(audit.details.get("memory_b64").is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn memory_commands_reject_missing_generation_on_windows_without_an_artifact() {
+        let child = ChildFixture::new();
+        let (engine, mut rx) = test_engine();
+        engine.cfg_handle.write().unwrap().rtr_enabled = true;
+        engine.handle(memory_command(child.pid(), None)).await;
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(event.action, EventAction::CommandRejected));
+        let EventData::Prevention(audit) = event.data else {
+            panic!("audit")
+        };
+        assert!(!audit.success);
+        assert_eq!(
+            audit.details.get("process_start_time"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(audit.details.get("memory_b64").is_none());
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn memory_commands_read_the_observed_child_and_audit_the_generation() {
+        let child = ChildFixture::new();
+        let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+        let generations = if cfg!(windows) {
+            vec![Some(start)]
+        } else {
+            vec![Some(start), None]
+        };
+        for generation in generations {
+            let (engine, mut rx) = test_engine();
+            engine.cfg_handle.write().unwrap().rtr_enabled = true;
+            engine.handle(memory_command(child.pid(), generation)).await;
+            let event = rx.try_recv().unwrap();
+            assert!(matches!(event.action, EventAction::CommandAccepted));
+            let EventData::Prevention(audit) = event.data else {
+                panic!("audit")
+            };
+            assert!(audit.success);
+            assert_eq!(
+                audit.details["process_start_time"],
+                serde_json::json!(generation)
+            );
+            let memory = audit.details["memory_b64"].as_str().unwrap();
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(memory)
+                .unwrap();
+            assert!(!bytes.is_empty());
+            assert!(bytes.len() <= 4096);
         }
     }
 

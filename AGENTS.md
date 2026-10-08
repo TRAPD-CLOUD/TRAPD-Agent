@@ -362,6 +362,13 @@ also carry an optional observed `process_start_time`. Automatic process control
 requires that generation and compares it against the action handle (Windows)
 or a PID-stable pidfd (Linux); missing identity only permits an alert.
 
+`collect_process_memory` commands can also carry a signed `process_start_time`.
+Windows requires that exact observed creation FILETIME on the memory-read
+handle; missing, zero or stale generations are refused without an artifact.
+Legacy commands still decode and verify, and Linux retains legacy omission.
+Command producers must preserve the observed u64 exactly when signing, rather
+than rounding it through a floating-point representation.
+
 Linux honeytoken kernel events append their original `bpf_ktime_get_ns` timestamp.
 Older kernel objects still decode as access telemetry but lack an identity that
 can authorize automatic process control. Attribution requires the end of the

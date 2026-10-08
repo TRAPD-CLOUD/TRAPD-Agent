@@ -335,11 +335,18 @@ fn read_at(p: &Process, address: usize, buf: &mut [u8]) -> usize {
 /// Protected system processes (LSASS above all) are refused by the same guard
 /// as terminate/suspend: a memory-collection command must not double as a
 /// credential-dumping primitive.
-pub fn dump_memory(pid: i32, cap: u64) -> Result<MemoryDump> {
+/// The observed creation time is mandatory and compared on the handle used
+/// for every subsequent read, so PID reuse cannot redirect the artifact.
+pub fn dump_memory(pid: i32, cap: u64, expected_start: Option<u64>) -> Result<MemoryDump> {
     use windows_sys::Win32::System::Memory::MEM_PRIVATE;
     use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
-    let p = open_target(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, None)?;
+    require_generation(pid, expected_start)?;
+    let p = open_target(
+        pid,
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+        expected_start,
+    )?;
     let candidates = committed_regions(&p)
         .into_iter()
         .map(|r| {
@@ -702,8 +709,25 @@ mod tests {
     }
 
     #[test]
-    fn dumps_readable_memory_of_an_ordinary_process() {
-        let dump = dump_memory(std::process::id() as i32, 256 * 1024).expect("dump own memory");
+    fn memory_dump_requires_matching_generation_and_reads_a_valid_child() {
+        let mut child = sleeper();
+        let pid = child.id() as i32;
+        let start = start_of(&child);
+        let refusals = [None, Some(0), Some(start + 1)].map(|generation| {
+            dump_memory(pid, 256 * 1024, generation)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        let valid = dump_memory(pid, 256 * 1024, Some(start));
+        let _ = child.kill();
+        let _ = child.wait();
+        for refusal in refusals {
+            assert!(
+                refusal.is_err(),
+                "unknown/zero/stale process identity must not be dumped"
+            );
+        }
+        let dump = valid.expect("dump the observed child memory");
         assert!(!dump.bytes.is_empty());
         assert!(dump.bytes.len() <= 256 * 1024, "budget respected");
         assert!(dump.regions > 0);

@@ -23,14 +23,14 @@ else on Windows is type-checked and unit-tested on shared logic only.
 | Detection engine, Sigma, IOA, baseline | ✅ | ✅ same engine |
 | Honeytokens (deploy / detect / respond) | ✅ | ✅ file + registry decoys, 4663 audit |
 | Ransomware indicators (entropy, mass-write, extension, backup deletion) | ✅ | ✅ shared heuristics over registered local profile paths (including relocated/Entra profiles), plus the default Users tree; remote redirected folders need separate coverage |
-| Agent / binary tamper detection | ✅ `/etc/trapd`, state dir | ✅ config/install directories and their replacement; parent watches rearm protected paths, independent of generic scope changes; update-aware |
+| Agent / binary tamper detection | ✅ `/etc/trapd`, state dir | ✅ config/install directories and their replacement; parent watches rearm protected paths, independent of generic scope changes; integrity-file changes reported immediately; update-aware |
 | FIM (periodic hashing) | ✅ | ✅ |
 | Process-memory injection scan | ✅ maps: RWX, memfd, deleted exec | ✅ `VirtualQueryEx`: thread started in unbacked executable memory (alert), injected PE (alert), RWX alone (context) |
 | Rootkit cross-view detection | ✅ | ⏳ not planned: depends on `/proc`, `getdents`, `sock_diag` |
 | Process kill / freeze (with PID-reuse guard) | ✅ automatic `SIGKILL` / `SIGSTOP` through a generation-checked pidfd | ✅ `TerminateProcess` / idempotent `NtSuspendProcess` bound to creation time; core system processes are never targets |
 | Network containment (block IP, isolate) | ✅ nftables / iptables, current backend DNS/config allowances | ✅ native `INetFwPolicy2` / `INetFwRule`, current backend DNS/config allowances, requires every active profile to enforce local rules; preserves profile defaults; native CI |
 | File quarantine + restore | ✅ move + `chmod 000` + `chattr +i` | ✅ SYSTEM ownership + protected DACL, original owner/DACL restored; pins paths and copies into a fresh protected object, preserving NTFS data streams; native CI |
-| Auto-response, signed command channel, RTR | ✅ | ✅ PowerShell via `-EncodedCommand`; memory collection via `ReadProcessMemory` (LSASS and other protected processes refused) |
+| Auto-response, signed command channel, RTR | ✅ | ✅ PowerShell via `-EncodedCommand`; memory collection via `ReadProcessMemory` requires the signed observed process generation (LSASS and other protected processes refused) |
 | Pre-exec kernel blocking | 🟡 tracepoint kill (not LSM) | ⏳ none: post-creation kill only (needs a driver) |
 | Signed self-update with rollback | ✅ systemd path unit, authenticated recovery targets, resumable completion cleanup | ✅ copied apply helper with staged-launch retries, recovery checks at guard expiry, verified SCM stop, durable recovery and completion cleanup |
 | Binary self-integrity | ✅ | ✅ strict hash check; MSI resets the baseline within its installer transaction, signed updates refresh it with rollback |
@@ -210,7 +210,7 @@ reject config from a backend not updated in lockstep.
 | File quarantine | ✅ | move + `chmod 000` + `chattr +i`, restore by id |
 | Auto-response playbooks | ✅ | opt-in, severity/confidence-gated, cooldown, allowlist, fully audited |
 | Signed command channel | ✅ | Ed25519, nonce + monotonic replay protection |
-| RTR (script exec, file/dir/memory collection) | ✅ | `rtr_enabled`-gated, signed, size-capped |
+| RTR (script exec, file/dir/memory collection) | ✅ | `rtr_enabled`-gated, signed, size-capped; Windows memory requests require an exact observed `process_start_time` FILETIME |
 | Kernel-side SHA-256 inode blocking | 🟡 | intentionally userspace post-exec today; ⏳ resolve SHA-256→inode for kernel map |
 | Real **BPF-LSM** enforcement | ⏳🧪 | replace tracepoint signal-kill with `lsm/bprm_check_security` etc. to close the exec race (kernel ≥5.7, `CONFIG_BPF_LSM`) |
 | Memory-injection **prevention** | ⏳🧪 | mmap/memfd/ptrace are detected; LSM-based blocking planned |

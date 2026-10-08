@@ -184,87 +184,237 @@ fn detection_roots() -> DetectionRoots {
     }
 }
 
-/// Own tamper handles separately from live telemetry and ransomware watches.
-/// Parent handles observe replacement of the protected directory; target
-/// handles observe only its immediate children and are rearmed at its path.
-struct TamperWatches {
-    watcher: RecommendedWatcher,
-    targets: Vec<PathBuf>,
-    scope: Vec<String>,
-    watched: BTreeMap<String, PathBuf>,
+type Notification = notify::Result<Vec<(Change, PathBuf)>>;
+
+/// Split rename pairs before filtering so an out-of-scope half cannot change
+/// the meaning of the other. Filter parent/sibling churn before the queue.
+fn enqueue_relevant(
+    result: notify::Result<notify::Event>,
+    tx: &Sender<Notification>,
+    relevant: impl Fn(&str) -> bool,
+) {
+    let result = result.map(|event| {
+        let mut changes = change_for(&event.kind, &event.paths);
+        changes.retain(|(_, path)| relevant(&fs_plan::normalise(&path.to_string_lossy())));
+        changes
+    });
+    if result.as_ref().is_ok_and(Vec::is_empty) {
+        return;
+    }
+    if tx.try_send(result).is_err() {
+        crate::telemetry::metrics::metrics()
+            .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
+    }
 }
 
-impl TamperWatches {
-    fn new(targets: &[PathBuf], tx: Sender<notify::Result<notify::Event>>) -> Result<Self> {
-        let filter: Vec<String> = targets
+fn relevant_path(path: &str, roots: &Roots) -> bool {
+    fs_plan::is_tamper_path(path, &roots.tamper)
+        || roots
+            .generic
             .iter()
-            .map(|p| fs_plan::normalise_root(&p.to_string_lossy()))
-            .collect();
+            .chain(&roots.ransom)
+            .chain(&roots.backup)
+            .any(|root| path == root.trim_end_matches('\\') || path.starts_with(root))
+}
+
+/// One physical handle union for independent logical scopes. A recursive
+/// ancestor serves overlapping telemetry/detection paths once; nonrecursive
+/// fixed parents observe root replacement without watching unrelated trees.
+struct FilesystemWatches {
+    watcher: RecommendedWatcher,
+    scope: Arc<RwLock<Roots>>,
+    recursive_targets: Vec<PathBuf>,
+    tamper_targets: Vec<PathBuf>,
+    generic: Vec<PathBuf>,
+    watched: BTreeMap<String, (PathBuf, RecursiveMode)>,
+    #[cfg(test)]
+    fail_watch: Option<String>,
+}
+
+impl FilesystemWatches {
+    fn new(
+        ransom: &[PathBuf],
+        backup: &[PathBuf],
+        tamper: &[PathBuf],
+        tx: Sender<Notification>,
+    ) -> Result<Self> {
+        let normalised = |paths: &[PathBuf]| {
+            paths
+                .iter()
+                .map(|p| fs_plan::normalise_root(&p.to_string_lossy()))
+                .collect()
+        };
+        let scope = Arc::new(RwLock::new(Roots {
+            ransom: normalised(ransom),
+            backup: normalised(backup),
+            tamper: normalised(tamper),
+            ..Default::default()
+        }));
+        let filter = Arc::clone(&scope);
         let watcher = RecommendedWatcher::new(
             move |result: notify::Result<notify::Event>| {
-                // Parent handles also receive sibling changes (e.g. spool and
-                // logs). Reject them before they can consume the bounded queue.
-                if result.as_ref().is_ok_and(|event| {
-                    !event.paths.iter().any(|path| {
-                        fs_plan::is_tamper_path(
-                            &fs_plan::normalise(&path.to_string_lossy()),
-                            &filter,
-                        )
-                    })
-                }) {
-                    return;
-                }
-                if tx.try_send(result).is_err() {
-                    crate::telemetry::metrics::metrics()
-                        .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
-                }
+                enqueue_relevant(result, &tx, |path| {
+                    filter.read().is_ok_and(|roots| relevant_path(path, &roots))
+                });
             },
             notify::Config::default(),
         )?;
         let mut watches = Self {
             watcher,
-            targets: Vec::new(),
-            scope: Vec::new(),
+            scope,
+            recursive_targets: ransom.iter().chain(backup).cloned().collect(),
+            tamper_targets: tamper.to_vec(),
+            generic: Vec::new(),
             watched: BTreeMap::new(),
+            #[cfg(test)]
+            fail_watch: None,
         };
-        for target in targets {
-            let Some(parent) = target.parent() else {
-                continue;
-            };
-            // Retain direct file monitoring if parent enumeration is denied;
-            // watch_directory reports that replacement coverage is unavailable.
-            watches.watch_directory(parent);
-            let scope = fs_plan::normalise_root(&target.to_string_lossy());
-            if watches.scope.contains(&scope) {
-                continue;
-            }
-            watches.scope.push(scope);
-            watches.targets.push(target.clone());
-            watches.watch_target(target);
-        }
+        watches.sync();
         Ok(watches)
     }
 
-    fn watch_target(&mut self, target: &std::path::Path) {
-        // An absent directory is still covered by its parent. Its creation
-        // will trigger rearming, including a replacement after removal.
-        if target.is_dir() {
-            self.watch_directory(target);
+    fn set_generic(&mut self, paths: Vec<PathBuf>) {
+        self.generic = paths;
+        if let Ok(mut roots) = self.scope.write() {
+            roots.generic = self
+                .generic
+                .iter()
+                .map(|p| fs_plan::normalise_root(&p.to_string_lossy()))
+                .collect();
+        }
+        self.sync();
+    }
+
+    fn sync(&mut self) {
+        let mut candidates: BTreeMap<String, (PathBuf, RecursiveMode)> = BTreeMap::new();
+        let mut add = |path: &std::path::Path, mode: RecursiveMode| {
+            if !path.is_dir() {
+                return;
+            }
+            let key = fs_plan::normalise_root(&path.to_string_lossy());
+            candidates
+                .entry(key)
+                .and_modify(|(_, existing)| {
+                    if mode == RecursiveMode::Recursive {
+                        *existing = mode;
+                    }
+                })
+                .or_insert((path.to_path_buf(), mode));
+        };
+        for target in self.recursive_targets.iter().chain(&self.tamper_targets) {
+            if let Some(parent) = target.parent() {
+                add(parent, RecursiveMode::NonRecursive);
+            }
+        }
+        for target in self.recursive_targets.iter().chain(&self.generic) {
+            add(target, RecursiveMode::Recursive);
+        }
+        for target in &self.tamper_targets {
+            add(target, RecursiveMode::NonRecursive);
+        }
+        let mut candidates: Vec<_> = candidates.into_iter().collect();
+        candidates.sort_by_key(|(_, (path, _))| path.components().count());
+        let mut required: BTreeMap<String, (PathBuf, RecursiveMode)> = BTreeMap::new();
+        let mut failed = Vec::new();
+        for (key, (path, mode)) in candidates {
+            if required
+                .iter()
+                .any(|(root, (_, mode))| *mode == RecursiveMode::Recursive && key.starts_with(root))
+            {
+                continue;
+            }
+            if self.ensure_watch(&key, &path, mode) {
+                required.insert(key, (path, mode));
+            } else {
+                failed.push(key.clone());
+                // A failed recursive upgrade can still retain its previous
+                // nonrecursive parent handle; descendants must still be tried.
+                if let Some(existing) = self.watched.get(&key) {
+                    required.insert(key, existing.clone());
+                }
+            }
+        }
+        // If a direct replacement handle fails, keep the working recursive
+        // ancestor that still supplies it. Logical filtering already excludes
+        // removed telemetry scope; retry can narrow physical coverage later.
+        for (root, existing) in &self.watched {
+            if existing.1 == RecursiveMode::Recursive
+                && failed.iter().any(|path| path.starts_with(root))
+            {
+                required.insert(root.clone(), existing.clone());
+            }
+        }
+        let recursive: Vec<_> = required
+            .iter()
+            .filter(|(_, (_, mode))| *mode == RecursiveMode::Recursive)
+            .map(|(root, _)| root.clone())
+            .collect();
+        required.retain(|key, _| {
+            !recursive
+                .iter()
+                .any(|root| root != key && key.starts_with(root))
+        });
+        // New fixed descendant handles are installed before retiring an old
+        // generic ancestor. Fixed detection must not have a reconfiguration gap.
+        let obsolete: Vec<_> = self
+            .watched
+            .keys()
+            .filter(|key| !required.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in obsolete {
+            if let Some((path, _)) = self.watched.remove(&key) {
+                let _ = self.watcher.unwatch(&path);
+            }
+        }
+        // A broad generic handle may now only be needed as a fixed parent.
+        // Downgrade after its required child watches have been established.
+        for (key, (path, mode)) in required {
+            if mode == RecursiveMode::NonRecursive
+                && self
+                    .watched
+                    .get(&key)
+                    .is_some_and(|(_, actual)| *actual == RecursiveMode::Recursive)
+            {
+                self.replace_watch(&key, &path, mode);
+            }
         }
     }
 
-    fn watch_directory(&mut self, path: &std::path::Path) -> bool {
-        let key = fs_plan::normalise_root(&path.to_string_lossy());
-        if self.watched.contains_key(&key) {
+    fn ensure_watch(&mut self, key: &str, path: &std::path::Path, mode: RecursiveMode) -> bool {
+        if self
+            .watched
+            .get(key)
+            .is_some_and(|(_, actual)| *actual == mode || *actual == RecursiveMode::Recursive)
+        {
             return true;
         }
-        match self.watcher.watch(path, RecursiveMode::NonRecursive) {
+        self.replace_watch(key, path, mode)
+    }
+
+    fn replace_watch(&mut self, key: &str, path: &std::path::Path, mode: RecursiveMode) -> bool {
+        #[cfg(test)]
+        if self.fail_watch.as_deref() == Some(key) {
+            return false;
+        }
+        // Never hold the callback's scope lock across native watch/unwatch:
+        // watch waits for a worker that can invoke that callback before its ack.
+        let previous = self.watched.remove(key);
+        if let Some((old, _)) = &previous {
+            let _ = self.watcher.unwatch(old);
+        }
+        match self.watcher.watch(path, mode) {
             Ok(()) => {
-                self.watched.insert(key, path.to_path_buf());
+                self.watched.insert(key.into(), (path.to_path_buf(), mode));
                 true
             }
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "Windows tamper watch unavailable");
+                tracing::warn!(path = %path.display(), error = %e, "Windows filesystem watch unavailable");
+                if let Some((old, old_mode)) = previous {
+                    if self.watcher.watch(&old, old_mode).is_ok() {
+                        self.watched.insert(key.into(), (old, old_mode));
+                    }
+                }
                 false
             }
         }
@@ -278,36 +428,27 @@ impl TamperWatches {
             return;
         }
         let key = fs_plan::normalise_root(&path.to_string_lossy());
-        if !self.scope.contains(&key) {
+        if !self
+            .recursive_targets
+            .iter()
+            .chain(&self.tamper_targets)
+            .chain(&self.generic)
+            .any(|target| fs_plan::normalise_root(&target.to_string_lossy()).starts_with(&key))
+        {
             return;
         }
-        // The old handle may have followed a moved directory. Never let it
-        // stand in for the original protected path.
-        // A config directory can live inside the install directory. Rearm
-        // nested targets and shared parent handles if that ancestor is replaced.
-        let stale: Vec<String> = self
+        let stale: Vec<_> = self
             .watched
             .keys()
             .filter(|root| root.starts_with(&key))
             .cloned()
             .collect();
         for root in stale {
-            if let Some(path) = self.watched.remove(&root) {
+            if let Some((path, _)) = self.watched.remove(&root) {
                 let _ = self.watcher.unwatch(&path);
             }
         }
-        let targets: Vec<PathBuf> = self
-            .targets
-            .iter()
-            .filter(|target| fs_plan::normalise_root(&target.to_string_lossy()).starts_with(&key))
-            .cloned()
-            .collect();
-        for target in targets {
-            if let Some(parent) = target.parent().filter(|parent| parent.is_dir()) {
-                self.watch_directory(parent);
-            }
-            self.watch_target(&target);
-        }
+        self.sync();
     }
 }
 
@@ -374,56 +515,14 @@ impl Collector for FilesystemCollector {
         hostname: String,
     ) -> Result<()> {
         let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(1024);
-        let generic_tx = notify_tx.clone();
-        let mut watcher = RecommendedWatcher::new(
-            move |result: notify::Result<notify::Event>| {
-                if generic_tx.try_send(result).is_err() {
-                    crate::telemetry::metrics::metrics()
-                        .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
-                }
-            },
-            notify::Config::default(),
-        )?;
-        // Fixed detection handles must survive live generic scope changes,
-        // even when both scopes contain the same path.
-        let detection_tx = notify_tx.clone();
-        let mut detection_watcher = RecommendedWatcher::new(
-            move |result: notify::Result<notify::Event>| {
-                if detection_tx.try_send(result).is_err() {
-                    crate::telemetry::metrics::metrics()
-                        .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
-                }
-            },
-            notify::Config::default(),
-        )?;
-        let defaults = AgentConfig::default();
-        let mut watched: Vec<PathBuf> = Vec::new();
-
-        // Named-detection roots are fixed for the process lifetime. A missing
-        // root (no backup folder on this host) is normal and silent.
-        let started = std::time::Instant::now();
         let detect = detection_roots();
-        let mut roots = Roots::default();
-        let mut register = |path: &PathBuf, mode: RecursiveMode, into: &mut Vec<String>| {
-            if !path.exists() {
-                return;
-            }
-            match detection_watcher.watch(path, mode) {
-                Ok(()) => into.push(fs_plan::normalise_root(&path.to_string_lossy())),
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "Windows detection watch unavailable")
-                }
-            }
-        };
-        for p in &detect.ransom {
-            register(p, RecursiveMode::Recursive, &mut roots.ransom);
-        }
-        for p in &detect.backup {
-            register(p, RecursiveMode::Recursive, &mut roots.backup);
-        }
-        let mut tamper_watches = TamperWatches::new(&detect.tamper, notify_tx)?;
-        roots.tamper = tamper_watches.scope.clone();
-        let mut planner = Planner::new(roots, std::time::Instant::now());
+        let mut watches =
+            FilesystemWatches::new(&detect.ransom, &detect.backup, &detect.tamper, notify_tx)?;
+        let mut planner = Planner::new(
+            watches.scope.read().unwrap().clone(),
+            std::time::Instant::now(),
+        );
+        let defaults = AgentConfig::default();
         let baseline_path = crate::paths::state_dir().join("windows_fim_baseline.json");
         let saved: Baseline = std::fs::metadata(&baseline_path)
             .ok()
@@ -441,18 +540,13 @@ impl Collector for FilesystemCollector {
                 _ = ticker.tick() => {
                     let cfg = self.config.read().map(|c| c.clone()).unwrap_or_default();
                     let roots = windows_paths(&cfg.fs_watch_paths, &defaults.fs_watch_paths);
-                    if roots != watched {
-                        for root in &watched { let _ = watcher.unwatch(root); }
-                        watched.clear();
-                        for root in roots {
-                            match watcher.watch(&root, RecursiveMode::Recursive) {
-                                Ok(()) => watched.push(root),
-                                Err(e) => tracing::warn!(path = %root.display(), error = %e, "Windows file watch unavailable"),
-                            }
-                        }
-                        planner.set_generic_roots(
-                            watched.iter().map(|p| fs_plan::normalise_root(&p.to_string_lossy())).collect(),
-                        );
+                    if roots != watches.generic {
+                        watches.set_generic(roots);
+                        planner.set_generic_roots(watches.scope.read().unwrap().generic.clone());
+                    } else {
+                        // Retry missing/denied paths even without a config
+                        // change (the generic target can be created later).
+                        watches.sync();
                     }
                     if cfg.fim_enabled && (first || last_scan.elapsed().as_secs() >= cfg.fim_interval_secs.max(10)) {
                         let roots = windows_paths(&cfg.fim_paths, &defaults.fim_paths);
@@ -486,15 +580,14 @@ impl Collector for FilesystemCollector {
                 }
                 Some(result) = notify_rx.recv() => {
                     match result {
-                        Ok(notification) => {
-                            for (change, path) in change_for(&notification.kind, &notification.paths) {
-                                tamper_watches.rearm(change, &path);
+                        Ok(changes) => {
+                            for (change, path) in changes {
+                                watches.rearm(change, &path);
                                 let path = path.to_string_lossy().into_owned();
                                 let actions = planner.plan(
                                     change,
                                     &path,
                                     std::time::Instant::now(),
-                                    started.elapsed(),
                                     crate::update::update_in_flight(),
                                 );
                                 for action in actions {
@@ -558,9 +651,287 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn repeated_real_notifications_are_not_time_coalesced() {
+        use notify::event::CreateKind;
+        let path = PathBuf::from("C:\\Users\\Public\\Documents\\report.locked");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let roots = Roots {
+            ransom: vec![fs_plan::normalise_root("C:\\Users")],
+            ..Default::default()
+        };
+        let mut planner = Planner::new(roots.clone(), Instant::now());
+        for _ in 0..2 {
+            let event =
+                notify::Event::new(EventKind::Create(CreateKind::File)).add_path(path.clone());
+            enqueue_relevant(Ok(event), &tx, |p| relevant_path(p, &roots));
+            let changes = rx.try_recv().unwrap().unwrap();
+            assert_eq!(changes, vec![(Change::Created, path.clone())]);
+            let actions = planner.plan(
+                Change::Created,
+                &path.to_string_lossy(),
+                Instant::now(),
+                false,
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::RansomExtension { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_filter_preserves_rename_halves_and_rejects_nested_tamper_siblings() {
+        let from = PathBuf::from("D:\\Agent\\nested\\config\\binary.sig");
+        let to = PathBuf::from("D:\\Agent\\nested\\state.json");
+        let roots = Roots {
+            tamper: vec![
+                fs_plan::normalise_root("D:\\Agent"),
+                fs_plan::normalise_root("D:\\Agent\\nested\\config"),
+            ],
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(from.clone())
+            .add_path(to.clone());
+        enqueue_relevant(Ok(event), &tx, |p| relevant_path(p, &roots));
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap(),
+            vec![(Change::RenamedFrom, from)]
+        );
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(to)
+            .add_path(PathBuf::from("D:\\Agent\\nested\\config\\binary.sha256"));
+        enqueue_relevant(Ok(event), &tx, |p| relevant_path(p, &roots));
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap(),
+            vec![(
+                Change::RenamedTo,
+                PathBuf::from("D:\\Agent\\nested\\config\\binary.sha256")
+            )]
+        );
+    }
+
+    async fn ransom_count(
+        rx: &mut tokio::sync::mpsc::Receiver<Notification>,
+        watches: &mut FilesystemWatches,
+        planner: &mut Planner,
+    ) -> usize {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut count = 0;
+            loop {
+                let received = if count == 0 {
+                    rx.recv().await
+                } else {
+                    match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+                        Ok(received) => received,
+                        Err(_) => return count,
+                    }
+                };
+                let changes = match received.expect("watcher channel closed") {
+                    Ok(changes) => changes,
+                    Err(_) => continue,
+                };
+                for (change, path) in changes {
+                    watches.rearm(change, &path);
+                    count += planner
+                        .plan(change, &path.to_string_lossy(), Instant::now(), false)
+                        .iter()
+                        .filter(|action| matches!(action, Action::RansomExtension { .. }))
+                        .count();
+                }
+            }
+        })
+        .await
+        .expect("ransomware change must reach the planner")
+    }
+
+    #[tokio::test]
+    async fn overlapping_native_watchers_emit_one_alarm_per_real_file_creation() {
+        let directory =
+            TestDirectory(std::env::temp_dir().join(format!("trapd-fs-{}", uuid::Uuid::new_v4())));
+        let profile = directory.0.join("Users");
+        let generic_root = profile.join("Public\\Documents");
+        std::fs::create_dir_all(&generic_root).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut fixed =
+            FilesystemWatches::new(std::slice::from_ref(&profile), &[], &[], tx).unwrap();
+        fixed.set_generic(vec![generic_root.clone()]);
+        assert!(
+            !fixed
+                .watched
+                .contains_key(&fs_plan::normalise_root(&generic_root.to_string_lossy())),
+            "the existing recursive ancestor must serve both scopes"
+        );
+        let mut planner = Planner::new(
+            Roots {
+                ransom: fixed.scope.read().unwrap().ransom.clone(),
+                generic: vec![fs_plan::normalise_root(&generic_root.to_string_lossy())],
+                ..Default::default()
+            },
+            Instant::now(),
+        );
+        let file = generic_root.join("report.locked");
+        std::fs::write(&file, b"first creation").unwrap();
+        assert_eq!(ransom_count(&mut rx, &mut fixed, &mut planner).await, 1);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, b"second real creation").unwrap();
+        assert_eq!(ransom_count(&mut rx, &mut fixed, &mut planner).await, 1);
+    }
+
+    #[tokio::test]
+    async fn recursive_fixed_scope_survives_root_replacement_under_shared_parent_handle() {
+        let directory =
+            TestDirectory(std::env::temp_dir().join(format!("trapd-fs-{}", uuid::Uuid::new_v4())));
+        let profile = directory.0.join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut fixed =
+            FilesystemWatches::new(std::slice::from_ref(&profile), &[], &[], tx).unwrap();
+        fixed.set_generic(vec![directory.0.clone()]);
+        let mut planner = Planner::new(
+            Roots {
+                ransom: fixed.scope.read().unwrap().ransom.clone(),
+                generic: vec![fs_plan::normalise_root(&directory.0.to_string_lossy())],
+                ..Default::default()
+            },
+            Instant::now(),
+        );
+        std::fs::rename(&profile, directory.0.join("profile-old")).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let Ok(changes) = rx.recv().await.unwrap() else {
+                    continue;
+                };
+                let removed = changes
+                    .iter()
+                    .any(|(change, path)| *change == Change::RenamedFrom && path == &profile);
+                for (change, path) in changes {
+                    fixed.rearm(change, &path);
+                }
+                if removed {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("root rename must invalidate and close the old watch");
+        std::fs::create_dir(&profile).unwrap();
+        // The shared recursive ancestor supplies this change even before
+        // the recreated fixed root's notification has been consumed.
+        std::fs::write(profile.join("during-replacement.locked"), b"replacement").unwrap();
+        assert_eq!(ransom_count(&mut rx, &mut fixed, &mut planner).await, 1);
+        std::fs::write(profile.join("after-rearm.locked"), b"later").unwrap();
+        assert_eq!(ransom_count(&mut rx, &mut fixed, &mut planner).await, 1);
+        fixed.set_generic(Vec::new());
+        planner.set_generic_roots(Vec::new());
+        std::fs::write(
+            profile.join("after-generic-removal.locked"),
+            b"still monitored",
+        )
+        .unwrap();
+        assert_eq!(ransom_count(&mut rx, &mut fixed, &mut planner).await, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_fixed_child_migration_keeps_working_recursive_ancestor() {
+        let directory =
+            TestDirectory(std::env::temp_dir().join(format!("trapd-fs-{}", uuid::Uuid::new_v4())));
+        let config = directory.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut watches =
+            FilesystemWatches::new(&[], &[], std::slice::from_ref(&config), tx).unwrap();
+        watches.set_generic(vec![directory.0.clone()]);
+        let parent_key = fs_plan::normalise_root(&directory.0.to_string_lossy());
+        let config_key = fs_plan::normalise_root(&config.to_string_lossy());
+        assert!(!watches.watched.contains_key(&config_key));
+        watches.fail_watch = Some(config_key.clone());
+        watches.set_generic(Vec::new());
+        assert_eq!(
+            watches.watched.get(&parent_key).unwrap().1,
+            RecursiveMode::Recursive
+        );
+        let mut planner = Planner::new(watches.scope.read().unwrap().clone(), Instant::now());
+        let key = config.join("command_signing.pub");
+        std::fs::write(&key, b"while direct handle is unavailable").unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &key, "create").await;
+        watches.fail_watch = None;
+        watches.sync();
+        assert_eq!(
+            watches.watched.get(&parent_key).unwrap().1,
+            RecursiveMode::NonRecursive
+        );
+        assert!(watches.watched.contains_key(&config_key));
+        std::fs::write(&key, b"after retry recovered").unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &key, "modify").await;
+    }
+
+    #[tokio::test]
+    async fn initially_missing_generic_roots_can_be_retried_without_config_changes() {
+        let directory =
+            TestDirectory(std::env::temp_dir().join(format!("trapd-fs-{}", uuid::Uuid::new_v4())));
+        let target = directory.0.join("created-later");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut watches = FilesystemWatches::new(&[], &[], &[], tx).unwrap();
+        watches.set_generic(vec![target.clone()]);
+        let key = fs_plan::normalise_root(&target.to_string_lossy());
+        assert!(!watches.watched.contains_key(&key));
+        std::fs::create_dir_all(&target).unwrap();
+        watches.sync();
+        assert!(watches.watched.contains_key(&key));
+        let file = target.join("observed.txt");
+        std::fs::write(&file, b"newly watched").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let Ok(changes) = rx.recv().await.unwrap() else {
+                    continue;
+                };
+                if changes
+                    .iter()
+                    .any(|(change, path)| *change == Change::Created && path == &file)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("created generic root must be monitored after retry");
+    }
+
+    #[tokio::test]
+    async fn native_integrity_changes_are_reported_immediately_after_watch_start() {
+        let directory =
+            TestDirectory(std::env::temp_dir().join(format!("trapd-fs-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut watches =
+            FilesystemWatches::new(&[], &[], std::slice::from_ref(&directory.0), tx).unwrap();
+        let mut planner = Planner::new(
+            Roots {
+                tamper: watches.scope.read().unwrap().tamper.clone(),
+                ..Default::default()
+            },
+            Instant::now(),
+        );
+        for name in ["binary.sha256", "binary.version", "binary.sig"] {
+            let path = directory.0.join(name);
+            std::fs::write(&path, b"foreign creation").unwrap();
+            expect_tamper(&mut rx, &mut watches, &mut planner, &path, "create").await;
+            std::fs::write(&path, b"foreign modification").unwrap();
+            expect_tamper(&mut rx, &mut watches, &mut planner, &path, "modify").await;
+            std::fs::remove_file(&path).unwrap();
+            expect_tamper(&mut rx, &mut watches, &mut planner, &path, "delete").await;
+        }
+    }
+
     async fn expect_tamper(
-        rx: &mut tokio::sync::mpsc::Receiver<notify::Result<notify::Event>>,
-        watches: &mut TamperWatches,
+        rx: &mut tokio::sync::mpsc::Receiver<Notification>,
+        watches: &mut FilesystemWatches,
         planner: &mut Planner,
         wanted_path: &std::path::Path,
         wanted_action: &str,
@@ -575,15 +946,10 @@ mod tests {
                     Ok(notification) => notification,
                     Err(_) => continue,
                 };
-                for (change, path) in change_for(&notification.kind, &notification.paths) {
+                for (change, path) in notification {
                     watches.rearm(change, &path);
-                    let actions = planner.plan(
-                        change,
-                        &path.to_string_lossy(),
-                        Instant::now(),
-                        Duration::from_secs(3600),
-                        false,
-                    );
+                    let actions =
+                        planner.plan(change, &path.to_string_lossy(), Instant::now(), false);
                     if actions.iter().any(|action| {
                         matches!(action,
                             Action::Tamper { path, action }
@@ -608,26 +974,20 @@ mod tests {
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(&key, b"original key").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let mut watches = TamperWatches::new(std::slice::from_ref(&config), tx).unwrap();
+        let mut watches =
+            FilesystemWatches::new(&[], &[], std::slice::from_ref(&config), tx).unwrap();
         let mut planner = Planner::new(
             Roots {
-                tamper: watches.scope.clone(),
+                tamper: watches.scope.read().unwrap().tamper.clone(),
                 ..Roots::default()
             },
             Instant::now(),
         );
 
-        // Live telemetry may watch the same parent and then remove its scope.
-        // Its handle must not own or remove the fixed detection watches.
-        let mut generic = RecommendedWatcher::new(
-            |_: notify::Result<notify::Event>| {},
-            notify::Config::default(),
-        )
-        .unwrap();
-        generic
-            .watch(&directory.0, RecursiveMode::Recursive)
-            .unwrap();
-        generic.unwatch(&directory.0).unwrap();
+        // Removing live telemetry must retain the fixed logical scope and
+        // install its child handle before downgrading the shared ancestor.
+        watches.set_generic(vec![directory.0.clone()]);
+        watches.set_generic(Vec::new());
 
         std::fs::rename(&config, directory.0.join("config-old")).unwrap();
         expect_tamper(&mut rx, &mut watches, &mut planner, &config, "delete").await;
@@ -654,10 +1014,11 @@ mod tests {
         let config = install.join("config");
         std::fs::create_dir_all(&config).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let mut watches = TamperWatches::new(&[config.clone(), install.clone()], tx).unwrap();
+        let mut watches =
+            FilesystemWatches::new(&[], &[], &[config.clone(), install.clone()], tx).unwrap();
         let mut planner = Planner::new(
             Roots {
-                tamper: watches.scope.clone(),
+                tamper: watches.scope.read().unwrap().tamper.clone(),
                 ..Roots::default()
             },
             Instant::now(),
@@ -684,7 +1045,7 @@ mod tests {
         let config = directory.0.join("config");
         std::fs::create_dir_all(&config).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let _watches = TamperWatches::new(&[config], tx).unwrap();
+        let _watches = FilesystemWatches::new(&[], &[], &[config], tx).unwrap();
         for i in 0..100 {
             std::fs::write(
                 directory.0.join(format!("state-{i}.json")),

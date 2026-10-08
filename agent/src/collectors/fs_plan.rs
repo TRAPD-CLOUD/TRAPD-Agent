@@ -205,7 +205,6 @@ impl Planner {
         change: Change,
         path: &str,
         now: Instant,
-        process_uptime: Duration,
         update_in_flight: bool,
     ) -> Vec<Action> {
         let norm = normalise(path);
@@ -214,7 +213,7 @@ impl Planner {
         // Agent configuration: any foreign change is critical.
         if is_tamper_path(&norm, &self.roots.tamper) {
             let file = norm.rsplit('\\').next().unwrap_or(&norm);
-            if !is_expected_self_write(file, process_uptime, update_in_flight) {
+            if !is_expected_self_write(file, update_in_flight) {
                 let action = match change {
                     Change::Deleted | Change::RenamedFrom => "delete",
                     Change::Created | Change::RenamedTo => "create",
@@ -298,7 +297,7 @@ mod tests {
     }
 
     fn plan(p: &mut Planner, c: Change, path: &str, t: Instant) -> Vec<Action> {
-        p.plan(c, path, t, Duration::from_secs(3600), false)
+        p.plan(c, path, t, false)
     }
 
     #[test]
@@ -564,27 +563,34 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_own_start_up_write_is_not_reported_as_tamper() {
+    fn integrity_changes_are_tamper_from_the_first_notification() {
+        let now = Instant::now();
+        let mut planner = Planner::new(roots(), now);
+        for name in [
+            "binary.sha256",
+            "binary.version",
+            "binary.sig",
+            ".binary.sha256.tmp.42",
+        ] {
+            for change in [Change::Created, Change::Modified, Change::Deleted] {
+                let path = format!("C:\\ProgramData\\TRAPD\\config\\{name}");
+                let actions = planner.plan(change, &path, now, false);
+                assert!(
+                    matches!(actions.as_slice(), [Action::Tamper { .. }]),
+                    "{path}: {actions:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_in_flight_update_integrity_writes_are_excused() {
         let t = Instant::now();
         let mut p = Planner::new(roots(), t);
         let baseline = "C:\\ProgramData\\TRAPD\\config\\binary.sha256";
-        let early = p.plan(Change::Modified, baseline, t, Duration::from_secs(5), false);
-        assert!(early.is_empty(), "{early:?}");
-        let late = p.plan(
-            Change::Modified,
-            baseline,
-            t,
-            Duration::from_secs(7200),
-            false,
-        );
-        assert!(matches!(late.as_slice(), [Action::Tamper { .. }]));
-        let updating = p.plan(
-            Change::Modified,
-            baseline,
-            t,
-            Duration::from_secs(7200),
-            true,
-        );
+        let foreign = p.plan(Change::Modified, baseline, t, false);
+        assert!(matches!(foreign.as_slice(), [Action::Tamper { .. }]));
+        let updating = p.plan(Change::Modified, baseline, t, true);
         assert!(updating.is_empty());
     }
 

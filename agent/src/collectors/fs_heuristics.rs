@@ -229,19 +229,15 @@ impl CheckThrottle {
 /// update helper) doing its job rather than tampering.
 ///
 ///   * Configuration directory: the integrity baseline and version record are
-///     written at start-up and on upgrade, and every atomic write goes through a
-///     dot-prefixed temporary sibling.
+///     written on upgrade, and every atomic write goes through a dot-prefixed
+///     temporary sibling. Initial integrity checks finish before collectors
+///     start, so process age never excuses later changes.
 ///   * Install directory: the binary is renamed, replaced and restored only
 ///     while a verified update is being applied.
 ///
 /// Anything else, at any time, is reported.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn is_expected_self_write(
-    file_name: &str,
-    process_uptime: Duration,
-    update_in_flight: bool,
-) -> bool {
-    const STARTUP_GRACE: Duration = Duration::from_secs(120);
+pub fn is_expected_self_write(file_name: &str, update_in_flight: bool) -> bool {
     let lower = file_name.to_ascii_lowercase();
     let is_atomic_temp = lower.starts_with('.') && lower.contains(".tmp.");
     let is_baseline = matches!(
@@ -252,9 +248,7 @@ pub fn is_expected_self_write(
         lower.as_str(),
         "trapd-agent.exe" | "trapd-agent.exe.prev" | ".trapd-agent.exe.new"
     );
-    let during_startup_or_update = process_uptime < STARTUP_GRACE || update_in_flight;
-    ((is_atomic_temp || is_baseline) && during_startup_or_update)
-        || (is_binary_swap && update_in_flight)
+    (is_atomic_temp || is_baseline || is_binary_swap) && update_in_flight
 }
 
 // ── Event construction ────────────────────────────────────────────────────────
@@ -497,30 +491,21 @@ mod tests {
 
     #[test]
     fn only_agent_owned_files_are_excused_and_only_at_the_right_time() {
-        let early = Duration::from_secs(10);
-        let late = Duration::from_secs(3600);
-        // Start-up writes of the integrity record.
-        assert!(is_expected_self_write("binary.sha256", early, false));
-        assert!(is_expected_self_write("binary.version", early, false));
-        assert!(is_expected_self_write(
+        for name in [
+            "binary.sha256",
+            "binary.version",
+            "binary.sig",
             ".binary.sha256.tmp.4242",
-            early,
-            false
-        ));
-        // Long after start-up the same write is not the agent's doing …
-        assert!(!is_expected_self_write("binary.sha256", late, false));
-        // … unless an update is being applied.
-        assert!(is_expected_self_write("binary.sha256", late, true));
-        // The binary swap is only legitimate while an update is applied — not
-        // merely because the process is young.
-        assert!(is_expected_self_write("trapd-agent.exe", late, true));
-        assert!(is_expected_self_write("trapd-agent.exe.prev", late, true));
-        assert!(!is_expected_self_write("trapd-agent.exe", early, false));
-        assert!(!is_expected_self_write("trapd-agent.exe", late, false));
+            "trapd-agent.exe",
+            "trapd-agent.exe.prev",
+        ] {
+            assert!(!is_expected_self_write(name, false));
+            assert!(is_expected_self_write(name, true));
+        }
         // Anything else in the directory is always tamper.
-        assert!(!is_expected_self_write("command_signing.pub", early, true));
-        assert!(!is_expected_self_write("agent.env", early, true));
-        assert!(!is_expected_self_write("policy.json", early, true));
+        assert!(!is_expected_self_write("command_signing.pub", true));
+        assert!(!is_expected_self_write("agent.env", true));
+        assert!(!is_expected_self_write("policy.json", true));
     }
 
     #[test]
