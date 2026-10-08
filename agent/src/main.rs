@@ -373,9 +373,9 @@ async fn main() -> Result<()> {
         let tx_ap = tx.clone();
         let aid = agent_id.clone();
         let host = hostname.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             selfprotect::anti_ptrace::run(tx_ap, aid, host).await;
-        });
+        }));
     }
 
     // Windows: OS-neutral system snapshots, a sysinfo-based process collector
@@ -386,7 +386,15 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         spawn_collector!(SystemCollector::new());
-        spawn_collector!(collectors::windows::process::ProcessCollector::new());
+        spawn_collector!(collectors::windows::sensor_supervisor::SensorSupervisor::new(
+            Arc::clone(&agent_config)
+        ));
+        spawn_collector!(collectors::windows::eventlog::EventLogCollector::new(
+            Arc::clone(&agent_config)
+        ));
+        crate::deception::activity::set_enabled(
+            agent_config.read().map(|c| c.deception_activity_learning_enabled).unwrap_or(false)
+        );
         spawn_collector!(collectors::windows::honeytokens::HoneytokenCollector::new(
             Arc::clone(&agent_config)
         ));
@@ -509,11 +517,22 @@ async fn main() -> Result<()> {
         let started = std::time::Instant::now();
         let report_path = telemetry::TelemetryReport::default_path();
         let baseline_engine = std::sync::Arc::clone(&engine);
+        #[cfg(windows)]
+        let learning_config = Arc::clone(&agent_config);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 ticker.tick().await;
                 baseline_engine.persist_baseline();
+                #[cfg(windows)]
+                {
+                    let enabled = learning_config.read()
+                        .map(|c| c.deception_activity_learning_enabled).unwrap_or(false);
+                    if crate::deception::activity::enabled() != enabled {
+                        crate::deception::activity::set_enabled(enabled);
+                    }
+                    crate::deception::activity::persist();
+                }
                 let report =
                     telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
                 if let Err(e) = report.write_atomic(&report_path) {

@@ -9,12 +9,12 @@ use windows_sys::Win32::System::EventLog::*;
 
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
+use crate::detection::windows_decoy;
+use crate::schema::DetectionData;
 use crate::schema::{
     AgentEvent, EventAction, EventClass, EventData, HoneytokenAccessData, LogEventData, Severity,
     UserLogonData,
 };
-use crate::detection::windows_decoy;
-use crate::schema::DetectionData;
 
 struct Handle(EVT_HANDLE);
 impl Drop for Handle {
@@ -211,7 +211,10 @@ fn parse(xml: &str, channel: &str) -> Result<(u64, LogEventData, Option<UserLogo
 
 /// Record the logon type of a 4624 success so later object-access events can
 /// be graded by session kind. Bounded to 4096 entries.
-fn capture_logon_type(fields: &serde_json::Map<String, serde_json::Value>, cache: &mut HashMap<String, u32>) {
+fn capture_logon_type(
+    fields: &serde_json::Map<String, serde_json::Value>,
+    cache: &mut HashMap<String, u32>,
+) {
     let id = fields.get("EventID").and_then(|v| v.as_u64());
     if id != Some(4624) {
         return;
@@ -234,11 +237,19 @@ fn capture_logon_type(fields: &serde_json::Map<String, serde_json::Value>, cache
 fn decoy_access(
     fields: &serde_json::Map<String, serde_json::Value>,
     logon_types: &HashMap<String, u32>,
+    observed: Option<chrono::DateTime<chrono::Utc>>,
+    devices: &crate::collectors::etw_map::DeviceMap,
 ) -> Option<HoneytokenAccessData> {
     if fields.get("EventID").and_then(|v| v.as_u64()) != Some(4663) {
         return None;
     }
-    let get = |k: &str| fields.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let get = |k: &str| {
+        fields
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let object = get("ObjectName");
     if object.is_empty() {
         return None;
@@ -246,13 +257,41 @@ fn decoy_access(
     let decoy = windows_decoy::lookup_decoy(&object)?;
     let logon_type = {
         let id = get("SubjectLogonId");
-        (!id.is_empty()).then(|| logon_types.get(&id).copied()).flatten()
+        (!id.is_empty())
+            .then(|| logon_types.get(&id).copied())
+            .flatten()
     };
-    // Signature verification of the accessor is a follow-up; until then only
-    // explicitly configured allowlist names count as trusted (none here), so a
-    // sweeper is never auto-trusted on name alone.
-    let accessor = windows_decoy::accessor_from_4663(|k| get(k), logon_type, false);
-    let verdict = windows_decoy::grade(&decoy, &accessor, None);
+    let mut accessor = windows_decoy::accessor_from_4663(|k| get(k), logon_type, false);
+    // Security auditing can report an NT device image while current_exe and
+    // live process queries return DOS paths. Compare the full mapped identity.
+    accessor.process_name =
+        crate::collectors::etw_map::device_to_dos(&accessor.process_name, devices);
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let pid = std::process::id() as i32;
+    let observed_filetime = observed
+        .and_then(|t| t.timestamp_millis().checked_add(11_644_473_600_000))
+        .and_then(|t| u64::try_from(t).ok())
+        .and_then(|t| t.checked_mul(10_000));
+    if windows_decoy::is_agent_self_read(
+        &accessor,
+        pid,
+        &exe,
+        crate::telemetry::identity::process_start_time(pid),
+        observed_filetime,
+    ) {
+        return None;
+    }
+    accessor.signed_trusted = super::sweeper_identity::verified(&accessor, observed_filetime);
+    let unusual = observed.and_then(|t| {
+        use chrono::Timelike;
+        crate::deception::activity::current_summaries()
+            .get(&accessor.subject_user.to_lowercase())
+            .and_then(|s| s.is_unusual_hour(t.hour()))
+    });
+    let verdict = windows_decoy::grade(&decoy, &accessor, unusual);
     Some(windows_decoy::to_access_data(&decoy, &accessor, &verdict))
 }
 
@@ -261,8 +300,14 @@ fn decoy_access(
 fn audit_tamper(fields: &serde_json::Map<String, serde_json::Value>) -> Option<DetectionData> {
     let id = fields.get("EventID").and_then(|v| v.as_u64())?;
     let (title, detail) = match id {
-        1102 => ("Security event log cleared", "The Windows Security log was cleared"),
-        4719 => ("System audit policy changed", "The system audit policy was changed"),
+        1102 => (
+            "Security event log cleared",
+            "The Windows Security log was cleared",
+        ),
+        4719 => (
+            "System audit policy changed",
+            "The system audit policy was changed",
+        ),
         _ => return None,
     };
     Some(DetectionData {
@@ -308,6 +353,7 @@ impl Collector for EventLogCollector {
         // can be graded by how its subject logged on (interactive vs. RDP vs.
         // service). Bounded; oldest dropped on overflow.
         let mut logon_types: HashMap<String, u32> = HashMap::new();
+        let devices = super::etw::device_map();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             ticker.tick().await;
@@ -368,15 +414,27 @@ impl Collector for EventLogCollector {
                             }
                         }
                         if cursor.is_some() {
-                            if let Some(hit) = decoy_access(&data.fields, &logon_types) {
-                                let ev = AgentEvent::new(
+                            if let Some(hit) = decoy_access(
+                                &data.fields,
+                                &logon_types,
+                                data.log_timestamp,
+                                &devices,
+                            ) {
+                                let outcome = crate::detection::honeytoken_policy::assess(
+                                    &hit,
+                                    Severity::Critical,
+                                );
+                                let mut ev = AgentEvent::new(
                                     agent_id.clone(),
                                     hostname.clone(),
                                     EventClass::Detection,
                                     EventAction::HoneytokenAccess,
-                                    Severity::Critical,
+                                    outcome.severity,
                                     EventData::HoneytokenAccess(Box::new(hit)),
                                 );
+                                if let Some(time) = data.log_timestamp {
+                                    ev.timestamp = time;
+                                }
                                 if tx.send(ev).await.is_err() {
                                     return Ok(());
                                 }
@@ -440,5 +498,132 @@ mod tests {
         assert_eq!(auth.username, "Jörg & Co");
         assert_eq!(auth.src_addr.as_deref(), Some("10.0.0.1"));
         assert!(!auth.success);
+    }
+    #[test]
+    #[ignore = "requires elevated native Windows with Audit File System success enabled"]
+    fn native_4663_self_read_is_suppressed_and_foreign_read_alerts() {
+        use super::super::decoy_audit;
+        // Runners expose TEMP as an 8.3 short name (RUNNER~1) while other
+        // processes are audited under the long name; register the long form.
+        let canonical = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let temp = std::path::PathBuf::from(canonical.trim_start_matches(r"\\?\"));
+        let path = temp.join(format!("trapd-4663-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"native audit fixture").unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                windows_decoy::forget_decoy(&self.0.to_string_lossy());
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+        assert_eq!(decoy_audit::file_audit_enabled(), Some(true));
+        assert!(decoy_audit::set_read_audit_sacl(&path));
+        windows_decoy::register_decoy(windows_decoy::DecoyInfo {
+            token_id: uuid::Uuid::new_v4().to_string(),
+            path: path.to_string_lossy().into_owned(),
+            kind: "password_note".into(),
+            owner_sid: decoy_audit::owner_sid(&path).unwrap(),
+            audit_ready: true,
+        });
+        let newest = read("Security", None).unwrap();
+        let mut cursor = newest
+            .first()
+            .map(|xml| parse(xml, "Security").unwrap().0)
+            .unwrap_or(0);
+        for _ in 0..3 {
+            assert!(!std::fs::read(&path).unwrap().is_empty());
+        }
+        let mut child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "[void][System.IO.File]::ReadAllBytes($env:TRAPD_NATIVE_AUDIT_FILE); Start-Sleep -Seconds 3"])
+            .env("TRAPD_NATIVE_AUDIT_FILE", &path).spawn().unwrap();
+        let child_pid = child.id() as i32;
+        let mut self_reads = 0;
+        let devices = super::super::etw::device_map();
+        let mut foreign_alert = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline && (self_reads < 3 || !foreign_alert) {
+            for xml in read("Security", Some(cursor)).unwrap() {
+                let (record, data, _) = parse(&xml, "Security").unwrap();
+                cursor = cursor.max(record);
+                if data.fields.get("EventID").and_then(|v| v.as_u64()) == Some(4663) {
+                    let f = |k: &str| {
+                        data.fields
+                            .get(k)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let object = f("ObjectName");
+                    if object.contains("trapd-4663") {
+                        eprintln!(
+                            "4663 raw: object={object:?} pid={} mask={} process={:?}",
+                            f("ProcessId"),
+                            f("AccessMask"),
+                            f("ProcessName")
+                        );
+                    }
+                }
+                if data.fields.get("EventID").and_then(|v| v.as_u64()) != Some(4663)
+                    || !data
+                        .fields
+                        .get("ObjectName")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|p| p.eq_ignore_ascii_case(&path.to_string_lossy()))
+                {
+                    continue;
+                }
+                let get = |key: &str| {
+                    data.fields
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let accessor = windows_decoy::accessor_from_4663(get, None, false);
+                if accessor.access_mask & windows_decoy::FILE_READ_DATA == 0 {
+                    continue;
+                }
+                let hit = decoy_access(&data.fields, &HashMap::new(), data.log_timestamp, &devices);
+                eprintln!(
+                    "4663 read: pid={} (child={}, self={}) image={:?} mask={:#x} user={:?} hit={:?}",
+                    accessor.pid,
+                    child_pid,
+                    std::process::id(),
+                    accessor.process_name,
+                    accessor.access_mask,
+                    accessor.subject_user,
+                    hit.as_ref().map(|h| (&h.access_kind, h.confidence, &h.assessment)),
+                );
+                if accessor.pid == std::process::id() as i32 {
+                    self_reads += 1;
+                    assert!(
+                        hit.is_none(),
+                        "live agent health read must be excluded: image={:?}, current={:?}, mask={:#x}, started={:?}, observed={:?}",
+                        accessor.process_name,
+                        std::env::current_exe(),
+                        accessor.access_mask,
+                        crate::telemetry::identity::process_start_time(accessor.pid),
+                        data.log_timestamp,
+                    );
+                } else if accessor.pid == child_pid {
+                    let hit = hit.expect("foreign read must remain visible");
+                    let outcome = crate::detection::honeytoken_policy::assess(&hit, Severity::High);
+                    assert_eq!(outcome.mode, crate::schema::DetectionMode::Alert);
+                    foreign_alert = true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(child.wait().unwrap().success());
+        assert!(
+            self_reads >= 3,
+            "4663 stream must include every health read"
+        );
+        assert!(foreign_alert, "real PowerShell read must generate an Alert");
     }
 }

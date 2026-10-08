@@ -1,7 +1,7 @@
 [package]
 license = "Apache-2.0"
 name    = "trapd-agent"
-version = "0.6.9"
+version = "0.6.10"
 edition = "2021"
 
 [[bin]]
@@ -80,6 +80,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Time",
     "Win32_Security_Authorization",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Authentication_Identity",
 ] }
 roxmltree = "0.20"
 windows-service = "0.7"

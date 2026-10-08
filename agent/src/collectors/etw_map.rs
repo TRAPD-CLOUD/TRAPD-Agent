@@ -81,6 +81,19 @@ impl EtwRecord {
     }
 }
 
+/// ETW session uses system-time ticks (FILETIME), never QPC ticks.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn filetime_timestamp(ticks: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    if ticks <= 0 {
+        return None;
+    }
+    let unix_ticks = ticks.checked_sub(116_444_736_000_000_000)?;
+    chrono::DateTime::from_timestamp(
+        unix_ticks.div_euclid(10_000_000),
+        (unix_ticks.rem_euclid(10_000_000) * 100) as u32,
+    )
+}
+
 /// NT device prefix → drive, e.g. (`\Device\HarddiskVolume3`, `C:`).
 pub type DeviceMap = Vec<(String, String)>;
 
@@ -91,7 +104,9 @@ pub fn device_to_dos(path: &str, devices: &DeviceMap) -> String {
     let path = path.strip_prefix("\\??\\").unwrap_or(path);
     for (device, drive) in devices {
         if path.len() > device.len()
-            && path[..device.len()].eq_ignore_ascii_case(device)
+            && path
+                .get(..device.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(device))
             && path.as_bytes()[device.len()] == b'\\'
         {
             return format!("{drive}{}", &path[device.len()..]);
@@ -114,6 +129,11 @@ pub struct ProcessEnrichment {
     pub exe_sha256: Option<String>,
 }
 
+/// Enrichment is valid only for the generation that produced this source event.
+pub fn same_process_generation(start: Option<u64>, current: Option<u64>, observed: i64) -> bool {
+    start.is_some_and(|s| s > 0 && current == Some(s) && observed >= 0 && observed as u64 >= s)
+}
+
 /// Kernel-Process event 1 → process create.
 pub fn process_start(
     rec: &EtwRecord,
@@ -123,10 +143,11 @@ pub fn process_start(
     if rec.provider != KERNEL_PROCESS || rec.id != 1 {
         return None;
     }
-    let pid = rec.int(&["ProcessID", "ProcessId"])? as i32;
+    let pid = i32::try_from(rec.int(&["ProcessID", "ProcessId"])?).ok()?;
     let ppid = rec
         .int(&["ParentProcessID", "ParentId", "ParentProcessId"])
-        .unwrap_or(0) as i32;
+        .and_then(|p| i32::try_from(p).ok())
+        .unwrap_or(0);
     let image = rec
         .str(&["ImageName", "ImageFileName"])
         .map(|p| device_to_dos(&p, devices))
@@ -159,7 +180,7 @@ pub fn process_stop(rec: &EtwRecord, devices: &DeviceMap) -> Option<ProcessTermi
     if rec.provider != KERNEL_PROCESS || rec.id != 2 {
         return None;
     }
-    let pid = rec.int(&["ProcessID", "ProcessId"])? as i32;
+    let pid = i32::try_from(rec.int(&["ProcessID", "ProcessId"])?).ok()?;
     let name = rec
         .str(&["ImageName", "ImageFileName"])
         .map(|p| basename(&device_to_dos(&p, devices)))
@@ -172,7 +193,7 @@ pub fn image_load(rec: &EtwRecord, devices: &DeviceMap) -> Option<(i32, String)>
     if rec.provider != KERNEL_PROCESS || rec.id != 5 {
         return None;
     }
-    let pid = rec.int(&["ProcessID", "ProcessId"])? as i32;
+    let pid = i32::try_from(rec.int(&["ProcessID", "ProcessId"])?).ok()?;
     let image = rec.str(&["ImageName", "FileName"])?;
     Some((pid, device_to_dos(&image, devices)))
 }
@@ -211,7 +232,7 @@ pub fn network_connection(
         15 | 31 => true,
         _ => return None,
     };
-    let pid = rec.int(&["PID"]).map(|p| p as i32);
+    let pid = rec.int(&["PID"]).and_then(|p| i32::try_from(p).ok());
     let daddr = address(rec, "daddr")?;
     let saddr = address(rec, "saddr")?;
     let dport = port(rec, "dport")?;
@@ -343,6 +364,30 @@ mod tests {
             ("\\Device\\HarddiskVolume3".into(), "C:".into()),
             ("\\Device\\HarddiskVolume10".into(), "D:".into()),
         ]
+    }
+
+    #[test]
+    fn reused_pid_and_old_records_are_not_enriched() {
+        assert!(same_process_generation(Some(100), Some(100), 120));
+        assert!(!same_process_generation(Some(100), Some(200), 120));
+        assert!(!same_process_generation(Some(100), Some(100), 90));
+        assert!(!same_process_generation(None, Some(100), 120));
+        assert!(!same_process_generation(Some(100), None, 120));
+    }
+
+    #[test]
+    fn event_filetime_keeps_sensor_time_and_unicode_device_paths_do_not_panic() {
+        assert_eq!(
+            filetime_timestamp(116_444_736_000_000_000)
+                .unwrap()
+                .timestamp(),
+            0
+        );
+        assert!(filetime_timestamp(0).is_none());
+        assert_eq!(
+            device_to_dos("aéabc", &vec![("ab".into(), "C:".into())]),
+            "aéabc"
+        );
     }
 
     #[test]

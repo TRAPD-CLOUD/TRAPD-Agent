@@ -225,9 +225,6 @@ const SCHEDULERS: &[&str] = &[
 /// cannot be renamed like `comm`; an unknown lineage is not scheduled.
 fn launched_by_scheduler(ancestors: &[ProcessAncestor]) -> bool {
     for ancestor in ancestors {
-        if ancestor.pid == 1 {
-            return true;
-        }
         let Some(exe) = ancestor.exe.as_deref() else {
             return false;
         };
@@ -315,6 +312,8 @@ pub enum AccessKind {
     Mmap,
     /// getdents64 — a token's parent directory was listed (directory recon).
     Getdents,
+    /// A successful open with write/truncate intent.
+    Modify,
     /// Unrecognised kind from a newer/older kernel build — treated as full access.
     Unknown,
 }
@@ -411,6 +410,13 @@ impl AccessKind {
                 "TA0040 Impact",
                 "T1070.004",
             ),
+            Self::Modify => (
+                "modify",
+                Severity::Critical,
+                95,
+                "TA0040 Impact",
+                "T1565.001",
+            ),
             Self::Rename => ("rename", Severity::High, 85, "TA0040 Impact", "T1070.004"),
             // ── Metadata recon — strong lead, scored below content access ────
             Self::Stat => ("stat", Severity::High, 75, "TA0007 Discovery", "T1083"),
@@ -450,6 +456,8 @@ pub fn build_access_event(
     allowlist: &Allowlist,
     proc: &dyn ProcInfo,
 ) -> Option<AgentEvent> {
+    let normalized = normalized_hit(hit);
+    let hit = &normalized;
     let class = allowlist.classify(hit.pid);
     match class {
         AccessorClass::Agent => return None,
@@ -465,6 +473,27 @@ pub fn build_access_event(
     )
 }
 
+fn normalized_hit<'a>(hit: &AccessHit<'a>) -> AccessHit<'a> {
+    let kind = if matches!(
+        hit.access_kind,
+        AccessKind::Openat | AccessKind::Open | AccessKind::Openat2 | AccessKind::Mmap
+    ) {
+        if hit.open_flags & 0x20_0000 != 0 {
+            AccessKind::Stat
+        } else if hit.open_flags & (3 | 0x200) != 0 {
+            AccessKind::Modify
+        } else {
+            hit.access_kind
+        }
+    } else {
+        hit.access_kind
+    };
+    AccessHit {
+        access_kind: kind,
+        ..*hit
+    }
+}
+
 fn build_event(
     agent_id: &str,
     hostname: &str,
@@ -472,6 +501,8 @@ fn build_event(
     allowlisted: bool,
     proc: &dyn ProcInfo,
 ) -> Option<AgentEvent> {
+    let normalized = normalized_hit(hit);
+    let hit = &normalized;
     let accessor = ProcessLineage {
         pid: hit.pid,
         uid: hit.uid,
@@ -486,6 +517,10 @@ fn build_event(
     let (label, severity, confidence, tactic, technique) = hit.access_kind.describe();
 
     let mut data = HoneytokenAccessData {
+        sensor: Some(crate::schema::HoneytokenSensor::LinuxEbpf),
+        assessment: None,
+        assessment_reasons: Vec::new(),
+        mode: None,
         token_id: hit.token_id.to_string(),
         path: hit.path.to_string(),
         kind: hit.kind.to_string(),
@@ -505,9 +540,24 @@ fn build_event(
     // A backup/AV tool reading the bait on its schedule is expected. The same
     // tool started any other way (terminal, `ssh host cmd`, a reverse shell)
     // is how an attacker would exfiltrate with it, so it keeps its full score.
-    let interactive = data.session.as_ref().is_some_and(|s| s.tty.is_some());
-    data.scheduled_sweep =
-        allowlisted && !interactive && launched_by_scheduler(&data.accessor.ancestors);
+    let non_interactive = data
+        .session
+        .as_ref()
+        .is_some_and(|s| s.tty.is_none() && s.remote_addr.is_none());
+    data.scheduled_sweep = allowlisted
+        && matches!(
+            hit.access_kind,
+            AccessKind::Openat | AccessKind::Open | AccessKind::Openat2 | AccessKind::Mmap
+        )
+        && non_interactive
+        && launched_by_scheduler(&data.accessor.ancestors);
+    data.assessment = Some(if data.scheduled_sweep {
+        crate::schema::HoneytokenAssessment::ScheduledSweep
+    } else if hit.access_kind.is_metadata_only() {
+        crate::schema::HoneytokenAssessment::Metadata
+    } else {
+        crate::schema::HoneytokenAssessment::ContentAccess
+    });
     let severity = if data.scheduled_sweep {
         data.confidence = SCHEDULED_SWEEPER_CONFIDENCE;
         Severity::Info
@@ -637,6 +687,16 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn pid_one_without_verified_scheduler_image_is_not_a_schedule() {
+        assert!(!launched_by_scheduler(&[ProcessAncestor {
+            pid: 1,
+            comm: "systemd".into(),
+            exe: Some("/tmp/systemd".into()),
+            cmdline: None
+        }]));
+    }
+
+    #[test]
     fn parses_ppid_with_simple_comm() {
         let stat = "4242 (cat) R 4099 4242 4099 34816 4242 4194304 ...";
         assert_eq!(parse_stat_ppid(stat), Some(4099));
@@ -700,6 +760,7 @@ mod tests {
         comm: HashMap<i32, String>,
         exe: HashMap<i32, String>,
         tty: Option<String>,
+        session_resolved: bool,
     }
     impl ProcInfo for FakeProc {
         fn ppid(&self, pid: i32) -> Option<i32> {
@@ -719,8 +780,8 @@ mod tests {
         }
         fn session(&self, _pid: i32) -> Option<SessionContext> {
             // Keep lineage tests independent of the host's /proc.
-            self.tty.as_ref().map(|tty| SessionContext {
-                tty: Some(tty.clone()),
+            (self.session_resolved || self.tty.is_some()).then(|| SessionContext {
+                tty: self.tty.clone(),
                 ..SessionContext::default()
             })
         }
@@ -741,6 +802,7 @@ mod tests {
             comm,
             exe: HashMap::new(),
             tty: None,
+            session_resolved: false,
         }
     }
 
@@ -768,6 +830,42 @@ mod tests {
             access_kind: AccessKind::Openat,
         };
         assert!(build_access_event("a", "h", &hit, &al, &RealProc).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_path_is_metadata_and_write_flags_are_tamper() {
+        for kind in [
+            AccessKind::Openat,
+            AccessKind::Open,
+            AccessKind::Openat2,
+            AccessKind::Mmap,
+        ] {
+            let mut hit = sweeper_hit(100, kind);
+            hit.open_flags = 0x20_0000; // O_PATH: never a readable descriptor.
+            let ev = build_event("a", "h", &hit, false, &fake()).unwrap();
+            let EventData::HoneytokenAccess(d) = ev.data else {
+                panic!("payload")
+            };
+            assert_eq!(d.access_kind, "stat");
+            for flags in [1, 2, 0x200, 1 | 0x200] {
+                hit.open_flags = flags;
+                let ev = build_event(
+                    "a",
+                    "h",
+                    &hit,
+                    true,
+                    &lineage(100, &[(1, "systemd", "/usr/lib/systemd/systemd")]),
+                )
+                .unwrap();
+                let EventData::HoneytokenAccess(d) = ev.data else {
+                    panic!("payload")
+                };
+                assert_eq!(d.access_kind, "modify");
+                assert!(!d.scheduled_sweep);
+                assert!(d.confidence >= 90);
+            }
+        }
     }
 
     #[test]
@@ -960,6 +1058,7 @@ mod tests {
     /// first): `(pid, comm, exe)` per ancestor.
     fn lineage(pid: i32, chain: &[(i32, &str, &str)]) -> FakeProc {
         let mut proc = fake();
+        proc.session_resolved = true;
         let mut child = pid;
         for (ancestor, comm, exe) in chain {
             proc.ppid.insert(child, *ancestor);

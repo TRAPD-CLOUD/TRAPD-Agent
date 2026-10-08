@@ -23,13 +23,13 @@
 //! privileged attacker who stops the session itself (that stop *is* detected).
 
 use std::collections::HashMap;
-use std::sync::mpsc;
+
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
-use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind, Users};
+
+use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind};
 use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 use windows_sys::core::{GUID, PWSTR};
@@ -50,11 +50,31 @@ const MAX_HASH_CACHE: usize = 4096;
 /// Shared sink the C callback writes decoded records into, drained by the async
 /// side. A plain channel keeps the `unsafe extern "system"` callback tiny.
 struct Sink {
-    tx: std::sync::Mutex<mpsc::Sender<EtwRecord>>,
+    tx: tokio::sync::mpsc::Sender<EtwRecord>,
+    lost: std::sync::atomic::AtomicU64,
 }
 
-/// Passed to the callback through `EVENT_TRACE_LOGFILEW.Context`.
-static SINK: std::sync::OnceLock<Arc<Sink>> = std::sync::OnceLock::new();
+/// Stops the native session when its async consumer is cancelled or exits.
+struct NativeControl {
+    handle: CONTROLTRACE_HANDLE,
+    stopped: std::sync::atomic::AtomicBool,
+}
+impl NativeControl {
+    fn stop(&self) {
+        if !self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            unsafe {
+                let _ = stop_control(self.handle);
+            }
+        }
+    }
+}
+struct RunGuard(Arc<NativeControl>);
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.0.stop();
+        coverage::update(|c| c.etw_session = Some(false));
+    }
+}
 
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -74,16 +94,14 @@ impl Collector for EtwCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
-        let (rec_tx, rec_rx) = mpsc::channel::<EtwRecord>();
+        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<EtwRecord>(8192);
         let sink = Arc::new(Sink {
-            tx: std::sync::Mutex::new(rec_tx),
+            tx: rec_tx,
+            lost: std::sync::atomic::AtomicU64::new(0),
         });
-        if SINK.set(sink).is_err() {
-            return Err(anyhow!("ETW sensor already running"));
-        }
-
         // The blocking ProcessTrace loop owns a dedicated OS thread.
-        let session = Session::start().context("start ETW session")?;
+        let session = Session::start(sink).context("start ETW session")?;
+        let _guard = RunGuard(Arc::clone(&session.control));
         let trace_thread = std::thread::Builder::new()
             .name("trapd-etw".into())
             .spawn(move || session.process())
@@ -95,26 +113,31 @@ impl Collector for EtwCollector {
         });
         info!("WindowsEtwCollector: real-time ETW session started");
         crate::telemetry::metrics::metrics()
-            .set_collector_mode(crate::telemetry::metrics::CollectorMode::WindowsPolling);
+            .set_collector_mode(crate::telemetry::metrics::CollectorMode::WindowsEtw);
 
         let mut state = DecodeState::new();
-        // Drain decoded records on a blocking-friendly cadence. `recv_timeout`
-        // lets us notice the trace thread dying even in a quiet period.
+        // Callback handoff is bounded; native waits and enrichment never block Tokio.
         loop {
-            match rec_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                Ok(rec) => {
-                    for event in state.map(&rec, &agent_id, &hostname) {
-                        if tx.send(event).await.is_err() {
-                            return Ok(());
-                        }
-                    }
+            let rec = tokio::select! {
+                record = rec_rx.recv() => match record { Some(r) => r, None => break },
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    if trace_thread.is_finished() { break; }
+                    continue;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if trace_thread.is_finished() {
-                        break;
-                    }
+                _ = tx.closed() => return Ok(()),
+            };
+            let aid = agent_id.clone();
+            let host = hostname.clone();
+            let (next_state, events) = tokio::task::spawn_blocking(move || {
+                let events = state.map(&rec, &aid, &host);
+                (state, events)
+            })
+            .await?;
+            state = next_state;
+            for event in events {
+                if tx.send(event).await.is_err() {
+                    return Ok(());
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         // The session stopped: either we are shutting down, or something (a
@@ -149,8 +172,9 @@ impl Collector for EtwCollector {
 
 /// Owns the controller + consumer handles and the enabled providers.
 struct Session {
-    control: CONTROLTRACE_HANDLE,
+    control: Arc<NativeControl>,
     trace: PROCESSTRACE_HANDLE,
+    _sink: Arc<Sink>,
 }
 
 // The handles are process-wide kernel objects; the struct is only moved to the
@@ -158,7 +182,7 @@ struct Session {
 unsafe impl Send for Session {}
 
 impl Session {
-    fn start() -> Result<Self> {
+    fn start(sink: Arc<Sink>) -> Result<Self> {
         unsafe {
             // Stop a leftover session of the same name first.
             let _ = stop_named(SESSION_NAME);
@@ -170,7 +194,7 @@ impl Session {
             let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
             (*props).Wnode.BufferSize = buf_len as u32;
             (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-            (*props).Wnode.ClientContext = 1; // QPC timestamps
+            (*props).Wnode.ClientContext = 2; // system time / FILETIME
             (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
             (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
             (*props).BufferSize = 64; // KB
@@ -205,8 +229,17 @@ impl Session {
                     0,
                     std::ptr::null(),
                 );
+                coverage::update(|c| match guid {
+                    etw_map::KERNEL_PROCESS => c.etw_process_provider = Some(rc == ERROR_SUCCESS),
+                    etw_map::KERNEL_NETWORK => c.etw_network_provider = Some(rc == ERROR_SUCCESS),
+                    _ => c.etw_dns_provider = Some(rc == ERROR_SUCCESS),
+                });
                 if rc != ERROR_SUCCESS {
                     warn!(provider = %format!("{guid:032x}"), rc, "EnableTraceEx2 failed");
+                    if guid == etw_map::KERNEL_PROCESS {
+                        let _ = stop_control(control);
+                        return Err(anyhow!("ETW process provider unavailable: {rc}"));
+                    }
                 }
             }
 
@@ -216,6 +249,8 @@ impl Session {
             logfile.Anonymous1.ProcessTraceMode =
                 PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
             logfile.Anonymous2.EventRecordCallback = Some(event_callback);
+            logfile.Context = Arc::as_ptr(&sink) as *mut std::ffi::c_void;
+            logfile.BufferCallback = Some(buffer_callback);
             let trace = OpenTraceW(&mut logfile);
             if trace.Value == u64::MAX {
                 let _ = stop_named(SESSION_NAME);
@@ -224,7 +259,14 @@ impl Session {
                     std::io::Error::last_os_error()
                 ));
             }
-            Ok(Self { control, trace })
+            Ok(Self {
+                control: Arc::new(NativeControl {
+                    handle: control,
+                    stopped: std::sync::atomic::AtomicBool::new(false),
+                }),
+                trace,
+                _sink: sink,
+            })
         }
     }
 
@@ -233,8 +275,15 @@ impl Session {
         unsafe {
             let handles = [self.trace];
             let _ = ProcessTrace(handles.as_ptr(), 1, std::ptr::null(), std::ptr::null());
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        unsafe {
             CloseTrace(self.trace);
-            let _ = stop_control(self.control);
+            self.control.stop();
         }
     }
 }
@@ -267,15 +316,45 @@ fn guid_from_u128(v: u128) -> GUID {
 
 /// ETW record callback — kept minimal: decode to [`EtwRecord`], push to the
 /// channel. Runs on the ProcessTrace thread.
-unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
-    let Some(sink) = SINK.get() else { return };
-    if record.is_null() {
-        return;
-    }
-    if let Some(decoded) = decode_record(&*record) {
-        if let Ok(tx) = sink.tx.lock() {
-            let _ = tx.send(decoded);
+unsafe extern "system" fn buffer_callback(log: *mut EVENT_TRACE_LOGFILEW) -> u32 {
+    if let Some(log) = log.as_ref() {
+        if let Some(sink) = (log.Context as *const Sink).as_ref() {
+            let count = log.EventsLost as u64;
+            let before = sink
+                .lost
+                .fetch_max(count, std::sync::atomic::Ordering::Relaxed);
+            let lost = count.saturating_sub(before);
+            coverage::update(|c| c.etw_events_lost = c.etw_events_lost.saturating_add(lost));
+            crate::telemetry::metrics::metrics()
+                .events_dropped(crate::telemetry::DropReason::KernelRingbufferFull, lost);
         }
+    }
+    1
+}
+
+unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
+    let Some(record) = record.as_ref() else {
+        return;
+    };
+    let Some(sink) = (record.UserContext as *const Sink).as_ref() else {
+        return;
+    };
+    if let Some(decoded) = decode_record(record) {
+        // Full and Closed (consumer gone while ProcessTrace still delivers) both lose
+        // the record; neither may vanish without a named counter.
+        if sink.tx.try_send(decoded).is_err() {
+            crate::telemetry::metrics::metrics()
+                .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
+        }
+    } else if [
+        etw_map::KERNEL_PROCESS,
+        etw_map::KERNEL_NETWORK,
+        etw_map::DNS_CLIENT,
+    ]
+    .contains(&guid_to_u128(&record.EventHeader.ProviderId))
+    {
+        crate::telemetry::metrics::metrics()
+            .event_dropped(crate::telemetry::DropReason::InternalError);
     }
 }
 
@@ -295,15 +374,27 @@ unsafe fn decode_record(record: &EVENT_RECORD) -> Option<EtwRecord> {
     // Fetch the schema (TRACE_EVENT_INFO) to learn the property names/types.
     let mut size = 0u32;
     TdhGetEventInformation(record, 0, std::ptr::null(), std::ptr::null_mut(), &mut size);
-    if size == 0 {
+    if size == 0 || size > 1024 * 1024 {
         return None;
     }
-    let mut info_buf = vec![0u8; size as usize];
+    let allocated = size as usize;
+    let mut info_buf = vec![0u64; allocated.div_ceil(8)];
     let info = info_buf.as_mut_ptr() as *mut TRACE_EVENT_INFO;
     if TdhGetEventInformation(record, 0, std::ptr::null(), info, &mut size) != ERROR_SUCCESS {
         return None;
     }
+    if size as usize > allocated {
+        return None;
+    }
     let count = (*info).TopLevelPropertyCount as usize;
+    let prop_offset = std::mem::offset_of!(TRACE_EVENT_INFO, EventPropertyInfoArray);
+    if count > 128
+        || prop_offset
+            .checked_add(count.checked_mul(std::mem::size_of::<EVENT_PROPERTY_INFO>())?)?
+            > allocated
+    {
+        return None;
+    }
     let props_base =
         std::ptr::addr_of!((*info).EventPropertyInfoArray) as *const EVENT_PROPERTY_INFO;
     let mut props = HashMap::new();
@@ -313,8 +404,18 @@ unsafe fn decode_record(record: &EVENT_RECORD) -> Option<EtwRecord> {
         if pi.Flags & PropertyStruct != 0 {
             continue;
         }
-        let name_ptr = (info as *const u8).add(pi.NameOffset as usize) as *const u16;
-        let name = wide_at(name_ptr);
+        let offset = pi.NameOffset as usize;
+        if !offset.is_multiple_of(2) || offset >= allocated {
+            continue;
+        }
+        let raw = std::slice::from_raw_parts(
+            (info as *const u8).add(offset) as *const u16,
+            ((allocated - offset) / 2).min(512),
+        );
+        let Some(end) = raw.iter().position(|c| *c == 0) else {
+            continue;
+        };
+        let name = String::from_utf16_lossy(&raw[..end]);
         if name.is_empty() {
             continue;
         }
@@ -371,6 +472,10 @@ fn interpret(in_type: u16, raw: Vec<u8>) -> EtwValue {
         u64::from_le_bytes(b)
     };
     match in_type as i32 {
+        TDH_INTYPE_FILETIME => match raw.as_slice().try_into() {
+            Ok(bytes) => EtwValue::Int(u64::from_le_bytes(bytes), raw),
+            Err(_) => EtwValue::Bytes(raw),
+        },
         TDH_INTYPE_UNICODESTRING => {
             // A step loop rather than `chunks_exact(2)`: avoids the 1.99
             // `clippy::chunks_exact_to_as_chunks` lint without the unstable
@@ -402,17 +507,6 @@ fn interpret(in_type: u16, raw: Vec<u8>) -> EtwValue {
     }
 }
 
-unsafe fn wide_at(ptr: *const u16) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    let mut len = 0usize;
-    while *ptr.add(len) != 0 && len < 512 {
-        len += 1;
-    }
-    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
-}
-
 fn guid_to_u128(g: &GUID) -> u128 {
     ((g.data1 as u128) << 96)
         | ((g.data2 as u128) << 80)
@@ -424,18 +518,16 @@ fn guid_to_u128(g: &GUID) -> u128 {
 /// device→drive table. Keeps the `sysinfo` handles for enrichment.
 struct DecodeState {
     sys: System,
-    users: Users,
     devices: DeviceMap,
-    hash_cache: HashMap<String, (u64, String)>,
+    hash_cache: HashMap<String, (u64, Option<std::time::SystemTime>, String)>,
     /// pid → image path, so a network/DNS event can name its process.
-    proc_images: HashMap<i32, String>,
+    proc_images: HashMap<i32, (String, u64)>,
 }
 
 impl DecodeState {
     fn new() -> Self {
         Self {
             sys: System::new(),
-            users: Users::new_with_refreshed_list(),
             devices: device_map(),
             hash_cache: HashMap::new(),
             proc_images: HashMap::new(),
@@ -453,15 +545,44 @@ impl DecodeState {
                 Severity::Info,
                 data,
             ));
+            if let Some(time) = etw_map::filetime_timestamp(rec.timestamp) {
+                if let Some(event) = out.last_mut() {
+                    event.timestamp = time;
+                }
+            }
+            if let Some(event) = out.last_mut() {
+                if let Some(origin) = &mut event.origin {
+                    origin.source = Some("windows_etw".into());
+                }
+            }
         };
         match rec.provider {
             p if p == etw_map::KERNEL_PROCESS => match rec.id {
                 1 => {
-                    let pid = rec.int(&["ProcessID", "ProcessId"]).unwrap_or(0) as i32;
-                    let enrich = self.enrich_process(pid);
+                    let pid = rec
+                        .int(&["ProcessID", "ProcessId"])
+                        .and_then(|p| i32::try_from(p).ok())
+                        .unwrap_or(0);
+                    let event_start = rec.int(&["CreateTime"]).filter(|t| *t > 0);
+                    let live_start = crate::telemetry::identity::process_start_time(pid);
+                    let enrich = if event_start.is_some() && event_start == live_start {
+                        let enrich = self.enrich_process(pid);
+                        if crate::telemetry::identity::process_start_time(pid) == event_start {
+                            enrich
+                        } else {
+                            ProcessEnrichment::default()
+                        }
+                    } else {
+                        ProcessEnrichment::default()
+                    };
                     if let Some(data) = etw_map::process_start(rec, &self.devices, enrich) {
                         crate::deception::activity::record_exec(&data.username, &data.exe);
-                        self.proc_images.insert(data.pid, data.exe.clone());
+                        if self.proc_images.len() >= 8192 {
+                            self.proc_images.clear();
+                        }
+                        if let Some(start) = event_start {
+                            self.proc_images.insert(data.pid, (data.exe.clone(), start));
+                        }
                         emit(
                             EventClass::Process,
                             EventAction::Create,
@@ -471,7 +592,11 @@ impl DecodeState {
                 }
                 2 => {
                     if let Some(data) = etw_map::process_stop(rec, &self.devices) {
-                        self.proc_images.remove(&data.pid);
+                        if self.proc_images.get(&data.pid).is_some_and(|(_, start)| {
+                            rec.timestamp >= 0 && rec.timestamp as u64 >= *start
+                        }) {
+                            self.proc_images.remove(&data.pid);
+                        }
                         emit(
                             EventClass::Process,
                             EventAction::Terminate,
@@ -482,7 +607,17 @@ impl DecodeState {
                 5 => {
                     if let Some((pid, dll)) = etw_map::image_load(rec, &self.devices) {
                         if let Some(d) = crate::detection::windows_rules::inspect_image_load(
-                            self.proc_images.get(&pid).map(String::as_str).unwrap_or(""),
+                            self.proc_images
+                                .get(&pid)
+                                .filter(|(_, start)| {
+                                    etw_map::same_process_generation(
+                                        Some(*start),
+                                        crate::telemetry::identity::process_start_time(pid),
+                                        rec.timestamp,
+                                    )
+                                })
+                                .map(|(image, _)| image.as_str())
+                                .unwrap_or(""),
                             &dll,
                         ) {
                             // Emitted straight as a detection (admit_external
@@ -498,10 +633,18 @@ impl DecodeState {
                 _ => {}
             },
             p if p == etw_map::KERNEL_NETWORK => {
-                let pid = rec.int(&["PID"]).map(|p| p as i32);
+                let pid = rec.int(&["PID"]).and_then(|p| i32::try_from(p).ok());
                 let process = pid
-                    .and_then(|p| self.proc_images.get(&p))
-                    .map(|e| e.rsplit('\\').next().unwrap_or(e).to_string());
+                    .and_then(|p| {
+                        self.proc_images.get(&p).filter(|(_, start)| {
+                            etw_map::same_process_generation(
+                                Some(*start),
+                                crate::telemetry::identity::process_start_time(p),
+                                rec.timestamp,
+                            )
+                        })
+                    })
+                    .map(|(e, _)| e.rsplit('\\').next().unwrap_or(e).to_string());
                 if let Some(data) = etw_map::network_connection(rec, process) {
                     emit(
                         EventClass::Network,
@@ -548,10 +691,7 @@ impl DecodeState {
             let c = proc_.cmd().join(" ");
             (!c.is_empty()).then_some(c)
         };
-        let username = proc_
-            .user_id()
-            .and_then(|uid| self.users.get_user_by_id(uid))
-            .map(|u| u.name().to_string());
+        let username = crate::telemetry::identity::windows_process_account(pid);
         let exe_sha256 = exe.as_deref().and_then(|e| self.exe_sha256(e));
         ProcessEnrichment {
             exe,
@@ -566,25 +706,31 @@ impl DecodeState {
         if !meta.is_file() || meta.len() > MAX_HASH_BYTES {
             return None;
         }
-        if let Some((len, hash)) = self.hash_cache.get(path) {
-            if *len == meta.len() {
+        let modified = meta.modified().ok();
+        if let Some((len, mtime, hash)) = self.hash_cache.get(path) {
+            if modified.is_some() && *len == meta.len() && *mtime == modified {
                 return Some(hash.clone());
             }
         }
-        let bytes = std::fs::read(path).ok()?;
-        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+        let digest = format!(
+            "sha256:{}",
+            hex::encode(
+                crate::paths::bounded_regular_sha256(std::path::Path::new(path), MAX_HASH_BYTES)
+                    .ok()?
+            )
+        );
         if self.hash_cache.len() >= MAX_HASH_CACHE {
             self.hash_cache.clear();
         }
         self.hash_cache
-            .insert(path.to_string(), (meta.len(), digest.clone()));
+            .insert(path.to_string(), (meta.len(), modified, digest.clone()));
         Some(digest)
     }
 }
 
 /// Map `\Device\HarddiskVolumeN` → `C:` for every drive letter, via
 /// QueryDosDeviceW. Rebuilt once at startup (mounts rarely change).
-fn device_map() -> DeviceMap {
+pub(super) fn device_map() -> DeviceMap {
     use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
     let mut map = Vec::new();
     for letter in b'A'..=b'Z' {
@@ -602,4 +748,69 @@ fn device_map() -> DeviceMap {
         }
     }
     map
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    #[test]
+    fn tdh_filetime_preserves_create_time_generation() {
+        let created = 133_400_000_000_000_000u64;
+        let v = interpret(TDH_INTYPE_FILETIME as u16, created.to_le_bytes().to_vec());
+        assert!(matches!(v, EtwValue::Int(n, _) if n == created));
+        assert!(matches!(
+            interpret(TDH_INTYPE_FILETIME as u16, vec![0; 7]),
+            EtwValue::Bytes(_)
+        ));
+    }
+
+    /// Requires elevation; deliberately fails instead of claiming a skipped sensor worked.
+    #[tokio::test]
+    #[ignore = "native ETW acceptance; run elevated on Windows"]
+    async fn native_etw_two_sessions_deliver_to_their_own_sink() {
+        for _ in 0..2 {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8192);
+            let sink = Arc::new(Sink {
+                tx,
+                lost: std::sync::atomic::AtomicU64::new(0),
+            });
+            let session =
+                Session::start(sink).expect("ETW session requires an elevated Windows runner");
+            let control = Arc::clone(&session.control);
+            let trace = std::thread::spawn(move || session.process());
+            let guard = RunGuard(control);
+            let child = std::process::Command::new("cmd.exe")
+                .args(["/C", "ping -n 4 127.0.0.1 >NUL"])
+                .spawn()
+                .unwrap();
+            let pid = child.id() as u64;
+            let received = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                while let Some(record) = rx.recv().await {
+                    if record.provider == etw_map::KERNEL_PROCESS
+                        && record.id == 1
+                        && record.int(&["ProcessID", "ProcessId"]) == Some(pid)
+                    {
+                        assert!(
+                            record.int(&["CreateTime"]).is_some(),
+                            "real FILETIME was not decoded"
+                        );
+                        assert!(etw_map::filetime_timestamp(record.timestamp).is_some());
+                        return true;
+                    }
+                }
+                false
+            })
+            .await;
+            drop(guard);
+            trace.join().unwrap();
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                received.unwrap(),
+                "new session did not deliver the process start"
+            );
+        }
+    }
 }

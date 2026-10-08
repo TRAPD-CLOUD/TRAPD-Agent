@@ -36,6 +36,7 @@ pub enum CollectorMode {
     Hybrid,
     /// Windows process table polling (short-lived processes may be missed).
     WindowsPolling,
+    WindowsEtw,
     /// Every process collector failed to start.
     Failed,
 }
@@ -48,6 +49,7 @@ impl CollectorMode {
             CollectorMode::ProcPolling => "proc_polling",
             CollectorMode::Hybrid => "hybrid",
             CollectorMode::WindowsPolling => "windows_polling",
+            CollectorMode::WindowsEtw => "windows_etw",
             CollectorMode::Failed => "failed",
         }
     }
@@ -59,6 +61,7 @@ impl CollectorMode {
             3 => CollectorMode::Hybrid,
             4 => CollectorMode::Failed,
             5 => CollectorMode::WindowsPolling,
+            6 => CollectorMode::WindowsEtw,
             _ => CollectorMode::Unknown,
         }
     }
@@ -71,6 +74,7 @@ impl CollectorMode {
             CollectorMode::Hybrid => 3,
             CollectorMode::Failed => 4,
             CollectorMode::WindowsPolling => 5,
+            CollectorMode::WindowsEtw => 6,
         }
     }
 }
@@ -660,6 +664,13 @@ mod tests {
     // instance rather than `METRICS` to stay independent of execution order.
     fn fresh() -> Metrics {
         Metrics::new()
+    }
+
+    #[test]
+    fn windows_etw_mode_is_distinct_from_polling() {
+        let m = Metrics::new();
+        m.set_collector_mode(CollectorMode::WindowsEtw);
+        assert_eq!(m.snapshot().collector_mode, "windows_etw");
     }
 
     #[test]

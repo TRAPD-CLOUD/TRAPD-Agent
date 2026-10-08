@@ -30,6 +30,29 @@ jobs:
         run: cargo clippy --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml -- -D warnings
       - name: Windows unit tests
         run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml --bin trapd-agent
+      - name: Native sweeper directory trust boundary
+        run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml protected_file_in_a_writable_parent -- --ignored --nocapture --test-threads=1
+      - name: Native audit ACL preservation
+        run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml native_audit_sacl_preserves -- --ignored --nocapture --test-threads=1
+      - name: Native 4663 read detection acceptance
+        shell: pwsh
+        run: |
+          $backup = Join-Path $env:RUNNER_TEMP ('trapd-audit-' + [guid]::NewGuid() + '.csv')
+          auditpol /backup /file:$backup
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot back up audit policy' }
+          try {
+            auditpol /set /subcategory:'{0CCE921D-69AE-11D9-BED3-505054503030}' /success:enable
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot enable test file auditing' }
+            cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml native_4663_self_read -- --ignored --nocapture --test-threads=1
+            $testExit = $LASTEXITCODE
+            if ($testExit -ne 0) { throw 'Native 4663 acceptance failed' }
+          } finally {
+            auditpol /restore /file:$backup
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot restore audit policy' }
+            Remove-Item $backup -ErrorAction SilentlyContinue
+          }
+      - name: Native ETW session restart acceptance
+        run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml native_etw_two_sessions -- --ignored --nocapture --test-threads=1
       - name: Install pinned packaging and acceptance dependencies
         run: |
           dotnet tool install --global wix --version 4.0.6

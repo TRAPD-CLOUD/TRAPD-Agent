@@ -15,8 +15,8 @@
 //! OS-neutral `system/snapshot` telemetry (CPU, RAM, OS version, uptime) is
 //! provided by the shared [`crate::collectors::system`] collector.
 
-pub mod etw;
 pub mod decoy_audit;
+pub mod etw;
 pub mod eventlog;
 pub mod filesystem;
 pub mod honeytokens;
@@ -24,3 +24,7 @@ pub mod network;
 pub mod process;
 pub mod registry;
 pub mod users;
+
+pub mod sensor_supervisor;
+
+pub mod sweeper_identity;

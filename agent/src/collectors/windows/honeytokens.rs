@@ -591,12 +591,26 @@ fn arm_decoy_audit(path: &Path) {
         path: path.display().to_string(),
         kind: "windows_decoy_file".to_string(),
         owner_sid,
+        audit_ready: audited,
     });
+    let policy = super::decoy_audit::file_audit_enabled();
+    let (ready, failed) = crate::detection::windows_decoy::audit_coverage();
     crate::telemetry::coverage::update(|c| {
-        // Only ever report a stronger mode; once any decoy is audited the host
-        // can attribute reads. The last-access poll remains the fallback.
-        let stronger = audited || c.decoy_detection.as_deref() == Some("audit");
-        c.decoy_detection = Some(if stronger { "audit" } else { "last_access" }.into());
+        c.audit_file_system = policy;
+        c.decoy_audit_armed = ready as u64;
+        c.decoy_audit_unavailable = failed as u64;
+        c.decoy_detection = Some(
+            if policy == Some(true) && ready > 0 {
+                if failed == 0 {
+                    "audit"
+                } else {
+                    "audit_partial"
+                }
+            } else {
+                read_detection_mode()
+            }
+            .into(),
+        );
     });
 }
 
@@ -928,7 +942,7 @@ async fn sweep(
         let prev = state.atime.lock().ok().and_then(|m| m.get(path).copied());
         if let Some(prev_at) = prev {
             if now_at > prev_at && !state.recently_planted(path) {
-                emit_fs_event(tx, agent_id, hostname, path, "open");
+                emit_fs_event(tx, agent_id, hostname, path, "last_access");
             }
         }
         if let Ok(mut m) = state.atime.lock() {
@@ -1096,12 +1110,7 @@ fn reconcile_removed(
 
 /// Report plant failures (once each) so the backend moves the token to `failed`
 /// instead of leaving it in `deploying`.
-fn report_plant_failures(
-    tx: &Sender<AgentEvent>,
-    agent_id: &str,
-    hostname: &str,
-    state: &FsState,
-) {
+fn report_plant_failures(tx: &Sender<AgentEvent>, agent_id: &str, hostname: &str, state: &FsState) {
     for (path, reason) in state.take_failures() {
         send_prevention(
             tx,
@@ -1283,6 +1292,14 @@ fn emit_fs_event(
 ) {
     let (severity, confidence, tactic, technique) = describe_fs(access_kind);
     let data = HoneytokenAccessData {
+        sensor: Some(if access_kind == "last_access" {
+            crate::schema::HoneytokenSensor::WindowsLastAccess
+        } else {
+            crate::schema::HoneytokenSensor::WindowsChange
+        }),
+        assessment: None,
+        assessment_reasons: Vec::new(),
+        mode: None,
         token_id: format!("winfs:{}", path.display()),
         path: path.display().to_string(),
         kind: "windows_decoy_file".to_string(),
@@ -1305,6 +1322,7 @@ fn emit_fs_event(
 /// delete = tamper 90, rename = 85); `modify` is data manipulation.
 fn describe_fs(access_kind: &str) -> (Severity, u8, &'static str, &'static str) {
     match access_kind {
+        "last_access" => (Severity::Low, 30, "TA0007 Discovery", "T1083"),
         "open" => (
             Severity::Critical,
             100,
@@ -1752,31 +1770,53 @@ fn plant_adaptive(config: &Arc<RwLock<AgentConfig>>, state: &FsState) {
         build_candidates, kind_spec, resolve_file, resolve_placement, ProfilerInput, RealDirProbe,
     };
     let approved = match config.read() {
-        Ok(c) if c.honeytoken_detection_enabled && !c.adaptive_decoys.is_empty() => c.adaptive_decoys.clone(),
+        Ok(c) if c.honeytoken_detection_enabled && !c.adaptive_decoys.is_empty() => {
+            c.adaptive_decoys.clone()
+        }
         _ => return,
     };
     let profiles = crate::inventory::collect::windows_user_profiles();
     let software: Vec<String> = Vec::new(); // kept light; activity is the strong signal
     let activity = crate::deception::activity::current_summaries();
     let now_unix = chrono::Utc::now().timestamp();
-    let input = ProfilerInput { users: &profiles, software: &software, activity: &activity, now_unix };
+    let input = ProfilerInput {
+        users: &profiles,
+        software: &software,
+        activity: &activity,
+        now_unix,
+    };
     let (candidates, _signals) = build_candidates(&input, &RealDirProbe);
 
     for entry in &approved {
-        let Some(cand) = candidates.iter().find(|c| c.id == entry.id && c.kind == entry.kind) else {
-            state.fail(Path::new(&entry.id), "approved decoy no longer fits this host (profile changed)");
+        let Some(cand) = candidates
+            .iter()
+            .find(|c| c.id == entry.id && c.kind == entry.kind)
+        else {
+            state.fail(
+                Path::new(&entry.id),
+                "approved decoy no longer fits this host (profile changed)",
+            );
             continue;
         };
-        let Some(user) = profiles.iter().find(|u| u.name == cand.user) else { continue };
-        let Some(spec) = kind_spec(&cand.kind) else { continue };
+        let Some(user) = profiles.iter().find(|u| u.name == cand.user) else {
+            continue;
+        };
+        let Some(spec) = kind_spec(&cand.kind) else {
+            continue;
+        };
         let act = activity.get(&user.name.to_lowercase());
         let Some(place) = resolve_placement(spec, user, act, now_unix, &RealDirProbe) else {
-            state.fail(Path::new(&entry.id), "no cold directory available for this decoy");
+            state.fail(
+                Path::new(&entry.id),
+                "no cold directory available for this decoy",
+            );
             continue;
         };
         let style = act.and_then(|a| a.naming).unwrap_or_default();
         let pick = u64::from_le_bytes(Sha256::digest(cand.id.as_bytes())[..8].try_into().unwrap());
-        let Some(resolved) = resolve_file(spec, &place, &style, pick) else { continue };
+        let Some(resolved) = resolve_file(spec, &place, &style, pick) else {
+            continue;
+        };
         if resolved.path.symlink_metadata().is_ok() {
             continue; // already planted (or a real file is there — never overwrite)
         }

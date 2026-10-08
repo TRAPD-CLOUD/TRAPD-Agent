@@ -1,4 +1,6 @@
 {
   "default_alerts_per_host_day": 0.05,
-  "rules": {}
+  "rules": {
+    "deception.honeytoken_access": 0
+  }
 }

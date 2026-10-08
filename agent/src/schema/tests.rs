@@ -471,6 +471,10 @@ fn test_honeytoken_access_event_with_session_roundtrip() {
         remote_port: Some(40222),
     };
     let data = HoneytokenAccessData {
+        sensor: None,
+        assessment: None,
+        assessment_reasons: Vec::new(),
+        mode: None,
         token_id: "tok-1".to_string(),
         path: "/home/alice/.aws/credentials".to_string(),
         kind: "aws_credentials".to_string(),
