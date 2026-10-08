@@ -30,23 +30,6 @@ pub(crate) fn hash_store_path() -> PathBuf {
     paths::config_dir().join("binary.sha256")
 }
 
-/// Windows only: the product version the baseline was recorded for.
-fn version_store_path() -> PathBuf {
-    paths::config_dir().join("binary.version")
-}
-
-/// Whether a baseline mismatch is a legitimate upgrade rather than tampering.
-///
-/// Windows only. The MSI replaces the executable without knowing about this
-/// agent-written baseline (Linux's installer deletes it), so after an MSI
-/// upgrade the old digest no longer matches. A mismatch is therefore accepted
-/// — and re-baselined, with a warning — when the baseline was recorded for a
-/// *different product version* than the one now running. A swapped binary that
-/// still reports the recorded version (the tampering case) is still refused.
-fn mismatch_is_upgrade(platform_allows: bool, recorded: Option<&str>, running: &str) -> bool {
-    platform_allows && recorded.is_some_and(|v| v.trim() != running)
-}
-
 fn pubkey_path() -> PathBuf {
     paths::config_dir().join("signing.pub")
 }
@@ -72,10 +55,14 @@ pub fn check() -> Result<()> {
 
     info!(binary = %exe.display(), hash = %hash_str, "Binary integrity check started");
 
-    let hash_file = hash_store_path();
+    // A failed signature must never leave a new trusted baseline behind.
+    verify_ed25519_signature(&hash_bytes)?;
+    check_baseline(&exe, &hash_store_path(), &hash_str)
+}
 
+fn check_baseline(exe: &Path, hash_file: &Path, hash_str: &str) -> Result<()> {
     if hash_file.exists() {
-        let stored = std::fs::read_to_string(&hash_file).with_context(|| {
+        let stored = std::fs::read_to_string(hash_file).with_context(|| {
             format!(
                 "Cannot read binary hash baseline from {}",
                 hash_file.display()
@@ -83,22 +70,7 @@ pub fn check() -> Result<()> {
         })?;
         let stored = stored.trim();
 
-        let running_version = env!("CARGO_PKG_VERSION");
-        if stored != hash_str
-            && mismatch_is_upgrade(
-                cfg!(windows),
-                std::fs::read_to_string(version_store_path())
-                    .ok()
-                    .as_deref(),
-                running_version,
-            )
-        {
-            warn!(
-                "Binary differs from the baseline recorded for another product \
-                 version; treating it as an upgrade and re-recording the baseline"
-            );
-            write_baseline(&hash_file, &hash_str)?;
-        } else if stored != hash_str {
+        if stored != hash_str {
             bail!(
                 "BINARY INTEGRITY VIOLATION: hash mismatch for {}\n  \
                  baseline: {stored}\n  \
@@ -108,15 +80,13 @@ pub fn check() -> Result<()> {
             );
         }
         info!("Binary SHA256 ✓  (matches stored baseline)");
-        record_version();
     } else {
         // First run: create the baseline directory + file.  Best-effort: if the
         // config directory is not writable (non-root test run) we warn rather
         // than abort, so the agent still comes up.
-        match write_baseline(&hash_file, &hash_str) {
+        match write_baseline(hash_file, hash_str) {
             Ok(()) => {
                 info!(path = %hash_file.display(), "Binary hash baseline written (first run)");
-                record_version();
             }
             Err(e) => warn!(
                 path = %hash_file.display(),
@@ -127,25 +97,7 @@ pub fn check() -> Result<()> {
         }
     }
 
-    verify_ed25519_signature(&hash_bytes)
-}
-
-/// Windows: remember which product version the baseline belongs to.
-fn record_version() {
-    if !cfg!(windows) {
-        return;
-    }
-    let version = env!("CARGO_PKG_VERSION");
-    let path = version_store_path();
-    if std::fs::read_to_string(&path)
-        .map(|v| v.trim() == version)
-        .unwrap_or(false)
-    {
-        return;
-    }
-    if let Err(e) = paths::write_atomic(&path, version.as_bytes(), 0o600) {
-        warn!(path = %path.display(), error = %e, "could not record the baseline's product version");
-    }
+    Ok(())
 }
 
 fn write_baseline(hash_file: &Path, hash_str: &str) -> Result<()> {
@@ -252,14 +204,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_version_change_on_windows_excuses_a_baseline_mismatch() {
-        // Tampering: same recorded version, different bytes -> never excused.
-        assert!(!mismatch_is_upgrade(true, Some("0.6.10\n"), "0.6.10"));
-        // MSI upgrade: baseline was recorded for another version.
-        assert!(mismatch_is_upgrade(true, Some("0.6.9"), "0.6.10"));
-        // No version record: strict, exactly the Linux behaviour.
-        assert!(!mismatch_is_upgrade(true, None, "0.6.10"));
-        // Linux never relaxes the check.
-        assert!(!mismatch_is_upgrade(false, Some("0.6.9"), "0.6.10"));
+    fn a_self_reported_version_change_cannot_authorize_different_bytes() {
+        let root = std::env::temp_dir().join(format!("trapd-integrity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join("agent.exe");
+        let baseline = root.join("binary.sha256");
+        let original = baseline_line(&hex::encode(Sha256::digest(b"trusted binary v0.6.9")));
+        std::fs::write(&baseline, &original).unwrap();
+        std::fs::write(root.join("binary.version"), "0.6.9").unwrap();
+        std::fs::write(&exe, b"arbitrary replacement declaring version 99.0.0").unwrap();
+        let (hash, _) = sha256_of_file(&exe).unwrap();
+        let err = check_baseline(&exe, &baseline, &baseline_line(&hash)).unwrap_err();
+        assert!(err.to_string().contains("BINARY INTEGRITY VIOLATION"));
+        assert_eq!(std::fs::read_to_string(&baseline).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installer_reset_records_new_baseline_then_rejects_later_changes() {
+        let root = std::env::temp_dir().join(format!("trapd-integrity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join("agent.exe");
+        let baseline = root.join("binary.sha256");
+        let hash = baseline_line(&hex::encode(Sha256::digest(b"installed bytes")));
+        check_baseline(&exe, &baseline, &hash).unwrap();
+        assert_eq!(std::fs::read_to_string(&baseline).unwrap(), hash);
+        check_baseline(&exe, &baseline, &hash).unwrap();
+        let changed = baseline_line(&hex::encode(Sha256::digest(b"other bytes")));
+        assert!(check_baseline(&exe, &baseline, &changed).is_err());
+        assert_eq!(std::fs::read_to_string(&baseline).unwrap(), hash);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

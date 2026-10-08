@@ -223,19 +223,26 @@ try {
     $badMsi = Join-Path $root 'invalid-upgrade.msi'
     & (Join-Path $PSScriptRoot 'build-msi.ps1') -AgentExe $badExe -Version $upgradedVersion -Output $badMsi
     $beforeBinary = (Get-FileHash (Join-Path $env:ProgramFiles 'TRAPD Agent\trapd-agent.exe')).Hash
+    $beforeBaseline = Get-Content -Raw (Join-Path $config 'binary.sha256')
     $failedUpgrade = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @('/i', "`"$badMsi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'rollback.log')`"") -Wait -PassThru
     if ($failedUpgrade.ExitCode -in @(0, 3010)) { throw 'An invalid service executable was accepted.' }
     Wait-Until { (Get-Service trapd-agent -ErrorAction SilentlyContinue).Status -eq 'Running' } 'Rollback did not restore the previous service.'
     if ((Get-FileHash (Join-Path $env:ProgramFiles 'TRAPD Agent\trapd-agent.exe')).Hash -ne $beforeBinary) { throw 'Rollback did not restore the previous executable.' }
+    if ((Get-Content -Raw (Join-Path $config 'binary.sha256')) -ne $beforeBaseline) { throw 'Rollback did not restore the binary integrity baseline.' }
     if ((Get-Content -Raw (Join-Path $state 'device_id')) -ne $device) { throw 'Failed upgrade changed device identity.' }
 
     # Build a distinct product version and exercise the native MSI transaction.
     $upgrade = Join-Path $root 'upgrade.msi'
     & (Join-Path $PSScriptRoot 'build-msi.ps1') -AgentExe $AgentExe -Version $upgradedVersion -Output $upgrade
     $configHash = (Get-FileHash (Join-Path $config 'agent.env')).Hash
+    # A legitimate MSI replacement must reset an obsolete digest itself;
+    # the new process may not trust an embedded version to excuse a mismatch.
+    ('sha256:' + ('0' * 64)) | Set-Content (Join-Path $config 'binary.sha256')
+    '0.0.1' | Set-Content (Join-Path $config 'binary.version')
     Invoke-Msi @('/i', "`"$upgrade`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'upgrade.log')`"")
     $installedMsi = $upgrade
     Wait-Until { (Get-Service trapd-agent).Status -eq 'Running' } 'Service did not survive major upgrade.'
+    Wait-Until { ((Get-Content -Raw (Join-Path $config 'binary.sha256')).Trim()) -eq ('sha256:' + $beforeBinary.ToLowerInvariant()) } 'MSI did not establish the installed binary integrity baseline.' 30
     if ((Get-Content -Raw (Join-Path $state 'device_id')) -ne $device) { throw 'Upgrade changed identity.' }
     if ((Get-FileHash (Join-Path $config 'agent.env')).Hash -ne $configHash) { throw 'Upgrade overwrote agent.env.' }
     foreach ($name in $containmentNames) {

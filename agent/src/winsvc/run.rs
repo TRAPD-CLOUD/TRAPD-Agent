@@ -162,7 +162,8 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
 
     // Self-integrity, like the Linux agent: refuse to run a binary that no
     // longer matches its recorded digest (or whose signature fails). An MSI
-    // upgrade is recognised by its changed product version and re-baselined.
+    // installer resets the baseline in its transaction; startup never trusts
+    // a self-reported version to excuse a hash mismatch.
     if let Err(e) = crate::selfprotect::binary_integrity::check() {
         error!("{e:#}");
         return Err(e);

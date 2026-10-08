@@ -104,6 +104,10 @@ impl Updater {
     }
 
     async fn check_once(&self) -> Result<()> {
+        // A completed transaction may still have staging after a crash or a
+        // deletion failure. Finish that cleanup before recovery or helper
+        // launch, then continue polling for the next release in this check.
+        apply::resume_completed_staging(&self.paths)?;
         // A failed stop/restore/restart must keep its original signed offer and
         // artifact. A later release cannot supersede an unfinished recovery.
         if self.paths.recovery().exists() {
@@ -192,6 +196,7 @@ impl Updater {
         // so a transient download failure can retry the same offer.
         UpdateState {
             last_issued_at: verified.issued_at,
+            completion: None,
             ..state
         }
         .save(&self.paths)?;
@@ -365,6 +370,77 @@ pub fn run_apply_helper() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn completed_staging_is_cleaned_before_polling_for_the_next_update() {
+        use sha2::{Digest, Sha256};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let paths = StagingPaths {
+            dir: std::env::temp_dir().join(format!("trapd-completion-{}", uuid::Uuid::new_v4())),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.offer(), b"completed signed offer").unwrap();
+        std::fs::write(paths.recovery(), b"completed recovery").unwrap();
+        std::fs::write(paths.artifact(), b"completed artifact").unwrap();
+        UpdateState {
+            last_issued_at: 500,
+            completion: Some(apply::CompletedUpdate {
+                offer_sha256: hex::encode(Sha256::digest(b"completed signed offer")),
+                outcome: Outcome::Applied {
+                    version: "0.5.0".into(),
+                },
+            }),
+            ..Default::default()
+        }
+        .save(&paths)
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/update", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let mut n = 0;
+            while !buf[..n].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                assert!(n < buf.len(), "request headers exceeded the test bound");
+                let read = socket.read(&mut buf[n..]).await.unwrap();
+                assert!(read > 0, "request ended before its headers");
+                n += read;
+            }
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("GET /update?"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-token"));
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let updater = Updater {
+            control: reqwest::Client::builder().no_proxy().build().unwrap(),
+            download: reqwest::Client::builder().no_proxy().build().unwrap(),
+            update_url: url,
+            token: "test-token".into(),
+            agent_id: "agent-1".into(),
+            release_key: key,
+            command_key: key,
+            paths,
+        };
+        tokio::time::timeout(Duration::from_secs(5), updater.check_once())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!updater.paths.offer().exists());
+        assert!(!updater.paths.recovery().exists());
+        assert!(!updater.paths.artifact().exists());
+        assert_eq!(UpdateState::load(&updater.paths).last_issued_at, 500);
+        std::fs::remove_dir_all(updater.paths.dir).unwrap();
+    }
+
     #[test]
     fn staged_helper_launch_failure_retries_without_changing_replay_watermark() {
         let paths = StagingPaths {
@@ -376,6 +452,7 @@ mod tests {
         UpdateState {
             last_issued_at: 500,
             blocked_version: None,
+            completion: None,
         }
         .save(&paths)
         .unwrap();

@@ -64,6 +64,16 @@ pub struct UpdateState {
     /// back. The updater refuses it so a bad release cannot loop forever.
     #[serde(default)]
     pub blocked_version: Option<String>,
+    /// Bind terminal cleanup to the exact offer. Persisted before removing
+    /// recovery/staging so a crash cannot turn completion into another apply.
+    #[serde(default)]
+    pub completion: Option<CompletedUpdate>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompletedUpdate {
+    pub offer_sha256: String,
+    pub outcome: Outcome,
 }
 
 impl UpdateState {
@@ -95,7 +105,7 @@ pub struct ApplyContext<'a> {
     pub health_timeout: Duration,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     Applied { version: String },
     RolledBack { attempted: String },
@@ -475,18 +485,59 @@ fn restore_files(installed: &[Installed]) -> Result<()> {
 }
 
 fn finish_rollback(ctx: &ApplyContext<'_>, version: &str) -> Result<()> {
-    let mut state = UpdateState::load(ctx.paths);
-    state.blocked_version = Some(version.to_string());
-    state.save(ctx.paths)?;
+    finish_update(
+        ctx.paths,
+        Outcome::RolledBack {
+            attempted: version.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+fn finish_update(paths: &StagingPaths, outcome: Outcome) -> Result<Outcome> {
+    let mut state = UpdateState::load(paths);
+    if let Outcome::RolledBack { attempted } = &outcome {
+        state.blocked_version = Some(attempted.clone());
+    }
+    state.completion = Some(CompletedUpdate {
+        offer_sha256: hex::encode(Sha256::digest(std::fs::read(paths.offer())?)),
+        outcome: outcome.clone(),
+    });
+    state
+        .save(paths)
+        .context("update: persist completed transaction")?;
+    clear_completed_staging(paths)?;
+    Ok(outcome)
+}
+
+/// Only removes fixed staging paths; the completion record never authorizes
+/// installed-file changes. Match the exact offer so an old record cannot
+/// discard a newly accepted directive, even for the same release version.
+pub(super) fn resume_completed_staging(paths: &StagingPaths) -> Result<Option<Outcome>> {
+    let Some(completion) = UpdateState::load(paths).completion else {
+        return Ok(None);
+    };
+    let offer = match std::fs::read(paths.offer()) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("update: inspect completed offer"),
+    };
+    if hex::encode(Sha256::digest(offer)) != completion.offer_sha256 {
+        return Ok(None);
+    }
+    clear_completed_staging(paths)?;
+    Ok(Some(completion.outcome))
+}
+
+fn clear_completed_staging(paths: &StagingPaths) -> Result<()> {
     // Remove the journal before the signed offer: a retained journal without
     // its offer would be impossible to authenticate on the next helper run.
-    match std::fs::remove_file(ctx.paths.recovery()) {
+    match std::fs::remove_file(paths.recovery()) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).context("update: clear completed recovery"),
     }
-    clear_staging(ctx.paths);
-    Ok(())
+    clear_staging(paths)
 }
 
 fn clear_absence_evidence(installed: &[Installed]) -> Result<()> {
@@ -530,10 +581,16 @@ fn recover_update(
     })
 }
 
-fn clear_staging(paths: &StagingPaths) {
-    let _ = std::fs::remove_file(paths.artifact());
-    let _ = std::fs::remove_file(paths.ebpf_artifact());
-    let _ = std::fs::remove_file(paths.offer());
+fn clear_staging(paths: &StagingPaths) -> Result<()> {
+    // Offer last: retain a retry trigger if deleting any artifact fails.
+    for path in [paths.artifact(), paths.ebpf_artifact(), paths.offer()] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("update: clear completed staging"),
+        }
+    }
+    Ok(())
 }
 
 /// Read a staged file and require it to match the signed size and digest.
@@ -548,6 +605,9 @@ fn read_verified(path: &Path, size: u64, sha256: &[u8; 32], what: &str) -> Resul
 /// Re-verify the staged update, install it, and wait for the new agent to
 /// report healthy; otherwise restore the previous files.
 pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<Outcome> {
+    if let Some(outcome) = resume_completed_staging(ctx.paths)? {
+        return Ok(outcome);
+    }
     let offer_bytes = std::fs::read(ctx.paths.offer()).context("update: read staged offer")?;
     let offer: UpdateOffer =
         serde_json::from_slice(&offer_bytes).context("update: parse staged offer")?;
@@ -699,12 +759,14 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
     }
 
     if wait_for_healthy(ctx.paths, &verified.version, ctx.health_timeout) {
-        std::fs::remove_file(ctx.paths.recovery()).context("update: clear completed recovery")?;
-        clear_staging(ctx.paths);
+        let outcome = finish_update(
+            ctx.paths,
+            Outcome::Applied {
+                version: verified.version,
+            },
+        )?;
         clear_absence_evidence(&recovery.installed)?;
-        Ok(Outcome::Applied {
-            version: verified.version,
-        })
+        Ok(outcome)
     } else {
         tracing::error!(version = %verified.version, "update: new agent not healthy in time, rolling back");
         recover_update(ctx, platform, &recovery)
@@ -843,6 +905,7 @@ mod tests {
         UpdateState {
             last_issued_at: 500,
             blocked_version: None,
+            completion: None,
         }
         .save(&paths)
         .unwrap();
@@ -1458,6 +1521,147 @@ mod tests {
     }
 
     #[test]
+    fn successful_update_cleanup_failure_is_reported_and_can_resume_on_new_version() {
+        let env = setup(b"NEW BINARY", None);
+        struct LockedArtifact<'a>(&'a Env);
+        impl Platform for LockedArtifact<'_> {
+            fn restart_service(&self) -> Result<()> {
+                std::fs::write(self.0.paths.healthy_marker(), "0.5.0")?;
+                // A directory reliably simulates a non-removable staging file
+                // on both Windows and Unix, including elevated test runners.
+                std::fs::remove_file(self.0.paths.artifact())?;
+                std::fs::create_dir(self.0.paths.artifact())?;
+                Ok(())
+            }
+        }
+        assert!(run(&env, &LockedArtifact(&env), 0).is_err());
+        assert!(env.paths.offer().exists(), "retain the retry trigger");
+        std::fs::remove_dir(env.paths.artifact()).unwrap();
+        let p = platform(&env, None, false);
+        assert_eq!(
+            run_with_baseline_and_version(&env, &p, 0, Some(&env.baseline), "0.5.0").unwrap(),
+            Outcome::Applied {
+                version: "0.5.0".into()
+            }
+        );
+        assert_eq!(
+            p.restarts.get(),
+            0,
+            "completion must not reinstall or roll back"
+        );
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"NEW BINARY");
+        assert_eq!(
+            std::fs::read(prev_path(&env.target)).unwrap(),
+            b"OLD BINARY"
+        );
+        assert!(!env.paths.offer().exists());
+        assert!(!env.paths.recovery().exists());
+        assert_eq!(UpdateState::load(&env.paths).last_issued_at, 500);
+    }
+
+    #[test]
+    fn completed_update_crash_before_journal_removal_does_not_roll_back() {
+        let env = setup(b"NEW BINARY", None);
+        struct InterruptedCleanup<'a>(&'a Env);
+        impl Platform for InterruptedCleanup<'_> {
+            fn restart_service(&self) -> Result<()> {
+                std::fs::write(self.0.paths.healthy_marker(), "0.5.0")?;
+                std::fs::copy(self.0.paths.recovery(), self.0._root.join("saved-recovery"))?;
+                std::fs::remove_file(self.0.paths.recovery())?;
+                std::fs::create_dir(self.0.paths.recovery())?;
+                Ok(())
+            }
+        }
+        assert!(run(&env, &InterruptedCleanup(&env), 0).is_err());
+        assert!(UpdateState::load(&env.paths).completion.is_some());
+        // Reconstruct the state at a crash immediately after the completion
+        // commit: the healthy binary and the original rollback journal remain.
+        std::fs::remove_dir(env.paths.recovery()).unwrap();
+        std::fs::copy(env._root.join("saved-recovery"), env.paths.recovery()).unwrap();
+        let p = platform(&env, None, false);
+        assert_eq!(
+            run_with_baseline_and_version(&env, &p, 0, Some(&env.baseline), "0.5.0").unwrap(),
+            Outcome::Applied {
+                version: "0.5.0".into()
+            }
+        );
+        assert_eq!(p.restarts.get(), 0);
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"NEW BINARY");
+        assert!(!env.paths.offer().exists());
+        assert!(!env.paths.recovery().exists());
+    }
+
+    #[test]
+    fn rollback_cleanup_failure_retries_cleanup_without_reinstalling_failed_release() {
+        let env = setup(b"NEW BINARY", None);
+        struct LockedArtifact<'a> {
+            env: &'a Env,
+            restarts: Cell<u32>,
+        }
+        impl Platform for LockedArtifact<'_> {
+            fn restart_service(&self) -> Result<()> {
+                self.restarts.set(self.restarts.get() + 1);
+                if self.restarts.get() == 1 {
+                    std::fs::remove_file(self.env.paths.artifact())?;
+                    std::fs::create_dir(self.env.paths.artifact())?;
+                }
+                Ok(())
+            }
+        }
+        assert!(run(
+            &env,
+            &LockedArtifact {
+                env: &env,
+                restarts: Cell::new(0)
+            },
+            0
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+        assert_eq!(
+            UpdateState::load(&env.paths).blocked_version.as_deref(),
+            Some("0.5.0")
+        );
+        assert!(env.paths.offer().exists());
+        std::fs::remove_dir(env.paths.artifact()).unwrap();
+        let p = platform(&env, None, false);
+        assert_eq!(
+            run(&env, &p, 0).unwrap(),
+            Outcome::RolledBack {
+                attempted: "0.5.0".into()
+            }
+        );
+        assert_eq!(p.restarts.get(), 0);
+        assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
+        assert!(!env.paths.offer().exists());
+        assert_eq!(UpdateState::load(&env.paths).last_issued_at, 500);
+    }
+
+    #[test]
+    fn completion_cannot_discard_a_different_offer_and_legacy_state_still_loads() {
+        let env = setup(b"NEW BINARY", None);
+        let offer = std::fs::read(env.paths.offer()).unwrap();
+        run(&env, &platform(&env, Some("0.5.0"), false), 0).unwrap();
+        let replacement = [offer.as_slice(), b" "].concat();
+        std::fs::write(env.paths.offer(), &replacement).unwrap();
+        std::fs::write(env.paths.artifact(), b"next artifact").unwrap();
+        assert!(resume_completed_staging(&env.paths).unwrap().is_none());
+        assert_eq!(std::fs::read(env.paths.offer()).unwrap(), replacement);
+        assert_eq!(
+            std::fs::read(env.paths.artifact()).unwrap(),
+            b"next artifact"
+        );
+        assert_eq!(UpdateState::load(&env.paths).last_issued_at, 500);
+        std::fs::write(
+            env.paths.state(),
+            br#"{"last_issued_at":500,"blocked_version":null}"#,
+        )
+        .unwrap();
+        assert!(UpdateState::load(&env.paths).completion.is_none());
+        assert_eq!(UpdateState::load(&env.paths).last_issued_at, 500);
+    }
+
+    #[test]
     fn healthy_update_replaces_binary_and_keeps_previous() {
         let env = setup(b"NEW BINARY", None);
         let out = run(&env, &platform(&env, Some("0.5.0"), false), 2000).unwrap();
@@ -1535,6 +1739,7 @@ mod tests {
         UpdateState {
             last_issued_at: 900,
             blocked_version: None,
+            completion: None,
         }
         .save(&env.paths)
         .unwrap();

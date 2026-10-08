@@ -34,6 +34,12 @@
                                 ThirdFailureActionType="restart" ResetPeriodInDays="1" RestartServiceDelayInSeconds="10" />
           </ServiceInstall>
           <ServiceControl Id="ManageService" Name="trapd-agent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+          <!-- MSI authorizes replacement, not the executable's claimed
+               version. Remove the old baseline inside its rollback-enabled
+               transaction, after stopping the service and before installing
+               and starting the replacement. Signed self-update manages the
+               baseline in its own authenticated recovery transaction. -->
+          <RemoveFile Id="ResetBinaryBaseline" Directory="CONFIGDIR" Name="binary.sha256" On="install" />
           <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
         </Component>
         <!-- Lives in Program Files (not user-writable): it is started elevated. -->
