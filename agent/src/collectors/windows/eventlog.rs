@@ -238,6 +238,7 @@ fn decoy_access(
     fields: &serde_json::Map<String, serde_json::Value>,
     logon_types: &HashMap<String, u32>,
     observed: Option<chrono::DateTime<chrono::Utc>>,
+    devices: &crate::collectors::etw_map::DeviceMap,
 ) -> Option<HoneytokenAccessData> {
     if fields.get("EventID").and_then(|v| v.as_u64()) != Some(4663) {
         return None;
@@ -261,6 +262,10 @@ fn decoy_access(
             .flatten()
     };
     let mut accessor = windows_decoy::accessor_from_4663(|k| get(k), logon_type, false);
+    // Security auditing can report an NT device image while current_exe and
+    // live process queries return DOS paths. Compare the full mapped identity.
+    accessor.process_name =
+        crate::collectors::etw_map::device_to_dos(&accessor.process_name, devices);
     let exe = std::env::current_exe()
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
@@ -348,6 +353,7 @@ impl Collector for EventLogCollector {
         // can be graded by how its subject logged on (interactive vs. RDP vs.
         // service). Bounded; oldest dropped on overflow.
         let mut logon_types: HashMap<String, u32> = HashMap::new();
+        let devices = super::etw::device_map();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             ticker.tick().await;
@@ -408,9 +414,12 @@ impl Collector for EventLogCollector {
                             }
                         }
                         if cursor.is_some() {
-                            if let Some(hit) =
-                                decoy_access(&data.fields, &logon_types, data.log_timestamp)
-                            {
+                            if let Some(hit) = decoy_access(
+                                &data.fields,
+                                &logon_types,
+                                data.log_timestamp,
+                                &devices,
+                            ) {
                                 let outcome = crate::detection::honeytoken_policy::assess(
                                     &hit,
                                     Severity::Critical,
@@ -527,6 +536,7 @@ mod tests {
             .env("TRAPD_NATIVE_AUDIT_FILE", &path).spawn().unwrap();
         let child_pid = child.id() as i32;
         let mut self_reads = 0;
+        let devices = super::super::etw::device_map();
         let mut foreign_alert = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while std::time::Instant::now() < deadline && (self_reads < 3 || !foreign_alert) {
@@ -553,7 +563,7 @@ mod tests {
                 if accessor.access_mask & windows_decoy::FILE_READ_DATA == 0 {
                     continue;
                 }
-                let hit = decoy_access(&data.fields, &HashMap::new(), data.log_timestamp);
+                let hit = decoy_access(&data.fields, &HashMap::new(), data.log_timestamp, &devices);
                 if accessor.pid == std::process::id() as i32 {
                     self_reads += 1;
                     assert!(

@@ -154,3 +154,14 @@ bleiben erhalten. Die neue Migration trägt Version `20261009130000`, damit
 sie nach den inzwischen hinzugekommenen Migrationen ausgeführt wird.
 Erneut geprüft: 978 Agent-Tests, 100 Stream-Processor-Tests und 99 Deception-
 Tests bestanden; Windows-Runtime bleibt ein verpflichtender CI-Gate.
+
+## Native Windows CI: Pfadidentität
+
+Die erste native 4663-Abnahme fand einen realen Eigenzugriffs-Fehler: Security
+meldet `ProcessName` als NT-Gerätepfad, während `current_exe()` einen DOS-Pfad
+liefert. Masken, PID und Prozessgeneration waren korrekt. Der Eventlog-Collector
+nutzt deshalb dieselbe bestehende QueryDosDevice-/DeviceMap-Umsetzung wie ETW,
+bevor Eigenzugriff und Scanneridentität geprüft werden. Unbekannte Geräte bleiben
+unverändert und werden nicht allein anhand ihres Basenames ausgeschlossen.
+Der fehlgeschlagene native Test bleibt die Regression; die lokale Standardsuite
+besteht nach der Korrektur erneut mit 978 Tests. Native CI-Abnahme ausstehend.

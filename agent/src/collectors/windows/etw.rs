@@ -728,7 +728,7 @@ impl DecodeState {
 
 /// Map `\Device\HarddiskVolumeN` → `C:` for every drive letter, via
 /// QueryDosDeviceW. Rebuilt once at startup (mounts rarely change).
-fn device_map() -> DeviceMap {
+pub(super) fn device_map() -> DeviceMap {
     use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
     let mut map = Vec::new();
     for letter in b'A'..=b'Z' {
