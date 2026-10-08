@@ -37,17 +37,30 @@ fn stream_path(path: &Path, name: &[u16]) -> PathBuf {
     path.into()
 }
 
-pub(super) fn file_identity(file: &File) -> Result<(u32, u32, u32)> {
+fn file_information(file: &File) -> Result<BY_HANDLE_FILE_INFORMATION> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: retained valid file handle and initialized, correctly sized buffer.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
         return Err(std::io::Error::last_os_error()).context("identify quarantine stream");
     }
+    Ok(info)
+}
+
+pub(super) fn file_identity(file: &File) -> Result<(u32, u32, u32)> {
+    let info = file_information(file)?;
     Ok((
         info.dwVolumeSerialNumber,
         info.nFileIndexHigh,
         info.nFileIndexLow,
     ))
+}
+
+fn require_single_link(file: &File) -> Result<()> {
+    let links = file_information(file)?.nNumberOfLinks;
+    if links != 1 {
+        bail!("quarantine source has {links} hard links; exactly one is required");
+    }
+    Ok(())
 }
 
 fn parse_streams(bytes: &[u8]) -> Result<Vec<Stream>> {
@@ -205,6 +218,9 @@ impl Source {
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             bail!("quarantine source is not a plain file");
         }
+        // Deleting one name cannot contain a file reachable by another link.
+        // Query the retained handle, never a separately resolved pathname.
+        require_single_link(&file)?;
         let snapshot = stream_snapshot(&file)?;
         super::quarantine::checked_windows_copy_size(
             std::iter::once(metadata.len()).chain(snapshot.iter().map(|stream| stream.size)),
@@ -258,6 +274,7 @@ impl Source {
     }
 
     pub(super) fn copy_to(&self, destination: &Path) -> Result<()> {
+        require_single_link(&self.file)?;
         let parents = Parents::pin(destination)?;
         let output = OpenOptions::new()
             .write(true)
@@ -278,15 +295,16 @@ impl Source {
                     .context("create protected quarantine data stream")?;
                 copy_stream(input, &output, stream.size)?;
             }
-            self.verify_streams()?;
+            self.verify_source()?;
             self.mark_deleted(true)?;
             deletion_pending = true;
             // New ADS can be created independently of the main stream sharing
             // mode. Delete-pending closes that opening window; check the final
-            // complete list before publishing a successful copy.
-            if let Err(error) = self.verify_streams() {
+            // complete list and link count before publishing a successful copy.
+            // Share modes alone must not stand in for a hardlink-count check.
+            if let Err(error) = self.verify_source() {
                 self.mark_deleted(false)
-                    .context("undo quarantine deletion after stream change")?;
+                    .context("undo quarantine deletion after source change")?;
                 deletion_pending = false;
                 return Err(error);
             }
@@ -309,7 +327,8 @@ impl Source {
         result
     }
 
-    fn verify_streams(&self) -> Result<()> {
+    fn verify_source(&self) -> Result<()> {
+        require_single_link(&self.file)?;
         let expected: Vec<_> = self
             .streams
             .iter()
@@ -343,6 +362,95 @@ fn copy_stream(input: &File, output: &File, expected: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDirectory(PathBuf);
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn native_quarantine_rejects_hardlinks_without_mutating_either_name() {
+        let root = TestDirectory(
+            std::env::temp_dir().join(format!("trapd-hardlink-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&root.0).unwrap();
+        let original = root.0.join("payload.exe");
+        let alias = root.0.join("alias.exe");
+        let destination = root.0.join("stored.bin");
+        std::fs::write(&original, b"must remain unchanged on refusal").unwrap();
+        std::fs::hard_link(&original, &alias).unwrap();
+        let identity = file_identity(&File::open(&original).unwrap()).unwrap();
+        let security = crate::winacl::get_file_security(&original).unwrap();
+        for path in [&original, &alias] {
+            let result = Source::pin(path);
+            let error = match result {
+                Ok(source) => {
+                    drop(source);
+                    panic!("a multiply linked source must be refused before quarantine mutation")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("hard link"),
+                "unexpected refusal: {error:#}"
+            );
+        }
+        assert!(!destination.exists());
+        for path in [&original, &alias] {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                b"must remain unchanged on refusal"
+            );
+            assert_eq!(file_identity(&File::open(path).unwrap()).unwrap(), identity);
+            assert_eq!(crate::winacl::get_file_security(path).unwrap(), security);
+        }
+    }
+
+    #[test]
+    #[ignore = "assigns SYSTEM ownership when linking is blocked; requires elevated Windows token"]
+    fn native_quarantine_rechecks_late_links_or_proves_sharing_blocks_them() {
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        let root = TestDirectory(
+            std::env::temp_dir().join(format!("trapd-late-link-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&root.0).unwrap();
+        let original = root.0.join("payload.exe");
+        let alias = root.0.join("alias.exe");
+        let destination = root.0.join("stored.bin");
+        std::fs::write(&original, b"payload").unwrap();
+        let source = Source::pin(&original).unwrap();
+        let linked = match std::fs::hard_link(&original, &alias) {
+            Ok(()) => {
+                let error = source
+                    .copy_to(&destination)
+                    .expect_err("late hardlink must prevent quarantine success");
+                assert!(
+                    error.to_string().contains("hard link"),
+                    "unexpected refusal: {error:#}"
+                );
+                true
+            }
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+                source
+                    .copy_to(&destination)
+                    .expect("a protected single-link source must remain quarantinable");
+                assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
+                source.cancel(&destination).unwrap();
+                false
+            }
+        };
+        drop(source);
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&original).unwrap(), b"payload");
+        if linked {
+            assert_eq!(std::fs::read(&alias).unwrap(), b"payload");
+        } else {
+            assert!(!alias.exists());
+        }
+    }
 
     fn stream_metadata(name: &str, size: i64) -> Vec<u8> {
         let name: Vec<_> = name.encode_utf16().collect();
