@@ -494,6 +494,9 @@ pub(crate) mod tests {
                 .any(|(b, a)| b == bin && a == args)
         })
     }
+    pub(crate) fn no_calls() -> bool {
+        FIREWALL.with(|f| f.borrow().as_ref().unwrap().calls.is_empty())
+    }
     #[test]
     fn iptables_isolates_both_families_and_preserves_allowlists() {
         setup(false);

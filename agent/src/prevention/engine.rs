@@ -66,7 +66,7 @@ fn is_valid_target_pid(pid: i32, own_pid: i32) -> bool {
 #[derive(Clone)]
 pub struct EngineConfig {
     pub net_backend: Backend,
-    pub management_ips: Vec<std::net::IpAddr>,
+    pub management_host: Option<String>,
 }
 
 /// Escalating honeytoken-access response, parsed from `AgentConfig::honeytoken_response`.
@@ -196,17 +196,24 @@ impl Engine {
             .unwrap_or(false)
     }
 
-    /// Only backend addresses are cached. Signed-config allowances are read
-    /// at the action boundary so additions AND removals apply without restart.
-    fn isolation_allowlist(
+    /// Resolve the backend and read signed-config allowances at the action
+    /// boundary so DNS rotation and config changes apply without restart.
+    async fn isolation_allowlist(
         &self,
         additional: &[std::net::IpAddr],
     ) -> anyhow::Result<Vec<std::net::IpAddr>> {
+        let mut allow = match &self.cfg.management_host {
+            Some(host) => super::runtime::resolve_management_ips(host).await?,
+            None => Vec::new(),
+        };
         let cfg = self
             .cfg_handle
             .read()
             .map_err(|_| anyhow::anyhow!("isolation config lock poisoned"))?;
-        let mut allow = self.cfg.management_ips.clone();
+        anyhow::ensure!(
+            cfg.prevention_enabled,
+            "prevention was disabled before isolation"
+        );
         allow.extend(
             cfg.isolation_allowlist_ips
                 .iter()
@@ -392,6 +399,7 @@ impl Engine {
         if matches!(level, ResponseLevel::Isolate) {
             isolated = self
                 .isolation_allowlist(&[])
+                .await
                 .and_then(|allow| network::isolate(self.cfg.net_backend, &allow))
                 .is_ok();
             actions.push(if isolated {
@@ -561,12 +569,13 @@ impl Engine {
             cd.retain(|_, t| now.duration_since(*t) < AUTO_RESPONSE_COOLDOWN);
         }
 
-        self.execute_auto(rule_id, category, subject, &targets, &decision);
+        self.execute_auto(rule_id, category, subject, &targets, &decision)
+            .await;
     }
 
     /// Execute a decided auto-response: kill / quarantine / isolate. Never the
     /// agent itself or pid ≤ 1. Best-effort — failures are audited, never fatal.
-    fn execute_auto(
+    async fn execute_auto(
         &self,
         rule_id: &str,
         category: &str,
@@ -613,6 +622,7 @@ impl Engine {
         if matches!(decision.action, AutoAction::Isolate) {
             isolated = self
                 .isolation_allowlist(&[])
+                .await
                 .and_then(|allow| network::isolate(self.cfg.net_backend, &allow))
                 .is_ok();
             actions.push(if isolated {
@@ -913,7 +923,7 @@ impl Engine {
                 self.cmd_kill_pid(*pid, &cmd_id);
             }
             CommandPayload::IsolateNetwork { allowlist_ips } => {
-                self.cmd_isolate(allowlist_ips.clone(), &cmd_id);
+                self.cmd_isolate(allowlist_ips.clone(), &cmd_id).await;
             }
             CommandPayload::DeisolateNetwork => {
                 self.cmd_deisolate(&cmd_id);
@@ -1634,8 +1644,8 @@ impl Engine {
         );
     }
 
-    fn cmd_isolate(&self, mut allow: Vec<std::net::IpAddr>, cmd_id: &str) {
-        let res = self.isolation_allowlist(&allow).and_then(|current| {
+    async fn cmd_isolate(&self, mut allow: Vec<std::net::IpAddr>, cmd_id: &str) {
+        let res = self.isolation_allowlist(&allow).await.and_then(|current| {
             allow = current;
             network::isolate(self.cfg.net_backend, &allow)
         });
@@ -1913,7 +1923,7 @@ mod tests {
             audit,
             EngineConfig {
                 net_backend: Backend::None,
-                management_ips: vec![],
+                management_host: None,
             },
             Arc::new(HoneytokenStore::load_from(ht_path)),
             Arc::new(RwLock::new(AgentConfig::default())),
@@ -1922,11 +1932,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn isolation_resolves_the_backend_hostname_at_action_time() {
+        let (mut engine, _) = test_engine();
+        engine.cfg.management_host = Some("localhost".into());
+        let allow = engine.isolation_allowlist(&[]).await.unwrap();
+        assert!(
+            allow.iter().any(std::net::IpAddr::is_loopback),
+            "backend DNS was not refreshed: {allow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolation_refreshes_rotated_dns_for_all_paths_and_fails_before_mutation() {
+        use crate::prevention::network::tests::{called, no_calls, setup};
+        use crate::prevention::runtime::tests::fake_management_answers;
+        let (mut engine, mut audit_rx) = test_engine();
+        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.management_host = Some("control.example.test".into());
+        {
+            let mut cfg = engine.cfg_handle.write().unwrap();
+            cfg.prevention_enabled = true;
+            cfg.honeytoken_response = "isolate".into();
+        }
+        let old = "192.0.2.1".parse().unwrap();
+        let new = "192.0.2.2".parse().unwrap();
+        let ipv6 = "2001:db8::2".parse().unwrap();
+        let _answers = fake_management_answers(
+            [
+                Ok(vec![old]),
+                Ok(vec![new, ipv6, new]),
+                Ok(vec![new, ipv6]),
+                Ok(vec![new, ipv6]),
+                Err("DNS unavailable"),
+                Ok(vec![]),
+            ]
+            .into(),
+        );
+        setup(false);
+        engine.cmd_isolate(vec![], "initial-dns").await;
+        assert!(called(
+            "iptables",
+            &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.1", "-j", "ACCEPT"]
+        ));
+        for path in ["command", "automatic", "honeytoken"] {
+            setup(false);
+            match path {
+                "command" => engine.cmd_isolate(vec![], "rotated-dns").await,
+                "automatic" => {
+                    engine
+                        .execute_auto(
+                            "dns-fixture",
+                            "test",
+                            "host",
+                            &Targets {
+                                pid: None,
+                                process_start_time: None,
+                                file_path: None,
+                            },
+                            &response::Decision {
+                                action: AutoAction::Isolate,
+                                reason: "fixture".into(),
+                            },
+                        )
+                        .await
+                }
+                _ => {
+                    let mut data = access(false, None);
+                    data.accessor.pid = 0;
+                    engine.respond_honeytoken(&data).await;
+                }
+            }
+            assert!(
+                called(
+                    "iptables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.2", "-j", "ACCEPT"]
+                ),
+                "{path}"
+            );
+            assert!(
+                called(
+                    "ip6tables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "2001:db8::2", "-j", "ACCEPT"]
+                ),
+                "{path}"
+            );
+            assert!(
+                !called(
+                    "iptables",
+                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.1", "-j", "ACCEPT"]
+                ),
+                "stale DNS allowance on {path}"
+            );
+        }
+        while audit_rx.try_recv().is_ok() {}
+        for cmd in ["failed-dns", "empty-dns"] {
+            setup(false);
+            engine
+                .cmd_isolate(vec!["198.51.100.1".parse().unwrap()], cmd)
+                .await;
+            assert!(no_calls(), "failed resolution must not alter rules");
+            let EventData::Prevention(audit) = audit_rx.try_recv().unwrap().data else {
+                panic!("audit");
+            };
+            assert!(!audit.success);
+        }
+    }
+
+    #[tokio::test]
+    async fn isolation_rechecks_live_prevention_setting_before_firewall_mutation() {
+        use crate::prevention::network::tests::{no_calls, setup};
+        let (mut engine, mut audit_rx) = test_engine();
+        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.management_host = Some("::1".into());
+        engine.cfg_handle.write().unwrap().prevention_enabled = false;
+        setup(false);
+        engine.cmd_isolate(vec![], "disabled-prevention").await;
+        assert!(no_calls());
+        let EventData::Prevention(audit) = audit_rx.try_recv().unwrap().data else {
+            panic!("audit");
+        };
+        assert!(!audit.success);
+    }
+
+    #[tokio::test]
     async fn isolation_uses_live_allowlist_for_commands_and_automatic_responses() {
         use crate::prevention::network::tests::{called, setup};
         let (mut engine, _audit_rx) = test_engine();
         engine.cfg.net_backend = Backend::Iptables;
-        engine.cfg.management_ips = vec!["2001:db8::1".parse().unwrap()];
+        engine.cfg.management_host = Some("2001:db8::1".into());
         {
             let mut cfg = engine.cfg_handle.write().unwrap();
             cfg.prevention_enabled = true;
@@ -1934,7 +2067,7 @@ mod tests {
             cfg.isolation_allowlist_ips = vec!["192.0.2.10".into()];
         }
         setup(false);
-        engine.cmd_isolate(vec![], "initial");
+        engine.cmd_isolate(vec![], "initial").await;
         assert!(called(
             "iptables",
             &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.10", "-j", "ACCEPT"]
@@ -1944,21 +2077,29 @@ mod tests {
         for response_path in ["command", "automatic", "honeytoken"] {
             setup(false);
             match response_path {
-                "command" => engine.cmd_isolate(vec!["192.0.2.30".parse().unwrap()], "updated"),
-                "automatic" => engine.execute_auto(
-                    "test-rule",
-                    "test",
-                    "test",
-                    &Targets {
-                        pid: None,
-                        process_start_time: None,
-                        file_path: None,
-                    },
-                    &response::Decision {
-                        action: AutoAction::Isolate,
-                        reason: "test".into(),
-                    },
-                ),
+                "command" => {
+                    engine
+                        .cmd_isolate(vec!["192.0.2.30".parse().unwrap()], "updated")
+                        .await
+                }
+                "automatic" => {
+                    engine
+                        .execute_auto(
+                            "test-rule",
+                            "test",
+                            "test",
+                            &Targets {
+                                pid: None,
+                                process_start_time: None,
+                                file_path: None,
+                            },
+                            &response::Decision {
+                                action: AutoAction::Isolate,
+                                reason: "test".into(),
+                            },
+                        )
+                        .await
+                }
                 _ => {
                     let mut data = access(false, None);
                     data.accessor.pid = 0;
@@ -2065,26 +2206,28 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", windows))]
-    #[test]
-    fn automatic_execution_never_kills_an_unknown_or_reused_generation() {
+    #[tokio::test]
+    async fn automatic_execution_never_kills_an_unknown_or_reused_generation() {
         for stale in [false, true] {
             let mut child = ChildFixture::new();
             let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
             let (engine, mut rx) = test_engine();
-            engine.execute_auto(
-                "memory.inject",
-                "memory",
-                "fixture",
-                &Targets {
-                    pid: Some(child.pid()),
-                    process_start_time: stale.then_some(start + 1),
-                    file_path: None,
-                },
-                &response::Decision {
-                    action: AutoAction::Kill,
-                    reason: "test fixture".into(),
-                },
-            );
+            engine
+                .execute_auto(
+                    "memory.inject",
+                    "memory",
+                    "fixture",
+                    &Targets {
+                        pid: Some(child.pid()),
+                        process_start_time: stale.then_some(start + 1),
+                        file_path: None,
+                    },
+                    &response::Decision {
+                        action: AutoAction::Kill,
+                        reason: "test fixture".into(),
+                    },
+                )
+                .await;
             let EventData::Prevention(audit) = rx.try_recv().unwrap().data else {
                 panic!("audit");
             };

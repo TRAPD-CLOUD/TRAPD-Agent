@@ -82,6 +82,58 @@ fn under(normalised_path: &str, roots: &[String]) -> bool {
         .any(|r| normalised_path.starts_with(r.as_str()))
 }
 
+/// Tamper watches are deliberately nonrecursive: include the directory itself
+/// (replacement/removal), and its direct children, without sibling or nested churn.
+pub fn is_tamper_path(normalised_path: &str, roots: &[String]) -> bool {
+    roots.iter().any(|root| {
+        normalised_path == root.trim_end_matches('\\')
+            || normalised_path
+                .strip_prefix(root)
+                .is_some_and(|child| !child.is_empty() && !child.contains('\\'))
+    })
+}
+
+/// Keep the shared/default user-data tree and add relocated local profiles.
+/// Registry mistakes must not widen a profile watch to a drive or network root.
+pub fn ransom_roots<'a>(
+    profiles: impl IntoIterator<Item = (&'a str, &'a str)>,
+    fallback: &str,
+) -> (Vec<String>, bool) {
+    const MAX_EXTRA_ROOTS: usize = 256;
+    let mut roots = vec![normalise_root(fallback)];
+    for (sid, profile) in profiles {
+        // Exclude known service identities, while retaining local/domain and
+        // Entra (S-1-12-1-...) profiles and other registered user identities.
+        if matches!(sid, "S-1-5-18" | "S-1-5-19" | "S-1-5-20")
+            || ["S-1-5-80-", "S-1-5-82-", "S-1-5-90-", "S-1-5-96-"]
+                .iter()
+                .any(|prefix| sid.starts_with(prefix))
+        {
+            continue;
+        }
+        let root = normalise_root(profile);
+        let bytes = root.as_bytes();
+        if bytes.len() <= 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || bytes[2] != b'\\'
+            || root[3..].split('\\').any(|c| {
+                matches!(c, "." | "..")
+                    || c.contains([':', '*', '?', '%'])
+                    || c.chars().any(char::is_control)
+            })
+            || roots.iter().any(|existing| root.starts_with(existing))
+        {
+            continue;
+        }
+        if roots.len() > MAX_EXTRA_ROOTS {
+            return (roots, true);
+        }
+        roots.push(root);
+    }
+    (roots, false)
+}
+
 /// Application caches and other churn that must not count as "user data being
 /// modified". `AppData` is excluded except its `Temp`, the Windows analogue of
 /// `/tmp` that ransomware loaders and droppers actually use.
@@ -157,7 +209,7 @@ impl Planner {
         let mut out = Vec::new();
 
         // Agent configuration: any foreign change is critical.
-        if under(&norm, &self.roots.tamper) {
+        if is_tamper_path(&norm, &self.roots.tamper) {
             let file = norm.rsplit('\\').next().unwrap_or(&norm);
             if !is_expected_self_write(file, process_uptime, update_in_flight) {
                 let action = match change {
@@ -388,6 +440,105 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[test]
+    fn replacing_the_config_directory_is_tamper_without_widening_scope() {
+        let t = Instant::now();
+        let mut p = Planner::new(roots(), t);
+        let config = "C:\\ProgramData\\TRAPD\\config";
+        for (change, action) in [
+            (Change::RenamedFrom, "delete"),
+            (Change::Deleted, "delete"),
+            (Change::Created, "create"),
+            (Change::RenamedTo, "create"),
+        ] {
+            assert_eq!(
+                plan(&mut p, change, config, t),
+                vec![Action::Tamper {
+                    path: config.into(),
+                    action
+                }]
+            );
+        }
+        for outside in [
+            "C:\\ProgramData\\TRAPD\\config-old\\command_signing.pub",
+            "C:\\ProgramData\\TRAPD\\state\\credentials.json",
+            "C:\\ProgramData\\TRAPD\\config\\nested\\unrelated.txt",
+        ] {
+            assert!(plan(&mut p, Change::Modified, outside, t).is_empty());
+        }
+    }
+
+    #[test]
+    fn relocated_profiles_are_in_scope_without_watching_entire_drives() {
+        let t = Instant::now();
+        let r = Roots {
+            ransom: ransom_roots(
+                [
+                    ("S-1-12-1-100-200-300-400", "D:\\Profiles\\alice"),
+                    ("S-1-12-1-100-200-300-400", "d:/profiles/ALICE"),
+                    ("S-1-5-21-100-200-300-1001", "C:\\Users\\bob"),
+                    ("S-1-5-18", "C:\\Windows\\System32\\config\\systemprofile"),
+                ],
+                "C:\\Users",
+            )
+            .0,
+            ..Roots::default()
+        };
+        assert_eq!(r.ransom.len(), 2, "deduplicate overlapping profile watches");
+        let mut p = Planner::new(r, t);
+        for path in [
+            "D:\\Profiles\\alice\\Documents\\budget.xlsx.locked",
+            "C:\\Users\\Public\\Documents\\report.txt.locked",
+        ] {
+            assert_eq!(
+                plan(&mut p, Change::Created, path, t),
+                vec![Action::RansomExtension { path: path.into() }]
+            );
+        }
+        assert!(plan(&mut p, Change::Created, "D:\\Projects\\file.locked", t).is_empty());
+        assert!(plan(
+            &mut p,
+            Change::Created,
+            "D:\\Profiles\\alice-old\\file.locked",
+            t
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn profile_scope_rejects_invalid_roots_and_bounds_additional_watches() {
+        assert_eq!(
+            ransom_roots(
+                [
+                    "",
+                    "D:\\",
+                    "relative\\profile",
+                    "D:relative",
+                    "D:\\Profiles\\..",
+                    "\\\\server\\share"
+                ]
+                .map(|path| ("S-1-5-21-100-200-300-1001", path)),
+                "C:\\Users"
+            ),
+            (vec!["c:\\users\\".to_string()], false)
+        );
+        let profiles: Vec<String> = (0..1000)
+            .map(|i| format!("D:\\Profiles\\user{i}"))
+            .collect();
+        let (selected, truncated) = ransom_roots(
+            profiles
+                .iter()
+                .map(|path| ("S-1-5-21-100-200-300-1001", path.as_str())),
+            "C:\\Users",
+        );
+        assert!(selected.len() <= 257, "profile watches must remain bounded");
+        assert!(
+            selected.len() > 1,
+            "valid relocated profiles must be included"
+        );
+        assert!(truncated, "partial coverage must be observable");
     }
 
     #[test]

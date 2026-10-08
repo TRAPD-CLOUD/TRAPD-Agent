@@ -50,11 +50,9 @@ pub async fn start(
         warn!(error = %e, "could not initialise the network containment backend — IP/isolation actions will fail");
     }
 
-    let management_ips = resolve_management_ips(backend_url);
-
     let engine_cfg = EngineConfig {
         net_backend: backend,
-        management_ips,
+        management_host: Some(backend_host(backend_url).context("invalid management backend URL")?),
     };
 
     let verifier = match Verifier::new(&command_pubkey_path(), agent_id.to_string(), &nonce_store())
@@ -219,20 +217,35 @@ fn detection_mode() -> String {
     }
 }
 
-fn resolve_management_ips(backend_url: &str) -> Vec<std::net::IpAddr> {
-    let mut out: Vec<std::net::IpAddr> = Vec::new();
-
-    if let Some(host) = backend_host(backend_url) {
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            out.push(ip);
-        } else if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:443")) {
-            for a in addrs {
-                out.push(a.ip());
-            }
-        }
+pub(super) async fn resolve_management_ips(host: &str) -> Result<Vec<std::net::IpAddr>> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(vec![ip]);
     }
+    #[cfg(test)]
+    if let Some(answer) = tests::management_answer(host) {
+        return validate_management_ips(answer?);
+    }
+    // Refresh at the isolation boundary, without blocking a Tokio worker or
+    // holding the signed-config lock. Failure must leave firewall state alone:
+    // stale/empty management addresses cannot guarantee a recovery channel.
+    let resolved = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host((host, 443)),
+    )
+    .await
+    .context("management DNS resolution timed out")?
+    .context("management DNS resolution failed")?;
+    validate_management_ips(resolved.map(|addr| addr.ip()).collect())
+}
 
-    out
+fn validate_management_ips(mut out: Vec<std::net::IpAddr>) -> Result<Vec<std::net::IpAddr>> {
+    anyhow::ensure!(
+        !out.is_empty(),
+        "management DNS resolution returned no addresses"
+    );
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 fn backend_host(url: &str) -> Option<String> {
@@ -252,12 +265,46 @@ fn backend_host(url: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
 
-    #[test]
-    fn ipv6_backend_remains_reachable_during_isolation() {
-        let allow = resolve_management_ips("https://[2001:db8::1]:8443/api");
+    type Answers = VecDeque<std::result::Result<Vec<std::net::IpAddr>, &'static str>>;
+    thread_local! {
+        static MANAGEMENT_ANSWERS: RefCell<Option<Answers>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct ManagementAnswers;
+    impl Drop for ManagementAnswers {
+        fn drop(&mut self) {
+            MANAGEMENT_ANSWERS.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn fake_management_answers(answers: Answers) -> ManagementAnswers {
+        MANAGEMENT_ANSWERS.with(|slot| *slot.borrow_mut() = Some(answers));
+        ManagementAnswers
+    }
+
+    pub(super) fn management_answer(host: &str) -> Option<Result<Vec<std::net::IpAddr>>> {
+        if host != "control.example.test" {
+            return None;
+        }
+        MANAGEMENT_ANSWERS.with(|slot| {
+            slot.borrow_mut().as_mut().map(|answers| {
+                answers
+                    .pop_front()
+                    .expect("unexpected management DNS lookup")
+                    .map_err(anyhow::Error::msg)
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn ipv6_backend_remains_reachable_during_isolation() {
+        let host = backend_host("https://[2001:db8::1]:8443/api").unwrap();
+        let allow = resolve_management_ips(&host).await.unwrap();
         assert_eq!(
             allow,
             vec!["2001:db8::1".parse::<std::net::IpAddr>().unwrap()]

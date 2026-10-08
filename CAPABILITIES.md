@@ -22,13 +22,13 @@ else on Windows is type-checked and unit-tested on shared logic only.
 | Generic log collector (file tail, rotation, parsers) | ✅ | ✅ IIS / http.sys (W3C), nginx, Apache, PostgreSQL, MySQL; real file identity for rotation. No journal / syslog-socket sources |
 | Detection engine, Sigma, IOA, baseline | ✅ | ✅ same engine |
 | Honeytokens (deploy / detect / respond) | ✅ | ✅ file + registry decoys, 4663 audit |
-| Ransomware indicators (entropy, mass-write, extension, backup deletion) | ✅ | ✅ shared heuristics (`fs_heuristics`, `fs_plan`) over user profiles |
-| Agent / binary tamper detection | ✅ `/etc/trapd`, state dir | ✅ config dir + install dir (`Program Files`), update-aware |
+| Ransomware indicators (entropy, mass-write, extension, backup deletion) | ✅ | ✅ shared heuristics over registered local profile paths (including relocated/Entra profiles), plus the default Users tree; remote redirected folders need separate coverage |
+| Agent / binary tamper detection | ✅ `/etc/trapd`, state dir | ✅ config/install directories and their replacement; parent watches rearm protected paths, independent of generic scope changes; update-aware |
 | FIM (periodic hashing) | ✅ | ✅ |
 | Process-memory injection scan | ✅ maps: RWX, memfd, deleted exec | ✅ `VirtualQueryEx`: thread started in unbacked executable memory (alert), injected PE (alert), RWX alone (context) |
 | Rootkit cross-view detection | ✅ | ⏳ not planned: depends on `/proc`, `getdents`, `sock_diag` |
 | Process kill / freeze (with PID-reuse guard) | ✅ automatic `SIGKILL` / `SIGSTOP` through a generation-checked pidfd | ✅ `TerminateProcess` / idempotent `NtSuspendProcess` bound to creation time; core system processes are never targets |
-| Network containment (block IP, isolate) | ✅ nftables / iptables | ✅ native `INetFwPolicy2` / `INetFwRule`, requires every active profile to enforce local rules; preserves profile defaults; native CI |
+| Network containment (block IP, isolate) | ✅ nftables / iptables, current backend DNS/config allowances | ✅ native `INetFwPolicy2` / `INetFwRule`, current backend DNS/config allowances, requires every active profile to enforce local rules; preserves profile defaults; native CI |
 | File quarantine + restore | ✅ move + `chmod 000` + `chattr +i` | ✅ SYSTEM ownership + protected DACL, original owner/DACL restored; pins paths and copies into a fresh protected object, preserving NTFS data streams; native CI |
 | Auto-response, signed command channel, RTR | ✅ | ✅ PowerShell via `-EncodedCommand`; memory collection via `ReadProcessMemory` (LSASS and other protected processes refused) |
 | Pre-exec kernel blocking | 🟡 tracepoint kill (not LSM) | ⏳ none: post-creation kill only (needs a driver) |

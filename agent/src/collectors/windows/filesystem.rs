@@ -161,8 +161,18 @@ struct DetectionRoots {
 fn detection_roots() -> DetectionRoots {
     let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
     let on_drive = |dir: &str| PathBuf::from(format!("{drive}\\{dir}"));
+    let profiles = crate::inventory::collect::windows_user_profiles();
+    let (ransom, truncated) = fs_plan::ransom_roots(
+        profiles
+            .iter()
+            .map(|profile| (profile.sid.as_str(), profile.profile_dir.as_str())),
+        &on_drive("Users").to_string_lossy(),
+    );
+    if truncated {
+        tracing::warn!(watched_roots = ransom.len(), "Windows ransomware profile watch limit exceeded; some relocated profiles are not monitored");
+    }
     DetectionRoots {
-        ransom: vec![on_drive("Users")],
+        ransom: ransom.into_iter().map(PathBuf::from).collect(),
         backup: vec![on_drive("Backup"), on_drive("Backups")],
         tamper: std::iter::once(crate::paths::config_dir().to_path_buf())
             .chain(
@@ -171,6 +181,133 @@ fn detection_roots() -> DetectionRoots {
                     .and_then(|exe| exe.parent().map(|p| p.to_path_buf())),
             )
             .collect(),
+    }
+}
+
+/// Own tamper handles separately from live telemetry and ransomware watches.
+/// Parent handles observe replacement of the protected directory; target
+/// handles observe only its immediate children and are rearmed at its path.
+struct TamperWatches {
+    watcher: RecommendedWatcher,
+    targets: Vec<PathBuf>,
+    scope: Vec<String>,
+    watched: BTreeMap<String, PathBuf>,
+}
+
+impl TamperWatches {
+    fn new(targets: &[PathBuf], tx: Sender<notify::Result<notify::Event>>) -> Result<Self> {
+        let filter: Vec<String> = targets
+            .iter()
+            .map(|p| fs_plan::normalise_root(&p.to_string_lossy()))
+            .collect();
+        let watcher = RecommendedWatcher::new(
+            move |result: notify::Result<notify::Event>| {
+                // Parent handles also receive sibling changes (e.g. spool and
+                // logs). Reject them before they can consume the bounded queue.
+                if result.as_ref().is_ok_and(|event| {
+                    !event.paths.iter().any(|path| {
+                        fs_plan::is_tamper_path(
+                            &fs_plan::normalise(&path.to_string_lossy()),
+                            &filter,
+                        )
+                    })
+                }) {
+                    return;
+                }
+                if tx.try_send(result).is_err() {
+                    crate::telemetry::metrics::metrics()
+                        .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
+                }
+            },
+            notify::Config::default(),
+        )?;
+        let mut watches = Self {
+            watcher,
+            targets: Vec::new(),
+            scope: Vec::new(),
+            watched: BTreeMap::new(),
+        };
+        for target in targets {
+            let Some(parent) = target.parent() else {
+                continue;
+            };
+            // Retain direct file monitoring if parent enumeration is denied;
+            // watch_directory reports that replacement coverage is unavailable.
+            watches.watch_directory(parent);
+            let scope = fs_plan::normalise_root(&target.to_string_lossy());
+            if watches.scope.contains(&scope) {
+                continue;
+            }
+            watches.scope.push(scope);
+            watches.targets.push(target.clone());
+            watches.watch_target(target);
+        }
+        Ok(watches)
+    }
+
+    fn watch_target(&mut self, target: &std::path::Path) {
+        // An absent directory is still covered by its parent. Its creation
+        // will trigger rearming, including a replacement after removal.
+        if target.is_dir() {
+            self.watch_directory(target);
+        }
+    }
+
+    fn watch_directory(&mut self, path: &std::path::Path) -> bool {
+        let key = fs_plan::normalise_root(&path.to_string_lossy());
+        if self.watched.contains_key(&key) {
+            return true;
+        }
+        match self.watcher.watch(path, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                self.watched.insert(key, path.to_path_buf());
+                true
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "Windows tamper watch unavailable");
+                false
+            }
+        }
+    }
+
+    fn rearm(&mut self, change: Change, path: &std::path::Path) {
+        if !matches!(
+            change,
+            Change::Created | Change::Deleted | Change::RenamedFrom | Change::RenamedTo
+        ) {
+            return;
+        }
+        let key = fs_plan::normalise_root(&path.to_string_lossy());
+        if !self.scope.contains(&key) {
+            return;
+        }
+        // The old handle may have followed a moved directory. Never let it
+        // stand in for the original protected path.
+        // A config directory can live inside the install directory. Rearm
+        // nested targets and shared parent handles if that ancestor is replaced.
+        let stale: Vec<String> = self
+            .watched
+            .keys()
+            .filter(|root| root.starts_with(&key))
+            .cloned()
+            .collect();
+        for root in stale {
+            if let Some(path) = self.watched.remove(&root) {
+                let _ = self.watcher.unwatch(&path);
+            }
+        }
+        let targets: Vec<PathBuf> = self
+            .targets
+            .iter()
+            .filter(|target| fs_plan::normalise_root(&target.to_string_lossy()).starts_with(&key))
+            .cloned()
+            .collect();
+        for target in targets {
+            if let Some(parent) = target.parent().filter(|parent| parent.is_dir()) {
+                self.watch_directory(parent);
+            }
+            self.watch_target(&target);
+        }
     }
 }
 
@@ -237,9 +374,22 @@ impl Collector for FilesystemCollector {
         hostname: String,
     ) -> Result<()> {
         let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(1024);
+        let generic_tx = notify_tx.clone();
         let mut watcher = RecommendedWatcher::new(
             move |result: notify::Result<notify::Event>| {
-                if notify_tx.try_send(result).is_err() {
+                if generic_tx.try_send(result).is_err() {
+                    crate::telemetry::metrics::metrics()
+                        .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
+                }
+            },
+            notify::Config::default(),
+        )?;
+        // Fixed detection handles must survive live generic scope changes,
+        // even when both scopes contain the same path.
+        let detection_tx = notify_tx.clone();
+        let mut detection_watcher = RecommendedWatcher::new(
+            move |result: notify::Result<notify::Event>| {
+                if detection_tx.try_send(result).is_err() {
                     crate::telemetry::metrics::metrics()
                         .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
                 }
@@ -258,7 +408,7 @@ impl Collector for FilesystemCollector {
             if !path.exists() {
                 return;
             }
-            match watcher.watch(path, mode) {
+            match detection_watcher.watch(path, mode) {
                 Ok(()) => into.push(fs_plan::normalise_root(&path.to_string_lossy())),
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "Windows detection watch unavailable")
@@ -271,9 +421,8 @@ impl Collector for FilesystemCollector {
         for p in &detect.backup {
             register(p, RecursiveMode::Recursive, &mut roots.backup);
         }
-        for p in &detect.tamper {
-            register(p, RecursiveMode::NonRecursive, &mut roots.tamper);
-        }
+        let mut tamper_watches = TamperWatches::new(&detect.tamper, notify_tx)?;
+        roots.tamper = tamper_watches.scope.clone();
         let mut planner = Planner::new(roots, std::time::Instant::now());
         let baseline_path = crate::paths::state_dir().join("windows_fim_baseline.json");
         let saved: Baseline = std::fs::metadata(&baseline_path)
@@ -339,6 +488,7 @@ impl Collector for FilesystemCollector {
                     match result {
                         Ok(notification) => {
                             for (change, path) in change_for(&notification.kind, &notification.paths) {
+                                tamper_watches.rearm(change, &path);
                                 let path = path.to_string_lossy().into_owned();
                                 let actions = planner.plan(
                                     change,
@@ -393,5 +543,152 @@ impl Collector for FilesystemCollector {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    struct TestDirectory(PathBuf);
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn expect_tamper(
+        rx: &mut tokio::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+        watches: &mut TamperWatches,
+        planner: &mut Planner,
+        wanted_path: &std::path::Path,
+        wanted_action: &str,
+    ) {
+        let expected = fs_plan::normalise(&wanted_path.to_string_lossy());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                // Closing a deleted directory's old handle may report an
+                // error. Coverage is established by the expected parent/root
+                // and replacement-file events, each required below.
+                let notification = match rx.recv().await.expect("watcher channel closed") {
+                    Ok(notification) => notification,
+                    Err(_) => continue,
+                };
+                for (change, path) in change_for(&notification.kind, &notification.paths) {
+                    watches.rearm(change, &path);
+                    let actions = planner.plan(
+                        change,
+                        &path.to_string_lossy(),
+                        Instant::now(),
+                        Duration::from_secs(3600),
+                        false,
+                    );
+                    if actions.iter().any(|action| {
+                        matches!(action,
+                            Action::Tamper { path, action }
+                            if fs_plan::normalise(path) == expected && *action == wanted_action
+                        )
+                    }) {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("protected path change must be reported as tamper");
+    }
+
+    #[tokio::test]
+    async fn directory_replacement_rearms_tamper_watch_after_generic_unwatch() {
+        let directory =
+            TestDirectory(std::env::temp_dir().join(format!("trapd-fs-{}", uuid::Uuid::new_v4())));
+        let config = directory.0.join("config");
+        let key = config.join("command_signing.pub");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(&key, b"original key").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut watches = TamperWatches::new(std::slice::from_ref(&config), tx).unwrap();
+        let mut planner = Planner::new(
+            Roots {
+                tamper: watches.scope.clone(),
+                ..Roots::default()
+            },
+            Instant::now(),
+        );
+
+        // Live telemetry may watch the same parent and then remove its scope.
+        // Its handle must not own or remove the fixed detection watches.
+        let mut generic = RecommendedWatcher::new(
+            |_: notify::Result<notify::Event>| {},
+            notify::Config::default(),
+        )
+        .unwrap();
+        generic
+            .watch(&directory.0, RecursiveMode::Recursive)
+            .unwrap();
+        generic.unwatch(&directory.0).unwrap();
+
+        std::fs::rename(&config, directory.0.join("config-old")).unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &config, "delete").await;
+        std::fs::create_dir(&config).unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &config, "create").await;
+        std::fs::write(&key, b"replacement key").unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &key, "create").await;
+        std::fs::write(&key, b"edited replacement key").unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &key, "modify").await;
+
+        std::fs::remove_dir_all(&config).unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &config, "delete").await;
+        std::fs::create_dir(&config).unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &config, "create").await;
+        std::fs::write(&key, b"key after deletion").unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &key, "create").await;
+    }
+
+    #[tokio::test]
+    async fn replacing_install_directory_rearms_nested_config_watch() {
+        let directory =
+            TestDirectory(std::env::temp_dir().join(format!("trapd-fs-{}", uuid::Uuid::new_v4())));
+        let install = directory.0.join("install");
+        let config = install.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut watches = TamperWatches::new(&[config.clone(), install.clone()], tx).unwrap();
+        let mut planner = Planner::new(
+            Roots {
+                tamper: watches.scope.clone(),
+                ..Roots::default()
+            },
+            Instant::now(),
+        );
+
+        std::fs::rename(&install, directory.0.join("install-old")).unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &install, "delete").await;
+        std::fs::create_dir_all(&config).unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &install, "create").await;
+        let key = config.join("command_signing.pub");
+        std::fs::write(&key, b"nested replacement key").unwrap();
+        expect_tamper(&mut rx, &mut watches, &mut planner, &key, "create").await;
+    }
+
+    #[tokio::test]
+    async fn tamper_parent_watch_filters_sibling_state_churn_before_enqueue() {
+        let directory =
+            TestDirectory(std::env::temp_dir().join(format!("trapd-fs-{}", uuid::Uuid::new_v4())));
+        let config = directory.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let _watches = TamperWatches::new(&[config], tx).unwrap();
+        for i in 0..100 {
+            std::fs::write(
+                directory.0.join(format!("state-{i}.json")),
+                b"own state write",
+            )
+            .unwrap();
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(250), rx.recv())
+            .await
+            .is_err());
     }
 }
