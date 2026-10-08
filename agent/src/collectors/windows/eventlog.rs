@@ -556,7 +556,15 @@ mod tests {
                 let hit = decoy_access(&data.fields, &HashMap::new(), data.log_timestamp);
                 if accessor.pid == std::process::id() as i32 {
                     self_reads += 1;
-                    assert!(hit.is_none(), "live agent health read must be excluded");
+                    assert!(
+                        hit.is_none(),
+                        "live agent health read must be excluded: image={:?}, current={:?}, mask={:#x}, started={:?}, observed={:?}",
+                        accessor.process_name,
+                        std::env::current_exe(),
+                        accessor.access_mask,
+                        crate::telemetry::identity::process_start_time(accessor.pid),
+                        data.log_timestamp,
+                    );
                 } else if accessor.pid == child_pid {
                     let hit = hit.expect("foreign read must remain visible");
                     let outcome = crate::detection::honeytoken_policy::assess(&hit, Severity::High);
