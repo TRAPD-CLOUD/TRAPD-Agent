@@ -134,6 +134,25 @@ fn load_msi_config() {
 
 // ── Runtime ───────────────────────────────────────────────────────────────────
 
+async fn reconcile_pending_firewall_expiry() -> Vec<crate::prevention::winfirewall::ExpiredBlock> {
+    match tokio::task::spawn_blocking(crate::prevention::winfirewall::expire_due_blocks).await {
+        Ok(Ok(expired)) => {
+            for block in &expired {
+                info!(target = %block.target, "persistent firewall block expired");
+            }
+            expired
+        }
+        Ok(Err(error)) => {
+            warn!(%error, "firewall expiry reconciliation failed; will retry");
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(%error, "firewall expiry task failed; will retry");
+            Vec::new()
+        }
+    }
+}
+
 /// Run the agent until `stop` fires (SCM stop/shutdown or Ctrl-C in console
 /// mode) or the event pipeline closes.
 pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Result<()> {
@@ -148,6 +167,10 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         error!("{e:#}");
         return Err(e);
     }
+
+    // Expired rules may be what prevents enrollment reaching the backend.
+    // Recover before ANY backend request, including pending pairing.
+    let mut startup_expired = reconcile_pending_firewall_expiry().await;
 
     let device_id = load_or_create_device_id()
         .await
@@ -183,13 +206,21 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         // stop, MSI upgrade/removal) must still be honoured during that wait,
         // otherwise Windows Installer's ServiceControl hangs on an unpaired
         // agent. Dropping the future cancels pairing and removes pairing.txt.
-        let creds = tokio::select! {
-            creds = crate::enrollment::load_or_enroll(&backend_url, &device_id, &hostname) => {
-                creds.context("Failed to obtain agent credentials")?
-            }
-            _ = stop.recv() => {
-                info!("stop requested before enrollment completed");
-                return Ok(());
+        let creds = {
+            let enrollment = crate::enrollment::load_or_enroll(&backend_url, &device_id, &hostname);
+            tokio::pin!(enrollment);
+            let mut expiry_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    creds = &mut enrollment => {
+                        break creds.context("Failed to obtain agent credentials")?;
+                    }
+                    _ = expiry_tick.tick() => { startup_expired.extend(reconcile_pending_firewall_expiry().await); },
+                    _ = stop.recv() => {
+                        info!("stop requested before enrollment completed");
+                        return Ok(());
+                    }
+                }
             }
         };
         (
@@ -218,6 +249,21 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     let ring_buffer: Arc<Mutex<Spool>> = Arc::new(Mutex::new(spool));
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
+    let startup_audit =
+        crate::prevention::audit::AuditEmitter::new(tx.clone(), agent_id.clone(), hostname.clone());
+    for expired in startup_expired {
+        startup_audit.emit(
+            crate::schema::EventAction::IpUnblocked,
+            crate::schema::Severity::Info,
+            "ip_unblock",
+            expired.target,
+            true,
+            "TTL expired during startup",
+            None,
+            Some(expired.command_id),
+            serde_json::Value::Null,
+        );
+    }
 
     // ── Prevention subsystem (active response) ────────────────────────────────
     // Same runtime as the Linux agent: signed command channel, IoC enforcement
@@ -249,6 +295,35 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             }
         }
     };
+
+    // Offline mode and policy-start failures must not turn a finite block
+    // into a permanent one. Online prevention owns its own audited reconciler.
+    if prev_event_tx.is_none() {
+        let audit = crate::prevention::audit::AuditEmitter::new(
+            tx.clone(),
+            agent_id.clone(),
+            hostname.clone(),
+        );
+        handles.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                for expired in reconcile_pending_firewall_expiry().await {
+                    audit.emit(
+                        crate::schema::EventAction::IpUnblocked,
+                        crate::schema::Severity::Info,
+                        "ip_unblock",
+                        expired.target,
+                        true,
+                        "TTL expired",
+                        None,
+                        Some(expired.command_id),
+                        serde_json::Value::Null,
+                    );
+                }
+            }
+        }));
+    }
 
     macro_rules! spawn_collector {
         ($collector:expr) => {{

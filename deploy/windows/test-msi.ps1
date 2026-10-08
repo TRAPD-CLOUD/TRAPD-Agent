@@ -36,6 +36,28 @@ function Read-Requests {
     @(Get-Content $p | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} })
 }
 
+function Test-BlockExpiryAcrossRestart {
+    # Stop before writing the rule so the old service cannot consume its TTL.
+    Stop-Service trapd-agent
+    $firewall = New-Object -ComObject HNetCfg.FwPolicy2
+    $names = @('TRAPD-BLOCK-OUT-203.0.113.80', 'TRAPD-BLOCK-IN-203.0.113.80')
+    $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 15
+    foreach ($name in $names) {
+        $rule = New-Object -ComObject HNetCfg.FWRule
+        $rule.Name = $name
+        $rule.Grouping = 'TRAPD-Containment'
+        $rule.Description = 'TRAPD containment: blocked indicator; expiry-v1:' + (@{ deadline = $deadline; command_id = 'expiry-acceptance' } | ConvertTo-Json -Compress)
+        $rule.Protocol = 256
+        $rule.Direction = if ($name -like '*-IN-*') { 1 } else { 2 }
+        $rule.Action = 0
+        $rule.RemoteAddresses = '203.0.113.80'
+        $rule.Enabled = $true
+        $firewall.Rules.Add($rule)
+    }
+    Start-Service trapd-agent
+    Wait-Until { @($firewall.Rules | Where-Object { $_.Name -in $names }).Count -eq 0 } 'Restart lost the persistent firewall TTL.' 60
+}
+
 $defaults = Join-Path $root 'defaults.json'
 & $AgentExe diagnostics config | Set-Content -Encoding utf8 $defaults
 if ($LASTEXITCODE -ne 0) { throw 'Could not read agent configuration schema.' }
@@ -56,6 +78,7 @@ try {
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'system' }).Count -gt 0 } 'Offline MSI produced no local telemetry.'
     Wait-Until { Test-Path (Join-Path $state 'inventory.json') } 'Offline inventory was not written.'
     if (@(Read-Requests).Count -ne 0) { throw 'Offline installation contacted the backend.' }
+    Test-BlockExpiryAcrossRestart
     $offlineDevice = Get-Content -Raw (Join-Path $state 'device_id')
     Invoke-Msi @('/x', "`"$Msi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'offline-uninstall.log')`"")
     Wait-Until { $null -eq (Get-Service trapd-agent -ErrorAction SilentlyContinue) } 'Offline uninstall left the service.'
@@ -81,6 +104,7 @@ try {
     if ($helperOut -notmatch 'ABCDE-FGHJK') { throw 'pair.ps1 did not show the pairing code.' }
     if (-not (Test-Path (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'TRAPD\Pair this computer with TRAPD.lnk'))) { throw 'Pairing shortcut is missing.' }
     if (@(Read-Requests | Where-Object { $_.path -like '*/agents/pair/start' }).Count -lt 1) { throw 'Agent did not start pairing at the backend.' }
+    Test-BlockExpiryAcrossRestart
     Invoke-Msi @('/x', "`"$Msi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'pairing-uninstall.log')`"")
     Wait-Until { $null -eq (Get-Service trapd-agent -ErrorAction SilentlyContinue) } 'Uninstall during pending pairing left the service.'
     if (Test-Path $pairingFile) { throw 'pairing.txt survived the service stop.' }
@@ -151,6 +175,23 @@ try {
     Wait-Until { (Get-Service trapd-agent).Status -eq 'Running' } 'Repair did not restart the service.'
     if ((Get-Content -Raw (Join-Path $state 'device_id')) -ne $device) { throw 'Repair changed device identity.' }
 
+    # Persistent containment must not outlive explicit removal. TEST-NET
+    # remote scopes keep the CI host reachable while exercising enabled rules.
+    $firewall = New-Object -ComObject HNetCfg.FwPolicy2
+    $containmentNames = @('TRAPD-ISOLATE-OUT', 'TRAPD-ISOLATE-IN', 'TRAPD-BLOCK-OUT-203.0.113.79')
+    $externalName = 'TRAPD-MSI-EXTERNAL-TEST'
+    foreach ($name in ($containmentNames + @($externalName))) {
+        $rule = New-Object -ComObject HNetCfg.FWRule
+        $rule.Name = $name
+        $rule.Grouping = if ($name -eq $externalName) { 'Other-Application' } else { 'TRAPD-Containment' }
+        $rule.Protocol = 256
+        $rule.Direction = if ($name -eq 'TRAPD-ISOLATE-IN') { 1 } else { 2 }
+        $rule.Action = 0
+        $rule.RemoteAddresses = '203.0.113.79'
+        $rule.Enabled = $true
+        $firewall.Rules.Add($rule)
+    }
+
     # A replacement that cannot start must fail its MSI transaction and
     # restore the previous service and executable.
     $currentVersion = ((& $AgentExe --version) -replace '^trapd-agent v', '')
@@ -176,12 +217,19 @@ try {
     Wait-Until { (Get-Service trapd-agent).Status -eq 'Running' } 'Service did not survive major upgrade.'
     if ((Get-Content -Raw (Join-Path $state 'device_id')) -ne $device) { throw 'Upgrade changed identity.' }
     if ((Get-FileHash (Join-Path $config 'agent.env')).Hash -ne $configHash) { throw 'Upgrade overwrote agent.env.' }
+    foreach ($name in $containmentNames) {
+        if (@($firewall.Rules | Where-Object { $_.Name -eq $name -and $_.Enabled }).Count -ne 1) { throw "Upgrade did not preserve containment rule $name." }
+    }
     $downgrade = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @('/i', "`"$Msi`"", '/qn', '/norestart') -Wait -PassThru
     if ($downgrade.ExitCode -in @(0, 3010)) { throw 'MSI downgrade was accepted.' }
     Invoke-Msi @('/x', "`"$installedMsi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'uninstall.log')`"")
     Wait-Until { $null -eq (Get-Service trapd-agent -ErrorAction SilentlyContinue) } 'Uninstall left the service registered.'
     if (Test-Path (Join-Path $env:ProgramFiles 'TRAPD Agent\trapd-agent.exe')) { throw 'Uninstall left the executable.' }
     if (-not (Test-Path (Join-Path $state 'device_id'))) { throw 'Uninstall removed retained identity.' }
+    $remaining = @($firewall.Rules | Where-Object { $_.Grouping -eq 'TRAPD-Containment' })
+    if ($remaining.Count -ne 0) { throw 'Uninstall left persistent TRAPD containment rules.' }
+    if (@($firewall.Rules | Where-Object { $_.Name -eq $externalName }).Count -ne 1) { throw 'Uninstall removed another application firewall rule.' }
+    $firewall.Rules.Remove($externalName)
     Write-Host 'MSI lifecycle and native telemetry acceptance passed.'
 } finally {
     $logs = Join-Path (Get-Location) 'msi-test-results'

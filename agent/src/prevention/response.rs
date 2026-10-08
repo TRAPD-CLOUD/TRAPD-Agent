@@ -284,7 +284,16 @@ pub fn targets_for_rule(rule_id: &str, subject: &str, evidence: &serde_json::Val
     let (pid, process_start_time) = if let Some(pid) = explicit_pid {
         (
             pid.as_i64(),
-            evidence.get("process_start_time").and_then(|v| v.as_u64()),
+            match evidence.get("process_start_time") {
+                Some(start) => start.as_u64(),
+                None => lineage_head
+                    .filter(|head| {
+                        pid.as_i64().is_some()
+                            && head.get("pid").and_then(|v| v.as_i64()) == pid.as_i64()
+                    })
+                    .and_then(|head| head.get("process_start_time"))
+                    .and_then(|start| start.as_u64()),
+            },
         )
     } else {
         (
@@ -524,7 +533,7 @@ mod tests {
             "memory.inject",
             "",
             &json!({
-                "pid": 99, "process_lineage": [{ "pid": 99, "process_start_time": 456 }]
+                "pid": 99, "process_lineage": [{ "pid": 88, "process_start_time": 456 }]
             }),
         );
         assert_eq!((unknown.pid, unknown.process_start_time), (Some(99), None));
@@ -539,6 +548,63 @@ mod tests {
             (lineage.pid, lineage.process_start_time),
             (Some(88), Some(456))
         );
+    }
+
+    #[test]
+    fn matching_lineage_identity_allows_configured_automatic_kill() {
+        for field in ["pid", "accessor_pid"] {
+            let targets = targets_for_rule(
+                "privesc.setuid_root",
+                "bash",
+                &json!({field: 99, "process_lineage": [{"pid": 99, "process_start_time": 456}]}),
+            );
+            assert_eq!(
+                (targets.pid, targets.process_start_time),
+                (Some(99), Some(456))
+            );
+            let decision = decide(
+                true,
+                AutoAction::Kill,
+                Severity::High,
+                80,
+                &[],
+                Severity::Critical,
+                "privesc.setuid_root",
+                "privilege_escalation",
+                95,
+                &targets,
+            );
+            assert_eq!(decision.action, AutoAction::Kill);
+        }
+    }
+
+    #[test]
+    fn explicit_generation_wins_over_matching_lineage() {
+        let targets = targets_for_rule(
+            "memory.inject",
+            "",
+            &json!({"pid": 99, "process_start_time": 123,
+                "process_lineage": [{"pid": 99, "process_start_time": 456}]}),
+        );
+        assert_eq!(
+            (targets.pid, targets.process_start_time),
+            (Some(99), Some(123))
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_generation_cannot_be_replaced_by_lineage() {
+        for start in [json!(0), json!(-1), json!(null), json!("123")] {
+            let targets = targets_for_rule(
+                "memory.inject",
+                "",
+                &json!({
+                    "pid": 99, "process_start_time": start,
+                    "process_lineage": [{"pid": 99, "process_start_time": 456}]
+                }),
+            );
+            assert_eq!(targets.process_start_time, None);
+        }
     }
 
     #[test]

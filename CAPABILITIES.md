@@ -43,7 +43,7 @@ else on Windows is type-checked and unit-tested on shared logic only.
 
 Known Windows limits: isolation does not allow DNS or DHCP unless the resolver is
 in `isolation_allowlist_ips`; isolation and IP blocks persist across a reboot
-(they are ordinary firewall rules, removed by `deisolate` / `unblock_ip`).
+(they are persistent firewall rules, removed by `deisolate` / `unblock_ip` or explicit uninstall). Windows IP blocks with a TTL store their deadline in each rule and are reconciled before enrollment and every five seconds, including offline and pending-pairing modes; upgrades preserve containment.
 Windows quarantine refuses files larger than 1 GiB including their data streams
 and filesystems that cannot enumerate those streams safely.
 

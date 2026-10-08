@@ -50,6 +50,8 @@ pub fn entry() -> Result<()> {
             crate::update::run_apply_helper()
         }
         Some("cleanup") => {
+            crate::prevention::winfirewall::cleanup()
+                .context("remove containment firewall rules")?;
             crate::collectors::windows::honeytokens::uninstall(&crate::config::load_persisted());
             Ok(())
         }
@@ -245,6 +247,11 @@ fn uninstall() -> Result<()> {
             std::thread::sleep(Duration::from_secs(1));
         }
     }
+
+    if service.query_status()?.current_state != ServiceState::Stopped {
+        bail!("service did not stop; refusing uninstall while containment can be recreated");
+    }
+    crate::prevention::winfirewall::cleanup().context("remove containment firewall rules")?;
 
     // 2. Delete the service registration.
     service.delete().context("delete service")?;

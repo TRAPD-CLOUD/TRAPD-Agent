@@ -46,6 +46,73 @@ pub fn block_rule_name(target: &str, dir: Direction) -> String {
     )
 }
 
+/// Recover the canonical target we encoded in a block rule's stable name.
+/// Windows may reformat RemoteAddresses as a subnet mask or address range;
+/// rule names preserve our original validated IP/CIDR representation.
+pub fn parse_block_rule_name(name: &str) -> Option<(IpNet, Direction)> {
+    let (target, direction) = if let Some(target) = name.strip_prefix("TRAPD-BLOCK-OUT-") {
+        (target, Direction::Out)
+    } else {
+        (name.strip_prefix("TRAPD-BLOCK-IN-")?, Direction::In)
+    };
+    let target = target.replace('_', "/");
+    let net = target
+        .parse::<IpNet>()
+        .or_else(|_| target.parse::<IpAddr>().map(IpNet::from))
+        .ok()?
+        .trunc();
+    (block_rule_name(&remote_for(&net), direction) == name).then_some((net, direction))
+}
+
+const BLOCK_DESCRIPTION: &str = "TRAPD containment: blocked indicator";
+const EXPIRY_PREFIX: &str = "TRAPD containment: blocked indicator; expiry-v1:";
+
+/// Stored in the native rule itself, so a crash cannot lose a separate timer
+/// or leave the rule and its expiry journal out of sync.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockExpiry {
+    pub deadline: u64,
+    pub command_id: String,
+}
+
+impl BlockExpiry {
+    pub fn expired(&self, now: u64) -> bool {
+        now >= self.deadline
+    }
+}
+
+pub fn block_description(ttl: Option<u64>, command_id: &str, now: u64) -> anyhow::Result<String> {
+    let Some(ttl) = ttl else {
+        return Ok(BLOCK_DESCRIPTION.to_string());
+    };
+    let deadline = now
+        .checked_add(ttl)
+        .ok_or_else(|| anyhow::anyhow!("block TTL exceeds timestamp range"))?;
+    let description = format!(
+        "{EXPIRY_PREFIX}{}",
+        serde_json::to_string(&BlockExpiry {
+            deadline,
+            command_id: command_id.into(),
+        })?
+    );
+    // INetFwRule descriptions forbid '|'. Bound metadata before publishing.
+    if description.len() > 512 || description.contains('|') {
+        anyhow::bail!("invalid firewall expiry metadata");
+    }
+    Ok(description)
+}
+
+pub fn block_expiry(description: &str) -> anyhow::Result<Option<BlockExpiry>> {
+    let Some(metadata) = description.strip_prefix(EXPIRY_PREFIX) else {
+        return Ok(None);
+    };
+    if description.len() > 512 {
+        anyhow::bail!("firewall expiry metadata exceeds limit");
+    }
+    Ok(Some(serde_json::from_str(metadata)?))
+}
+
 /// Registry locations of the per-profile firewall switch: the local setting and
 /// the group-policy override. Shared by containment (is the firewall actually
 /// enforcing?) and the hardening inventory.
@@ -177,6 +244,84 @@ impl Bounded for u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_expiry_survives_serialization_and_expires_at_deadline() {
+        let description = block_description(Some(60), "command-1", 1_000).unwrap();
+        let restored = block_expiry(&description).unwrap().unwrap();
+        assert_eq!(restored.deadline, 1_060);
+        assert_eq!(restored.command_id, "command-1");
+        assert!(!restored.expired(1_059));
+        assert!(restored.expired(1_060));
+        assert!(restored.expired(1_100));
+    }
+
+    #[test]
+    fn permanent_blocks_have_no_expiry_and_zero_ttl_is_immediate() {
+        assert!(block_expiry(&block_description(None, "", 1_000).unwrap())
+            .unwrap()
+            .is_none());
+        assert!(block_expiry("TRAPD containment: host isolated")
+            .unwrap()
+            .is_none());
+        assert!(
+            block_expiry(&block_description(Some(0), "cmd", 1_000).unwrap())
+                .unwrap()
+                .unwrap()
+                .expired(1_000)
+        );
+    }
+
+    #[test]
+    fn block_expiry_rejects_overflow_and_corrupt_metadata() {
+        assert!(block_description(Some(u64::MAX), "cmd", 1).is_err());
+        for description in [
+            "TRAPD containment: blocked indicator; expiry-v1:broken",
+            "TRAPD containment: blocked indicator; expiry-v1:{\"deadline\":-1,\"command_id\":\"cmd\"}",
+            "TRAPD containment: blocked indicator; expiry-v1:{\"deadline\":1}",
+        ] {
+            assert!(block_expiry(description).is_err(), "{description}");
+        }
+    }
+
+    #[test]
+    fn expiry_recovers_targets_from_owned_rule_names() {
+        for (name, target, direction) in [
+            (
+                "TRAPD-BLOCK-OUT-203.0.113.77",
+                "203.0.113.77/32",
+                Direction::Out,
+            ),
+            (
+                "TRAPD-BLOCK-IN-203.0.113.0_24",
+                "203.0.113.0/24",
+                Direction::In,
+            ),
+            (
+                "TRAPD-BLOCK-IN-2001:db8::1",
+                "2001:db8::1/128",
+                Direction::In,
+            ),
+            (
+                "TRAPD-BLOCK-OUT-2001:db8::_64",
+                "2001:db8::/64",
+                Direction::Out,
+            ),
+        ] {
+            assert_eq!(
+                parse_block_rule_name(name),
+                Some((target.parse::<IpNet>().unwrap(), direction))
+            );
+        }
+        for name in [
+            "TRAPD-ISOLATE-OUT",
+            "Other-Application",
+            "TRAPD-BLOCK-OUT-DNS",
+            "TRAPD-BLOCK-OUT-203.0.113.77_24",
+        ] {
+            assert!(parse_block_rule_name(name).is_none(), "{name}");
+        }
+    }
 
     fn covers(ranges: &[String], ip: &str) -> bool {
         let ip: IpAddr = ip.parse().unwrap();

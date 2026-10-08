@@ -148,6 +148,34 @@ pub fn block_ip(backend: Backend, target: &str) -> Result<String> {
     }
 }
 
+/// Windows rules carry their deadline durably; other backends retain the
+/// existing engine timer behavior.
+pub fn block_ip_with_ttl(
+    backend: Backend,
+    target: &str,
+    ttl: Option<u64>,
+    command_id: &str,
+) -> Result<String> {
+    #[cfg(windows)]
+    if matches!(backend, Backend::WindowsFirewall) {
+        return super::winfirewall::block_with_ttl(
+            &parse_ip_or_cidr(target)?.as_net(),
+            ttl,
+            command_id,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (ttl, command_id);
+    block_ip(backend, target)
+}
+
+#[cfg(windows)]
+pub(super) fn canonical_windows_target(target: &str) -> Result<String> {
+    Ok(super::firewall::remote_for(
+        &parse_ip_or_cidr(target)?.as_net().trunc(),
+    ))
+}
+
 pub fn unblock_ip(backend: Backend, target: &str) -> Result<()> {
     let parsed = parse_ip_or_cidr(target)?;
     match backend {

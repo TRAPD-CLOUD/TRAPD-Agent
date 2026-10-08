@@ -209,10 +209,61 @@ impl Engine {
         }
     }
 
-    /// Spawn the event-enforcement loop.  Consumes the receiver.
-    ///
-    /// Two enforcement paths ride this stream: IoC enforcement on `ProcessExec`,
-    /// and the policy-driven auto-response on a `HoneytokenAccess` detection.
+    /// Recover persistent Windows deadlines before consuming new responses.
+    #[cfg(windows)]
+    pub async fn start_firewall_expiry(self: Arc<Self>) {
+        if !matches!(self.cfg.net_backend, Backend::WindowsFirewall) {
+            return;
+        }
+        // Reconcile before starting command/event consumers, then retry even
+        // when prevention has been disabled since installing rules.
+        self.reconcile_firewall_expiry().await;
+        tokio::spawn(async move {
+            let period = Duration::from_secs(5);
+            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                self.reconcile_firewall_expiry().await;
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    async fn reconcile_firewall_expiry(&self) {
+        let mut blocked = self.blocked.lock().await;
+        let expired = match tokio::task::spawn_blocking(super::winfirewall::expire_due_blocks).await
+        {
+            Ok(Ok(expired)) => expired,
+            Ok(Err(error)) => {
+                warn!(%error, "firewall TTL reconciliation failed; will retry");
+                return;
+            }
+            Err(error) => {
+                warn!(%error, "firewall TTL reconciliation task failed; will retry");
+                return;
+            }
+        };
+        for expiry in expired {
+            blocked.retain(|key| {
+                network::canonical_windows_target(key).ok().as_deref()
+                    != Some(expiry.target.as_str())
+            });
+            self.audit.emit(
+                EventAction::IpUnblocked,
+                Severity::Info,
+                "ip_unblock",
+                expiry.target,
+                true,
+                "TTL expired",
+                None,
+                Some(expiry.command_id),
+                serde_json::Value::Null,
+            );
+        }
+    }
+
+    /// Spawn the event-enforcement loop. Consumes the receiver.
     pub fn spawn_event_loop(self: Arc<Self>, mut rx: Receiver<AgentEvent>) {
         tokio::spawn(async move {
             let mut config_tick = tokio::time::interval(Duration::from_millis(100));
@@ -1689,14 +1740,16 @@ impl Engine {
     }
 
     async fn cmd_block_ip(&self, ip: &str, ttl_secs: Option<u64>, cmd_id: &str) {
-        let res = network::block_ip(self.cfg.net_backend, ip);
+        let mut blocked = self.blocked.lock().await;
+        let res = network::block_ip_with_ttl(self.cfg.net_backend, ip, ttl_secs, cmd_id);
         let (success, reason) = match &res {
             Ok(handle) => (true, format!("block rule installed ({handle})")),
             Err(e) => (false, format!("block_ip failed: {e:#}")),
         };
         if success {
-            self.blocked.lock().await.insert(ip.to_string());
+            blocked.insert(ip.to_string());
         }
+        drop(blocked);
         self.audit.emit(
             crate::schema::EventAction::IpBlocked,
             crate::schema::Severity::High,
@@ -1708,6 +1761,13 @@ impl Engine {
             Some(cmd_id.into()),
             json!({ "ttl_secs": ttl_secs }),
         );
+
+        // Windows expiry is driven by persistent rule metadata, including
+        // replacement commands, rather than a stale per-command sleep.
+        #[cfg(windows)]
+        if matches!(self.cfg.net_backend, Backend::WindowsFirewall) {
+            return;
+        }
 
         if let (true, Some(ttl)) = (success, ttl_secs) {
             let backend = self.cfg.net_backend;
@@ -1738,14 +1798,22 @@ impl Engine {
     }
 
     async fn cmd_unblock_ip(&self, ip: &str, cmd_id: &str) {
+        let mut blocked = self.blocked.lock().await;
         let res = network::unblock_ip(self.cfg.net_backend, ip);
         let (success, reason) = match res {
             Ok(_) => (true, format!("unblocked {ip}")),
             Err(e) => (false, format!("unblock failed: {e:#}")),
         };
         if success {
-            self.blocked.lock().await.remove(ip);
+            blocked.remove(ip);
+            #[cfg(windows)]
+            if let Ok(target) = network::canonical_windows_target(ip) {
+                blocked.retain(|key| {
+                    network::canonical_windows_target(key).ok().as_deref() != Some(target.as_str())
+                });
+            }
         }
+        drop(blocked);
         self.audit.emit(
             crate::schema::EventAction::IpUnblocked,
             crate::schema::Severity::Info,
@@ -1831,6 +1899,36 @@ mod tests {
             Arc::new(RwLock::new(AgentConfig::default())),
         );
         (engine, rx)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "blocks TEST-NET; requires elevated enforcing Windows host"]
+    async fn native_windows_firewall_engine_expiry_updates_dedup_and_audit() {
+        let (mut engine, mut audit_rx) = test_engine();
+        engine.cfg.net_backend = Backend::WindowsFirewall;
+        engine
+            .cmd_block_ip("203.0.113.81/32", Some(0), "command-expiry")
+            .await;
+        assert!(engine.blocked.lock().await.contains("203.0.113.81/32"));
+        let blocked_event = audit_rx.recv().await.unwrap();
+        assert!(matches!(blocked_event.action, EventAction::IpBlocked));
+        match blocked_event.data {
+            EventData::Prevention(data) => assert!(data.success),
+            _ => panic!("expected prevention audit"),
+        }
+        engine.reconcile_firewall_expiry().await;
+        assert!(engine.blocked.lock().await.is_empty());
+        let expired_event = audit_rx.recv().await.unwrap();
+        assert!(matches!(expired_event.action, EventAction::IpUnblocked));
+        match expired_event.data {
+            EventData::Prevention(data) => {
+                assert!(data.success);
+                assert_eq!(data.target, "203.0.113.81");
+                assert_eq!(data.command_id.as_deref(), Some("command-expiry"));
+            }
+            _ => panic!("expected prevention audit"),
+        }
     }
 
     #[cfg(any(target_os = "linux", windows))]

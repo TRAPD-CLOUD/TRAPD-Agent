@@ -114,11 +114,11 @@
       <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="string" Value="[ENROLLTOKEN]" KeyPath="yes" />
     </Component>
 
-    <!-- MSI owns service registration. This verb only revokes agent decoys,
-         after StopServices and before RemoveFiles; upgrades preserve decoys. -->
+    <!-- MSI owns service registration. Remove persistent containment and
+         decoys after StopServices, before DeleteServices; upgrades preserve both. -->
     <CustomAction Id="CleanupDecoys" FileRef="AgentExe" ExeCommand="cleanup" Execute="deferred" Impersonate="no" Return="check" />
     <InstallExecuteSequence>
-      <Custom Action="CleanupDecoys" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="CleanupDecoys" Before="DeleteServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
     <Feature Id="Agent" Title="TRAPD Agent" Level="1">
       <ComponentRef Id="AgentService" /><ComponentRef Id="DataDirectory" /><ComponentRef Id="ConfigDirectory" />

@@ -90,6 +90,8 @@ pub async fn start(
         )
         .with_reconcile_signal(reconcile_signal),
     );
+    #[cfg(windows)]
+    Arc::clone(&engine).start_firewall_expiry().await;
     Arc::clone(&engine).spawn_event_loop(event_rx);
 
     if let Some(v) = verifier {
@@ -247,19 +249,47 @@ fn build_isolation_allowlist(
 }
 
 fn backend_host(url: &str) -> Option<String> {
-    let s = url.split("://").nth(1).unwrap_or(url);
-    let s = s.split('/').next().unwrap_or(s);
-    let s = s.split(':').next().unwrap_or(s);
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
+    let url = reqwest::Url::parse(url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
     }
+    // Url::host_str brackets IPv6 literals; IpAddr and ToSocketAddrs need
+    // the host itself rather than the serialized URL authority.
+    let host = url.host_str()?;
+    Some(
+        host.strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host)
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_backend_remains_reachable_during_isolation() {
+        let cfg = Arc::new(RwLock::new(AgentConfig::default()));
+        let allow = build_isolation_allowlist("https://[2001:db8::1]:8443/api", &cfg);
+        assert_eq!(
+            allow,
+            vec!["2001:db8::1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(backend_host("https://[::1]/"), Some("::1".into()));
+    }
+
+    #[test]
+    fn backend_host_rejects_invalid_or_hostless_urls() {
+        for url in [
+            "",
+            "https://[2001:db8::1",
+            "file:///tmp/backend",
+            "https://",
+        ] {
+            assert_eq!(backend_host(url), None, "{url}");
+        }
+    }
 
     #[test]
     fn backend_host_extracts_hostname() {
