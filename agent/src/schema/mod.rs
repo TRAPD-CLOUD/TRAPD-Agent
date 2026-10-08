@@ -303,6 +303,10 @@ pub struct ProcessCreateData {
     /// later one that reused its PID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_start_time: Option<u64>,
+    /// Observed parent's creation identity; absent when it cannot be bound to
+    /// a generation that already existed when this child was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_start_time: Option<u64>,
     /// Which `/proc` reads failed or were truncated while building this event.
     #[serde(default, flatten)]
     pub enrichment: crate::telemetry::Enrichment,

@@ -163,13 +163,14 @@ pub fn thaw_pid(_pid: i32) -> Result<()> {
 }
 
 /// Look up the parent's comm by PPID.
-fn parent_comm(ppid: i32) -> Option<String> {
+fn parent_comm(exec: &ExecEventData) -> Option<String> {
+    let ppid = exec.ppid;
     if ppid <= 0 {
         return None;
     }
     #[cfg(windows)]
     {
-        super::winproc::image_name(ppid)
+        super::winproc::image_name_observed(ppid, exec.parent_start_time)
     }
     #[cfg(not(windows))]
     {
@@ -209,6 +210,7 @@ pub fn exec_from_create(create: &crate::schema::ProcessCreateData) -> ExecEventD
         cmdline: create.cmdline.clone(),
         exe_sha256: create.exe_sha256.clone(),
         process_start_time: create.process_start_time,
+        parent_start_time: create.parent_start_time,
         ..Default::default()
     }
 }
@@ -237,7 +239,7 @@ pub fn enforce_exec(
     // before matching just when such a rule exists, and for the audit record
     // after a match otherwise.
     let mut parent = if policy.read().has_parent_child_rules() {
-        parent_comm(exec.ppid)
+        parent_comm(exec)
     } else {
         None
     };
@@ -249,7 +251,7 @@ pub fn enforce_exec(
 
     let m = m?;
     if parent.is_none() {
-        parent = parent_comm(exec.ppid);
+        parent = parent_comm(exec);
     }
 
     let details = serde_json::json!({
@@ -310,6 +312,24 @@ pub fn enforce_exec(
 mod tests {
     use super::super::policy::{IocRule, PolicyStore};
     use super::*;
+
+    #[test]
+    fn process_create_policy_view_preserves_observed_parent_generation() {
+        let create = crate::schema::ProcessCreateData {
+            pid: 100,
+            ppid: 50,
+            process_start_time: Some(20),
+            parent_start_time: Some(10),
+            ..Default::default()
+        };
+        let decoded: crate::schema::ProcessCreateData =
+            serde_json::from_slice(&serde_json::to_vec(&create).unwrap()).unwrap();
+        assert_eq!(exec_from_create(&decoded).parent_start_time, Some(10));
+        let mut legacy = serde_json::to_value(create).unwrap();
+        legacy.as_object_mut().unwrap().remove("parent_start_time");
+        let legacy: crate::schema::ProcessCreateData = serde_json::from_value(legacy).unwrap();
+        assert_eq!(exec_from_create(&legacy).parent_start_time, None);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -398,6 +418,57 @@ mod windows_tests {
     use super::super::policy::{IocRule, PolicyStore};
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn parent_child_block_requires_the_observed_parent_generation() {
+        let mut child = Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let ppid = std::process::id() as i32;
+        let parent_start = crate::telemetry::identity::process_start_time(ppid).unwrap();
+        let parent_name =
+            super::super::winproc::image_name_observed(ppid, Some(parent_start)).unwrap();
+        let policy = PolicyHandle::new(
+            PolicyStore::from_rules(vec![IocRule::ParentChild {
+                id: "bound-parent".into(),
+                parent: parent_name,
+                child: "ping.exe".into(),
+                action: RuleAction::Block,
+            }])
+            .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let audit = AuditEmitter::new(tx, "agent".into(), "host".into());
+        let mut exec = ExecEventData {
+            pid: child.id() as i32,
+            ppid,
+            comm: "ping.exe".into(),
+            process_start_time: crate::telemetry::identity::process_start_time(child.id() as i32),
+            ..Default::default()
+        };
+        for generation in [None, Some(0), Some(parent_start + 1)] {
+            exec.parent_start_time = generation;
+            assert!(enforce_exec(&exec, &policy, &audit).is_none());
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "unproven parent must not cause a child kill"
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        exec.parent_start_time = Some(parent_start);
+        assert_eq!(
+            enforce_exec(&exec, &policy, &audit).as_deref(),
+            Some("bound-parent")
+        );
+        child.wait().unwrap();
+        match rx.try_recv().unwrap().data {
+            crate::schema::EventData::Prevention(data) => assert!(data.success),
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
 
     /// End to end on a real process: a Block rule written the way a Linux
     /// operator would (lower-case name) kills the Windows image, bound to the

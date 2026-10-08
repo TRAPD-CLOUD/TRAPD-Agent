@@ -30,6 +30,30 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(3600);
 const STAGED_RETRY_AFTER: Duration = Duration::from_secs(6 * 3600);
 /// How long the helper waits for the new version's first good heartbeat.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
+const RECOVERY_GRACE: Duration = Duration::from_secs(300);
+
+fn next_check_delay(paths: &StagingPaths, normal: Duration, windows: bool) -> Duration {
+    if !windows {
+        return normal;
+    }
+    if !paths.recovery().exists() {
+        // Helper launch is asynchronous: its journal may appear immediately
+        // after this check. Do not sleep an hour through that crash window.
+        return if paths.offer().is_file() {
+            RECOVERY_GRACE
+        } else {
+            normal
+        };
+    }
+    // The next check must observe the guard's expiry, rather than the next
+    // hourly backend poll. After a launch/failure keep five minutes between
+    // attempts, giving a detached helper time to finish its health/SCM work.
+    file_age(&paths.recovery())
+        .and_then(|age| RECOVERY_GRACE.checked_sub(age))
+        .filter(|remaining| !remaining.is_zero())
+        .unwrap_or(RECOVERY_GRACE)
+        .max(Duration::from_secs(1))
+}
 
 /// Where the release public key lives.
 ///
@@ -99,7 +123,12 @@ impl Updater {
             if let Err(e) = self.check_once().await {
                 warn!(error = %e, "update: check failed");
             }
-            tokio::time::sleep(CHECK_INTERVAL + jitter).await;
+            tokio::time::sleep(next_check_delay(
+                &self.paths,
+                CHECK_INTERVAL + jitter,
+                cfg!(windows),
+            ))
+            .await;
         }
     }
 
@@ -112,7 +141,7 @@ impl Updater {
         // artifact. A later release cannot supersede an unfinished recovery.
         if self.paths.recovery().exists() {
             #[cfg(windows)]
-            if !file_is_fresh(&self.paths.recovery(), Duration::from_secs(300)) {
+            if !file_is_fresh(&self.paths.recovery(), RECOVERY_GRACE) {
                 windows::spawn_apply_helper(&self.paths.dir)
                     .context("update: relaunch pending recovery helper")?;
             }
@@ -241,12 +270,14 @@ fn staged_within(paths: &StagingPaths, window: Duration) -> bool {
 }
 
 fn file_is_fresh(path: &std::path::Path, window: Duration) -> bool {
+    file_age(path).is_some_and(|age| age < window)
+}
+
+fn file_age(path: &std::path::Path) -> Option<Duration> {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .map(|age| age < window)
-        .unwrap_or(false)
 }
 
 fn rand_u32() -> u32 {
@@ -369,6 +400,42 @@ pub fn run_apply_helper() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_windows_recovery_is_checked_at_grace_expiry_instead_of_next_hour() {
+        let paths = StagingPaths {
+            dir: std::env::temp_dir().join(format!("trapd-retry-delay-{}", uuid::Uuid::new_v4())),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let journal = std::fs::File::create(paths.recovery()).unwrap();
+        journal
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(100)),
+            )
+            .unwrap();
+        let normal = CHECK_INTERVAL + Duration::from_secs(120);
+        let delay = next_check_delay(&paths, normal, true);
+        assert!(
+            delay > Duration::from_secs(198) && delay <= Duration::from_secs(201),
+            "delay={delay:?}"
+        );
+        assert_eq!(next_check_delay(&paths, normal, false), normal);
+        journal
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(301)),
+            )
+            .unwrap();
+        assert_eq!(next_check_delay(&paths, normal, true), RECOVERY_GRACE);
+        drop(journal);
+        std::fs::remove_file(paths.recovery()).unwrap();
+        assert_eq!(next_check_delay(&paths, normal, true), normal);
+        std::fs::write(paths.offer(), b"pending signed offer").unwrap();
+        assert_eq!(next_check_delay(&paths, normal, true), RECOVERY_GRACE);
+        assert_eq!(next_check_delay(&paths, normal, false), normal);
+        std::fs::remove_dir_all(paths.dir).unwrap();
+    }
 
     #[tokio::test]
     async fn completed_staging_is_cleaned_before_polling_for_the_next_update() {

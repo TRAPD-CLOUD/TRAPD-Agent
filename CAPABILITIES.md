@@ -32,7 +32,7 @@ else on Windows is type-checked and unit-tested on shared logic only.
 | File quarantine + restore | ✅ move + `chmod 000` + `chattr +i` | ✅ SYSTEM ownership + protected DACL, original owner/DACL restored; pins paths and copies into a fresh protected object, preserving NTFS data streams; native CI |
 | Auto-response, signed command channel, RTR | ✅ | ✅ PowerShell via `-EncodedCommand`; memory collection via `ReadProcessMemory` (LSASS and other protected processes refused) |
 | Pre-exec kernel blocking | 🟡 tracepoint kill (not LSM) | ⏳ none: post-creation kill only (needs a driver) |
-| Signed self-update with rollback | ✅ systemd path unit, authenticated recovery targets, resumable completion cleanup | ✅ copied apply helper with staged-launch retries, verified SCM stop, durable recovery and completion cleanup |
+| Signed self-update with rollback | ✅ systemd path unit, authenticated recovery targets, resumable completion cleanup | ✅ copied apply helper with staged-launch retries, recovery checks at guard expiry, verified SCM stop, durable recovery and completion cleanup |
 | Binary self-integrity | ✅ | ✅ strict hash check; MSI resets the baseline within its installer transaction, signed updates refresh it with rollback |
 | Inventory (hardware, software, ports) | ✅ | ✅ registry software, native TCP table |
 | Hardening assessment | ✅ CIS-style (sysctl, SSH) | ✅ `WIN-*` checks (UAC, firewall, Defender policy, WDigest, LSA PPL, NTLM, SMB1, RDP NLA, LLMNR, script-block logging, Secure Boot) |

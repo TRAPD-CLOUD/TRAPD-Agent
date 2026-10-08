@@ -261,6 +261,10 @@ impl Collector for ProcessCollector {
                     // since 1601). Its precision distinguishes PID reuse even
                     // within one second; unresolved identity remains unknown.
                     process_start_time: start_time,
+                    parent_start_time: crate::telemetry::identity::parent_generation_before_child(
+                        start_time,
+                        current.get(&ppid).and_then(|(_, start)| *start),
+                    ),
                     enrichment: notes.finish(0),
                 };
                 crate::deception::activity::record_exec(&data.username, &data.exe);

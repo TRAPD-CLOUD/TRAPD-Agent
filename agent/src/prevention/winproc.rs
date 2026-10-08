@@ -234,12 +234,17 @@ pub fn resume(pid: i32, expected_start: Option<u64>) -> Result<()> {
 }
 
 /// File name of the image `pid` runs (the Windows analogue of Linux `comm`),
-/// used to evaluate parent-process rules.
-pub fn image_name(pid: i32) -> Option<String> {
+/// used to evaluate parent-process rules. Creation time and name are read from
+/// the same owned handle so PID reuse cannot splice two process generations.
+pub fn image_name_observed(pid: i32, expected_start: Option<u64>) -> Option<String> {
+    let expected = require_generation(pid, expected_start).ok()?;
     if winguard::is_reserved_pid(pid) {
         return None;
     }
     let p = open(pid, 0).ok()?;
+    if creation_time(&p) != Some(expected) {
+        return None;
+    }
     let path = image_path(&p)?;
     path.rsplit(['\\', '/']).next().map(str::to_string)
 }
@@ -558,7 +563,7 @@ mod tests {
     #[test]
     fn a_missing_process_is_an_error_not_a_panic() {
         assert!(terminate(i32::MAX, None).is_err());
-        assert!(image_name(i32::MAX).is_none());
+        assert!(image_name_observed(i32::MAX, Some(1)).is_none());
     }
 
     #[test]
@@ -659,7 +664,12 @@ mod tests {
 
     #[test]
     fn image_name_is_the_file_name_of_the_running_image() {
-        let name = image_name(std::process::id() as i32).expect("own image");
+        let pid = std::process::id() as i32;
+        let start = crate::telemetry::identity::process_start_time(pid).unwrap();
+        assert!(image_name_observed(pid, None).is_none());
+        assert!(image_name_observed(pid, Some(0)).is_none());
+        assert!(image_name_observed(pid, Some(start + 1)).is_none());
+        let name = image_name_observed(pid, Some(start)).expect("own image");
         assert!(name.to_ascii_lowercase().ends_with(".exe"), "{name}");
     }
 
