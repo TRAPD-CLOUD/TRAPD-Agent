@@ -309,17 +309,6 @@ impl DetectionEngine {
         }
     }
 
-    /// Spawn a background task that reloads the IOC feed every `secs` seconds.
-    pub fn spawn_ioc_reloader(self: std::sync::Arc<Self>, secs: u64) {
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(secs.max(30)));
-            loop {
-                ticker.tick().await;
-                self.reload_iocs();
-            }
-        });
-    }
-
     /// Inspect one event, returning the findings it triggers — enriched with
     /// correlation keys and severity-finalised, but not yet gated: callers pass
     /// them through [`Self::admit`] before emitting them.

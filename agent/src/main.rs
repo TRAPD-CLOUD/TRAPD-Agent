@@ -440,7 +440,7 @@ async fn main() -> Result<()> {
         "Detection engine started"
     );
     // Pick up threat-intel feed updates without a restart.
-    Arc::clone(&engine).spawn_ioc_reloader(300);
+    crate::detection_host::spawn_ioc_reloader(Arc::clone(&engine), 300);
 
     // SIEM forwarder — best-effort export of every event (and detection) to
     // external syslog/HEC infrastructure, in parallel with backend ingest.

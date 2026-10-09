@@ -16,7 +16,6 @@ regex = "1.12.3"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
 hex = "0.4"
-tokio = { version = "1", features = ["rt", "time"] }
 yara-rust = { version = "0.28", package = "yara", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

@@ -51,6 +51,17 @@ pub fn engine(agent_id: String, hostname: String) -> trapd_detection::DetectionE
         Arc::new(HostRuntime),
     )
 }
+/// Pick up threat-intel feed updates on the agent runtime without a restart.
+pub fn spawn_ioc_reloader(engine: Arc<trapd_detection::DetectionEngine>, secs: u64) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(secs.max(30)));
+        loop {
+            ticker.tick().await;
+            engine.reload_iocs();
+        }
+    });
+}
+
 #[cfg(target_os = "linux")]
 mod process {
     use trapd_detection::honeytoken::ProcInfo;
