@@ -187,9 +187,13 @@ fn emit_contract() {
             cover_eventaction(&action);
             let c = serde_json::to_value(&class).unwrap();
             let a = serde_json::to_value(&action).unwrap();
+            let mut payload = data.clone();
+            if a == "logon_failed" {
+                payload["success"] = json!(false);
+            }
             fixtures.push(fixture(
                 format!("matrix/{}/{}", c.as_str().unwrap(), a.as_str().unwrap()),
-                source(c, a, data.clone()),
+                source(c, a, payload),
             ));
         }
     }
@@ -275,6 +279,198 @@ fn emit_contract() {
             .unwrap(),
         ),
     ));
+    fixtures.push(fixture(
+        "typed/file-open".into(),
+        source(
+            json!("filesystem"),
+            json!("open"),
+            serde_json::to_value(trapd_schema::FileOpenData {
+                pid: 42,
+                uid: 1000,
+                gid: 1000,
+                username: "fixture".into(),
+                comm: "cat".into(),
+                path: "/tmp/fixture.txt".into(),
+                flags: 0,
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/user-logon".into(),
+        source(
+            json!("user"),
+            json!("logon"),
+            serde_json::to_value(trapd_schema::UserLogonData {
+                username: "fixture".into(),
+                src_addr: None,
+                src_port: None,
+                auth_method: Some("password".into()),
+                success: true,
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/system-snapshot".into(),
+        source(
+            json!("system"),
+            json!("snapshot"),
+            serde_json::to_value(trapd_schema::SystemSnapshotData {
+                os: "Linux".into(),
+                kernel: "6.8".into(),
+                distro: "Debian".into(),
+                cpu_count: 4,
+                cpu_usage_pct: 10.0,
+                memory_total_mb: 4096,
+                memory_used_mb: 1024,
+                memory_free_mb: 3072,
+                uptime_secs: 3600,
+                load_avg: [0.1, 0.2, 0.3],
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/prevention".into(),
+        source(
+            json!("prevention"),
+            json!("process_blocked"),
+            serde_json::to_value(trapd_schema::PreventionEventData {
+                kind: "process_block".into(),
+                target: "123".into(),
+                success: true,
+                reason: "fixture".into(),
+                rule_id: None,
+                command_id: Some("contract-command".into()),
+                details: Value::Null,
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/detection".into(),
+        source(
+            json!("detection"),
+            json!("detected"),
+            serde_json::to_value(trapd_schema::DetectionData {
+                rule_id: "fixture.rule".into(),
+                title: "Finding title".into(),
+                detail: "Finding explanation".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/network-connection".into(),
+        source(
+            json!("network"),
+            json!("connection"),
+            serde_json::to_value(
+                serde_json::from_value::<trapd_schema::NetworkConnectionData>(data.clone())
+                    .unwrap(),
+            )
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/windows-etw-dns".into(),
+        source(
+            json!("network"),
+            json!("dns_response"),
+            serde_json::to_value(trapd_schema::DnsResolutionData {
+                qname: "actualsource.example".into(),
+                qtype: "A".into(),
+                resolved_ips: vec!["203.0.113.7".into()],
+                cnames: vec![],
+                server_addr: "".into(),
+                client_addr: "".into(),
+                transaction_id: 0,
+                rcode: "NOERROR".into(),
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/ptrace".into(),
+        source(
+            json!("process"),
+            json!("ptrace"),
+            serde_json::to_value(trapd_schema::PtraceData {
+                pid: 77,
+                uid: 1000,
+                gid: 1000,
+                username: "fixture".into(),
+                comm: "gdb".into(),
+                request: 16,
+                target_pid: 88,
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/user-logon-failure".into(),
+        source(
+            json!("user"),
+            json!("logon"),
+            serde_json::to_value(trapd_schema::UserLogonData {
+                username: "fixture".into(),
+                src_addr: None,
+                src_port: None,
+                auth_method: Some("password".into()),
+                success: false,
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/process-create-hash".into(),
+        source(
+            json!("process"),
+            json!("create"),
+            serde_json::to_value(trapd_schema::ProcessCreateData {
+                pid: 123,
+                ppid: 1,
+                name: "worker".into(),
+                exe: "/usr/bin/worker".into(),
+                cmdline: "worker".into(),
+                username: "fixture".into(),
+                exe_sha256: Some("a".repeat(64)),
+                ..Default::default()
+            })
+            .unwrap(),
+        ),
+    ));
+    let mut finding_failure = data.clone();
+    finding_failure["success"] = json!(false);
+    fixtures.push(fixture(
+        "finding/false-outcome".into(),
+        source(json!("detection"), json!("detected"), finding_failure),
+    ));
+    fixtures.push(fixture(
+        "typed/user-logon-invalid-ip".into(),
+        source(
+            json!("user"),
+            json!("logon"),
+            serde_json::to_value(trapd_schema::UserLogonData {
+                username: "fixture".into(),
+                src_addr: Some("not-an-ip".into()),
+                src_port: None,
+                auth_method: Some("password".into()),
+                success: true,
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "filesystem/username-only".into(),
+        source(
+            json!("filesystem"),
+            json!("open"),
+            json!({"username":"fixture","path":"/tmp/fixture.txt"}),
+        ),
+    ));
     let mut closed = data.clone();
     closed["state"] = json!("closed");
     fixtures.push(fixture(
@@ -291,4 +487,29 @@ fn emit_contract() {
         std::fs::write(path, serde_json::to_vec_pretty(&fixtures).unwrap()).unwrap();
     }
     assert!(fixtures.len() > 600);
+}
+
+#[test]
+fn process_identifier_overflow_is_rejected() {
+    for (class, action, data) in [
+        ("process", "create", json!({"pid":u64::MAX})),
+        ("process", "create", json!({"pid":1,"ppid":u64::MAX})),
+        ("process", "ptrace", json!({"pid":u64::MAX,"target_pid":88})),
+        (
+            "filesystem",
+            "open",
+            json!({"path":"/tmp/fixture","pid":u64::MAX}),
+        ),
+        (
+            "network",
+            "connection",
+            json!({"src_addr":"192.0.2.1","pid":u64::MAX}),
+        ),
+    ] {
+        let result = ocsf::to_ocsf(&source(json!(class), json!(action), data));
+        assert!(
+            result.is_err(),
+            "{class}/{action}: overflowing process identifier accepted"
+        );
+    }
 }

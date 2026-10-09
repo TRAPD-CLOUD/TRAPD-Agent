@@ -102,11 +102,18 @@ fn classification(class: &str, action: &str, data: &Value) -> (u64, u64) {
     }
 }
 fn copy(out: &mut Value, dest: &str, src: &Value, keys: &[&str]) {
-    if let Some(v) = keys
-        .iter()
-        .find_map(|k| src.get(*k).filter(|v| !v.is_null()))
-    {
-        out[dest] = v.clone();
+    if let Some(v) = keys.iter().find_map(|k| {
+        src.get(*k)
+            .filter(|v| !v.is_null() && v.as_str() != Some(""))
+    }) {
+        // Collectors may retain non-IP source tokens from text logs. Keep that
+        // evidence in the extension, never emit an invalid standard IP.
+        if dest != "ip"
+            || v.as_str()
+                .is_some_and(|s| s.parse::<std::net::IpAddr>().is_ok())
+        {
+            out[dest] = v.clone();
+        }
     }
 }
 fn file(path: &str) -> Value {
@@ -143,18 +150,36 @@ fn process(data: &Value, target: bool) -> Value {
             .filter(|s| !s.is_empty())
         {
             p["file"] = file(path);
+            if let Some(hash) = data
+                .get("exe_sha256")
+                .and_then(Value::as_str)
+                .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                p["file"]["hashes"] = json!([{"algorithm_id":3,"value":hash}]);
+            }
         }
     }
     p
 }
-fn actor(data: &Value) -> Value {
+fn actor(data: &Value, parent: bool) -> Value {
     let mut a = json!({});
-    let p = process(data, false);
-    if p.as_object().is_some_and(|o| !o.is_empty()) {
+    let p = if parent {
+        process(data, false)
+    } else {
+        process(data, true)
+    };
+    if ["pid", "uid", "cpid"]
+        .iter()
+        .any(|k| p.get(*k).is_some_and(|v| !v.is_null()))
+    {
         a["process"] = p;
     }
     if let Some(name) = data
-        .get("username")
+        .get(if parent {
+            "parent_username"
+        } else {
+            "username"
+        })
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
     {
@@ -180,23 +205,94 @@ pub fn to_ocsf(v: &Value) -> Result<Value, ContractError> {
         .get("data")
         .filter(|d| d.is_object())
         .ok_or(ContractError("invalid event data"))?;
-    let (cid, aid) = classification(class, action, data);
+    for key in [
+        "pid",
+        "ppid",
+        "parent_pid",
+        "child_pid",
+        "target_pid",
+        "sender_pid",
+        "uid",
+        "gid",
+    ] {
+        if let Some(pid) = data.get(key).filter(|v| !v.is_null()) {
+            if !pid.as_u64().is_some_and(|n| n <= u32::MAX as u64) {
+                return Err(ContractError("invalid source process pid"));
+            }
+        }
+    }
+    for key in ["src_port", "dst_port", "port"] {
+        if let Some(port) = data.get(key).filter(|v| !v.is_null()) {
+            if !port.as_u64().is_some_and(|n| n <= u16::MAX as u64) {
+                return Err(ContractError("invalid source endpoint port"));
+            }
+        }
+    }
+    for (path, max) in [
+        ("/correlation/pid", u32::MAX as u64),
+        ("/evidence/pid", u32::MAX as u64),
+        ("/correlation/remote_port", u16::MAX as u64),
+    ] {
+        if let Some(n) = data.pointer(path).filter(|v| !v.is_null()) {
+            if !n.as_u64().is_some_and(|n| n <= max) {
+                return Err(ContractError("invalid detection correlation identifier"));
+            }
+        }
+    }
+    let (mut cid, mut aid) = classification(class, action, data);
+    if cid == 1001
+        && !data
+            .get("path")
+            .or_else(|| data.get("old_path"))
+            .and_then(Value::as_str)
+            .is_some_and(|p| !p.is_empty())
+    {
+        // Incomplete collector evidence remains deliverable without inventing a file.
+        cid = 0;
+        aid = 99;
+    }
     let mut ext = json!({"schema_version":1,"class":class,"action":action,"severity":sev,"data":data,"timestamp":timestamp});
     if let Some(origin) = v.get("origin") {
         ext["origin"] = origin.clone();
     }
-    let mut out = json!({"metadata":{"version":OCSF_VERSION,"uid":uid,"product":{"name":"TRAPD Agent","vendor_name":"TRAPD"}},"time":time,"category_uid":cid/1000,"class_uid":cid,"activity_id":aid,"type_uid":cid*100+aid,"severity_id":severity(sev)?,"device":{"uid":agent,"hostname":hostname,"type_id":0},"unmapped":{"trapd":ext}});
+    let mut out = json!({"metadata":{"version":OCSF_VERSION,"uid":uid,"profiles":["host"],"product":{"name":"TRAPD Agent","vendor_name":"TRAPD"}},"time":time,"category_uid":cid/1000,"class_uid":cid,"activity_id":aid,"type_uid":cid*100+aid,"severity_id":severity(sev)?,"device":{"uid":agent,"hostname":hostname,"type_id":0},"unmapped":{"trapd":ext}});
     if aid == 99 {
         out["activity_name"] = json!(action);
+        let caption = match cid {
+            0 => "Base Event",
+            1001 => "File System Activity",
+            1007 => "Process Activity",
+            2004 => "Detection Finding",
+            3002 => "Authentication",
+            4001 => "Network Activity",
+            4003 => "DNS Activity",
+            5001 => "Device Inventory Info",
+            7001 => "Remediation Activity",
+            _ => unreachable!(),
+        };
+        out["type_name"] = json!(format!("{caption}: {action}"));
     }
     match cid {
         1007 => {
-            out["actor"] = actor(data);
+            out["actor"] = actor(data, matches!(action, "create" | "exec" | "fork"));
             out["process"] = process(data, true);
+            if action == "ptrace" {
+                out["actor"] = json!({"process": {}});
+                copy(&mut out["actor"]["process"], "pid", data, &["pid"]);
+                copy(&mut out["actor"]["process"], "name", data, &["comm"]);
+                out["process"] = json!({});
+                copy(&mut out["process"], "pid", data, &["target_pid"]);
+                copy(
+                    &mut out["process"],
+                    "name",
+                    data,
+                    &["target_comm", "target_name"],
+                );
+            }
             copy(&mut out, "exit_code", data, &["exit_code"]);
         }
         1001 => {
-            out["actor"] = actor(data);
+            out["actor"] = actor(data, false);
             let path = data
                 .get("path")
                 .or_else(|| data.get("old_path"))
@@ -238,18 +334,33 @@ pub fn to_ocsf(v: &Value) -> Result<Value, ContractError> {
                 out["answers"] =
                     json!(ips.iter().map(|ip| json!({"rdata":ip})).collect::<Vec<_>>());
             }
-            if let Some(ip) = data.get("server_addr") {
+            if let Some(ip) = data.get("server_addr").filter(|v| {
+                v.as_str()
+                    .is_some_and(|s| s.parse::<std::net::IpAddr>().is_ok())
+            }) {
                 out["dst_endpoint"] = json!({"ip":ip});
             }
-            if let Some(ip) = data.get("client_addr") {
+            if let Some(ip) = data.get("client_addr").filter(|v| {
+                v.as_str()
+                    .is_some_and(|s| s.parse::<std::net::IpAddr>().is_ok())
+            }) {
                 out["src_endpoint"] = json!({"ip":ip});
             }
         }
         3002 => {
             out["user"] = json!({});
             copy(&mut out["user"], "name", data, &["username"]);
+            out["dst_endpoint"] = json!({"hostname":hostname,"uid":agent});
+            let mut src = json!({});
+            copy(&mut src, "ip", data, &["src_addr"]);
+            copy(&mut src, "port", data, &["src_port"]);
+            if src.as_object().is_some_and(|o| !o.is_empty()) {
+                out["src_endpoint"] = src;
+            }
             if action == "logon_failed" {
                 out["status_id"] = json!(2);
+            } else if let Some(success) = data.get("success").and_then(Value::as_bool) {
+                out["status_id"] = json!(if success { 1 } else { 2 });
             }
         }
         2004 => {
@@ -258,13 +369,13 @@ pub fn to_ocsf(v: &Value) -> Result<Value, ContractError> {
                 &mut out["finding_info"],
                 "title",
                 data,
-                &["name", "rule_id"],
+                &["title", "name", "rule_id"],
             );
             copy(
                 &mut out["finding_info"],
                 "desc",
                 data,
-                &["description", "details"],
+                &["detail", "description", "details"],
             );
         }
         7001 => {
@@ -274,6 +385,52 @@ pub fn to_ocsf(v: &Value) -> Result<Value, ContractError> {
             }
         }
         _ => {}
+    }
+    for ep in ["src_endpoint", "dst_endpoint"] {
+        if out.get(ep).is_some_and(|e| {
+            e.get("ip").is_none() && e.get("hostname").is_none() && e.get("uid").is_none()
+        }) {
+            out.as_object_mut().unwrap().remove(ep);
+        }
+    }
+    let identified_process = |p: &Value| {
+        ["pid", "uid", "cpid"]
+            .iter()
+            .any(|k| p.get(*k).is_some_and(|v| !v.is_null()))
+    };
+    let identified_actor = |a: &Value| {
+        a.get("process").is_some_and(identified_process)
+            || a.get("user").is_some_and(|u| u.get("name").is_some())
+    };
+    if (cid == 1007 && (!identified_process(&out["process"]) || !identified_actor(&out["actor"])))
+        || (cid == 1001 && !identified_actor(&out["actor"]))
+        || (cid == 3002 && out["user"].get("name").is_none())
+    {
+        // Keep sparse collector evidence deliverable without fabricating identity.
+        out["class_uid"] = json!(0);
+        out["category_uid"] = json!(0);
+        out["activity_id"] = json!(99);
+        out["type_uid"] = json!(99);
+        out["activity_name"] = json!(action);
+        out["type_name"] = json!(format!("Base Event: {action}"));
+        for field in [
+            "process",
+            "actor",
+            "file",
+            "user",
+            "exit_code",
+            "status_id",
+            "dst_endpoint",
+            "src_endpoint",
+        ] {
+            out.as_object_mut().unwrap().remove(field);
+        }
+    }
+    if matches!(cid, 4001 | 4003)
+        && out.get("src_endpoint").is_none()
+        && out.get("dst_endpoint").is_none()
+    {
+        out["src_endpoint"] = json!({"hostname":hostname,"uid":agent});
     }
     validate_standard(&out)?;
     Ok(out)
@@ -365,7 +522,90 @@ fn validate_standard(v: &Value) -> Result<(), ContractError> {
     if cid == 7001 {
         string(v, "command_uid")?;
     }
+    if matches!(cid, 4001 | 4003)
+        && v.get("src_endpoint").is_none()
+        && v.get("dst_endpoint").is_none()
+    {
+        return Err(ContractError("missing network endpoint"));
+    }
+    if cid == 3002 && v.get("service").is_none() && v.get("dst_endpoint").is_none() {
+        return Err(ContractError("missing authentication target"));
+    }
+    for path in [
+        "/process",
+        "/process/parent_process",
+        "/actor/process",
+        "/actor/process/parent_process",
+    ] {
+        if let Some(p) = v.pointer(path) {
+            if !p.is_object()
+                || !["pid", "uid", "cpid"]
+                    .iter()
+                    .any(|k| p.get(*k).is_some_and(|v| !v.is_null()))
+            {
+                return Err(ContractError("missing process identity"));
+            }
+        }
+    }
+    if let Some(a) = v.get("actor") {
+        if !a.is_object()
+            || ![
+                "process",
+                "user",
+                "iam_role",
+                "session",
+                "app",
+                "invoked_by",
+                "idp",
+            ]
+            .iter()
+            .any(|k| a.get(*k).is_some_and(|v| !v.is_null()))
+        {
+            return Err(ContractError("missing actor identity"));
+        }
+    }
+    for path in ["/user", "/actor/user", "/process/user"] {
+        if let Some(u) = v.pointer(path) {
+            if !u.is_object()
+                || !["account", "name", "uid"].iter().any(|k| {
+                    u.get(*k)
+                        .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+                })
+            {
+                return Err(ContractError("missing user identity"));
+            }
+        }
+    }
     for ep in ["src_endpoint", "dst_endpoint"] {
+        if let Some(e) = v.get(ep) {
+            if !e.is_object()
+                || ![
+                    "ip",
+                    "uid",
+                    "name",
+                    "hostname",
+                    "mac",
+                    "domain",
+                    "interface_uid",
+                    "instance_uid",
+                ]
+                .iter()
+                .any(|k| {
+                    e.get(*k)
+                        .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+                })
+            {
+                return Err(ContractError("missing endpoint identity"));
+            }
+        }
+        if let Some(ip) = v.pointer(&format!("/{ep}/ip")) {
+            if !ip
+                .as_str()
+                .is_some_and(|s| s.parse::<std::net::IpAddr>().is_ok())
+            {
+                return Err(ContractError("invalid endpoint IP"));
+            }
+        }
         if let Some(port) = v.pointer(&format!("/{ep}/port")) {
             if !port.as_u64().is_some_and(|n| n <= 65535) {
                 return Err(ContractError("invalid endpoint port"));
@@ -375,9 +615,16 @@ fn validate_standard(v: &Value) -> Result<(), ContractError> {
     if let Some(query) = v.get("query") {
         string(query, "hostname")?;
     }
-    if let Some(pid) = v.pointer("/process/pid") {
-        if !pid.as_u64().is_some_and(|n| n <= u32::MAX as u64) {
-            return Err(ContractError("invalid process pid"));
+    for path in [
+        "/process/pid",
+        "/process/parent_process/pid",
+        "/actor/process/pid",
+        "/actor/process/parent_process/pid",
+    ] {
+        if let Some(pid) = v.pointer(path) {
+            if !pid.as_u64().is_some_and(|n| n <= u32::MAX as u64) {
+                return Err(ContractError("invalid process pid"));
+            }
         }
     }
     Ok(())
@@ -529,11 +776,50 @@ mod tests {
         json!({"event_id":"a2522ab9-4f09-4c6f-93cb-61f91c716224","agent_id":"agent_test","hostname":"host","timestamp":"2026-10-09T12:00:00.123456Z","class":class,"action":action,"severity":"medium","data":data,"origin":{"boot_id":"boot","sequence_number":42,"monotonic_timestamp_ns":123456789}})
     }
     #[test]
+    fn sparse_evidence_uses_lossless_base_other() {
+        for (class, action, data) in [
+            ("process", "exec", json!({"pid":42})),
+            ("filesystem", "open", json!({"path":"/tmp/file"})),
+            ("filesystem", "open", json!({"pid":42,"path":""})),
+            ("user", "logon", json!({"success":false})),
+        ] {
+            let src = event(class, action, data);
+            let mapped = to_ocsf(&src).unwrap();
+            assert_eq!(mapped["class_uid"], 0);
+            assert_eq!(from_ocsf(&mapped).unwrap(), src);
+        }
+    }
+    #[test]
+    fn rejects_invalid_nested_identity_and_addresses() {
+        let valid = to_ocsf(&event("process", "exec", json!({"pid":42,"ppid":1}))).unwrap();
+        for process in [json!({}), json!({"pid":4294967296u64})] {
+            let mut bad = valid.clone();
+            bad["actor"]["process"] = process;
+            assert!(validate(&bad).is_err());
+        }
+        let valid = to_ocsf(&event(
+            "network",
+            "dns_response",
+            json!({"qname":"example.org","server_addr":"192.0.2.1"}),
+        ))
+        .unwrap();
+        for endpoint in [
+            json!({}),
+            json!({"ip":""}),
+            json!({"ip":"invalid"}),
+            json!({"ip":"192.0.2.1","port":65536}),
+        ] {
+            let mut bad = valid.clone();
+            bad["dst_endpoint"] = endpoint;
+            assert!(validate(&bad).is_err());
+        }
+    }
+    #[test]
     fn collected_snapshots_and_unknown_network_direction_are_explicit() {
-        let snapshot=to_ocsf(&event("system","snapshot",json!({"os":"Linux"}))).unwrap();
-        assert_eq!(snapshot["activity_id"],2);
+        let snapshot = to_ocsf(&event("system", "snapshot", json!({"os":"Linux"}))).unwrap();
+        assert_eq!(snapshot["activity_id"], 2);
         let connection=to_ocsf(&event("network","connection",json!({"protocol":"tcp","src_addr":"127.0.0.1","dst_addr":"127.0.0.2","src_port":1000,"dst_port":443}))).unwrap();
-        assert_eq!(connection["connection_info"]["direction_id"],0);
+        assert_eq!(connection["connection_info"]["direction_id"], 0);
     }
     #[test]
     fn process_identity_and_evidence_roundtrip() {
@@ -552,7 +838,12 @@ mod tests {
     }
     #[test]
     fn activities_are_class_specific() {
-        let file = to_ocsf(&event("filesystem", "delete", json!({"path":"/tmp/a"}))).unwrap();
+        let file = to_ocsf(&event(
+            "filesystem",
+            "delete",
+            json!({"path":"/tmp/a","pid":42}),
+        ))
+        .unwrap();
         assert_eq!(file["class_uid"], 1001);
         assert_eq!(file["activity_id"], 4);
         let proc = to_ocsf(&event("process", "terminate", json!({"pid":42}))).unwrap();
@@ -595,7 +886,12 @@ mod tests {
     #[test]
     fn required_objects_and_class_dependent_fields() {
         for (class, action, data, key) in [
-            ("filesystem", "open", json!({"path":"/etc/passwd"}), "file"),
+            (
+                "filesystem",
+                "open",
+                json!({"path":"/etc/passwd","pid":42}),
+                "file",
+            ),
             (
                 "detection",
                 "detected",

@@ -37,8 +37,40 @@ impl OutputMode {
     }
 }
 
+fn serialize_event(event: &AgentEvent) -> Result<String> {
+    let legacy = serde_json::to_value(event)?;
+    Ok(serde_json::to_string(&trapd_schema::ocsf::to_ocsf(
+        &legacy,
+    )?)?)
+}
+#[cfg(test)]
+mod ocsf_tests {
+    use super::*;
+    #[test]
+    fn local_output_is_ocsf_and_replays_losslessly() {
+        let event = AgentEvent::new(
+            "agent".into(),
+            "host".into(),
+            crate::schema::EventClass::Process,
+            crate::schema::EventAction::Create,
+            crate::schema::Severity::Info,
+            crate::schema::EventData::ProcessCreate(crate::schema::ProcessCreateData {
+                pid: 42,
+                ..Default::default()
+            }),
+        );
+        let wire: serde_json::Value =
+            serde_json::from_str(&serialize_event(&event).unwrap()).unwrap();
+        assert_eq!(wire["class_uid"], 1007);
+        assert_eq!(
+            trapd_schema::ocsf::from_ocsf(&wire).unwrap(),
+            serde_json::to_value(&event).unwrap()
+        );
+    }
+}
+
 pub async fn write_event(event: &AgentEvent, mode: &OutputMode) -> Result<()> {
-    let line = serde_json::to_string(event)?;
+    let line = serialize_event(event)?;
     match mode {
         OutputMode::Stdout => {
             let mut out = tokio::io::stdout();

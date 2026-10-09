@@ -128,7 +128,17 @@ pub fn replay<R: BufRead>(engine: &DetectionEngine, reader: R) -> ReplayReport {
             report.skipped_lines += 1;
             continue;
         }
-        let Ok(event) = serde_json::from_str::<AgentEvent>(&line) else {
+        let parsed = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|value| {
+                let legacy = if trapd_schema::ocsf::is_ocsf(&value) {
+                    trapd_schema::ocsf::from_ocsf(&value).ok()?
+                } else {
+                    value
+                };
+                serde_json::from_value::<AgentEvent>(legacy).ok()
+            });
+        let Some(event) = parsed else {
             report.skipped_lines += 1;
             continue;
         };
@@ -298,6 +308,26 @@ mod tests {
             .map(|e| serde_json::to_string(e).unwrap())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn ocsf_and_legacy_replay_produce_the_same_findings() {
+        let engine = DetectionEngine::new("a".into(), "host-1".into());
+        let event = proc_event(Utc::now(), "bash", "/bin/bash", "bash -c id");
+        let legacy = serde_json::to_string(&event).unwrap();
+        let wire = trapd_schema::ocsf::to_ocsf(&serde_json::to_value(&event).unwrap()).unwrap();
+        let expected = replay(&engine, std::io::Cursor::new(legacy));
+        let actual = replay(
+            &DetectionEngine::new("a".into(), "host-1".into()),
+            std::io::Cursor::new(serde_json::to_string(&wire).unwrap()),
+        );
+        assert_eq!(actual.events, expected.events);
+        assert_eq!(actual.skipped_lines, 0);
+        assert_eq!(actual.hosts, expected.hosts);
+        assert_eq!(
+            actual.rules.keys().collect::<Vec<_>>(),
+            expected.rules.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

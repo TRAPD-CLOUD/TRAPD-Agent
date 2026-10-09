@@ -23,6 +23,10 @@ jobs:
       - run: cargo build --release --manifest-path agent/Cargo.toml
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Validate OCSF contract against pinned official schema
+        run: |
+          python3 -m pip install -r scripts/ocsf/requirements.txt
+          scripts/ocsf_validate.sh
 
       # Telemetry-pipeline acceptance gate. The unit and integration suites
       # above already cover the loss-transparency contract (stable event ids,
