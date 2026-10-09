@@ -1381,6 +1381,12 @@ fn entities_from_evidence(evidence: &serde_json::Value, c: &mut CorrelationKeys)
 /// process instances of one binary are the same finding (see `KeyStrategy::Binary`).
 const BINARY_KEY_MAX_CONFIDENCE: u8 = 50;
 
+/// Context-level means the catalog only ever lets the rule act as correlation
+/// context (signal mode), or this particular finding is too weak to alert.
+fn is_context_level(meta: &catalog::RuleMeta, d: &DetectionData) -> bool {
+    meta.mode == DetectionMode::Signal || d.confidence < BINARY_KEY_MAX_CONFIDENCE
+}
+
 /// The gate key repeats of a finding share, per the catalog's strategy.
 fn dedup_key(meta: &catalog::RuleMeta, d: &DetectionData) -> String {
     use catalog::KeyStrategy;
@@ -1398,7 +1404,7 @@ fn dedup_key(meta: &catalog::RuleMeta, d: &DetectionData) -> String {
             format!("{}|{}|{}", or(&c.user), actor, normalize_cmdline(cmd))
         }
         KeyStrategy::Process => c.process_key.clone().unwrap_or_else(|| d.subject.clone()),
-        KeyStrategy::Binary => match (&c.exe, d.confidence < BINARY_KEY_MAX_CONFIDENCE) {
+        KeyStrategy::Binary => match (&c.exe, is_context_level(meta, d)) {
             (Some(exe), true) => format!("{}|{}", or(&c.user), exe),
             _ => c.process_key.clone().unwrap_or_else(|| d.subject.clone()),
         },
@@ -1615,6 +1621,20 @@ mod tests {
             dedup_key(&meta, &finding(10, 40)),
             dedup_key(&meta, &finding(20, 40))
         );
+        // Signal-mode rules fold at any confidence: rare_binary emits 55 and
+        // tmp_exec 50, both outside the "weak finding" range.
+        for rule in ["anomaly.rare_binary_for_user", "defense.tmp_exec"] {
+            let meta = catalog::lookup(rule);
+            let at = |pid: i32, confidence: u8| DetectionData {
+                rule_id: rule.into(),
+                ..finding(pid, confidence)
+            };
+            assert_eq!(
+                dedup_key(&meta, &at(10, 55)),
+                dedup_key(&meta, &at(20, 55)),
+                "{rule}"
+            );
+        }
         // A thread running injected code stays per process instance.
         assert_ne!(
             dedup_key(&meta, &finding(10, 94)),
