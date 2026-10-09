@@ -25,6 +25,10 @@ pub enum KeyStrategy {
     ProcessRemote,
     /// Same process touching the same file path.
     Path,
+    /// Same user running the same binary, whatever the process instance. For
+    /// context-level findings (confidence < 50) only: a stronger finding keeps
+    /// its own process, because a second injected process is a new incident.
+    Binary,
     /// Same subject (the rule's own most identifying field).
     Subject,
 }
@@ -95,7 +99,7 @@ const fn from_event(mut m: RuleMeta) -> RuleMeta {
 }
 
 use DetectionMode::{Alert, Shadow, Signal};
-use KeyStrategy::{Command, Path, Process, ProcessRemote, Subject};
+use KeyStrategy::{Binary, Command, Path, Process, ProcessRemote, Subject};
 use Severity::{Critical, High, Low, Medium};
 
 const TEN_MIN: u64 = 600;
@@ -149,7 +153,7 @@ pub const RULES: &[RuleMeta] = &[
     rule("privesc.untracked_suid_exec", PRIVESC, "T1548.001", High, Critical, Alert, Process, HOUR),
     rule("injection.ld_preload", EVASION, "T1574.006", High, Critical, Alert, Command, HOUR),
     // ── Behavioural baseline (context only) ───────────────────────────────
-    rule("anomaly.rare_binary_for_user", EXEC, "T1204", Low, Low, Signal, Command, HOUR),
+    rule("anomaly.rare_binary_for_user", EXEC, "T1204", Low, Low, Signal, Binary, HOUR),
     rule("anomaly.exec_rate_spike", EXEC, "T1059", Low, Low, Signal, Subject, HOUR),
     // ── IOA chains (already correlated across the process tree) ───────────
     rule("ioa.download_and_execute", EXEC, "T1105", High, Critical, Alert, Process, TEN_MIN),
@@ -157,7 +161,7 @@ pub const RULES: &[RuleMeta] = &[
     rule("ioa.credential_access_exfil", EXFIL, "T1041", High, Critical, Alert, Process, TEN_MIN),
     // ── Memory scanning ────────────────────────────────────────────────────
     rule("memory.memfd_exec", EVASION, "T1620", Critical, Critical, Alert, Process, HOUR),
-    root_bump(rule("memory.anon_exec", EVASION, "T1055", High, Critical, Alert, Process, HOUR)),
+    root_bump(rule("memory.anon_exec", EVASION, "T1055", High, Critical, Alert, Binary, HOUR)),
     // Windows: a PE image sitting in executable memory the process allocated
     // itself — reflective DLL / PE injection.
     root_bump(rule("memory.injected_pe", EVASION, "T1055.001", High, Critical, Alert, Process, HOUR)),
@@ -169,7 +173,7 @@ pub const RULES: &[RuleMeta] = &[
     // ── Initial access / execution ─────────────────────────────────────────
     rule("exec.webserver_shell", INITIAL, "T1505.003", High, Critical, Alert, Command, TEN_MIN),
     rule("exec.b64_decode_exec", EXEC, "T1140", High, Critical, Alert, Command, TEN_MIN),
-    rule("defense.tmp_exec", EXEC, "T1204.002", Low, Medium, Signal, Process, TEN_MIN),
+    rule("defense.tmp_exec", EXEC, "T1204.002", Low, Medium, Signal, Binary, TEN_MIN),
     rule("defense.tmp_exec_chmod", EXEC, "T1204.002", Medium, High, Alert, Path, TEN_MIN),
     rule("auth.ssh_bruteforce_success", INITIAL, "T1110.001", High, Critical, Alert, Subject, HOUR),
     // ── Persistence ────────────────────────────────────────────────────────

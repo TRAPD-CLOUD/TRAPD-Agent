@@ -32,6 +32,10 @@ const UNDROPPABLE_PREFIXES: &[&str] = &["deception."];
 /// Max distinct findings tracked; the least recently seen is evicted (and its
 /// pending aggregate flushed) beyond this.
 const MAX_ENTRIES: usize = 8_192;
+/// Context (signal-mode) rules may open this many distinct findings per window;
+/// further ones fold into one overflow finding per rule. Alerts are never limited.
+const SIGNAL_NEW_FINDINGS_PER_WINDOW: u32 = 20;
+const SIGNAL_RATE_WINDOW: Duration = Duration::from_secs(600);
 /// A long-running storm still reports progress at this cadence.
 const PROGRESS_EVERY: Duration = Duration::from_secs(300);
 
@@ -176,6 +180,8 @@ struct Entry {
 pub struct FindingGate {
     entries: HashMap<String, Entry>,
     suppressions: Vec<SuppressionRule>,
+    /// Per rule: start of the current window and findings opened in it.
+    signal_opened: HashMap<String, (Instant, u32)>,
 }
 
 impl FindingGate {
@@ -247,6 +253,15 @@ impl FindingGate {
             .dedup_key
             .clone()
             .unwrap_or_else(|| format!("{}|{}", d.rule_id, d.subject));
+        let key = if d.mode == Some(DetectionMode::Signal)
+            && !self.entries.contains_key(&key)
+            && self.signal_budget_exhausted(&d.rule_id, now)
+        {
+            d.severity_reasons.push("signal:rate_limited".into());
+            format!("{}:overflow", d.rule_id)
+        } else {
+            key
+        };
         d.dedup_key = Some(key.clone());
         let window = Duration::from_secs(super::catalog::lookup(&d.rule_id).window_s.max(1));
         let ts = event.timestamp;
@@ -300,6 +315,23 @@ impl FindingGate {
             aggregate: false,
         });
         out
+    }
+
+    /// Counts one more distinct finding of a context rule; true once the
+    /// window's budget is spent (the overflow finding itself is not counted).
+    fn signal_budget_exhausted(&mut self, rule_id: &str, now: Instant) -> bool {
+        let slot = self
+            .signal_opened
+            .entry(rule_id.to_string())
+            .or_insert((now, 0));
+        if now.duration_since(slot.0) >= SIGNAL_RATE_WINDOW {
+            *slot = (now, 0);
+        }
+        if slot.1 >= SIGNAL_NEW_FINDINGS_PER_WINDOW {
+            return true;
+        }
+        slot.1 += 1;
+        false
     }
 
     /// Emit aggregate updates for windows that closed (or long storms due a
@@ -640,5 +672,65 @@ mod tests {
         );
         assert_eq!(g.admit(raw.clone(), Instant::now()).len(), 1);
         assert_eq!(g.admit(raw, Instant::now()).len(), 1);
+    }
+
+    fn signal_det(key: &str) -> AgentEvent {
+        let mut e = det("anomaly.rare_binary_for_user", key, Severity::Low);
+        if let EventData::Detection(d) = &mut e.data {
+            d.mode = Some(DetectionMode::Signal);
+        }
+        e
+    }
+
+    #[test]
+    fn context_findings_beyond_the_budget_fold_into_one_overflow_finding() {
+        let mut g = FindingGate::new();
+        let t = Instant::now();
+        let mut emitted = 0;
+        for i in 0..(SIGNAL_NEW_FINDINGS_PER_WINDOW + 30) {
+            emitted += g.admit(signal_det(&format!("k{i}")), t).len();
+        }
+        // The budget, plus the first overflow finding; the rest only count.
+        assert_eq!(emitted as u32, SIGNAL_NEW_FINDINGS_PER_WINDOW + 1);
+        let flushed = g.flush(t + Duration::from_secs(7200), true);
+        assert!(flushed.iter().any(|e| count_of(e) == 30));
+    }
+
+    #[test]
+    fn alerts_are_never_rate_limited() {
+        let mut g = FindingGate::new();
+        let t = Instant::now();
+        let mut emitted = 0;
+        for i in 0..(SIGNAL_NEW_FINDINGS_PER_WINDOW + 30) {
+            emitted += g
+                .admit(det("creds.shadow_read", &format!("k{i}"), Severity::High), t)
+                .len();
+        }
+        assert_eq!(emitted as u32, SIGNAL_NEW_FINDINGS_PER_WINDOW + 30);
+    }
+
+    #[test]
+    fn an_already_open_context_finding_keeps_folding_after_the_budget_is_spent() {
+        let mut g = FindingGate::new();
+        let t = Instant::now();
+        assert_eq!(g.admit(signal_det("first"), t).len(), 1);
+        for i in 0..SIGNAL_NEW_FINDINGS_PER_WINDOW {
+            g.admit(signal_det(&format!("k{i}")), t);
+        }
+        // Not a new finding: counted into its own entry, not the overflow one.
+        assert!(g.admit(signal_det("first"), t).is_empty());
+        let flushed = g.flush(t + Duration::from_secs(7200), true);
+        assert!(flushed.iter().any(|e| count_of(e) == 2));
+    }
+
+    #[test]
+    fn the_budget_renews_with_the_next_window() {
+        let mut g = FindingGate::new();
+        let t = Instant::now();
+        for i in 0..(SIGNAL_NEW_FINDINGS_PER_WINDOW + 5) {
+            g.admit(signal_det(&format!("k{i}")), t);
+        }
+        let later = t + SIGNAL_RATE_WINDOW + Duration::from_secs(1);
+        assert_eq!(g.admit(signal_det("fresh"), later).len(), 1);
     }
 }
