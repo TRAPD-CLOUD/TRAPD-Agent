@@ -192,6 +192,15 @@ pub const RULES: &[RuleMeta] = &[
     rule("credential_access.lsass_dump", CREDS, "T1003.001", Critical, Critical, Alert, Command, HOUR),
     rule("credential_access.sam_hive_save", CREDS, "T1003.002", High, Critical, Alert, Command, HOUR),
     rule("impact.shadow_copy_delete", IMPACT, "T1490", Critical, Critical, Alert, Command, HOUR),
+    // Filesystem ransomware indicators (see collectors/fs_heuristics.rs). The
+    // collector has no process attribution, so the subject is the place, and
+    // one burst folds into a single finding per window.
+    rule("ransomware.mass_modification", IMPACT, "T1486", High, Critical, Alert, Subject, FIFTEEN_MIN),
+    rule("ransomware.suspicious_extension", IMPACT, "T1486", Medium, High, Alert, Subject, FIFTEEN_MIN),
+    rule("ransomware.backup_tamper", IMPACT, "T1490", Medium, High, Alert, Subject, FIFTEEN_MIN),
+    // Entropy alone is weak (compressed and encrypted data look alike); it only
+    // adds weight to a chain.
+    rule("ransomware.high_entropy", IMPACT, "T1486", Low, Medium, Signal, Subject, TEN_MIN),
     rule("impact.recovery_disabled", IMPACT, "T1490", High, Critical, Alert, Command, HOUR),
     rule("defense_evasion.defender_tamper", EVASION, "T1562.001", High, Critical, Alert, Command, HOUR),
     rule("defense_evasion.eventlog_clear", EVASION, "T1070.001", High, Critical, Alert, Command, HOUR),
@@ -294,7 +303,6 @@ mod tests {
     const UNTESTED: &[&str] = &[
         // Pre-existing rules covered only indirectly (category or tracker
         // tests); each needs a test asserting its id.
-        "beaconing.regular_interval",
         "dns_tunnel.anomalous_query_volume",
         "lateral.admin_port_sweep",
         "revshell.interpreter_socket",

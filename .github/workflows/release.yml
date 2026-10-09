@@ -242,11 +242,19 @@ jobs:
             echo "::notice::backend registration skipped (not configured or nothing signed)"
             exit 0
           fi
+          # Only the backend's own answer counts: 201 registered, 409 already
+          # there. Anything else (a 200 from a website behind the same name, a
+          # timeout) must not look like success. Backends that are only reachable
+          # inside a private network are registered by hand from
+          # release-statements.ndjson instead; leave TRAPD_BACKEND_URL unset then.
           while read -r line; do
             body="$(printf '%s' "${line}" | jq -c --arg channel "${CHANNEL}" '. + {channel: $channel}')"
-            curl -fsS -X POST "${TRAPD_BACKEND_URL%/}/api/v1/agent-releases" \
+            code="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X POST "${TRAPD_BACKEND_URL%/}/api/v1/agent-releases" \
               -H "Authorization: Bearer ${TRAPD_RELEASE_PUBLISH_TOKEN}" \
               -H "Content-Type: application/json" \
-              --data "${body}"
-            echo
+              --data "${body}")"
+            case "${code}" in
+              201|409) echo "registered (HTTP ${code})" ;;
+              *) echo "::error::release registration failed (HTTP ${code})"; exit 1 ;;
+            esac
           done < release-statements.ndjson
