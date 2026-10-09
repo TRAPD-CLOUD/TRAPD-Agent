@@ -1377,6 +1377,10 @@ fn entities_from_evidence(evidence: &serde_json::Value, c: &mut CorrelationKeys)
     );
 }
 
+/// Below this confidence a finding is context, and repeats from different
+/// process instances of one binary are the same finding (see `KeyStrategy::Binary`).
+const BINARY_KEY_MAX_CONFIDENCE: u8 = 50;
+
 /// The gate key repeats of a finding share, per the catalog's strategy.
 fn dedup_key(meta: &catalog::RuleMeta, d: &DetectionData) -> String {
     use catalog::KeyStrategy;
@@ -1394,6 +1398,10 @@ fn dedup_key(meta: &catalog::RuleMeta, d: &DetectionData) -> String {
             format!("{}|{}|{}", or(&c.user), actor, normalize_cmdline(cmd))
         }
         KeyStrategy::Process => c.process_key.clone().unwrap_or_else(|| d.subject.clone()),
+        KeyStrategy::Binary => match (&c.exe, d.confidence < BINARY_KEY_MAX_CONFIDENCE) {
+            (Some(exe), true) => format!("{}|{}", or(&c.user), exe),
+            _ => c.process_key.clone().unwrap_or_else(|| d.subject.clone()),
+        },
         KeyStrategy::ProcessRemote => {
             let remote = c
                 .domain
@@ -1586,6 +1594,34 @@ fn is_routable(addr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn binary_key_folds_context_findings_across_process_instances() {
+        use crate::schema::CorrelationKeys;
+        let meta = catalog::lookup("memory.anon_exec");
+        let finding = |pid: i32, confidence: u8| DetectionData {
+            rule_id: "memory.anon_exec".into(),
+            subject: format!("pid {pid} (svchost.exe)"),
+            confidence,
+            correlation: Some(CorrelationKeys {
+                exe: Some("C:\\Windows\\System32\\svchost.exe".into()),
+                user: Some("SYSTEM".into()),
+                process_key: Some(format!("w:{pid}:1")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Context level: two instances of one binary are one finding.
+        assert_eq!(
+            dedup_key(&meta, &finding(10, 40)),
+            dedup_key(&meta, &finding(20, 40))
+        );
+        // A thread running injected code stays per process instance.
+        assert_ne!(
+            dedup_key(&meta, &finding(10, 94)),
+            dedup_key(&meta, &finding(20, 94))
+        );
+    }
+
     use super::*;
     use crate::schema::{ExecEventData, NetworkConnectionData, ProcessCreateData};
 
