@@ -82,7 +82,7 @@ already used; XDP/TC packet-level visibility.
 
 ---
 
-## 2. Detection engine (`agent/src/detection/`)
+## 2. Detection engine (`crates/trapd-detection/src/`)
 
 Platform-neutral analytics over every event; findings are first-class events fed
 back through the pipeline (persist + backend + auto-response).

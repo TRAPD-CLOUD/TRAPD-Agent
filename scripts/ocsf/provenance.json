@@ -1,0 +1,7 @@
+{
+  "version": "1.9.0",
+  "schema_commit": "856d462bd20dc46cc1ffed2dfffe3b91ef0fbeba",
+  "source": "https://schema.ocsf.io/1.9.0/export/v2/schema",
+  "sha256": "cf67a1dfa6acd76ed7ecd222da7979f54fa63a166090f63610d63c8e4817ad73",
+  "profiles": ["host"]
+}

@@ -77,7 +77,8 @@ use tracing::{info, warn};
 use crate::collectors::linux::ebpf_drops::DropMonitor;
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
-use crate::detection::honeytoken::{self, AccessHit, AccessKind, Allowlist, RealProc};
+use crate::detection_host::RealProc;
+use crate::detection::honeytoken::{self, AccessHit, AccessKind, Allowlist};
 use crate::schema::{
     AgentEvent, DnsData, EventAction, EventClass, EventData, FileChmodData, FileChownData,
     FileOpenData, FileRenameData, FileUnlinkData, ForkData, KillAttemptData, MemfdCreateData,
