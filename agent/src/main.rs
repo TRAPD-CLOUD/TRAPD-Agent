@@ -17,7 +17,8 @@ use uuid::Uuid;
 mod collectors;
 mod config;
 mod deception;
-mod detection;
+use trapd_detection as detection;
+mod detection_host;
 mod enrollment;
 mod forensics;
 mod heartbeat;
@@ -29,7 +30,7 @@ mod pipeline;
 mod prevention;
 #[cfg(target_os = "linux")]
 mod rootkit;
-mod schema;
+use trapd_schema as schema;
 mod selfprotect;
 mod telemetry;
 mod transport;
@@ -70,12 +71,14 @@ use transport::Transport;
 /// from the same modules the Linux agent uses.
 #[cfg(windows)]
 fn main() -> Result<()> {
+    detection_host::initialize();
     winsvc::entry()
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<()> {
+    detection_host::initialize();
     if let Some(monitored_pid) = selfprotect::watchdog::detect() {
         selfprotect::watchdog::run_watchdog(monitored_pid);
     }
@@ -124,7 +127,7 @@ async fn main() -> Result<()> {
     {
         let args: Vec<String> = std::env::args().collect();
         if args.get(1).map(String::as_str) == Some("replay") {
-            std::process::exit(detection::replay::run_cli(&args[2..]));
+            std::process::exit(detection::replay::run_cli(&args[2..], &crate::detection_host::engine("replay".into(), "replay".into())));
         }
     }
 
@@ -406,7 +409,7 @@ async fn main() -> Result<()> {
 
     // Local detection engine — behavioural + IOC analytics over every event.
     // Platform-neutral, so the future Windows agent reuses it unchanged.
-    let engine = std::sync::Arc::new(detection::DetectionEngine::new(
+    let engine = std::sync::Arc::new(detection_host::engine(
         agent_id.clone(),
         hostname.clone(),
     ));

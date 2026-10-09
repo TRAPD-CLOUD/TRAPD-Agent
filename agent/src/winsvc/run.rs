@@ -374,7 +374,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
 
     drop(tx);
 
-    let engine = Arc::new(crate::detection::DetectionEngine::new(
+    let engine = Arc::new(crate::detection_host::engine(
         agent_id.clone(),
         hostname.clone(),
     ));

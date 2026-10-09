@@ -381,12 +381,7 @@ pub struct AgentConfig {
     pub adaptive_decoys: Vec<AdaptiveDecoy>,
 }
 
-/// One rule mode override (exact rule id).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuleModeOverride {
-    pub rule: String,
-    pub mode: crate::schema::DetectionMode,
-}
+pub use trapd_detection::RuleModeOverride;
 
 /// An approved adaptive decoy: which candidate (`id` from the recon profile),
 /// of which kind, for which user.

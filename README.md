@@ -181,7 +181,7 @@ process-tree lineage, and can be disabled with `TRAPD_EXEC_HASH=off`.
 
 ### 2. Detection engine
 
-`agent/src/detection/` — runs synchronously in the consumer, allocation-light,
+`crates/trapd-detection/src/` — runs synchronously in the consumer, allocation-light,
 never blocks the pipeline. Every collected event is passed through
 `DetectionEngine::inspect()`, which returns zero or more `class=detection`
 findings (each carrying a MITRE ATT&CK mapping, a confidence score and evidence):
@@ -699,3 +699,18 @@ schema, command/policy/inventory format and endpoint contract — see
 ## License
 
 The TRAPD agent is open source under the [Apache License 2.0](LICENSE).
+
+### Reusable Rust crates
+
+`trapd-schema` owns event types, provenance, enrichment and truncation. It has no
+agent or detection dependency and performs no operating system queries. The agent
+installs its clock and telemetry adapter before constructing events; all event
+constructors share the schema crate's single sequence counter.
+
+`trapd-detection` owns the existing local rule engine and filesystem heuristics.
+Use `DetectionEngine::with_runtime` to supply IOC, Sigma and baseline paths and
+callbacks for metrics and secure baseline persistence. `DetectionEngine::new`
+creates an independent engine without disk rules or persistence. Privileged
+process observation and forensic capture stay in `agent/src/detection_host.rs`.
+The agent's `yara` feature forwards to the detection crate. Run `cargo test
+--workspace` to include both library test suites.

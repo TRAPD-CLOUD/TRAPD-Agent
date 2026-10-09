@@ -27,13 +27,13 @@ jobs:
       - name: Build native Windows agent with static CRT
         run: cargo build --release --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml
       - name: Check native Windows code
-        run: cargo clippy --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --workspace --target x86_64-pc-windows-msvc --all-targets -- -D warnings
       - name: Native Windows Firewall containment rules
         run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml native_windows_firewall_ -- --ignored --nocapture --test-threads=1
       - name: Native Windows quarantine ownership and pinned file identity
         run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml native_quarantine_ -- --ignored --nocapture --test-threads=1
       - name: Windows unit tests
-        run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml --bin trapd-agent
+        run: cargo test --workspace --target x86_64-pc-windows-msvc
       - name: Native sweeper directory trust boundary
         run: cargo test --target x86_64-pc-windows-msvc --manifest-path agent/Cargo.toml protected_file_in_a_writable_parent -- --ignored --nocapture --test-threads=1
       - name: Native audit ACL preservation
