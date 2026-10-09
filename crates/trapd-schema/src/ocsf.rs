@@ -233,7 +233,7 @@ pub fn to_ocsf(v: &Value) -> Result<Value, ContractError> {
         ("/evidence/pid", u32::MAX as u64),
         ("/correlation/remote_port", u16::MAX as u64),
     ] {
-        if let Some(n) = data.pointer(path).filter(|v| !v.is_null()) {
+        if let Some(n) = data.pointer(path).filter(|v| v.is_number()) {
             if !n.as_u64().is_some_and(|n| n <= max) {
                 return Err(ContractError("invalid detection correlation identifier"));
             }
@@ -774,6 +774,22 @@ mod tests {
     use serde_json::json;
     fn event(class: &str, action: &str, data: Value) -> Value {
         json!({"event_id":"a2522ab9-4f09-4c6f-93cb-61f91c716224","agent_id":"agent_test","hostname":"host","timestamp":"2026-10-09T12:00:00.123456Z","class":class,"action":action,"severity":"medium","data":data,"origin":{"boot_id":"boot","sequence_number":42,"monotonic_timestamp_ns":123456789}})
+    }
+    #[test]
+    fn opaque_detection_evidence_stays_lossless_and_numbers_do_not_wrap() {
+        let src = event(
+            "detection",
+            "detected",
+            json!({"rule_id":"fixture","evidence":{"pid":"unknown"}}),
+        );
+        assert_eq!(from_ocsf(&to_ocsf(&src).unwrap()).unwrap(), src);
+        for data in [
+            json!({"rule_id":"fixture","correlation":{"pid":4294967297u64}}),
+            json!({"rule_id":"fixture","correlation":{"remote_port":65536}}),
+            json!({"pid":42,"ppid":1,"uid":4294967296u64}),
+        ] {
+            assert!(to_ocsf(&event("detection", "detected", data)).is_err());
+        }
     }
     #[test]
     fn sparse_evidence_uses_lossless_base_other() {
