@@ -241,6 +241,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
 
     let output_mode = OutputMode::from_env();
 
+    crate::heartbeat::lifecycle::begin_process();
     info!(
         agent_id  = %agent_id,
         device_id = %device_id,
@@ -563,6 +564,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     if let Ok(mut spool) = ring_buffer.lock() {
         spool.checkpoint();
     }
+    crate::heartbeat::lifecycle::mark_clean_shutdown();
     info!("Shutdown complete");
     Ok(())
 }

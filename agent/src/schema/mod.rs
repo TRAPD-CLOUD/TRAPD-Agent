@@ -92,6 +92,56 @@ pub enum EventClass {
     Log,
 }
 
+impl EventClass {
+    /// Every class, in `index()` order.
+    pub const ALL: [EventClass; 11] = [
+        EventClass::Process,
+        EventClass::Network,
+        EventClass::System,
+        EventClass::User,
+        EventClass::Filesystem,
+        EventClass::Memory,
+        EventClass::Kernel,
+        EventClass::Ipc,
+        EventClass::Prevention,
+        EventClass::Detection,
+        EventClass::Log,
+    ];
+
+    /// Stable lowercase label (identical to the serde spelling).
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            EventClass::Process => "process",
+            EventClass::Network => "network",
+            EventClass::System => "system",
+            EventClass::User => "user",
+            EventClass::Filesystem => "filesystem",
+            EventClass::Memory => "memory",
+            EventClass::Kernel => "kernel",
+            EventClass::Ipc => "ipc",
+            EventClass::Prevention => "prevention",
+            EventClass::Detection => "detection",
+            EventClass::Log => "log",
+        }
+    }
+
+    pub const fn index(&self) -> usize {
+        match self {
+            EventClass::Process => 0,
+            EventClass::Network => 1,
+            EventClass::System => 2,
+            EventClass::User => 3,
+            EventClass::Filesystem => 4,
+            EventClass::Memory => 5,
+            EventClass::Kernel => 6,
+            EventClass::Ipc => 7,
+            EventClass::Prevention => 8,
+            EventClass::Detection => 9,
+            EventClass::Log => 10,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventAction {

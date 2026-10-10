@@ -10,6 +10,9 @@
 //! The metrics struct is OS-neutral so the future Windows agent reports the
 //! same shape.
 
+pub mod lifecycle;
+
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::Utc;
@@ -30,11 +33,71 @@ struct HeartbeatPayload {
     agent_version: String,
     timestamp: chrono::DateTime<Utc>,
     metrics: Metrics,
+    /// Seconds since this agent process started (not host uptime).
+    agent_uptime_seconds: u64,
+    /// RFC 3339 start time of this agent process, i.e. the last (re)start.
+    agent_last_restart: String,
+    /// How the previous run ended: clean, unclean (killed/crashed) or unknown.
+    previous_shutdown: lifecycle::PreviousShutdown,
+    /// Delivery accounting since process start, to verify loss after outages.
+    pipeline: PipelineCounters,
     /// What the sensors can currently see (empty object when unknown).
     coverage: crate::telemetry::coverage::Coverage,
     /// Findings of shadow-mode rules since the last accepted beat.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     shadow_hits: std::collections::BTreeMap<String, u64>,
+}
+
+/// Cumulative (since process start) event accounting. For every accepted
+/// event exactly one of acknowledged / still queued / dropped holds, so
+/// `produced - dropped_total - acknowledged == queued` can be checked by the
+/// backend per heartbeat. Counters reset on a restart; `agent_last_restart`
+/// tells the reader when.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct PipelineCounters {
+    /// Events accepted by the pipeline.
+    produced: u64,
+    /// Per-sensor split of `produced`, keyed by event class.
+    produced_by_class: BTreeMap<String, u64>,
+    /// Events accepted into the delivery queue.
+    spooled: u64,
+    /// Events put on the wire (attempts; a retry counts again).
+    sent: u64,
+    /// Events the backend confirmed durable.
+    acked: u64,
+    /// Events discarded, all reasons.
+    dropped_total: u64,
+    dropped_by_reason: BTreeMap<String, u64>,
+    /// Detection/prevention events lost to queue overflow (subset of dropped).
+    priority_evicted: u64,
+    /// Events recovered from the on-disk queue at start (replayed after a restart).
+    replayed_from_disk: u64,
+    /// Events re-queued for another attempt after a failed send.
+    retried: u64,
+    /// Current queue depth / bytes / age of the oldest queued event.
+    queued: u64,
+    queued_bytes: u64,
+    oldest_queued_age_ms: u64,
+}
+
+impl PipelineCounters {
+    fn from_snapshot(s: &crate::telemetry::metrics::MetricsSnapshot) -> Self {
+        Self {
+            produced: s.collector_events_received_total,
+            produced_by_class: s.events_by_class.clone(),
+            spooled: s.spool_accepted_total,
+            sent: s.transport_events_sent_total,
+            acked: s.transport_events_acknowledged_total,
+            dropped_total: s.collector_events_dropped_total,
+            dropped_by_reason: s.collector_events_dropped_by_reason.clone(),
+            priority_evicted: s.spool_priority_evicted_total,
+            replayed_from_disk: s.spool_recovered_records_total,
+            retried: s.transport_events_retried_total,
+            queued: s.spool_events,
+            queued_bytes: s.spool_bytes,
+            oldest_queued_age_ms: s.spool_oldest_event_age_ms,
+        }
+    }
 }
 
 /// Live host resource utilisation sampled at beat time.
@@ -77,6 +140,9 @@ impl Heartbeat {
         config: Arc<RwLock<AgentConfig>>,
     ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
+        // Idempotent; guarantees the start time exists even if the caller
+        // forgot to record it earlier.
+        lifecycle::begin_process();
         Ok(Self {
             client: crate::http::control_client()?,
             heartbeat_url: format!("{base}/api/v1/agents/{agent_id}/heartbeat"),
@@ -105,12 +171,19 @@ impl Heartbeat {
 
     async fn send(&self) {
         let metrics = self.sample_metrics();
+        let life = lifecycle::begin_process();
         let payload = HeartbeatPayload {
             agent_id: self.agent_id.clone(),
             hostname: self.hostname.clone(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             timestamp: Utc::now(),
             metrics,
+            agent_uptime_seconds: life.uptime_seconds(),
+            agent_last_restart: life.last_restart(),
+            previous_shutdown: life.previous_shutdown(),
+            pipeline: PipelineCounters::from_snapshot(
+                &crate::telemetry::metrics::metrics().snapshot(),
+            ),
             coverage: crate::telemetry::coverage::snapshot(),
             shadow_hits: crate::telemetry::coverage::take_shadow_hits(),
         };
@@ -230,4 +303,60 @@ fn count_processes() -> usize {
     System::new_with_specifics(RefreshKind::new().with_processes(ProcessRefreshKind::new()))
         .processes()
         .len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::metrics::MetricsSnapshot;
+
+    #[test]
+    fn pipeline_counters_mirror_the_metrics_snapshot() {
+        let snap = MetricsSnapshot {
+            collector_events_received_total: 10,
+            events_by_class: BTreeMap::from([
+                ("process".to_string(), 7),
+                ("network".to_string(), 3),
+            ]),
+            spool_accepted_total: 9,
+            transport_events_sent_total: 8,
+            transport_events_acknowledged_total: 6,
+            collector_events_dropped_total: 1,
+            collector_events_dropped_by_reason: BTreeMap::from([(
+                "persistent_queue_full".to_string(),
+                1,
+            )]),
+            spool_events: 3,
+            ..Default::default()
+        };
+        let c = PipelineCounters::from_snapshot(&snap);
+        assert_eq!(c.produced, 10);
+        assert_eq!(c.produced_by_class["process"], 7);
+        assert_eq!((c.spooled, c.sent, c.acked, c.queued), (9, 8, 6, 3));
+        assert_eq!(c.dropped_by_reason["persistent_queue_full"], 1);
+        // The invariant the backend can check per heartbeat.
+        assert_eq!(c.produced, c.acked + c.queued + c.dropped_total);
+    }
+
+    #[test]
+    fn payload_carries_the_agent_lifecycle_fields() {
+        let json =
+            serde_json::to_value(PipelineCounters::from_snapshot(&MetricsSnapshot::default()))
+                .unwrap();
+        for k in [
+            "produced",
+            "spooled",
+            "sent",
+            "acked",
+            "dropped_total",
+            "replayed_from_disk",
+            "queued",
+        ] {
+            assert!(json.get(k).is_some(), "missing {k}");
+        }
+        assert_eq!(
+            serde_json::to_value(lifecycle::PreviousShutdown::Unclean).unwrap(),
+            "unclean"
+        );
+    }
 }

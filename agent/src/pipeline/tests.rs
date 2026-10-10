@@ -785,3 +785,56 @@ fn every_accepted_event_is_acknowledged_queued_or_counted_as_dropped() {
     );
     assert_eq!(refused, 0, "no event should have been refused in this run");
 }
+
+// ── Overflow policy ──────────────────────────────────────────────────────────
+
+#[test]
+fn overflow_sheds_bulk_telemetry_before_detections() {
+    let mut s = Spool::in_memory(3);
+    let det = s.push(detection_event()).unwrap();
+    for _ in 0..5 {
+        s.push(dummy_event()).unwrap();
+    }
+    assert_eq!(s.len(), 3);
+    assert_eq!(s.dropped_total(), 3, "every eviction is counted");
+    let held = s.peek_batch(10);
+    assert!(
+        held.iter().any(|e| e.seq == det),
+        "the oldest entry is a detection and must outlive newer bulk events"
+    );
+}
+
+#[test]
+fn a_full_queue_of_detections_evicts_the_oldest_and_reports_it() {
+    let before = crate::telemetry::metrics::metrics()
+        .snapshot()
+        .spool_priority_evicted_total;
+    let mut s = Spool::in_memory(2);
+    let first = s.push(detection_event()).unwrap();
+    s.push(detection_event()).unwrap();
+    s.push(detection_event()).unwrap();
+    assert_eq!(s.len(), 2);
+    assert_eq!(s.dropped_total(), 1);
+    assert!(
+        s.peek_batch(10).iter().all(|e| e.seq != first),
+        "with no bulk left the oldest detection is the one shed"
+    );
+    let after = crate::telemetry::metrics::metrics()
+        .snapshot()
+        .spool_priority_evicted_total;
+    assert!(
+        after > before,
+        "losing a detection must be reported separately"
+    );
+}
+
+#[test]
+fn accepted_events_are_counted_by_class() {
+    let before = crate::telemetry::metrics::metrics().snapshot();
+    crate::pipeline::accepted(&detection_event());
+    let after = crate::telemetry::metrics::metrics().snapshot();
+    let get = |s: &crate::telemetry::metrics::MetricsSnapshot| {
+        s.events_by_class.get("detection").copied().unwrap_or(0)
+    };
+    assert!(get(&after) > get(&before));
+}
