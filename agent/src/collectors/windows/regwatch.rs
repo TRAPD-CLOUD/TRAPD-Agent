@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use super::registry::{self, Hive};
 use crate::collectors::registry_watch::{
     encode_baseline, load_baseline, plan_events, retain_unavailable, snapshot_with_preferred_users,
-    PendingRegistryPoll, RegRoot, RegistryReader, Snapshot, StormGate, SPECS,
+    stable_event_id, PendingRegistryPoll, RegRoot, RegistryReader, Snapshot, StormGate, SPECS,
 };
 use crate::collectors::Collector;
 use crate::schema::{AgentEvent, EventClass, EventData, Severity};
@@ -88,7 +88,11 @@ impl Collector for RegistryWatchCollector {
                 None
             }
         };
-        let mut last_saved: Option<Vec<u8>> = None;
+        // The persisted baseline: event ids derive from it, so a restart that
+        // reloads the same file regenerates the same ids for the same changes.
+        let mut last_saved: Option<Vec<u8>> = previous
+            .as_ref()
+            .and_then(|loaded| encode_baseline(loaded).ok());
         let mut gate = StormGate::default();
         let mut last_omitted_users = 0usize;
         let mut ticker = interval(POLL);
@@ -160,15 +164,17 @@ impl Collector for RegistryWatchCollector {
                     .as_ref()
                     .map(|prev| plan_events(prev, &next, &mut next_gate, std::time::Instant::now()))
                     .unwrap_or_default();
+                let epoch = last_saved.clone().unwrap_or_default();
                 let events = planned
                     .into_iter()
                     .map(|(action, data)| {
+                        let event_id = stable_event_id(&epoch, action.clone(), &data);
                         let severity = if data.category == "storm" {
                             Severity::Low
                         } else {
                             Severity::Info
                         };
-                        AgentEvent::new(
+                        let mut event = AgentEvent::new(
                             agent_id.clone(),
                             hostname.clone(),
                             EventClass::Registry,
@@ -176,7 +182,9 @@ impl Collector for RegistryWatchCollector {
                             severity,
                             EventData::Registry(data),
                         )
-                        .with_source("windows_registry_snapshot")
+                        .with_source("windows_registry_snapshot");
+                        event.event_id = event_id;
+                        event
                     })
                     .collect();
                 pending = Some(PendingRegistryPoll::new(next, saved, next_gate, events));

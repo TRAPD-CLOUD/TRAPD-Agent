@@ -1164,6 +1164,34 @@ pub fn storm_event(category: &str, suppressed: u32) -> RegistryEventData {
     }
 }
 
+/// Deterministic identity of one registry event.
+///
+/// A crash between the durable handoff and the baseline write makes the next
+/// run regenerate the same changes from the same on-disk baseline. Random
+/// UUIDs would make those look like new events to the backend, repeating
+/// detections and automatic responses. The id therefore derives from the
+/// persisted baseline the change was computed against plus the change itself:
+/// a regenerated change repeats its id, while a later recurrence (a value
+/// flipping back and forth) is computed against a different baseline and gets
+/// a new one.
+#[cfg(any(windows, test))]
+pub fn stable_event_id(
+    baseline: &[u8],
+    action: EventAction,
+    data: &RegistryEventData,
+) -> uuid::Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"trapd/registry-event/v1\0");
+    hasher.update(Sha256::digest(baseline));
+    // Serialisation of these plain structs is deterministic (fixed field order).
+    hasher.update(serde_json::to_vec(&(action, data)).unwrap_or_default());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_random_bytes(bytes).into_uuid()
+}
+
 /// One poll: diff, then rate-limit. Returns the events to emit.
 pub fn plan_events(
     old: &Snapshot,
@@ -1282,6 +1310,42 @@ pub mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].old.as_deref(), Some("before"));
         assert_eq!(changes[0].new.as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn event_ids_repeat_for_a_regenerated_change_and_differ_otherwise() {
+        let mut reg = FakeReg::default();
+        user_run(&mut reg, "Updater", r"C:\a.exe");
+        let old = snapshot(&reg, SPECS);
+        let baseline = encode_baseline(&old).unwrap();
+        user_run(&mut reg, "Updater", r"C:\b.exe");
+        let new = snapshot(&reg, SPECS);
+        let ids = |baseline: &[u8]| -> Vec<uuid::Uuid> {
+            plan_events(&old, &new, &mut StormGate::default(), Instant::now())
+                .iter()
+                .map(|(action, data)| stable_event_id(baseline, action.clone(), data))
+                .collect()
+        };
+        // Crash window: the same baseline and change yield the same ids.
+        let first = ids(&baseline);
+        assert!(!first.is_empty());
+        assert_eq!(first, ids(&baseline));
+        // The same change against a later baseline (value flipped back and
+        // forth) is a new event.
+        assert_ne!(first, ids(&encode_baseline(&new).unwrap()));
+        // A different change is a different event.
+        user_run(&mut reg, "Updater", r"C:\c.exe");
+        let other = plan_events(
+            &old,
+            &snapshot(&reg, SPECS),
+            &mut StormGate::default(),
+            Instant::now(),
+        );
+        let other_ids: Vec<_> = other
+            .iter()
+            .map(|(action, data)| stable_event_id(&baseline, action.clone(), data))
+            .collect();
+        assert_ne!(first, other_ids);
     }
 
     #[test]
