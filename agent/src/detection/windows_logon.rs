@@ -9,6 +9,7 @@
 #![cfg_attr(not(any(windows, test)), allow(dead_code))]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 
 use crate::schema::{CorrelationKeys, DetectionData, UserLogonData};
 
@@ -22,6 +23,8 @@ const SOURCE_THRESHOLD: usize = 10;
 /// Distinct accounts failing from one source that make a password spray.
 const SPRAY_USERS: usize = 5;
 const MAX_KEYS: usize = 4_096;
+/// Keep a bounded recent sample during floods; capped counts are lower bounds.
+const MAX_FAILURES_PER_KEY: usize = 128;
 
 fn field<'a>(fields: &'a Fields, key: &str) -> &'a str {
     fields
@@ -194,12 +197,41 @@ pub fn normalize(event_id: u32, fields: &Fields) -> Option<UserLogonData> {
 pub struct WindowsLogonTracker {
     by_user: HashMap<String, VecDeque<f64>>,
     by_source: HashMap<String, VecDeque<(f64, String)>>,
+    /// Alert suppression is independent from evidence consumed on success.
+    last_alert: HashMap<(&'static str, String), f64>,
 }
 
-fn bound<V>(m: &mut HashMap<String, V>) {
+fn bound<K: Clone + Ord + Hash, V>(m: &mut HashMap<K, V>, last_seen: impl Fn(&V) -> f64) {
     if m.len() >= MAX_KEYS {
-        m.clear();
+        let oldest = m
+            .iter()
+            .min_by(|(left_key, left), (right_key, right)| {
+                last_seen(left)
+                    .total_cmp(&last_seen(right))
+                    .then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest {
+            m.remove(&key);
+        }
     }
+}
+
+fn alert_due(
+    alerts: &mut HashMap<(&'static str, String), f64>,
+    scope: &'static str,
+    subject: &str,
+    now: f64,
+) -> bool {
+    let key = (scope, subject.to_owned());
+    if alerts.get(&key).is_some_and(|last| now - last < WINDOW) {
+        return false;
+    }
+    if !alerts.contains_key(&key) {
+        bound(alerts, |last| *last);
+    }
+    alerts.insert(key, now);
+    true
 }
 
 impl WindowsLogonTracker {
@@ -215,16 +247,20 @@ impl WindowsLogonTracker {
         if user.is_empty() || user == "-" {
             return out;
         }
-        bound(&mut self.by_user);
-        bound(&mut self.by_source);
-
         if !l.success {
+            if !self.by_user.contains_key(&user) {
+                bound(&mut self.by_user, |q| {
+                    q.back().copied().unwrap_or(f64::NEG_INFINITY)
+                });
+            }
             let q = self.by_user.entry(user.clone()).or_default();
             q.retain(|t| now - t <= WINDOW);
             q.push_back(now);
-            if q.len() >= USER_THRESHOLD {
-                let n = q.len();
-                q.clear();
+            if q.len() > MAX_FAILURES_PER_KEY {
+                q.pop_front();
+            }
+            let n = q.len();
+            if n >= USER_THRESHOLD && alert_due(&mut self.last_alert, "user", &user, now) {
                 out.push(detection(
                     "auth.windows_bruteforce",
                     "Repeated failed logons against one account",
@@ -233,19 +269,30 @@ impl WindowsLogonTracker {
                     &user,
                     format!("{n} failed logons for {} within {WINDOW:.0}s", l.username),
                     serde_json::json!({ "user": l.username, "failures": n,
+                        "history_capped": n == MAX_FAILURES_PER_KEY,
                         "src_addr": l.src_addr, "last_reason": l.failure_reason }),
                     l,
                 ));
             }
             if let Some(src) = &source {
+                if !self.by_source.contains_key(src) {
+                    bound(&mut self.by_source, |q| {
+                        q.back().map(|(t, _)| *t).unwrap_or(f64::NEG_INFINITY)
+                    });
+                }
                 let q = self.by_source.entry(src.clone()).or_default();
                 q.retain(|(t, _)| now - t <= WINDOW);
                 q.push_back((now, user.clone()));
+                if q.len() > MAX_FAILURES_PER_KEY {
+                    q.pop_front();
+                }
                 let users: HashSet<&str> = q.iter().map(|(_, u)| u.as_str()).collect();
                 if users.len() >= SPRAY_USERS {
+                    if !alert_due(&mut self.last_alert, "spray", src, now) {
+                        return out;
+                    }
                     let mut names: Vec<String> = users.into_iter().map(String::from).collect();
                     names.sort();
-                    q.clear();
                     out.push(detection(
                         "auth.windows_password_spray",
                         "Failed logons across many accounts from one source",
@@ -259,9 +306,10 @@ impl WindowsLogonTracker {
                         serde_json::json!({ "source": src, "users": names }),
                         l,
                     ));
-                } else if q.len() >= SOURCE_THRESHOLD {
+                } else if q.len() >= SOURCE_THRESHOLD
+                    && alert_due(&mut self.last_alert, "source", src, now)
+                {
                     let n = q.len();
-                    q.clear();
                     out.push(detection(
                         "auth.windows_bruteforce",
                         "Repeated failed logons from one source",
@@ -269,7 +317,8 @@ impl WindowsLogonTracker {
                         65,
                         src,
                         format!("{n} failed logons from {src} within {WINDOW:.0}s"),
-                        serde_json::json!({ "source": src, "failures": n }),
+                        serde_json::json!({ "source": src, "failures": n,
+                        "history_capped": n == MAX_FAILURES_PER_KEY }),
                         l,
                     ));
                 }
@@ -305,6 +354,7 @@ impl WindowsLogonTracker {
                 &user,
                 format!("{} logged on after {failures} failed attempts", l.username),
                 serde_json::json!({ "user": l.username, "failures": failures,
+                    "history_capped": failures == MAX_FAILURES_PER_KEY,
                     "src_addr": l.src_addr, "logon_type": l.logon_type_name }),
                 l,
             ));
@@ -467,6 +517,214 @@ mod tests {
             success: false,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn success_after_bruteforce_threshold_retains_failure_evidence() {
+        for failures in [5, 10, 20] {
+            let mut tracker = WindowsLogonTracker::default();
+            for i in 0..failures {
+                tracker.observe(&fail("alice", Some("203.0.113.5")), i as f64);
+            }
+            let mut success = fail("alice", Some("203.0.113.5"));
+            success.success = true;
+            let out = tracker.observe(&success, 30.0);
+            let finding = out
+                .iter()
+                .find(|d| d.rule_id == "auth.windows_bruteforce_success")
+                .expect("threshold alert must not erase evidence needed by success correlation");
+            assert_eq!(finding.evidence["failures"], failures);
+            assert!(
+                tracker.observe(&success, 31.0).is_empty(),
+                "success consumes its failure evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn spray_alert_does_not_erase_success_correlation() {
+        let mut tracker = WindowsLogonTracker::default();
+        for i in 0..5 {
+            tracker.observe(&fail("alice", Some("203.0.113.5")), i as f64);
+        }
+        let mut spray = false;
+        for (i, user) in ["bob", "carol", "dan", "erin"].iter().enumerate() {
+            spray |= tracker
+                .observe(&fail(user, Some("203.0.113.5")), 5.0 + i as f64)
+                .iter()
+                .any(|d| d.rule_id == "auth.windows_password_spray");
+        }
+        assert!(spray);
+        let mut success = fail("alice", Some("203.0.113.5"));
+        success.success = true;
+        assert!(tracker
+            .observe(&success, 10.0)
+            .iter()
+            .any(|d| d.rule_id == "auth.windows_bruteforce_success"));
+    }
+
+    #[test]
+    fn repeated_alerts_have_a_separate_window_cooldown() {
+        let mut tracker = WindowsLogonTracker::default();
+        let mut account_hits = 0;
+        let mut source_hits = 0;
+        for i in 0..30 {
+            for finding in tracker.observe(&fail("alice", Some("203.0.113.5")), i as f64) {
+                if finding.rule_id == "auth.windows_bruteforce" {
+                    if finding.evidence.get("source").is_some() {
+                        source_hits += 1;
+                    } else {
+                        account_hits += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(account_hits, 1);
+        assert_eq!(source_hits, 1);
+        let mut after_expiry = 0;
+        for i in 0..5 {
+            after_expiry += tracker
+                .observe(&fail("alice", Some("203.0.113.5")), 305.0 + i as f64)
+                .iter()
+                .filter(|d| d.rule_id == "auth.windows_bruteforce")
+                .count();
+        }
+        assert_eq!(
+            after_expiry, 2,
+            "account and source cooldowns expire independently of retained failures"
+        );
+    }
+
+    #[test]
+    fn retained_failure_history_stays_bounded_under_a_flood() {
+        let mut tracker = WindowsLogonTracker::default();
+        for i in 0..1000 {
+            tracker.observe(&fail("alice", Some("203.0.113.5")), i as f64 / 100.0);
+        }
+        assert!(tracker.by_user.values().all(|q| q.len() <= 128));
+        assert!(tracker.by_source.values().all(|q| q.len() <= 128));
+        let mut success = fail("alice", Some("203.0.113.5"));
+        success.success = true;
+        assert!(tracker
+            .observe(&success, 11.0)
+            .iter()
+            .any(|d| d.rule_id == "auth.windows_bruteforce_success"));
+    }
+
+    #[test]
+    fn success_at_capacity_preserves_a_tracked_accounts_failures() {
+        let mut tracker = WindowsLogonTracker::default();
+        for i in 0..3 {
+            tracker.observe(&fail("victim", Some("source-victim")), i as f64);
+        }
+        for i in 0..4095 {
+            tracker.observe(
+                &fail(&format!("user-{i}"), Some(&format!("source-{i}"))),
+                3.0,
+            );
+        }
+        assert_eq!(tracker.by_user.len(), 4096);
+        assert_eq!(tracker.by_source.len(), 4096);
+        let mut success = fail("victim", Some("source-victim"));
+        success.success = true;
+        assert!(tracker
+            .observe(&success, 4.0)
+            .iter()
+            .any(|d| d.rule_id == "auth.windows_bruteforce_success"));
+        assert_eq!(
+            tracker.by_user.len(),
+            4095,
+            "success drains only its account"
+        );
+        assert_eq!(
+            tracker.by_source.len(),
+            4096,
+            "success must not reset unrelated sources"
+        );
+        tracker.observe(&fail("new-user", Some("new-source")), 5.0);
+        assert_eq!(tracker.by_user.len(), 4096);
+        assert_eq!(tracker.by_source.len(), 4096);
+        assert!(
+            tracker.by_user.contains_key("user-4094"),
+            "one new key must not discard all other history"
+        );
+        assert!(tracker.by_source.contains_key("source-4094"));
+        // Updating a tracked key at capacity keeps its history. A later new
+        // key evicts the oldest account/source, preserving the active one.
+        for now in [6.0, 7.0] {
+            tracker.observe(&fail("user-4094", Some("source-4094")), now);
+        }
+        tracker.observe(&fail("overflow", Some("overflow-source")), 8.0);
+        assert!(!tracker.by_user.contains_key("user-0"));
+        assert!(!tracker.by_source.contains_key("source-0"));
+        let mut success = fail("user-4094", Some("source-4094"));
+        success.success = true;
+        assert!(tracker
+            .observe(&success, 9.0)
+            .iter()
+            .any(|d| d.rule_id == "auth.windows_bruteforce_success"));
+    }
+
+    #[test]
+    fn spray_cooldown_is_independent_from_source_bruteforce() {
+        let mut tracker = WindowsLogonTracker::default();
+        for i in 0..10 {
+            tracker.observe(&fail("alice", Some("203.0.113.5")), i as f64);
+        }
+        let mut hits = 0;
+        for i in 0..20 {
+            hits += tracker
+                .observe(
+                    &fail(&format!("user-{i}"), Some("203.0.113.5")),
+                    10.0 + i as f64,
+                )
+                .iter()
+                .filter(|d| d.rule_id == "auth.windows_password_spray")
+                .count();
+        }
+        assert_eq!(
+            hits, 1,
+            "source alert must not suppress spray or cause repeated spray alerts"
+        );
+        let mut next_window = 0;
+        for i in 0..5 {
+            next_window += tracker
+                .observe(
+                    &fail(&format!("next-{i}"), Some("203.0.113.5")),
+                    315.0 + i as f64,
+                )
+                .iter()
+                .filter(|d| d.rule_id == "auth.windows_password_spray")
+                .count();
+        }
+        assert_eq!(next_window, 1);
+    }
+
+    #[test]
+    fn success_consumes_only_its_account_and_expired_failures_do_not_match() {
+        let mut tracker = WindowsLogonTracker::default();
+        for i in 0..3 {
+            tracker.observe(&fail("alice", Some("203.0.113.5")), i as f64);
+            tracker.observe(&fail("bob", Some("203.0.113.5")), i as f64);
+        }
+        for user in ["alice", "bob"] {
+            let mut success = fail(user, Some("203.0.113.5"));
+            success.success = true;
+            assert!(tracker
+                .observe(&success, 4.0)
+                .iter()
+                .any(|d| d.rule_id == "auth.windows_bruteforce_success"));
+            assert!(tracker.observe(&success, 5.0).is_empty());
+        }
+        for i in 0..5 {
+            tracker.observe(&fail("carol", Some("203.0.113.5")), i as f64);
+        }
+        let mut success = fail("carol", Some("203.0.113.5"));
+        success.success = true;
+        assert!(
+            tracker.observe(&success, 305.0).is_empty(),
+            "expired failure evidence must not correlate"
+        );
     }
 
     #[test]
