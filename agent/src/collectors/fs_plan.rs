@@ -159,6 +159,21 @@ pub fn is_scratch_file(normalised_path: &str) -> bool {
     normalised_path.contains("\\appdata\\local\\temp\\") || normalised_path.ends_with(".tmp")
 }
 
+/// Machine-wide persistence directories watched by default on Windows, next to
+/// the hosts directory: the all-users Startup folder and the scheduled-task
+/// store (`System32\Tasks`, including subfolders). Per-user Startup folders
+/// are not included: they need the profile list and are a known gap.
+pub fn default_persistence_dirs(system_root: &str, program_data: &str) -> Vec<String> {
+    let trim = |s: &str| s.trim_end_matches(['\\', '/']).to_string();
+    vec![
+        format!(
+            "{}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+            trim(program_data)
+        ),
+        format!("{}\\System32\\Tasks", trim(system_root)),
+    ]
+}
+
 /// Never filtered or coalesced: persistence and name-resolution targets.
 pub fn is_security_critical(normalised_path: &str) -> bool {
     normalised_path.contains("\\microsoft\\windows\\start menu\\programs\\startup\\")
@@ -713,5 +728,17 @@ mod tests {
         .is_empty());
         let lock = "C:\\Windows\\System32\\drivers\\etc\\~$lock";
         assert!(plan(&mut p, Change::Modified, lock, t).is_empty(), "noise");
+    }
+
+    #[test]
+    fn default_persistence_dirs_are_classified_security_critical() {
+        let dirs = default_persistence_dirs("C:\\Windows\\", "C:\\ProgramData");
+        assert_eq!(dirs.len(), 2);
+        for d in &dirs {
+            let file = normalise(&format!("{d}\\sub\\evil.lnk"));
+            assert!(is_security_critical(&file), "{file}");
+        }
+        assert!(dirs[1].ends_with("System32\\Tasks"), "{}", dirs[1]);
+        assert!(!dirs[1].contains("\\\\"), "no doubled separators");
     }
 }

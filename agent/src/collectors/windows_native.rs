@@ -2,6 +2,16 @@
 use crate::schema::*;
 
 pub const SYSMON_CHANNEL: &str = "Microsoft-Windows-Sysmon/Operational";
+/// Only event 5861 (permanent subscription registered) is collected from it.
+pub const WMI_CHANNEL: &str = "Microsoft-Windows-WMI-Activity/Operational";
+/// PowerShell script-block logging (event 4104). Evaluated on the host only:
+/// the record is never forwarded, since script text can hold credentials.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const POWERSHELL_CHANNEL: &str = "Microsoft-Windows-PowerShell/Operational";
+/// The one WMI-Activity event worth keeping; the rest of that channel is
+/// high-volume provider chatter and query text.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WMI_SUBSCRIPTION_EVENT: u64 = 5861;
 
 fn number(value: &str) -> Option<u32> {
     if let Some(hex) = value
@@ -491,7 +501,7 @@ impl PendingRecords {
         anyhow::ensure!(
             matches!(
                 channel,
-                "Security" | "System" | "Application" | SYSMON_CHANNEL
+                "Security" | "System" | "Application" | SYSMON_CHANNEL | WMI_CHANNEL
             ),
             "unknown native channel"
         );

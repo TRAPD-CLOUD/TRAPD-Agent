@@ -55,6 +55,7 @@ pub mod windows_evasion_rules;
 pub mod windows_logon;
 pub mod windows_roots;
 pub mod windows_rules;
+pub mod windows_script_rules;
 
 #[cfg(feature = "yara")]
 pub mod yara_scanner;

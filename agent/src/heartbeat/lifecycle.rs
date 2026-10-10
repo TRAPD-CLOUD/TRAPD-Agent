@@ -47,6 +47,24 @@ impl PreviousShutdown {
     }
 }
 
+/// Finding for a start that follows an unclean shutdown. The marker is a hint
+/// (anyone who can write the state dir can forge it), so this is only a
+/// low-severity signal the backend can fold, never a response trigger.
+pub fn unclean_shutdown_finding(previous: PreviousShutdown) -> Option<trapd_schema::DetectionData> {
+    (previous == PreviousShutdown::Unclean).then(|| trapd_schema::DetectionData {
+        rule_id: "selfprotect.unclean_shutdown".into(),
+        title: "Agent restarted after an unclean shutdown".into(),
+        category: "defense_evasion".into(),
+        mitre_tactic: Some("TA0005 Defense Evasion".into()),
+        mitre_technique: Some("T1562".into()),
+        confidence: 40,
+        subject: "trapd-agent".into(),
+        detail: "The previous agent run ended without an orderly shutdown (killed, crashed or power loss)".into(),
+        evidence: serde_json::json!({ "previous_shutdown": "unclean" }),
+        ..Default::default()
+    })
+}
+
 /// Immutable facts about this process run.
 #[derive(Debug, Clone)]
 pub struct Lifecycle {
@@ -112,6 +130,14 @@ pub fn mark_clean_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_unclean_previous_run_yields_a_finding() {
+        let f = unclean_shutdown_finding(PreviousShutdown::Unclean).unwrap();
+        assert_eq!(f.rule_id, "selfprotect.unclean_shutdown");
+        assert!(unclean_shutdown_finding(PreviousShutdown::Clean).is_none());
+        assert!(unclean_shutdown_finding(PreviousShutdown::Unknown).is_none());
+    }
 
     fn temp_marker(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

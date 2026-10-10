@@ -40,6 +40,10 @@ pub(super) fn eventlog_source(log: &LogEventData) -> Option<String> {
     let (channel, provider) = match id {
         4688 | 4697 | 4698 => ("Security", "Microsoft-Windows-Security-Auditing"),
         7045 => ("System", "Service Control Manager"),
+        5861 => (
+            "Microsoft-Windows-WMI-Activity/Operational",
+            "Microsoft-Windows-WMI-Activity",
+        ),
         _ => return None,
     };
     matches_eventlog(log, id, channel, provider).then(|| format!("windows_eventlog:{channel}:{id}"))
