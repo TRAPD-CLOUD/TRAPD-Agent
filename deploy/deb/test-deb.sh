@@ -102,6 +102,7 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
 else
     mkdir -p "$TMP/work"
     cp "$DEB1" "$TMP/work/v1.deb"; cp "$DEB2" "$TMP/work/v2.deb"; cp "$HERE/test-in-container.sh" "$TMP/work/"
+    cp "$HERE/../install.sh" "$TMP/work/install.sh"
     for image in ${IMAGES:-ubuntu:24.04 debian:12}; do
         echo "-- $image"
         if ! docker image inspect "$image" >/dev/null 2>&1 && ! docker pull -q "$image" >/dev/null 2>&1; then

@@ -120,6 +120,10 @@ command -v restorecon &>/dev/null && restorecon -F "$INSTALL_BIN" || true
 mkdir -p "$ENV_DIR"
 echo "sha256:$(sha256sum "$INSTALL_BIN" | awk '{print $1}')" > "${ENV_DIR}/binary.sha256"
 chmod 600 "${ENV_DIR}/binary.sha256"
+# The downloaded binary passed checksum verification before replacement.
+# A prior self-update's signature cannot authenticate this new installation.
+# Preserve the independently provisioned release verification key.
+rm -f "${ENV_DIR}/binary.sig"
 
 # ── Download eBPF binary ─────────────────────────────────────────────────────
 EBPF_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${EBPF_BINARY_NAME}"

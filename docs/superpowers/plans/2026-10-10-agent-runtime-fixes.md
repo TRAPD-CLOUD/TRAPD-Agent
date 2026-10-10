@@ -57,3 +57,10 @@ Linux release build and Windows GNU build passed. Strict Linux and Windows GNU
 all-target checks include the native XML truncation regression. Repository-wide
 agent formatting has existing debt; new files and changed hunks are formatted.
 The physical CLT-MBL field test is unavailable in this environment.
+
+Additional GitHub review fixes: hosts deletion/rename-away, startup lifecycle
+before enrollment, bounded logon failure history across alert thresholds, and
+stale signature invalidation on MSI/deb/script upgrades. Real Ubuntu/Debian
+package and full script-installer tests pass, including checksum rejection that
+leaves integrity state unchanged. MSI validates signature restoration on
+failed upgrades and stale-signature removal on successful upgrades in CI.
