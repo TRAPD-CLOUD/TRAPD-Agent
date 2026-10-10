@@ -1,13 +1,13 @@
 //! Native Windows Security/System/Application event logs with persisted cursors.
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::Sender;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::EventLog::*;
 
-use crate::collectors::Collector;
+use crate::collectors::{windows_native, Collector};
 use crate::config::AgentConfig;
 use crate::detection::windows_decoy;
 use crate::schema::DetectionData;
@@ -17,6 +17,15 @@ use crate::schema::{
 };
 
 struct Handle(EVT_HANDLE);
+struct CoverageGuard;
+impl Drop for CoverageGuard {
+    fn drop(&mut self) {
+        crate::telemetry::coverage::update(|c| {
+            c.set_eventlog_active("Security", false);
+            c.set_eventlog_active(windows_native::SYSMON_CHANNEL, false);
+        });
+    }
+}
 impl Drop for Handle {
     fn drop(&mut self) {
         unsafe {
@@ -121,14 +130,29 @@ fn parse(xml: &str, channel: &str) -> Result<(u64, LogEventData, Option<UserLogo
     let record_id = text("EventRecordID").parse::<u64>()?;
     let event_id = text("EventID").parse::<u32>()?;
     let mut fields = serde_json::Map::new();
+    let mut truncated_fields = BTreeMap::new();
     fields.insert("EventID".into(), event_id.into());
     fields.insert("EventRecordID".into(), record_id.into());
-    for n in doc.descendants().filter(|n| n.has_tag_name("Data")) {
+    let event_data = doc
+        .root_element()
+        .children()
+        .find(|n| n.has_tag_name("EventData"));
+    for n in event_data
+        .into_iter()
+        .flat_map(|n| n.children())
+        .filter(|n| n.has_tag_name("Data"))
+    {
         if let Some(name) = n.attribute("Name") {
-            fields.insert(
-                name.into(),
-                serde_json::Value::String(n.text().unwrap_or("").chars().take(16384).collect()),
-            );
+            if fields.len() >= 258 || name.len() > 256 || fields.contains_key(name) {
+                bail!("invalid or duplicate event data field");
+            }
+            let (value, truncation) =
+                crate::telemetry::limits::truncate_str(n.text().unwrap_or(""), 16 * 1024);
+            if let Some(truncation) = truncation {
+                truncated_fields.insert(format!("fields.{name}"), truncation);
+                crate::telemetry::metrics::metrics().enrichment_truncation();
+            }
+            fields.insert(name.into(), serde_json::Value::String(value));
         }
     }
     // 4624/4625 become structured logon events; the operating system's own
@@ -142,7 +166,10 @@ fn parse(xml: &str, channel: &str) -> Result<(u64, LogEventData, Option<UserLogo
         None
     };
     let (message, truncation) = crate::telemetry::limits::truncate_str(xml, 64 * 1024);
-    let truncated_fields = truncation.map(|t| BTreeMap::from([("message".into(), t)]));
+    if let Some(truncation) = truncation {
+        truncated_fields.insert("message".into(), truncation);
+    }
+    let truncated_fields = (!truncated_fields.is_empty()).then_some(truncated_fields);
     let log_timestamp = system
         .children()
         .find(|n| n.has_tag_name("TimeCreated"))
@@ -328,10 +355,14 @@ fn audit_tamper(
 
 pub struct EventLogCollector {
     config: Arc<RwLock<AgentConfig>>,
+    durable_handoff: bool,
 }
 impl EventLogCollector {
-    pub fn new(config: Arc<RwLock<AgentConfig>>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<RwLock<AgentConfig>>, durable_handoff: bool) -> Self {
+        Self {
+            config,
+            durable_handoff,
+        }
     }
 }
 
@@ -346,6 +377,7 @@ impl Collector for EventLogCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
+        let _coverage_guard = CoverageGuard;
         let path = crate::paths::state_dir().join("windows_eventlog_cursors.json");
         let mut cursors: HashMap<String, u64> = std::fs::read(&path)
             .ok()
@@ -356,22 +388,67 @@ impl Collector for EventLogCollector {
         // service). Bounded; oldest dropped on overflow.
         let mut logon_types: HashMap<String, u32> = HashMap::new();
         let devices = super::etw::device_map();
+        let mut unavailable = HashSet::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             ticker.tick().await;
             if !self.config.read().map(|c| c.logs_enabled).unwrap_or(true) {
+                crate::telemetry::coverage::update(|c| {
+                    c.set_eventlog_active("Security", false);
+                    c.set_eventlog_active(windows_native::SYSMON_CHANNEL, false);
+                });
                 continue;
             }
-            for channel in ["Security", "System", "Application"] {
+            let policy = tokio::task::spawn_blocking(|| {
+                let command_line = super::registry::values_checked(
+                    super::registry::Hive::LocalMachine,
+                    r"Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit",
+                    0,
+                )
+                .ok()
+                .map(|values| {
+                    values.iter().any(|(name, value)| {
+                        name.eq_ignore_ascii_case("ProcessCreationIncludeCmdLine_Enabled")
+                            && value == "1"
+                    })
+                });
+                (
+                    super::decoy_audit::process_audit_enabled(),
+                    command_line,
+                    super::decoy_audit::registry_audit_enabled(),
+                )
+            })
+            .await?;
+            crate::telemetry::coverage::update(|c| {
+                c.audit_process_creation = policy.0;
+                c.audit_command_line = policy.1;
+                c.audit_registry = policy.2;
+            });
+            for channel in [
+                "Security",
+                "System",
+                "Application",
+                windows_native::SYSMON_CHANNEL,
+            ] {
                 let cursor = cursors.get(channel).copied();
-                let records =
-                    match tokio::task::spawn_blocking(move || read(channel, cursor)).await? {
-                        Ok(records) => records,
-                        Err(e) => {
-                            tracing::warn!(channel, error = %e, "Windows event log unavailable");
-                            continue;
+                let records = match tokio::task::spawn_blocking(move || read(channel, cursor))
+                    .await?
+                {
+                    Ok(records) => records,
+                    Err(e) => {
+                        crate::telemetry::coverage::update(|c| {
+                            c.set_eventlog_active(channel, false)
+                        });
+                        if unavailable.insert(channel) {
+                            tracing::warn!(channel, error = %e, "Windows event log unavailable; native coverage for this channel is absent");
                         }
-                    };
+                        continue;
+                    }
+                };
+                crate::telemetry::coverage::update(|c| c.set_eventlog_active(channel, true));
+                if unavailable.remove(channel) {
+                    tracing::info!(channel, "Windows event log available again");
+                }
                 if records.is_empty() && cursor.is_none() {
                     cursors.insert(channel.into(), 0);
                 }
@@ -397,7 +474,31 @@ impl Collector for EventLogCollector {
                     }
                 }
                 for xml in records {
-                    let (record, data, auth) = parse(&xml, channel)?;
+                    let (record, data, auth) = match parse(&xml, channel) {
+                        Ok(record) => record,
+                        Err(error) => {
+                            tracing::warn!(channel, %error, "Skipping malformed Windows event record");
+                            crate::telemetry::metrics::metrics()
+                                .event_dropped(crate::telemetry::DropReason::InternalError);
+                            // Native XML may have valid System identity but bad data.
+                            // Advance past that record to avoid a poison-record retry loop.
+                            if let Ok(doc) = roxmltree::Document::parse(&xml) {
+                                if let Some(id) = doc
+                                    .root_element()
+                                    .children()
+                                    .find(|n| n.has_tag_name("System"))
+                                    .and_then(|n| {
+                                        n.children().find(|n| n.has_tag_name("EventRecordID"))
+                                    })
+                                    .and_then(|n| n.text())
+                                    .and_then(|t| t.parse::<u64>().ok())
+                                {
+                                    cursors.insert(channel.into(), id);
+                                }
+                            }
+                            continue;
+                        }
+                    };
                     if channel == "System"
                         && cursor.is_some()
                         && data.proc.as_deref() == Some("Microsoft-Windows-Eventlog")
@@ -464,16 +565,21 @@ impl Collector for EventLogCollector {
                     // First start tails from the newest record, avoiding a full
                     // historical replay. Subsequent starts resume the cursor.
                     if cursor.is_some() {
-                        let event = AgentEvent::new(
-                            agent_id.clone(),
-                            hostname.clone(),
-                            EventClass::Log,
-                            EventAction::Log,
-                            Severity::Info,
-                            EventData::Log(Box::new(data)),
-                        );
-                        if tx.send(event).await.is_err() {
-                            return Ok(());
+                        if windows_native::emit_record(
+                            &tx,
+                            data,
+                            &agent_id,
+                            &hostname,
+                            self.durable_handoff,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            if tx.is_closed() {
+                                return Ok(());
+                            }
+                            tracing::warn!(channel, "native source record not durably journaled; retaining source cursor for retry");
+                            break;
                         }
                         if let Some(auth) = auth {
                             let event = AgentEvent::new(
@@ -519,6 +625,38 @@ mod tests {
         assert_eq!(auth.src_addr.as_deref(), Some("10.0.0.1"));
         assert!(!auth.success);
     }
+    #[test]
+    fn native_xml_rejects_duplicate_or_reserved_fields() {
+        for fields in [
+            r#"<Data Name="EventID">4688</Data>"#,
+            r#"<Data Name="CommandLine">first</Data><Data Name="CommandLine">second</Data>"#,
+        ] {
+            let xml = format!("<Event><System><EventID>4688</EventID><EventRecordID>7</EventRecordID></System><EventData>{fields}</EventData></Event>");
+            assert!(parse(&xml, "Security").is_err());
+        }
+        assert!(parse("<Event>", "Security").is_err());
+    }
+
+    #[test]
+    fn native_xml_field_truncation_preserves_original_byte_lengths() {
+        for command_line in ["x".repeat(20_000), "🦀".repeat(6_000)] {
+            let xml = format!(
+                r#"<Event><System><Provider Name="Microsoft-Windows-Security-Auditing"/><EventID>4688</EventID><EventRecordID>7</EventRecordID><TimeCreated SystemTime="2026-10-10T12:00:00Z"/></System><EventData><Data Name="NewProcessId">0x123</Data><Data Name="NewProcessName">C:\test.exe</Data><Data Name="CommandLine">{command_line}</Data></EventData></Event>"#
+            );
+            let (_, log, _) = parse(&xml, "Security").unwrap();
+            let captured = log.fields["CommandLine"].as_str().unwrap();
+            assert!(captured.len() <= 16 * 1024);
+            let marker = &log.truncated_fields.as_ref().unwrap()["fields.CommandLine"];
+            assert_eq!(marker.original_length, command_line.len());
+            assert_eq!(marker.captured_length, captured.len());
+            let event = windows_native::normalize(&log, "agent", "host").unwrap();
+            let EventData::ProcessCreate(process) = event.data else {
+                panic!("process expected")
+            };
+            assert!(process.enrichment.has_truncation());
+        }
+    }
+
     #[test]
     #[ignore = "requires elevated native Windows with Audit File System success enabled"]
     fn native_4663_self_read_is_suppressed_and_foreign_read_alerts() {

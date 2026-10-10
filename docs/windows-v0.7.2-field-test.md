@@ -80,38 +80,33 @@ regression test plus a repeat of the field test above.
 
 ## Fix status (branch `integ/windows-field-test-fixes`)
 
-All fixes below are merged on one integration branch (not pushed, not yet
-released). Verified: Linux unit and integration tests, clippy `-D warnings`
-(Linux and `x86_64-pc-windows-gnu` type-check). **Not verified: nothing has run
-on a real Windows host.** A finding is only closed after the field test is
-repeated on `CLT-MBL`.
+The integration fixes are tracked in [agent PR 135](https://github.com/TRAPD-CLOUD/TRAPD-Agent/pull/135). Linux tests and Windows cross-compilation validate the code; native Windows/MSI checks run in CI. **The original field test has not been repeated on `CLT-MBL`.** A field finding is only closed after that host test is repeated.
 
 | Finding | State | What changed | Still open |
 |---------|-------|--------------|------------|
 | F1 | fixed, untested on Windows | `release_signing.pub` used consistently; manual copy refreshes the baseline only with a verifying `binary.sig`; capped backoff (30 s to 15 min) instead of a restart loop | Release publishes no standalone `binary.sig`; downgrade of an older signed binary is accepted; `BINARY_SIGNING_KEY` removed, the release key now also signs the binary digest (one trust anchor instead of two: owner decision) |
 | F2 | fixed | single hex encoding, unit test with a known digest | none |
-| F3 | mitigated | command line and account read in the ETW callback with creation-time check | cannot be guaranteed for processes that exit first; username can stay `unknown`; acceptance test (100 runs) not done |
+| F3 | mitigated with persisted sources | ETW event-time enrichment plus recorded Security 4688 / optional Sysmon 1 command line and account; historical PIDs never borrow current process context | Security auditing and command-line policy or existing Sysmon are required; acceptance test (100 runs) not repeated |
 | F4/F5 | partly fixed | SOA no longer parsed as CNAME; rcode mapping; PID/process added | no client/server address or transaction id in the source event; NXDOMAIN-as-NOERROR unconfirmed on a real host |
 | F6 | partly fixed | hosts-file hash and diff alert; optional `actor`/`change_summary` | actor is a command-line lead only; agent-config changes have no hash/actor |
 | F7 | fixed, untested on Windows | spurious SYSTEM logons dropped; failure reason/type/source structured; brute force, spray, success-after-failures rules | 4776 on domain controllers not counted |
-| F8 | implemented, untested on Windows | registry watcher (10 s diff) for Run, Services, IFEO, Winlogon, AppInit, Defender, COM, TaskCache; 15 rules; 7045/4697/4698 | no process attribution; baseline in memory only; only loaded user hives |
+| F8 | implemented, field validation pending | bounded persistent snapshot baseline, unloaded-hive/read-failure retention, durable event handoff; Security 4657 / optional Sysmon 12–14 supplement polling | snapshot misses changes between polls; native registry auditing requires policy and key SACLs or configured Sysmon; host test pending |
 | F9 | partly fixed | rare-binary baseline cap 64 to 512 (root cause of endless "novel" alerts); admin install paths learned silently; anon-exec thread start in protected images downgraded | downgrade is path-based, no Authenticode check; idle alert rate not measured |
 | F10 | fixed | 30 s warm-up suppression for unattributed last-access hits | none |
 | F11 | fixed | single event medium; `rename_burst` high at 10 and critical at 30 files in 10 s | backend alert severity not checked |
 | F12 | partly fixed | accessor from `process.create` command lines, high/90 when attributed; 2 s poll | processes that do not name the decoy (Explorer copy) are not found; no true change notification |
 | F13 | fixed | `agent_uptime_seconds`, `agent_last_restart`, `previous_shutdown` in the heartbeat | none |
-| F14 | agent side fixed | `pipeline` counters in the heartbeat; oldest-first spool eviction with priority-loss counters | backend must alert on missing heartbeat, `previous_shutdown=unclean`, `dropped_total`; no flush or `agent.stopping` event on shutdown |
+| F14 | agent side fixed | `pipeline` counters in the heartbeat; oldest-first spool eviction with priority-loss counters | backend must alert on missing heartbeat, `previous_shutdown=unclean`, `dropped_total` and `durability_lost`; no `agent.stopping` event on shutdown |
 
 ### Backend work required (not done in this repo)
-- Normalizer (`backend/libs/detection/src/dcs/normalizers/linux.rs`) must accept `class=registry`.
+- Registry normalization and the missing Windows runtime catalog policies are prepared in the companion platform branch `fix/agent-registry-normalization`; they require platform release and migration deployment.
 - ClickHouse payload schema: registry fields, new heartbeat fields (`pipeline.*`), logon fields, filesystem `actor`/`change_summary`, DNS `pid`/`process`.
-- Vendor the regenerated `agent/rule-catalog.json` (30+ new rules) into the platform catalog.
 - Missing-heartbeat and unclean-shutdown alerting.
 
 ### Not covered by any fix yet
-- Tamper detection for deleted `config` files or edited `agent.env`, and a final flush on shutdown (F14 follow-up).
+- Tamper detection for deleted `config` files or edited `agent.env`. Journal checkpoint now performs a checked final fsync; durability failure is visible in diagnostics, health and heartbeat.
 - Scheduled-task subfolders, WMI subscriptions and startup folder.
-- LSASS handle access (only command-line patterns exist), script block logging 4104.
+- LSASS access without an existing configured Sysmon process-access source; script block logging 4104. Sysmon 10 memory-capable LSASS access is a low-severity signal, not a confirmed dump.
 - Repeatable field-test script and ATT&CK coverage measurement (P2).
 
 ## Honest scope statement
@@ -129,3 +124,5 @@ ClickHouse queries against `trapd_events` (`ts`, `event_type`, `payload_json`)
 filtered by marker strings (`trapdtest*`), PIDs and time windows; agent logs
 from `C:\ProgramData\TRAPD\logs`. Findings F4/F5 (cause) and F2 (effect on
 folding) are hypotheses and have not been confirmed in the agent code.
+
+Runtime coverage prerequisites and failure behavior are documented in [Persisted Windows event coverage](windows-native-event-coverage.md). Historical test results above remain unchanged; code fixes do not substitute for repeating the host test.

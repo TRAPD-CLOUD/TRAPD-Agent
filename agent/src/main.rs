@@ -401,7 +401,8 @@ async fn main() -> Result<()> {
             ))
         );
         spawn_collector!(collectors::windows::eventlog::EventLogCollector::new(
-            Arc::clone(&agent_config)
+            Arc::clone(&agent_config),
+            !offline
         ));
         crate::deception::activity::set_enabled(
             agent_config

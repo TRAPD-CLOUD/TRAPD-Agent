@@ -50,3 +50,7 @@ pub mod windows;
 // tested on every build host.
 #[cfg(any(target_os = "windows", test))]
 pub mod etw_map;
+
+// Persisted Windows event normalization; tested independently of native APIs.
+#[cfg(any(target_os = "windows", test))]
+pub mod windows_native;

@@ -106,9 +106,11 @@ after configuration removes them. On upgrade, legacy decoys without ownership re
 are preserved with a warning rather than adopted or deleted automatically.
 
 The ETW sensor is user-mode: no kernel driver is installed. It therefore does
-**not** see, and must not be reported as seeing, LSASS handle access (that needs
-the PPL/ELAM ETW-Ti provider) or an attacker with administrator rights who stops
-the `TRAPD-Agent` session itself — that stop *is* detected and reported, but not
+**not** capture LSASS handle access. An existing, configured Sysmon channel can
+supplement it with observed memory-capable process access signals; TRAPD does
+not install its driver or claim complete kernel coverage. An attacker with
+administrator rights can stop
+the `TRAPD-Agent` session itself — that stop is detected and reported, but not
 prevented. There is also no packet/TLS sensor, no Linux rootkit/memory scanner,
 no Linux CIS audit, no generic file/journal/syslog log-source readers, no Linux
 session forensics, and no Linux prevention/response enforcement in this package.
@@ -120,7 +122,9 @@ restart; native process creation time still distinguishes PID reuse within a run
 ETW process-creation command lines are read from the live process, so a process
 that exits within microseconds may yield a start event without its command line
 (marked in `enrichment`); 4688 Security-event command lines (requiring the audit
-policy) remain a complementary source.
+policy) now produce structured process records. Security 4657 and an existing
+Sysmon channel supplement registry polling with persisted operation records.
+See [native event prerequisites and coverage limits](../docs/windows-native-event-coverage.md).
 
 Default file roots are `%SystemRoot%\System32\drivers\etc` and
 `%PUBLIC%\Documents`. Explicit Windows `fs_watch_paths` and `fim_paths` in signed

@@ -193,9 +193,47 @@ pub const RULES: &[RuleMeta] = &[
     // Unambiguous attacker actions alert from day one; heuristics that touch
     // tools admins also use start in shadow mode and are promoted per project
     // once their shadow hit rate is known (`rule_modes`).
-    rule("credential_access.lsass_dump", CREDS, "T1003.001", Critical, Critical, Alert, Command, HOUR),
-    rule("credential_access.sam_hive_save", CREDS, "T1003.002", High, Critical, Alert, Command, HOUR),
-    rule("impact.shadow_copy_delete", IMPACT, "T1490", Critical, Critical, Alert, Command, HOUR),
+    // Existing Sysmon telemetry proves memory-capable handle access, not a dump.
+    rule(
+        "credential_access.lsass_memory_access",
+        CREDS,
+        "T1003.001",
+        Low,
+        Low,
+        Signal,
+        Process,
+        TEN_MIN,
+    ),
+    rule(
+        "credential_access.lsass_dump",
+        CREDS,
+        "T1003.001",
+        Critical,
+        Critical,
+        Alert,
+        Command,
+        HOUR,
+    ),
+    rule(
+        "credential_access.sam_hive_save",
+        CREDS,
+        "T1003.002",
+        High,
+        Critical,
+        Alert,
+        Command,
+        HOUR,
+    ),
+    rule(
+        "impact.shadow_copy_delete",
+        IMPACT,
+        "T1490",
+        Critical,
+        Critical,
+        Alert,
+        Command,
+        HOUR,
+    ),
     // Filesystem ransomware indicators (see collectors/fs_heuristics.rs). The
     // collector has no process attribution, so the subject is the place, and
     // one burst folds into a single finding per window.

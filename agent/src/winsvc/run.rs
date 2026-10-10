@@ -363,7 +363,10 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     );
     spawn_collector!(UserSessionCollector::new());
     spawn_collector!(
-        crate::collectors::windows::eventlog::EventLogCollector::new(Arc::clone(&agent_config))
+        crate::collectors::windows::eventlog::EventLogCollector::new(
+            Arc::clone(&agent_config),
+            !offline
+        )
     );
     spawn_collector!(
         crate::collectors::windows::filesystem::FilesystemCollector::new(Arc::clone(&agent_config))
@@ -382,7 +385,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     ));
 
     // Registry persistence watcher (Run keys, services, IFEO, Winlogon, ...).
-    spawn_collector!(crate::collectors::windows::regwatch::RegistryWatchCollector::new());
+    spawn_collector!(crate::collectors::windows::regwatch::RegistryWatchCollector::new(!offline));
 
     drop(tx);
 

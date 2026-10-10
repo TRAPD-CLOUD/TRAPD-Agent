@@ -109,15 +109,29 @@ pub fn subkeys(path: &str, view: u32) -> Vec<String> {
 }
 
 pub fn subkeys_in(hive: Hive, path: &str, view: u32) -> Vec<String> {
+    subkeys_read(hive, path, view, false).unwrap_or_default()
+}
+
+/// Missing keys are empty; inaccessible, partial and bounded-out reads fail.
+pub fn subkeys_checked(hive: Hive, path: &str, view: u32) -> Result<Vec<String>, u32> {
+    subkeys_read(hive, path, view, true)
+}
+
+fn subkeys_read(hive: Hive, path: &str, view: u32, strict: bool) -> Result<Vec<String>, u32> {
     let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
     let mut key = std::ptr::null_mut();
     let mut names = Vec::new();
     // SAFETY: key is a valid out-pointer and the returned handle is always closed.
     unsafe {
-        if RegOpenKeyExW(hive.key(), path.as_ptr(), 0, KEY_READ | view, &mut key) != 0 {
-            return names;
+        let status = RegOpenKeyExW(hive.key(), path.as_ptr(), 0, KEY_READ | view, &mut key);
+        if status != 0 {
+            return if status == 2 || status == 3 {
+                Ok(names)
+            } else {
+                Err(status)
+            };
         }
-        for index in 0..8192 {
+        for index in 0..=8192 {
             let mut name = [0u16; 256];
             let mut len = name.len() as u32;
             let status = RegEnumKeyExW(
@@ -131,17 +145,22 @@ pub fn subkeys_in(hive: Hive, path: &str, view: u32) -> Vec<String> {
                 std::ptr::null_mut(),
             );
             if status == 259 {
-                break;
+                RegCloseKey(key);
+                return Ok(names);
             }
-            if status != 0 {
-                tracing::warn!(status, "registry inventory enumeration incomplete");
-                break;
+            if status != 0 || index == 8192 {
+                RegCloseKey(key);
+                if !strict {
+                    tracing::warn!(status, "registry inventory enumeration incomplete");
+                    return Ok(names);
+                }
+                return Err(if status != 0 { status } else { 234 });
             }
             names.push(String::from_utf16_lossy(&name[..len as usize]));
         }
         RegCloseKey(key);
     }
-    names
+    Err(234)
 }
 
 /// Render one raw registry value for telemetry. Text types are decoded
@@ -189,6 +208,19 @@ fn render_value(kind: u32, data: &[u8]) -> String {
 /// are reported as `<value too large>`). Missing or unreadable keys yield an
 /// empty list.
 pub fn values_in(hive: Hive, path: &str, view: u32) -> Vec<(String, String)> {
+    values_read(hive, path, view, false).unwrap_or_default()
+}
+
+pub fn values_checked(hive: Hive, path: &str, view: u32) -> Result<Vec<(String, String)>, u32> {
+    values_read(hive, path, view, true)
+}
+
+fn values_read(
+    hive: Hive,
+    path: &str,
+    view: u32,
+    strict: bool,
+) -> Result<Vec<(String, String)>, u32> {
     const MAX_VALUES: u32 = 1024;
     const MORE_DATA: u32 = 234;
     const MAX_DATA: usize = 256 * 1024;
@@ -198,10 +230,15 @@ pub fn values_in(hive: Hive, path: &str, view: u32) -> Vec<(String, String)> {
     // SAFETY: key is a valid out-pointer and the handle is always closed; every
     // buffer length passed to RegEnumValueW matches its allocation.
     unsafe {
-        if RegOpenKeyExW(hive.key(), path.as_ptr(), 0, KEY_READ | view, &mut key) != 0 {
-            return out;
+        let status = RegOpenKeyExW(hive.key(), path.as_ptr(), 0, KEY_READ | view, &mut key);
+        if status != 0 {
+            return if status == 2 || status == 3 {
+                Ok(out)
+            } else {
+                Err(status)
+            };
         }
-        for index in 0..MAX_VALUES {
+        for index in 0..=MAX_VALUES {
             let mut name = vec![0u16; 16384]; // names are at most 16383 chars
             let mut name_len: u32;
             let mut capacity = 4 * 1024usize;
@@ -221,13 +258,15 @@ pub fn values_in(hive: Hive, path: &str, view: u32) -> Vec<(String, String)> {
                     &mut data_len,
                 );
                 if status == 0 {
-                    break Some(render_value(
-                        kind,
-                        &data[..(data_len as usize).min(capacity)],
-                    ));
+                    break render_value(kind, &data[..(data_len as usize).min(capacity)]);
+                }
+                if status == 259 {
+                    RegCloseKey(key);
+                    return Ok(out);
                 }
                 if status != MORE_DATA {
-                    break None;
+                    RegCloseKey(key);
+                    return if strict { Err(status) } else { Ok(out) };
                 }
                 if (data_len as usize) > capacity && (data_len as usize) <= MAX_DATA {
                     capacity = data_len as usize;
@@ -246,14 +285,24 @@ pub fn values_in(hive: Hive, path: &str, view: u32) -> Vec<(String, String)> {
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 );
-                break (status == 0).then(|| "<value too large>".to_string());
+                if status != 0 {
+                    RegCloseKey(key);
+                    return if strict { Err(status) } else { Ok(out) };
+                }
+                break "<value too large>".to_string();
             };
-            let Some(value) = rendered else { break };
-            out.push((String::from_utf16_lossy(&name[..name_len as usize]), value));
+            if index == MAX_VALUES {
+                RegCloseKey(key);
+                return if strict { Err(MORE_DATA) } else { Ok(out) };
+            }
+            out.push((
+                String::from_utf16_lossy(&name[..name_len as usize]),
+                rendered,
+            ));
         }
         RegCloseKey(key);
     }
-    out
+    Err(MORE_DATA)
 }
 
 #[cfg(test)]
@@ -279,5 +328,71 @@ mod render_tests {
         let single = [b'a', 0, b'b', 0, 0, 0, 0, 0];
         assert_eq!(render_value(7, &single), "ab");
         assert_eq!(render_value(7, &[0, 0, 0, 0]), "");
+    }
+}
+
+#[cfg(test)]
+mod checked_read_tests {
+    use super::*;
+    use windows_sys::Win32::System::Registry::{
+        RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY_CURRENT_USER, KEY_WRITE, REG_DWORD,
+        REG_OPTION_NON_VOLATILE,
+    };
+
+    struct TestKey(Vec<u16>);
+    impl Drop for TestKey {
+        fn drop(&mut self) {
+            // SAFETY: the test-owned HKCU path is NUL terminated.
+            unsafe {
+                RegDeleteTreeW(HKEY_CURRENT_USER, self.0.as_ptr());
+            }
+        }
+    }
+
+    #[test]
+    fn checked_missing_keys_are_empty_and_value_cap_is_incomplete() {
+        let path = format!(r"Software\TRAPD_RegistryTests_{}", uuid::Uuid::new_v4());
+        let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let _cleanup = TestKey(wide.clone());
+        assert!(values_checked(Hive::CurrentUser, &path, 0)
+            .unwrap()
+            .is_empty());
+        assert!(subkeys_checked(Hive::CurrentUser, &path, 0)
+            .unwrap()
+            .is_empty());
+        let mut key = std::ptr::null_mut();
+        // SAFETY: buffers are NUL terminated, key is an out-pointer and all
+        // RegSetValueExW data buffers contain the declared four bytes.
+        unsafe {
+            assert_eq!(
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide.as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_WRITE,
+                    std::ptr::null(),
+                    &mut key,
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            for index in 0..1025 {
+                let name: Vec<u16> = format!("v{index}").encode_utf16().chain(Some(0)).collect();
+                let value = 1u32.to_le_bytes();
+                let status = RegSetValueExW(key, name.as_ptr(), 0, REG_DWORD, value.as_ptr(), 4);
+                if status != 0 {
+                    RegCloseKey(key);
+                    panic!("test registry write failed: {status}");
+                }
+            }
+            RegCloseKey(key);
+        }
+        assert_eq!(
+            values_checked(Hive::CurrentUser, &path, 0).unwrap_err(),
+            234
+        );
+        assert_eq!(values_in(Hive::CurrentUser, &path, 0).len(), 1024);
     }
 }

@@ -718,6 +718,19 @@
       "window_s": 600
     },
     {
+      "base": "low",
+      "base_from_event": false,
+      "container_bump": false,
+      "dedup": "process",
+      "id": "credential_access.lsass_memory_access",
+      "max": "low",
+      "mode": "signal",
+      "root_bump": false,
+      "tactic": "TA0006 Credential Access",
+      "technique": "T1003.001",
+      "window_s": 600
+    },
+    {
       "base": "critical",
       "base_from_event": false,
       "container_bump": false,
