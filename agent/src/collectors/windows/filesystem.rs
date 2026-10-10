@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::Sender;
 
+use crate::collectors::critical_file as critical;
 use crate::collectors::fs_heuristics as heur;
 use crate::collectors::fs_plan::{self, Action, Change, Planner, Roots};
 use crate::collectors::Collector;
@@ -133,7 +134,7 @@ fn event(
             path,
             operation,
             source,
-            integrity: if realtime {
+            integrity: if realtime && before.is_none() && after.is_none() {
                 IntegrityStatus::NotChecked
             } else if violation {
                 IntegrityStatus::Violation
@@ -143,8 +144,59 @@ fn event(
             expected_hash: before.map(|f| f.sha256.clone()),
             actual_hash: after.map(|f| f.sha256.clone()),
             size_delta: before.map(|f| after.map(|a| a.size as i64).unwrap_or(0) - f.size as i64),
+            actor: None,
+            change_summary: None,
         }),
     )
+}
+
+/// A real-time event for a path whose content is tracked (the hosts file):
+/// hashes before/after, the added/removed lines, and the integrity verdict.
+/// Unchanged content (an attribute touch) stays plain telemetry.
+fn checked_event(
+    agent_id: &str,
+    hostname: &str,
+    path: String,
+    operation: FilesystemOperation,
+    verdict: &critical::Verdict,
+    before: Option<&critical::Snapshot>,
+    after: Option<&critical::Snapshot>,
+) -> AgentEvent {
+    let fp = |s: &critical::Snapshot| Fingerprint {
+        sha256: s.sha256.clone(),
+        size: s.size,
+    };
+    let (b, a) = (before.map(fp), after.map(fp));
+    let changed = matches!(verdict, critical::Verdict::Changed { .. });
+    let mut ev = event(
+        agent_id,
+        hostname,
+        path,
+        operation,
+        FilesystemSource::Realtime,
+        b.as_ref().filter(|_| changed),
+        a.as_ref().filter(|_| changed),
+    );
+    if let EventData::Filesystem(d) = &mut ev.data {
+        if let critical::Verdict::Changed { summary, .. } = verdict {
+            d.change_summary = summary.clone();
+        } else {
+            // Not a content change: report the hash we saw, flag nothing.
+            d.actual_hash = a.map(|f| f.sha256);
+        }
+    }
+    ev
+}
+
+/// Attach the best-effort actor (a process whose command line named the file).
+fn with_actor(mut ev: AgentEvent, path: &str) -> AgentEvent {
+    if let (EventData::Filesystem(d), Some(m)) = (
+        &mut ev.data,
+        crate::detection::accessor_correlation::attribute(path),
+    ) {
+        d.actor = Some(m.lineage);
+    }
+    ev
 }
 
 /// Locations watched for their named detections, in addition to the configured
@@ -452,6 +504,14 @@ impl FilesystemWatches {
     }
 }
 
+/// Files whose content is tracked: the hosts file under the real system root.
+fn critical_files() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
+            .join("System32\\drivers\\etc\\hosts"),
+    ]
+}
+
 fn change_for(kind: &EventKind, paths: &[PathBuf]) -> Vec<(Change, PathBuf)> {
     let first = || paths.first().cloned();
     match kind {
@@ -523,6 +583,15 @@ impl Collector for FilesystemCollector {
             std::time::Instant::now(),
         );
         let defaults = AgentConfig::default();
+        // Last known content of the tracked critical files (the hosts file).
+        // Seeded now so the first change is a diff, not a "baseline".
+        let mut critical_state: BTreeMap<String, critical::Snapshot> = BTreeMap::new();
+        for file in critical_files() {
+            let key = fs_plan::normalise(&file.to_string_lossy());
+            if let Some(snap) = critical::read_snapshot(&file, critical::is_diffable(&key)) {
+                critical_state.insert(key, snap);
+            }
+        }
         let baseline_path = crate::paths::state_dir().join("windows_fim_baseline.json");
         let saved: Baseline = std::fs::metadata(&baseline_path)
             .ok()
@@ -591,10 +660,41 @@ impl Collector for FilesystemCollector {
                                 );
                                 for action in actions {
                                     let event = match action {
-                                        Action::Generic { path, change } => Some(event(
-                                            &agent_id, &hostname, path, operation_for(change),
-                                            FilesystemSource::Realtime, None, None,
-                                        )),
+                                        Action::Generic { path, change } => {
+                                            let key = fs_plan::normalise(&path);
+                                            if critical::is_hosts_file(&key) && change != Change::Deleted {
+                                                // Content check: what changed in the hosts file?
+                                                let probe = PathBuf::from(&path);
+                                                let keep = critical::is_diffable(&key);
+                                                let after = tokio::task::spawn_blocking(move || critical::read_snapshot(&probe, keep))
+                                                    .await
+                                                    .ok()
+                                                    .flatten();
+                                                let ev = match after {
+                                                    Some(after) => {
+                                                        let before = critical_state.get(&key);
+                                                        let verdict = critical::compare(before, &after);
+                                                        let ev = checked_event(
+                                                            &agent_id, &hostname, path.clone(),
+                                                            operation_for(change), &verdict, before, Some(&after),
+                                                        );
+                                                        critical_state.insert(key, after);
+                                                        ev
+                                                    }
+                                                    None => event(
+                                                        &agent_id, &hostname, path.clone(), operation_for(change),
+                                                        FilesystemSource::Realtime, None, None,
+                                                    ),
+                                                };
+                                                Some(with_actor(ev, &path))
+                                            } else {
+                                                let ev = event(
+                                                    &agent_id, &hostname, path.clone(), operation_for(change),
+                                                    FilesystemSource::Realtime, None, None,
+                                                );
+                                                Some(with_actor(ev, &path))
+                                            }
+                                        }
                                         Action::Tamper { path, action } => Some(AgentEvent::new(
                                             agent_id.clone(), hostname.clone(),
                                             EventClass::Filesystem, EventAction::AgentTamper, Severity::Critical,
@@ -602,6 +702,9 @@ impl Collector for FilesystemCollector {
                                         )),
                                         Action::RansomExtension { path } => {
                                             Some(heur::suspicious_extension_event(&agent_id, &hostname, &path))
+                                        }
+                                        Action::RansomBurst { count } => {
+                                            Some(heur::rename_burst_event(&agent_id, &hostname, count))
                                         }
                                         Action::BackupDeletion { path } => {
                                             Some(heur::backup_deletion_event(&agent_id, &hostname, &path))

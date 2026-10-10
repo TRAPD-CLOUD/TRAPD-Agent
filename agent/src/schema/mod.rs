@@ -610,6 +610,15 @@ pub struct FilesystemEventData {
     pub actual_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_delta: Option<i64>,
+    /// Best-effort process that likely made the change. `ReadDirectoryChangesW`
+    /// carries no actor, so on Windows this is a correlation with a recent
+    /// `process.create` whose command line names the file — a lead, not proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<ProcessLineage>,
+    /// Human-readable content diff for small critical text files (hosts):
+    /// added/removed lines, truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_summary: Option<String>,
 }
 
 /// One value-level change on a watched Windows registry location. Emitted by

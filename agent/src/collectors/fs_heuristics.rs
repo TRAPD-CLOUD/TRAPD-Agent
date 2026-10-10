@@ -27,6 +27,17 @@ pub const MAX_ENTROPY_BYTES: u64 = 8 * 1024 * 1024;
 pub const MASS_MOD_THRESHOLD: usize = 50;
 pub const MASS_MOD_WINDOW: Duration = Duration::from_secs(10);
 
+/// A burst of files appearing under ransomware extensions (typically renames
+/// of the victim's documents) is reported once it reaches this many distinct
+/// paths within [`RENAME_BURST_WINDOW`], and again at each higher tier of
+/// [`burst_severity`]. One such file alone is only weak evidence (an archive
+/// someone named `.locked`), thirty in seconds is an encryption run.
+pub const RENAME_BURST_MIN: usize = 10;
+pub const RENAME_BURST_CRITICAL: usize = 30;
+pub const RENAME_BURST_WINDOW: Duration = Duration::from_secs(10);
+/// Distinct modified files at which `high_write_rate` is critical, not high.
+pub const MASS_MOD_CRITICAL: usize = 200;
+
 /// Identical generic notifications inside this window collapse into one.
 pub const GENERIC_COALESCE_WINDOW: Duration = Duration::from_secs(2);
 
@@ -135,6 +146,56 @@ impl MassModification {
     }
 }
 
+/// Severity of a burst of `count` distinct files in one window: from the size
+/// of the burst, not from any single file name.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn burst_severity(count: usize) -> Severity {
+    if count >= RENAME_BURST_CRITICAL {
+        Severity::Critical
+    } else if count >= RENAME_BURST_MIN {
+        Severity::High
+    } else {
+        Severity::Medium
+    }
+}
+
+/// Counts distinct files that appeared under a ransomware extension and
+/// reports when the burst first crosses [`RENAME_BURST_MIN`] and again when it
+/// crosses [`RENAME_BURST_CRITICAL`] (each tier at most once per burst).
+#[derive(Default)]
+pub struct RenameBurst {
+    seen: HashMap<String, Instant>,
+    reported_tier: u8,
+}
+
+impl RenameBurst {
+    /// Returns `Some(distinct_count)` when this file moves the burst into a
+    /// new severity tier.
+    pub fn record(&mut self, path: &str, now: Instant) -> Option<usize> {
+        self.seen
+            .retain(|_, last| now.duration_since(*last) <= RENAME_BURST_WINDOW);
+        self.seen.insert(path.to_string(), now);
+        let n = self.seen.len();
+        let tier = if n >= RENAME_BURST_CRITICAL {
+            2
+        } else if n >= RENAME_BURST_MIN {
+            1
+        } else {
+            0
+        };
+        if tier == 0 {
+            // The burst is over: a later one reports again.
+            self.reported_tier = 0;
+            return None;
+        }
+        if tier > self.reported_tier {
+            self.reported_tier = tier;
+            return Some(n);
+        }
+        None
+    }
+}
+
 /// Collapses repeated identical notifications. Security-critical paths bypass
 /// both the noise filter and the coalescing, so a persistence or credential
 /// change is never swallowed.
@@ -236,12 +297,35 @@ pub fn indicator_event(
     write_rate: Option<u64>,
     details: String,
 ) -> AgentEvent {
+    indicator_event_with(
+        agent_id,
+        hostname,
+        Severity::High,
+        indicator_type,
+        path,
+        entropy,
+        write_rate,
+        details,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn indicator_event_with(
+    agent_id: &str,
+    hostname: &str,
+    severity: Severity,
+    indicator_type: &str,
+    path: Option<String>,
+    entropy: Option<f64>,
+    write_rate: Option<u64>,
+    details: String,
+) -> AgentEvent {
     AgentEvent::new(
         agent_id.to_string(),
         hostname.to_string(),
         EventClass::Filesystem,
         EventAction::RansomwareIndicator,
-        Severity::High,
+        severity,
         EventData::RansomwareIndicator(RansomwareIndicatorData {
             process_start_time: None,
             indicator_type: indicator_type.to_string(),
@@ -268,9 +352,14 @@ pub fn high_entropy_event(agent_id: &str, hostname: &str, path: &str, entropy: f
 }
 
 pub fn high_write_rate_event(agent_id: &str, hostname: &str, rate: u64) -> AgentEvent {
-    indicator_event(
+    indicator_event_with(
         agent_id,
         hostname,
+        if rate as usize >= MASS_MOD_CRITICAL {
+            Severity::Critical
+        } else {
+            Severity::High
+        },
         "high_write_rate",
         None,
         None,
@@ -282,15 +371,36 @@ pub fn high_write_rate_event(agent_id: &str, hostname: &str, rate: u64) -> Agent
     )
 }
 
+/// One file under a ransomware extension is weak evidence on its own, so a
+/// single event is medium; the burst indicator ([`rename_burst_event`]) carries
+/// the severity of an actual encryption run.
 pub fn suspicious_extension_event(agent_id: &str, hostname: &str, path: &str) -> AgentEvent {
-    indicator_event(
+    indicator_event_with(
         agent_id,
         hostname,
+        Severity::Medium,
         "suspicious_extension",
         Some(path.to_string()),
         None,
         None,
         format!("File appeared with ransomware-associated extension: {path}"),
+    )
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn rename_burst_event(agent_id: &str, hostname: &str, count: usize) -> AgentEvent {
+    indicator_event_with(
+        agent_id,
+        hostname,
+        burst_severity(count),
+        "rename_burst",
+        None,
+        None,
+        Some(count as u64),
+        format!(
+            "{count} distinct files appeared under ransomware extensions in {}s",
+            RENAME_BURST_WINDOW.as_secs()
+        ),
     )
 }
 
@@ -475,5 +585,85 @@ mod tests {
         }
         let e = high_entropy_event("a", "h", "/x", 7.9);
         assert!(matches!(e.data, EventData::RansomwareIndicator(d) if d.entropy == Some(7.9)));
+    }
+
+    #[test]
+    fn burst_severity_scales_with_size() {
+        assert_eq!(burst_severity(1), Severity::Medium);
+        assert_eq!(burst_severity(9), Severity::Medium);
+        assert_eq!(burst_severity(10), Severity::High);
+        assert_eq!(burst_severity(29), Severity::High);
+        assert_eq!(burst_severity(30), Severity::Critical);
+    }
+
+    #[test]
+    fn thirty_renames_in_seconds_report_high_then_critical_once_each() {
+        let t = Instant::now();
+        let mut b = RenameBurst::default();
+        let mut reports = Vec::new();
+        for i in 0..40 {
+            if let Some(n) = b.record(
+                &format!("f{i}.docx.locked"),
+                t + Duration::from_millis(i * 50),
+            ) {
+                reports.push(n);
+            }
+        }
+        assert_eq!(reports, vec![RENAME_BURST_MIN, RENAME_BURST_CRITICAL]);
+    }
+
+    #[test]
+    fn a_few_or_slow_renames_never_report_a_burst() {
+        let t = Instant::now();
+        let mut b = RenameBurst::default();
+        for i in 0..9 {
+            assert!(b.record(&format!("f{i}.locked"), t).is_none());
+        }
+        // One file every 3 s never accumulates 10 inside the window.
+        let mut b = RenameBurst::default();
+        for i in 0..50 {
+            assert!(b
+                .record(&format!("g{i}.locked"), t + Duration::from_secs(3 * i))
+                .is_none());
+        }
+        // The same file renamed repeatedly is one file.
+        let mut b = RenameBurst::default();
+        for _ in 0..100 {
+            assert!(b.record("same.locked", t).is_none());
+        }
+    }
+
+    #[test]
+    fn a_new_burst_after_a_quiet_period_reports_again() {
+        let t = Instant::now();
+        let mut b = RenameBurst::default();
+        for i in 0..12 {
+            b.record(&format!("a{i}"), t);
+        }
+        let later = t + Duration::from_secs(60);
+        assert!(b.record("b0", later).is_none());
+        let mut got = None;
+        for i in 1..12 {
+            got = got.or(b.record(&format!("b{i}"), later));
+        }
+        assert_eq!(got, Some(RENAME_BURST_MIN));
+    }
+
+    #[test]
+    fn single_events_stay_medium_and_big_write_bursts_go_critical() {
+        let e = suspicious_extension_event("a", "h", "C:\\x.locked");
+        assert_eq!(e.severity, Severity::Medium);
+        assert_eq!(high_write_rate_event("a", "h", 60).severity, Severity::High);
+        assert_eq!(
+            high_write_rate_event("a", "h", 250).severity,
+            Severity::Critical
+        );
+        let e = rename_burst_event("a", "h", 30);
+        assert_eq!(e.severity, Severity::Critical);
+        assert!(matches!(
+            e.data,
+            EventData::RansomwareIndicator(d)
+                if d.indicator_type == "rename_burst" && d.write_rate == Some(30)
+        ));
     }
 }

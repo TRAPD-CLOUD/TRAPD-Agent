@@ -21,6 +21,7 @@
 //! It never blocks the consumer: inspection is synchronous, allocation-light
 //! and lock-scoped to the beacon tracker only.
 
+pub mod accessor_correlation;
 mod baseline;
 mod beaconing;
 mod behavior;

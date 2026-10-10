@@ -23,6 +23,7 @@ pub mod system;
 
 // Ransomware / coalescing / tamper-timing rules shared by the Linux and Windows
 // filesystem collectors.
+pub mod critical_file;
 pub mod fs_heuristics;
 pub mod fs_plan;
 

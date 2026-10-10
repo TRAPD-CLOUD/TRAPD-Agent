@@ -14,7 +14,9 @@
 
 use std::time::{Duration, Instant};
 
-use super::fs_heuristics::{is_compressed_by_nature, CheckThrottle, Coalescer, MassModification};
+use super::fs_heuristics::{
+    is_compressed_by_nature, CheckThrottle, Coalescer, MassModification, RenameBurst,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
@@ -35,6 +37,9 @@ pub enum Action {
     Tamper { path: String, action: &'static str },
     /// A file appeared under a known ransomware extension.
     RansomExtension { path: String },
+    /// Many distinct files appeared under ransomware extensions in seconds;
+    /// `count` is the burst size when it entered a new severity tier.
+    RansomBurst { count: usize },
     /// Read the file and evaluate its entropy (I/O: done by the collector).
     EntropyCheck { path: String },
     /// Many distinct files changed in a short window.
@@ -184,6 +189,7 @@ pub fn is_noisy(normalised_path: &str) -> bool {
 pub struct Planner {
     roots: Roots,
     mass: MassModification,
+    burst: RenameBurst,
     coalescer: Coalescer,
     throttle: CheckThrottle,
 }
@@ -193,6 +199,7 @@ impl Planner {
         Self {
             roots,
             mass: MassModification::default(),
+            burst: RenameBurst::default(),
             coalescer: Coalescer::default(),
             // A modified file is read for entropy at most once per 5 s, and at
             // most 8 reads per second overall: enough for ransomware (which
@@ -242,6 +249,9 @@ impl Planner {
                         out.push(Action::RansomExtension {
                             path: path.to_string(),
                         });
+                        if let Some(count) = self.burst.record(&norm, now) {
+                            out.push(Action::RansomBurst { count });
+                        }
                     }
                 }
                 Change::Modified => {
@@ -335,6 +345,37 @@ mod tests {
             .any(|x| matches!(x, Action::RansomExtension { .. })));
         // The same name outside the watched profiles tree is not evaluated.
         assert!(plan(&mut p, Change::Created, "D:\\data\\a.locked", t).is_empty());
+    }
+
+    #[test]
+    fn thirty_renames_in_seconds_plan_a_burst_that_a_single_rename_does_not() {
+        let t = Instant::now();
+        let mut p = Planner::new(roots(), t);
+        let mut bursts = Vec::new();
+        for i in 0..30u64 {
+            for a in plan(
+                &mut p,
+                Change::RenamedTo,
+                &format!("C:\\Users\\bob\\Documents\\f{i}.docx.locked"),
+                t + Duration::from_millis(i * 100),
+            ) {
+                if let Action::RansomBurst { count } = a {
+                    bursts.push(count);
+                }
+            }
+        }
+        assert_eq!(bursts, vec![10, 30]);
+        let mut p = Planner::new(roots(), t);
+        let a = plan(
+            &mut p,
+            Change::RenamedTo,
+            "C:\\Users\\bob\\a.docx.locked",
+            t,
+        );
+        assert!(a
+            .iter()
+            .any(|x| matches!(x, Action::RansomExtension { .. })));
+        assert!(!a.iter().any(|x| matches!(x, Action::RansomBurst { .. })));
     }
 
     #[test]
