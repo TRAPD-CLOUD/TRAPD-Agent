@@ -372,6 +372,9 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         Arc::clone(&agent_config)
     ));
 
+    // Registry persistence watcher (Run keys, services, IFEO, Winlogon, ...).
+    spawn_collector!(crate::collectors::windows::regwatch::RegistryWatchCollector::new());
+
     drop(tx);
 
     let engine = Arc::new(crate::detection::DetectionEngine::new(

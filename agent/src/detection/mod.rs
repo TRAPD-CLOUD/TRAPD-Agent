@@ -34,6 +34,7 @@ pub mod honeytoken_policy;
 mod ioa;
 mod ioc;
 mod netscan;
+pub mod registry_rules;
 pub mod replay;
 pub mod severity;
 pub mod sigma;
@@ -422,7 +423,16 @@ impl DetectionEngine {
                     out.push(self.detection(Severity::Info, d));
                 }
             }
+            EventData::Registry(r) => {
+                for d in registry_rules::inspect_registry(r) {
+                    out.push(self.detection(Severity::Info, d));
+                }
+            }
             EventData::Log(l) => {
+                // Service / scheduled-task creation (7045, 4697, 4698).
+                for d in registry_rules::inspect_eventlog(&l.fields) {
+                    out.push(self.detection(Severity::Info, d));
+                }
                 // Log records feed the same engine: a sudo COMMAND is an
                 // exec-equivalent, a remote_addr/src_addr is a network IOC.
                 if let Some(cmd) = l.fields.get("command").and_then(|v| v.as_str()) {

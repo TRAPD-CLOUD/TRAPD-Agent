@@ -33,6 +33,9 @@ pub mod mem_finding;
 // Linux and Windows; each platform supplies its own built-in source catalogue.
 pub mod logs;
 
+// Registry persistence watcher core (pure; the Windows collector does the reads).
+pub mod registry_watch;
+
 // Windows memory classification rules (pure; the scanner does the I/O).
 pub mod win_mem_rules;
 
