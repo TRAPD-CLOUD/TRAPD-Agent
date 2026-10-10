@@ -49,9 +49,9 @@ use collectors::linux::{
 // Only consumed by the Linux `async fn main`; the Windows runtime (winsvc::run)
 // imports these itself, so gate them to avoid an unused-import warning there.
 #[cfg(target_os = "linux")]
-use collectors::system::SystemCollector;
-#[cfg(target_os = "linux")]
 use collectors::logs::LogCollector;
+#[cfg(target_os = "linux")]
+use collectors::system::SystemCollector;
 #[cfg(target_os = "linux")]
 use collectors::Collector;
 #[cfg(target_os = "linux")]
@@ -112,7 +112,9 @@ async fn main() -> Result<()> {
         {
             paths::init_state_dir();
             collectors::windows::honeytokens::uninstall(&config::load_persisted());
-            crate::deception::activity::ActivityStore::purge(&crate::deception::activity::state_path());
+            crate::deception::activity::ActivityStore::purge(
+                &crate::deception::activity::state_path(),
+            );
             info!("Uninstall cleanup complete (honeytoken files + registry decoys + activity profile removed)");
         }
         #[cfg(not(target_os = "windows"))]
@@ -127,7 +129,10 @@ async fn main() -> Result<()> {
     {
         let args: Vec<String> = std::env::args().collect();
         if args.get(1).map(String::as_str) == Some("replay") {
-            std::process::exit(detection::replay::run_cli(&args[2..], &crate::detection_host::engine("replay".into(), "replay".into())));
+            std::process::exit(detection::replay::run_cli(
+                &args[2..],
+                &crate::detection_host::engine("replay".into(), "replay".into()),
+            ));
         }
     }
 
@@ -391,14 +396,19 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         spawn_collector!(SystemCollector::new());
-        spawn_collector!(collectors::windows::sensor_supervisor::SensorSupervisor::new(
-            Arc::clone(&agent_config)
-        ));
+        spawn_collector!(
+            collectors::windows::sensor_supervisor::SensorSupervisor::new(Arc::clone(
+                &agent_config
+            ))
+        );
         spawn_collector!(collectors::windows::eventlog::EventLogCollector::new(
             Arc::clone(&agent_config)
         ));
         crate::deception::activity::set_enabled(
-            agent_config.read().map(|c| c.deception_activity_learning_enabled).unwrap_or(false)
+            agent_config
+                .read()
+                .map(|c| c.deception_activity_learning_enabled)
+                .unwrap_or(false),
         );
         spawn_collector!(collectors::windows::honeytokens::HoneytokenCollector::new(
             Arc::clone(&agent_config)
@@ -409,10 +419,7 @@ async fn main() -> Result<()> {
 
     // Local detection engine — behavioural + IOC analytics over every event.
     // Platform-neutral, so the future Windows agent reuses it unchanged.
-    let engine = std::sync::Arc::new(detection_host::engine(
-        agent_id.clone(),
-        hostname.clone(),
-    ));
+    let engine = std::sync::Arc::new(detection_host::engine(agent_id.clone(), hostname.clone()));
     // Compile Sigma rules = on-disk `<config>/sigma/` baseline + any inline
     // rules carried in the (last-known-good) config, so detections are active
     // from boot before the first backend config pull.
@@ -531,8 +538,10 @@ async fn main() -> Result<()> {
                 baseline_engine.persist_baseline();
                 #[cfg(windows)]
                 {
-                    let enabled = learning_config.read()
-                        .map(|c| c.deception_activity_learning_enabled).unwrap_or(false);
+                    let enabled = learning_config
+                        .read()
+                        .map(|c| c.deception_activity_learning_enabled)
+                        .unwrap_or(false);
                     if crate::deception::activity::enabled() != enabled {
                         crate::deception::activity::set_enabled(enabled);
                     }

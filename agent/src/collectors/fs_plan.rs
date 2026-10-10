@@ -397,9 +397,14 @@ mod tests {
             );
         }
         // A document still is.
-        assert!(plan(&mut p, Change::Modified, "C:\\Users\\bob\\Documents\\a.txt", t)
-            .iter()
-            .any(|x| matches!(x, Action::EntropyCheck { .. })));
+        assert!(plan(
+            &mut p,
+            Change::Modified,
+            "C:\\Users\\bob\\Documents\\a.txt",
+            t
+        )
+        .iter()
+        .any(|x| matches!(x, Action::EntropyCheck { .. })));
     }
 
     #[test]

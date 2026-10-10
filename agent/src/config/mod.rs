@@ -354,7 +354,6 @@ pub struct AgentConfig {
     // ── Fields below are trailing and omitted at their default, so a config
     // that does not set them signs to the same bytes as before. Keep the
     // order: the backend's canonical serialiser emits them in this order. ──
-
     /// Per-project rule mode overrides (`shadow` / `signal` / `alert`), set
     /// when a rule is promoted after its shadow period, or silenced.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

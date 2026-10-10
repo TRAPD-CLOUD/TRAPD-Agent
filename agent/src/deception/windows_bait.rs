@@ -130,10 +130,14 @@ fn winscp_ini(p: &Persona, rng: &mut Rng, secrets: &mut Vec<String>) -> String {
     if generated {
         secrets.push(pw.clone());
     }
-    let enc: String = (0..rng.range(40, 60)).map(|_| *rng.pick(b"0123456789ABCDEF") as char).collect();
+    let enc: String = (0..rng.range(40, 60))
+        .map(|_| *rng.pick(b"0123456789ABCDEF") as char)
+        .collect();
     let mut out = String::from("[Configuration\\Security]\r\nUseMasterPassword=0\r\n\r\n");
     out.push_str(&format!("[Sessions\\{user}@{host}]\r\n"));
-    out.push_str(&format!("HostName={host}\r\nUserName={user}\r\nFSProtocol=5\r\nPortNumber=22\r\nPassword={enc}\r\n"));
+    out.push_str(&format!(
+        "HostName={host}\r\nUserName={user}\r\nFSProtocol=5\r\nPortNumber=22\r\nPassword={enc}\r\n"
+    ));
     out.push_str(&format!("; last used with {pw}\r\n"));
     out
 }
@@ -148,7 +152,9 @@ fn filezilla_sitemanager(p: &Persona, rng: &mut Rng, secrets: &mut Vec<String>) 
     let b64 = base64_like(&pw, rng);
     let mut out = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
     out.push_str("\r\n<FileZilla3 version=\"3.66.4\">\r\n  <Servers>\r\n    <Server>\r\n");
-    out.push_str(&format!("      <Host>{host}</Host>\r\n      <Port>21</Port>\r\n      <Protocol>0</Protocol>\r\n"));
+    out.push_str(&format!(
+        "      <Host>{host}</Host>\r\n      <Port>21</Port>\r\n      <Protocol>0</Protocol>\r\n"
+    ));
     out.push_str(&format!("      <User>{user}</User>\r\n      <Pass encoding=\"base64\">{b64}</Pass>\r\n      <Name>{host}</Name>\r\n"));
     out.push_str("    </Server>\r\n  </Servers>\r\n</FileZilla3>\r\n");
     out
@@ -162,7 +168,9 @@ fn map_drives_script(p: &Persona, rng: &mut Rng, secrets: &mut Vec<String>) -> S
         secrets.push(pw.clone());
     }
     let mut out = String::from("@echo off\r\nrem map standard shares\r\n");
-    out.push_str(&format!("net use P: \\\\{fs}\\projekte /user:{user} {pw} /persistent:yes\r\n"));
+    out.push_str(&format!(
+        "net use P: \\\\{fs}\\projekte /user:{user} {pw} /persistent:yes\r\n"
+    ));
     out.push_str(&format!("net use H: \\\\{fs}\\home /persistent:yes\r\n"));
     out
 }
@@ -176,7 +184,9 @@ fn unattend_xml(p: &Persona, rng: &mut Rng, secrets: &mut Vec<String>) -> String
     let mut out = String::from(r#"<?xml version="1.0" encoding="utf-8"?>"#);
     out.push_str("\r\n<unattend xmlns=\"urn:schemas-microsoft-com:unattend\">\r\n  <settings pass=\"oobeSystem\">\r\n");
     out.push_str("    <component name=\"Microsoft-Windows-Shell-Setup\">\r\n      <AutoLogon>\r\n");
-    out.push_str(&format!("        <Password><Value>{pw}</Value><PlainText>true</PlainText></Password>\r\n"));
+    out.push_str(&format!(
+        "        <Password><Value>{pw}</Value><PlainText>true</PlainText></Password>\r\n"
+    ));
     out.push_str("        <Enabled>true</Enabled>\r\n");
     out.push_str(&format!("        <Username>{admin}</Username>\r\n"));
     out.push_str("      </AutoLogon>\r\n    </component>\r\n  </settings>\r\n</unattend>\r\n");
@@ -221,15 +231,26 @@ fn env_file(p: &Persona, rng: &mut Rng, secrets: &mut Vec<String>) -> String {
     }
     let secret = base64_like(&pw, rng);
     let mut out = String::new();
-    out.push_str(&format!("DATABASE_URL=postgresql://appuser:{pw}@{db}:5432/app\r\n"));
+    out.push_str(&format!(
+        "DATABASE_URL=postgresql://appuser:{pw}@{db}:5432/app\r\n"
+    ));
     out.push_str(&format!("JWT_SECRET={secret}\r\n"));
     out.push_str(&format!("REDIS_URL=redis://{db}:6379\r\n"));
     out
 }
 
 fn aws_credentials_backup(rng: &mut Rng, secrets: &mut Vec<String>) -> String {
-    let key_id: String = format!("AKIA{}", (0..16).map(|_| *rng.pick(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567") as char).collect::<String>());
-    let secret: String = (0..40).map(|_| *rng.pick(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") as char).collect();
+    let key_id: String = format!(
+        "AKIA{}",
+        (0..16)
+            .map(|_| *rng.pick(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567") as char)
+            .collect::<String>()
+    );
+    let secret: String = (0..40)
+        .map(|_| {
+            *rng.pick(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") as char
+        })
+        .collect();
     secrets.push(secret.clone());
     let mut out = String::from("[default]\r\n");
     out.push_str(&format!("aws_access_key_id = {key_id}\r\n"));
@@ -242,7 +263,11 @@ fn aws_credentials_backup(rng: &mut Rng, secrets: &mut Vec<String>) -> String {
 /// base64 of the seed — only the shape matters for a lure).
 fn base64_like(_seed: &str, rng: &mut Rng) -> String {
     let n = rng.range(32, 44);
-    (0..n).map(|_| *rng.pick(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") as char).collect()
+    (0..n)
+        .map(|_| {
+            *rng.pick(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") as char
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -765,9 +790,19 @@ mod tests {
     }
 
     const ADAPTIVE_KINDS: &[&str] = &[
-        "password_note", "credential_csv", "db_connection_notes", "recovery_key",
-        "rdp_connection", "winscp_ini", "filezilla_sitemanager", "map_drives_script",
-        "unattend_xml", "appsettings_json", "web_config", "env_file", "aws_credentials_backup",
+        "password_note",
+        "credential_csv",
+        "db_connection_notes",
+        "recovery_key",
+        "rdp_connection",
+        "winscp_ini",
+        "filezilla_sitemanager",
+        "map_drives_script",
+        "unattend_xml",
+        "appsettings_json",
+        "web_config",
+        "env_file",
+        "aws_credentials_backup",
     ];
 
     #[test]
@@ -786,7 +821,12 @@ mod tests {
     fn adaptive_kinds_embed_their_generated_secret() {
         // A generated (high-entropy) secret must appear in the content so the
         // out-of-band / content checks have something to anchor on.
-        for kind in ["winscp_ini", "env_file", "aws_credentials_backup", "web_config"] {
+        for kind in [
+            "winscp_ini",
+            "env_file",
+            "aws_credentials_backup",
+            "web_config",
+        ] {
             let mut found_generated = false;
             for _ in 0..40 {
                 let mut secrets = Vec::new();
@@ -796,14 +836,35 @@ mod tests {
                     found_generated = true;
                 }
             }
-            assert!(found_generated, "{kind}: never produced a generated secret in 40 tries");
+            assert!(
+                found_generated,
+                "{kind}: never produced a generated secret in 40 tries"
+            );
         }
     }
 
     #[test]
     fn adaptive_kinds_differ_across_hosts() {
-        let a = text(&generate_kind("env_file", &HostIdentity { hostname: "BER-WS-01".into(), dns_domain: Some("corp.a.eu".into()) }).unwrap());
-        let b = text(&generate_kind("env_file", &HostIdentity { hostname: "MUC-WS-02".into(), dns_domain: Some("corp.b.eu".into()) }).unwrap());
+        let a = text(
+            &generate_kind(
+                "env_file",
+                &HostIdentity {
+                    hostname: "BER-WS-01".into(),
+                    dns_domain: Some("corp.a.eu".into()),
+                },
+            )
+            .unwrap(),
+        );
+        let b = text(
+            &generate_kind(
+                "env_file",
+                &HostIdentity {
+                    hostname: "MUC-WS-02".into(),
+                    dns_domain: Some("corp.b.eu".into()),
+                },
+            )
+            .unwrap(),
+        );
         assert_ne!(a, b);
     }
 

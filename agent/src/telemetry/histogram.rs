@@ -168,7 +168,10 @@ mod tests {
     #[test]
     fn bucket_index_stays_in_range() {
         for v in [0, 1, 7, 8, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
-            assert!(bucket_of(v) < BUCKET_COUNT, "v={v} escaped the bucket array");
+            assert!(
+                bucket_of(v) < BUCKET_COUNT,
+                "v={v} escaped the bucket array"
+            );
         }
     }
 

@@ -137,8 +137,8 @@ fn cstr(buf: &[u8]) -> &str {
 /// indistinguishable from "the kernel reported PPid 0" and would quietly
 /// reparent an orphan onto the swapper task.
 fn proc_ppid(pid: u32) -> Result<u32, EnrichmentError> {
-    let status =
-        fs::read_to_string(format!("/proc/{pid}/status")).map_err(|e| EnrichmentError::from_io(&e))?;
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))
+        .map_err(|e| EnrichmentError::from_io(&e))?;
     status
         .lines()
         .find_map(|l| l.strip_prefix("PPid:"))
@@ -152,7 +152,8 @@ fn proc_ppid(pid: u32) -> Result<u32, EnrichmentError> {
 /// the command line was longer, so a consumer can tell a complete command line
 /// from its prefix.
 fn proc_cmdline(pid: u32) -> Result<(String, Option<Truncation>), EnrichmentError> {
-    let bytes = fs::read(format!("/proc/{pid}/cmdline")).map_err(|e| EnrichmentError::from_io(&e))?;
+    let bytes =
+        fs::read(format!("/proc/{pid}/cmdline")).map_err(|e| EnrichmentError::from_io(&e))?;
     let joined = bytes
         .split(|&b| b == 0)
         .filter_map(|part| std::str::from_utf8(part).ok().filter(|s| !s.is_empty()))
