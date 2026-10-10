@@ -479,6 +479,7 @@ async fn main() -> Result<()> {
     let det_engine = Arc::clone(&engine);
     let siem_fwd = siem.clone();
     let mut consumer = tokio::spawn(async move {
+        let mut checkpoints = detection::CheckpointTracker::default();
         // Aggregate updates for repeated findings are released on this tick.
         let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(30));
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -500,6 +501,13 @@ async fn main() -> Result<()> {
                 for f in det_engine.admit_external(event) {
                     emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem_fwd).await;
                 }
+                continue;
+            }
+
+            // A retry still needs a fresh journal receipt, but has already
+            // been counted, exported and analysed by this consumer.
+            if checkpoints.is_retry(&event) {
+                spool_event(&event, &buf_for_consumer).await;
                 continue;
             }
 
@@ -715,6 +723,11 @@ async fn handle_event(event: &schema::AgentEvent, mode: &OutputMode, buf: &Arc<M
     if let Err(err) = write_event(event, mode).await {
         error!("Failed to write event: {err}");
     }
+    spool_event(event, buf).await;
+}
+
+/// Retry a checkpoint handoff without repeating analysis, exports or accounting.
+async fn spool_event(event: &schema::AgentEvent, buf: &Arc<Mutex<Spool>>) {
     // Spool::push() does synchronous disk I/O (journal append, and
     // periodically an fsync — see pipeline::spool::FSYNC_EVERY). handle_event
     // runs inside the single async consumer task, so doing that inline would

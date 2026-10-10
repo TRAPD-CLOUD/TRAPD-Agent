@@ -52,7 +52,7 @@ so only their raw source records carry cursor receipts. Native channel/audit
 prerequisites are reported separately in coverage. Platform catalog sync retains
 project overrides and is tracked in TRAPD PR 204 (all five CI jobs passed).
 
-Local final verification: 1296 Linux unit tests and 16 integration tests passed;
+Local final verification: 1321 Linux unit tests and 16 integration tests passed;
 Linux release build and Windows GNU build passed. Strict Linux and Windows GNU
 all-target checks include the native XML truncation regression. Repository-wide
 agent formatting has existing debt; new files and changed hunks are formatted.
@@ -79,3 +79,14 @@ hash can rebaseline its own read; request executable paths in memory-scanner
 snapshots before applying existing confidence hints; preserve native UTC/source
 on System 104 and Security 1102/4719 audit findings. Undated audit records stay
 raw evidence. These regressions require native Windows test execution.
+
+Checkpoint review follow-up: native raw records retain UUID/time across receipt
+retries, and queue deduplication preserves unrelated evidence. Consumer and
+engine guards prevent repeated analysis/export of the same pending record.
+Receipt retries still attempt local journal sync; queue-admission counters track
+actual insertions independently of once-only source-event accounting. Event-ID
+rules require the native channel/provider envelope and preserve recorded UTC.
+Registry profile churn evicts only inactive whole-hive baselines within count,
+entry and encoded-byte limits; known loaded hives are preferred when more than
+64 profiles are loaded. Pending registry polls keep captured IDs and skip
+confirmed changes before checkpointing the snapshot.

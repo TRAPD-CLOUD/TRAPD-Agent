@@ -307,10 +307,71 @@ pub struct EntryKey {
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub entries: BTreeMap<EntryKey, String>,
-    /// User hives that were loaded (and readable) when the snapshot was taken.
+    /// Baselined user hives; raw scans contain selected loaded users, while
+    /// retained snapshots can also contain inactive users.
     pub users: BTreeSet<String>,
     pub unavailable: BTreeSet<String>,
     pub incomplete: bool,
+    /// Loaded users excluded by the per-poll cap; not persisted.
+    pub omitted_users: usize,
+    /// Inactive retained baselines discarded by this poll; not persisted.
+    pub evicted_users: usize,
+}
+
+/// One bounded captured poll awaiting pipeline confirmation. The captured
+/// snapshot, storm budget and original event identities move together; later
+/// polls must not replace them until every event has been acknowledged.
+#[cfg(any(windows, test))]
+pub struct PendingRegistryPoll {
+    next: Snapshot,
+    saved: Vec<u8>,
+    gate: StormGate,
+    events: Vec<crate::schema::AgentEvent>,
+    next_index: usize,
+}
+
+#[cfg(any(windows, test))]
+impl PendingRegistryPoll {
+    pub fn new(
+        next: Snapshot,
+        saved: Vec<u8>,
+        gate: StormGate,
+        events: Vec<crate::schema::AgentEvent>,
+    ) -> Self {
+        Self {
+            next,
+            saved,
+            gate,
+            events,
+            next_index: 0,
+        }
+    }
+
+    pub fn into_checkpoint(self) -> anyhow::Result<(Snapshot, Vec<u8>, StormGate)> {
+        anyhow::ensure!(
+            self.next_index == self.events.len(),
+            "registry poll still awaits durable handoff"
+        );
+        Ok((self.next, self.saved, self.gate))
+    }
+
+    pub async fn handoff(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<crate::schema::AgentEvent>,
+        durable: bool,
+    ) -> anyhow::Result<()> {
+        while let Some(event) = self.events.get(self.next_index) {
+            if durable {
+                crate::pipeline::receipt::send_durable(tx, event.clone()).await?;
+            } else {
+                tx.send(event.clone())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("registry pipeline closed"))?;
+            }
+            self.next_index += 1;
+        }
+        Ok(())
+    }
 }
 
 /// Bound both file reads and JSON encoding; raw values retain the existing
@@ -569,24 +630,45 @@ fn unavailable(index: &BTreeSet<String>, path: &str) -> bool {
 }
 
 /// Keep offline hives and failed reads so recovery compares against the last
-/// known state. At capacity retain no partial baseline: the caller skips it.
+/// known state. Capacity evicts only inactive user baselines, never machine
+/// scopes or users protected by a failed root enumeration.
 pub fn retain_unavailable(previous: &Snapshot, mut current: Snapshot) -> anyhow::Result<Snapshot> {
     anyhow::ensure!(!current.incomplete, "registry snapshot incomplete");
     let failed_index = prefix_index(&current.unavailable);
+    let observed_users = current.users.clone();
+    let mut inactive: BTreeSet<String> = if current.unavailable.contains("HKU") {
+        BTreeSet::new()
+    } else {
+        previous
+            .users
+            .difference(&observed_users)
+            .cloned()
+            .collect()
+    };
+    current.users.extend(previous.users.iter().cloned());
+    while current.users.len() > MAX_USERS {
+        let sid = inactive
+            .pop_first()
+            .ok_or_else(|| anyhow::anyhow!("too many active registry users"))?;
+        evict_user(&mut current, &sid);
+    }
     for (key, value) in &previous.entries {
         if key
             .user_sid
             .as_ref()
             .is_some_and(|sid| !current.users.contains(sid))
+        {
+            continue;
+        }
+        if key
+            .user_sid
+            .as_ref()
+            .is_some_and(|sid| !observed_users.contains(sid))
             || unavailable(&failed_index, &key.key_path)
         {
             current.entries.insert(key.clone(), value.clone());
         }
     }
-    let observed_users = current.users.clone();
-    // An empty observed hive is still a baseline: losing its identity would
-    // hide persistence created while it was unloaded. At capacity fail visibly.
-    current.users.extend(previous.users.iter().cloned());
     // Mark only scopes that have never had a readable baseline. Failed reads
     // of known scopes retain their values and must still report recovery changes.
     let failed_scopes = std::mem::take(&mut current.unavailable);
@@ -597,7 +679,9 @@ pub fn retain_unavailable(previous: &Snapshot, mut current: Snapshot) -> anyhow:
         .map(|prefix| (prefix.to_ascii_lowercase(), prefix))
         .collect();
     for failed in &failed_scopes {
-        if unavailable(&unknown_index, failed) {
+        if prefix_user(failed).is_some_and(|sid| !previous.users.contains(sid))
+            || unavailable(&unknown_index, failed)
+        {
             current.unavailable.insert(failed.clone());
         } else {
             let descendants = format!("{}\\", failed.to_ascii_lowercase());
@@ -614,13 +698,40 @@ pub fn retain_unavailable(previous: &Snapshot, mut current: Snapshot) -> anyhow:
             .strip_prefix("HKU\\")
             .and_then(|path| path.split('\\').next())
             .map(|hive| hive.strip_suffix("_Classes").unwrap_or(hive));
-        if hive.is_some_and(|hive| previous.users.contains(hive) && !observed_users.contains(hive))
-        {
+        if hive.is_some_and(|hive| current.users.contains(hive) && !observed_users.contains(hive)) {
             current.unavailable.insert(prefix.clone());
         }
     }
-    validate_snapshot(&current)?;
+    current
+        .unavailable
+        .retain(|prefix| prefix_user(prefix).is_none_or(|sid| current.users.contains(sid)));
+    // Also account for retained entries, markers and JSON escaping overhead.
+    // Drop whole inactive hives until the same persisted artifact bounds fit.
+    while let Err(error) = encode_baseline(&current) {
+        let Some(sid) = inactive.pop_first() else {
+            return Err(error);
+        };
+        evict_user(&mut current, &sid);
+    }
     Ok(current)
+}
+
+fn prefix_user(path: &str) -> Option<&str> {
+    path.strip_prefix("HKU\\")
+        .and_then(|tail| tail.split('\\').next())
+        .map(|hive| hive.strip_suffix("_Classes").unwrap_or(hive))
+}
+
+fn evict_user(snapshot: &mut Snapshot, sid: &str) {
+    if snapshot.users.remove(sid) {
+        snapshot.evicted_users += 1;
+    }
+    snapshot
+        .entries
+        .retain(|key, _| key.user_sid.as_deref() != Some(sid));
+    snapshot
+        .unavailable
+        .retain(|prefix| prefix_user(prefix) != Some(sid));
 }
 
 /// Canonical HKLM/HKU paths only; reuse the watcher table for native audit events.
@@ -729,7 +840,18 @@ fn mark_unavailable(snapshot: &mut Snapshot, raw_bytes: &mut usize, prefix: Stri
     snapshot.unavailable.insert(prefix);
 }
 
+#[cfg(test)]
 pub fn snapshot(reader: &dyn RegistryReader, specs: &[Spec]) -> Snapshot {
+    snapshot_with_preferred_users(reader, specs, &BTreeSet::new())
+}
+
+/// Previously tracked loaded hives keep their baseline even when more than
+/// MAX_USERS profiles are loaded. Additional profiles are visibly untracked.
+pub fn snapshot_with_preferred_users(
+    reader: &dyn RegistryReader,
+    specs: &[Spec],
+    preferred_users: &BTreeSet<String>,
+) -> Snapshot {
     let mut snap = Snapshot::default();
     let mut raw_bytes = 0usize;
     let hives = match reader.checked_subkeys(RegRoot::Users, "") {
@@ -739,12 +861,18 @@ pub fn snapshot(reader: &dyn RegistryReader, specs: &[Spec]) -> Snapshot {
             Vec::new()
         }
     };
-    let sids: Vec<String> = hives
+    let loaded_users: BTreeSet<String> = hives
         .iter()
-        .filter(|s| is_user_sid(s))
+        .filter(|sid| is_user_sid(sid))
+        .cloned()
+        .collect();
+    let sids: Vec<String> = loaded_users
+        .intersection(preferred_users)
+        .chain(loaded_users.difference(preferred_users))
         .take(MAX_USERS)
         .cloned()
         .collect();
+    snap.omitted_users = loaded_users.len().saturating_sub(sids.len());
     snap.users = sids.iter().cloned().collect();
 
     raw_bytes += snap.users.iter().map(String::len).sum::<usize>();
@@ -1420,6 +1548,369 @@ pub mod tests {
         let captured = snapshot(&reg, SPECS);
         assert!(!captured.incomplete);
         assert!(encode_baseline(&captured).is_err());
+    }
+
+    #[test]
+    fn profile_churn_does_not_stop_machine_registry_diffs() {
+        let mut previous = Snapshot::default();
+        for profile in 1000..=1000 + MAX_USERS {
+            let sid = format!("S-1-5-21-1-2-3-{profile}");
+            let mut reg = FakeReg::default();
+            reg.set(RegRoot::Users, &format!(r"{sid}\{RUN}"), "user", "known");
+            reg.set(
+                RegRoot::LocalMachine,
+                SPECS[0].path,
+                "machine",
+                &profile.to_string(),
+            );
+            let next = retain_unavailable(&previous, snapshot(&reg, SPECS)).unwrap();
+            assert!(next.users.len() <= MAX_USERS);
+            assert!(next.users.contains(&sid));
+            assert_eq!(
+                diff(&previous, &next)
+                    .iter()
+                    .filter(|change| change.key.user_sid.is_none())
+                    .count(),
+                1
+            );
+            previous = decode_baseline(&encode_baseline(&next).unwrap()).unwrap();
+        }
+        // Capacity eviction is loss of offline continuity, not a false deletion.
+        let mut reloaded = FakeReg::default();
+        reloaded.set(
+            RegRoot::Users,
+            &format!(r"S-1-5-21-1-2-3-1000\{RUN}"),
+            "user",
+            "offline",
+        );
+        let next = retain_unavailable(&previous, snapshot(&reloaded, SPECS)).unwrap();
+        assert!(diff(&previous, &next)
+            .iter()
+            .all(|change| change.key.user_sid.is_none()));
+        reloaded.set(
+            RegRoot::Users,
+            &format!(r"S-1-5-21-1-2-3-1000\{RUN}"),
+            "user",
+            "later",
+        );
+        assert!(diff(&next, &snapshot(&reloaded, SPECS))
+            .iter()
+            .any(|change| change.key.user_sid.is_some()));
+    }
+
+    #[test]
+    fn excess_loaded_users_preserve_active_baselines_and_machine_diffs() {
+        let mut reg = FakeReg::default();
+        let sid = "S-1-5-21-1-2-3-9999";
+        reg.set(
+            RegRoot::Users,
+            &format!(r"{sid}\{RUN}"),
+            "persist",
+            "before",
+        );
+        reg.set(RegRoot::LocalMachine, SPECS[0].path, "machine", "before");
+        let previous = snapshot(&reg, SPECS);
+        for profile in 100..100 + MAX_USERS {
+            let sid = format!("S-1-5-21-1-2-3-{profile}");
+            reg.set(RegRoot::Users, &format!(r"{sid}\{RUN}"), "user", "existing");
+        }
+        reg.set(RegRoot::Users, &format!(r"{sid}\{RUN}"), "persist", "after");
+        reg.set(RegRoot::LocalMachine, SPECS[0].path, "machine", "after");
+        // Enumeration order/different numeric SID order must not drop the previously tracked SID.
+        let captured = snapshot_with_preferred_users(&reg, SPECS, &previous.users);
+        assert_eq!(captured.omitted_users, 1);
+        assert!(!captured.incomplete);
+        assert!(captured.users.contains(sid));
+        let next = retain_unavailable(&previous, captured).unwrap();
+        let changes = diff(&previous, &next);
+        assert_eq!(changes.len(), 2);
+        assert!(changes
+            .iter()
+            .all(|change| change.old.as_deref() == Some("before")));
+        assert_eq!(next.evicted_users, 0);
+    }
+
+    #[test]
+    fn active_failed_reads_survive_inactive_capacity_eviction() {
+        let mut reg = FakeReg::default();
+        user_run(&mut reg, "persist", "before");
+        for profile in 2000..2000 + MAX_USERS - 1 {
+            reg.set(RegRoot::Users, &format!("S-1-5-21-1-2-3-{profile}"), "", "");
+        }
+        let previous = snapshot(&reg, SPECS);
+        let mut reg = FakeReg::default();
+        user_run(&mut reg, "persist", "after");
+        reg.failed_values
+            .insert((RegRoot::Users, format!(r"{SID}\{RUN}")));
+        reg.set(RegRoot::Users, "S-1-5-21-1-2-3-9999", "", "");
+        reg.set(RegRoot::LocalMachine, SPECS[0].path, "machine", "new");
+        let next = retain_unavailable(
+            &previous,
+            snapshot_with_preferred_users(&reg, SPECS, &previous.users),
+        )
+        .unwrap();
+        assert_eq!(next.users.len(), MAX_USERS);
+        assert_eq!(next.evicted_users, 1);
+        assert!(next.entries.values().any(|value| value == "before"));
+        assert_eq!(diff(&previous, &next).len(), 1);
+        reg.failed_values.clear();
+        assert!(diff(
+            &next,
+            &snapshot_with_preferred_users(&reg, SPECS, &next.users)
+        )
+        .iter()
+        .any(|change| change.old.as_deref() == Some("before")
+            && change.new.as_deref() == Some("after")));
+    }
+
+    #[test]
+    fn failed_user_root_enumeration_preserves_baselines_and_machine_checks() {
+        let mut previous = Snapshot::default();
+        for profile in 1000..1000 + MAX_USERS {
+            previous.users.insert(format!("S-1-5-21-1-2-3-{profile}"));
+        }
+        let mut reg = FakeReg::default();
+        reg.failed_subkeys.insert((RegRoot::Users, "".into()));
+        reg.set(RegRoot::LocalMachine, SPECS[0].path, "machine", "new");
+        let next = retain_unavailable(
+            &previous,
+            snapshot_with_preferred_users(&reg, SPECS, &previous.users),
+        )
+        .unwrap();
+        assert_eq!(next.users, previous.users);
+        assert_eq!(next.evicted_users, 0);
+        assert_eq!(diff(&previous, &next).len(), 1);
+    }
+
+    fn budget_entry(sid: Option<&str>, index: usize, value: String) -> (EntryKey, String) {
+        (
+            EntryKey {
+                category: "run_key",
+                user_sid: sid.map(str::to_owned),
+                key_path: sid.map_or_else(
+                    || format!(r"HKLM\{}", SPECS[0].path),
+                    |sid| format!(r"HKU\{sid}\{RUN}"),
+                ),
+                value_name: format!("value{index}"),
+            },
+            value,
+        )
+    }
+
+    #[test]
+    fn inactive_hives_are_evicted_for_entry_and_encoded_byte_limits() {
+        for (old_count, new_count, value) in [
+            (MAX_ENTRIES, 1, "x".to_owned()),
+            (10_000, 7_000, "x".repeat(MAX_VALUE_CHARS)),
+            // JSON escaping can exhaust the file bound before the raw-byte bound.
+            (10_000, 5_000, "\n".repeat(512)),
+        ] {
+            let previous = Snapshot {
+                users: [SID.to_owned()].into_iter().collect(),
+                entries: (0..old_count)
+                    .map(|index| budget_entry(Some(SID), index, value.clone()))
+                    .collect(),
+                unavailable: [format!(r"HKU\{SID}_Classes")].into_iter().collect(),
+                ..Snapshot::default()
+            };
+            assert!(encode_baseline(&previous).is_ok());
+            let current = Snapshot {
+                entries: (0..new_count)
+                    .map(|index| budget_entry(None, index, value.clone()))
+                    .collect(),
+                ..Snapshot::default()
+            };
+            assert!(encode_baseline(&current).is_ok());
+            let next = retain_unavailable(&previous, current).unwrap();
+            assert_eq!(next.evicted_users, 1);
+            assert!(next.users.is_empty());
+            assert!(next.unavailable.is_empty());
+            assert_eq!(next.entries.len(), new_count);
+            assert_eq!(diff(&previous, &next).len(), new_count);
+            assert!(encode_baseline(&next).is_ok());
+        }
+    }
+
+    #[test]
+    fn inactive_unknown_markers_are_evicted_without_blocking_machine_checks() {
+        let previous = Snapshot {
+            users: [SID.to_owned()].into_iter().collect(),
+            unavailable: (0..MAX_ENTRIES)
+                .map(|index| format!(r"HKU\{SID}_Classes\CLSID\{{{index}}}\InprocServer32"))
+                .collect(),
+            ..Snapshot::default()
+        };
+        assert!(encode_baseline(&previous).is_ok());
+        let mut reg = FakeReg::default();
+        reg.set(RegRoot::Users, "S-1-5-21-1-2-3-9999", "", "");
+        reg.set(RegRoot::LocalMachine, SPECS[0].path, "machine", "new");
+        let next = retain_unavailable(&previous, snapshot(&reg, SPECS)).unwrap();
+        assert_eq!(next.evicted_users, 1);
+        assert!(!next.users.contains(SID));
+        assert_eq!(next.unavailable.len(), 1);
+        assert!(next
+            .unavailable
+            .contains(r"HKU\S-1-5-21-1-2-3-9999_Classes"));
+        assert_eq!(diff(&previous, &next).len(), 1);
+        assert!(encode_baseline(&next).is_ok());
+    }
+
+    #[test]
+    fn newly_tracked_user_retains_initially_unknown_classes_scope() {
+        let mut reg = FakeReg::default();
+        user_run(&mut reg, "known", "before");
+        let initial = retain_unavailable(&Snapshot::default(), snapshot(&reg, SPECS)).unwrap();
+        assert!(initial.unavailable.contains(&format!(r"HKU\{SID}_Classes")));
+        let restored = decode_baseline(&encode_baseline(&initial).unwrap()).unwrap();
+        let path = format!(r"{SID}_Classes\CLSID\{{new}}\InprocServer32");
+        reg.set(RegRoot::Users, &path, "", "existing.dll");
+        let readable = snapshot(&reg, SPECS);
+        assert!(diff(&restored, &readable).is_empty());
+        let known = retain_unavailable(&restored, readable).unwrap();
+        reg.set(RegRoot::Users, &path, "", "changed.dll");
+        assert_eq!(diff(&known, &snapshot(&reg, SPECS)).len(), 1);
+    }
+
+    fn pending_test_event(name: &str) -> crate::schema::AgentEvent {
+        use crate::schema::{AgentEvent, EventClass, EventData, Severity};
+        AgentEvent::new(
+            "test".into(),
+            "host".into(),
+            EventClass::Registry,
+            EventAction::Modify,
+            Severity::Info,
+            EventData::Registry(RegistryEventData {
+                key_path: format!(r"HKLM\{}", SPECS[0].path),
+                value_name: name.into(),
+                category: "run_key".into(),
+                old_value: Some("before".into()),
+                new_value: Some("after".into()),
+                user_sid: None,
+                rename_from: None,
+                suppressed: None,
+            }),
+        )
+        .with_source("windows_registry_snapshot")
+    }
+
+    fn pending_test_poll(events: Vec<crate::schema::AgentEvent>) -> PendingRegistryPoll {
+        let mut reg = FakeReg::default();
+        let mut gate = StormGate::default();
+        for event in &events {
+            let crate::schema::EventData::Registry(data) = &event.data else {
+                panic!("registry fixture required");
+            };
+            reg.set(
+                RegRoot::LocalMachine,
+                SPECS[0].path,
+                &data.value_name,
+                data.new_value.as_deref().unwrap(),
+            );
+            assert!(gate.admit("run_key", Instant::now()));
+        }
+        let next = snapshot(&reg, SPECS);
+        let saved = encode_baseline(&next).unwrap();
+        PendingRegistryPoll::new(next, saved, gate, events)
+    }
+
+    #[tokio::test]
+    async fn failed_registry_receipts_retry_stable_ids_without_spool_growth() {
+        let mut spool = crate::pipeline::Spool::in_memory(2);
+        let unrelated = pending_test_event("unrelated");
+        let unrelated_id = unrelated.event_id;
+        spool.push(unrelated).unwrap();
+        let event = pending_test_event("pending");
+        let id = event.event_id;
+        let timestamp = event.timestamp;
+        let sequence = event.sequence_number();
+        let mut pending = pending_test_poll(vec![event]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        for _ in 0..5 {
+            let (result, ()) = tokio::join!(pending.handoff(&tx, true), async {
+                let event = rx.recv().await.unwrap();
+                assert_eq!(event.event_id, id);
+                assert_eq!(event.timestamp, timestamp);
+                assert_eq!(event.sequence_number(), sequence);
+                spool.push(event).unwrap();
+            });
+            assert!(result.is_err());
+            assert_eq!(pending.next_index, 0);
+            assert_eq!(spool.len(), 2);
+            assert_eq!(spool.dropped_total(), 0);
+            assert!(spool
+                .peek_batch(2)
+                .iter()
+                .any(|entry| entry.event.event_id == unrelated_id));
+        }
+        assert!(
+            pending.into_checkpoint().is_err(),
+            "failed receipts cannot advance the registry baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_registry_poll_completes_without_a_durable_receipt() {
+        let event = pending_test_event("offline");
+        let id = event.event_id;
+        let mut pending = pending_test_poll(vec![event]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        pending.handoff(&tx, false).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap().event_id, id);
+        assert!(rx.try_recv().is_err());
+        assert!(pending.into_checkpoint().is_ok());
+    }
+
+    #[tokio::test]
+    async fn registry_retry_skips_confirmed_events_after_partial_durable_success() {
+        let dir =
+            std::env::temp_dir().join(format!("trapd-registry-receipt-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("queue.journal");
+        let mut durable = crate::pipeline::Spool::durable_at(path.clone(), 10);
+        let mut failed = crate::pipeline::Spool::in_memory(10);
+        let first = pending_test_event("first");
+        let first_id = first.event_id;
+        let second = pending_test_event("second");
+        let second_id = second.event_id;
+        let mut pending = pending_test_poll(vec![first, second]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (result, ()) = tokio::join!(pending.handoff(&tx, true), async {
+            let event = rx.recv().await.unwrap();
+            assert_eq!(event.event_id, first_id);
+            durable.push(event).unwrap();
+            let event = rx.recv().await.unwrap();
+            assert_eq!(event.event_id, second_id);
+            failed.push(event).unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(pending.next_index, 1);
+        let (result, ()) = tokio::join!(pending.handoff(&tx, true), async {
+            let event = rx.recv().await.unwrap();
+            assert_eq!(
+                event.event_id, second_id,
+                "confirmed first change must not be resent"
+            );
+            durable.push(event).unwrap();
+        });
+        result.unwrap();
+        assert_eq!(pending.next_index, 2);
+        assert!(rx.try_recv().is_err());
+        let (next, saved, gate) = pending.into_checkpoint().unwrap();
+        assert_eq!(next.entries.len(), 2);
+        assert_eq!(decode_baseline(&saved).unwrap().entries, next.entries);
+        assert_eq!(gate.buckets["run_key"].used, 2);
+        assert_eq!(durable.len(), 2);
+        drop(durable);
+        let recovered = crate::pipeline::Spool::durable_at(path, 10);
+        assert_eq!(
+            recovered
+                .peek_batch(2)
+                .iter()
+                .map(|entry| entry.event.event_id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id]
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

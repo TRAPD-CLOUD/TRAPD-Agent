@@ -468,6 +468,7 @@ impl Collector for EventLogCollector {
         let mut logon_types: HashMap<String, u32> = HashMap::new();
         // At most one pending record for each of the four fixed channels.
         let mut pending_auth = HashMap::new();
+        let mut pending_native = windows_native::PendingRecords::default();
         let devices = super::etw::device_map();
         let mut unavailable = HashSet::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -550,6 +551,7 @@ impl Collector for EventLogCollector {
                                         .event_dropped(crate::telemetry::DropReason::InternalError);
                                     cursors.insert(channel.into(), 0);
                                     pending_auth.remove(channel);
+                                    pending_native.clear(channel);
                                 }
                             }
                         }
@@ -577,13 +579,31 @@ impl Collector for EventLogCollector {
                                 {
                                     cursors.insert(channel.into(), id);
                                     pending_auth.remove(channel);
+                                    pending_native.clear(channel);
                                 }
                             }
                             continue;
                         }
                     };
+                    let first_attempt = if cursor.is_some() {
+                        match pending_native.prepare(
+                            channel,
+                            record,
+                            data.clone(),
+                            &agent_id,
+                            &hostname,
+                        ) {
+                            Ok(first) => first,
+                            Err(error) => {
+                                tracing::warn!(channel, %error, "native source batch could not be prepared; retaining source cursor for retry");
+                                break;
+                            }
+                        }
+                    } else {
+                        false
+                    };
                     if channel == "System"
-                        && cursor.is_some()
+                        && first_attempt
                         && data.proc.as_deref() == Some("Microsoft-Windows-Eventlog")
                     {
                         if let Some(ev) = audit_tamper_event(channel, &data, &agent_id, &hostname) {
@@ -594,7 +614,7 @@ impl Collector for EventLogCollector {
                     }
                     if channel == "Security" {
                         capture_logon_type(&data.fields, &mut logon_types);
-                        if cursor.is_some() {
+                        if first_attempt {
                             if let Some(ev) =
                                 audit_tamper_event(channel, &data, &agent_id, &hostname)
                             {
@@ -603,7 +623,7 @@ impl Collector for EventLogCollector {
                                 }
                             }
                         }
-                        if cursor.is_some() {
+                        if first_attempt {
                             if let Some(hit) = decoy_access(
                                 &data.fields,
                                 &logon_types,
@@ -648,15 +668,18 @@ impl Collector for EventLogCollector {
                         {
                             return Ok(());
                         }
-                        if windows_native::emit_record(
-                            &tx,
-                            data,
-                            &agent_id,
-                            &hostname,
-                            self.durable_handoff,
-                        )
-                        .await
-                        .is_err()
+                        if pending_native
+                            .emit(
+                                &tx,
+                                channel,
+                                record,
+                                data,
+                                &agent_id,
+                                &hostname,
+                                self.durable_handoff,
+                            )
+                            .await
+                            .is_err()
                         {
                             if tx.is_closed() {
                                 return Ok(());
@@ -666,6 +689,7 @@ impl Collector for EventLogCollector {
                         }
                     }
                     pending_auth.remove(channel);
+                    pending_native.clear(channel);
                     cursors.insert(channel.into(), record);
                 }
             }
@@ -795,6 +819,53 @@ mod tests {
         );
         assert!(rx.try_recv().is_ok());
         assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_raw_receipts_enqueue_audit_tamper_once() {
+        let xml = r#"<Event><System><Provider Name="Microsoft-Windows-Eventlog"/><EventID>104</EventID><EventRecordID>123</EventRecordID><TimeCreated SystemTime="2026-01-01T10:34:56Z"/></System><EventData><Data Name="Channel">Security</Data></EventData></Event>"#;
+        let (record, data, _) = parse(xml, "System").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(2);
+        let consumer = tokio::spawn(async move {
+            let mut spool = crate::pipeline::Spool::in_memory(100);
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event.clone());
+                spool.push(event).unwrap();
+            }
+            events
+        });
+        let mut pending = windows_native::PendingRecords::default();
+        for _ in 0..3 {
+            if pending
+                .prepare("System", record, data.clone(), "agent", "host")
+                .unwrap()
+            {
+                tx.send(audit_tamper_event("System", &data, "agent", "host").unwrap())
+                    .await
+                    .unwrap();
+            }
+            assert!(pending
+                .emit(&tx, "System", record, data.clone(), "agent", "host", true)
+                .await
+                .is_err());
+        }
+        drop(tx);
+        let events = consumer.await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.data, EventData::Detection(_)))
+                .count(),
+            1
+        );
+        let ids: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.data, EventData::Log(_)))
+            .map(|e| e.event_id)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| *id == ids[0]));
     }
 
     #[tokio::test]

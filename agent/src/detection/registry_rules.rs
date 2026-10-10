@@ -12,8 +12,8 @@
 //! mode; a plain new autorun/service/task is a signal that only adds context
 //! to a chain. Deleted values never fire: cleanup is not persistence.
 
-use super::windows_rules::is_user_writable;
-use crate::schema::{DetectionData, RegistryEventData};
+use super::windows_rules::{eventlog_source, is_user_writable};
+use crate::schema::{DetectionData, LogEventData, RegistryEventData};
 
 /// What a command line / image path looks like.
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -465,8 +465,12 @@ fn unescape(s: &str) -> String {
 /// Windows event-log records that create persistence: System 7045 / Security
 /// 4697 (service installed) and Security 4698 (scheduled task created; needs
 /// the "Other Object Access Events" audit policy to be logged at all).
-pub fn inspect_eventlog(fields: &serde_json::Map<String, serde_json::Value>) -> Vec<DetectionData> {
+pub fn inspect_eventlog(log: &LogEventData) -> Vec<DetectionData> {
+    let fields = &log.fields;
     let id = fields.get("EventID").and_then(|v| v.as_u64()).unwrap_or(0);
+    if eventlog_source(log).is_none() {
+        return Vec::new();
+    }
     match id {
         7045 | 4697 => {
             let name = field(fields, "ServiceName");
@@ -831,28 +835,39 @@ mod tests {
         assert_eq!(d[0].subject, "task:Updater");
     }
 
-    fn fields(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-        v.as_object().unwrap().clone()
+    fn native_log(v: serde_json::Value) -> LogEventData {
+        let (channel, provider) = if v["EventID"] == 7045 {
+            ("System", "Service Control Manager")
+        } else {
+            ("Security", "Microsoft-Windows-Security-Auditing")
+        };
+        serde_json::from_value(serde_json::json!({
+            "source": format!("windows_{channel}"), "source_type": "windows_eventlog",
+            "source_path": channel, "parser": "windows_eventlog_xml",
+            "message": "", "category": "system", "proc": provider, "fields": v,
+            "log_timestamp": "2020-09-13T12:26:40Z"
+        }))
+        .unwrap()
     }
 
     #[test]
     fn event_7045_new_service() {
-        let d = inspect_eventlog(&fields(serde_json::json!({
+        let d = inspect_eventlog(&native_log(serde_json::json!({
             "EventID": 7045, "ServiceName": "evil", "ImagePath": r"C:\Users\Public\a.exe",
             "ServiceType": "user mode service", "StartType": "auto start", "AccountName": "LocalSystem"
         })));
         assert_eq!(ids(&d), ["persistence.service_image_userpath"]);
         assert_eq!(d[0].subject, "service:evil");
-        let d = inspect_eventlog(&fields(serde_json::json!({
+        let d = inspect_eventlog(&native_log(serde_json::json!({
             "EventID": 7045, "ServiceName": "x", "ImagePath": r"C:\Users\u\AppData\d.sys",
             "ServiceType": "kernel mode driver"
         })));
         assert_eq!(ids(&d), ["persistence.service_image_suspicious"]);
-        let d = inspect_eventlog(&fields(serde_json::json!({
+        let d = inspect_eventlog(&native_log(serde_json::json!({
             "EventID": 7045, "ServiceName": "ok", "ImagePath": r"C:\Program Files\App\svc.exe"
         })));
         assert_eq!(ids(&d), ["persistence.service_installed"]);
-        let d = inspect_eventlog(&fields(serde_json::json!({
+        let d = inspect_eventlog(&native_log(serde_json::json!({
             "EventID": 4697, "ServiceName": "p", "ServiceFileName":
             "%COMSPEC% /b /c start /b /min powershell -nop -w hidden -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAKQA="
         })));
@@ -867,7 +882,7 @@ mod tests {
             )
         };
         let mk = |c: String| {
-            fields(serde_json::json!({
+            native_log(serde_json::json!({
                 "EventID": 4698, "TaskName": "\\Updater", "TaskContent": c, "SubjectUserName": "u"
             }))
         };
@@ -884,7 +899,7 @@ mod tests {
             "/ua &amp;",
         )));
         assert_eq!(ids(&d), ["persistence.scheduled_task_created"]);
-        assert!(inspect_eventlog(&fields(serde_json::json!({"EventID": 4624}))).is_empty());
+        assert!(inspect_eventlog(&native_log(serde_json::json!({"EventID": 4624}))).is_empty());
     }
 
     #[test]
@@ -895,7 +910,7 @@ mod tests {
             "ImagePath",
             Some(r"C:\Users\Public\a.exe"),
         ));
-        let e = inspect_eventlog(&fields(serde_json::json!({
+        let e = inspect_eventlog(&native_log(serde_json::json!({
             "EventID": 7045, "ServiceName": "evil", "ImagePath": r"C:\Users\Public\a.exe"
         })));
         assert_eq!(r[0].subject, e[0].subject);

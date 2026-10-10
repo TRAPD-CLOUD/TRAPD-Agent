@@ -237,6 +237,35 @@ impl Spool {
         let receipt_id = event.event_id;
         #[cfg(any(windows, test))]
         let wants_receipt = super::receipt::requested(receipt_id);
+        // A checkpoint retry refers to the same accepted event. Keep its
+        // delivery state and capacity slot rather than evicting other evidence.
+        #[cfg(any(windows, test))]
+        if wants_receipt
+            || event
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.source.as_deref())
+                .is_some_and(|source| {
+                    (matches!(event.class, EventClass::Log)
+                        && source.starts_with("windows_eventlog:"))
+                        || (matches!(event.class, EventClass::Registry)
+                            && source == "windows_registry_snapshot")
+                })
+        {
+            if let Some(seq) = self
+                .mem
+                .iter()
+                .find(|entry| entry.event.event_id == receipt_id)
+                .map(|entry| entry.seq)
+            {
+                if wants_receipt {
+                    self.sync_for_checkpoint();
+                    self.publish();
+                    super::receipt::complete(receipt_id, self.is_durable());
+                }
+                return Ok(seq);
+            }
+        }
         #[cfg(test)]
         {
             self.last_push_thread = Some(std::thread::current().id());
@@ -286,20 +315,8 @@ impl Spool {
         // Checkpointing sources must not advance their durable baseline/cursor
         // until this particular record has reached stable journal storage.
         #[cfg(any(windows, test))]
-        if wants_receipt && self.appends_since_fsync > 0 {
-            if let Some(file) = self.file.as_mut() {
-                match file.handle.sync_all() {
-                    Ok(()) => {
-                        self.fsyncs_total += 1;
-                        self.appends_since_fsync = 0;
-                    }
-                    Err(error) => {
-                        warn!(%error, "spool: checkpoint handoff sync failed — durability lost, continuing in memory");
-                        self.file = None;
-                        self.degraded = true;
-                    }
-                }
-            }
+        if wants_receipt {
+            self.sync_for_checkpoint();
         }
 
         let entry = SpoolEntry {
@@ -331,6 +348,26 @@ impl Spool {
             self.priority_wake.notify_one();
         }
         Ok(seq)
+    }
+
+    #[cfg(any(windows, test))]
+    fn sync_for_checkpoint(&mut self) {
+        if self.appends_since_fsync == 0 {
+            return;
+        }
+        if let Some(file) = self.file.as_mut() {
+            match file.handle.sync_all() {
+                Ok(()) => {
+                    self.fsyncs_total += 1;
+                    self.appends_since_fsync = 0;
+                }
+                Err(error) => {
+                    warn!(%error, "spool: checkpoint handoff sync failed — durability lost, continuing in memory");
+                    self.file = None;
+                    self.degraded = true;
+                }
+            }
+        }
     }
 
     /// Handle the transport waits on to learn that a priority event arrived.
@@ -858,6 +895,38 @@ pub fn spool_max_bytes_from_env() -> u64 {
 mod sync_failure_tests {
     use super::*;
     use crate::schema::{EventAction, EventData, Severity};
+
+    #[tokio::test]
+    async fn retry_sync_failure_keeps_one_record_without_confirming_durability() {
+        let dir = std::env::temp_dir().join(format!("trapd-retry-sync-{}", uuid::Uuid::new_v4()));
+        let mut spool = Spool::durable_at(dir.join("queue.journal"), 2);
+        let event = AgentEvent::new(
+            "test".into(),
+            "host".into(),
+            EventClass::Process,
+            EventAction::Create,
+            Severity::Info,
+            EventData::ProcessExec(Box::default()),
+        );
+        let seq = spool.push(event.clone()).unwrap();
+        spool.file.as_mut().unwrap().handle =
+            OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        for _ in 0..3 {
+            let tx = tx.clone();
+            let retry = event.clone();
+            let sender =
+                tokio::spawn(async move { super::super::receipt::send_durable(&tx, retry).await });
+            assert_eq!(spool.push(rx.recv().await.unwrap()).unwrap(), seq);
+            assert!(sender.await.unwrap().is_err());
+            assert_eq!(spool.len(), 1);
+            assert_eq!(spool.fsyncs_total(), 0);
+            assert!(spool.is_degraded());
+        }
+        assert_eq!(spool.dropped_total(), 0);
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn failed_shutdown_sync_marks_durability_lost() {

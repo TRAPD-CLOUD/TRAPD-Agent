@@ -428,6 +428,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     let prev_tx = prev_event_tx.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let mut consumer = tokio::spawn(async move {
+        let mut checkpoints = crate::detection::CheckpointTracker::default();
         let mut shutting_down = false;
         // Aggregate updates for repeated findings are released on this tick.
         let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -451,6 +452,11 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
                 for f in consumer_engine.admit_external(event) {
                     emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem).await;
                 }
+                continue;
+            }
+            // Retry durability without repeating downstream side effects.
+            if checkpoints.is_retry(&event) {
+                crate::spool_event(&event, &buf_for_consumer).await;
                 continue;
             }
             // Best-effort tee: a stalled enforcement engine must not stall

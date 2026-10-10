@@ -15,8 +15,8 @@ use tracing::{info, warn};
 
 use super::registry::{self, Hive};
 use crate::collectors::registry_watch::{
-    encode_baseline, load_baseline, plan_events, retain_unavailable, snapshot, RegRoot,
-    RegistryReader, Snapshot, StormGate, SPECS,
+    encode_baseline, load_baseline, plan_events, retain_unavailable, snapshot_with_preferred_users,
+    PendingRegistryPoll, RegRoot, RegistryReader, Snapshot, StormGate, SPECS,
 };
 use crate::collectors::Collector;
 use crate::schema::{AgentEvent, EventClass, EventData, Severity};
@@ -90,88 +90,117 @@ impl Collector for RegistryWatchCollector {
         };
         let mut last_saved: Option<Vec<u8>> = None;
         let mut gate = StormGate::default();
+        let mut last_omitted_users = 0usize;
         let mut ticker = interval(POLL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        'poll: loop {
+        let mut pending: Option<PendingRegistryPoll> = None;
+        loop {
             tokio::select! {
                 _ = tx.closed() => return Ok(()),
                 _ = ticker.tick() => {}
             }
-            let current = match tokio::task::spawn_blocking(|| snapshot(&WinReader, SPECS)).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "registry snapshot panicked; skipping poll");
-                    continue;
-                }
-            };
-            if current.incomplete {
-                warn!("registry snapshot exceeded tracking limit; preserving baseline and skipping poll");
-                continue;
-            }
-            if !current.unavailable.is_empty() {
-                warn!(
-                    unavailable_scopes = current.unavailable.len(),
-                    "registry reads incomplete; retaining last known values for unavailable scopes"
-                );
-            }
-            let next = match previous.as_ref() {
-                Some(prev) => match retain_unavailable(prev, current) {
-                    Ok(next) => next,
-                    Err(_) => {
-                        warn!("registry retained baseline exceeded limits; preserving previous baseline and skipping poll");
+            if pending.is_none() {
+                let preferred_users = previous
+                    .as_ref()
+                    .map(|previous| previous.users.clone())
+                    .unwrap_or_default();
+                let current = match tokio::task::spawn_blocking(move || {
+                    snapshot_with_preferred_users(&WinReader, SPECS, &preferred_users)
+                })
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "registry snapshot panicked; skipping poll");
                         continue;
                     }
-                },
-                None => {
-                    info!("registry watcher initial baseline captured");
-                    current
+                };
+                if !current.unavailable.contains("HKU")
+                    && current.omitted_users != last_omitted_users
+                {
+                    if current.omitted_users > 0 {
+                        warn!(omitted_users = current.omitted_users, "registry loaded-user capacity exceeded; additional user hives are not monitored by snapshots; machine monitoring continues");
+                    } else {
+                        info!("registry loaded-user count returned within snapshot capacity");
+                    }
+                    last_omitted_users = current.omitted_users;
                 }
-            };
-            let saved = match encode_baseline(&next) {
-                Ok(saved) => saved,
-                Err(_) => {
-                    warn!("registry snapshot cannot be persisted within limits; preserving baseline and skipping poll");
+                if current.incomplete {
+                    warn!("registry snapshot exceeded tracking limit; preserving baseline and skipping poll");
                     continue;
                 }
-            };
-            let mut next_gate = gate.clone();
-            let planned = previous
-                .as_ref()
-                .map(|prev| plan_events(prev, &next, &mut next_gate, std::time::Instant::now()))
-                .unwrap_or_default();
-            for (action, data) in planned {
-                let severity = if data.category == "storm" {
-                    Severity::Low
-                } else {
-                    Severity::Info
-                };
-                let event = AgentEvent::new(
-                    agent_id.clone(),
-                    hostname.clone(),
-                    EventClass::Registry,
-                    action,
-                    severity,
-                    EventData::Registry(data),
-                )
-                .with_source("windows_registry_snapshot");
-                if self.durable_handoff {
-                    if crate::pipeline::receipt::send_durable(&tx, event)
-                        .await
-                        .is_err()
-                    {
-                        if tx.is_closed() {
-                            return Ok(());
+                if !current.unavailable.is_empty() {
+                    warn!(
+                        unavailable_scopes = current.unavailable.len(),
+                        "registry reads incomplete; retaining last known values for unavailable scopes"
+                    );
+                }
+                let next = match previous.as_ref() {
+                    Some(prev) => match retain_unavailable(prev, current) {
+                        Ok(next) => next,
+                        Err(_) => {
+                            warn!("registry retained baseline exceeded limits; preserving previous baseline and skipping poll");
+                            continue;
                         }
-                        warn!("registry event not durably journaled; preserving baseline and retrying changes");
-                        continue 'poll;
+                    },
+                    None => {
+                        info!("registry watcher initial baseline captured");
+                        current
                     }
-                } else if tx.send(event).await.is_err() {
+                };
+                let saved = match encode_baseline(&next) {
+                    Ok(saved) => saved,
+                    Err(_) => {
+                        warn!("registry snapshot cannot be persisted within limits; preserving baseline and skipping poll");
+                        continue;
+                    }
+                };
+                let mut next_gate = gate.clone();
+                let planned = previous
+                    .as_ref()
+                    .map(|prev| plan_events(prev, &next, &mut next_gate, std::time::Instant::now()))
+                    .unwrap_or_default();
+                let events = planned
+                    .into_iter()
+                    .map(|(action, data)| {
+                        let severity = if data.category == "storm" {
+                            Severity::Low
+                        } else {
+                            Severity::Info
+                        };
+                        AgentEvent::new(
+                            agent_id.clone(),
+                            hostname.clone(),
+                            EventClass::Registry,
+                            action,
+                            severity,
+                            EventData::Registry(data),
+                        )
+                        .with_source("windows_registry_snapshot")
+                    })
+                    .collect();
+                pending = Some(PendingRegistryPoll::new(next, saved, next_gate, events));
+            }
+            let Some(poll) = pending.as_mut() else {
+                continue;
+            };
+            if poll.handoff(&tx, self.durable_handoff).await.is_err() {
+                if tx.is_closed() {
                     return Ok(());
                 }
+                warn!("registry event not durably journaled; preserving pending poll for retry");
+                continue;
             }
+            let Some(completed) = pending.take() else {
+                continue;
+            };
+            let (next, saved, next_gate) = completed.into_checkpoint()?;
             // Online, every planned event is fsynced before the baseline moves.
             // Offline retains the existing NDJSON output semantics.
             gate = next_gate;
+            if next.evicted_users > 0 {
+                warn!(evicted_users = next.evicted_users, "registry baseline capacity discarded inactive user hives; reloaded evicted hives establish a new silent baseline");
+            }
             previous = Some(next);
             if last_saved.as_ref() != Some(&saved) {
                 let path = baseline_path.clone();

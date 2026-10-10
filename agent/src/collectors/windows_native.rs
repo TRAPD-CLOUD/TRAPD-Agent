@@ -418,51 +418,126 @@ fn preflight(event: &AgentEvent) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Forward native observation and its source evidence before advancing a cursor.
-pub async fn emit_record(
+/// One bounded source batch, reused until the native cursor is acknowledged.
+struct PendingRecord {
+    raw: AgentEvent,
+    normalized: Option<AgentEvent>,
+}
+impl PendingRecord {
+    fn new(mut data: LogEventData, agent: &str, host: &str) -> anyhow::Result<Self> {
+        bound_source(&mut data)?;
+        let normalized = normalize(&data, agent, host);
+        if let Some(event) = &normalized {
+            preflight(event)?;
+        }
+        let observed = data.log_timestamp;
+        let source = format!("windows_eventlog:{}", data.source_path);
+        let mut raw = AgentEvent::new(
+            agent.into(),
+            host.into(),
+            EventClass::Log,
+            EventAction::Log,
+            Severity::Info,
+            EventData::Log(Box::new(data)),
+        )
+        .with_source(&source);
+        if let Some(time) = observed {
+            raw.timestamp = time;
+        }
+        preflight(&raw)?;
+        Ok(Self { raw, normalized })
+    }
+    async fn emit(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+        durable: bool,
+    ) -> anyhow::Result<()> {
+        if let Some(event) = &self.normalized {
+            // An accepted derived event is not regenerated on raw retries.
+            tx.send(event.clone())
+                .await
+                .map_err(|_| anyhow::anyhow!("pipeline closed"))?;
+            self.normalized = None;
+        }
+        // Raw IDs remain stable through failed receipts. The receipt registry
+        // cleans each registration on failure/timeout before the next attempt.
+        if durable {
+            crate::pipeline::receipt::send_durable(tx, self.raw.clone()).await?;
+        } else {
+            tx.send(self.raw.clone())
+                .await
+                .map_err(|_| anyhow::anyhow!("pipeline closed"))?;
+        }
+        Ok(())
+    }
+}
+
+/// At most one bounded pending record per fixed native channel. A reset removes
+/// the identity so a reused OS record number cannot inherit an earlier log's ID.
+#[derive(Default)]
+pub struct PendingRecords(std::collections::HashMap<&'static str, (u64, PendingRecord)>);
+impl PendingRecords {
+    /// Prepare and validate the whole source batch before any derived sends.
+    /// True marks the first attempt; later retries reuse identities and skip
+    /// auxiliary findings already accepted before the failed raw receipt.
+    pub fn prepare(
+        &mut self,
+        channel: &'static str,
+        record: u64,
+        data: LogEventData,
+        agent: &str,
+        host: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            matches!(
+                channel,
+                "Security" | "System" | "Application" | SYSMON_CHANNEL
+            ),
+            "unknown native channel"
+        );
+        anyhow::ensure!(data.source_path == channel, "native channel mismatch");
+        if self.0.get(channel).is_some_and(|(id, _)| *id == record) {
+            return Ok(false);
+        }
+        self.0
+            .insert(channel, (record, PendingRecord::new(data, agent, host)?));
+        Ok(true)
+    }
+    pub fn clear(&mut self, channel: &'static str) {
+        self.0.remove(channel);
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn emit(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+        channel: &'static str,
+        record: u64,
+        data: LogEventData,
+        agent: &str,
+        host: &str,
+        durable: bool,
+    ) -> anyhow::Result<()> {
+        self.prepare(channel, record, data, agent, host)?;
+        self.0
+            .get_mut(channel)
+            .expect("prepared native record")
+            .1
+            .emit(tx, durable)
+            .await
+    }
+}
+
+#[cfg(test)]
+async fn emit_record(
     tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-    mut data: LogEventData,
+    data: LogEventData,
     agent: &str,
     host: &str,
-    durable_handoff: bool,
+    durable: bool,
 ) -> anyhow::Result<()> {
-    bound_source(&mut data)?;
-    let normalized = normalize(&data, agent, host);
-    if let Some(event) = &normalized {
-        preflight(event)?;
-    }
-    if let Some(event) = normalized {
-        // Derived findings may be coalesced by the detection gate. Their IDs
-        // cannot carry a receipt for the original source record.
-        tx.send(event)
-            .await
-            .map_err(|_| anyhow::anyhow!("pipeline closed"))?;
-    }
-    let observed = data.log_timestamp;
-    let source = format!("windows_eventlog:{}", data.source_path);
-    let mut raw = AgentEvent::new(
-        agent.into(),
-        host.into(),
-        EventClass::Log,
-        EventAction::Log,
-        Severity::Info,
-        EventData::Log(Box::new(data)),
-    )
-    .with_source(&source);
-    if let Some(time) = observed {
-        raw.timestamp = time;
-    }
-    preflight(&raw)?;
-    // Raw logs bypass finding admission. Their fsync also covers any preceding
-    // normalized record that the pipeline admitted to the same journal.
-    if durable_handoff {
-        crate::pipeline::receipt::send_durable(tx, raw).await?;
-    } else {
-        tx.send(raw)
-            .await
-            .map_err(|_| anyhow::anyhow!("pipeline closed"))?;
-    }
-    Ok(())
+    PendingRecord::new(data, agent, host)?
+        .emit(tx, durable)
+        .await
 }
 
 #[cfg(test)]
@@ -476,6 +551,116 @@ mod tests {
         fields.insert("EventID".into(), id.into());
         serde_json::from_value(serde_json::json!({"source":"windows_test", "source_type":"windows_eventlog", "source_path":channel, "parser":"windows_eventlog_xml", "message":"", "category":"system", "proc":provider, "log_timestamp":"2026-10-10T12:34:56Z", "fields":fields})).unwrap()
     }
+    #[tokio::test]
+    async fn failed_native_receipts_reuse_identity_without_queue_growth_and_reset_is_fresh() {
+        let directory =
+            std::env::temp_dir().join(format!("trapd-native-retry-{}", uuid::Uuid::new_v4()));
+        // A directory at the journal pathname makes real journal opening fail.
+        // The spool retains telemetry in memory but cannot complete a receipt.
+        std::fs::create_dir_all(&directory).unwrap();
+        let spool = std::sync::Arc::new(std::sync::Mutex::new(crate::pipeline::Spool::durable_at(
+            directory.clone(),
+            3,
+        )));
+        assert!(!spool.lock().unwrap().is_durable());
+        let unrelated = AgentEvent::new(
+            "agent".into(),
+            "host".into(),
+            EventClass::Log,
+            EventAction::Log,
+            Severity::Info,
+            EventData::Log(Box::new(log("Application", "other", 1, &[]))),
+        );
+        let unrelated_id = unrelated.event_id;
+        spool.lock().unwrap().push(unrelated).unwrap();
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(2);
+        let consumer_spool = spool.clone();
+        let consumer_events = collected.clone();
+        let consumer = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                consumer_events.lock().unwrap().push(event.clone());
+                consumer_spool.lock().unwrap().push(event).unwrap();
+            }
+        });
+        let record = || {
+            log(
+                "Security",
+                "Microsoft-Windows-Security-Auditing",
+                4688,
+                &[
+                    ("NewProcessId", "123"),
+                    ("ProcessId", "45"),
+                    ("NewProcessName", r"C:\test.exe"),
+                    ("CommandLine", "test"),
+                ],
+            )
+        };
+        let mut pending = PendingRecords::default();
+        for _ in 0..3 {
+            assert!(pending
+                .emit(&tx, "Security", 100, record(), "agent", "host", true)
+                .await
+                .is_err());
+        }
+        let events = collected.lock().unwrap().clone();
+        let raw_ids: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.data, EventData::Log(_)))
+            .map(|e| e.event_id)
+            .collect();
+        assert_eq!(raw_ids.len(), 3);
+        assert!(
+            raw_ids.iter().all(|id| *id == raw_ids[0]),
+            "failed receipt must reuse the same source event ID"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.data, EventData::ProcessCreate(_)))
+                .count(),
+            1,
+            "derived observation is enqueued once"
+        );
+        assert_eq!(
+            spool.lock().unwrap().len(),
+            3,
+            "raw retries must not grow the retained queue"
+        );
+        assert!(
+            spool
+                .lock()
+                .unwrap()
+                .peek_batch(3)
+                .iter()
+                .any(|e| e.event.event_id == unrelated_id),
+            "retries must not evict unrelated evidence"
+        );
+        assert!(pending
+            .emit(&tx, "Security", 101, record(), "agent", "host", true)
+            .await
+            .is_err());
+        let different = collected.lock().unwrap().last().unwrap().event_id;
+        assert_ne!(
+            different, raw_ids[0],
+            "next source record has its own identity"
+        );
+        pending.clear("Security");
+        assert!(pending
+            .emit(&tx, "Security", 101, record(), "agent", "host", true)
+            .await
+            .is_err());
+        assert_ne!(
+            collected.lock().unwrap().last().unwrap().event_id,
+            different,
+            "log reset must renew reused OS record identity"
+        );
+        drop(tx);
+        consumer.await.unwrap();
+        drop(spool);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn oversized_native_source_and_normalized_process_are_durable_with_explicit_truncation() {
         let huge = "🦀\n".repeat(100_000);
