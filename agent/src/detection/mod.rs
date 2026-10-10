@@ -101,6 +101,30 @@ impl RansomContext {
     }
 }
 
+/// Native audit records use recorded UTC, independently of live elapsed time.
+/// The Security cursor is ordered; late timestamps (including clock rollback)
+/// remain telemetry but cannot change correlation history or complete a burst.
+#[derive(Default)]
+struct RecordedWindowsLogons {
+    tracker: windows_logon::WindowsLogonTracker,
+    last_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl RecordedWindowsLogons {
+    fn observe(
+        &mut self,
+        logon: &crate::schema::UserLogonData,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<DetectionData> {
+        if self.last_timestamp.is_some_and(|last| timestamp < last) {
+            return Vec::new();
+        }
+        self.last_timestamp = Some(timestamp);
+        self.tracker
+            .observe(logon, timestamp.timestamp_millis() as f64 / 1000.0)
+    }
+}
+
 /// The detection engine.  Cheap to share behind an `Arc`; only the beacon
 /// tracker is mutable (guarded by a `Mutex`).
 pub struct DetectionEngine {
@@ -121,6 +145,7 @@ pub struct DetectionEngine {
     anomaly_enabled: std::sync::atomic::AtomicBool,
     /// Multi-event single-host rules (recon bursts, brute force, chmod+exec).
     stateful: Mutex<stateful::StatefulRules>,
+    recorded_windows_logons: Mutex<RecordedWindowsLogons>,
     /// When filesystem ransomware indicators last fired, so a write burst is
     /// only an alert when something else corroborates it.
     ransom: Mutex<RansomContext>,
@@ -173,6 +198,7 @@ impl DetectionEngine {
             )),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             stateful: Mutex::new(stateful::StatefulRules::new()),
+            recorded_windows_logons: Mutex::new(RecordedWindowsLogons::default()),
             ransom: Mutex::new(RansomContext::default()),
             gate: Mutex::new(gate::FindingGate::new()),
             self_pid: std::process::id() as i32,
@@ -455,6 +481,16 @@ impl DetectionEngine {
             }
             // Windows logons (normalised, carry a logon type) have their own
             // account- and source-keyed tracker; the SSH one is source-only.
+            EventData::UserLogon(l) if is_historical_windows_record(event) => {
+                let hits = self
+                    .recorded_windows_logons
+                    .lock()
+                    .map(|mut tracker| tracker.observe(l, event.timestamp))
+                    .unwrap_or_default();
+                for d in hits {
+                    out.push(self.detection(Severity::Info, d));
+                }
+            }
             EventData::UserLogon(l) if l.logon_type.is_some() => {
                 let hits = self
                     .stateful
@@ -1775,6 +1811,7 @@ mod tests {
             baseline: Mutex::new(baseline::BaselineEngine::new()),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             stateful: Mutex::new(stateful::StatefulRules::new()),
+            recorded_windows_logons: Mutex::new(RecordedWindowsLogons::default()),
             ransom: Mutex::new(RansomContext::default()),
             gate: Mutex::new(gate::FindingGate::new()),
             // Not this test process: tests feed synthetic pids.
@@ -2484,6 +2521,139 @@ mod tests {
             assert!(d.correlation.as_ref().unwrap().process_key.is_none());
             assert!(d.evidence.get("process_lineage").is_none());
         }
+    }
+
+    fn audit_logon_at(success: bool, seconds: i64) -> AgentEvent {
+        let mut event = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::User,
+            EventAction::Logon,
+            Severity::Info,
+            EventData::UserLogon(crate::schema::UserLogonData {
+                username: "alice".into(),
+                domain: Some("CORP".into()),
+                src_addr: Some("203.0.113.5".into()),
+                success,
+                logon_type: Some(3),
+                ..Default::default()
+            }),
+        )
+        .with_source(if success {
+            "windows_eventlog:Security:4624"
+        } else {
+            "windows_eventlog:Security:4625"
+        });
+        event.timestamp = chrono::DateTime::from_timestamp(1_600_000_000 + seconds, 0).unwrap();
+        event
+    }
+
+    #[test]
+    fn recorded_windows_logons_do_not_compress_hours_into_collection_time() {
+        let e = engine();
+        let receipt = Instant::now();
+        for i in 0..5 {
+            assert!(
+                e.inspect_at(&audit_logon_at(false, i * 3600), receipt, 0.0)
+                    .is_empty(),
+                "hour-separated audit failures must not form a five-minute burst"
+            );
+        }
+        assert!(e
+            .inspect_at(&audit_logon_at(true, 5 * 3600), receipt, 0.0)
+            .is_empty());
+    }
+
+    #[test]
+    fn recorded_windows_logon_burst_preserves_evidence_source_and_timestamp() {
+        let e = engine();
+        let receipt = Instant::now();
+        for i in 0..5 {
+            e.inspect_at(&audit_logon_at(false, i * 30), receipt, 0.0);
+        }
+        let success = audit_logon_at(true, 150);
+        let findings = e.inspect_at(&success, receipt, 0.0);
+        let finding = find(&findings, "auth.windows_bruteforce_success")
+            .expect("genuine five-minute audit burst must remain detectable");
+        assert!(is_historical_windows_record(finding));
+        assert_eq!(finding.timestamp, success.timestamp);
+        assert_eq!(
+            finding.origin.as_ref().unwrap().source.as_deref(),
+            Some("windows_eventlog:Security:4624")
+        );
+        assert_eq!(
+            det_of(finding)
+                .correlation
+                .as_ref()
+                .unwrap()
+                .user
+                .as_deref(),
+            Some("corp\\alice")
+        );
+        assert!(det_of(finding)
+            .correlation
+            .as_ref()
+            .unwrap()
+            .process_key
+            .is_none());
+    }
+
+    #[test]
+    fn recorded_logons_accept_equal_timestamps_and_do_not_mix_live_failures() {
+        let e = engine();
+        let receipt = Instant::now();
+        for _ in 0..2 {
+            e.inspect_at(&audit_logon_at(false, 100), receipt, 0.0);
+        }
+        let mut live_failure = audit_logon_at(false, 0);
+        live_failure.origin.as_mut().unwrap().source = Some("windows_process_poll".into());
+        e.inspect_at(&live_failure, receipt, 0.0);
+        assert!(
+            e.inspect_at(&audit_logon_at(true, 100), receipt, 0.0)
+                .is_empty(),
+            "two recorded failures must not borrow a live failure"
+        );
+        // Equal event timestamps are common in the same Security batch.
+        e.inspect_at(&audit_logon_at(false, 100), receipt, 0.0);
+        assert!(find(
+            &e.inspect_at(&audit_logon_at(true, 100), receipt, 0.0),
+            "auth.windows_bruteforce_success"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn recorded_logon_watermark_rejects_older_records_without_affecting_live_history() {
+        let e = engine();
+        let receipt = Instant::now();
+        for i in 0..3 {
+            e.inspect_at(&audit_logon_at(false, 100 + i), receipt, 0.0);
+        }
+        assert!(
+            e.inspect_at(&audit_logon_at(true, 99), receipt, 0.0)
+                .is_empty(),
+            "later failures cannot justify an earlier successful logon"
+        );
+        assert!(find(
+            &e.inspect_at(&audit_logon_at(true, 103), receipt, 0.0),
+            "auth.windows_bruteforce_success"
+        )
+        .is_some());
+        for i in 0..3 {
+            let mut live = audit_logon_at(false, i);
+            live.origin.as_mut().unwrap().source = Some("windows_process_poll".into());
+            e.inspect_at(&live, receipt, i as f64);
+        }
+        let mut success = audit_logon_at(true, 3);
+        success.origin.as_mut().unwrap().source = Some("windows_process_poll".into());
+        assert!(
+            find(
+                &e.inspect_at(&success, receipt, 3.0),
+                "auth.windows_bruteforce_success"
+            )
+            .is_some(),
+            "recorded UTC watermark must not discard live elapsed-time events"
+        );
     }
 
     fn find<'a>(out: &'a [AgentEvent], rule: &str) -> Option<&'a AgentEvent> {

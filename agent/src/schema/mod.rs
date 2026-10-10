@@ -621,16 +621,27 @@ pub struct FilesystemEventData {
     pub change_summary: Option<String>,
 }
 
-/// One value-level change on a watched Windows registry location. Emitted by
-/// the registry watcher with `class=registry` and action `create` / `modify` /
-/// `delete`. There is no process attribution (polling snapshots); correlate
-/// with process events by time and command line.
+/// Original object identity for a registry rename. The enclosing event's
+/// key_path/value_name identify the destination; names are not registry data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryRenameSource {
+    pub key_path: String,
+    /// None for a key rename; Some for a value rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_name: Option<String>,
+}
+
+/// Registry observation from snapshot polling or persisted native audit records.
+/// `class=registry` uses create/modify/delete; native renames use modify with
+/// destination key_path/value_name and explicit rename_from source identity.
+/// Rename names are not old/new value data. Native actor evidence remains in
+/// the paired raw log; this payload does not infer a writing process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryEventData {
     /// Full key path with hive prefix, e.g.
     /// `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`.
     pub key_path: String,
-    /// Value name; `(Default)` for the unnamed value.
+    /// Value name; `(Default)` for the unnamed value, `(Key)` for a key object.
     pub value_name: String,
     /// Watch category: `run_key`, `service`, `ifeo`, `winlogon`, `appinit`,
     /// `defender`, `com_hijack`, `scheduled_task`, `startup_env`, or `storm`.
@@ -644,6 +655,9 @@ pub struct RegistryEventData {
     /// New data (absent for a deleted value). Truncated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_value: Option<String>,
+    /// Present only for observed name changes, whose value data is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename_from: Option<RegistryRenameSource>,
     /// Set only on a `storm` summary: changes dropped by the rate limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppressed: Option<u32>,

@@ -194,6 +194,36 @@ fn tiered(
 
 /// Inspect one registry change. Deletions never fire.
 pub fn inspect_registry(r: &RegistryEventData) -> Vec<DetectionData> {
+    if let Some(source) = &r.rename_from {
+        let destination = crate::schema::RegistryRenameSource {
+            key_path: r.key_path.clone(),
+            value_name: source.value_name.as_ref().map(|_| r.value_name.clone()),
+        };
+        let watched =
+            |object: &crate::schema::RegistryRenameSource| match object.value_name.as_deref() {
+                Some(name) => {
+                    crate::collectors::registry_watch::category_for_path(&object.key_path, name)
+                }
+                None => crate::collectors::registry_watch::category_for_key_path(&object.key_path),
+            };
+        let Some(category) = watched(&destination).or_else(|| watched(source)) else {
+            return Vec::new();
+        };
+        let subject = if source.value_name.is_some() {
+            format!("{}\\{}", r.key_path, r.value_name)
+        } else {
+            r.key_path.clone()
+        };
+        let mut finding = detection(
+            "persistence.registry_object_renamed", "Registry object renamed at a watched location",
+            "persistence", EVASION, "T1112", 60, subject,
+            "A registry object name changed at a watched location; value data is unavailable and this observation alone does not establish malicious persistence.".into(),
+            serde_json::json!({"key_path":r.key_path,"value_name":r.value_name,"rename_from":source,
+                "category":category,"old_value":null,"new_value":null,"value_data_available":false}),
+        );
+        finding.mode = Some(crate::schema::DetectionMode::Signal);
+        return vec![finding];
+    }
     let Some(new) = r.new_value.as_deref() else {
         return Vec::new();
     };
@@ -528,6 +558,7 @@ mod tests {
             user_sid: Some("S-1-5-21-1-2-3-1001".into()),
             old_value: None,
             new_value: new.map(str::to_string),
+            rename_from: None,
             suppressed: None,
         }
     }
@@ -537,6 +568,67 @@ mod tests {
     }
 
     const RUN: &str = r"HKU\S-1-5-21-1-2-3-1001\Software\Microsoft\Windows\CurrentVersion\Run";
+
+    #[test]
+    fn renames_in_watched_categories_are_signals_without_content_dependent_findings() {
+        for (category, key, name) in [
+            ("run_key", RUN, "Renamed"),
+            (
+                "service",
+                r"HKLM\SYSTEM\CurrentControlSet\Services\demo",
+                "ImagePath",
+            ),
+            (
+                "ifeo",
+                r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\cmd.exe",
+                "Debugger",
+            ),
+            (
+                "winlogon",
+                r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
+                "Shell",
+            ),
+            (
+                "appinit",
+                r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows",
+                "AppInit_DLLs",
+            ),
+            (
+                "defender",
+                r"HKLM\SOFTWARE\Policies\Microsoft\Windows Defender",
+                "DisableAntiSpyware",
+            ),
+            (
+                "com_hijack",
+                r"HKU\S-1-5-21-1-2-3-1001_Classes\CLSID\{test}\InprocServer32",
+                "(Default)",
+            ),
+            (
+                "scheduled_task",
+                r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\demo",
+                "Id",
+            ),
+            (
+                "startup_env",
+                r"HKU\S-1-5-21-1-2-3-1001\Environment",
+                "UserInitMprLogonScript",
+            ),
+        ] {
+            let mut record = change(category, key, name, None);
+            record.rename_from = Some(crate::schema::RegistryRenameSource {
+                key_path: key.into(),
+                value_name: Some("Previous".into()),
+            });
+            let findings = inspect_registry(&record);
+            assert_eq!(ids(&findings), ["persistence.registry_object_renamed"]);
+            assert_eq!(findings[0].mode, Some(crate::schema::DetectionMode::Signal));
+            assert_eq!(
+                findings[0].evidence["rename_from"]["value_name"],
+                "Previous"
+            );
+            assert!(findings[0].evidence["new_value"].is_null());
+        }
+    }
 
     #[test]
     fn plain_run_value_is_a_context_signal() {

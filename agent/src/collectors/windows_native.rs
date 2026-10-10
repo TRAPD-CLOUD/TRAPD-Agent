@@ -36,6 +36,32 @@ fn registry_path(path: &str) -> Option<String> {
     }
     None
 }
+// Names identify registry objects; they are never interpreted as stored data.
+fn rename_object(path: &str, is_value: bool) -> Option<RegistryRenameSource> {
+    let path = registry_path(path)?;
+    if path.contains('\0') || path.split('\\').any(str::is_empty) {
+        return None;
+    }
+    let (key_path, value_name) = if is_value {
+        let (key, value) = path.rsplit_once('\\')?;
+        if !key.contains('\\') {
+            return None;
+        }
+        (key.to_string(), Some(value.to_string()))
+    } else {
+        (path, None)
+    };
+    Some(RegistryRenameSource {
+        key_path,
+        value_name,
+    })
+}
+fn rename_category(object: &RegistryRenameSource) -> Option<&'static str> {
+    match object.value_name.as_deref() {
+        Some(name) => crate::collectors::registry_watch::category_for_path(&object.key_path, name),
+        None => crate::collectors::registry_watch::category_for_key_path(&object.key_path),
+    }
+}
 fn account(user: &str, domain: &str) -> String {
     if user.is_empty() || user == "-" {
         String::new()
@@ -154,6 +180,8 @@ pub fn normalize(log: &LogEventData, agent: &str, host: &str) -> Option<AgentEve
                     "truncated_fields": log.truncated_fields }), ..Default::default()
             })));
     }
+    let mut rename_from = None;
+    let mut rename_scope = None;
     let (path, value, action, old_value, new_value) = if security && id == 4657 {
         let action = match get("OperationType") {
             "%%1904" => EventAction::Create,
@@ -172,7 +200,37 @@ pub fn normalize(log: &LogEventData, agent: &str, host: &str) -> Option<AgentEve
             old,
             new,
         )
-    } else if sysmon && matches!(id, 12..=14) {
+    } else if sysmon && id == 14 {
+        let is_value = match get("EventType") {
+            "RenameKey" => false,
+            "RenameValue" => true,
+            _ => return None,
+        };
+        if log.truncated_fields.as_ref().is_some_and(|fields| {
+            fields.contains_key("fields.TargetObject") || fields.contains_key("fields.NewName")
+        }) {
+            return None;
+        }
+        let source = rename_object(get("TargetObject"), is_value)?;
+        let destination = rename_object(get("NewName"), is_value)?;
+        // Native rename changes a leaf name within its original key/parent.
+        let same_parent = if is_value {
+            source.key_path.eq_ignore_ascii_case(&destination.key_path)
+        } else {
+            source
+                .key_path
+                .rsplit_once('\\')?
+                .0
+                .eq_ignore_ascii_case(destination.key_path.rsplit_once('\\')?.0)
+        };
+        if !same_parent {
+            return None;
+        }
+        rename_scope = rename_category(&destination).or_else(|| rename_category(&source));
+        let value = destination.value_name.unwrap_or_else(|| "(Key)".into());
+        rename_from = Some(source);
+        (destination.key_path, value, EventAction::Modify, None, None)
+    } else if sysmon && matches!(id, 12..=13) {
         let target = registry_path(get("TargetObject"))?;
         let kind = get("EventType");
         let (action, is_value) = match (id, kind) {
@@ -181,8 +239,6 @@ pub fn normalize(log: &LogEventData, agent: &str, host: &str) -> Option<AgentEve
             (12, "CreateValue") => (EventAction::Create, true),
             (12, "DeleteValue") => (EventAction::Delete, true),
             (13, "SetValue") => (EventAction::Modify, true),
-            (14, "RenameKey") => (EventAction::Modify, false),
-            (14, "RenameValue") => (EventAction::Modify, true),
             _ => return None,
         };
         let (path, value) = if is_value {
@@ -200,7 +256,8 @@ pub fn normalize(log: &LogEventData, agent: &str, host: &str) -> Option<AgentEve
         .strip_prefix("HKU\\")
         .and_then(|p| p.split('\\').next())
         .filter(|p| p.starts_with("S-1-"));
-    let category = crate::collectors::registry_watch::category_for_path(&path, &value)
+    let category = rename_scope
+        .or_else(|| crate::collectors::registry_watch::category_for_path(&path, &value))
         .unwrap_or("native_registry");
     make(
         EventClass::Registry,
@@ -217,6 +274,7 @@ pub fn normalize(log: &LogEventData, agent: &str, host: &str) -> Option<AgentEve
             user_sid: sid.map(str::to_string),
             old_value: old_value.map(|v| crate::collectors::registry_watch::truncate_value(&v)),
             new_value: new_value.map(|v| crate::collectors::registry_watch::truncate_value(&v)),
+            rename_from,
             suppressed: None,
         }),
     )
@@ -325,6 +383,7 @@ fn bound_source(data: &mut LogEventData) -> anyhow::Result<()> {
                             | "OldValue"
                             | "NewValue"
                             | "TargetObject"
+                            | "NewName"
                             | "EventType"
                             | "Details"
                     )
@@ -731,6 +790,157 @@ mod tests {
             assert!(normalize(&record, "a", "h").is_none());
         }
     }
+    #[test]
+    fn sysmon_registry_key_rename_classifies_the_new_watched_destination_without_value_data() {
+        let old = r"HKLM\Software\Microsoft\Windows\CurrentVersion\Staged";
+        let new = r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run";
+        let record = log(
+            SYSMON_CHANNEL,
+            "Microsoft-Windows-Sysmon",
+            14,
+            &[
+                ("EventType", "RenameKey"),
+                ("TargetObject", old),
+                ("NewName", new),
+            ],
+        );
+        let event = normalize(&record, "a", "h").unwrap();
+        let EventData::Registry(r) = event.data else {
+            panic!("registry expected")
+        };
+        assert_eq!(r.key_path, new);
+        assert_eq!(r.value_name, "(Key)");
+        assert_eq!(r.category, "run_key");
+        let source = r.rename_from.as_ref().unwrap();
+        assert_eq!(source.key_path, old);
+        assert!(source.value_name.is_none());
+        assert!(
+            r.old_value.is_none() && r.new_value.is_none(),
+            "names cannot be represented as value data"
+        );
+        let findings = crate::detection::registry_rules::inspect_registry(&r);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "persistence.registry_object_renamed");
+        assert_eq!(findings[0].mode, Some(DetectionMode::Signal));
+    }
+
+    #[test]
+    fn sysmon_registry_value_rename_classifies_the_destination_value_not_the_old_name() {
+        let key = r"HKLM\SYSTEM\CurrentControlSet\Services\demo";
+        let old = format!("{key}\\Unrelated");
+        let new = format!("{key}\\ImagePath");
+        let record = log(
+            SYSMON_CHANNEL,
+            "Microsoft-Windows-Sysmon",
+            14,
+            &[
+                ("EventType", "RenameValue"),
+                ("TargetObject", &old),
+                ("NewName", &new),
+            ],
+        );
+        let event = normalize(&record, "a", "h").unwrap();
+        let EventData::Registry(r) = event.data else {
+            panic!("registry expected")
+        };
+        assert_eq!(r.key_path, key);
+        assert_eq!(r.value_name, "ImagePath");
+        assert_eq!(r.category, "service");
+        let source = r.rename_from.as_ref().unwrap();
+        assert_eq!(source.key_path, key);
+        assert_eq!(source.value_name.as_deref(), Some("Unrelated"));
+        assert!(r.old_value.is_none() && r.new_value.is_none());
+        let findings = crate::detection::registry_rules::inspect_registry(&r);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "persistence.registry_object_renamed");
+        assert!(!findings[0].title.contains("installed"));
+    }
+
+    #[test]
+    fn sysmon_registry_rename_rejects_missing_malformed_or_spoofed_destination() {
+        let old = r"HKLM\Software\Microsoft\Windows\CurrentVersion\Staged";
+        for new in [
+            "",
+            "Run",
+            "HKLM\\",
+            r"HKLM\Software\\Run",
+            r"HKLM\Software\..\Run",
+            "HKLM\\Software\\Run\0",
+        ] {
+            let record = log(
+                SYSMON_CHANNEL,
+                "Microsoft-Windows-Sysmon",
+                14,
+                &[
+                    ("EventType", "RenameKey"),
+                    ("TargetObject", old),
+                    ("NewName", new),
+                ],
+            );
+            assert!(
+                normalize(&record, "a", "h").is_none(),
+                "malformed destination {new:?}"
+            );
+        }
+        let mut record = log(
+            SYSMON_CHANNEL,
+            "Impostor",
+            14,
+            &[
+                ("EventType", "RenameKey"),
+                ("TargetObject", old),
+                (
+                    "NewName",
+                    r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+                ),
+            ],
+        );
+        assert!(normalize(&record, "a", "h").is_none());
+        record.proc = Some("Microsoft-Windows-Sysmon".into());
+        record.source_path = "Application".into();
+        assert!(normalize(&record, "a", "h").is_none());
+    }
+
+    #[test]
+    fn sysmon_registry_rename_preserves_watched_source_and_truncated_names_are_raw_only() {
+        for (kind, old, new, category) in [
+            (
+                "RenameKey",
+                r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+                r"HKLM\Software\Microsoft\Windows\CurrentVersion\Unwatched",
+                "run_key",
+            ),
+            (
+                "RenameValue",
+                r"HKLM\SYSTEM\CurrentControlSet\Services\demo\ImagePath",
+                r"HKLM\SYSTEM\CurrentControlSet\Services\demo\Unwatched",
+                "service",
+            ),
+        ] {
+            let mut record = log(
+                SYSMON_CHANNEL,
+                "Microsoft-Windows-Sysmon",
+                14,
+                &[("EventType", kind), ("TargetObject", old), ("NewName", new)],
+            );
+            let EventData::Registry(r) = normalize(&record, "a", "h").unwrap().data else {
+                panic!("registry expected")
+            };
+            assert_eq!(r.category, category);
+            assert_eq!(
+                crate::detection::registry_rules::inspect_registry(&r).len(),
+                1
+            );
+            for field in ["fields.NewName", "fields.TargetObject"] {
+                record.truncated_fields = Some(std::collections::BTreeMap::from([(
+                    field.into(),
+                    crate::telemetry::limits::Truncation::new(100, 50),
+                )]));
+                assert!(normalize(&record, "a", "h").is_none());
+            }
+        }
+    }
+
     #[test]
     fn sysmon_registry_value_set_retains_data_and_exact_value_path() {
         let record = log(

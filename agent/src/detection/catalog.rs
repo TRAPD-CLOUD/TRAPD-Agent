@@ -275,6 +275,16 @@ pub const RULES: &[RuleMeta] = &[
     rule("auth.windows_bruteforce_success", CREDS, "T1110.001", High, Critical, Alert, Subject, TEN_MIN),
 
     // ── Windows registry / service / task persistence (detection::registry_rules)
+    rule(
+        "persistence.registry_object_renamed",
+        EVASION,
+        "T1112",
+        Low,
+        Low,
+        Signal,
+        Subject,
+        HOUR,
+    ),
     // A plain new autorun, service or task is context only; forms installers
     // also produce start in shadow; encoded/download forms and the
     // unambiguous hijack points (IFEO, Winlogon, AppInit) alert.

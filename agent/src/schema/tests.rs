@@ -4,8 +4,8 @@ use super::{
     AgentEvent, DnsData, EbpfDropsData, EventAction, EventClass, EventData, FileOpenData,
     FilesystemEventData, FilesystemOperation, FilesystemSource, ForkData, HoneytokenAccessData,
     IntegrityStatus, LogEventData, MmapData, ModuleLoadData, NamespaceIds, NetworkSocketData,
-    NsChangeData, ProcessCreateData, ProcessLineage, PtraceData, RegistryEventData, SessionContext, Severity, ShmData,
-    SystemSnapshotData,
+    NsChangeData, ProcessCreateData, ProcessLineage, PtraceData, RegistryEventData,
+    RegistryRenameSource, SessionContext, Severity, ShmData, SystemSnapshotData,
 };
 
 fn process_create_event() -> AgentEvent {
@@ -839,6 +839,7 @@ fn test_registry_event_roundtrip() {
             user_sid: Some("S-1-5-21-1".into()),
             old_value: None,
             new_value: Some("cmd /c echo x".into()),
+            rename_from: None,
             suppressed: None,
         }),
     );
@@ -852,4 +853,44 @@ fn test_registry_event_roundtrip() {
     // different untagged variant.
     let back: AgentEvent = serde_json::from_str(&json).unwrap();
     assert!(matches!(back.data, EventData::Registry(_)));
+}
+
+#[test]
+fn registry_rename_destination_and_source_round_trip_without_fabricated_value_data() {
+    for source_value in [None, Some("OldValue".to_string())] {
+        let key_rename = source_value.is_none();
+        let data = RegistryEventData {
+            key_path: r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
+            value_name: if key_rename { "(Key)" } else { "NewValue" }.into(),
+            category: "run_key".into(),
+            user_sid: None,
+            old_value: None,
+            new_value: None,
+            rename_from: Some(RegistryRenameSource {
+                key_path: r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Staged".into(),
+                value_name: source_value.clone(),
+            }),
+            suppressed: None,
+        };
+        let event = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Registry,
+            EventAction::Modify,
+            Severity::Info,
+            EventData::Registry(data),
+        );
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            encoded["data"]["rename_from"]["key_path"],
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Staged"
+        );
+        assert!(encoded["data"].get("old_value").is_none());
+        assert!(encoded["data"].get("new_value").is_none());
+        let recovered: AgentEvent = serde_json::from_value(encoded).unwrap();
+        let EventData::Registry(data) = recovered.data else {
+            panic!("registry variant expected")
+        };
+        assert_eq!(data.rename_from.unwrap().value_name, source_value);
+    }
 }

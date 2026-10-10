@@ -225,6 +225,60 @@ fn parse(xml: &str, channel: &str) -> Result<(u64, LogEventData, Option<UserLogo
     Ok((record_id, data, auth))
 }
 
+/// Preserve the operating system's authentication timeline. A raw record with
+/// no usable native timestamp remains evidence, but cannot date a logon event.
+fn auth_event(
+    data: &LogEventData,
+    auth: UserLogonData,
+    agent_id: &str,
+    hostname: &str,
+) -> Option<AgentEvent> {
+    let recorded_at = data.log_timestamp?;
+    let event_id = data.fields.get("EventID")?.as_u64()?;
+    let source = format!("windows_eventlog:{}:{event_id}", data.source_path);
+    let mut event = AgentEvent::new(
+        agent_id.into(),
+        hostname.into(),
+        EventClass::User,
+        if auth.success {
+            EventAction::Logon
+        } else {
+            EventAction::LogonFailed
+        },
+        if auth.success {
+            Severity::Info
+        } else {
+            Severity::Low
+        },
+        EventData::UserLogon(auth),
+    )
+    .with_source(&source);
+    event.timestamp = recorded_at;
+    Some(event)
+}
+
+/// Keep one unacknowledged authentication identity per configured channel.
+/// A failed raw receipt must retry the source record without counting it again.
+async fn enqueue_auth_once(
+    tx: &Sender<AgentEvent>,
+    pending: &mut HashMap<&'static str, u64>,
+    channel: &'static str,
+    record: u64,
+    event: Option<AgentEvent>,
+) -> bool {
+    if pending.get(channel) == Some(&record) {
+        return true;
+    }
+    if let Some(event) = event {
+        if tx.send(event).await.is_err() {
+            return false;
+        }
+        // Record only a successful enqueue; channel count is fixed by run().
+        pending.insert(channel, record);
+    }
+    true
+}
+
 /// Record the logon type of a 4624 success so later object-access events can
 /// be graded by session kind. Bounded to 4096 entries.
 fn capture_logon_type(
@@ -387,6 +441,8 @@ impl Collector for EventLogCollector {
         // can be graded by how its subject logged on (interactive vs. RDP vs.
         // service). Bounded; oldest dropped on overflow.
         let mut logon_types: HashMap<String, u32> = HashMap::new();
+        // At most one pending record for each of the four fixed channels.
+        let mut pending_auth = HashMap::new();
         let devices = super::etw::device_map();
         let mut unavailable = HashSet::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -468,6 +524,7 @@ impl Collector for EventLogCollector {
                                     crate::telemetry::metrics::metrics()
                                         .event_dropped(crate::telemetry::DropReason::InternalError);
                                     cursors.insert(channel.into(), 0);
+                                    pending_auth.remove(channel);
                                 }
                             }
                         }
@@ -494,6 +551,7 @@ impl Collector for EventLogCollector {
                                     .and_then(|t| t.parse::<u64>().ok())
                                 {
                                     cursors.insert(channel.into(), id);
+                                    pending_auth.remove(channel);
                                 }
                             }
                             continue;
@@ -565,6 +623,20 @@ impl Collector for EventLogCollector {
                     // First start tails from the newest record, avoiding a full
                     // historical replay. Subsequent starts resume the cursor.
                     if cursor.is_some() {
+                        // Construct before moving the raw data, and enqueue first:
+                        // a durable raw source receipt fsyncs the preceding logon
+                        // record before this channel's cursor advances.
+                        if !enqueue_auth_once(
+                            &tx,
+                            &mut pending_auth,
+                            channel,
+                            record,
+                            auth.and_then(|auth| auth_event(&data, auth, &agent_id, &hostname)),
+                        )
+                        .await
+                        {
+                            return Ok(());
+                        }
                         if windows_native::emit_record(
                             &tx,
                             data,
@@ -581,28 +653,8 @@ impl Collector for EventLogCollector {
                             tracing::warn!(channel, "native source record not durably journaled; retaining source cursor for retry");
                             break;
                         }
-                        if let Some(auth) = auth {
-                            let event = AgentEvent::new(
-                                agent_id.clone(),
-                                hostname.clone(),
-                                EventClass::User,
-                                if auth.success {
-                                    EventAction::Logon
-                                } else {
-                                    EventAction::LogonFailed
-                                },
-                                if auth.success {
-                                    Severity::Info
-                                } else {
-                                    Severity::Low
-                                },
-                                EventData::UserLogon(auth),
-                            );
-                            if tx.send(event).await.is_err() {
-                                return Ok(());
-                            }
-                        }
                     }
+                    pending_auth.remove(channel);
                     cursors.insert(channel.into(), record);
                 }
             }
@@ -625,6 +677,135 @@ mod tests {
         assert_eq!(auth.src_addr.as_deref(), Some("10.0.0.1"));
         assert!(!auth.success);
     }
+    #[test]
+    fn native_logon_record_preserves_recorded_utc_and_source_identity() {
+        for (event_id, success) in [(4624, true), (4625, false)] {
+            let xml = format!(
+                r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>{event_id}</EventID><EventRecordID>123</EventRecordID><TimeCreated SystemTime="2026-01-01T12:34:56.9876543+02:00"/></System><EventData><Data Name="TargetUserName">Jörg &amp; Co</Data><Data Name="LogonType">3</Data><Data Name="IpAddress">10.0.0.1</Data></EventData></Event>"#
+            );
+            let (_, data, auth) = parse(&xml, "Security").unwrap();
+            let event = auth_event(&data, auth.unwrap(), "agent", "host").unwrap();
+            let expected = chrono::DateTime::parse_from_rfc3339("2026-01-01T10:34:56.9876543Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            assert_eq!(event.timestamp, expected);
+            assert_eq!(event.timestamp, data.log_timestamp.unwrap());
+            assert_eq!(
+                event.origin.unwrap().source.as_deref(),
+                Some(format!("windows_eventlog:Security:{event_id}").as_str())
+            );
+            assert!(matches!(event.class, EventClass::User));
+            assert!(if success {
+                matches!(event.action, EventAction::Logon)
+            } else {
+                matches!(event.action, EventAction::LogonFailed)
+            });
+            let EventData::UserLogon(logon) = event.data else {
+                panic!("structured logon expected")
+            };
+            assert_eq!(logon.username, "Jörg & Co");
+            assert_eq!(logon.success, success);
+        }
+    }
+
+    #[test]
+    fn invalid_native_time_keeps_raw_authentication_without_fabricating_timeline() {
+        for timestamp in [
+            "",
+            r#"<TimeCreated/>"#,
+            r#"<TimeCreated SystemTime="invalid"/>"#,
+        ] {
+            let xml = format!(
+                r#"<Event><System><EventID>4625</EventID><EventRecordID>123</EventRecordID>{timestamp}</System><EventData><Data Name="TargetUserName">alice</Data></EventData></Event>"#
+            );
+            let (record, data, auth) = parse(&xml, "Security").unwrap();
+            assert_eq!(record, 123);
+            assert!(data.message.contains("alice"));
+            assert!(data.log_timestamp.is_none());
+            assert!(auth_event(&data, auth.unwrap(), "agent", "host").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn retried_raw_handoff_emits_one_auth_per_native_record() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut pending = HashMap::new();
+        let xml = |record| {
+            format!(
+                r#"<Event><System><EventID>4625</EventID><EventRecordID>{record}</EventRecordID><TimeCreated SystemTime="2026-01-01T10:34:56Z"/></System><EventData><Data Name="TargetUserName">alice</Data></EventData></Event>"#
+            )
+        };
+        // Each missing raw receipt leaves the source cursor and pending identity
+        // unchanged, so the next poll parses and attempts the same record again.
+        for _ in 0..5 {
+            let (record, data, auth) = parse(&xml(123), "Security").unwrap();
+            assert!(
+                enqueue_auth_once(
+                    &tx,
+                    &mut pending,
+                    "Security",
+                    record,
+                    auth.and_then(|auth| auth_event(&data, auth, "agent", "host")),
+                )
+                .await
+            );
+        }
+        let first = rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err());
+        // A successful raw receipt advances this channel and clears pending state.
+        pending.remove("Security");
+        let (record, data, auth) = parse(&xml(124), "Security").unwrap();
+        assert!(
+            enqueue_auth_once(
+                &tx,
+                &mut pending,
+                "Security",
+                record,
+                auth.and_then(|auth| auth_event(&data, auth, "agent", "host")),
+            )
+            .await
+        );
+        let second = rx.try_recv().unwrap();
+        assert_eq!(first.timestamp, second.timestamp);
+        assert_ne!(first.event_id, second.event_id);
+        assert!(rx.try_recv().is_err());
+        // Log reset clears the same bounded channel slot, permitting reused IDs.
+        pending.remove("Security");
+        let (record, data, auth) = parse(&xml(123), "Security").unwrap();
+        assert!(
+            enqueue_auth_once(
+                &tx,
+                &mut pending,
+                "Security",
+                record,
+                auth.and_then(|auth| auth_event(&data, auth, "agent", "host")),
+            )
+            .await
+        );
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_auth_enqueue_does_not_mark_record_pending() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let mut pending = HashMap::new();
+        let xml = r#"<Event><System><EventID>4625</EventID><EventRecordID>123</EventRecordID><TimeCreated SystemTime="2026-01-01T10:34:56Z"/></System><EventData><Data Name="TargetUserName">alice</Data></EventData></Event>"#;
+        let (record, data, auth) = parse(xml, "Security").unwrap();
+        assert!(
+            !enqueue_auth_once(
+                &tx,
+                &mut pending,
+                "Security",
+                record,
+                auth.and_then(|auth| auth_event(&data, auth, "agent", "host")),
+            )
+            .await
+        );
+        assert!(pending.is_empty());
+    }
+
     #[test]
     fn native_xml_rejects_duplicate_or_reserved_fields() {
         for fields in [

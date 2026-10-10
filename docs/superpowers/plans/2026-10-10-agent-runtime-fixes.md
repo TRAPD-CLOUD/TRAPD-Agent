@@ -31,9 +31,9 @@ without that source. Live-process ETW enrichment remains best effort.
 - [x] Review combined changes for validation, false attribution, resource bounds,
   failure handling, replay and tenant identity; run full agent tests, Linux and
   Windows checks/builds plus platform detection tests.
-- [ ] Commit/push agent changes to PR 135 and prepare the isolated backend fix
-  for review. Verify CI; document actual Windows field-test prerequisites and
-  any unavailable host validation.
+- [x] Prepare agent changes for PR 135 and the isolated platform fix for PR 204;
+  document Windows field-test prerequisites and unavailable host validation.
+  Require final-head CI before resolving review threads.
 
 ## Review focus
 
@@ -52,7 +52,7 @@ so only their raw source records carry cursor receipts. Native channel/audit
 prerequisites are reported separately in coverage. Platform catalog sync retains
 project overrides and is tracked in TRAPD PR 204 (all five CI jobs passed).
 
-Local final verification: 1275 Linux unit tests and 16 integration tests passed;
+Local final verification: 1296 Linux unit tests and 16 integration tests passed;
 Linux release build and Windows GNU build passed. Strict Linux and Windows GNU
 all-target checks include the native XML truncation regression. Repository-wide
 agent formatting has existing debt; new files and changed hunks are formatted.
@@ -64,3 +64,12 @@ stale signature invalidation on MSI/deb/script upgrades. Real Ubuntu/Debian
 package and full script-installer tests pass, including checksum rejection that
 leaves integrity state unchanged. MSI validates signature restoration on
 failed upgrades and stale-signature removal on successful upgrades in CI.
+
+Final review follow-up: native authentication uses its recorded UTC timeline in
+a tracker separate from live elapsed time. Domain-qualified accounts prevent
+identity collisions. Structured logons precede raw durable receipts, with
+bounded per-channel record IDs preventing duplicate counting during retries.
+Sysmon renames retain typed original/destination names and emit a conservative
+Low/Signal policy without inventing value data. Both canonical catalogs contain
+106 rules; the platform migration syncs 26 policies and preserves tenant overrides.
+The published registry ingest contract matches the implementation.

@@ -234,10 +234,25 @@ fn alert_due(
     true
 }
 
+// Windows account names are scoped to their authority. Keep the qualified
+// identity in correlation as well as history so equal short names cannot alias.
+fn account_identity(l: &UserLogonData) -> String {
+    let username = l.username.trim();
+    if username.is_empty() || username == "-" {
+        return String::new();
+    }
+    match l.domain.as_deref().map(str::trim) {
+        Some(domain) if !domain.is_empty() && domain != "-" => {
+            format!("{domain}\\{username}").to_lowercase()
+        }
+        _ => username.to_lowercase(),
+    }
+}
+
 impl WindowsLogonTracker {
     /// Feed one normalised logon outcome. Returns the detections it completes.
     pub fn observe(&mut self, l: &UserLogonData, now: f64) -> Vec<DetectionData> {
-        let user = l.username.to_ascii_lowercase();
+        let user = account_identity(l);
         let source = l
             .src_addr
             .clone()
@@ -267,8 +282,8 @@ impl WindowsLogonTracker {
                     "T1110.001",
                     65,
                     &user,
-                    format!("{n} failed logons for {} within {WINDOW:.0}s", l.username),
-                    serde_json::json!({ "user": l.username, "failures": n,
+                    format!("{n} failed logons for {user} within {WINDOW:.0}s"),
+                    serde_json::json!({ "user": user, "username": l.username, "domain": l.domain, "failures": n,
                         "history_capped": n == MAX_FAILURES_PER_KEY,
                         "src_addr": l.src_addr, "last_reason": l.failure_reason }),
                     l,
@@ -352,8 +367,8 @@ impl WindowsLogonTracker {
                 "T1110.001",
                 80,
                 &user,
-                format!("{} logged on after {failures} failed attempts", l.username),
-                serde_json::json!({ "user": l.username, "failures": failures,
+                format!("{user} logged on after {failures} failed attempts"),
+                serde_json::json!({ "user": user, "username": l.username, "domain": l.domain, "failures": failures,
                     "history_capped": failures == MAX_FAILURES_PER_KEY,
                     "src_addr": l.src_addr, "logon_type": l.logon_type_name }),
                 l,
@@ -385,7 +400,7 @@ fn detection(
         detail,
         evidence,
         correlation: Some(CorrelationKeys {
-            user: Some(l.username.clone()),
+            user: Some(account_identity(l)),
             remote_ip: l.src_addr.clone(),
             ..Default::default()
         }),
@@ -517,6 +532,64 @@ mod tests {
             success: false,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn domain_qualified_accounts_are_isolated_and_case_insensitive() {
+        let mut tracker = WindowsLogonTracker::default();
+        let mut failure = fail("Alice", Some("203.0.113.5"));
+        failure.domain = Some("CORP-A".into());
+        for now in [0.0, 1.0, 2.0] {
+            tracker.observe(&failure, now);
+        }
+        let mut other_success = failure.clone();
+        other_success.domain = Some("CORP-B".into());
+        other_success.success = true;
+        assert!(
+            tracker.observe(&other_success, 3.0).is_empty(),
+            "same short name in another domain must not inherit failures"
+        );
+        let mut success = failure;
+        success.username = "ALICE".into();
+        success.domain = Some("corp-a".into());
+        success.success = true;
+        let findings = tracker.observe(&success, 4.0);
+        let finding = findings
+            .iter()
+            .find(|d| d.rule_id == "auth.windows_bruteforce_success")
+            .unwrap();
+        assert_eq!(finding.subject, "corp-a\\alice");
+        assert_eq!(finding.evidence["user"], "corp-a\\alice");
+        assert_eq!(
+            finding.correlation.as_ref().unwrap().user.as_deref(),
+            Some("corp-a\\alice")
+        );
+        assert!(tracker.observe(&success, 5.0).is_empty());
+    }
+
+    #[test]
+    fn spray_counts_qualified_accounts_in_different_domains() {
+        let mut tracker = WindowsLogonTracker::default();
+        let mut findings = Vec::new();
+        for i in 0..5 {
+            let mut failure = fail("alice", Some("203.0.113.5"));
+            failure.domain = Some(format!("DOMAIN-{i}"));
+            findings.extend(tracker.observe(&failure, i as f64));
+        }
+        let finding = findings
+            .iter()
+            .find(|d| d.rule_id == "auth.windows_password_spray")
+            .expect("five domains identify five distinct accounts");
+        assert_eq!(
+            finding.evidence["users"],
+            serde_json::json!([
+                "domain-0\\alice",
+                "domain-1\\alice",
+                "domain-2\\alice",
+                "domain-3\\alice",
+                "domain-4\\alice"
+            ])
+        );
     }
 
     #[test]

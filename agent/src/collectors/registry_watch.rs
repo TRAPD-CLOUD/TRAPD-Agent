@@ -624,7 +624,16 @@ pub fn retain_unavailable(previous: &Snapshot, mut current: Snapshot) -> anyhow:
 }
 
 /// Canonical HKLM/HKU paths only; reuse the watcher table for native audit events.
+/// Classify an observed key object without inventing a value write.
+pub fn category_for_key_path(path: &str) -> Option<&'static str> {
+    category_for_object(path, None)
+}
+
 pub fn category_for_path(path: &str, name: &str) -> Option<&'static str> {
+    category_for_object(path, Some(name))
+}
+
+fn category_for_object(path: &str, name: Option<&str>) -> Option<&'static str> {
     let (root, tail) = path.split_once('\\')?;
     let (scope, relative) = if root.eq_ignore_ascii_case("HKLM") {
         (Scope::Machine, tail)
@@ -657,27 +666,32 @@ pub fn category_for_path(path: &str, name: &str) -> Option<&'static str> {
         .then(|| format!("SYSTEM\\CurrentControlSet\\{tail}"))
     });
     let relative = numbered.as_deref().unwrap_or(relative);
-    let name = if name == "(Default)" { "" } else { name };
+    let name = name.map(|name| if name == "(Default)" { "" } else { name });
     SPECS.iter().find_map(|spec| {
         if std::mem::discriminant(&spec.scope) != std::mem::discriminant(&scope) {
             return None;
         }
         let matches = match spec.shape {
             Shape::Values(names) => {
-                relative.eq_ignore_ascii_case(spec.path) && name_wanted(names, name)
+                relative.eq_ignore_ascii_case(spec.path)
+                    && name.is_none_or(|name| name_wanted(names, name))
             }
             Shape::Children { child, names } => {
+                if name.is_none() && relative.eq_ignore_ascii_case(spec.path) {
+                    return Some(spec.category);
+                }
                 if !below(relative, spec.path) || relative.len() <= spec.path.len() {
                     return None;
                 }
                 let rest = relative.get(spec.path.len() + 1..)?;
                 let shape_matches = match child {
                     None => !rest.is_empty() && !rest.contains('\\'),
+                    Some(_) if name.is_none() && !rest.is_empty() && !rest.contains('\\') => true,
                     Some(child) => rest.split_once('\\').is_some_and(|(sub, tail)| {
                         !sub.is_empty() && tail.eq_ignore_ascii_case(child)
                     }),
                 };
-                shape_matches && name_wanted(names, name)
+                shape_matches && name.is_none_or(|name| name_wanted(names, name))
             }
         };
         matches.then_some(spec.category)
@@ -955,6 +969,7 @@ impl From<&Change> for RegistryEventData {
             user_sid: c.key.user_sid.clone(),
             old_value: c.old.clone(),
             new_value: c.new.clone(),
+            rename_from: None,
             suppressed: None,
         }
     }
@@ -1016,6 +1031,7 @@ pub fn storm_event(category: &str, suppressed: u32) -> RegistryEventData {
         user_sid: None,
         old_value: None,
         new_value: Some(category.to_string()),
+        rename_from: None,
         suppressed: Some(suppressed),
     }
 }
@@ -1110,6 +1126,21 @@ pub mod tests {
 
     fn user_run(reg: &mut FakeReg, name: &str, data: &str) {
         reg.set(RegRoot::Users, &format!("{SID}\\{RUN}"), name, data);
+    }
+
+    #[test]
+    fn watched_key_objects_classify_without_fabricated_value_names() {
+        assert_eq!(
+            category_for_key_path(r"HKLM\SYSTEM\CurrentControlSet\Services\demo"),
+            Some("service")
+        );
+        assert_eq!(
+            category_for_key_path(
+                r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\cmd.exe"
+            ),
+            Some("ifeo")
+        );
+        assert_eq!(category_for_key_path(r"HKLM\Unwatched\demo"), None);
     }
 
     #[test]
