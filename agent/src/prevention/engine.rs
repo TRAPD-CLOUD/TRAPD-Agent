@@ -329,6 +329,9 @@ impl Engine {
                 // bounded ring so a later honeytoken hit can ship the session's
                 // pre-history. Cheap and lock-poison-tolerant.
                 self.recorder.record(&event);
+                if crate::detection::is_historical_windows_record(&event) {
+                    continue;
+                }
                 if !self.prevention_enabled() {
                     self.kernel_blocker.set_enabled(false).await;
                     continue;
@@ -483,6 +486,17 @@ impl Engine {
 
     /// Auto-respond to a generic local detection (config-gated, off by default).
     async fn auto_respond_detection(&self, event: &AgentEvent, det: &DetectionData) {
+        if crate::detection::is_historical_windows_record(event) {
+            return;
+        }
+        // Signals are context, and shadow findings are observations only.
+        // Neither may cause a response even with permissive signed thresholds.
+        if matches!(
+            det.mode,
+            Some(crate::schema::DetectionMode::Signal | crate::schema::DetectionMode::Shadow)
+        ) {
+            return;
+        }
         let targets = response::targets_for_rule(&det.rule_id, &det.subject, &det.evidence);
         self.auto_respond(
             event,
@@ -2023,6 +2037,80 @@ mod tests {
             Arc::new(RwLock::new(AgentConfig::default())),
         );
         (engine, rx)
+    }
+
+    #[tokio::test]
+    async fn signal_and_shadow_findings_never_trigger_automatic_response() {
+        use crate::schema::{DetectionData, DetectionMode, EventClass, Severity};
+        for mode in [DetectionMode::Signal, DetectionMode::Shadow] {
+            let (engine, mut rx) = test_engine();
+            {
+                let mut cfg = engine.cfg_handle.write().unwrap();
+                cfg.prevention_enabled = true;
+                cfg.auto_response_enabled = true;
+                cfg.auto_response_action = "alert".into();
+                cfg.auto_response_min_severity = "low".into();
+                cfg.auto_response_min_confidence = 0;
+                cfg.auto_response_allowlist.clear();
+            }
+            let det = DetectionData {
+                rule_id: "credential_access.lsass_memory_access".into(),
+                category: "credential_access".into(),
+                confidence: 100,
+                mode: Some(mode),
+                ..Default::default()
+            };
+            let event = AgentEvent::new(
+                "test".into(),
+                "host".into(),
+                EventClass::Detection,
+                EventAction::Detected,
+                Severity::Critical,
+                EventData::Detection(Box::new(det.clone())),
+            );
+            engine.auto_respond_detection(&event, &det).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "a non-alert must not emit a prevention action"
+            );
+            assert!(engine.auto_cooldown.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_windows_findings_never_authorize_automatic_response() {
+        use crate::schema::{DetectionData, DetectionMode, EventClass, Severity};
+        let (engine, mut rx) = test_engine();
+        {
+            let mut cfg = engine.cfg_handle.write().unwrap();
+            cfg.prevention_enabled = true;
+            cfg.auto_response_enabled = true;
+            cfg.auto_response_action = "alert".into();
+            cfg.auto_response_min_severity = "low".into();
+            cfg.auto_response_min_confidence = 0;
+            cfg.auto_response_allowlist.clear();
+        }
+        let det = DetectionData {
+            rule_id: "execution.powershell_encoded".into(),
+            category: "execution".into(),
+            confidence: 100,
+            mode: Some(DetectionMode::Alert),
+            ..Default::default()
+        };
+        let event = AgentEvent::new(
+            "test".into(),
+            "host".into(),
+            EventClass::Detection,
+            EventAction::Detected,
+            Severity::Critical,
+            EventData::Detection(Box::new(det.clone())),
+        )
+        .with_source("windows_eventlog:Security:4688");
+        engine.auto_respond_detection(&event, &det).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "archived evidence needs current verification before a response"
+        );
     }
 
     #[tokio::test]

