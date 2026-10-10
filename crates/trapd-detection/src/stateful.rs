@@ -35,15 +35,21 @@ pub struct StatefulRules {
 fn recon_command(base: &str, cmdline: &str) -> Option<String> {
     let lower = cmdline.to_ascii_lowercase();
     let arg1 = lower.split_whitespace().nth(1).unwrap_or("");
+    // Windows image names carry an extension and arbitrary case (`WHOAMI.EXE`).
+    let base = base.to_ascii_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
     let name = match base {
         "whoami" | "id" | "uname" | "hostname" | "hostnamectl" | "ifconfig" | "ss" | "netstat"
         | "w" | "who" | "last" | "lastlog" | "lsb_release" | "arp" | "route" | "groups"
-        | "getent" | "lscpu" | "lsblk" | "env" | "printenv" | "uptime" => base.to_string(),
-        "ip" if matches!(
-            arg1,
-            "a" | "addr" | "address" | "r" | "route" | "link" | "neigh"
-        ) =>
-        {
+        | "getent" | "lscpu" | "lsblk" | "env" | "printenv" | "uptime"
+        // Windows discovery tools.
+        | "ipconfig" | "systeminfo" | "tasklist" | "nltest" | "quser" | "qwinsta" => {
+            base.to_string()
+        }
+        "net" | "net1" if matches!(arg1, "user" | "group" | "localgroup" | "view" | "accounts") => {
+            format!("net {arg1}")
+        }
+        "ip" if matches!(arg1, "a" | "addr" | "address" | "r" | "route" | "link" | "neigh") => {
             format!("ip {arg1}")
         }
         "ps" if lower.contains("aux") || lower.contains("-ef") || lower.contains("-e") => {
@@ -52,13 +58,8 @@ fn recon_command(base: &str, cmdline: &str) -> Option<String> {
         "sudo" if arg1 == "-l" => "sudo -l".into(),
         "cat" | "head" | "less" => {
             const FILES: &[&str] = &[
-                "/etc/passwd",
-                "/etc/group",
-                "/etc/os-release",
-                "/etc/issue",
-                "/etc/hosts",
-                "/etc/resolv.conf",
-                "/proc/version",
+                "/etc/passwd", "/etc/group", "/etc/os-release", "/etc/issue", "/etc/hosts",
+                "/etc/resolv.conf", "/proc/version",
             ];
             let f = FILES.iter().find(|f| lower.contains(*f))?;
             format!("{base} {f}")
@@ -266,6 +267,31 @@ mod tests {
         let d = s.observe_exec_recon("r", "ss", "ss -tan", 4.0).unwrap();
         assert_eq!(d.rule_id, "discovery.recon_burst");
         assert_eq!(d.subject, "r");
+    }
+
+    #[test]
+    fn recon_burst_matches_windows_image_names() {
+        let mut s = StatefulRules::new();
+        assert!(s
+            .observe_exec_recon("r", "whoami.exe", "whoami", 0.0)
+            .is_none());
+        assert!(s
+            .observe_exec_recon("r", "HOSTNAME.EXE", "hostname", 1.0)
+            .is_none());
+        assert!(s
+            .observe_exec_recon("r", "netstat.exe", "netstat -an", 2.0)
+            .is_none());
+        let d = s.observe_exec_recon("r", "arp.exe", "arp -a", 3.0).unwrap();
+        assert_eq!(d.rule_id, "discovery.recon_burst");
+    }
+
+    #[test]
+    fn recon_ignores_net_subcommands_that_are_not_discovery() {
+        assert_eq!(
+            recon_command("net.exe", "net user"),
+            Some("net user".into())
+        );
+        assert_eq!(recon_command("net.exe", "net use z: \\\\srv\\share"), None);
     }
 
     #[test]
