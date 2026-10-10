@@ -237,13 +237,20 @@ impl Transport {
 
                 // Read per-event results if the backend provides them.
                 let report: IngestResponse = resp.json().await.unwrap_or_default();
-                let (acked_seqs, requeue_seqs) = partition_by_report(&batch, &report);
+                let (acked_seqs, requeue_seqs, rejected_seqs) =
+                    partition_by_report(&batch, &report);
 
                 self.record_latency(&batch, &acked_seqs);
 
                 if let Ok(mut buf) = self.buffer.lock() {
+                    // Count only records still queued. Overflow may have
+                    // already evicted an in-flight record while awaiting HTTP.
+                    let rejected = buf.ack(&rejected_seqs);
+                    metrics().backend_rejected_events(rejected as u64);
                     let removed = buf.ack(&acked_seqs);
-                    metrics().transport_events_acknowledged(removed as u64);
+                    if removed > 0 {
+                        metrics().transport_events_acknowledged(removed as u64);
+                    }
                     if !requeue_seqs.is_empty() {
                         buf.nack(&requeue_seqs);
                     }
@@ -288,9 +295,9 @@ impl Transport {
                          dropping it (backend_rejected)"
                     );
                     if let Ok(mut buf) = self.buffer.lock() {
-                        buf.ack(&seqs);
+                        let removed = buf.ack(&seqs);
+                        metrics().backend_rejected_events(removed as u64);
                     }
-                    metrics().backend_rejected_events(n as u64);
                     FlushOutcome::Failed
                 } else {
                     warn!(%status, events = n, "Transport: transient backend error — will retry");
@@ -329,16 +336,20 @@ impl Transport {
     }
 }
 
-/// Split a batch into acknowledge / requeue sets based on the backend's report.
+/// Split a batch into accepted / retry / rejected sets without counting losses.
 ///
 /// An empty report means the backend does not do per-event accounting, so a 2xx
 /// covers the whole batch.
 fn partition_by_report(
     batch: &[crate::pipeline::SpoolEntry],
     report: &IngestResponse,
-) -> (Vec<u64>, Vec<u64>) {
+) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
     if report.accepted.is_empty() && report.rejected.is_empty() {
-        return (batch.iter().map(|e| e.seq).collect(), Vec::new());
+        return (
+            batch.iter().map(|e| e.seq).collect(),
+            Vec::new(),
+            Vec::new(),
+        );
     }
 
     let accepted: HashSet<&str> = report.accepted.iter().map(String::as_str).collect();
@@ -346,14 +357,13 @@ fn partition_by_report(
 
     let mut ack = Vec::new();
     let mut requeue = Vec::new();
-    let mut rejected_count = 0u64;
+    let mut rejected_seqs = Vec::new();
 
     for entry in batch {
         let id = entry.event.event_id.to_string();
         if rejected.contains(id.as_str()) {
-            // Permanently refused: remove it, but count it as loss.
-            ack.push(entry.seq);
-            rejected_count += 1;
+            // Loss is counted when this record actually leaves the queue.
+            rejected_seqs.push(entry.seq);
         } else if accepted.contains(id.as_str()) {
             ack.push(entry.seq);
         } else {
@@ -363,10 +373,7 @@ fn partition_by_report(
         }
     }
 
-    if rejected_count > 0 {
-        metrics().backend_rejected_events(rejected_count);
-    }
-    (ack, requeue)
+    (ack, requeue, rejected_seqs)
 }
 
 /// Whether an HTTP status means "never send this again".
@@ -470,6 +477,80 @@ mod tests {
         }
     }
 
+    static RESPONSE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn flush_with_response(status: &str, partial: bool, evict: bool) -> (u64, u64) {
+        let buffer = Arc::new(Mutex::new(Spool::in_memory(if evict { 1 } else { 2 })));
+        let rejected = event();
+        let rejected_id = rejected.event_id.to_string();
+        buffer.lock().unwrap().push(rejected).unwrap();
+        if !evict {
+            buffer.lock().unwrap().push(event()).unwrap();
+        }
+        let response_body = if partial {
+            serde_json::json!({"rejected": [rejected_id]}).to_string()
+        } else {
+            "{}".into()
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+            response_body.len(),
+        );
+        let server_buffer = Arc::clone(&buffer);
+        let (url, backend) = mock_backend_with(vec![response], move || {
+            if evict {
+                // Deterministic race: replace the in-flight record before replying.
+                server_buffer.lock().unwrap().push(event()).unwrap();
+            }
+        })
+        .await;
+        let mut transport = transport_for(url, 0);
+        transport.priority_wake = buffer.lock().unwrap().priority_wake();
+        transport.buffer = Arc::clone(&buffer);
+        let before = metrics().snapshot();
+        let outcome = transport.flush(false).await;
+        assert_eq!(
+            outcome,
+            if partial {
+                FlushOutcome::Delivered
+            } else {
+                FlushOutcome::Failed
+            }
+        );
+        backend.await.unwrap();
+        assert_eq!(buffer.lock().unwrap().len(), 1);
+        let after = metrics().snapshot();
+        assert_eq!(
+            after.last_ack_unix_ms, before.last_ack_unix_ms,
+            "a rejection-only response must not advance the acknowledgement clock"
+        );
+        (
+            after.backend_rejected_events_total - before.backend_rejected_events_total,
+            after.transport_events_acknowledged_total - before.transport_events_acknowledged_total,
+        )
+    }
+
+    #[tokio::test]
+    async fn permanent_rejection_does_not_double_count_an_evicted_record() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
+        assert_eq!(
+            flush_with_response("400 Bad Request", false, true).await.0,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_rejection_is_not_counted_as_acknowledged() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
+        assert_eq!(flush_with_response("200 OK", true, false).await, (1, 0));
+    }
+
+    #[tokio::test]
+    async fn partial_rejection_does_not_double_count_an_evicted_record() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
+        assert_eq!(flush_with_response("200 OK", true, true).await.0, 0);
+    }
+
     // ── Retryable vs permanent statuses ─────────────────────────────────────
 
     #[test]
@@ -513,7 +594,8 @@ mod tests {
     fn an_empty_report_acknowledges_the_whole_batch() {
         // Backends without per-event accounting: 2xx means "all of it".
         let batch: Vec<_> = (1..=3).map(entry).collect();
-        let (ack, requeue) = partition_by_report(&batch, &IngestResponse::default());
+        let (ack, requeue, rejected) = partition_by_report(&batch, &IngestResponse::default());
+        assert!(rejected.is_empty());
         assert_eq!(ack, vec![1, 2, 3]);
         assert!(requeue.is_empty());
     }
@@ -525,7 +607,8 @@ mod tests {
             accepted: vec![batch[0].event.event_id.to_string()],
             rejected: vec![],
         };
-        let (ack, requeue) = partition_by_report(&batch, &report);
+        let (ack, requeue, rejected) = partition_by_report(&batch, &report);
+        assert!(rejected.is_empty());
         assert_eq!(ack, vec![1]);
         assert_eq!(
             requeue,
@@ -541,8 +624,9 @@ mod tests {
             accepted: vec![batch[0].event.event_id.to_string()],
             rejected: vec![batch[1].event.event_id.to_string()],
         };
-        let (ack, requeue) = partition_by_report(&batch, &report);
-        assert_eq!(ack, vec![1, 2], "both leave the queue");
+        let (ack, requeue, rejected) = partition_by_report(&batch, &report);
+        assert_eq!(ack, vec![1], "only accepted records are acknowledged");
+        assert_eq!(rejected, vec![2], "refused records are tracked separately");
         assert!(requeue.is_empty(), "a rejected event must not be retried");
     }
 
@@ -555,7 +639,8 @@ mod tests {
             accepted: vec!["00000000-0000-0000-0000-000000000000".into()],
             rejected: vec![],
         };
-        let (ack, requeue) = partition_by_report(&batch, &report);
+        let (ack, requeue, rejected) = partition_by_report(&batch, &report);
+        assert!(rejected.is_empty());
         assert!(ack.is_empty());
         assert_eq!(requeue, vec![1, 2], "nothing was actually confirmed");
     }
@@ -568,15 +653,16 @@ mod tests {
             accepted: vec![id.clone(), id],
             rejected: vec![],
         };
-        let (ack, requeue) = partition_by_report(&batch, &report);
+        let (ack, requeue, rejected) = partition_by_report(&batch, &report);
+        assert!(rejected.is_empty());
         assert_eq!(ack, vec![1], "a repeated id must not acknowledge twice");
         assert_eq!(requeue, vec![2]);
     }
 
     #[test]
     fn an_empty_batch_partitions_to_nothing() {
-        let (ack, requeue) = partition_by_report(&[], &IngestResponse::default());
-        assert!(ack.is_empty() && requeue.is_empty());
+        let (ack, requeue, rejected) = partition_by_report(&[], &IngestResponse::default());
+        assert!(ack.is_empty() && requeue.is_empty() && rejected.is_empty());
     }
 
     #[test]
@@ -693,6 +779,13 @@ mod tests {
     /// Serves one scripted response per connection, in order, and records each
     /// request. `script` entries are full raw HTTP responses.
     async fn mock_backend(script: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<Seen>>) {
+        mock_backend_with(script, || {}).await
+    }
+
+    async fn mock_backend_with(
+        script: Vec<String>,
+        mut before_response: impl FnMut() + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<Vec<Seen>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
@@ -731,6 +824,7 @@ mod tests {
                         .map(|v| v.trim().to_string()),
                     body: buf[head_end..head_end + content_length].to_vec(),
                 });
+                before_response();
                 sock.write_all(response.as_bytes()).await.unwrap();
             }
             seen
@@ -761,6 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn compression_starts_only_after_the_backend_advertises_it() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
         let (url, backend) = mock_backend(vec![
             http("202 Accepted", "Accept-Encoding: gzip\r\n"),
             http("202 Accepted", "Accept-Encoding: gzip\r\n"),
@@ -795,6 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_backend_that_never_advertises_gzip_never_gets_it() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
         let (url, backend) =
             mock_backend(vec![http("202 Accepted", ""), http("202 Accepted", "")]).await;
         let t = transport_for(url, 40);
@@ -809,6 +905,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_415_for_gzip_keeps_the_events_and_turns_compression_off() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
         let (url, backend) = mock_backend(vec![http("415 Unsupported Media Type", "")]).await;
         let t = transport_for(url, 40);
         t.gzip_ok.store(true, Ordering::Relaxed);
@@ -823,6 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_after_from_a_throttled_response_is_recorded_and_events_are_kept() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
         let (url, _backend) =
             mock_backend(vec![http("429 Too Many Requests", "Retry-After: 7\r\n")]).await;
         let t = transport_for(url, 5);

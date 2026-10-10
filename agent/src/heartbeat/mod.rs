@@ -48,11 +48,16 @@ struct HeartbeatPayload {
     shadow_hits: std::collections::BTreeMap<String, u64>,
 }
 
-/// Cumulative (since process start) event accounting. For every accepted
-/// event exactly one of acknowledged / still queued / dropped holds, so
-/// `produced - dropped_total - acknowledged == queued` can be checked by the
-/// backend per heartbeat. Counters reset on a restart; `agent_last_restart`
-/// tells the reader when.
+/// Process-local event accounting; recovered records belong to the previous
+/// process and are added via `replayed_from_disk`, not `produced` or `spooled`.
+/// For a quiescent queue, the delivery-cohort balance is:
+/// `spooled + replayed_from_disk == acked + queued + queue_drops`, where
+/// `queue_drops` includes only `persistent_queue_full` and `backend_rejected`.
+/// `dropped_total` also includes pre-queue losses and unreadable/unsupported
+/// journal records, so it cannot be subtracted from this cohort's inputs.
+/// Snapshots read independent counters during live collection; a single beat
+/// is not an atomic balance check. Counters reset on restart, identified by
+/// `agent_last_restart`.
 #[derive(Serialize, Debug, PartialEq, Eq)]
 struct PipelineCounters {
     /// Events accepted by the pipeline.
@@ -70,7 +75,8 @@ struct PipelineCounters {
     dropped_by_reason: BTreeMap<String, u64>,
     /// Detection/prevention events lost to queue overflow (subset of dropped).
     priority_evicted: u64,
-    /// Events recovered from the on-disk queue at start (replayed after a restart).
+    /// Valid records replayed at startup, including those evicted by recovery
+    /// capacity limits. Corrupt/unsupported records are excluded.
     replayed_from_disk: u64,
     /// Events re-queued for another attempt after a failed send.
     retried: u64,
@@ -318,7 +324,7 @@ mod tests {
                 ("process".to_string(), 7),
                 ("network".to_string(), 3),
             ]),
-            spool_accepted_total: 9,
+            spool_accepted_total: 10,
             transport_events_sent_total: 8,
             transport_events_acknowledged_total: 6,
             collector_events_dropped_total: 1,
@@ -326,16 +332,21 @@ mod tests {
                 "persistent_queue_full".to_string(),
                 1,
             )]),
-            spool_events: 3,
+            spool_recovered_records_total: 4,
+            spool_events: 7,
             ..Default::default()
         };
         let c = PipelineCounters::from_snapshot(&snap);
         assert_eq!(c.produced, 10);
         assert_eq!(c.produced_by_class["process"], 7);
-        assert_eq!((c.spooled, c.sent, c.acked, c.queued), (9, 8, 6, 3));
+        assert_eq!((c.spooled, c.sent, c.acked, c.queued), (10, 8, 6, 7));
         assert_eq!(c.dropped_by_reason["persistent_queue_full"], 1);
-        // The invariant the backend can check per heartbeat.
-        assert_eq!(c.produced, c.acked + c.queued + c.dropped_total);
+        assert_eq!(c.replayed_from_disk, 4);
+        // The queue cohort includes valid replayed events after a restart.
+        assert_eq!(
+            c.spooled + c.replayed_from_disk,
+            c.acked + c.queued + c.dropped_by_reason["persistent_queue_full"],
+        );
     }
 
     #[test]

@@ -1024,6 +1024,21 @@ Persisted locally in `credentials.json`.
 }
 ```
 
+The heartbeat also carries `agent_uptime_seconds`, `agent_last_restart`,
+`previous_shutdown`, and process-local `pipeline` counters. Valid startup
+journal records are counted in `pipeline.replayed_from_disk`, including records
+subsequently evicted while enforcing recovery capacity. They are not included
+in `produced` or `spooled`.
+
+For a quiescent delivery queue:
+`spooled + replayed_from_disk == acked + queued + queue_drops`, where
+`queue_drops` is the sum of `dropped_by_reason.persistent_queue_full` and
+`dropped_by_reason.backend_rejected` (absent reasons mean zero).
+Do not substitute `dropped_total`: it includes pre-queue losses and corrupt or
+unsupported journal records that were never successfully replayed. Live
+snapshots read independent counters, so a single heartbeat is not an atomic
+balance check. Compare counters within the same `agent_last_restart` cohort.
+
 ### `Metrics`
 
 ```json
