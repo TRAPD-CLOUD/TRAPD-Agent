@@ -475,13 +475,35 @@ pub struct SystemSnapshotData {
     pub load_avg: [f64; 3],
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserLogonData {
     pub username: String,
     pub src_addr: Option<String>,
     pub src_port: Option<u16>,
     pub auth_method: Option<String>,
     pub success: bool,
+    /// Windows account domain (`TargetDomainName`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Windows logon type (2 interactive, 3 network, 10 remote interactive...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logon_type: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logon_type_name: Option<String>,
+    /// NTSTATUS of a failed logon (`0xc000006d`) and its sub status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_status: Option<String>,
+    /// Human-readable failure reason resolved from status/sub status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    /// Source workstation name when no source address is logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workstation: Option<String>,
+    /// Process that requested the logon (`ProcessName`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

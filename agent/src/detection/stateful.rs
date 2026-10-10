@@ -29,6 +29,7 @@ pub struct StatefulRules {
     failures: HashMap<String, VecDeque<f64>>,
     chmods: HashMap<String, f64>,
     units: HashMap<String, (f64, String)>,
+    windows_logons: super::windows_logon::WindowsLogonTracker,
 }
 
 /// Normalised discovery command, or `None` when the exec is not discovery.
@@ -149,6 +150,15 @@ impl StatefulRules {
             }),
             ..Default::default()
         })
+    }
+
+    /// Windows logon outcome (brute force, spray, success after failures).
+    pub fn observe_windows_logon(
+        &mut self,
+        l: &crate::schema::UserLogonData,
+        now: f64,
+    ) -> Vec<DetectionData> {
+        self.windows_logons.observe(l, now)
     }
 
     /// `chmod` that set an execute bit on `path`.

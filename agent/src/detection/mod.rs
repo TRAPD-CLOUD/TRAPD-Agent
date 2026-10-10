@@ -40,6 +40,8 @@ pub mod sigma;
 mod stateful;
 #[cfg(any(windows, test))]
 pub mod windows_decoy;
+pub mod windows_evasion_rules;
+pub mod windows_logon;
 pub mod windows_rules;
 
 #[cfg(feature = "yara")]
@@ -412,6 +414,18 @@ impl DetectionEngine {
             EventData::RansomwareIndicator(r) => {
                 self.inspect_ransomware(r, &mut out);
             }
+            // Windows logons (normalised, carry a logon type) have their own
+            // account- and source-keyed tracker; the SSH one is source-only.
+            EventData::UserLogon(l) if l.logon_type.is_some() => {
+                let hits = self
+                    .stateful
+                    .lock()
+                    .map(|mut st| st.observe_windows_logon(l, elapsed_secs))
+                    .unwrap_or_default();
+                for d in hits {
+                    out.push(self.detection(Severity::Info, d));
+                }
+            }
             EventData::UserLogon(l) => {
                 let src = l.src_addr.as_deref().unwrap_or("");
                 let hit =
@@ -762,7 +776,10 @@ impl DetectionEngine {
             out.push(self.detection(Severity::Info, d));
         }
         // Windows LOLBin / persistence / evasion rules (match `*.exe` only).
-        for d in windows_rules::inspect_process(comm, exe, cmdline, ctx) {
+        let windows_found = windows_rules::inspect_process(comm, exe, cmdline, ctx);
+        let windows_extra =
+            windows_evasion_rules::inspect_additional(comm, exe, cmdline, ctx, &windows_found);
+        for d in windows_found.into_iter().chain(windows_extra) {
             out.push(self.detection(Severity::Info, d));
         }
 
@@ -2555,6 +2572,7 @@ mod tests {
                     src_port: None,
                     auth_method: Some("password".into()),
                     success: ok,
+                    ..Default::default()
                 }),
             )
         };
