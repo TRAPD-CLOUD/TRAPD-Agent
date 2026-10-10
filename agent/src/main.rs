@@ -174,6 +174,10 @@ async fn main() -> Result<()> {
 
     if let Err(e) = selfprotect::binary_integrity::check() {
         error!("{e:#}");
+        // Not transient: hold before exiting so Restart=always cannot spin.
+        if let Some(hold) = selfprotect::binary_integrity::hold_duration(&e) {
+            tokio::time::sleep(hold).await;
+        }
         anyhow::bail!("{e}");
     }
 

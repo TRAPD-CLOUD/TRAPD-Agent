@@ -166,6 +166,14 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     // a self-reported version to excuse a hash mismatch.
     if let Err(e) = crate::selfprotect::binary_integrity::check() {
         error!("{e:#}");
+        // Not transient: hold (service stays STOP-able) before reporting the
+        // failure, so the SCM recovery policy cannot restart-loop every 10 s.
+        if let Some(hold) = crate::selfprotect::binary_integrity::hold_duration(&e) {
+            tokio::select! {
+                _ = tokio::time::sleep(hold) => {}
+                _ = stop.recv() => {}
+            }
+        }
         return Err(e);
     }
 
