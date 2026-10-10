@@ -212,6 +212,7 @@ impl Transport {
         }
 
         let started = Instant::now();
+        metrics().transport_events_sent(n as u64);
         let response = request.body(body).send().await;
         metrics().set_transport_activity(
             n as u64,

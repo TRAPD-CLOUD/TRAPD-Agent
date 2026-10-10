@@ -90,8 +90,9 @@ pub fn try_tee(tx: &mpsc::Sender<AgentEvent>, event: AgentEvent, source: &str) -
 /// than in each collector. A collector that forgets to call a producer-side
 /// counter would silently understate the received total and make the drop
 /// accounting unverifiable; there is no equivalent way to bypass the consumer.
-pub fn accepted() {
+pub fn accepted(event: &AgentEvent) {
     metrics().collector_event_received();
+    metrics().class_event_received(&event.class);
 }
 
 /// Log the first overflow and then roughly every 1000th, so a sustained stall

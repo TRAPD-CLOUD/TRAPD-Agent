@@ -48,9 +48,9 @@ use collectors::linux::{
 // Only consumed by the Linux `async fn main`; the Windows runtime (winsvc::run)
 // imports these itself, so gate them to avoid an unused-import warning there.
 #[cfg(target_os = "linux")]
-use collectors::system::SystemCollector;
-#[cfg(target_os = "linux")]
 use collectors::logs::LogCollector;
+#[cfg(target_os = "linux")]
+use collectors::system::SystemCollector;
 #[cfg(target_os = "linux")]
 use collectors::Collector;
 #[cfg(target_os = "linux")]
@@ -109,7 +109,9 @@ async fn main() -> Result<()> {
         {
             paths::init_state_dir();
             collectors::windows::honeytokens::uninstall(&config::load_persisted());
-            crate::deception::activity::ActivityStore::purge(&crate::deception::activity::state_path());
+            crate::deception::activity::ActivityStore::purge(
+                &crate::deception::activity::state_path(),
+            );
             info!("Uninstall cleanup complete (honeytoken files + registry decoys + activity profile removed)");
         }
         #[cfg(not(target_os = "windows"))]
@@ -248,6 +250,7 @@ async fn main() -> Result<()> {
         OutputMode::File => "file",
     };
 
+    heartbeat::lifecycle::begin_process();
     info!(
         agent_id   = %agent_id,
         device_id  = %device_id,
@@ -388,14 +391,19 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         spawn_collector!(SystemCollector::new());
-        spawn_collector!(collectors::windows::sensor_supervisor::SensorSupervisor::new(
-            Arc::clone(&agent_config)
-        ));
+        spawn_collector!(
+            collectors::windows::sensor_supervisor::SensorSupervisor::new(Arc::clone(
+                &agent_config
+            ))
+        );
         spawn_collector!(collectors::windows::eventlog::EventLogCollector::new(
             Arc::clone(&agent_config)
         ));
         crate::deception::activity::set_enabled(
-            agent_config.read().map(|c| c.deception_activity_learning_enabled).unwrap_or(false)
+            agent_config
+                .read()
+                .map(|c| c.deception_activity_learning_enabled)
+                .unwrap_or(false),
         );
         spawn_collector!(collectors::windows::honeytokens::HoneytokenCollector::new(
             Arc::clone(&agent_config)
@@ -528,8 +536,10 @@ async fn main() -> Result<()> {
                 baseline_engine.persist_baseline();
                 #[cfg(windows)]
                 {
-                    let enabled = learning_config.read()
-                        .map(|c| c.deception_activity_learning_enabled).unwrap_or(false);
+                    let enabled = learning_config
+                        .read()
+                        .map(|c| c.deception_activity_learning_enabled)
+                        .unwrap_or(false);
                     if crate::deception::activity::enabled() != enabled {
                         crate::deception::activity::set_enabled(enabled);
                     }
@@ -644,6 +654,7 @@ async fn main() -> Result<()> {
         Err(e) => error!("could not checkpoint the spool on shutdown: {e}"),
     }
 
+    heartbeat::lifecycle::mark_clean_shutdown();
     info!("Shutdown complete");
     Ok(())
 }
@@ -692,7 +703,7 @@ pub(crate) async fn emit_finding(
 }
 
 async fn handle_event(event: &schema::AgentEvent, mode: &OutputMode, buf: &Arc<Mutex<Spool>>) {
-    pipeline::accepted();
+    pipeline::accepted(event);
     if let Err(err) = write_event(event, mode).await {
         error!("Failed to write event: {err}");
     }

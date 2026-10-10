@@ -281,6 +281,7 @@ impl Spool {
         self.bytes += entry.bytes as u64;
         let priority = is_priority(&entry.event);
         self.mem.push_back(entry);
+        metrics().spool_event_accepted();
 
         self.enforce_caps();
 
@@ -304,12 +305,30 @@ impl Spool {
     /// Evict from the front until both caps are satisfied.
     fn enforce_caps(&mut self) {
         let mut evicted = 0u64;
+        let mut priority_evicted = 0u64;
         while self.mem.len() > self.max_events || self.bytes > self.max_bytes {
-            let Some(old) = self.mem.pop_front() else {
+            // Shed the oldest bulk telemetry first; detections and prevention
+            // actions are only sacrificed when nothing else is left to shed.
+            let idx = self
+                .mem
+                .iter()
+                .position(|e| !is_priority(&e.event))
+                .unwrap_or(0);
+            let Some(old) = self.mem.remove(idx) else {
                 break;
             };
+            if is_priority(&old.event) {
+                priority_evicted += 1;
+            }
             self.bytes = self.bytes.saturating_sub(old.bytes as u64);
             evicted += 1;
+        }
+        if priority_evicted > 0 {
+            metrics().spool_priority_evicted(priority_evicted);
+            warn!(
+                priority_evicted,
+                "spool at capacity with no bulk events left, evicting detection/prevention events"
+            );
         }
         if evicted > 0 {
             self.dropped_total += evicted;
