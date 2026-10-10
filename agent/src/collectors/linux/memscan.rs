@@ -397,12 +397,27 @@ impl MemScanCollector {
         if crate::telemetry::identity::process_start_time(pid) != Some(start) {
             return Vec::new();
         }
+        // Carry the image path and hash so suppressions can match the binary
+        // (hashed once per process, only when a finding is new; the hash is
+        // cached and size-capped by `exehash`).
+        let image = exe.starts_with('/').then_some(exe.as_str());
+        let mut image_hash: Option<Option<String>> = None;
         out.into_iter()
             .filter_map(|(key, severity, mut finding)| {
                 if !self.seen.insert(key) {
                     return None;
                 }
                 finding.evidence["process_start_time"] = serde_json::json!(start);
+                if let Some(path) = image {
+                    let hash =
+                        image_hash.get_or_insert_with(|| super::exehash::hash_executable(path));
+                    finding.correlation = Some(trapd_schema::CorrelationKeys {
+                        pid: Some(pid),
+                        exe: Some(path.to_string()),
+                        exe_sha256: hash.clone(),
+                        ..Default::default()
+                    });
+                }
                 Some((severity, finding))
             })
             .collect()

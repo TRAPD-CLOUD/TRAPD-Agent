@@ -47,7 +47,7 @@ struct ReleaseStatement {
     sha256: String,
     size: u64,
     /// Base64 Ed25519 signature over the raw binary SHA-256 digest, verified
-    /// against the host's optional `signing.pub` by the apply helper.
+    /// against the host's pinned release key (`release_signing.pub`) by the apply helper.
     #[serde(default)]
     binary_signature: Option<String>,
     /// Linux only: the kernel-side eBPF object shipped with this version. Its

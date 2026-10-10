@@ -66,9 +66,13 @@ const REGISTRY_VALUES: &[(&str, &str)] = &[
 /// (plant/replant/restore) are treated as self-inflicted and suppressed.
 const SELF_WRITE_SUPPRESSION: Duration = Duration::from_secs(3);
 
-/// Cadence of the resilience sweep (replant missing decoys) and of the
-/// last-access poll that detects content reads.
+/// Cadence of the resilience sweep (replant missing decoys).
 const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Cadence of the last-access poll. NTFS only updates the timestamp when the
+/// volume has last-access updates enabled (and may defer the write), so this
+/// bounds our own latency, not the OS's; the old 15 s sweep polled too slowly.
+const ACCESS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Honeytoken *health* is reported to the backend every N sweeps (= 60s with
 /// the 15s sweep), matching the Linux health verifier's cadence. The backend
@@ -389,6 +393,63 @@ mod ownership_regressions {
     }
 
     #[test]
+    fn health_hash_preserves_external_access_waiting_for_attribution() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _serial = serialize();
+        let path =
+            std::env::temp_dir().join(format!("trapd-win-health-access-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(FsState::default());
+        plant_missing(std::slice::from_ref(&path), &state);
+        state
+            .started
+            .set(Instant::now() - Duration::from_secs(60))
+            .unwrap();
+        state.planted.lock().unwrap().clear();
+        // Deterministically represent an external timestamp move. This avoids
+        // depending on the host's deferred/disabled NTFS access-time updates.
+        let observed = accessed_time(&path).unwrap();
+        state
+            .atime
+            .lock()
+            .unwrap()
+            .insert(path.clone(), observed - Duration::from_secs(1));
+        let config = Arc::new(RwLock::new(AgentConfig::default()));
+        config.write().unwrap().honeytoken_paths = vec![path.display().to_string()];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        runtime.block_on(sweep(&tx, "agent", "host", &config, &state, true));
+        assert!(
+            state.pending_access.lock().unwrap().contains_key(&path),
+            "health hash must preserve the external read before rebasing its own read"
+        );
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|e| matches!(e.action, EventAction::HoneytokenAccess)));
+        state
+            .pending_access
+            .lock()
+            .unwrap()
+            .insert(path.clone(), Instant::now() - Duration::from_secs(7));
+        poll_last_access(&tx, "agent", "host", &config, &state);
+        let hits: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|e| matches!(e.action, EventAction::HoneytokenAccess))
+            .collect();
+        assert_eq!(hits.len(), 1);
+        let EventData::HoneytokenAccess(hit) = &hits[0].data else {
+            panic!("access expected")
+        };
+        assert_eq!(hit.access_kind, "last_access");
+        assert!(state.pending_access.lock().unwrap().is_empty());
+        // A subsequent agent health read is not another external access.
+        runtime.block_on(sweep(&tx, "agent", "host", &config, &state, true));
+        poll_last_access(&tx, "agent", "host", &config, &state);
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|e| matches!(e.action, EventAction::HoneytokenAccess)));
+        config.write().unwrap().honeytoken_paths.clear();
+        reconcile_removed(&tx, "agent", "host", &config, &state);
+    }
+
+    #[test]
     fn registry_entries_are_not_treated_as_files() {
         let cfg = AgentConfig {
             honeytoken_paths: vec![
@@ -427,6 +488,11 @@ struct FsState {
     reported: Mutex<HashSet<PathBuf>>,
     /// The host the bait is tailored to (set once when the collector starts).
     host: std::sync::OnceLock<HostIdentity>,
+    /// When the collector started (start-up warm-up for last-access hits).
+    started: std::sync::OnceLock<Instant>,
+    /// Moved last-access times still waiting for an explaining process start,
+    /// keyed by decoy path, with when the move was first seen.
+    pending_access: Mutex<HashMap<PathBuf, Instant>>,
 }
 
 impl FsState {
@@ -480,9 +546,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn sha256_of_file(path: &Path) -> Option<String> {
-    crate::paths::bounded_regular_sha256(path, MAX_TOKEN_HASH_BYTES)
-        .ok()
-        .map(|digest| format!("sha256:{digest}"))
+    crate::paths::bounded_regular_sha256_label(path, MAX_TOKEN_HASH_BYTES).ok()
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
@@ -510,6 +574,7 @@ impl Collector for HoneytokenCollector {
         hostname: String,
     ) -> Result<()> {
         let state = Arc::new(FsState::default());
+        let _ = state.started.set(Instant::now());
         let _ = state.host.set(HostIdentity {
             hostname: hostname.clone(),
             dns_domain: host_dns_domain(),
@@ -562,19 +627,24 @@ impl Collector for HoneytokenCollector {
 
         // Resilience sweep + read (last-access) detection + periodic health.
         let mut tick: u32 = 0;
+        let mut sweep_timer = tokio::time::interval(SWEEP_INTERVAL);
+        let mut access_timer = tokio::time::interval(ACCESS_POLL_INTERVAL);
+        sweep_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        access_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Both intervals fire immediately once; the first sweep runs after a
+        // full period like before.
+        sweep_timer.tick().await;
         loop {
-            tokio::time::sleep(SWEEP_INTERVAL).await;
-            tick = tick.wrapping_add(1);
-            let report_health = tick.is_multiple_of(HEALTH_EVERY_N_SWEEPS);
-            sweep(
-                &tx,
-                &agent_id,
-                &hostname,
-                &self.config,
-                &state,
-                report_health,
-            )
-            .await;
+            tokio::select! {
+                _ = sweep_timer.tick() => {
+                    tick = tick.wrapping_add(1);
+                    let report_health = tick.is_multiple_of(HEALTH_EVERY_N_SWEEPS);
+                    sweep(&tx, &agent_id, &hostname, &self.config, &state, report_health).await;
+                }
+                _ = access_timer.tick() => {
+                    poll_last_access(&tx, &agent_id, &hostname, &self.config, &state);
+                }
+            }
         }
     }
 }
@@ -896,13 +966,14 @@ fn handle_fs_event(
             debug!(path = %path.display(), "honeytoken event suppressed (own plant)");
             continue;
         }
-        emit_fs_event(tx, agent_id, hostname, path, access_kind);
+        // Notifications carry no actor: look for a process that named the file.
+        let accessor = crate::detection::accessor_correlation::attribute(&path.to_string_lossy());
+        emit_fs_event(tx, agent_id, hostname, path, access_kind, accessor);
     }
 }
 
-/// Periodic resilience pass: replant deleted decoys, poll last-access
-/// timestamps to detect content reads, and (on the slower health cadence)
-/// report each token's on-host status to the backend lifecycle mirror.
+/// Periodic resilience pass: replant deleted decoys and (on the slower health
+/// cadence) report each token's on-host status to the backend lifecycle mirror.
 async fn sweep(
     tx: &Sender<AgentEvent>,
     agent_id: &str,
@@ -930,26 +1001,6 @@ async fn sweep(
         }
     }
 
-    // Read detection: a moved-on last-access timestamp outside our own write
-    // suppression window means something opened the bait.
-    for path in &paths {
-        if !owns_path(path) {
-            continue;
-        }
-        let Some(now_at) = accessed_time(path) else {
-            continue;
-        };
-        let prev = state.atime.lock().ok().and_then(|m| m.get(path).copied());
-        if let Some(prev_at) = prev {
-            if now_at > prev_at && !state.recently_planted(path) {
-                emit_fs_event(tx, agent_id, hostname, path, "last_access");
-            }
-        }
-        if let Ok(mut m) = state.atime.lock() {
-            m.insert(path.clone(), now_at);
-        }
-    }
-
     // Health verification (Linux-parity): is each planted token still there,
     // and does its content digest still match? Catches tampering that happened
     // while the agent was down (no watcher event fired).
@@ -959,6 +1010,10 @@ async fn sweep(
             if !owns_path(path) {
                 continue;
             }
+            // Observe external access before our content read can advance the
+            // same NTFS timestamp. Waiting observations remain pending across
+            // the post-hash rebaseline and retain normal attribution grace.
+            poll_path_last_access(tx, agent_id, hostname, path, state);
             let expected = state.sha.lock().ok().and_then(|m| m.get(path).cloned());
             let actual = sha256_of_file(path);
             // Hashing is an agent content read. Advance the atime baseline
@@ -981,6 +1036,90 @@ async fn sweep(
                 tx, agent_id, hostname, path, present, modified, expected, actual, detection,
             );
         }
+    }
+}
+
+/// Read detection: a moved-on last-access timestamp outside our own write
+/// suppression window means something opened the bait. Runs every
+/// [`ACCESS_POLL_INTERVAL`] (a `metadata` call per decoy), independent of the
+/// slower resilience sweep, so a read is seen within seconds.
+///
+/// Policy (pure, tested in `detection::accessor_correlation`):
+///   * a recent `process.create` that names the decoy on its command line
+///     becomes the accessor and lifts the hit to high;
+///   * no accessor yet: the hit is held for a short grace period, because the
+///     process telemetry lags the file access;
+///   * during the start-up warm-up an unattributed hit is a restart artefact
+///     and only re-baselines.
+fn poll_last_access(
+    tx: &Sender<AgentEvent>,
+    agent_id: &str,
+    hostname: &str,
+    config: &Arc<RwLock<AgentConfig>>,
+    state: &FsState,
+) {
+    for path in &configured_paths(config) {
+        poll_path_last_access(tx, agent_id, hostname, path, state);
+    }
+}
+
+fn poll_path_last_access(
+    tx: &Sender<AgentEvent>,
+    agent_id: &str,
+    hostname: &str,
+    path: &Path,
+    state: &FsState,
+) {
+    use crate::detection::accessor_correlation::{attribute, last_access_action, LastAccessAction};
+    let since_start = state
+        .started
+        .get()
+        .map(Instant::elapsed)
+        .unwrap_or_default();
+    if !owns_path(path) {
+        return;
+    }
+    let Some(now_at) = accessed_time(path) else {
+        return;
+    };
+    let prev = state.atime.lock().ok().and_then(|m| m.get(path).copied());
+    let Some(prev_at) = prev else {
+        if let Ok(mut m) = state.atime.lock() {
+            m.insert(path.to_path_buf(), now_at);
+        }
+        return;
+    };
+    let moved = now_at > prev_at && !state.recently_planted(path);
+    let pending_since = state
+        .pending_access
+        .lock()
+        .ok()
+        .and_then(|m| m.get(path).copied());
+    if !moved && pending_since.is_none() {
+        return;
+    }
+    let accessor = attribute(&path.to_string_lossy());
+    let first_seen = pending_since.unwrap_or_else(Instant::now);
+    match last_access_action(since_start, accessor.is_some(), first_seen.elapsed()) {
+        LastAccessAction::Wait => {
+            if let Ok(mut p) = state.pending_access.lock() {
+                p.entry(path.to_path_buf()).or_insert(first_seen);
+            }
+            // Keep the old baseline so the move is seen again next tick.
+            return;
+        }
+        LastAccessAction::Suppress => {
+            debug!(path = %path.display(), "honeytoken last-access ignored (start-up warm-up, no accessor)");
+        }
+        LastAccessAction::Emit => {
+            emit_fs_event(tx, agent_id, hostname, path, "last_access", accessor);
+        }
+    }
+    if let Ok(mut p) = state.pending_access.lock() {
+        p.remove(path);
+    }
+    if let Ok(mut m) = state.atime.lock() {
+        m.insert(path.to_path_buf(), now_at);
     }
 }
 
@@ -1289,16 +1428,25 @@ fn emit_fs_event(
     hostname: &str,
     path: &Path,
     access_kind: &str,
+    accessor: Option<crate::detection::accessor_correlation::Match>,
 ) {
-    let (severity, confidence, tactic, technique) = describe_fs(access_kind);
+    let (severity, confidence, tactic, technique) =
+        crate::detection::accessor_correlation::fs_access_score(
+            access_kind,
+            accessor.as_ref().map(|m| m.kind),
+        );
     let data = HoneytokenAccessData {
         sensor: Some(if access_kind == "last_access" {
             crate::schema::HoneytokenSensor::WindowsLastAccess
         } else {
             crate::schema::HoneytokenSensor::WindowsChange
         }),
-        assessment: None,
-        assessment_reasons: Vec::new(),
+        assessment: Some(if accessor.is_some() {
+            crate::schema::HoneytokenAssessment::ContentAccess
+        } else {
+            crate::schema::HoneytokenAssessment::UnattributedAccess
+        }),
+        assessment_reasons: accessor.iter().map(|m| m.reason()).collect(),
         mode: None,
         token_id: format!("winfs:{}", path.display()),
         path: path.display().to_string(),
@@ -1308,7 +1456,7 @@ fn emit_fs_event(
         confidence,
         mitre_tactic: tactic.to_string(),
         mitre_technique: technique.to_string(),
-        accessor: unknown_accessor(),
+        accessor: accessor.map_or_else(unknown_accessor, |m| m.lineage),
         session: None,
         allowlisted_accessor: false,
         scheduled_sweep: false,
@@ -1317,31 +1465,8 @@ fn emit_fs_event(
     warn!(path = %path.display(), access_kind, "HONEYTOKEN TRIGGERED (filesystem)");
 }
 
-/// Scoring per access kind: `(severity, confidence, mitre_tactic, technique)`.
-/// Mirrors the Linux scoring where the semantics match (content read = 100,
-/// delete = tamper 90, rename = 85); `modify` is data manipulation.
-fn describe_fs(access_kind: &str) -> (Severity, u8, &'static str, &'static str) {
-    match access_kind {
-        "last_access" => (Severity::Low, 30, "TA0007 Discovery", "T1083"),
-        "open" => (
-            Severity::Critical,
-            100,
-            "TA0006 Credential Access",
-            "T1552.001",
-        ),
-        "modify" => (Severity::Critical, 90, "TA0040 Impact", "T1565.001"),
-        "unlink" => (Severity::Critical, 90, "TA0040 Impact", "T1070.004"),
-        "rename" => (Severity::High, 85, "TA0040 Impact", "T1070.004"),
-        _ => (
-            Severity::Critical,
-            90,
-            "TA0006 Credential Access",
-            "T1552.001",
-        ),
-    }
-}
-
-/// Windows change notifications carry no accessor identity (no PID/user), so
+/// Windows change notifications carry no accessor identity (no PID/user). When
+/// no process start can be correlated (see `detection::accessor_correlation`)
 /// the lineage is explicitly `unknown` — the backend treats the *fact* of the
 /// access as the signal, exactly like a Linux hit whose process exited before
 /// `/proc` could be read.

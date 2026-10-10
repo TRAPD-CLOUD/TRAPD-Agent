@@ -100,6 +100,12 @@ impl FieldView {
                 for ip in &e.resolved_ips {
                     put("answer", ip.clone());
                 }
+                if let Some(p) = &e.process {
+                    put("image", p.clone());
+                }
+                if let Some(pid) = e.pid {
+                    put("processid", pid.to_string());
+                }
                 ("dns_query", e.qname.clone())
             }
             EventData::FileOpen(e) => {

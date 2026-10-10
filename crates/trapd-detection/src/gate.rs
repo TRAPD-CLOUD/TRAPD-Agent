@@ -92,6 +92,11 @@ impl SuppressionRule {
             None => true,
             Some(p) => value.is_some_and(|v| glob_match(p, &v)),
         };
+        // Identity fields (image paths, accounts) may be Windows spellings.
+        let path_ok = |pattern: &Option<String>, value: Option<String>| match pattern {
+            None => true,
+            Some(p) => value.is_some_and(|v| glob_match_identity(p, &v)),
+        };
         let parent_exe = d
             .evidence
             .get("process_lineage")
@@ -100,13 +105,13 @@ impl SuppressionRule {
             .and_then(|e| e.get("exe"))
             .and_then(|v| v.as_str())
             .map(String::from);
-        field_ok(
+        path_ok(
             &self.exe,
             corr.exe.clone().or_else(|| Some(d.subject.clone())),
         ) && field_ok(&self.cmdline, evidence_str("cmdline"))
-            && field_ok(&self.user, corr.user.clone())
-            && field_ok(&self.parent_exe, parent_exe)
-            && field_ok(
+            && path_ok(&self.user, corr.user.clone())
+            && path_ok(&self.parent_exe, parent_exe)
+            && path_ok(
                 &self.path,
                 corr.file_path.clone().or_else(|| evidence_str("path")),
             )
@@ -115,13 +120,39 @@ impl SuppressionRule {
                 Some(h) => corr
                     .exe_sha256
                     .as_deref()
-                    .is_some_and(|x| x.eq_ignore_ascii_case(h)),
+                    .is_some_and(|x| digest_hex(x).eq_ignore_ascii_case(digest_hex(h))),
             }
             && match &self.remote {
                 None => true,
                 Some(r) => remote_match(r, corr.remote_ip.as_deref(), corr.domain.as_deref()),
             }
     }
+}
+
+/// Glob over an identity value (image path, parent image, file path, account).
+/// Windows spellings are compared the way Windows does: `\\` and `/` are the
+/// same separator and case is ignored. In glob syntax `\\` is an escape, so
+/// without this normalisation a pattern such as `C:\\Windows\\explorer.exe`
+/// could never match even the identical path.
+fn glob_match_identity(pattern: &str, value: &str) -> bool {
+    let windows = value.contains('\\') || value.as_bytes().get(1) == Some(&b':');
+    if windows {
+        glob_match(
+            &pattern.replace('\\', "/").to_ascii_lowercase(),
+            &value.replace('\\', "/").to_ascii_lowercase(),
+        )
+    } else {
+        glob_match(pattern, value)
+    }
+}
+
+/// Telemetry carries digests as `sha256:<hex>`; operators and the console
+/// write bare hex. Compare the hex only.
+fn digest_hex(d: &str) -> &str {
+    let d = d.trim();
+    d.strip_prefix("sha256:")
+        .or_else(|| d.strip_prefix("SHA256:"))
+        .unwrap_or(d)
 }
 
 fn glob_match(pattern: &str, value: &str) -> bool {
@@ -689,6 +720,73 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn sha256_suppression_matches_labelled_and_bare_digests_only_on_equal_hash() {
+        let hex = "ab".repeat(32);
+        let finding = |hash: Option<String>| DetectionData {
+            rule_id: "memory.anon_exec".into(),
+            correlation: Some(trapd_schema::CorrelationKeys {
+                exe: Some(r"C:\Windows\explorer.exe".into()),
+                exe_sha256: hash,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rule = |sha: &str| SuppressionRule {
+            id: "s".into(),
+            rule: "memory.*".into(),
+            exe: Some(r"C:\Windows\explorer.exe".into()),
+            cmdline: None,
+            user: None,
+            parent_exe: None,
+            path: None,
+            sha256: Some(sha.into()),
+            remote: None,
+            action: SuppressionAction::Downgrade,
+            expires_at: None,
+        };
+        let now = Utc::now();
+        // Telemetry label vs bare operator hex, in either case.
+        assert!(rule(&hex).matches(&finding(Some(format!("sha256:{hex}"))), now));
+        assert!(rule(&hex.to_uppercase()).matches(&finding(Some(format!("sha256:{hex}"))), now));
+        assert!(rule(&format!("sha256:{hex}")).matches(&finding(Some(hex.clone())), now));
+        // A different digest, or no digest at all, never matches.
+        assert!(!rule(&hex).matches(&finding(Some(format!("sha256:{}", "cd".repeat(32)))), now));
+        assert!(!rule(&hex).matches(&finding(None), now));
+    }
+
+    #[test]
+    fn windows_identity_globs_match_across_separator_and_case() {
+        for (pattern, value) in [
+            (r"C:\Windows\explorer.exe", r"C:\Windows\explorer.exe"),
+            (r"C:\Windows\explorer.exe", r"c:\windows\Explorer.EXE"),
+            (
+                r"C:\Program Files\Intune\*",
+                r"C:\Program Files\Intune\a\b.exe",
+            ),
+            ("C:/Windows/*", r"C:\Windows\System32\x.exe"),
+            (r"CORP\alice", r"corp\Alice"),
+        ] {
+            assert!(glob_match_identity(pattern, value), "{pattern} vs {value}");
+        }
+        for (pattern, value) in [
+            (
+                r"C:\Windows\explorer.exe",
+                r"C:\Users\bob\Temp\explorer.exe",
+            ),
+            (r"C:\Windows\explorer.exe", r"D:\Windows\explorer.exe"),
+            (
+                r"C:\Program Files\Intune\*",
+                r"C:\Program Files Evil\Intune\a.exe",
+            ),
+        ] {
+            assert!(!glob_match_identity(pattern, value), "{pattern} vs {value}");
+        }
+        // Unix paths stay case-sensitive.
+        assert!(!glob_match_identity("/usr/bin/Ls", "/usr/bin/ls"));
+        assert!(glob_match_identity("/usr/bin/*", "/usr/bin/ls"));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::Sender;
 
+use crate::collectors::critical_file as critical;
 use crate::collectors::fs_heuristics as heur;
 use crate::collectors::fs_plan::{self, Action, Change, Planner, Roots};
 use crate::collectors::Collector;
@@ -133,7 +134,7 @@ fn event(
             path,
             operation,
             source,
-            integrity: if realtime {
+            integrity: if realtime && before.is_none() && after.is_none() {
                 IntegrityStatus::NotChecked
             } else if violation {
                 IntegrityStatus::Violation
@@ -143,8 +144,63 @@ fn event(
             expected_hash: before.map(|f| f.sha256.clone()),
             actual_hash: after.map(|f| f.sha256.clone()),
             size_delta: before.map(|f| after.map(|a| a.size as i64).unwrap_or(0) - f.size as i64),
+            actor: None,
+            change_summary: None,
         }),
     )
+}
+
+/// A real-time event for a path whose content is tracked (the hosts file):
+/// hashes before/after, the added/removed lines, and the integrity verdict.
+/// Unchanged content (an attribute touch) stays plain telemetry.
+fn checked_event(
+    agent_id: &str,
+    hostname: &str,
+    path: String,
+    operation: FilesystemOperation,
+    verdict: &critical::Verdict,
+    before: Option<&critical::Snapshot>,
+    after: Option<&critical::Snapshot>,
+) -> AgentEvent {
+    let fp = |s: &critical::Snapshot| Fingerprint {
+        sha256: s.sha256.clone(),
+        size: s.size,
+    };
+    let (b, a) = (before.map(fp), after.map(fp));
+    let changed = matches!(verdict, critical::Verdict::Changed { .. });
+    let mut ev = event(
+        agent_id,
+        hostname,
+        path,
+        operation,
+        FilesystemSource::Realtime,
+        b.as_ref().filter(|_| changed),
+        a.as_ref().filter(|_| changed),
+    );
+    if let EventData::Filesystem(d) = &mut ev.data {
+        if let critical::Verdict::Changed { summary, .. } = verdict {
+            // A content verdict takes precedence over the notification kind:
+            // atomic replacement arrives as Created (RenamedTo).
+            ev.severity = Severity::High;
+            d.integrity = IntegrityStatus::Violation;
+            d.change_summary = summary.clone();
+        } else {
+            // Not a content change: report the hash we saw, flag nothing.
+            d.actual_hash = a.map(|f| f.sha256);
+        }
+    }
+    ev
+}
+
+/// Attach the best-effort actor (a process whose command line named the file).
+fn with_actor(mut ev: AgentEvent, path: &str) -> AgentEvent {
+    if let (EventData::Filesystem(d), Some(m)) = (
+        &mut ev.data,
+        crate::detection::accessor_correlation::attribute(path),
+    ) {
+        d.actor = Some(m.lineage);
+    }
+    ev
 }
 
 /// Locations watched for their named detections, in addition to the configured
@@ -452,6 +508,14 @@ impl FilesystemWatches {
     }
 }
 
+/// Files whose content is tracked: the hosts file under the real system root.
+fn critical_files() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
+            .join("System32\\drivers\\etc\\hosts"),
+    ]
+}
+
 fn change_for(kind: &EventKind, paths: &[PathBuf]) -> Vec<(Change, PathBuf)> {
     let first = || paths.first().cloned();
     match kind {
@@ -523,6 +587,15 @@ impl Collector for FilesystemCollector {
             std::time::Instant::now(),
         );
         let defaults = AgentConfig::default();
+        // Last known content of the tracked critical files (the hosts file).
+        // Seeded now so the first change is a diff, not a "baseline".
+        let mut critical_state: BTreeMap<String, critical::Snapshot> = BTreeMap::new();
+        for file in critical_files() {
+            let key = fs_plan::normalise(&file.to_string_lossy());
+            if let Some(snap) = critical::read_snapshot(&file, critical::is_diffable(&key)) {
+                critical_state.insert(key, snap);
+            }
+        }
         let baseline_path = crate::paths::state_dir().join("windows_fim_baseline.json");
         let saved: Baseline = std::fs::metadata(&baseline_path)
             .ok()
@@ -591,10 +664,55 @@ impl Collector for FilesystemCollector {
                                 );
                                 for action in actions {
                                     let event = match action {
-                                        Action::Generic { path, change } => Some(event(
-                                            &agent_id, &hostname, path, operation_for(change),
-                                            FilesystemSource::Realtime, None, None,
-                                        )),
+                                        Action::Generic { path, change } => {
+                                            let key = fs_plan::normalise(&path);
+                                            if critical::is_hosts_file(&key) {
+                                                // Content check: what changed in the hosts file?
+                                                let probe = PathBuf::from(&path);
+                                                let keep = critical::is_diffable(&key);
+                                                let (after, missing) = tokio::task::spawn_blocking(move || {
+                                                    let snapshot = critical::read_snapshot(&probe, keep);
+                                                    // An unreadable/oversize file is not proof of deletion.
+                                                    let missing = snapshot.is_none() && std::fs::metadata(&probe)
+                                                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                                                    (snapshot, missing)
+                                                }).await.ok().unwrap_or((None, false));
+                                                let ev = match after {
+                                                    Some(after) => {
+                                                        let before = critical_state.get(&key);
+                                                        let verdict = critical::compare(before, &after);
+                                                        let ev = checked_event(
+                                                            &agent_id, &hostname, path.clone(),
+                                                            operation_for(change), &verdict, before, Some(&after),
+                                                        );
+                                                        critical_state.insert(key, after);
+                                                        ev
+                                                    }
+                                                    None if missing => {
+                                                        let before = critical_state.get(&key);
+                                                        let verdict = critical::compare_missing(before);
+                                                        let ev = checked_event(
+                                                            &agent_id, &hostname, path.clone(),
+                                                            FilesystemOperation::Deleted, &verdict, before, None,
+                                                        );
+                                                        // Keep the last known fingerprint so a later
+                                                        // recreation is checked against it, not re-baselined.
+                                                        ev
+                                                    }
+                                                    None => event(
+                                                        &agent_id, &hostname, path.clone(), operation_for(change),
+                                                        FilesystemSource::Realtime, None, None,
+                                                    ),
+                                                };
+                                                Some(with_actor(ev, &path))
+                                            } else {
+                                                let ev = event(
+                                                    &agent_id, &hostname, path.clone(), operation_for(change),
+                                                    FilesystemSource::Realtime, None, None,
+                                                );
+                                                Some(with_actor(ev, &path))
+                                            }
+                                        }
                                         Action::Tamper { path, action } => Some(AgentEvent::new(
                                             agent_id.clone(), hostname.clone(),
                                             EventClass::Filesystem, EventAction::AgentTamper, Severity::Critical,
@@ -602,6 +720,9 @@ impl Collector for FilesystemCollector {
                                         )),
                                         Action::RansomExtension { path } => {
                                             Some(heur::suspicious_extension_event(&agent_id, &hostname, &path))
+                                        }
+                                        Action::RansomBurst { count } => {
+                                            Some(heur::rename_burst_event(&agent_id, &hostname, count))
                                         }
                                         Action::BackupDeletion { path } => {
                                             Some(heur::backup_deletion_event(&agent_id, &hostname, &path))
@@ -642,6 +763,109 @@ impl Collector for FilesystemCollector {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn changed_hosts_replacement_is_an_integrity_violation() {
+        let before = critical::snapshot_of(b"127.0.0.1 localhost\n", true);
+        let after = critical::snapshot_of(b"127.0.0.1 localhost\n203.0.113.1 bank.example\n", true);
+        let verdict = critical::compare(Some(&before), &after);
+        let operation = operation_for(Change::RenamedTo);
+        assert_eq!(operation, FilesystemOperation::Created);
+        let ev = checked_event(
+            "agent",
+            "host",
+            "C:\\Windows\\System32\\drivers\\etc\\hosts".into(),
+            operation,
+            &verdict,
+            Some(&before),
+            Some(&after),
+        );
+        assert_eq!(ev.severity, Severity::High);
+        assert!(matches!(ev.action, EventAction::Create));
+        let EventData::Filesystem(data) = ev.data else {
+            panic!("expected filesystem event")
+        };
+        assert_eq!(data.integrity, IntegrityStatus::Violation);
+        assert_eq!(data.expected_hash.as_deref(), Some(before.sha256.as_str()));
+        assert_eq!(data.actual_hash.as_deref(), Some(after.sha256.as_str()));
+        assert_eq!(data.size_delta, Some(25));
+        assert!(data
+            .change_summary
+            .unwrap()
+            .contains("203.0.113.1 bank.example"));
+    }
+
+    #[test]
+    fn known_hosts_delete_and_rename_away_preserve_the_expected_fingerprint() {
+        let before = critical::snapshot_of(b"127.0.0.1 localhost\n", true);
+        for change in [Change::Deleted, Change::RenamedFrom] {
+            let verdict = critical::compare_missing(Some(&before));
+            let ev = checked_event(
+                "agent",
+                "host",
+                "hosts".into(),
+                operation_for(change),
+                &verdict,
+                Some(&before),
+                None,
+            );
+            assert_eq!(ev.severity, Severity::High);
+            assert!(matches!(ev.action, EventAction::Delete));
+            let EventData::Filesystem(data) = ev.data else {
+                panic!("filesystem event expected")
+            };
+            assert_eq!(data.integrity, IntegrityStatus::Violation);
+            assert_eq!(data.expected_hash.as_deref(), Some(before.sha256.as_str()));
+            assert!(
+                data.actual_hash.is_none(),
+                "absence is not an empty file fingerprint"
+            );
+            assert_eq!(data.size_delta, Some(-(before.size as i64)));
+            assert!(data.change_summary.unwrap().contains("file missing"));
+        }
+        let verdict = critical::compare_missing(None);
+        let ev = checked_event(
+            "agent",
+            "host",
+            "hosts".into(),
+            FilesystemOperation::Deleted,
+            &verdict,
+            None,
+            None,
+        );
+        assert_eq!(ev.severity, Severity::Info);
+        let EventData::Filesystem(data) = ev.data else {
+            panic!("filesystem event expected")
+        };
+        assert_eq!(data.integrity, IntegrityStatus::NotChecked);
+        assert!(data.expected_hash.is_none());
+        assert!(data.actual_hash.is_none());
+        assert!(data.change_summary.is_none());
+    }
+
+    #[test]
+    fn unchanged_hosts_replacement_and_first_creation_are_informational() {
+        let snapshot = critical::snapshot_of(b"127.0.0.1 localhost\n", true);
+        for before in [Some(&snapshot), None] {
+            let verdict = critical::compare(before, &snapshot);
+            let ev = checked_event(
+                "agent",
+                "host",
+                "hosts".into(),
+                FilesystemOperation::Created,
+                &verdict,
+                before,
+                Some(&snapshot),
+            );
+            assert_eq!(ev.severity, Severity::Info);
+            let EventData::Filesystem(data) = ev.data else {
+                panic!("expected filesystem event")
+            };
+            assert_ne!(data.integrity, IntegrityStatus::Violation);
+            assert_eq!(data.actual_hash.as_deref(), Some(snapshot.sha256.as_str()));
+            assert!(data.change_summary.is_none());
+        }
+    }
 
     struct TestDirectory(PathBuf);
     impl Drop for TestDirectory {

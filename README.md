@@ -670,14 +670,18 @@ The `release` GitHub Actions workflow triggers on tag push, builds the release
 binary, and publishes it to GitHub Releases. Installed agents pick it up within
 24 hours via the auto-updater.
 
-For the signed in-agent updater, hosts with `/etc/trapd/signing.pub` and
-`binary.sig` also require a signature over the new binary's raw SHA-256 digest.
-Set the optional `BINARY_SIGNING_KEY` release secret to the base64 32-byte
-Ed25519 seed matching that public key. `cargo xtask sign-release` embeds the
-result as `binary_signature` in the release payload before signing the payload
-with `RELEASE_SIGNING_KEY`. The helper verifies it before swapping files,
-installs it with the integrity baseline, and restores both on rollback. A
-missing or invalid replacement signature leaves the installed binary untouched.
+For the signed in-agent updater, hosts that have the pinned release key
+(`release_signing.pub`; legacy fallback `config/signing.pub` only when the
+release key is absent) require a signature over the new binary's raw SHA-256
+digest. `cargo xtask sign-release` signs that digest with `RELEASE_SIGNING_KEY`
+(there is no separate binary key) and embeds the result as `binary_signature`
+in the release payload before signing the payload. The helper verifies it
+before swapping files, installs it as `binary.sig` with the integrity baseline,
+and restores both on rollback. If a binary is copied over an install by hand,
+the agent refreshes the baseline only when `binary.sig` verifies for it;
+otherwise it refuses to start, prints the remediation, and backs off (30 s up
+to 15 min) instead of restart-looping. A missing or invalid replacement
+signature leaves the installed binary untouched.
 
 ---
 

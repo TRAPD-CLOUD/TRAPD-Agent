@@ -173,10 +173,22 @@ pub fn set_read_audit_sacl(path: &Path) -> bool {
 
 /// Query effective machine policy without changing operator-owned audit settings.
 pub fn file_audit_enabled() -> Option<bool> {
+    success_audit_enabled(0x0cce921d_69ae_11d9_bed3_505054503030)
+}
+
+pub fn process_audit_enabled() -> Option<bool> {
+    success_audit_enabled(0x0cce922b_69ae_11d9_bed3_505054503030)
+}
+
+pub fn registry_audit_enabled() -> Option<bool> {
+    success_audit_enabled(0x0cce921e_69ae_11d9_bed3_505054503030)
+}
+
+fn success_audit_enabled(subcategory: u128) -> Option<bool> {
     use windows_sys::Win32::Security::Authentication::Identity::{
         AuditFree, AuditQuerySystemPolicy,
     };
-    let guid = windows_sys::core::GUID::from_u128(0x0cce921d_69ae_11d9_bed3_505054503030);
+    let guid = windows_sys::core::GUID::from_u128(subcategory);
     unsafe {
         let mut policy = std::ptr::null_mut();
         if !AuditQuerySystemPolicy(&guid, 1, &mut policy) || policy.is_null() {

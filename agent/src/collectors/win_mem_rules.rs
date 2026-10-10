@@ -135,7 +135,11 @@ pub fn classify(region: &WinRegion, ctx: RegionContext) -> Option<MemFinding> {
     }
     if ctx.thread_started_here {
         // Not excused for JIT runtimes: their threads start in their own
-        // modules; the generated code is *called* from there.
+        // modules; the generated code is *called* from there. Not excused for
+        // protected-location images either: a hollowed image keeps its path,
+        // and shellcode can be flipped RW -> RX before the thread starts, so a
+        // sealed region proves nothing. Known-benign cases belong in explicit
+        // detection suppressions, not in a blanket downgrade.
         return Some(MemFinding {
             rule_id: "memory.anon_exec",
             title: "Thread started in executable non-image memory (injected code running)",
@@ -314,6 +318,28 @@ mod tests {
             ..r
         };
         assert!(top.contains(u64::MAX));
+    }
+
+    #[test]
+    fn thread_start_alerts_for_rwx_sealed_and_pe_regions_alike() {
+        // Sealed (r-x) memory is no excuse: shellcode can be flipped RW -> RX
+        // before its thread starts, in any process.
+        let started = RegionContext {
+            thread_started_here: true,
+            ..ctx()
+        };
+        for protect in [PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_READ] {
+            let f = classify(&region(MEM_PRIVATE, protect), started).unwrap();
+            assert_eq!(f.rule_id, "memory.anon_exec");
+            assert!(f.confidence >= 90);
+        }
+        // Reflective PE outranks a thread start.
+        let pe = RegionContext {
+            header_is_pe: true,
+            ..ctx()
+        };
+        let f = classify(&region(MEM_PRIVATE, PAGE_EXECUTE_READ), pe).unwrap();
+        assert_eq!(f.rule_id, "memory.injected_pe");
     }
 
     #[test]

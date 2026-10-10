@@ -64,8 +64,8 @@ fn next_check_delay(paths: &StagingPaths, normal: Duration, windows: bool) -> Du
 /// read-only for the agent under `ProtectSystem=strict`, so forging an update
 /// needs the real release key. Override with `TRAPD_RELEASE_KEY_DIR` (tests,
 /// non-standard layouts).
-fn release_pubkey_path() -> std::path::PathBuf {
-    let dir = std::env::var_os("TRAPD_RELEASE_KEY_DIR")
+pub(crate) fn release_key_dir() -> std::path::PathBuf {
+    std::env::var_os("TRAPD_RELEASE_KEY_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             if cfg!(target_os = "linux") {
@@ -73,8 +73,11 @@ fn release_pubkey_path() -> std::path::PathBuf {
             } else {
                 crate::paths::config_dir().to_path_buf()
             }
-        });
-    dir.join("release_signing.pub")
+        })
+}
+
+fn release_pubkey_path() -> std::path::PathBuf {
+    release_key_dir().join("release_signing.pub")
 }
 
 fn staging() -> StagingPaths {

@@ -299,6 +299,8 @@ fn run_sync(
                             expected_hash: None,
                             actual_hash: None,
                             size_delta: None,
+                            actor: None,
+                            change_summary: None,
                         }),
                     ),
                 ) {

@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use sysinfo::{ProcessRefreshKind, System};
+use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
 use tracing::info;
@@ -47,11 +47,21 @@ impl MemScanCollector {
     }
 }
 
+// The snapshot must include image paths used by the shared confidence rules.
+/// Images larger than this are not hashed (cost bound, same as the process
+/// collector); such findings can still be suppressed by path.
+const MAX_IMAGE_HASH_BYTES: u64 = 64 * 1024 * 1024;
+
+fn snapshot_processes() -> System {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessRefreshKind::new().with_exe(UpdateKind::OnlyIfNotSet));
+    sys
+}
+
 /// One blocking sweep over every process. Returns the new findings and the set
 /// of live generations (to forget findings of exited or reused PIDs).
 fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, LiveGenerations) {
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(ProcessRefreshKind::new());
+    let sys = snapshot_processes();
     let mut findings = Vec::new();
     let mut live = HashSet::new();
     // Capture generations before the thread snapshot: a recycled PID must not
@@ -86,6 +96,7 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
         if regions.is_empty() {
             continue;
         }
+        let image = process.exe().map(|p| p.to_string_lossy().into_owned());
         let mut process_findings = Vec::new();
         let starts = thread_starts.get(&pid).map(Vec::as_slice).unwrap_or(&[]);
         // Resolve the (more expensive) module list only when a rule would
@@ -118,6 +129,13 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
                 r.region.is_writable_executable(),
             );
             let mut det = finding_to_detection(pid, &name, &f);
+            // Full image path, so suppressions match the binary (`exe`) and
+            // not the spoofable process name in the subject.
+            det.correlation = Some(crate::schema::CorrelationKeys {
+                pid: Some(pid),
+                exe: image.clone(),
+                ..Default::default()
+            });
             det.evidence["process_start_time"] = process_start_time.into();
             process_findings.push((key, f.severity, det));
         }
@@ -127,10 +145,26 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
             live.remove(&(pid, process_start_time));
             continue;
         }
-        for (key, severity, det) in process_findings {
-            if seen.insert(key) {
-                findings.push((severity, det));
+        // Hash the on-disk image once per process, and only when a finding is
+        // actually new, so suppressions can match `sha256` as well as `exe`.
+        // This identifies the file at that path, not the in-memory image of a
+        // hollowed process; it is the same trust level as the path itself.
+        let mut image_hash: Option<Option<String>> = None;
+        for (key, severity, mut det) in process_findings {
+            if !seen.insert(key) {
+                continue;
             }
+            if let (Some(path), Some(corr)) = (&image, det.correlation.as_mut()) {
+                let hash = image_hash.get_or_insert_with(|| {
+                    crate::paths::bounded_regular_sha256_label(
+                        std::path::Path::new(path),
+                        MAX_IMAGE_HASH_BYTES,
+                    )
+                    .ok()
+                });
+                corr.exe_sha256 = hash.clone();
+            }
+            findings.push((severity, det));
         }
     }
     (findings, live)
@@ -216,6 +250,17 @@ mod tests {
     use windows_sys::Win32::System::Memory::{
         VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
     };
+
+    #[test]
+    fn sweep_snapshot_contains_the_current_process_image_path() {
+        let sys = snapshot_processes();
+        let own_pid = sysinfo::Pid::from_u32(std::process::id());
+        let process = sys
+            .process(own_pid)
+            .expect("current process must be listed");
+        let executable = process.exe().expect("sweep must request executable paths");
+        assert_eq!(executable, std::env::current_exe().unwrap());
+    }
 
     #[tokio::test]
     async fn initially_disabled_collector_waits_for_config_activation() {

@@ -165,6 +165,15 @@ pub fn render(report: &TelemetryReport, now_unix_ms: u64) -> String {
             ""
         }
     );
+    let _ = writeln!(
+        out,
+        "  Journal durability: {}",
+        if m.spool_durability_lost {
+            "lost — queued events are memory-only; operator recovery required"
+        } else {
+            "no durability failure reported"
+        }
+    );
     if m.spool_truncated_tail_records_total > 0 {
         let _ = writeln!(
             out,
@@ -475,6 +484,17 @@ mod tests {
         assert!(out.contains("Overall status: recovery_required"));
         assert!(out.contains("operator action required"));
         assert!(out.contains("telemetry was lost to corruption"));
+    }
+
+    #[test]
+    fn durability_loss_is_visible_without_inventing_dropped_events() {
+        let mut report = healthy_report();
+        report.metrics.spool_durability_lost = true;
+        report.health = HealthState::RecoveryRequired;
+        let out = render(&report, NOW);
+        assert!(out.contains("Journal durability: lost"));
+        assert!(out.contains("queued events are memory-only"));
+        assert_eq!(report.metrics.collector_events_dropped_total, 0);
     }
 
     #[test]

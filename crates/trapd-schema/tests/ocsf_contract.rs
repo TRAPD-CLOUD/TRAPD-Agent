@@ -15,6 +15,7 @@ fn all_eventclass() -> Vec<EventClass> {
         EventClass::Prevention,
         EventClass::Detection,
         EventClass::Log,
+        EventClass::Registry,
     ]
 }
 
@@ -31,6 +32,7 @@ fn cover_eventclass(value: &EventClass) {
         EventClass::Prevention => {}
         EventClass::Detection => {}
         EventClass::Log => {}
+        EventClass::Registry => {}
     }
 }
 
@@ -275,6 +277,9 @@ fn emit_contract() {
                 client_addr: "192.0.2.1".into(),
                 transaction_id: 42,
                 rcode: "NOERROR".into(),
+                pid: None,
+                process: None,
+                process_start_time: None,
             })
             .unwrap(),
         ),
@@ -307,6 +312,7 @@ fn emit_contract() {
                 src_port: None,
                 auth_method: Some("password".into()),
                 success: true,
+                ..Default::default()
             })
             .unwrap(),
         ),
@@ -388,6 +394,9 @@ fn emit_contract() {
                 client_addr: "".into(),
                 transaction_id: 0,
                 rcode: "NOERROR".into(),
+                pid: None,
+                process: None,
+                process_start_time: None,
             })
             .unwrap(),
         ),
@@ -420,6 +429,7 @@ fn emit_contract() {
                 src_port: None,
                 auth_method: Some("password".into()),
                 success: false,
+                ..Default::default()
             })
             .unwrap(),
         ),
@@ -459,6 +469,7 @@ fn emit_contract() {
                 src_port: None,
                 auth_method: Some("password".into()),
                 success: true,
+                ..Default::default()
             })
             .unwrap(),
         ),

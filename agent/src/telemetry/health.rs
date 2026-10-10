@@ -80,9 +80,9 @@ impl HealthState {
     /// configured, "not acknowledging" is the design, not a fault.
     /// `now_unix_ms` is passed in rather than read so the model is testable.
     pub fn evaluate(snap: &MetricsSnapshot, offline_mode: bool, now_unix_ms: u64) -> Self {
-        // Corruption first: it means telemetry was destroyed, and unlike a full
-        // queue it will not clear on its own.
-        if snap.spool_corrupt_records_total > 0 {
+        // Corruption or lost journal backing requires operator recovery before
+        // crash-safe delivery can be claimed. Memory collection still runs.
+        if snap.spool_corrupt_records_total > 0 || snap.spool_durability_lost {
             return HealthState::RecoveryRequired;
         }
 
@@ -188,6 +188,21 @@ mod tests {
     }
 
     const NOW: u64 = 1_000_000;
+
+    #[test]
+    fn loss_of_journal_durability_requires_attention() {
+        let mut value = serde_json::to_value(nominal()).unwrap();
+        value["spool_durability_lost"] = serde_json::json!(true);
+        let snap: MetricsSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            HealthState::evaluate(&snap, false, NOW),
+            HealthState::RecoveryRequired
+        );
+        assert_eq!(
+            HealthState::evaluate(&snap, true, NOW),
+            HealthState::RecoveryRequired
+        );
+    }
 
     #[test]
     fn nominal_snapshot_is_healthy() {

@@ -51,8 +51,10 @@ check "postinst printed the pairing hint" grep -q 'pairing.txt' /tmp/install1.lo
 
 echo "== reinstall keeps operator edits"
 echo "# local edit" >> /etc/trapd/agent.env
+head -c 64 /dev/zero > /etc/trapd/binary.sig
 dpkg -i "$V1" >/dev/null 2>&1 && ok "reinstall succeeds" || fail "reinstall"
 check "agent.env edit preserved" grep -qx '# local edit' /etc/trapd/agent.env
+check "reinstall removes prior self-update signature" test ! -e /etc/trapd/binary.sig
 
 echo "== policy-rc.d denial: units are enabled but never started"
 mkdir -p /run/systemd/system
@@ -65,11 +67,14 @@ check "no start/restart under policy" bash -c '! grep -Eq "^(start|try-restart) 
 rm -f /usr/sbin/policy-rc.d
 
 echo "== upgrade with systemd present (stubbed systemctl)"
+head -c 64 /dev/zero > /etc/trapd/binary.sig
 : > /tmp/systemctl.log
 PATH="$STUB:$PATH" dpkg -i "$V2" >/tmp/install2.log 2>&1 && ok "upgrade succeeds" || { fail "upgrade"; cat /tmp/install2.log; }
 check "binary replaced by v2" grep -q 'v2-binary' /usr/bin/trapd-agent
 check "baseline follows the new binary" \
     bash -c '[ "$(cat /etc/trapd/binary.sha256)" = "sha256:$(sha256sum /usr/bin/trapd-agent | cut -d" " -f1)" ]'
+check "upgrade removes prior self-update signature" test ! -e /etc/trapd/binary.sig
+check "upgrade preserves the release verification key" test -f /etc/trapd-release/release_signing.pub
 check "daemon-reload called" grep -qx 'daemon-reload' /tmp/systemctl.log
 check "units enabled" grep -qx 'enable trapd-agent.service trapd-agent-update.path' /tmp/systemctl.log
 check "agent restarted on upgrade" grep -qx 'try-restart trapd-agent.service' /tmp/systemctl.log
@@ -118,6 +123,65 @@ rm -f /usr/local/bin/trapd-agent
 echo x > /etc/systemd/system/trapd-agent.service 2>/dev/null || { mkdir -p /etc/systemd/system && echo x > /etc/systemd/system/trapd-agent.service; }
 if dpkg -i "$V1" >/dev/null 2>&1; then fail "install over install.sh unit must fail"; else ok "install over install.sh unit fails"; fi
 rm -f /etc/systemd/system/trapd-agent.service
+
+echo "== script installer upgrade after signed self-update (offline fixtures)"
+# Run the actual full installer in this disposable container. Only network and
+# service calls are stubbed; replacement files and integrity state are real.
+mkdir -p /etc/trapd /etc/trapd-release /etc/logrotate.d /var/lib/trapd
+echo '# operator config' > /etc/trapd/agent.env
+echo identity > /var/lib/trapd/device_id
+echo pinned-key > /etc/trapd-release/release_signing.pub
+head -c 64 /dev/zero > /etc/trapd/binary.sig
+cat > "$STUB/curl" <<'CURLEOF'
+#!/bin/bash
+out= url=
+while (( $# )); do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+if [[ "$url" == */releases/latest ]]; then
+    printf '{"tag_name":"v0.7.2"}\n'
+    exit 0
+fi
+artifact="${url##*/}"
+body='script-upgrade-binary'
+case "$artifact" in
+    trapd-agent-exec*) body='script-upgrade-ebpf' ;;
+    trapd-update.sh*) body='script-upgrade-updater' ;;
+esac
+if [[ "$artifact" == *.sha256 ]]; then
+    if [[ -n "${TRAPD_INSTALL_TEST_BAD_CHECKSUM:-}" ]]; then
+        printf '%064d\n' 0 > "$out"
+    else
+        printf '%s\n' "$body" | sha256sum > "$out"
+    fi
+else
+    printf '%s\n' "$body" > "$out"
+fi
+CURLEOF
+chmod +x "$STUB/curl"
+PATH="$STUB:$PATH" bash /work/install.sh >/tmp/script-install.log 2>&1 \
+    && ok "full script reinstall succeeds" || { fail "script reinstall"; cat /tmp/script-install.log; }
+check "script replaces the binary" grep -qx 'script-upgrade-binary' /usr/local/bin/trapd-agent
+check "script refreshes binary baseline" \
+    bash -c '[ "$(cat /etc/trapd/binary.sha256)" = "sha256:$(sha256sum /usr/local/bin/trapd-agent | cut -d" " -f1)" ]'
+check "script removes prior self-update signature" test ! -e /etc/trapd/binary.sig
+check "script preserves release verification key" grep -qx 'pinned-key' /etc/trapd-release/release_signing.pub
+check "script preserves operator config" grep -qx '# operator config' /etc/trapd/agent.env
+check "script preserves device identity" grep -qx 'identity' /var/lib/trapd/device_id
+head -c 64 /dev/zero > /etc/trapd/binary.sig
+before_baseline="$(cat /etc/trapd/binary.sha256)"
+if PATH="$STUB:$PATH" TRAPD_INSTALL_TEST_BAD_CHECKSUM=1 bash /work/install.sh >/tmp/script-rejected.log 2>&1; then
+    fail "script accepted a failed checksum"
+else
+    ok "script refuses a failed checksum"
+fi
+check "rejected script install leaves the old signature" test -f /etc/trapd/binary.sig
+[[ "$(cat /etc/trapd/binary.sha256)" == "$before_baseline" ]] \
+    && ok "rejected script install leaves baseline unchanged" || fail "rejected install changed baseline"
 
 echo
 if [[ "$FAILS" -eq 0 ]]; then echo "CONTAINER TESTS PASSED"; else echo "CONTAINER TESTS FAILED: $FAILS"; exit 1; fi

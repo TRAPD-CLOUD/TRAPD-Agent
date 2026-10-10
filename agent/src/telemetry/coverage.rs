@@ -44,6 +44,15 @@ pub struct Coverage {
     /// Command lines included in 4688 events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_command_line: Option<bool>,
+    /// Audit Registry success enabled; target-key SACLs are still required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_registry: Option<bool>,
+    /// Collector is enabled and its last Security channel read succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_eventlog_active: Option<bool>,
+    /// Channel readable, not a claim that Sysmon filters cover every operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sysmon_eventlog_active: Option<bool>,
     /// Advanced audit policy: File System (success) enabled — decoy reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_file_system: Option<bool>,
@@ -63,6 +72,14 @@ pub struct Coverage {
 }
 
 impl Coverage {
+    #[cfg(any(windows, test))]
+    pub fn set_eventlog_active(&mut self, channel: &str, active: bool) {
+        match channel {
+            "Security" => self.security_eventlog_active = Some(active),
+            "Microsoft-Windows-Sysmon/Operational" => self.sysmon_eventlog_active = Some(active),
+            _ => {}
+        }
+    }
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn clear_ebpf_attachments(&mut self) {
         for active in self.ebpf_honeytoken_programs.values_mut() {
@@ -197,6 +214,23 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&c).unwrap(),
             serde_json::json!({"process_sensor": "etw", "etw_session": true})
+        );
+    }
+
+    #[test]
+    fn native_channel_presence_is_explicit_and_does_not_claim_audit_policy() {
+        let mut c = Coverage::default();
+        c.set_eventlog_active("Security", true);
+        c.set_eventlog_active("Microsoft-Windows-Sysmon/Operational", false);
+        let value = serde_json::to_value(&c).unwrap();
+        assert_eq!(value["security_eventlog_active"], true);
+        assert_eq!(value["sysmon_eventlog_active"], false);
+        assert!(value.get("audit_process_creation").is_none());
+        assert!(value.get("audit_registry").is_none());
+        c.set_eventlog_active("Security", false);
+        assert_eq!(
+            serde_json::to_value(c).unwrap()["security_eventlog_active"],
+            false
         );
     }
 }

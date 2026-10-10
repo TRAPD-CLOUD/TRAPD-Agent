@@ -284,6 +284,7 @@ mod tests {
                 src_port: Some(40222),
                 auth_method: Some("publickey".into()),
                 success: true,
+                ..Default::default()
             }),
         );
         logon.timestamp = Utc::now();
@@ -313,6 +314,7 @@ mod tests {
                 src_port: Some(40333),
                 auth_method: Some("password".into()),
                 success: false,
+                ..Default::default()
             }),
         );
         logon.timestamp = Utc::now();

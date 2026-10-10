@@ -29,6 +29,7 @@ pub struct StatefulRules {
     failures: HashMap<String, VecDeque<f64>>,
     chmods: HashMap<String, f64>,
     units: HashMap<String, (f64, String)>,
+    windows_logons: super::windows_logon::WindowsLogonTracker,
 }
 
 /// Normalised discovery command, or `None` when the exec is not discovery.
@@ -58,8 +59,13 @@ fn recon_command(base: &str, cmdline: &str) -> Option<String> {
         "sudo" if arg1 == "-l" => "sudo -l".into(),
         "cat" | "head" | "less" => {
             const FILES: &[&str] = &[
-                "/etc/passwd", "/etc/group", "/etc/os-release", "/etc/issue", "/etc/hosts",
-                "/etc/resolv.conf", "/proc/version",
+                "/etc/passwd",
+                "/etc/group",
+                "/etc/os-release",
+                "/etc/issue",
+                "/etc/hosts",
+                "/etc/resolv.conf",
+                "/proc/version",
             ];
             let f = FILES.iter().find(|f| lower.contains(*f))?;
             format!("{base} {f}")
@@ -159,6 +165,15 @@ impl StatefulRules {
             }),
             ..Default::default()
         })
+    }
+
+    /// Windows logon outcome (brute force, spray, success after failures).
+    pub fn observe_windows_logon(
+        &mut self,
+        l: &trapd_schema::UserLogonData,
+        now: f64,
+    ) -> Vec<DetectionData> {
+        self.windows_logons.observe(l, now)
     }
 
     /// `chmod` that set an execute bit on `path`.

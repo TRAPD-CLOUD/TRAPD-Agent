@@ -11,6 +11,7 @@ $config = Join-Path $data 'config'
 $state = Join-Path $data 'state'
 $eventsPath = Join-Path $data 'logs\events.ndjson'
 $watch = Join-Path $env:PUBLIC ('Documents\TRAPD-MSI-Smoke-' + [guid]::NewGuid())
+$eventSource = 'TRAPD-MSI-Smoke-' + [guid]::NewGuid().ToString('N')
 $installedMsi = $Msi
 New-Item -ItemType Directory -Force $root, $config, $watch | Out-Null
 
@@ -74,6 +75,11 @@ $defaults = Join-Path $root 'defaults.json'
 if ($LASTEXITCODE -ne 0) { throw 'Could not read agent configuration schema.' }
 $backend = Start-Process python -ArgumentList @("`"$(Join-Path $PSScriptRoot 'mock-backend.py')`"", '--root', "`"$root`"", '--config-dir', "`"$config`"", '--default-config', "`"$defaults`"", '--watch-dir', "`"$watch`"") -PassThru -RedirectStandardError (Join-Path $root 'backend.err')
 try {
+    Add-Type -AssemblyName System.Diagnostics.EventLog
+    # Register before installation so Windows can refresh its source cache.
+    # WriteEntry later exercises the real Application log without depending
+    # on eventcreate.exe's implicit registration/permission behavior.
+    [Diagnostics.EventLog]::CreateEventSource($eventSource, 'Application')
     Wait-Until { Test-Path (Join-Path $root 'url.txt') } 'Test backend did not start.'
     $url = Get-Content -Raw (Join-Path $root 'url.txt')
     # First install has no backend properties: local collection must start
@@ -152,8 +158,7 @@ try {
     $client = [Net.Sockets.TcpClient]::new()
     $client.Connect('127.0.0.1', $listener.LocalEndpoint.Port)
     $peer = $listener.AcceptTcpClient()
-    & "$env:SystemRoot\System32\eventcreate.exe" /T INFORMATION /ID 100 /L APPLICATION /SO TRAPD-MSI-Smoke /D TRAPD_MSI_EVENTLOG_SMOKE | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Could not create native event-log test record.' }
+    [Diagnostics.EventLog]::WriteEntry($eventSource, 'TRAPD_MSI_EVENTLOG_SMOKE', [Diagnostics.EventLogEntryType]::Information, 100)
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'process' -and $_.data.cmdline -like '*TRAPD_MSI_SIGMA_SMOKE*' }).Count -gt 0 } 'No process telemetry.'
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'detection' -and $_.data.title -eq 'TRAPD MSI Sigma smoke' }).Count -gt 0 } 'Windows Sigma rule did not fire.'
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'network' -and $_.data.dst_port -eq $listener.LocalEndpoint.Port }).Count -gt 0 } 'No native TCP telemetry.'
@@ -226,6 +231,22 @@ try {
 
     # A replacement that cannot start must fail its MSI transaction and
     # restore the previous service and executable.
+    # Simulate the valid binary signature left by a signed self-update.
+    Stop-Service trapd-agent
+    $installedExe = Join-Path $env:ProgramFiles 'TRAPD Agent\trapd-agent.exe'
+    @'
+import hashlib, pathlib, sys
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+key = Ed25519PrivateKey.generate()
+config = pathlib.Path(sys.argv[1])
+(config / 'release_signing.pub').write_bytes(key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
+(config / 'binary.sig').write_bytes(key.sign(hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).digest()))
+'@ | python - $config $installedExe
+    if ($LASTEXITCODE -ne 0) { throw 'Could not provision self-update signature fixture.' }
+    $beforeSignature = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $config 'binary.sig')))
+    $beforeReleaseKey = (Get-FileHash (Join-Path $config 'release_signing.pub')).Hash
+    Start-Service trapd-agent
     $currentVersion = ((& $AgentExe --version) -replace '^trapd-agent v', '')
     $v = [version]$currentVersion
     $upgradedVersion = "$($v.Major).$($v.Minor).$($v.Build + 1)"
@@ -240,6 +261,7 @@ try {
     Wait-Until { (Get-Service trapd-agent -ErrorAction SilentlyContinue).Status -eq 'Running' } 'Rollback did not restore the previous service.'
     if ((Get-FileHash (Join-Path $env:ProgramFiles 'TRAPD Agent\trapd-agent.exe')).Hash -ne $beforeBinary) { throw 'Rollback did not restore the previous executable.' }
     if ((Get-Content -Raw (Join-Path $config 'binary.sha256')) -ne $beforeBaseline) { throw 'Rollback did not restore the binary integrity baseline.' }
+    if ([Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $config 'binary.sig'))) -ne $beforeSignature) { throw 'Rollback did not restore the previous binary signature.' }
     if ((Get-Content -Raw (Join-Path $state 'device_id')) -ne $device) { throw 'Failed upgrade changed device identity.' }
 
     # Build a distinct product version and exercise the native MSI transaction.
@@ -249,11 +271,16 @@ try {
     # A legitimate MSI replacement must reset an obsolete digest itself;
     # the new process may not trust an embedded version to excuse a mismatch.
     ('sha256:' + ('0' * 64)) | Set-Content (Join-Path $config 'binary.sha256')
+    # An obsolete signature must be removed by the same trusted transaction,
+    # without removing the independently provisioned release trust anchor.
+    [IO.File]::WriteAllBytes((Join-Path $config 'binary.sig'), [byte[]]::new(64))
     '0.0.1' | Set-Content (Join-Path $config 'binary.version')
     Invoke-Msi @('/i', "`"$upgrade`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'upgrade.log')`"")
     $installedMsi = $upgrade
     Wait-Until { (Get-Service trapd-agent).Status -eq 'Running' } 'Service did not survive major upgrade.'
     Wait-Until { ((Get-Content -Raw (Join-Path $config 'binary.sha256')).Trim()) -eq ('sha256:' + $beforeBinary.ToLowerInvariant()) } 'MSI did not establish the installed binary integrity baseline.' 30
+    if (Test-Path (Join-Path $config 'binary.sig')) { throw 'Upgrade retained an obsolete binary signature.' }
+    if ((Get-FileHash (Join-Path $config 'release_signing.pub')).Hash -ne $beforeReleaseKey) { throw 'Upgrade changed the release trust anchor.' }
     if ((Get-Content -Raw (Join-Path $state 'device_id')) -ne $device) { throw 'Upgrade changed identity.' }
     if ((Get-FileHash (Join-Path $config 'agent.env')).Hash -ne $configHash) { throw 'Upgrade overwrote agent.env.' }
     foreach ($name in $containmentNames) {
@@ -283,5 +310,8 @@ try {
     }
     Stop-Process -Id $backend.Id -Force -ErrorAction SilentlyContinue
     Stop-Service trapd-agent -Force -ErrorAction SilentlyContinue
+    if ([Diagnostics.EventLog]::SourceExists($eventSource)) {
+        [Diagnostics.EventLog]::DeleteEventSource($eventSource)
+    }
     Remove-Item -Recurse -Force $watch -ErrorAction SilentlyContinue
 }

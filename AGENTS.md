@@ -266,7 +266,7 @@ accepted:
   "agent_id": "string",
   "hostname": "string",
   "timestamp": "RFC3339 UTC datetime",
-  "class": "process|network|system|user|filesystem|memory|kernel|ipc|prevention|detection|log",
+  "class": "process|network|system|user|filesystem|memory|kernel|ipc|prevention|detection|log|registry",
   "action": "EventAction",
   "severity": "info|low|medium|high|critical",
   "origin": "EventOrigin, optional",
@@ -508,6 +508,46 @@ as `event_too_large` rather than being allowed to wedge the batch.
   "username": "string"
 }
 ```
+
+### `RegistryEventData`
+
+`class=registry` with `action=create|modify|delete` routes to this
+payload. Snapshot polling reports persistence-location value changes; native
+Security/Sysmon records can also report key operations and renames.
+
+```json
+{
+  "key_path": "string (hive-prefixed destination path)",
+  "value_name": "string",
+  "category": "run_key|service|ifeo|winlogon|appinit|defender|com_hijack|scheduled_task|startup_env|native_registry|storm",
+  "user_sid": "string, optional",
+  "old_value": "string, optional",
+  "new_value": "string, optional",
+  "rename_from": {
+    "key_path": "string (hive-prefixed source path)",
+    "value_name": "string, optional"
+  },
+  "suppressed": "u32, optional"
+}
+```
+
+- `key_path` identifies the destination key, for example
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`. `value_name` is
+  `(Default)` for an unnamed value and `(Key)` for a key operation.
+- `user_sid` identifies the owning user hive, not the writing process or actor.
+- `old_value` and `new_value` contain value data only when known; omitted data
+  must not be interpreted as an empty string. Captured registry value data is
+  truncated to 1024 characters; the raw native log remains separate evidence.
+- Native renames use `action=modify` with `rename_from`; `rename_from` is
+  optional and appears only for observed name changes. Its
+  `key_path` identifies the source key; an omitted `value_name` means a key
+  rename, while a present `value_name` identifies the source value. The outer
+  `key_path`/`value_name` identify the destination. Both `old_value` and
+  `new_value` are omitted for renames whose value data is unknown; names must
+  not be stored as value data.
+- `category=storm`, `action=modify` is a rate-limit summary. `suppressed` is the
+  number of changes suppressed and `new_value` names the affected watch
+  category; the empty key/value names do not describe a registry mutation.
 
 ### `FileEventData`
 
@@ -1023,6 +1063,21 @@ Persisted locally in `credentials.json`.
   "metrics": "Metrics"
 }
 ```
+
+The heartbeat also carries `agent_uptime_seconds`, `agent_last_restart`,
+`previous_shutdown`, and process-local `pipeline` counters. Valid startup
+journal records are counted in `pipeline.replayed_from_disk`, including records
+subsequently evicted while enforcing recovery capacity. They are not included
+in `produced` or `spooled`.
+
+For a quiescent delivery queue:
+`spooled + replayed_from_disk == acked + queued + queue_drops`, where
+`queue_drops` is the sum of `dropped_by_reason.persistent_queue_full` and
+`dropped_by_reason.backend_rejected` (absent reasons mean zero).
+Do not substitute `dropped_total`: it includes pre-queue losses and corrupt or
+unsupported journal records that were never successfully replayed. Live
+snapshots read independent counters, so a single heartbeat is not an atomic
+balance check. Compare counters within the same `agent_last_restart` cohort.
 
 ### `Metrics`
 
@@ -1561,7 +1616,7 @@ keeping `boot_id`, so treat a reset to 1 as a new run rather than as loss.
 - Event ingest must accept an array, not NDJSON, for `/api/v1/ingest/events`.
 - Local file output is NDJSON: one serialized `AgentEvent` per line.
 - Treat unknown `EventAction`/payload combinations defensively; the agent evolves with new eBPF and prevention actions.
-- Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=prevention` -> `PreventionEventData` (incl. `action=process_frozen`/`process_thawed`/`deception_escalation`); `class=detection, action=detected` -> `DetectionData`; `class=detection, action=honeytoken_access` -> `HoneytokenAccessData` (carries the optional `session` forensics); `class=log, action=log` -> `LogEventData`.
+- Because `EventData` is untagged, route and validate by `class` and `action`. Example mappings: `class=process, action=create` -> `ProcessCreateData`; `class=registry, action=create|modify|delete` -> `RegistryEventData` (typed `rename_from` source names, optional value data); `class=prevention` -> `PreventionEventData` (incl. `action=process_frozen`/`process_thawed`/`deception_escalation`); `class=detection, action=detected` -> `DetectionData`; `class=detection, action=honeytoken_access` -> `HoneytokenAccessData` (carries the optional `session` forensics); `class=log, action=log` -> `LogEventData`.
 - For command responses, return `[]` when no commands are pending.
 - Do not return unsigned commands. The agent rejects commands without a valid Ed25519 signature, matching `agent_id`, unexpired window, and fresh nonce.
 - Config endpoint must return a `SignedConfig`: wrap the `AgentConfig` in a `ConfigEnvelope` (`agent_id`, `issued_at`, `config`) and sign `canonical_json(envelope)` with the same Ed25519 key used for response commands (`command_signing.pub`). Do not return unsigned config — the agent rejects it. Bump `issued_at` monotonically so the agent's rollback guard accepts updates.

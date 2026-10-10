@@ -233,6 +233,39 @@ impl Spool {
     /// accepted. An `Err` here is always counted — there is no path that
     /// discards an event without naming why.
     pub fn push(&mut self, event: AgentEvent) -> Result<u64, DropReason> {
+        #[cfg(any(windows, test))]
+        let receipt_id = event.event_id;
+        #[cfg(any(windows, test))]
+        let wants_receipt = super::receipt::requested(receipt_id);
+        // A checkpoint retry refers to the same accepted event. Keep its
+        // delivery state and capacity slot rather than evicting other evidence.
+        #[cfg(any(windows, test))]
+        if wants_receipt
+            || event
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.source.as_deref())
+                .is_some_and(|source| {
+                    (matches!(event.class, EventClass::Log)
+                        && source.starts_with("windows_eventlog:"))
+                        || (matches!(event.class, EventClass::Registry)
+                            && source == "windows_registry_snapshot")
+                })
+        {
+            if let Some(seq) = self
+                .mem
+                .iter()
+                .find(|entry| entry.event.event_id == receipt_id)
+                .map(|entry| entry.seq)
+            {
+                if wants_receipt {
+                    self.sync_for_checkpoint();
+                    self.publish();
+                    super::receipt::complete(receipt_id, self.is_durable());
+                }
+                return Ok(seq);
+            }
+        }
         #[cfg(test)]
         {
             self.last_push_thread = Some(std::thread::current().id());
@@ -251,6 +284,10 @@ impl Spool {
             Err(e) => {
                 warn!(error = %e, "spool: event could not be serialized");
                 metrics().event_dropped(DropReason::SerializationFailed);
+                #[cfg(any(windows, test))]
+                if wants_receipt {
+                    super::receipt::complete(receipt_id, false);
+                }
                 return Err(DropReason::SerializationFailed);
             }
         };
@@ -265,11 +302,22 @@ impl Spool {
                 "spool: event exceeds the size limit — dropping"
             );
             metrics().event_dropped(DropReason::EventTooLarge);
+            #[cfg(any(windows, test))]
+            if wants_receipt {
+                super::receipt::complete(receipt_id, false);
+            }
             return Err(DropReason::EventTooLarge);
         }
 
         self.next_seq += 1;
         self.append_to_journal(&encoded);
+
+        // Checkpointing sources must not advance their durable baseline/cursor
+        // until this particular record has reached stable journal storage.
+        #[cfg(any(windows, test))]
+        if wants_receipt {
+            self.sync_for_checkpoint();
+        }
 
         let entry = SpoolEntry {
             seq,
@@ -281,6 +329,7 @@ impl Spool {
         self.bytes += entry.bytes as u64;
         let priority = is_priority(&entry.event);
         self.mem.push_back(entry);
+        metrics().spool_event_accepted();
 
         self.enforce_caps();
 
@@ -288,12 +337,37 @@ impl Spool {
             self.compact();
         }
         self.publish();
+        #[cfg(any(windows, test))]
+        if wants_receipt {
+            let retained = self.mem.back().is_some_and(|entry| entry.seq == seq);
+            super::receipt::complete(receipt_id, retained && self.is_durable());
+        }
         if priority {
             // Stores one permit if the transport is not waiting yet, so a
             // wake-up between two flushes is never lost.
             self.priority_wake.notify_one();
         }
         Ok(seq)
+    }
+
+    #[cfg(any(windows, test))]
+    fn sync_for_checkpoint(&mut self) {
+        if self.appends_since_fsync == 0 {
+            return;
+        }
+        if let Some(file) = self.file.as_mut() {
+            match file.handle.sync_all() {
+                Ok(()) => {
+                    self.fsyncs_total += 1;
+                    self.appends_since_fsync = 0;
+                }
+                Err(error) => {
+                    warn!(%error, "spool: checkpoint handoff sync failed — durability lost, continuing in memory");
+                    self.file = None;
+                    self.degraded = true;
+                }
+            }
+        }
     }
 
     /// Handle the transport waits on to learn that a priority event arrived.
@@ -304,12 +378,19 @@ impl Spool {
     /// Evict from the front until both caps are satisfied.
     fn enforce_caps(&mut self) {
         let mut evicted = 0u64;
+        let mut priority_evicted = 0u64;
         while self.mem.len() > self.max_events || self.bytes > self.max_bytes {
             let Some(old) = self.mem.pop_front() else {
                 break;
             };
+            if is_priority(&old.event) {
+                priority_evicted += 1;
+            }
             self.bytes = self.bytes.saturating_sub(old.bytes as u64);
             evicted += 1;
+        }
+        if priority_evicted > 0 {
+            metrics().spool_priority_evicted(priority_evicted);
         }
         if evicted > 0 {
             self.dropped_total += evicted;
@@ -319,6 +400,7 @@ impl Spool {
             if self.dropped_total - evicted == 0 || self.dropped_total % 1_000 < evicted {
                 warn!(
                     dropped_total = self.dropped_total,
+                    priority_evicted,
                     max_events = self.max_events,
                     max_bytes = self.max_bytes,
                     "spool at capacity — evicting oldest events (backend unreachable?)"
@@ -350,7 +432,10 @@ impl Spool {
         // for COMPACT_EVERY (see the module-level durability note).
         if self.appends_since_fsync >= FSYNC_EVERY {
             if let Err(e) = f.handle.sync_all() {
-                warn!(error = %e, "spool: periodic journal fsync failed");
+                warn!(error = %e, "spool: periodic journal fsync failed — durability lost, continuing in memory");
+                self.file = None;
+                self.degraded = true;
+                return;
             }
             self.fsyncs_total += 1;
             self.appends_since_fsync = 0;
@@ -474,6 +559,7 @@ impl Spool {
 
     fn publish(&self) {
         metrics().set_spool_state(self.mem.len() as u64, self.bytes);
+        metrics().set_spool_durability_lost(self.degraded);
         let age = self.mem.front().map_or(0, |entry| {
             chrono::Utc::now()
                 .signed_duration_since(entry.event.timestamp)
@@ -676,7 +762,13 @@ impl Spool {
     /// exactly the un-acknowledged set.
     pub fn checkpoint(&mut self) {
         if let Some(f) = self.file.as_mut() {
-            let _ = f.handle.flush();
+            if let Err(e) = f.handle.sync_all() {
+                warn!(error = %e, "spool: final journal fsync failed — durability lost, continuing in memory");
+                self.file = None;
+                self.degraded = true;
+                self.publish();
+                return;
+            }
         }
         self.compact();
         self.publish();
@@ -716,7 +808,7 @@ impl Spool {
         self.corrupt_records
     }
 
-    /// Periodic journal fsyncs performed independent of compaction — proves
+    /// Successful journal fsyncs performed independent of compaction — proves
     /// durability does not wait for [`COMPACT_EVERY`] (see the module-level
     /// durability note and [`FSYNC_EVERY`]).
     pub fn fsyncs_total(&self) -> u64 {
@@ -797,4 +889,99 @@ pub fn spool_max_bytes_from_env() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(SPOOL_MAX_BYTES)
+}
+
+#[cfg(all(test, unix))]
+mod sync_failure_tests {
+    use super::*;
+    use crate::schema::{EventAction, EventData, Severity};
+
+    #[tokio::test]
+    async fn retry_sync_failure_keeps_one_record_without_confirming_durability() {
+        let dir = std::env::temp_dir().join(format!("trapd-retry-sync-{}", uuid::Uuid::new_v4()));
+        let mut spool = Spool::durable_at(dir.join("queue.journal"), 2);
+        let event = AgentEvent::new(
+            "test".into(),
+            "host".into(),
+            EventClass::Process,
+            EventAction::Create,
+            Severity::Info,
+            EventData::ProcessExec(Box::default()),
+        );
+        let seq = spool.push(event.clone()).unwrap();
+        spool.file.as_mut().unwrap().handle =
+            OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        for _ in 0..3 {
+            let tx = tx.clone();
+            let retry = event.clone();
+            let sender =
+                tokio::spawn(async move { super::super::receipt::send_durable(&tx, retry).await });
+            assert_eq!(spool.push(rx.recv().await.unwrap()).unwrap(), seq);
+            assert!(sender.await.unwrap().is_err());
+            assert_eq!(spool.len(), 1);
+            assert_eq!(spool.fsyncs_total(), 0);
+            assert!(spool.is_degraded());
+        }
+        assert_eq!(spool.dropped_total(), 0);
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_shutdown_sync_marks_durability_lost() {
+        let dir = std::env::temp_dir().join(format!("trapd-sync-{}", uuid::Uuid::new_v4()));
+        let mut spool = Spool::durable_at(dir.join("queue.journal"), 100);
+        spool.file.as_mut().unwrap().handle =
+            OpenOptions::new().write(true).open("/dev/null").unwrap();
+        spool.checkpoint();
+        assert!(
+            spool.is_degraded(),
+            "checkpoint must surface a failed final sync"
+        );
+        assert!(!spool.is_durable());
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_periodic_sync_is_not_successful_durability() {
+        let dir = std::env::temp_dir().join(format!("trapd-sync-{}", uuid::Uuid::new_v4()));
+        let mut spool = Spool::durable_at(dir.join("queue.journal"), 100);
+        // A real OS handle accepts writes but rejects fsync. Unlike a read-only
+        // file, this reproduces precisely the write-success/sync-failure path.
+        spool.file.as_mut().unwrap().handle =
+            OpenOptions::new().write(true).open("/dev/null").unwrap();
+        for _ in 0..FSYNC_EVERY {
+            spool
+                .push(AgentEvent::new(
+                    "test".into(),
+                    "host".into(),
+                    EventClass::Process,
+                    EventAction::Exec,
+                    Severity::Info,
+                    EventData::ProcessExec(Box::default()),
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            spool.fsyncs_total(),
+            0,
+            "failed sync must not count as success"
+        );
+        assert!(spool.is_degraded(), "durability failure must be visible");
+        assert!(!spool.is_durable());
+        assert_eq!(
+            spool.len(),
+            FSYNC_EVERY,
+            "collection must continue in memory"
+        );
+        assert_eq!(
+            spool.dropped_total(),
+            0,
+            "loss of durability is not confirmed event loss"
+        );
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

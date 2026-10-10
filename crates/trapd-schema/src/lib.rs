@@ -86,6 +86,8 @@ pub enum EventClass {
     System,
     User,
     Filesystem,
+    /// Windows registry value changes on persistence-relevant keys.
+    Registry,
     /// Anonymous/executable memory mappings (fileless malware).
     Memory,
     /// Kernel-level events (module loads).
@@ -99,6 +101,59 @@ pub enum EventClass {
     /// Canonical log record from the generic log collector (file, journal,
     /// syslog). Routed by `class=log` + `action=log`; see [`LogEventData`].
     Log,
+}
+
+impl EventClass {
+    /// Every class, in `index()` order.
+    pub const ALL: [EventClass; 12] = [
+        EventClass::Process,
+        EventClass::Network,
+        EventClass::System,
+        EventClass::User,
+        EventClass::Filesystem,
+        EventClass::Memory,
+        EventClass::Kernel,
+        EventClass::Ipc,
+        EventClass::Prevention,
+        EventClass::Detection,
+        EventClass::Log,
+        EventClass::Registry,
+    ];
+
+    /// Stable lowercase label (identical to the serde spelling).
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            EventClass::Process => "process",
+            EventClass::Network => "network",
+            EventClass::System => "system",
+            EventClass::User => "user",
+            EventClass::Filesystem => "filesystem",
+            EventClass::Memory => "memory",
+            EventClass::Kernel => "kernel",
+            EventClass::Ipc => "ipc",
+            EventClass::Prevention => "prevention",
+            EventClass::Detection => "detection",
+            EventClass::Log => "log",
+            EventClass::Registry => "registry",
+        }
+    }
+
+    pub const fn index(&self) -> usize {
+        match self {
+            EventClass::Process => 0,
+            EventClass::Network => 1,
+            EventClass::System => 2,
+            EventClass::User => 3,
+            EventClass::Filesystem => 4,
+            EventClass::Memory => 5,
+            EventClass::Kernel => 6,
+            EventClass::Ipc => 7,
+            EventClass::Prevention => 8,
+            EventClass::Detection => 9,
+            EventClass::Log => 10,
+            EventClass::Registry => 11,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +294,8 @@ pub enum EventData {
     /// periodic integrity scanner emit this shape so consumers do not need
     /// separate pipelines for FIM and ordinary filesystem activity.
     Filesystem(FilesystemEventData),
+    /// Windows registry change on a watched persistence location.
+    Registry(RegistryEventData),
     /// Legacy journal compatibility only. New collectors emit `Filesystem`.
     FileEvent(FileEventData),
     // ── eBPF-sourced event data ──────────────────────────────────────
@@ -484,13 +541,35 @@ pub struct SystemSnapshotData {
     pub load_avg: [f64; 3],
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserLogonData {
     pub username: String,
     pub src_addr: Option<String>,
     pub src_port: Option<u16>,
     pub auth_method: Option<String>,
     pub success: bool,
+    /// Windows account domain (`TargetDomainName`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Windows logon type (2 interactive, 3 network, 10 remote interactive...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logon_type: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logon_type_name: Option<String>,
+    /// NTSTATUS of a failed logon (`0xc000006d`) and its sub status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_status: Option<String>,
+    /// Human-readable failure reason resolved from status/sub status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    /// Source workstation name when no source address is logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workstation: Option<String>,
+    /// Process that requested the logon (`ProcessName`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -540,6 +619,57 @@ pub struct FilesystemEventData {
     pub actual_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_delta: Option<i64>,
+    /// Best-effort process that likely made the change. `ReadDirectoryChangesW`
+    /// carries no actor, so on Windows this is a correlation with a recent
+    /// `process.create` whose command line names the file — a lead, not proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<ProcessLineage>,
+    /// Human-readable content diff for small critical text files (hosts):
+    /// added/removed lines, truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_summary: Option<String>,
+}
+
+/// Original object identity for a registry rename. The enclosing event's
+/// key_path/value_name identify the destination; names are not registry data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryRenameSource {
+    pub key_path: String,
+    /// None for a key rename; Some for a value rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_name: Option<String>,
+}
+
+/// Registry observation from snapshot polling or persisted native audit records.
+/// `class=registry` uses create/modify/delete; native renames use modify with
+/// destination key_path/value_name and explicit rename_from source identity.
+/// Rename names are not old/new value data. Native actor evidence remains in
+/// the paired raw log; this payload does not infer a writing process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryEventData {
+    /// Full key path with hive prefix, e.g.
+    /// `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`.
+    pub key_path: String,
+    /// Value name; `(Default)` for the unnamed value, `(Key)` for a key object.
+    pub value_name: String,
+    /// Watch category: `run_key`, `service`, `ifeo`, `winlogon`, `appinit`,
+    /// `defender`, `com_hijack`, `scheduled_task`, `startup_env`, or `storm`.
+    pub category: String,
+    /// Owning user SID for per-user hives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_sid: Option<String>,
+    /// Previous data (absent for a created value). Truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_value: Option<String>,
+    /// New data (absent for a deleted value). Truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_value: Option<String>,
+    /// Present only for observed name changes, whose value data is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename_from: Option<RegistryRenameSource>,
+    /// Set only on a `storm` summary: changes dropped by the rate limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed: Option<u32>,
 }
 
 /// Legacy pre-consolidation filesystem notification payload.
@@ -728,6 +858,16 @@ pub struct DnsResolutionData {
     pub transaction_id: u16,
     /// Response code as text (`NOERROR`, `NXDOMAIN`, …).
     pub rcode: String,
+    /// Requesting process, when the sensor can attribute it (Windows ETW
+    /// DNS-Client; the packet-capture path cannot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// Image name of the requesting process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+    /// Creation FILETIME of the requesting process (PID-reuse guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
 }
 
 /// A TLS ClientHello observed on the wire — SNI plus the JA3 fingerprint, the

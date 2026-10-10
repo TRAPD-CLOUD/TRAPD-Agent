@@ -12,12 +12,13 @@
 //! on-disk diagnostics file and `trapd-agent diagnostics telemetry`.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use super::drops::DropReason;
 use super::histogram::{LatencyHistogram, LatencySnapshot};
+use crate::schema::EventClass;
 
 /// Which telemetry source the process pipeline is actually running on.
 ///
@@ -93,6 +94,8 @@ pub struct Metrics {
     drops_by_reason: [AtomicU64; DropReason::COUNT],
     collector_failures: AtomicU64,
     collector_mode: AtomicU64,
+    /// Events accepted by the pipeline, per `EventClass` (the per-sensor view).
+    events_by_class: [AtomicU64; EventClass::ALL.len()],
 
     // ── Enrichment ───────────────────────────────────────────────────────────
     enrichment_attempts: AtomicU64,
@@ -113,14 +116,21 @@ pub struct Metrics {
     spool_capacity_bytes: AtomicU64,
     spool_capacity_events: AtomicU64,
     spool_corrupt_records: AtomicU64,
+    spool_durability_lost: AtomicBool,
     spool_truncated_tail_records: AtomicU64,
     spool_recovered_records: AtomicU64,
     spool_oldest_age_ms: AtomicU64,
+    /// Events accepted into the queue (as opposed to merely produced).
+    spool_accepted: AtomicU64,
+    spool_evicted_priority: AtomicU64,
 
     // ── Transport ────────────────────────────────────────────────────────────
     transport_batches_sent: AtomicU64,
     transport_batches_failed: AtomicU64,
     transport_events_acknowledged: AtomicU64,
+    /// Events handed to the network in a batch request (attempts, so retries
+    /// count again; compare with acknowledged to size the redelivery).
+    transport_events_sent: AtomicU64,
     transport_first_ack_unix_ms: AtomicU64,
     transport_events_retried: AtomicU64,
     backend_rejected_events: AtomicU64,
@@ -148,6 +158,7 @@ impl Metrics {
             drops_by_reason: [Self::ZERO; DropReason::COUNT],
             collector_failures: AtomicU64::new(0),
             collector_mode: AtomicU64::new(0),
+            events_by_class: [Self::ZERO; EventClass::ALL.len()],
             enrichment_attempts: AtomicU64::new(0),
             enrichment_failures: AtomicU64::new(0),
             enrichment_partial: AtomicU64::new(0),
@@ -162,12 +173,16 @@ impl Metrics {
             spool_capacity_bytes: AtomicU64::new(0),
             spool_capacity_events: AtomicU64::new(0),
             spool_corrupt_records: AtomicU64::new(0),
+            spool_durability_lost: AtomicBool::new(false),
             spool_truncated_tail_records: AtomicU64::new(0),
             spool_recovered_records: AtomicU64::new(0),
             spool_oldest_age_ms: AtomicU64::new(0),
+            spool_accepted: AtomicU64::new(0),
+            spool_evicted_priority: AtomicU64::new(0),
             transport_batches_sent: AtomicU64::new(0),
             transport_batches_failed: AtomicU64::new(0),
             transport_events_acknowledged: AtomicU64::new(0),
+            transport_events_sent: AtomicU64::new(0),
             transport_first_ack_unix_ms: AtomicU64::new(0),
             transport_events_retried: AtomicU64::new(0),
             backend_rejected_events: AtomicU64::new(0),
@@ -214,6 +229,11 @@ impl Metrics {
         );
         self.collector_events_received
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Per-class counterpart of [`Self::collector_event_received`].
+    pub fn class_event_received(&self, class: &EventClass) {
+        self.events_by_class[class.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// An event was discarded.  This is the single choke point for *every*
@@ -316,6 +336,11 @@ impl Metrics {
         self.spool_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// Loss of journal backing, independent of confirmed event loss.
+    pub fn set_spool_durability_lost(&self, lost: bool) {
+        self.spool_durability_lost.store(lost, Ordering::Relaxed);
+    }
+
     pub fn set_spool_oldest_age_ms(&self, age: u64) {
         self.spool_oldest_age_ms.store(age, Ordering::Relaxed);
     }
@@ -336,6 +361,16 @@ impl Metrics {
 
     pub fn spool_recovered_records(&self, n: u64) {
         self.spool_recovered_records.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// One event entered the queue.
+    pub fn spool_event_accepted(&self) {
+        self.spool_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Detection/prevention events evicted by oldest-first queue overflow.
+    pub fn spool_priority_evicted(&self, n: u64) {
+        self.spool_evicted_priority.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn spool_events(&self) -> u64 {
@@ -391,6 +426,11 @@ impl Metrics {
             .store(now_unix_ms(), Ordering::Relaxed);
     }
 
+    /// `n` events were put on the wire in one batch request.
+    pub fn transport_events_sent(&self, n: u64) {
+        self.transport_events_sent.fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn transport_events_retried(&self, n: u64) {
         self.transport_events_retried
             .fetch_add(n, Ordering::Relaxed);
@@ -435,7 +475,18 @@ impl Metrics {
                 drops.insert(reason.as_str().to_string(), v);
             }
         }
+        let mut by_class = BTreeMap::new();
+        for class in EventClass::ALL {
+            let v = self.events_by_class[class.index()].load(Ordering::Relaxed);
+            if v > 0 {
+                by_class.insert(class.as_str().to_string(), v);
+            }
+        }
         MetricsSnapshot {
+            events_by_class: by_class,
+            spool_accepted_total: self.spool_accepted.load(Ordering::Relaxed),
+            spool_priority_evicted_total: self.spool_evicted_priority.load(Ordering::Relaxed),
+            transport_events_sent_total: self.transport_events_sent.load(Ordering::Relaxed),
             ebpf_events_received_total: self.ebpf_events_received.load(Ordering::Relaxed),
             ebpf_events_lost_total: self.ebpf_events_lost.load(Ordering::Relaxed),
             collector_events_received_total: generated,
@@ -462,6 +513,7 @@ impl Metrics {
             spool_capacity_events: self.spool_capacity_events.load(Ordering::Relaxed),
             spool_capacity_bytes: self.spool_capacity_bytes.load(Ordering::Relaxed),
             spool_corrupt_records_total: self.spool_corrupt_records.load(Ordering::Relaxed),
+            spool_durability_lost: self.spool_durability_lost.load(Ordering::Relaxed),
             spool_truncated_tail_records_total: self
                 .spool_truncated_tail_records
                 .load(Ordering::Relaxed),
@@ -503,6 +555,12 @@ impl Metrics {
         }
         self.collector_failures.store(0, Ordering::Relaxed);
         self.collector_mode.store(0, Ordering::Relaxed);
+        for c in &self.events_by_class {
+            c.store(0, Ordering::Relaxed);
+        }
+        self.spool_accepted.store(0, Ordering::Relaxed);
+        self.spool_evicted_priority.store(0, Ordering::Relaxed);
+        self.transport_events_sent.store(0, Ordering::Relaxed);
         self.enrichment_attempts.store(0, Ordering::Relaxed);
         self.enrichment_failures.store(0, Ordering::Relaxed);
         self.enrichment_partial.store(0, Ordering::Relaxed);
@@ -516,6 +574,7 @@ impl Metrics {
         self.spool_capacity_events.store(0, Ordering::Relaxed);
         self.spool_capacity_bytes.store(0, Ordering::Relaxed);
         self.spool_corrupt_records.store(0, Ordering::Relaxed);
+        self.spool_durability_lost.store(false, Ordering::Relaxed);
         self.spool_truncated_tail_records
             .store(0, Ordering::Relaxed);
         self.spool_recovered_records.store(0, Ordering::Relaxed);
@@ -555,6 +614,15 @@ pub fn now_unix_ms() -> u64 {
 /// diagnostics snapshot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
+    /// Accepted events per class (per-sensor view); absent classes are zero.
+    #[serde(default)]
+    pub events_by_class: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub spool_accepted_total: u64,
+    #[serde(default)]
+    pub spool_priority_evicted_total: u64,
+    #[serde(default)]
+    pub transport_events_sent_total: u64,
     pub ebpf_events_received_total: u64,
     pub ebpf_events_lost_total: u64,
     pub collector_events_received_total: u64,
@@ -583,6 +651,9 @@ pub struct MetricsSnapshot {
     pub spool_capacity_events: u64,
     pub spool_capacity_bytes: u64,
     pub spool_corrupt_records_total: u64,
+    /// True when an intended durable spool has fallen back to memory.
+    #[serde(default)]
+    pub spool_durability_lost: bool,
     pub spool_truncated_tail_records_total: u64,
     pub spool_recovered_records_total: u64,
     #[serde(default)]
@@ -702,6 +773,28 @@ mod tests {
         m.events_dropped(DropReason::InternalError, 0);
         assert_eq!(m.snapshot().collector_events_dropped_total, 0);
         assert!(m.snapshot().collector_events_dropped_by_reason.is_empty());
+    }
+
+    #[test]
+    fn durability_loss_round_trips_and_clears_without_event_loss() {
+        let m = fresh();
+        m.set_spool_durability_lost(true);
+        let json = serde_json::to_value(m.snapshot()).unwrap();
+        let back: MetricsSnapshot = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.spool_durability_lost);
+        assert_eq!(back.collector_events_dropped_total, 0);
+        m.set_spool_durability_lost(false);
+        assert!(!m.snapshot().spool_durability_lost);
+        let mut older = json;
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("spool_durability_lost");
+        assert!(
+            !serde_json::from_value::<MetricsSnapshot>(older)
+                .unwrap()
+                .spool_durability_lost
+        );
     }
 
     #[test]

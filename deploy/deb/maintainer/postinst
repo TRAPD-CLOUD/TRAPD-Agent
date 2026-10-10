@@ -57,6 +57,10 @@ configure)
     )
     chmod 0600 "$ENV_DIR/binary.sha256.new.$$"
     mv -f "$ENV_DIR/binary.sha256.new.$$" "$ENV_DIR/binary.sha256"
+    # The package owns this replacement; a signature from a prior signed
+    # self-update authenticates the previous binary, not the unpacked one.
+    # Keep the independent release verification key untouched.
+    rm -f "$ENV_DIR/binary.sig"
 
     if systemd_active; then
         systemctl daemon-reload || warn "systemctl daemon-reload failed"

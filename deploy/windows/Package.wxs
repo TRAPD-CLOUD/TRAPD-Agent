@@ -40,6 +40,7 @@
                and starting the replacement. Signed self-update manages the
                baseline in its own authenticated recovery transaction. -->
           <RemoveFile Id="ResetBinaryBaseline" Directory="CONFIGDIR" Name="binary.sha256" On="install" />
+          <RemoveFile Id="ResetBinarySignature" Directory="CONFIGDIR" Name="binary.sig" On="install" />
           <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
         </Component>
         <!-- Lives in Program Files (not user-writable): it is started elevated. -->

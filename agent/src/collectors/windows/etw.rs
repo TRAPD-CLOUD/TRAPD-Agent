@@ -339,7 +339,10 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
     let Some(sink) = (record.UserContext as *const Sink).as_ref() else {
         return;
     };
-    if let Some(decoded) = decode_record(record) {
+    if let Some(mut decoded) = decode_record(record) {
+        if decoded.provider == etw_map::KERNEL_PROCESS && decoded.id == 1 {
+            decoded.captured = Some(capture_at_start(&decoded));
+        }
         // Full and Closed (consumer gone while ProcessTrace still delivers) both lose
         // the record; neither may vanish without a named counter.
         if sink.tx.try_send(decoded).is_err() {
@@ -355,6 +358,37 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
     {
         crate::telemetry::metrics::metrics()
             .event_dropped(crate::telemetry::DropReason::InternalError);
+    }
+}
+
+/// Reads command line and account of a just-started process on the ETW
+/// delivery thread, the earliest user-mode point and before the record waits
+/// in the channel behind other events. A one-shot `cmd /c echo` can exit within
+/// milliseconds, so every hop of latency here costs command lines.
+///
+/// Both reads are bracketed by the process creation time: a PID recycled
+/// meanwhile never lends its command line or account to the wrong start.
+fn capture_at_start(rec: &EtwRecord) -> ProcessEnrichment {
+    use crate::telemetry::identity::{
+        process_start_time, windows_process_account, windows_process_command_line,
+    };
+    let pid = rec
+        .int(&["ProcessID", "ProcessId"])
+        .and_then(|p| i32::try_from(p).ok())
+        .unwrap_or(0);
+    let event_start = rec.int(&["CreateTime"]).filter(|t| *t > 0);
+    if pid <= 0 || event_start.is_none() || process_start_time(pid) != event_start {
+        return ProcessEnrichment::default();
+    }
+    let cmdline = windows_process_command_line(pid);
+    let username = windows_process_account(pid);
+    if process_start_time(pid) != event_start {
+        return ProcessEnrichment::default();
+    }
+    ProcessEnrichment {
+        cmdline,
+        username,
+        ..Default::default()
     }
 }
 
@@ -430,6 +464,7 @@ unsafe fn decode_record(record: &EVENT_RECORD) -> Option<EtwRecord> {
         header_pid: header.ProcessId,
         timestamp: header.TimeStamp,
         props,
+        captured: None,
     })
 }
 
@@ -565,7 +600,7 @@ impl DecodeState {
                         .unwrap_or(0);
                     let event_start = rec.int(&["CreateTime"]).filter(|t| *t > 0);
                     let live_start = crate::telemetry::identity::process_start_time(pid);
-                    let enrich = if event_start.is_some() && event_start == live_start {
+                    let late = if event_start.is_some() && event_start == live_start {
                         let enrich = self.enrich_process(pid);
                         if crate::telemetry::identity::process_start_time(pid) == event_start {
                             enrich
@@ -575,6 +610,10 @@ impl DecodeState {
                     } else {
                         ProcessEnrichment::default()
                     };
+                    // What the callback read at delivery time wins; the late
+                    // lookup only fills the gaps (exe, hash, or a field the
+                    // early read could not get).
+                    let enrich = rec.captured.clone().unwrap_or_default().prefer_over(late);
                     if let Some(mut data) = etw_map::process_start(rec, &self.devices, enrich) {
                         data.parent_start_time =
                             crate::telemetry::identity::parent_generation_before_child(
@@ -582,6 +621,7 @@ impl DecodeState {
                                 crate::telemetry::identity::process_start_time(data.ppid),
                             );
                         crate::deception::activity::record_exec(&data.username, &data.exe);
+                        crate::detection::accessor_correlation::record_process(&data);
                         if self.proc_images.len() >= 8192 {
                             self.proc_images.clear();
                         }
@@ -670,7 +710,8 @@ impl DecodeState {
                 }
             }
             p if p == etw_map::DNS_CLIENT => {
-                if let Some((_pid, data)) = etw_map::dns_query(rec) {
+                if let Some((pid, mut data)) = etw_map::dns_query(rec) {
+                    self.attribute_dns(rec.timestamp, pid, &mut data);
                     crate::deception::activity::record_hostname(&data.qname);
                     emit(
                         EventClass::Network,
@@ -682,6 +723,42 @@ impl DecodeState {
             _ => {}
         }
         out
+    }
+
+    /// Names the process behind a DNS-Client event. The DNS-Client library runs
+    /// in the requesting process, so the event's logging PID is the requester
+    /// (or the Dnscache service host). Attribution is dropped when the PID's
+    /// live creation time does not precede the record (PID reuse).
+    fn attribute_dns(
+        &mut self,
+        observed: i64,
+        pid: u32,
+        data: &mut crate::schema::DnsResolutionData,
+    ) {
+        let Ok(pid) = i32::try_from(pid) else { return };
+        if pid <= 0 {
+            return;
+        }
+        let Some(start) = crate::telemetry::identity::process_start_time(pid) else {
+            return;
+        };
+        if !etw_map::same_process_generation(Some(start), Some(start), observed) {
+            return;
+        }
+        let known = self
+            .proc_images
+            .get(&pid)
+            .filter(|(_, s)| *s == start)
+            .map(|(image, _)| image.rsplit('\\').next().unwrap_or(image).to_string());
+        let spid = Pid::from_u32(pid as u32);
+        let name = known.or_else(|| {
+            self.sys
+                .refresh_process_specifics(spid, ProcessRefreshKind::new());
+            self.sys.process(spid).map(|p| p.name().to_string())
+        });
+        data.pid = Some(pid);
+        data.process = name.filter(|n| !n.is_empty());
+        data.process_start_time = Some(start);
     }
 
     /// Command line, account and image hash for a process that is (usually)
@@ -728,13 +805,9 @@ impl DecodeState {
                 return Some(hash.clone());
             }
         }
-        let digest = format!(
-            "sha256:{}",
-            hex::encode(
-                crate::paths::bounded_regular_sha256(std::path::Path::new(path), MAX_HASH_BYTES)
-                    .ok()?
-            )
-        );
+        let digest =
+            crate::paths::bounded_regular_sha256_label(std::path::Path::new(path), MAX_HASH_BYTES)
+                .ok()?;
         if self.hash_cache.len() >= MAX_HASH_CACHE {
             self.hash_cache.clear();
         }

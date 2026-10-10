@@ -268,6 +268,7 @@ impl Collector for ProcessCollector {
                     enrichment: notes.finish(0),
                 };
                 crate::deception::activity::record_exec(&data.username, &data.exe);
+                crate::detection::accessor_correlation::record_process(&data);
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),

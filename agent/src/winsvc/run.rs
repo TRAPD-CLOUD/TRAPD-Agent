@@ -159,6 +159,8 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     load_env_file();
     load_msi_config();
     paths::init_state_dir();
+    // Include startup recovery and pending enrollment in this process run.
+    crate::heartbeat::lifecycle::begin_process();
 
     // Self-integrity, like the Linux agent: refuse to run a binary that no
     // longer matches its recorded digest (or whose signature fails). An MSI
@@ -166,6 +168,14 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     // a self-reported version to excuse a hash mismatch.
     if let Err(e) = crate::selfprotect::binary_integrity::check() {
         error!("{e:#}");
+        // Not transient: hold (service stays STOP-able) before reporting the
+        // failure, so the SCM recovery policy cannot restart-loop every 10 s.
+        if let Some(hold) = crate::selfprotect::binary_integrity::hold_duration(&e) {
+            tokio::select! {
+                _ = tokio::time::sleep(hold) => {}
+                _ = stop.recv() => { crate::heartbeat::lifecycle::mark_clean_shutdown(); }
+            }
+        }
         return Err(e);
     }
 
@@ -219,6 +229,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
                     _ = expiry_tick.tick() => { startup_expired.extend(reconcile_pending_firewall_expiry().await); },
                     _ = stop.recv() => {
                         info!("stop requested before enrollment completed");
+                        crate::heartbeat::lifecycle::mark_clean_shutdown();
                         return Ok(());
                     }
                 }
@@ -354,7 +365,10 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     );
     spawn_collector!(UserSessionCollector::new());
     spawn_collector!(
-        crate::collectors::windows::eventlog::EventLogCollector::new(Arc::clone(&agent_config))
+        crate::collectors::windows::eventlog::EventLogCollector::new(
+            Arc::clone(&agent_config),
+            !offline
+        )
     );
     spawn_collector!(
         crate::collectors::windows::filesystem::FilesystemCollector::new(Arc::clone(&agent_config))
@@ -371,6 +385,9 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     spawn_collector!(crate::collectors::windows::memscan::MemScanCollector::new(
         Arc::clone(&agent_config)
     ));
+
+    // Registry persistence watcher (Run keys, services, IFEO, Winlogon, ...).
+    spawn_collector!(crate::collectors::windows::regwatch::RegistryWatchCollector::new(!offline));
 
     drop(tx);
 
@@ -411,6 +428,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     let prev_tx = prev_event_tx.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let mut consumer = tokio::spawn(async move {
+        let mut checkpoints = crate::detection::CheckpointTracker::default();
         let mut shutting_down = false;
         // Aggregate updates for repeated findings are released on this tick.
         let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -434,6 +452,11 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
                 for f in consumer_engine.admit_external(event) {
                     emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem).await;
                 }
+                continue;
+            }
+            // Retry durability without repeating downstream side effects.
+            if checkpoints.is_retry(&event) {
+                crate::spool_event(&event, &buf_for_consumer).await;
                 continue;
             }
             // Best-effort tee: a stalled enforcement engine must not stall
@@ -555,6 +578,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     if let Ok(mut spool) = ring_buffer.lock() {
         spool.checkpoint();
     }
+    crate::heartbeat::lifecycle::mark_clean_shutdown();
     info!("Shutdown complete");
     Ok(())
 }

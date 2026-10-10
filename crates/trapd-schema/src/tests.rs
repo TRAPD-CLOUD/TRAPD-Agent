@@ -4,8 +4,8 @@ use super::{
     AgentEvent, DnsData, EbpfDropsData, EventAction, EventClass, EventData, FileOpenData,
     FilesystemEventData, FilesystemOperation, FilesystemSource, ForkData, HoneytokenAccessData,
     IntegrityStatus, LogEventData, MmapData, ModuleLoadData, NamespaceIds, NetworkSocketData,
-    NsChangeData, ProcessCreateData, ProcessLineage, PtraceData, SessionContext, Severity, ShmData,
-    SystemSnapshotData,
+    NsChangeData, ProcessCreateData, ProcessLineage, PtraceData, RegistryEventData,
+    RegistryRenameSource, SessionContext, Severity, ShmData, SystemSnapshotData,
 };
 
 fn process_create_event() -> AgentEvent {
@@ -198,6 +198,8 @@ fn filesystem_notifications_share_one_wire_model() {
             expected_hash: Some("old".into()),
             actual_hash: Some("new".into()),
             size_delta: Some(12),
+            actor: None,
+            change_summary: None,
         }),
     );
     let value: serde_json::Value =
@@ -816,4 +818,75 @@ fn windows_authentication_log_keeps_fields_after_queue_round_trip() {
     let parsed: EventData = serde_json::from_value(payload.clone()).unwrap();
     assert!(matches!(&parsed, EventData::Log(log) if log.fields["EventID"] == 4625));
     assert_eq!(serde_json::to_value(parsed).unwrap(), payload);
+}
+
+#[test]
+fn test_registry_event_roundtrip() {
+    let event = AgentEvent::new(
+        "agent".to_string(),
+        "host".to_string(),
+        EventClass::Registry,
+        EventAction::Create,
+        Severity::Info,
+        EventData::Registry(RegistryEventData {
+            key_path: r"HKU\S-1-5-21-1\Software\Microsoft\Windows\CurrentVersion\Run".into(),
+            value_name: "trapdtest".into(),
+            category: "run_key".into(),
+            user_sid: Some("S-1-5-21-1".into()),
+            old_value: None,
+            new_value: Some("cmd /c echo x".into()),
+            rename_from: None,
+            suppressed: None,
+        }),
+    );
+    let json = serde_json::to_string(&event).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(val["class"], "registry");
+    assert_eq!(val["action"], "create");
+    assert_eq!(val["data"]["value_name"], "trapdtest");
+    assert!(val["data"].get("old_value").is_none());
+    // Journal/replay recovery must come back as a Registry payload, not a
+    // different untagged variant.
+    let back: AgentEvent = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back.data, EventData::Registry(_)));
+}
+
+#[test]
+fn registry_rename_destination_and_source_round_trip_without_fabricated_value_data() {
+    for source_value in [None, Some("OldValue".to_string())] {
+        let key_rename = source_value.is_none();
+        let data = RegistryEventData {
+            key_path: r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run".into(),
+            value_name: if key_rename { "(Key)" } else { "NewValue" }.into(),
+            category: "run_key".into(),
+            user_sid: None,
+            old_value: None,
+            new_value: None,
+            rename_from: Some(RegistryRenameSource {
+                key_path: r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Staged".into(),
+                value_name: source_value.clone(),
+            }),
+            suppressed: None,
+        };
+        let event = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Registry,
+            EventAction::Modify,
+            Severity::Info,
+            EventData::Registry(data),
+        );
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            encoded["data"]["rename_from"]["key_path"],
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Staged"
+        );
+        assert!(encoded["data"].get("old_value").is_none());
+        assert!(encoded["data"].get("new_value").is_none());
+        let recovered: AgentEvent = serde_json::from_value(encoded).unwrap();
+        let EventData::Registry(data) = recovered.data else {
+            panic!("registry variant expected")
+        };
+        assert_eq!(data.rename_from.unwrap().value_name, source_value);
+    }
 }

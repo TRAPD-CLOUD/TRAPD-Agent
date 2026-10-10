@@ -311,6 +311,8 @@ impl Collector for FimCollector {
                         expected_hash: (!ch.expected.is_empty()).then_some(ch.expected),
                         actual_hash: (!ch.actual.is_empty()).then_some(ch.actual),
                         size_delta: Some(ch.size_delta),
+                        actor: None,
+                        change_summary: None,
                     }),
                 );
                 if tx.send(event).await.is_err() {

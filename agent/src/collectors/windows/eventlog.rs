@@ -1,13 +1,13 @@
 //! Native Windows Security/System/Application event logs with persisted cursors.
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::Sender;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::EventLog::*;
 
-use crate::collectors::Collector;
+use crate::collectors::{windows_native, Collector};
 use crate::config::AgentConfig;
 use crate::detection::windows_decoy;
 use crate::schema::DetectionData;
@@ -17,6 +17,15 @@ use crate::schema::{
 };
 
 struct Handle(EVT_HANDLE);
+struct CoverageGuard;
+impl Drop for CoverageGuard {
+    fn drop(&mut self) {
+        crate::telemetry::coverage::update(|c| {
+            c.set_eventlog_active("Security", false);
+            c.set_eventlog_active(windows_native::SYSMON_CHANNEL, false);
+        });
+    }
+}
 impl Drop for Handle {
     fn drop(&mut self) {
         unsafe {
@@ -121,39 +130,46 @@ fn parse(xml: &str, channel: &str) -> Result<(u64, LogEventData, Option<UserLogo
     let record_id = text("EventRecordID").parse::<u64>()?;
     let event_id = text("EventID").parse::<u32>()?;
     let mut fields = serde_json::Map::new();
+    let mut truncated_fields = BTreeMap::new();
     fields.insert("EventID".into(), event_id.into());
     fields.insert("EventRecordID".into(), record_id.into());
-    for n in doc.descendants().filter(|n| n.has_tag_name("Data")) {
+    let event_data = doc
+        .root_element()
+        .children()
+        .find(|n| n.has_tag_name("EventData"));
+    for n in event_data
+        .into_iter()
+        .flat_map(|n| n.children())
+        .filter(|n| n.has_tag_name("Data"))
+    {
         if let Some(name) = n.attribute("Name") {
-            fields.insert(
-                name.into(),
-                serde_json::Value::String(n.text().unwrap_or("").chars().take(16384).collect()),
-            );
+            if fields.len() >= 258 || name.len() > 256 || fields.contains_key(name) {
+                bail!("invalid or duplicate event data field");
+            }
+            let (value, truncation) =
+                crate::telemetry::limits::truncate_str(n.text().unwrap_or(""), 16 * 1024);
+            if let Some(truncation) = truncation {
+                truncated_fields.insert(format!("fields.{name}"), truncation);
+                crate::telemetry::metrics::metrics().enrichment_truncation();
+            }
+            fields.insert(name.into(), serde_json::Value::String(value));
         }
     }
-    let value = |name: &str| {
-        fields
-            .get(name)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let auth = if channel == "Security" && matches!(event_id, 4624 | 4625) {
-        Some(UserLogonData {
-            username: value("TargetUserName"),
-            src_addr: match value("IpAddress").as_str() {
-                "" | "-" => None,
-                other => Some(other.into()),
-            },
-            src_port: value("IpPort").parse().ok(),
-            auth_method: Some(value("AuthenticationPackageName")),
-            success: event_id == 4624,
-        })
+    // 4624/4625 become structured logon events; the operating system's own
+    // service/machine logons (SYSTEM, DWM, machine accounts) are dropped.
+    // 4776 (NTLM validation) only gets readable fields on its raw record: it
+    // accompanies 4625 on workstations and would double-count failures.
+    let auth = if channel == "Security" {
+        crate::detection::windows_logon::enrich_fields(event_id, &mut fields);
+        crate::detection::windows_logon::normalize(event_id, &fields)
     } else {
         None
     };
     let (message, truncation) = crate::telemetry::limits::truncate_str(xml, 64 * 1024);
-    let truncated_fields = truncation.map(|t| BTreeMap::from([("message".into(), t)]));
+    if let Some(truncation) = truncation {
+        truncated_fields.insert("message".into(), truncation);
+    }
+    let truncated_fields = (!truncated_fields.is_empty()).then_some(truncated_fields);
     let log_timestamp = system
         .children()
         .find(|n| n.has_tag_name("TimeCreated"))
@@ -207,6 +223,64 @@ fn parse(xml: &str, channel: &str) -> Result<(u64, LogEventData, Option<UserLogo
         truncated_fields,
     };
     Ok((record_id, data, auth))
+}
+
+/// Preserve the operating system's authentication timeline. A raw record with
+/// no usable native timestamp remains evidence, but cannot date a logon event.
+fn auth_event(
+    data: &LogEventData,
+    auth: UserLogonData,
+    agent_id: &str,
+    hostname: &str,
+) -> Option<AgentEvent> {
+    data.log_timestamp?;
+    let event = AgentEvent::new(
+        agent_id.into(),
+        hostname.into(),
+        EventClass::User,
+        if auth.success {
+            EventAction::Logon
+        } else {
+            EventAction::LogonFailed
+        },
+        if auth.success {
+            Severity::Info
+        } else {
+            Severity::Low
+        },
+        EventData::UserLogon(auth),
+    );
+    native_provenance(event, data)
+}
+
+/// Authentication and audit findings retain native time and source so replay
+/// cannot authorize a live response. Undated records remain raw evidence only.
+fn native_provenance(mut event: AgentEvent, data: &LogEventData) -> Option<AgentEvent> {
+    event.timestamp = data.log_timestamp?;
+    let event_id = data.fields.get("EventID")?.as_u64()?;
+    Some(event.with_source(&format!("windows_eventlog:{}:{event_id}", data.source_path)))
+}
+
+/// Keep one unacknowledged authentication identity per configured channel.
+/// A failed raw receipt must retry the source record without counting it again.
+async fn enqueue_auth_once(
+    tx: &Sender<AgentEvent>,
+    pending: &mut HashMap<&'static str, u64>,
+    channel: &'static str,
+    record: u64,
+    event: Option<AgentEvent>,
+) -> bool {
+    if pending.get(channel) == Some(&record) {
+        return true;
+    }
+    if let Some(event) = event {
+        if tx.send(event).await.is_err() {
+            return false;
+        }
+        // Record only a successful enqueue; channel count is fixed by run().
+        pending.insert(channel, record);
+    }
+    true
 }
 
 /// Record the logon type of a 4624 success so later object-access events can
@@ -302,7 +376,10 @@ fn decoy_access(
 
 /// Security-log clear (1102) or audit-policy change (4719): an attacker
 /// blinding the host. Raised as a self-protection detection.
-fn audit_tamper(fields: &serde_json::Map<String, serde_json::Value>) -> Option<DetectionData> {
+fn audit_tamper(
+    channel: &str,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Option<DetectionData> {
     let id = fields.get("EventID").and_then(|v| v.as_u64())?;
     let (title, detail) = match id {
         1102 => (
@@ -313,6 +390,11 @@ fn audit_tamper(fields: &serde_json::Map<String, serde_json::Value>) -> Option<D
             "System audit policy changed",
             "The system audit policy was changed",
         ),
+        // 104: a non-Security log (System, Application, ...) was cleared.
+        104 if channel == "System" => (
+            "Windows event log cleared",
+            "A Windows event log (System channel event 104) was cleared",
+        ),
         _ => return None,
     };
     Some(DetectionData {
@@ -320,7 +402,7 @@ fn audit_tamper(fields: &serde_json::Map<String, serde_json::Value>) -> Option<D
         title: title.into(),
         category: "defense_evasion".into(),
         mitre_tactic: Some("TA0005 Defense Evasion".into()),
-        mitre_technique: Some(if id == 1102 { "T1070.001" } else { "T1562.002" }.into()),
+        mitre_technique: Some(if id == 4719 { "T1562.002" } else { "T1070.001" }.into()),
         confidence: 80,
         subject: format!("event {id}"),
         detail: detail.into(),
@@ -329,12 +411,37 @@ fn audit_tamper(fields: &serde_json::Map<String, serde_json::Value>) -> Option<D
     })
 }
 
+fn audit_tamper_event(
+    channel: &str,
+    data: &LogEventData,
+    agent_id: &str,
+    hostname: &str,
+) -> Option<AgentEvent> {
+    data.log_timestamp?;
+    let detection = audit_tamper(channel, &data.fields)?;
+    native_provenance(
+        AgentEvent::new(
+            agent_id.into(),
+            hostname.into(),
+            EventClass::Detection,
+            EventAction::Detected,
+            Severity::High,
+            EventData::Detection(Box::new(detection)),
+        ),
+        data,
+    )
+}
+
 pub struct EventLogCollector {
     config: Arc<RwLock<AgentConfig>>,
+    durable_handoff: bool,
 }
 impl EventLogCollector {
-    pub fn new(config: Arc<RwLock<AgentConfig>>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<RwLock<AgentConfig>>, durable_handoff: bool) -> Self {
+        Self {
+            config,
+            durable_handoff,
+        }
     }
 }
 
@@ -349,6 +456,7 @@ impl Collector for EventLogCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
+        let _coverage_guard = CoverageGuard;
         let path = crate::paths::state_dir().join("windows_eventlog_cursors.json");
         let mut cursors: HashMap<String, u64> = std::fs::read(&path)
             .ok()
@@ -358,23 +466,71 @@ impl Collector for EventLogCollector {
         // can be graded by how its subject logged on (interactive vs. RDP vs.
         // service). Bounded; oldest dropped on overflow.
         let mut logon_types: HashMap<String, u32> = HashMap::new();
+        // At most one pending record for each of the four fixed channels.
+        let mut pending_auth = HashMap::new();
+        let mut pending_native = windows_native::PendingRecords::default();
         let devices = super::etw::device_map();
+        let mut unavailable = HashSet::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             ticker.tick().await;
             if !self.config.read().map(|c| c.logs_enabled).unwrap_or(true) {
+                crate::telemetry::coverage::update(|c| {
+                    c.set_eventlog_active("Security", false);
+                    c.set_eventlog_active(windows_native::SYSMON_CHANNEL, false);
+                });
                 continue;
             }
-            for channel in ["Security", "System", "Application"] {
+            let policy = tokio::task::spawn_blocking(|| {
+                let command_line = super::registry::values_checked(
+                    super::registry::Hive::LocalMachine,
+                    r"Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit",
+                    0,
+                )
+                .ok()
+                .map(|values| {
+                    values.iter().any(|(name, value)| {
+                        name.eq_ignore_ascii_case("ProcessCreationIncludeCmdLine_Enabled")
+                            && value == "1"
+                    })
+                });
+                (
+                    super::decoy_audit::process_audit_enabled(),
+                    command_line,
+                    super::decoy_audit::registry_audit_enabled(),
+                )
+            })
+            .await?;
+            crate::telemetry::coverage::update(|c| {
+                c.audit_process_creation = policy.0;
+                c.audit_command_line = policy.1;
+                c.audit_registry = policy.2;
+            });
+            for channel in [
+                "Security",
+                "System",
+                "Application",
+                windows_native::SYSMON_CHANNEL,
+            ] {
                 let cursor = cursors.get(channel).copied();
-                let records =
-                    match tokio::task::spawn_blocking(move || read(channel, cursor)).await? {
-                        Ok(records) => records,
-                        Err(e) => {
-                            tracing::warn!(channel, error = %e, "Windows event log unavailable");
-                            continue;
+                let records = match tokio::task::spawn_blocking(move || read(channel, cursor))
+                    .await?
+                {
+                    Ok(records) => records,
+                    Err(e) => {
+                        crate::telemetry::coverage::update(|c| {
+                            c.set_eventlog_active(channel, false)
+                        });
+                        if unavailable.insert(channel) {
+                            tracing::warn!(channel, error = %e, "Windows event log unavailable; native coverage for this channel is absent");
                         }
-                    };
+                        continue;
+                    }
+                };
+                crate::telemetry::coverage::update(|c| c.set_eventlog_active(channel, true));
+                if unavailable.remove(channel) {
+                    tracing::info!(channel, "Windows event log available again");
+                }
                 if records.is_empty() && cursor.is_none() {
                     cursors.insert(channel.into(), 0);
                 }
@@ -394,31 +550,80 @@ impl Collector for EventLogCollector {
                                     crate::telemetry::metrics::metrics()
                                         .event_dropped(crate::telemetry::DropReason::InternalError);
                                     cursors.insert(channel.into(), 0);
+                                    pending_auth.remove(channel);
+                                    pending_native.clear(channel);
                                 }
                             }
                         }
                     }
                 }
                 for xml in records {
-                    let (record, data, auth) = parse(&xml, channel)?;
+                    let (record, data, auth) = match parse(&xml, channel) {
+                        Ok(record) => record,
+                        Err(error) => {
+                            tracing::warn!(channel, %error, "Skipping malformed Windows event record");
+                            crate::telemetry::metrics::metrics()
+                                .event_dropped(crate::telemetry::DropReason::InternalError);
+                            // Native XML may have valid System identity but bad data.
+                            // Advance past that record to avoid a poison-record retry loop.
+                            if let Ok(doc) = roxmltree::Document::parse(&xml) {
+                                if let Some(id) = doc
+                                    .root_element()
+                                    .children()
+                                    .find(|n| n.has_tag_name("System"))
+                                    .and_then(|n| {
+                                        n.children().find(|n| n.has_tag_name("EventRecordID"))
+                                    })
+                                    .and_then(|n| n.text())
+                                    .and_then(|t| t.parse::<u64>().ok())
+                                {
+                                    cursors.insert(channel.into(), id);
+                                    pending_auth.remove(channel);
+                                    pending_native.clear(channel);
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    let first_attempt = if cursor.is_some() {
+                        match pending_native.prepare(
+                            channel,
+                            record,
+                            data.clone(),
+                            &agent_id,
+                            &hostname,
+                        ) {
+                            Ok(first) => first,
+                            Err(error) => {
+                                tracing::warn!(channel, %error, "native source batch could not be prepared; retaining source cursor for retry");
+                                break;
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if channel == "System"
+                        && first_attempt
+                        && data.proc.as_deref() == Some("Microsoft-Windows-Eventlog")
+                    {
+                        if let Some(ev) = audit_tamper_event(channel, &data, &agent_id, &hostname) {
+                            if tx.send(ev).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
                     if channel == "Security" {
                         capture_logon_type(&data.fields, &mut logon_types);
-                        if cursor.is_some() {
-                            if let Some(det) = audit_tamper(&data.fields) {
-                                let ev = AgentEvent::new(
-                                    agent_id.clone(),
-                                    hostname.clone(),
-                                    EventClass::Detection,
-                                    EventAction::Detected,
-                                    Severity::High,
-                                    EventData::Detection(Box::new(det)),
-                                );
+                        if first_attempt {
+                            if let Some(ev) =
+                                audit_tamper_event(channel, &data, &agent_id, &hostname)
+                            {
                                 if tx.send(ev).await.is_err() {
                                     return Ok(());
                                 }
                             }
                         }
-                        if cursor.is_some() {
+                        if first_attempt {
                             if let Some(hit) = decoy_access(
                                 &data.fields,
                                 &logon_types,
@@ -449,39 +654,42 @@ impl Collector for EventLogCollector {
                     // First start tails from the newest record, avoiding a full
                     // historical replay. Subsequent starts resume the cursor.
                     if cursor.is_some() {
-                        let event = AgentEvent::new(
-                            agent_id.clone(),
-                            hostname.clone(),
-                            EventClass::Log,
-                            EventAction::Log,
-                            Severity::Info,
-                            EventData::Log(Box::new(data)),
-                        );
-                        if tx.send(event).await.is_err() {
+                        // Construct before moving the raw data, and enqueue first:
+                        // a durable raw source receipt fsyncs the preceding logon
+                        // record before this channel's cursor advances.
+                        if !enqueue_auth_once(
+                            &tx,
+                            &mut pending_auth,
+                            channel,
+                            record,
+                            auth.and_then(|auth| auth_event(&data, auth, &agent_id, &hostname)),
+                        )
+                        .await
+                        {
                             return Ok(());
                         }
-                        if let Some(auth) = auth {
-                            let event = AgentEvent::new(
-                                agent_id.clone(),
-                                hostname.clone(),
-                                EventClass::User,
-                                if auth.success {
-                                    EventAction::Logon
-                                } else {
-                                    EventAction::LogonFailed
-                                },
-                                if auth.success {
-                                    Severity::Info
-                                } else {
-                                    Severity::Low
-                                },
-                                EventData::UserLogon(auth),
-                            );
-                            if tx.send(event).await.is_err() {
+                        if pending_native
+                            .emit(
+                                &tx,
+                                channel,
+                                record,
+                                data,
+                                &agent_id,
+                                &hostname,
+                                self.durable_handoff,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            if tx.is_closed() {
                                 return Ok(());
                             }
+                            tracing::warn!(channel, "native source record not durably journaled; retaining source cursor for retry");
+                            break;
                         }
                     }
+                    pending_auth.remove(channel);
+                    pending_native.clear(channel);
                     cursors.insert(channel.into(), record);
                 }
             }
@@ -504,6 +712,256 @@ mod tests {
         assert_eq!(auth.src_addr.as_deref(), Some("10.0.0.1"));
         assert!(!auth.success);
     }
+    #[test]
+    fn native_logon_record_preserves_recorded_utc_and_source_identity() {
+        for (event_id, success) in [(4624, true), (4625, false)] {
+            let xml = format!(
+                r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>{event_id}</EventID><EventRecordID>123</EventRecordID><TimeCreated SystemTime="2026-01-01T12:34:56.9876543+02:00"/></System><EventData><Data Name="TargetUserName">Jörg &amp; Co</Data><Data Name="LogonType">3</Data><Data Name="IpAddress">10.0.0.1</Data></EventData></Event>"#
+            );
+            let (_, data, auth) = parse(&xml, "Security").unwrap();
+            let event = auth_event(&data, auth.unwrap(), "agent", "host").unwrap();
+            let expected = chrono::DateTime::parse_from_rfc3339("2026-01-01T10:34:56.9876543Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            assert_eq!(event.timestamp, expected);
+            assert_eq!(event.timestamp, data.log_timestamp.unwrap());
+            assert_eq!(
+                event.origin.unwrap().source.as_deref(),
+                Some(format!("windows_eventlog:Security:{event_id}").as_str())
+            );
+            assert!(matches!(event.class, EventClass::User));
+            assert!(if success {
+                matches!(event.action, EventAction::Logon)
+            } else {
+                matches!(event.action, EventAction::LogonFailed)
+            });
+            let EventData::UserLogon(logon) = event.data else {
+                panic!("structured logon expected")
+            };
+            assert_eq!(logon.username, "Jörg & Co");
+            assert_eq!(logon.success, success);
+        }
+    }
+
+    #[test]
+    fn invalid_native_time_keeps_raw_authentication_without_fabricating_timeline() {
+        for timestamp in [
+            "",
+            r#"<TimeCreated/>"#,
+            r#"<TimeCreated SystemTime="invalid"/>"#,
+        ] {
+            let xml = format!(
+                r#"<Event><System><EventID>4625</EventID><EventRecordID>123</EventRecordID>{timestamp}</System><EventData><Data Name="TargetUserName">alice</Data></EventData></Event>"#
+            );
+            let (record, data, auth) = parse(&xml, "Security").unwrap();
+            assert_eq!(record, 123);
+            assert!(data.message.contains("alice"));
+            assert!(data.log_timestamp.is_none());
+            assert!(auth_event(&data, auth.unwrap(), "agent", "host").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn retried_raw_handoff_emits_one_auth_per_native_record() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut pending = HashMap::new();
+        let xml = |record| {
+            format!(
+                r#"<Event><System><EventID>4625</EventID><EventRecordID>{record}</EventRecordID><TimeCreated SystemTime="2026-01-01T10:34:56Z"/></System><EventData><Data Name="TargetUserName">alice</Data></EventData></Event>"#
+            )
+        };
+        // Each missing raw receipt leaves the source cursor and pending identity
+        // unchanged, so the next poll parses and attempts the same record again.
+        for _ in 0..5 {
+            let (record, data, auth) = parse(&xml(123), "Security").unwrap();
+            assert!(
+                enqueue_auth_once(
+                    &tx,
+                    &mut pending,
+                    "Security",
+                    record,
+                    auth.and_then(|auth| auth_event(&data, auth, "agent", "host")),
+                )
+                .await
+            );
+        }
+        let first = rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err());
+        // A successful raw receipt advances this channel and clears pending state.
+        pending.remove("Security");
+        let (record, data, auth) = parse(&xml(124), "Security").unwrap();
+        assert!(
+            enqueue_auth_once(
+                &tx,
+                &mut pending,
+                "Security",
+                record,
+                auth.and_then(|auth| auth_event(&data, auth, "agent", "host")),
+            )
+            .await
+        );
+        let second = rx.try_recv().unwrap();
+        assert_eq!(first.timestamp, second.timestamp);
+        assert_ne!(first.event_id, second.event_id);
+        assert!(rx.try_recv().is_err());
+        // Log reset clears the same bounded channel slot, permitting reused IDs.
+        pending.remove("Security");
+        let (record, data, auth) = parse(&xml(123), "Security").unwrap();
+        assert!(
+            enqueue_auth_once(
+                &tx,
+                &mut pending,
+                "Security",
+                record,
+                auth.and_then(|auth| auth_event(&data, auth, "agent", "host")),
+            )
+            .await
+        );
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_raw_receipts_enqueue_audit_tamper_once() {
+        let xml = r#"<Event><System><Provider Name="Microsoft-Windows-Eventlog"/><EventID>104</EventID><EventRecordID>123</EventRecordID><TimeCreated SystemTime="2026-01-01T10:34:56Z"/></System><EventData><Data Name="Channel">Security</Data></EventData></Event>"#;
+        let (record, data, _) = parse(xml, "System").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(2);
+        let consumer = tokio::spawn(async move {
+            let mut spool = crate::pipeline::Spool::in_memory(100);
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event.clone());
+                spool.push(event).unwrap();
+            }
+            events
+        });
+        let mut pending = windows_native::PendingRecords::default();
+        for _ in 0..3 {
+            if pending
+                .prepare("System", record, data.clone(), "agent", "host")
+                .unwrap()
+            {
+                tx.send(audit_tamper_event("System", &data, "agent", "host").unwrap())
+                    .await
+                    .unwrap();
+            }
+            assert!(pending
+                .emit(&tx, "System", record, data.clone(), "agent", "host", true)
+                .await
+                .is_err());
+        }
+        drop(tx);
+        let events = consumer.await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.data, EventData::Detection(_)))
+                .count(),
+            1
+        );
+        let ids: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.data, EventData::Log(_)))
+            .map(|e| e.event_id)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| *id == ids[0]));
+    }
+
+    #[tokio::test]
+    async fn failed_auth_enqueue_does_not_mark_record_pending() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let mut pending = HashMap::new();
+        let xml = r#"<Event><System><EventID>4625</EventID><EventRecordID>123</EventRecordID><TimeCreated SystemTime="2026-01-01T10:34:56Z"/></System><EventData><Data Name="TargetUserName">alice</Data></EventData></Event>"#;
+        let (record, data, auth) = parse(xml, "Security").unwrap();
+        assert!(
+            !enqueue_auth_once(
+                &tx,
+                &mut pending,
+                "Security",
+                record,
+                auth.and_then(|auth| auth_event(&data, auth, "agent", "host")),
+            )
+            .await
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn replayed_audit_findings_keep_native_time_and_historical_guard() {
+        for (channel, event_id) in [("System", 104), ("Security", 1102), ("Security", 4719)] {
+            let xml = format!(
+                r#"<Event><System><Provider Name="Microsoft-Windows-Eventlog"/><EventID>{event_id}</EventID><EventRecordID>123</EventRecordID><TimeCreated SystemTime="2020-01-01T12:34:56.1234567+02:00"/></System><EventData/></Event>"#
+            );
+            let (_, data, _) = parse(&xml, channel).unwrap();
+            let event = audit_tamper_event(channel, &data, "agent", "host").unwrap();
+            assert_eq!(event.timestamp, data.log_timestamp.unwrap());
+            assert_eq!(
+                event.timestamp.to_rfc3339(),
+                "2020-01-01T10:34:56.123456700+00:00"
+            );
+            assert_eq!(
+                event.origin.as_ref().unwrap().source.as_deref(),
+                Some(format!("windows_eventlog:{channel}:{event_id}").as_str())
+            );
+            assert!(crate::detection::is_historical_windows_record(&event));
+            assert!(matches!(event.data, EventData::Detection(_)));
+        }
+    }
+
+    #[test]
+    fn undated_audit_records_remain_raw_without_live_findings() {
+        for (channel, event_id) in [("System", 104), ("Security", 1102), ("Security", 4719)] {
+            for timestamp in [
+                "",
+                r#"<TimeCreated/>"#,
+                r#"<TimeCreated SystemTime="invalid"/>"#,
+            ] {
+                let xml = format!(
+                    r#"<Event><System><EventID>{event_id}</EventID><EventRecordID>123</EventRecordID>{timestamp}</System><EventData/></Event>"#
+                );
+                let (record, data, _) = parse(&xml, channel).unwrap();
+                assert_eq!(record, 123);
+                assert_eq!(data.fields["EventID"], event_id);
+                assert!(data.log_timestamp.is_none());
+                assert!(audit_tamper_event(channel, &data, "agent", "host").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn native_xml_rejects_duplicate_or_reserved_fields() {
+        for fields in [
+            r#"<Data Name="EventID">4688</Data>"#,
+            r#"<Data Name="CommandLine">first</Data><Data Name="CommandLine">second</Data>"#,
+        ] {
+            let xml = format!("<Event><System><EventID>4688</EventID><EventRecordID>7</EventRecordID></System><EventData>{fields}</EventData></Event>");
+            assert!(parse(&xml, "Security").is_err());
+        }
+        assert!(parse("<Event>", "Security").is_err());
+    }
+
+    #[test]
+    fn native_xml_field_truncation_preserves_original_byte_lengths() {
+        for command_line in ["x".repeat(20_000), "🦀".repeat(6_000)] {
+            let xml = format!(
+                r#"<Event><System><Provider Name="Microsoft-Windows-Security-Auditing"/><EventID>4688</EventID><EventRecordID>7</EventRecordID><TimeCreated SystemTime="2026-10-10T12:00:00Z"/></System><EventData><Data Name="NewProcessId">0x123</Data><Data Name="NewProcessName">C:\test.exe</Data><Data Name="CommandLine">{command_line}</Data></EventData></Event>"#
+            );
+            let (_, log, _) = parse(&xml, "Security").unwrap();
+            let captured = log.fields["CommandLine"].as_str().unwrap();
+            assert!(captured.len() <= 16 * 1024);
+            let marker = &log.truncated_fields.as_ref().unwrap()["fields.CommandLine"];
+            assert_eq!(marker.original_length, command_line.len());
+            assert_eq!(marker.captured_length, captured.len());
+            let event = windows_native::normalize(&log, "agent", "host").unwrap();
+            let EventData::ProcessCreate(process) = event.data else {
+                panic!("process expected")
+            };
+            assert!(process.enrichment.has_truncation());
+        }
+    }
+
     #[test]
     #[ignore = "requires elevated native Windows with Audit File System success enabled"]
     fn native_4663_self_read_is_suppressed_and_foreign_read_alerts() {

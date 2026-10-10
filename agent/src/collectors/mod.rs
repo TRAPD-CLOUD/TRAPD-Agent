@@ -23,6 +23,7 @@ pub mod system;
 
 // Ransomware / coalescing / tamper-timing rules shared by the Linux and Windows
 // filesystem collectors.
+pub mod critical_file;
 pub mod fs_heuristics;
 pub mod fs_plan;
 
@@ -32,6 +33,9 @@ pub mod mem_finding;
 // Generic log collector (file tail, journal, syslog → parsers → events), shared by
 // Linux and Windows; each platform supplies its own built-in source catalogue.
 pub mod logs;
+
+// Registry persistence watcher core (pure; the Windows collector does the reads).
+pub mod registry_watch;
 
 // Windows memory classification rules (pure; the scanner does the I/O).
 pub mod win_mem_rules;
@@ -46,3 +50,7 @@ pub mod windows;
 // tested on every build host.
 #[cfg(any(target_os = "windows", test))]
 pub mod etw_map;
+
+// Persisted Windows event normalization; tested independently of native APIs.
+#[cfg(any(target_os = "windows", test))]
+pub mod windows_native;

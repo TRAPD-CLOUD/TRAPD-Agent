@@ -16,7 +16,34 @@
 //! shows they hold.
 
 use super::ioa::ProcContext;
-use trapd_schema::DetectionData;
+use trapd_schema::{DetectionData, LogEventData};
+
+/// Event IDs are provider-local. Only native records from the documented
+/// channel/provider pair can feed Windows event-specific rules; parsed files
+/// with matching payload fields are not native audit evidence.
+fn matches_eventlog(log: &LogEventData, event_id: u64, channel: &str, provider: &str) -> bool {
+    log.source_type == "windows_eventlog"
+        && log.log_timestamp.is_some()
+        && log.source_path.eq_ignore_ascii_case(channel)
+        && log
+            .proc
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(provider))
+        && log.fields.get("EventID").and_then(|v| v.as_u64()) == Some(event_id)
+}
+
+/// Native provenance for the event-specific rules supported below. The XML
+/// normalizer puts Provider.Name in `proc`; payload fields cannot replace it.
+/// A missing recorded time cannot become collection-time audit evidence.
+pub(super) fn eventlog_source(log: &LogEventData) -> Option<String> {
+    let id = log.fields.get("EventID")?.as_u64()?;
+    let (channel, provider) = match id {
+        4688 | 4697 | 4698 => ("Security", "Microsoft-Windows-Security-Auditing"),
+        7045 => ("System", "Service Control Manager"),
+        _ => return None,
+    };
+    matches_eventlog(log, id, channel, provider).then(|| format!("windows_eventlog:{channel}:{id}"))
+}
 
 fn base(path: &str) -> String {
     path.rsplit(['\\', '/'])
