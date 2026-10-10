@@ -2374,6 +2374,9 @@ mod tests {
                 client_addr: "10.0.0.2".into(),
                 transaction_id: 1,
                 rcode: "NOERROR".into(),
+                pid: None,
+                process: None,
+                process_start_time: None,
             }),
         );
         let out = e.inspect(&res);

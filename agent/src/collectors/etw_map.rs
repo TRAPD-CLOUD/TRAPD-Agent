@@ -55,6 +55,10 @@ pub struct EtwRecord {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub timestamp: i64,
     pub props: HashMap<String, EtwValue>,
+    /// Process context read in the ETW callback itself, the earliest point
+    /// user mode sees a `ProcessStart`. Only set for Kernel-Process event 1.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub captured: Option<ProcessEnrichment>,
 }
 
 impl EtwRecord {
@@ -129,6 +133,23 @@ pub struct ProcessEnrichment {
     pub exe_sha256: Option<String>,
 }
 
+impl ProcessEnrichment {
+    /// Field-wise merge: values already present win, `fallback` fills the
+    /// gaps. Empty strings count as missing, so a failed read never masks a
+    /// later successful one.
+    pub fn prefer_over(self, fallback: ProcessEnrichment) -> ProcessEnrichment {
+        fn pick(a: Option<String>, b: Option<String>) -> Option<String> {
+            a.filter(|v| !v.is_empty()).or(b.filter(|v| !v.is_empty()))
+        }
+        ProcessEnrichment {
+            exe: pick(self.exe, fallback.exe),
+            cmdline: pick(self.cmdline, fallback.cmdline),
+            username: pick(self.username, fallback.username),
+            exe_sha256: pick(self.exe_sha256, fallback.exe_sha256),
+        }
+    }
+}
+
 /// Enrichment is valid only for the generation that produced this source event.
 pub fn same_process_generation(start: Option<u64>, current: Option<u64>, observed: i64) -> bool {
     start.is_some_and(|s| s > 0 && current == Some(s) && observed >= 0 && observed as u64 >= s)
@@ -154,13 +175,25 @@ pub fn process_start(
         .unwrap_or_default();
     let exe = enrich.exe.filter(|e| !e.is_empty()).unwrap_or(image);
     let mut notes = crate::telemetry::Enrichment::new();
-    let cmdline = enrich.cmdline.unwrap_or_default();
+    // Source order: the kernel's own payload (authoritative, race-free, when
+    // the manifest carries it), then what the callback read at start, then a
+    // late lookup. The cap matches the polling collector's contract.
+    let from_payload = rec.str(&["CommandLine"]).filter(|c| !c.is_empty());
+    let (cmdline, truncation) = crate::telemetry::limits::truncate_str(
+        &from_payload.or(enrich.cmdline).unwrap_or_default(),
+        crate::telemetry::limits::MAX_CMDLINE_BYTES,
+    );
+    notes.truncated("cmdline", truncation);
     if cmdline.is_empty() {
-        // The process may have exited before the lookup (the reason ETW is
-        // needed at all); the start itself is still recorded.
+        // The process exited before any read could succeed; the start itself
+        // is still recorded (Security 4688 can still supply the command line
+        // to detection).
         notes.fail("cmdline", crate::telemetry::EnrichmentError::IoError);
     }
     let username = enrich.username.unwrap_or_else(|| "unknown".into());
+    if username == "unknown" {
+        notes.fail("username", crate::telemetry::EnrichmentError::IoError);
+    }
     Some(ProcessCreateData {
         pid,
         ppid,
@@ -283,20 +316,67 @@ fn qtype_name(t: u64) -> String {
 }
 
 /// `QueryStatus` (Win32/DNS error code) → DNS response code text.
-fn rcode(status: u64) -> String {
+///
+/// DNS RCODEs surface as `DNS_ERROR_RCODE_*` (9001..9010, windns.h). Statuses
+/// that are not a DNS response code (transport errors, `ERROR_INVALID_PARAMETER`
+/// = 87, ...) map to `UNKNOWN` rather than leaking a Win32 number into a field
+/// whose contract is an RCODE name.
+fn rcode(status: u64) -> &'static str {
     match status {
-        0 => "NOERROR".into(),
-        9003 => "NXDOMAIN".into(),
-        9002 => "SERVFAIL".into(),
-        9005 => "REFUSED".into(),
-        9501 => "NOERROR".into(), // DNS_INFO_NO_RECORDS: name exists, no data
-        1460 => "TIMEOUT".into(),
-        other => format!("ERROR{other}"),
+        0 => "NOERROR",
+        9001 => "FORMERR",
+        9002 => "SERVFAIL",
+        9003 => "NXDOMAIN",
+        9004 => "NOTIMP",
+        9005 => "REFUSED",
+        9006 => "YXDOMAIN",
+        9007 => "YXRRSET",
+        9008 => "NXRRSET",
+        9009 => "NOTAUTH",
+        9010 => "NOTZONE",
+        // DNS_INFO_NO_RECORDS / DNS_ERROR_RECORD_DOES_NOT_EXIST: the name
+        // resolved but holds no record of the requested type (NODATA).
+        9501 | 9701 => "NODATA",
+        // ERROR_TIMEOUT / DNS timeout / WSAETIMEDOUT.
+        258 | 1460 | 10060 => "TIMEOUT",
+        _ => "UNKNOWN",
     }
 }
 
+/// Parses the `QueryResults` text of DNS-Client events, e.g.
+/// `"10.0.0.5;::ffff:10.0.0.5;type:  5 cdn.example;type:  6 ns1.example admin.example 1 900 ...;"`.
+///
+/// Only address entries and CNAME (type 5) entries belong to the answer.
+/// Other `type:` entries (SOA 6, NS 2, ...) are authority records of a
+/// negative response and must not be reported as aliases.
+fn parse_query_results(text: &str) -> (Vec<String>, Vec<String>) {
+    let (mut ips, mut cnames) = (Vec::new(), Vec::new());
+    for part in text.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(rest) = part.strip_prefix("type:") {
+            let mut fields = rest.split_whitespace();
+            if fields.next() == Some("5") {
+                if let Some(name) = fields.next() {
+                    cnames.push(name.trim_end_matches('.').to_string());
+                }
+            }
+        } else if part.parse::<std::net::IpAddr>().is_ok() {
+            let ip = part.strip_prefix("::ffff:").unwrap_or(part).to_string();
+            if !ips.contains(&ip) {
+                ips.push(ip);
+            }
+        }
+    }
+    (ips, cnames)
+}
+
 /// DNS-Client event 3008 (query completed) → resolution record. Returns the
-/// querying PID alongside (the schema has no PID field).
+/// PID that logged the event alongside; the DNS-Client library runs in the
+/// querying process, so this is the requester unless it is the Dnscache
+/// service host (shared-cache lookups).
 pub fn dns_query(rec: &EtwRecord) -> Option<(u32, DnsResolutionData)> {
     if rec.provider != DNS_CLIENT || rec.id != 3008 {
         return None;
@@ -307,22 +387,7 @@ pub fn dns_query(rec: &EtwRecord) -> Option<(u32, DnsResolutionData)> {
     }
     let qtype = qtype_name(rec.int(&["QueryType"]).unwrap_or(0));
     let status = rec.int(&["QueryStatus", "Status"]).unwrap_or(0);
-    // `QueryResults` looks like "10.0.0.5;::ffff:10.0.0.5;type:  5 cdn.example;".
-    let (mut ips, mut cnames) = (Vec::new(), Vec::new());
-    for part in rec.str(&["QueryResults"]).unwrap_or_default().split(';') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some(rest) = part.strip_prefix("type:") {
-            if let Some(name) = rest.split_whitespace().nth(1) {
-                cnames.push(name.trim_end_matches('.').to_string());
-            }
-        } else if part.parse::<std::net::IpAddr>().is_ok() {
-            ips.push(part.trim_start_matches("::ffff:").to_string());
-        }
-    }
-    ips.dedup();
+    let (ips, cnames) = parse_query_results(&rec.str(&["QueryResults"]).unwrap_or_default());
     Some((
         rec.header_pid,
         DnsResolutionData {
@@ -333,7 +398,10 @@ pub fn dns_query(rec: &EtwRecord) -> Option<(u32, DnsResolutionData)> {
             server_addr: String::new(),
             client_addr: String::new(),
             transaction_id: 0,
-            rcode: rcode(status),
+            rcode: rcode(status).to_string(),
+            pid: None,
+            process: None,
+            process_start_time: None,
         },
     ))
 }
@@ -352,6 +420,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
+            captured: None,
         }
     }
     fn int(v: u64, width: usize) -> EtwValue {
@@ -586,5 +655,135 @@ mod tests {
         let (_, d) = dns_query(&nx).unwrap();
         assert_eq!((d.qtype.as_str(), d.rcode.as_str()), ("AAAA", "NXDOMAIN"));
         assert!(dns_query(&rec(DNS_CLIENT, 3006, &[("QueryName", s("x"))])).is_none());
+    }
+
+    #[test]
+    fn dns_authority_records_are_not_cnames() {
+        // Negative answer: Windows lists the zone's SOA (type 6), whose first
+        // field is the primary nameserver. That is not an alias.
+        let r = rec(
+            DNS_CLIENT,
+            3008,
+            &[
+                ("QueryName", s("nope.example.com")),
+                ("QueryType", int(1, 2)),
+                ("QueryStatus", int(9003, 4)),
+                (
+                    "QueryResults",
+                    s("type:  6 ns1.example.com hostmaster.example.com 1 900 300 604800 60;"),
+                ),
+            ],
+        );
+        let (_, d) = dns_query(&r).unwrap();
+        assert_eq!(d.rcode, "NXDOMAIN");
+        assert!(d.cnames.is_empty(), "{:?}", d.cnames);
+        assert!(d.resolved_ips.is_empty());
+
+        let (ips, cnames) = parse_query_results(
+            "type:  5 a.example;type:  2 ns.example;1.2.3.4;1.2.3.4;::ffff:1.2.3.4;2001:db8::1;",
+        );
+        assert_eq!(cnames, vec!["a.example".to_string()]);
+        assert_eq!(ips, vec!["1.2.3.4".to_string(), "2001:db8::1".to_string()]);
+    }
+
+    #[test]
+    fn rcode_maps_dns_statuses_and_never_leaks_win32_numbers() {
+        for (status, want) in [
+            (0, "NOERROR"),
+            (9001, "FORMERR"),
+            (9002, "SERVFAIL"),
+            (9003, "NXDOMAIN"),
+            (9004, "NOTIMP"),
+            (9005, "REFUSED"),
+            (9009, "NOTAUTH"),
+            (9501, "NODATA"),
+            (9701, "NODATA"),
+            (1460, "TIMEOUT"),
+            (10060, "TIMEOUT"),
+            (87, "UNKNOWN"),
+            (123_456, "UNKNOWN"),
+        ] {
+            assert_eq!(rcode(status), want, "status {status}");
+        }
+    }
+
+    #[test]
+    fn process_start_prefers_payload_then_early_capture_and_caps_length() {
+        let base = [
+            ("ProcessID", int(4242, 4)),
+            ("CreateTime", int(133_000_000_000_000_000, 8)),
+            ("ImageName", s("C:\\Windows\\System32\\cmd.exe")),
+        ];
+        // The kernel payload beats a (possibly stale) captured value.
+        let mut props = base.to_vec();
+        props.push(("CommandLine", s("cmd /c echo payload")));
+        let p = process_start(
+            &rec(KERNEL_PROCESS, 1, &props),
+            &devices(),
+            ProcessEnrichment {
+                cmdline: Some("cmd /c echo captured".into()),
+                username: Some("CORP\\anna".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.cmdline, "cmd /c echo payload");
+        assert!(p.enrichment.enrichment_errors.is_empty());
+
+        // Without a payload the early capture is used.
+        let r = rec(KERNEL_PROCESS, 1, &base);
+        let p = process_start(
+            &r,
+            &devices(),
+            ProcessEnrichment {
+                cmdline: Some("cmd /c echo captured".into()),
+                username: Some("CORP\\anna".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.cmdline, "cmd /c echo captured");
+
+        // Nothing at all: partial, both fields reported.
+        let p = process_start(&r, &devices(), ProcessEnrichment::default()).unwrap();
+        assert!(p.cmdline.is_empty() && p.username == "unknown");
+        assert!(p.enrichment.enrichment_errors.contains_key("cmdline"));
+        assert!(p.enrichment.enrichment_errors.contains_key("username"));
+
+        // Oversized command lines are capped and marked.
+        let huge = "x".repeat(crate::telemetry::limits::MAX_CMDLINE_BYTES + 10);
+        let p = process_start(
+            &r,
+            &devices(),
+            ProcessEnrichment {
+                cmdline: Some(huge),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.cmdline.len(), crate::telemetry::limits::MAX_CMDLINE_BYTES);
+        assert!(p.enrichment.truncated_fields.contains_key("cmdline"));
+    }
+
+    #[test]
+    fn early_capture_wins_and_late_lookup_fills_gaps() {
+        let early = ProcessEnrichment {
+            cmdline: Some("reg add HKCU\\x".into()),
+            username: Some(String::new()), // failed read counts as missing
+            ..Default::default()
+        };
+        let late = ProcessEnrichment {
+            exe: Some("C:\\Windows\\System32\\reg.exe".into()),
+            cmdline: Some("stale".into()),
+            username: Some("CORP\\anna".into()),
+            exe_sha256: Some("sha256:ab".into()),
+        };
+        let m = early.prefer_over(late);
+        assert_eq!(m.cmdline.as_deref(), Some("reg add HKCU\\x"));
+        assert_eq!(m.username.as_deref(), Some("CORP\\anna"));
+        assert_eq!(m.exe.as_deref(), Some("C:\\Windows\\System32\\reg.exe"));
+        assert_eq!(m.exe_sha256.as_deref(), Some("sha256:ab"));
+        let none = ProcessEnrichment::default().prefer_over(ProcessEnrichment::default());
+        assert!(none.cmdline.is_none() && none.username.is_none());
     }
 }

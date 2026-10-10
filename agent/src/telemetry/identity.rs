@@ -266,6 +266,78 @@ pub fn parent_generation_before_child(child: Option<u64>, parent: Option<u64>) -
     parent.filter(|start| *start > 0 && *start < child)
 }
 
+/// Decodes the buffer `NtQueryInformationProcess(ProcessCommandLineInformation)`
+/// fills: a `UNICODE_STRING` header whose `Buffer` pointer refers to UTF-16
+/// data stored later in the *same* buffer. `base` is the address the buffer
+/// had when the kernel filled it, needed to turn that pointer into an offset.
+///
+/// Never trusts the embedded pointer or length: anything outside the buffer,
+/// odd-sized or empty yields `None`. Invalid UTF-16 is replaced, not rejected,
+/// so an attacker-chosen byte pattern cannot suppress the command line.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn decode_command_line_buffer(buf: &[u8], base: usize) -> Option<String> {
+    const HEADER: usize = 16; // u16 Length, u16 MaximumLength, pad, 64-bit pointer
+    let header = buf.get(..HEADER)?;
+    let length = u16::from_le_bytes([header[0], header[1]]) as usize;
+    let pointer = u64::from_le_bytes(header[8..16].try_into().ok()?);
+    let offset = usize::try_from(pointer).ok()?.checked_sub(base)?;
+    if length == 0 || !length.is_multiple_of(2) || offset < HEADER {
+        return None;
+    }
+    let bytes = buf.get(offset..offset.checked_add(length)?)?;
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    let text = String::from_utf16_lossy(&units);
+    let text = text.trim_end_matches('\0');
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Full command line of a live process, read through the kernel rather than
+/// by walking the target's PEB: `ProcessCommandLineInformation` (Windows 8.1+)
+/// needs only `PROCESS_QUERY_LIMITED_INFORMATION`, so it also works for
+/// processes whose memory the agent may not read.
+#[cfg(windows)]
+pub fn windows_process_command_line(pid: i32) -> Option<String> {
+    use windows_sys::Wdk::System::Threading::NtQueryInformationProcess;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // ProcessCommandLineInformation in the undocumented-but-stable class list.
+    const PROCESS_COMMAND_LINE_INFORMATION: i32 = 60;
+    // Command lines are bounded at 32767 UTF-16 units by CreateProcess.
+    const MAX_BYTES: usize = 16 + 2 * 33_000;
+    if pid <= 0 {
+        return None;
+    }
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if process.is_null() {
+            return None;
+        }
+        // u64 elements keep the buffer 8-byte aligned for the header.
+        let mut buffer = vec![0u64; MAX_BYTES.div_ceil(8)];
+        let mut returned = 0u32;
+        let status = NtQueryInformationProcess(
+            process,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * 8) as u32,
+            &mut returned,
+        );
+        CloseHandle(process);
+        if status < 0 {
+            return None;
+        }
+        let base = buffer.as_ptr() as usize;
+        let len = (returned as usize).min(buffer.len() * 8);
+        let bytes = std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), len);
+        decode_command_line_buffer(bytes, base)
+    }
+}
+
 /// Qualified account identity prevents local/domain accounts sharing a baseline.
 #[cfg(windows)]
 pub fn windows_process_account(pid: i32) -> Option<String> {
@@ -391,6 +463,59 @@ pub fn parse_start_time(stat: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds the kernel's reply layout: header followed by UTF-16 data.
+    fn reply(text: &str, base: usize, claimed_len: Option<u16>) -> Vec<u8> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let len = claimed_len.unwrap_or((units.len() * 2) as u16);
+        let mut out = Vec::new();
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&((base + 16) as u64).to_le_bytes());
+        for u in units {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn command_line_buffer_roundtrips_unicode() {
+        let text = "reg add HKCU\\Software\\Run /v trapdtest /d \"C:\\Temp\\\u{e4}.exe\"";
+        let buf = reply(text, 0x1000, None);
+        assert_eq!(
+            decode_command_line_buffer(&buf, 0x1000).as_deref(),
+            Some(text)
+        );
+    }
+
+    #[test]
+    fn command_line_buffer_rejects_hostile_layouts() {
+        // Length beyond the buffer, pointer outside it, pointer into the
+        // header, odd length, empty, truncated header.
+        assert!(decode_command_line_buffer(&reply("abc", 0x1000, Some(60)), 0x1000).is_none());
+        assert!(decode_command_line_buffer(&reply("abc", 0x1000, None), 0x9000).is_none());
+        assert!(decode_command_line_buffer(&reply("abc", 0x1000, None), 0x1010).is_none());
+        assert!(decode_command_line_buffer(&reply("abc", 0x1000, Some(5)), 0x1000).is_none());
+        assert!(decode_command_line_buffer(&reply("", 0x1000, None), 0x1000).is_none());
+        assert!(decode_command_line_buffer(&[0u8; 8], 0).is_none());
+        let mut huge = reply("abc", 0x1000, None);
+        huge[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode_command_line_buffer(&huge, 0x1000).is_none());
+    }
+
+    #[test]
+    fn command_line_buffer_trims_trailing_nul_and_survives_bad_utf16() {
+        let buf = reply("cmd /c echo x\0\0", 0x2000, None);
+        assert_eq!(
+            decode_command_line_buffer(&buf, 0x2000).as_deref(),
+            Some("cmd /c echo x")
+        );
+        let mut lone = reply("ab", 0x2000, None);
+        lone[16..18].copy_from_slice(&0xD800u16.to_le_bytes()); // lone surrogate
+        let text = decode_command_line_buffer(&lone, 0x2000).unwrap();
+        assert!(text.ends_with('b') && text.contains('\u{FFFD}'));
+    }
 
     #[test]
     fn parent_generation_must_predate_the_child() {

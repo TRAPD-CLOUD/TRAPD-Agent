@@ -2794,6 +2794,9 @@ mod tests {
                 client_addr: "10.0.0.2".into(),
                 transaction_id: 42,
                 rcode: "NOERROR".into(),
+                pid: None,
+                process: None,
+                process_start_time: None,
             })
             .await;
         assert!(
@@ -2964,6 +2967,9 @@ mod tests {
             client_addr: "10.0.0.5".into(),
             transaction_id: 4242,
             rcode: "NOERROR".into(),
+            pid: None,
+            process: None,
+            process_start_time: None,
         };
         engine.enforce_dns_resolution(&answer).await;
 
