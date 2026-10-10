@@ -728,13 +728,9 @@ impl DecodeState {
                 return Some(hash.clone());
             }
         }
-        let digest = format!(
-            "sha256:{}",
-            hex::encode(
-                crate::paths::bounded_regular_sha256(std::path::Path::new(path), MAX_HASH_BYTES)
-                    .ok()?
-            )
-        );
+        let digest =
+            crate::paths::bounded_regular_sha256_label(std::path::Path::new(path), MAX_HASH_BYTES)
+                .ok()?;
         if self.hash_cache.len() >= MAX_HASH_CACHE {
             self.hash_cache.clear();
         }

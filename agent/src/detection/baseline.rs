@@ -6,7 +6,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 const MAX_ENTITIES: usize = 8192;
-const MAX_CHILDREN: usize = 64;
+/// Per-user cap on confirmed and on pending binaries. A Windows workstation
+/// runs hundreds of distinct executables; at 64 the confirmed set filled up
+/// within days and every further binary stayed "novel" forever.
+const MAX_CHILDREN: usize = 512;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PROFILE_BYTES: usize = 4 * 1024 * 1024;
 const DAY: u64 = 86_400;
@@ -111,6 +114,26 @@ fn identity(user: &str, exe: &str) -> Option<(String, String)> {
     })
 }
 
+/// Images under admin-only Windows install locations (input is the normalised,
+/// lower-cased identity form). A first run there is routine servicing and
+/// feature rollout (Store apps, SystemApps, updated vendor helpers), not a
+/// novel binary; planting one needs admin and is covered by the integrity,
+/// FIM and persistence rules. The binary is still learned.
+fn is_os_protected_image(exe: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "c:/windows/system32/",
+        "c:/windows/syswow64/",
+        "c:/windows/systemapps/",
+        "c:/windows/winsxs/",
+        "c:/windows/immersivecontrolpanel/",
+        "c:/windows/servicing/",
+        "c:/program files/windowsapps/",
+        "c:/program files/",
+        "c:/program files (x86)/",
+    ];
+    PREFIXES.iter().any(|p| exe.starts_with(p))
+}
+
 impl BaselineEngine {
     pub fn new() -> Self {
         Self {
@@ -201,7 +224,7 @@ impl BaselineEngine {
         } else if !eligible && profile.pending.remove(&exe).is_some() {
             self.profile_bytes = self.profile_bytes.saturating_sub(exe.len() + 128);
         }
-        let novelty = (!known && mature).then(|| DetectionData {
+        let novelty = (!known && mature && !is_os_protected_image(&exe)).then(|| DetectionData {
             rule_id: "anomaly.rare_binary_for_user".into(), title: "Anomalous binary for user".into(), category: "anomaly".into(),
             mitre_tactic: Some("TA0002 Execution".into()), mitre_technique: Some("T1059".into()), confidence: 55,
             subject: format!("{user}: {exe}"), detail: "Executable is absent from the confirmed local baseline".into(),
@@ -385,6 +408,66 @@ pub struct BaselineSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mature_engine() -> (BaselineEngine, Instant) {
+        let mut e = BaselineEngine::new();
+        let t = Instant::now();
+        // Four distinct binaries seen three times over more than a day.
+        for exe in ["a", "b", "c", "d"] {
+            for wall in [100_000, 150_000, 200_000] {
+                e.observe_exec_at("bob", &format!("/opt/{exe}"), t, wall, true);
+            }
+        }
+        assert_eq!(e.profiles["bob"].confirmed.len(), 4);
+        (e, t)
+    }
+
+    #[test]
+    fn learning_keeps_up_beyond_the_old_64_binary_cap() {
+        let mut e = BaselineEngine::new();
+        let t = Instant::now();
+        for i in 0..200 {
+            for wall in [100_000, 150_000, 200_000] {
+                e.observe_exec_at("bob", &format!("/opt/app{i}"), t, wall, true);
+            }
+        }
+        assert_eq!(e.profiles["bob"].confirmed.len(), 200);
+        // A confirmed binary beyond the old cap stays quiet.
+        assert!(e
+            .observe_exec_at("bob", "/opt/app150", t, 300_000, true)
+            .is_none());
+    }
+
+    #[test]
+    fn novel_binary_in_user_writable_location_still_flags() {
+        let (mut e, t) = mature_engine();
+        let d = e
+            .observe_exec_at(
+                "bob",
+                "C:\\Users\\bob\\AppData\\Local\\Temp\\x.exe",
+                t,
+                300_000,
+                true,
+            )
+            .expect("novel temp binary must flag");
+        assert_eq!(d.rule_id, "anomaly.rare_binary_for_user");
+        assert!(e
+            .observe_exec_at("bob", "/tmp/dropper", t, 300_001, true)
+            .is_some());
+    }
+
+    #[test]
+    fn novel_binary_in_admin_only_windows_location_is_learned_but_not_flagged() {
+        let (mut e, t) = mature_engine();
+        for exe in [
+            "C:\\Windows\\SystemApps\\Microsoft.LockApp_cw5n1h2txyewy\\LockApp.exe",
+            "C:\\Program Files\\Cloudflare\\Cloudflare WARP\\warp-svc.exe",
+            "C:\\Windows\\System32\\RuntimeBroker.exe",
+        ] {
+            assert!(e.observe_exec_at("bob", exe, t, 300_000, true).is_none());
+        }
+        assert!(e.profiles["bob"].pending.len() >= 3);
+    }
 
     #[test]
     fn stale_candidates_do_not_block_learning_forever() {
