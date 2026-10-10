@@ -272,11 +272,12 @@ mod render_tests {
         assert_eq!(render_value(1, &utf16(r"C:.exe")), r"C:.exe");
         assert_eq!(render_value(4, &1u32.to_le_bytes()), "1");
         assert_eq!(render_value(3, &[0xde, 0xad]), "dead");
-        let mut multi = utf16("a");
-        multi.pop();
-        multi.pop();
-        multi.extend(utf16("b"));
-        multi.extend([0, 0]);
+        // REG_MULTI_SZ: each entry ends in a UTF-16 NUL; a second NUL
+        // terminates the list. Keep the separator between "a" and "b".
+        let multi = [b'a', 0, 0, 0, b'b', 0, 0, 0, 0, 0];
         assert_eq!(render_value(7, &multi), "a|b");
+        let single = [b'a', 0, b'b', 0, 0, 0, 0, 0];
+        assert_eq!(render_value(7, &single), "ab");
+        assert_eq!(render_value(7, &[0, 0, 0, 0]), "");
     }
 }
