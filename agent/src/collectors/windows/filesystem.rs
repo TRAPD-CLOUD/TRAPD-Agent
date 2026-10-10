@@ -179,6 +179,10 @@ fn checked_event(
     );
     if let EventData::Filesystem(d) = &mut ev.data {
         if let critical::Verdict::Changed { summary, .. } = verdict {
+            // A content verdict takes precedence over the notification kind:
+            // atomic replacement arrives as Created (RenamedTo).
+            ev.severity = Severity::High;
+            d.integrity = IntegrityStatus::Violation;
             d.change_summary = summary.clone();
         } else {
             // Not a content change: report the hash we saw, flag nothing.
@@ -745,6 +749,61 @@ impl Collector for FilesystemCollector {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn changed_hosts_replacement_is_an_integrity_violation() {
+        let before = critical::snapshot_of(b"127.0.0.1 localhost\n", true);
+        let after = critical::snapshot_of(b"127.0.0.1 localhost\n203.0.113.1 bank.example\n", true);
+        let verdict = critical::compare(Some(&before), &after);
+        let operation = operation_for(Change::RenamedTo);
+        assert_eq!(operation, FilesystemOperation::Created);
+        let ev = checked_event(
+            "agent",
+            "host",
+            "C:\\Windows\\System32\\drivers\\etc\\hosts".into(),
+            operation,
+            &verdict,
+            Some(&before),
+            Some(&after),
+        );
+        assert_eq!(ev.severity, Severity::High);
+        assert!(matches!(ev.action, EventAction::Create));
+        let EventData::Filesystem(data) = ev.data else {
+            panic!("expected filesystem event")
+        };
+        assert_eq!(data.integrity, IntegrityStatus::Violation);
+        assert_eq!(data.expected_hash.as_deref(), Some(before.sha256.as_str()));
+        assert_eq!(data.actual_hash.as_deref(), Some(after.sha256.as_str()));
+        assert_eq!(data.size_delta, Some(25));
+        assert!(data
+            .change_summary
+            .unwrap()
+            .contains("203.0.113.1 bank.example"));
+    }
+
+    #[test]
+    fn unchanged_hosts_replacement_and_first_creation_are_informational() {
+        let snapshot = critical::snapshot_of(b"127.0.0.1 localhost\n", true);
+        for before in [Some(&snapshot), None] {
+            let verdict = critical::compare(before, &snapshot);
+            let ev = checked_event(
+                "agent",
+                "host",
+                "hosts".into(),
+                FilesystemOperation::Created,
+                &verdict,
+                before,
+                Some(&snapshot),
+            );
+            assert_eq!(ev.severity, Severity::Info);
+            let EventData::Filesystem(data) = ev.data else {
+                panic!("expected filesystem event")
+            };
+            assert_ne!(data.integrity, IntegrityStatus::Violation);
+            assert_eq!(data.actual_hash.as_deref(), Some(snapshot.sha256.as_str()));
+            assert!(data.change_summary.is_none());
+        }
+    }
 
     struct TestDirectory(PathBuf);
     impl Drop for TestDirectory {
