@@ -73,7 +73,10 @@ pub fn entry() -> Result<()> {
         // side-effect free, exactly like the Linux verb.
         Some("replay") => {
             let args: Vec<String> = std::env::args().collect();
-            std::process::exit(crate::detection::replay::run_cli(&args[2..]));
+            std::process::exit(crate::detection::replay::run_cli(
+                &args[2..],
+                &crate::detection_host::engine("replay".into(), "replay".into()),
+            ));
         }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("config") => {
             println!(

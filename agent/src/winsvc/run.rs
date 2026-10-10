@@ -391,7 +391,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
 
     drop(tx);
 
-    let engine = Arc::new(crate::detection::DetectionEngine::new(
+    let engine = Arc::new(crate::detection_host::engine(
         agent_id.clone(),
         hostname.clone(),
     ));
@@ -403,7 +403,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         engine.set_rule_modes(&cfg.rule_modes);
         crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
     }
-    Arc::clone(&engine).spawn_ioc_reloader(300);
+    crate::detection_host::spawn_ioc_reloader(Arc::clone(&engine), 300);
 
     // SIEM forwarder — same best-effort export path as the Linux agent.
     let siem = {

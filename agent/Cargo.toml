@@ -9,6 +9,9 @@ name = "trapd-agent"
 path = "src/main.rs"
 
 [dependencies]
+regex = "1.12.3"
+trapd-schema = { path = "../crates/trapd-schema" }
+trapd-detection = { path = "../crates/trapd-detection" }
 tokio              = { version = "1",    features = ["full"] }
 serde              = { version = "1",    features = ["derive"] }
 serde_json         = "1"
@@ -36,18 +39,8 @@ ipnet              = { version = "2", features = ["serde"] }
 getrandom          = "0.3"
 zeroize            = { version = "1", features = ["derive"] }
 
-# Optional YARA file-scanning support — enable with `--features yara`.
-# Requires the libyara C library + headers at build time; off by default so the
-# standard build has no native dependency.  (The crate published by the
-# yara-rust project is named `yara`; the dependency key keeps the `yara-rust`
-# name used throughout the codebase.)
-yara-rust          = { version = "0.28", package = "yara", optional = true }
-serde_yaml_ng = "0.10"
-regex = "1.12.3"
-
 [features]
-# Compile the optional YARA scanner (agent/src/detection/yara_scanner.rs).
-yara = ["dep:yara-rust"]
+yara = ["trapd-detection/yara"]
 
 # eBPF userspace loader — Linux only.
 # Only needed at runtime if the eBPF binary is installed;

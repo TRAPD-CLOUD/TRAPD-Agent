@@ -48,8 +48,13 @@ p=Path(sys.argv[1]);mode=sys.argv[2];pid=int((p/'agent.pid').read_text());hits=[
 for line in (p/'events.ndjson').read_text().splitlines():
  try:e=json.loads(line)
  except ValueError:continue
- d=e.get('data',{})
- if isinstance(d,dict) and d.get('token_id','').startswith(('11111111-','22222222-','33333333-')):hits.append(e)
+ assert e.get('metadata',{}).get('version')=='1.9.0','local telemetry is not OCSF 1.9.0'
+ source=e.get('unmapped',{}).get('trapd',{})
+ d=source.get('data',{})
+ if isinstance(d,dict) and d.get('token_id','').startswith(('11111111-','22222222-','33333333-')):
+  assert e.get('class_uid')==2004 and e.get('activity_id')==1,'incorrect finding class'
+  assert e.get('finding_info',{}).get('uid')==e['metadata']['uid'],'finding identity changed'
+  hits.append({'data':d})
 assert hits,'no Honeytoken data'
 assert not any(e['data']['token_id'].startswith('33333333-') and e['data']['access_kind'] in ['exec','open'] for e in hits),'failed exec became content access'
 assert not any(e['data'].get('accessor',{}).get('pid')==pid for e in hits),'agent self access leaked'

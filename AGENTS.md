@@ -5,7 +5,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 ## Repository Overview
 
 - Language/runtime: Rust 2021, Tokio async runtime.
-- Workspace members: `agent`, `xtask`.
+- Workspace members: `agent`, `crates/trapd-schema`, `crates/trapd-detection`, `xtask`.
 - Standalone crate: `trapd-agent-ebpf` is intentionally outside the root workspace because it targets `bpfel-unknown-none`.
 - Main binary: `agent/src/main.rs` builds `trapd-agent`.
 - Current package version: `trapd-agent` `0.2.0`.
@@ -14,7 +14,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 ## Important Paths
 
-- `agent/src/schema/mod.rs`: primary telemetry event envelope and event payload schemas.
+- `crates/trapd-schema/src/lib.rs`: primary telemetry event envelope and event payload schemas.
 - `agent/src/enrollment/mod.rs`: first-run enrollment request/response and persisted credentials.
 - `agent/src/heartbeat/mod.rs`: heartbeat payload schema.
 - `agent/src/inventory/mod.rs`: asset inventory payload schema.
@@ -1195,7 +1195,7 @@ Backend responsibilities for the recon profile:
   the cheap in-kernel gate is path-based. A future hardening is a BTF/CO-RE
   inode read to also catch relative-path / symlink opens at the kernel layer.
 - Userspace (`agent/src/collectors/linux/ebpf_syscalls.rs` +
-  `agent/src/detection/honeytoken.rs`): a reconciler arms `HONEYTOKEN_PATHS`
+  `crates/trapd-detection/src/honeytoken.rs`): a reconciler arms `HONEYTOKEN_PATHS`
   from the on-disk register (`<state>/honeytokens.json`) every 15s; a consumer
   enriches each hit with full `/proc` lineage, applies the false-positive
   allowlist + agent self-exclusion, and emits a `HoneytokenAccess` detection.

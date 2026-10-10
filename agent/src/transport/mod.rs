@@ -80,6 +80,8 @@ pub struct Transport {
     /// before that would hand an older backend a body it cannot parse, which it
     /// rejects with a permanent 4xx, and the batch would be dropped.
     gzip_ok: AtomicBool,
+    /// OCSF is used only after an explicit advertisement by the pinned backend.
+    ocsf_ok: AtomicBool,
     /// Seconds from the last `Retry-After`, consumed by the flush loop.
     retry_after_secs: AtomicU64,
     /// Fired by the spool when a detection/prevention event is queued; cuts the
@@ -109,6 +111,7 @@ impl Transport {
             ingest_url,
             token,
             gzip_ok: AtomicBool::new(false),
+            ocsf_ok: AtomicBool::new(false),
             retry_after_secs: AtomicU64::new(0),
         })
     }
@@ -186,21 +189,27 @@ impl Transport {
             return FlushOutcome::Idle;
         }
 
-        let n = batch.len();
-        let seqs: Vec<u64> = batch.iter().map(|e| e.seq).collect();
-        let events: Vec<_> = batch.iter().map(|e| e.event.clone()).collect();
-
-        let raw = match serde_json::to_vec(&events) {
-            Ok(raw) => raw,
+        let all_seqs: Vec<u64> = batch.iter().map(|e| e.seq).collect();
+        let sent_ocsf = self.ocsf_ok.load(Ordering::Relaxed);
+        // OCSF adds standard projections alongside source evidence. Bound the
+        // actual encoded body, and acknowledge only entries included in it.
+        let (batch, raw) = match encode_event_batch(
+            &batch,
+            sent_ocsf,
+            crate::telemetry::limits::MAX_BATCH_BYTES,
+        ) {
+            Ok(encoded) => encoded,
             Err(e) => {
-                warn!(error = %e, events = n, "Transport: batch serialisation failed — will retry");
+                warn!(error = %e, "Transport: batch encoding failed — will retry");
                 metrics().transport_batch_failed();
                 if let Ok(mut buf) = self.buffer.lock() {
-                    buf.nack(&seqs);
+                    buf.nack(&all_seqs);
                 }
                 return FlushOutcome::Failed;
             }
         };
+        let n = batch.len();
+        let seqs: Vec<u64> = batch.iter().map(|e| e.seq).collect();
         let (body, compressed) = encode_body(raw, self.gzip_ok.load(Ordering::Relaxed));
         let mut request = self
             .client
@@ -224,6 +233,8 @@ impl Transport {
             if advertises_gzip(resp.headers()) {
                 self.gzip_ok.store(true, Ordering::Relaxed);
             }
+            self.ocsf_ok
+                .store(advertises_ocsf(resp.headers()), Ordering::Relaxed);
             // Always overwrite (0 when absent) so a stale hint never outlives
             // the response that sent it.
             let hint = parse_retry_after(resp.headers()).map_or(0, |d| d.as_secs());
@@ -285,6 +296,17 @@ impl Transport {
                         buf.nack(&seqs);
                     }
                     FlushOutcome::Failed
+                } else if sent_ocsf
+                    && !advertises_ocsf(resp.headers())
+                    && matches!(status.as_u16(), 400 | 415 | 422)
+                {
+                    // A rollout may route the next request to an older gateway.
+                    // Retry its legacy contract once, preserving every event ID.
+                    self.ocsf_ok.store(false, Ordering::Relaxed);
+                    if let Ok(mut buf) = self.buffer.lock() {
+                        buf.nack(&seqs);
+                    }
+                    FlushOutcome::Failed
                 } else if is_permanent(status.as_u16()) {
                     // Retrying forever would block every event behind this
                     // batch. Remove it, but count the loss.
@@ -334,6 +356,46 @@ impl Transport {
             }
         }
     }
+}
+
+/// Encode the largest prefix that fits the wire limit after OCSF expansion.
+fn encode_event_batch(
+    batch: &[crate::pipeline::SpoolEntry],
+    ocsf: bool,
+    limit: usize,
+) -> Result<(Vec<crate::pipeline::SpoolEntry>, Vec<u8>), trapd_schema::ocsf::ContractError> {
+    use trapd_schema::ocsf::{to_ocsf, ContractError};
+    let mut selected = Vec::new();
+    let mut raw = vec![b'['];
+    for entry in batch {
+        let legacy = serde_json::to_value(&entry.event)
+            .map_err(|_| ContractError("event serialization failed"))?;
+        let wire = if ocsf { to_ocsf(&legacy)? } else { legacy };
+        let encoded =
+            serde_json::to_vec(&wire).map_err(|_| ContractError("event serialization failed"))?;
+        let comma = usize::from(!selected.is_empty());
+        if raw.len() + comma + encoded.len() + 1 > limit {
+            if selected.is_empty() {
+                return Err(ContractError("encoded event exceeds batch limit"));
+            }
+            break;
+        }
+        if comma != 0 {
+            raw.push(b',');
+        }
+        raw.extend_from_slice(&encoded);
+        selected.push(entry.clone());
+    }
+    raw.push(b']');
+    Ok((selected, raw))
+}
+fn advertises_ocsf(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(trapd_schema::ocsf::CAPABILITY_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|token| token.trim() == "ocsf-1.9.0")
 }
 
 /// Split a batch into accepted / retry / rejected sets without counting losses.
@@ -849,7 +911,145 @@ mod tests {
             ingest_url: url,
             token: "secret_test".into(),
             gzip_ok: AtomicBool::new(false),
+            ocsf_ok: AtomicBool::new(false),
             retry_after_secs: AtomicU64::new(0),
+        }
+    }
+
+    async fn flush_ready(t: &Transport) -> FlushOutcome {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let outcome = t.flush(false).await;
+                if outcome != FlushOutcome::Idle {
+                    break outcome;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("spool retry should become eligible within its backoff bound")
+    }
+
+    #[test]
+    fn imperfect_auth_address_does_not_poison_a_mixed_batch() {
+        let mut batch: Vec<_> = (1..=3).map(entry).collect();
+        batch[1].event.class = crate::schema::EventClass::User;
+        batch[1].event.action = crate::schema::EventAction::LogonFailed;
+        batch[1].event.data = crate::schema::EventData::UserLogon(crate::schema::UserLogonData {
+            username: "fixture".into(),
+            src_addr: Some("not-an-ip".into()),
+            src_port: Some(22),
+            auth_method: Some("password".into()),
+            success: false,
+            ..Default::default()
+        });
+        let (selected, raw) = encode_event_batch(&batch, true, usize::MAX).unwrap();
+        assert_eq!(selected.len(), 3);
+        let wire: Vec<serde_json::Value> = serde_json::from_slice(&raw).unwrap();
+        assert!(wire[1].get("src_endpoint").is_none());
+        assert_eq!(
+            wire[1]["unmapped"]["trapd"]["data"]["src_addr"],
+            "not-an-ip"
+        );
+        for (event, original) in wire.iter().zip(&batch) {
+            assert_eq!(
+                event["metadata"]["uid"],
+                original.event.event_id.to_string()
+            );
+            crate::schema::ocsf::validate(event).unwrap();
+        }
+    }
+    #[test]
+    fn ocsf_expansion_respects_wire_limit_and_selected_handles() {
+        let batch: Vec<_> = (1..=3).map(entry).collect();
+        let (_, one) = encode_event_batch(&batch[..1], true, usize::MAX).unwrap();
+        let (selected, raw) = encode_event_batch(&batch, true, one.len() + 1).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].seq, batch[0].seq);
+        assert!(raw.len() <= one.len() + 1);
+        let wire: Vec<serde_json::Value> = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            wire[0]["metadata"]["uid"],
+            batch[0].event.event_id.to_string()
+        );
+        assert!(encode_event_batch(&batch, true, one.len() - 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn older_gateway_after_negotiation_retries_legacy_without_loss() {
+        let (url, backend) = mock_backend(vec![
+            http(
+                "503 Service Unavailable",
+                "x-trapd-event-formats: legacy,ocsf-1.9.0\r\n",
+            ),
+            http("400 Bad Request", ""),
+            http("202 Accepted", ""),
+        ])
+        .await;
+        let t = transport_for(url, 1);
+        assert_eq!(flush_ready(&t).await, FlushOutcome::Failed);
+        assert_eq!(flush_ready(&t).await, FlushOutcome::Failed);
+        assert_eq!(flush_ready(&t).await, FlushOutcome::Delivered);
+        let seen = backend.await.unwrap();
+        let payloads: Vec<Vec<serde_json::Value>> = seen
+            .iter()
+            .map(|s| serde_json::from_slice(&s.body).unwrap())
+            .collect();
+        assert_eq!(payloads[0], payloads[2]);
+        assert_eq!(
+            payloads[1][0]["metadata"]["uid"],
+            payloads[0][0]["event_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ocsf_negotiation_preserves_identity_across_retries() {
+        let (url, backend) = mock_backend(vec![
+            http(
+                "503 Service Unavailable",
+                "x-trapd-event-formats: legacy,ocsf-1.9.0\r\n",
+            ),
+            http(
+                "503 Service Unavailable",
+                "x-trapd-event-formats: legacy,ocsf-1.9.0\r\n",
+            ),
+            http(
+                "202 Accepted",
+                "x-trapd-event-formats: legacy,ocsf-1.9.0\r\n",
+            ),
+        ])
+        .await;
+        let t = transport_for(url, 1);
+        assert_eq!(flush_ready(&t).await, FlushOutcome::Failed);
+        assert_eq!(flush_ready(&t).await, FlushOutcome::Failed);
+        assert_eq!(flush_ready(&t).await, FlushOutcome::Delivered);
+        let seen = backend.await.unwrap();
+        let legacy: Vec<serde_json::Value> = serde_json::from_slice(&seen[0].body).unwrap();
+        let retry: Vec<serde_json::Value> = serde_json::from_slice(&seen[1].body).unwrap();
+        let final_batch: Vec<serde_json::Value> = serde_json::from_slice(&seen[2].body).unwrap();
+        assert!(retry[0].get("class_uid").is_some());
+        assert_eq!(retry[0]["metadata"]["uid"], legacy[0]["event_id"]);
+        assert_eq!(retry, final_batch);
+        assert_eq!(trapd_schema::ocsf::from_ocsf(&retry[0]).unwrap(), legacy[0]);
+    }
+
+    #[tokio::test]
+    async fn unsupported_capability_keeps_legacy_wire() {
+        let (url, backend) = mock_backend(vec![
+            http(
+                "503 Service Unavailable",
+                "x-trapd-event-formats: ocsf-2.0.0\r\n",
+            ),
+            http("202 Accepted", ""),
+        ])
+        .await;
+        let t = transport_for(url, 1);
+        assert_eq!(flush_ready(&t).await, FlushOutcome::Failed);
+        assert_eq!(flush_ready(&t).await, FlushOutcome::Delivered);
+        for seen in backend.await.unwrap() {
+            let events: Vec<serde_json::Value> = serde_json::from_slice(&seen.body).unwrap();
+            assert!(events[0].get("event_id").is_some());
+            assert!(events[0].get("class_uid").is_none());
         }
     }
 
@@ -960,6 +1160,7 @@ mod tests {
                 ingest_url: var("TRAPD_E2E_INGEST_URL"),
                 token: var("TRAPD_E2E_TOKEN"),
                 gzip_ok: AtomicBool::new(false),
+                ocsf_ok: AtomicBool::new(false),
                 retry_after_secs: AtomicU64::new(0),
             }
         };

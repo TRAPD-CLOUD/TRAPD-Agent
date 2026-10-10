@@ -411,7 +411,7 @@ impl MemScanCollector {
                 if let Some(path) = image {
                     let hash =
                         image_hash.get_or_insert_with(|| super::exehash::hash_executable(path));
-                    finding.correlation = Some(crate::schema::CorrelationKeys {
+                    finding.correlation = Some(trapd_schema::CorrelationKeys {
                         pid: Some(pid),
                         exe: Some(path.to_string()),
                         exe_sha256: hash.clone(),

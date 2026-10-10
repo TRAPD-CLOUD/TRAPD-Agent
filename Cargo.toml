@@ -2,5 +2,5 @@
 # trapd-agent-ebpf lives outside this workspace: it targets bpfel-unknown-none
 # and requires a different toolchain (nightly + bpf-linker). Build it with:
 #   cargo xtask build-ebpf --release
-members  = ["agent", "xtask"]
+members  = ["agent", "crates/trapd-schema", "crates/trapd-detection", "xtask"]
 resolver = "2"

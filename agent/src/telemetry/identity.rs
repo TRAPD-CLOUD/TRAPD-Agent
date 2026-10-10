@@ -16,28 +16,12 @@
 //! the kernel and immutable for the life of the process.  [`ProcessKey`] is that
 //! triple.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-/// Monotonically increasing per-agent-run event sequence.
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// Next sequence number for this agent run.
-///
-/// Sequence numbers start at 1 and increase by exactly one per event, so a gap
-/// in the numbers the backend receives is direct evidence of loss — and the
-/// pair `(boot_id, sequence)` says exactly *which* events went missing.  They
-/// are per-run, not per-collector, which makes them totally ordered.
-pub fn next_sequence() -> u64 {
-    SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
-}
-
-/// Sequence numbers issued so far this run.
-pub fn issued_sequences() -> u64 {
-    SEQUENCE.load(Ordering::Relaxed)
-}
+pub use trapd_schema::runtime::issued_sequences;
+pub use trapd_schema::EventOrigin;
 
 /// Identifier of the current *system boot*.
 ///
@@ -99,46 +83,6 @@ pub fn monotonic_ns() -> u64 {
         .get_or_init(std::time::Instant::now)
         .elapsed()
         .as_nanos() as u64
-}
-
-/// Provenance stamped on every event.
-///
-/// Carried alongside `event_id` so a receiver can reconstruct the agent's
-/// ordered event stream, detect gaps, and reason about timing without trusting
-/// the wall clock.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventOrigin {
-    /// System boot this event belongs to; scopes `sequence` and every
-    /// [`ProcessKey`].
-    pub boot_id: String,
-    /// Position in this run's totally-ordered event stream, starting at 1.
-    pub sequence_number: u64,
-    /// Monotonic clock reading at event creation, in nanoseconds.
-    pub monotonic_timestamp_ns: u64,
-    /// Collector that produced the event (`ebpf_exec`, `proc_poll`, …).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-}
-
-impl EventOrigin {
-    /// Stamp a new origin, consuming the next sequence number.
-    pub fn new(source: impl Into<String>) -> Self {
-        Self {
-            source: Some(source.into()),
-            ..Self::unsourced()
-        }
-    }
-
-    /// Stamp an origin without naming a source; the collector fills it in via
-    /// [`crate::schema::AgentEvent::from_source`].
-    pub fn unsourced() -> Self {
-        Self {
-            boot_id: boot_id().to_string(),
-            sequence_number: next_sequence(),
-            monotonic_timestamp_ns: monotonic_ns(),
-            source: None,
-        }
-    }
 }
 
 /// Stable identity of a running process: `(boot_id, pid, start_time)`.
@@ -533,32 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn sequences_are_strictly_increasing() {
-        let a = next_sequence();
-        let b = next_sequence();
-        let c = next_sequence();
-        assert!(a < b && b < c, "sequence must be strictly increasing");
-        assert_eq!(b, a + 1);
-        assert_eq!(c, b + 1);
-    }
-
-    #[test]
-    fn sequences_are_unique_across_threads() {
-        // Gap detection depends on the counter never handing out a duplicate.
-        let handles: Vec<_> = (0..8)
-            .map(|_| std::thread::spawn(|| (0..500).map(|_| next_sequence()).collect::<Vec<_>>()))
-            .collect();
-        let mut all: Vec<u64> = handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect();
-        let total = all.len();
-        all.sort_unstable();
-        all.dedup();
-        assert_eq!(all.len(), total, "sequence numbers must never repeat");
-    }
-
-    #[test]
     fn boot_id_is_stable_within_a_run() {
         assert_eq!(boot_id(), boot_id());
         assert!(!boot_id().is_empty());
@@ -572,22 +490,6 @@ mod tests {
             assert!(now >= prev, "monotonic clock went backwards");
             prev = now;
         }
-    }
-
-    #[test]
-    fn origin_carries_boot_sequence_and_clock() {
-        let o = EventOrigin::new("ebpf_exec");
-        assert_eq!(o.boot_id, boot_id());
-        assert!(o.sequence_number > 0);
-        assert!(o.monotonic_timestamp_ns > 0);
-        assert_eq!(o.source.as_deref(), Some("ebpf_exec"));
-    }
-
-    #[test]
-    fn origin_round_trips_through_json() {
-        let o = EventOrigin::new("proc_poll");
-        let back: EventOrigin = serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
-        assert_eq!(o, back);
     }
 
     // ── /proc/<pid>/stat parsing ────────────────────────────────────────────
