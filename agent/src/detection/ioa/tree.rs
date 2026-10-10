@@ -43,38 +43,113 @@ const MAX_LINEAGE_KEYS: usize = 8;
 /// Session boundaries: a process whose parent is one of these starts a new
 /// session root (an SSH login shell, a cron job, a container's init, …).
 const SESSION_BOUNDARIES: &[&str] = &[
-    "systemd", "init", "sshd", "cron", "crond", "atd", "login", "su", "sudo",
-    "containerd-shim", "containerd-shim-runc-v2", "conmon", "runc", "tmux: server",
-    "screen", "gdm-session-worker", "lightdm", "sddm", "xrdp-sesman", "kthreadd",
+    "systemd",
+    "init",
+    "sshd",
+    "cron",
+    "crond",
+    "atd",
+    "login",
+    "su",
+    "sudo",
+    "containerd-shim",
+    "containerd-shim-runc-v2",
+    "conmon",
+    "runc",
+    "tmux: server",
+    "screen",
+    "gdm-session-worker",
+    "lightdm",
+    "sddm",
+    "xrdp-sesman",
+    "kthreadd",
 ];
 /// System services that are never reported as a session root: grouping on
 /// them would tie unrelated activity together.
 const SYSTEM_ROOTS: &[&str] = &[
-    "systemd", "init", "sshd", "cron", "crond", "atd", "dbus-daemon", "kthreadd",
-    "containerd", "dockerd", "containerd-shim", "containerd-shim-runc-v2", "conmon",
-    "NetworkManager", "polkitd", "snapd", "journald", "systemd-journal", "systemd-logind",
+    "systemd",
+    "init",
+    "sshd",
+    "cron",
+    "crond",
+    "atd",
+    "dbus-daemon",
+    "kthreadd",
+    "containerd",
+    "dockerd",
+    "containerd-shim",
+    "containerd-shim-runc-v2",
+    "conmon",
+    "NetworkManager",
+    "polkitd",
+    "snapd",
+    "journald",
+    "systemd-journal",
+    "systemd-logind",
 ];
 /// Web servers / app servers: a shell below one of these is a web shell.
 pub const WEB_SERVERS: &[&str] = &[
-    "nginx", "apache2", "httpd", "lighttpd", "caddy", "php-fpm", "php-fpm7", "php-fpm8",
-    "php-fpm8.1", "php-fpm8.2", "php-fpm8.3", "tomcat", "catalina", "uwsgi", "gunicorn",
+    "nginx",
+    "apache2",
+    "httpd",
+    "lighttpd",
+    "caddy",
+    "php-fpm",
+    "php-fpm7",
+    "php-fpm8",
+    "php-fpm8.1",
+    "php-fpm8.2",
+    "php-fpm8.3",
+    "tomcat",
+    "catalina",
+    "uwsgi",
+    "gunicorn",
     "w3wp",
 ];
 /// Package managers: their children legitimately write to system locations.
 const PKG_MANAGERS: &[&str] = &[
-    "dpkg", "apt", "apt-get", "aptitude", "unattended-upgr", "unattended-upgrade", "rpm",
-    "dnf", "yum", "zypper", "pacman", "snapd", "flatpak", "apk", "packagekitd",
+    "dpkg",
+    "apt",
+    "apt-get",
+    "aptitude",
+    "unattended-upgr",
+    "unattended-upgrade",
+    "rpm",
+    "dnf",
+    "yum",
+    "zypper",
+    "pacman",
+    "snapd",
+    "flatpak",
+    "apk",
+    "packagekitd",
     // Windows installers and servicing.
-    "msiexec.exe", "tiworker.exe", "trustedinstaller.exe", "wuauclt.exe", "usoclient.exe",
-    "winget.exe", "choco.exe", "setuphost.exe",
+    "msiexec.exe",
+    "tiworker.exe",
+    "trustedinstaller.exe",
+    "wuauclt.exe",
+    "usoclient.exe",
+    "winget.exe",
+    "choco.exe",
+    "setuphost.exe",
 ];
 /// Configuration-management agents.
 const CONFIG_MGMT: &[&str] = &[
-    "ansible-playboo", "ansible-playbook", "ansible", "puppet", "chef-client", "salt-minion",
-    "salt-call", "cloud-init",
+    "ansible-playboo",
+    "ansible-playbook",
+    "ansible",
+    "puppet",
+    "chef-client",
+    "salt-minion",
+    "salt-call",
+    "cloud-init",
     // Windows management agents (ConfigMgr, Intune, Group Policy, DSC).
-    "ccmexec.exe", "agentexecutor.exe", "microsoft.management.services.intunewindowsagent.exe",
-    "intunemanagementextension.exe", "gpscript.exe", "omsagent.exe",
+    "ccmexec.exe",
+    "agentexecutor.exe",
+    "microsoft.management.services.intunewindowsagent.exe",
+    "intunemanagementextension.exe",
+    "gpscript.exe",
+    "omsagent.exe",
 ];
 
 /// What a collector knows about a process's identity at exec time.
@@ -536,10 +611,12 @@ impl ProcessTree {
             ctx.flags.push(crate::detection::severity::FLAG_WEB_LINEAGE);
         }
         if ancestors.iter().any(|a| comm_in(&a.comm, PKG_MANAGERS)) {
-            ctx.flags.push(crate::detection::severity::FLAG_PKG_MGR_LINEAGE);
+            ctx.flags
+                .push(crate::detection::severity::FLAG_PKG_MGR_LINEAGE);
         }
         if ancestors.iter().any(|a| comm_in(&a.comm, CONFIG_MGMT)) {
-            ctx.flags.push(crate::detection::severity::FLAG_CONFIG_MGMT_LINEAGE);
+            ctx.flags
+                .push(crate::detection::severity::FLAG_CONFIG_MGMT_LINEAGE);
         }
         if ancestors.iter().any(|a| a.comm == "sshd") {
             ctx.flags.push(crate::detection::severity::FLAG_SSH_SESSION);
@@ -598,23 +675,84 @@ mod tests {
     fn windows_root_flag_and_management_lineage() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_create(500, 4, 0, "NT AUTHORITY\\SYSTEM", "CcmExec.exe", "C:\\Windows\\CCM\\CcmExec.exe", "", None, now);
-        tree.on_create(600, 500, 0, "NT AUTHORITY\\SYSTEM", "powershell.exe", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "", None, now);
-        tree.on_create(700, 4, 0, "CORP\\anna", "powershell.exe", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "", None, now);
+        tree.on_create(
+            500,
+            4,
+            0,
+            "NT AUTHORITY\\SYSTEM",
+            "CcmExec.exe",
+            "C:\\Windows\\CCM\\CcmExec.exe",
+            "",
+            None,
+            now,
+        );
+        tree.on_create(
+            600,
+            500,
+            0,
+            "NT AUTHORITY\\SYSTEM",
+            "powershell.exe",
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "",
+            None,
+            now,
+        );
+        tree.on_create(
+            700,
+            4,
+            0,
+            "CORP\\anna",
+            "powershell.exe",
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "",
+            None,
+            now,
+        );
         let managed = tree.context(600).unwrap();
-        assert!(managed.flags.contains(&crate::detection::severity::FLAG_ROOT));
-        assert!(managed.flags.contains(&crate::detection::severity::FLAG_CONFIG_MGMT_LINEAGE));
+        assert!(managed
+            .flags
+            .contains(&crate::detection::severity::FLAG_ROOT));
+        assert!(managed
+            .flags
+            .contains(&crate::detection::severity::FLAG_CONFIG_MGMT_LINEAGE));
         let user = tree.context(700).unwrap();
-        assert!(!user.flags.contains(&crate::detection::severity::FLAG_ROOT), "uid 0 on Windows is not root");
-        assert!(!user.flags.contains(&crate::detection::severity::FLAG_CONFIG_MGMT_LINEAGE));
+        assert!(
+            !user.flags.contains(&crate::detection::severity::FLAG_ROOT),
+            "uid 0 on Windows is not root"
+        );
+        assert!(!user
+            .flags
+            .contains(&crate::detection::severity::FLAG_CONFIG_MGMT_LINEAGE));
     }
 
     #[test]
     fn resolves_direct_ancestry() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(100, 1, 0, 0, "root", "sshd", "/usr/sbin/sshd", "sshd", ProcIdentity::default(), now);
-        tree.on_exec(200, 100, 0, 0, "root", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
+        tree.on_exec(
+            100,
+            1,
+            0,
+            0,
+            "root",
+            "sshd",
+            "/usr/sbin/sshd",
+            "sshd",
+            ProcIdentity::default(),
+            now,
+        );
+        tree.on_exec(
+            200,
+            100,
+            0,
+            0,
+            "root",
+            "bash",
+            "/bin/bash",
+            "bash",
+            ProcIdentity::default(),
+            now,
+        );
         tree.on_exec(
             300,
             200,
@@ -624,7 +762,8 @@ mod tests {
             "curl",
             "/usr/bin/curl",
             "curl http://x",
-            ProcIdentity::default(), now,
+            ProcIdentity::default(),
+            now,
         );
         assert!(
             tree.is_ancestor(100, 300),
@@ -638,9 +777,31 @@ mod tests {
     fn siblings_under_one_shell_are_related() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
+        tree.on_exec(
+            200,
+            1,
+            0,
+            0,
+            "root",
+            "bash",
+            "/bin/bash",
+            "bash",
+            ProcIdentity::default(),
+            now,
+        );
         // two children of the same shell — not ancestors of each other
-        tree.on_exec(301, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl", ProcIdentity::default(), now);
+        tree.on_exec(
+            301,
+            200,
+            0,
+            0,
+            "root",
+            "curl",
+            "/usr/bin/curl",
+            "curl",
+            ProcIdentity::default(),
+            now,
+        );
         tree.on_exec(
             302,
             200,
@@ -650,7 +811,8 @@ mod tests {
             "evil",
             "/tmp/evil",
             "/tmp/evil",
-            ProcIdentity::default(), now,
+            ProcIdentity::default(),
+            now,
         );
         assert!(!tree.is_ancestor(301, 302));
         assert!(
@@ -673,9 +835,21 @@ mod tests {
             "nginx",
             "/usr/sbin/nginx",
             "nginx",
-            ProcIdentity::default(), now,
+            ProcIdentity::default(),
+            now,
         );
-        tree.on_exec(20, 1, 0, 0, "root", "cron", "/usr/sbin/cron", "cron", ProcIdentity::default(), now);
+        tree.on_exec(
+            20,
+            1,
+            0,
+            0,
+            "root",
+            "cron",
+            "/usr/sbin/cron",
+            "cron",
+            ProcIdentity::default(),
+            now,
+        );
         assert!(!tree.related(10, 20));
     }
 
@@ -683,7 +857,18 @@ mod tests {
     fn fork_child_inherits_then_exec_replaces() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(200, 1, 1000, 1000, "u", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
+        tree.on_exec(
+            200,
+            1,
+            1000,
+            1000,
+            "u",
+            "bash",
+            "/bin/bash",
+            "bash",
+            ProcIdentity::default(),
+            now,
+        );
         tree.on_fork(200, 201, "bash", "bash", now);
         assert_eq!(
             tree.node(201).unwrap().exe,
@@ -699,7 +884,8 @@ mod tests {
             "curl",
             "/usr/bin/curl",
             "curl",
-            ProcIdentity::default(), now,
+            ProcIdentity::default(),
+            now,
         );
         assert_eq!(
             tree.node(201).unwrap().exe,
@@ -712,8 +898,30 @@ mod tests {
     fn tombstones_are_reaped_but_keep_living_children_resolvable() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
-        tree.on_exec(300, 200, 0, 0, "root", "curl", "/usr/bin/curl", "curl", ProcIdentity::default(), now);
+        tree.on_exec(
+            200,
+            1,
+            0,
+            0,
+            "root",
+            "bash",
+            "/bin/bash",
+            "bash",
+            ProcIdentity::default(),
+            now,
+        );
+        tree.on_exec(
+            300,
+            200,
+            0,
+            0,
+            "root",
+            "curl",
+            "/usr/bin/curl",
+            "curl",
+            ProcIdentity::default(),
+            now,
+        );
         tree.on_exit(200, now);
         // Parent dead but child alive — lineage still resolvable before GC TTL.
         assert!(tree.is_ancestor(200, 300));
@@ -727,7 +935,18 @@ mod tests {
     fn set_exe_hash_surfaces_in_lineage() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(200, 1, 0, 0, "root", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
+        tree.on_exec(
+            200,
+            1,
+            0,
+            0,
+            "root",
+            "bash",
+            "/bin/bash",
+            "bash",
+            ProcIdentity::default(),
+            now,
+        );
         tree.set_exe_hash(200, Some("abc123"));
         // Unknown pid / None are no-ops.
         tree.set_exe_hash(999, Some("nope"));
@@ -740,8 +959,30 @@ mod tests {
     fn lineage_json_walks_up_the_chain() {
         let mut tree = t();
         let now = Instant::now();
-        tree.on_exec(100, 1, 0, 0, "root", "sshd", "/usr/sbin/sshd", "sshd", ProcIdentity::default(), now);
-        tree.on_exec(200, 100, 0, 0, "root", "bash", "/bin/bash", "bash", ProcIdentity::default(), now);
+        tree.on_exec(
+            100,
+            1,
+            0,
+            0,
+            "root",
+            "sshd",
+            "/usr/sbin/sshd",
+            "sshd",
+            ProcIdentity::default(),
+            now,
+        );
+        tree.on_exec(
+            200,
+            100,
+            0,
+            0,
+            "root",
+            "bash",
+            "/bin/bash",
+            "bash",
+            ProcIdentity::default(),
+            now,
+        );
         let lin = tree.lineage_json(200).unwrap();
         let arr = lin.as_array().unwrap();
         assert_eq!(arr[0]["pid"], 200);

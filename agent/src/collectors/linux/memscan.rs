@@ -186,22 +186,66 @@ pub fn is_suspicious_preload(value: &str) -> bool {
 /// Runtimes that legitimately map writable+executable anonymous memory (JIT
 /// compilers). Matched against the exe basename (prefix for versioned names).
 const JIT_RUNTIMES: &[&str] = &[
-    "java", "node", "nodejs", "deno", "bun", "chrome", "chromium", "chromium-browse",
-    "firefox", "firefox-bin", "electron", "code", "slack", "discord", "teams", "spotify",
-    "dotnet", "pwsh", "mono", "luajit", "qemu-", "wine", "wine64", "gnome-shell", "gjs",
-    "plasmashell", "kwin_x11", "kwin_wayland", "Xorg", "Xwayland", "php-fpm", "php",
-    "python3", "pypy", "ruby", "julia", "erl", "beam.smp", "qemu-system-x86_64",
-    "steam", "webkit", "WebKitWebProcess", "thunderbird", "libreoffice", "soffice.bin",
+    "java",
+    "node",
+    "nodejs",
+    "deno",
+    "bun",
+    "chrome",
+    "chromium",
+    "chromium-browse",
+    "firefox",
+    "firefox-bin",
+    "electron",
+    "code",
+    "slack",
+    "discord",
+    "teams",
+    "spotify",
+    "dotnet",
+    "pwsh",
+    "mono",
+    "luajit",
+    "qemu-",
+    "wine",
+    "wine64",
+    "gnome-shell",
+    "gjs",
+    "plasmashell",
+    "kwin_x11",
+    "kwin_wayland",
+    "Xorg",
+    "Xwayland",
+    "php-fpm",
+    "php",
+    "python3",
+    "pypy",
+    "ruby",
+    "julia",
+    "erl",
+    "beam.smp",
+    "qemu-system-x86_64",
+    "steam",
+    "webkit",
+    "WebKitWebProcess",
+    "thunderbird",
+    "libreoffice",
+    "soffice.bin",
 ];
 
 /// True when `exe` is a JIT runtime whose anonymous executable memory is
 /// expected (`/proc/<pid>/exe` basename, or the `comm` as a fallback).
 pub fn is_jit_runtime(exe: &str) -> bool {
-    let base = exe.rsplit('/').next().unwrap_or(exe).trim_end_matches(" (deleted)");
-    JIT_RUNTIMES
-        .iter()
-        .any(|j| base == *j || (j.ends_with('-') && base.starts_with(j)) || base.starts_with(&format!("{j}.")))
-        || exe.contains("/jvm/")
+    let base = exe
+        .rsplit('/')
+        .next()
+        .unwrap_or(exe)
+        .trim_end_matches(" (deleted)");
+    JIT_RUNTIMES.iter().any(|j| {
+        base == *j
+            || (j.ends_with('-') && base.starts_with(j))
+            || base.starts_with(&format!("{j}."))
+    }) || exe.contains("/jvm/")
         || exe.contains("/electron")
 }
 
@@ -284,7 +328,9 @@ impl Collector for MemScanCollector {
             // Forget findings for processes that have since exited.
             self.seen.retain(|k| {
                 let mut fields = k.split(':');
-                fields.next().and_then(|p| p.parse::<i32>().ok())
+                fields
+                    .next()
+                    .and_then(|p| p.parse::<i32>().ok())
                     .zip(fields.next().and_then(|s| s.parse::<u64>().ok()))
                     .is_some_and(|generation| live.contains(&generation))
             });
@@ -351,11 +397,15 @@ impl MemScanCollector {
         if crate::telemetry::identity::process_start_time(pid) != Some(start) {
             return Vec::new();
         }
-        out.into_iter().filter_map(|(key, severity, mut finding)| {
-            if !self.seen.insert(key) { return None; }
-            finding.evidence["process_start_time"] = serde_json::json!(start);
-            Some((severity, finding))
-        }).collect()
+        out.into_iter()
+            .filter_map(|(key, severity, mut finding)| {
+                if !self.seen.insert(key) {
+                    return None;
+                }
+                finding.evidence["process_start_time"] = serde_json::json!(start);
+                Some((severity, finding))
+            })
+            .collect()
     }
 }
 
@@ -397,9 +447,12 @@ mod tests {
 
     #[test]
     fn native_scan_carries_the_observed_process_generation() {
-        let mut child = std::process::Command::new("sleep").arg("60")
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
             .env("LD_PRELOAD", "/tmp/trapd-test-missing-preload.so")
-            .stderr(std::process::Stdio::null()).spawn().unwrap();
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
         let pid = child.id() as i32;
         let start = crate::telemetry::identity::process_start_time(pid).unwrap();
         // The loader needs a moment to exec the child and install environ.
@@ -408,12 +461,20 @@ mod tests {
         let mut collector = MemScanCollector::new(cfg);
         for _ in 0..100 {
             findings = collector.scan_pid(pid);
-            if findings.iter().any(|(_, d)| d.rule_id == "injection.ld_preload_runtime") { break; }
+            if findings
+                .iter()
+                .any(|(_, d)| d.rule_id == "injection.ld_preload_runtime")
+            {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let _ = child.kill(); let _ = child.wait();
-        let (_, finding) = findings.into_iter()
-            .find(|(_, d)| d.rule_id == "injection.ld_preload_runtime").unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let (_, finding) = findings
+            .into_iter()
+            .find(|(_, d)| d.rule_id == "injection.ld_preload_runtime")
+            .unwrap();
         assert_eq!(finding.evidence["pid"], pid);
         assert_eq!(finding.evidence["process_start_time"], start);
     }
@@ -430,7 +491,9 @@ mod tests {
 
     #[test]
     fn jit_runtimes_are_recognised() {
-        assert!(is_jit_runtime("/usr/lib/jvm/java-17-openjdk-amd64/bin/java"));
+        assert!(is_jit_runtime(
+            "/usr/lib/jvm/java-17-openjdk-amd64/bin/java"
+        ));
         assert!(is_jit_runtime("/usr/bin/node"));
         assert!(is_jit_runtime("/usr/bin/qemu-system-aarch64"));
         assert!(is_jit_runtime("/opt/google/chrome/chrome"));

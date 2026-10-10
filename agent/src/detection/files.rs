@@ -25,13 +25,29 @@ pub const FILE_COVERED_RULES: &[&str] = &[
 /// Package managers write system locations by definition; their own writes
 /// are not persistence. (Their *children* are only downgraded, by policy.)
 const PKG_WRITERS: &[&str] = &[
-    "dpkg", "apt", "apt-get", "rpm", "dnf", "yum", "zypper", "pacman", "snapd", "apk",
-    "unattended-upgr", "packagekitd", "systemd", "systemctl", "systemd-sysv-ge",
+    "dpkg",
+    "apt",
+    "apt-get",
+    "rpm",
+    "dnf",
+    "yum",
+    "zypper",
+    "pacman",
+    "snapd",
+    "apk",
+    "unattended-upgr",
+    "packagekitd",
+    "systemd",
+    "systemctl",
+    "systemd-sysv-ge",
 ];
 /// Writers sanctioned for a specific location.
 const SANCTIONED: &[(&str, &[&str])] = &[
     ("privesc.sudoers_modify", &["visudo"]),
-    ("persistence.ssh_authorized_keys", &["sshd", "ssh-copy-id", "google_guest_ag", "cloud-init"]),
+    (
+        "persistence.ssh_authorized_keys",
+        &["sshd", "ssh-copy-id", "google_guest_ag", "cloud-init"],
+    ),
 ];
 
 /// `open(2)` flags that imply a write.
@@ -64,7 +80,10 @@ pub fn inspect_write(path: &str, comm: &str) -> Option<DetectionData> {
     if path.ends_with(".swp") || path.ends_with(".swx") || path.ends_with('~') {
         return None;
     }
-    let editor = matches!(base, "vim" | "vi" | "nvim" | "nano" | "emacs" | "code" | "gedit");
+    let editor = matches!(
+        base,
+        "vim" | "vi" | "nvim" | "nano" | "emacs" | "code" | "gedit"
+    );
     let base_severity = match rule_id {
         "persistence.cron_write" if base == "crontab" || editor => Some(Severity::Medium),
         "persistence.cron_write" => Some(Severity::High),
@@ -109,17 +128,24 @@ mod tests {
     fn authorized_keys_write_by_shell() {
         let d = inspect_write("/root/.ssh/authorized_keys", "bash").unwrap();
         assert_eq!(d.rule_id, "persistence.ssh_authorized_keys");
-        assert_eq!(d.correlation.unwrap().file_path.as_deref(), Some("/root/.ssh/authorized_keys"));
+        assert_eq!(
+            d.correlation.unwrap().file_path.as_deref(),
+            Some("/root/.ssh/authorized_keys")
+        );
     }
 
     #[test]
     fn cron_writer_decides_base_severity() {
         assert_eq!(
-            inspect_write("/var/spool/cron/crontabs/root", "crontab").unwrap().base_severity,
+            inspect_write("/var/spool/cron/crontabs/root", "crontab")
+                .unwrap()
+                .base_severity,
             Some(Severity::Medium)
         );
         assert_eq!(
-            inspect_write("/etc/cron.d/backdoor", "python3").unwrap().base_severity,
+            inspect_write("/etc/cron.d/backdoor", "python3")
+                .unwrap()
+                .base_severity,
             Some(Severity::High)
         );
     }
@@ -127,7 +153,9 @@ mod tests {
     #[test]
     fn systemd_units_only() {
         assert_eq!(
-            inspect_write("/etc/systemd/system/evil.service", "cp").unwrap().rule_id,
+            inspect_write("/etc/systemd/system/evil.service", "cp")
+                .unwrap()
+                .rule_id,
             "persistence.systemd_unit"
         );
         assert!(inspect_write("/etc/systemd/system/multi-user.target.wants", "cp").is_none());

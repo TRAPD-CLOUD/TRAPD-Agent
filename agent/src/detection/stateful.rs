@@ -35,10 +35,20 @@ pub struct StatefulRules {
 fn recon_command(base: &str, cmdline: &str) -> Option<String> {
     let lower = cmdline.to_ascii_lowercase();
     let arg1 = lower.split_whitespace().nth(1).unwrap_or("");
+    // Windows image names carry an extension and arbitrary case (`WHOAMI.EXE`).
+    let base = base.to_ascii_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
     let name = match base {
         "whoami" | "id" | "uname" | "hostname" | "hostnamectl" | "ifconfig" | "ss" | "netstat"
         | "w" | "who" | "last" | "lastlog" | "lsb_release" | "arp" | "route" | "groups"
-        | "getent" | "lscpu" | "lsblk" | "env" | "printenv" | "uptime" => base.to_string(),
+        | "getent" | "lscpu" | "lsblk" | "env" | "printenv" | "uptime"
+        // Windows discovery tools.
+        | "ipconfig" | "systeminfo" | "tasklist" | "nltest" | "quser" | "qwinsta" => {
+            base.to_string()
+        }
+        "net" | "net1" if matches!(arg1, "user" | "group" | "localgroup" | "view" | "accounts") => {
+            format!("net {arg1}")
+        }
         "ip" if matches!(arg1, "a" | "addr" | "address" | "r" | "route" | "link" | "neigh") => {
             format!("ip {arg1}")
         }
@@ -186,14 +196,23 @@ impl StatefulRules {
     /// A systemd unit was written in `session`.
     pub fn observe_unit_write(&mut self, session: &str, path: &str, now: f64) {
         bound(&mut self.units);
-        self.units.insert(session.to_string(), (now, path.to_string()));
+        self.units
+            .insert(session.to_string(), (now, path.to_string()));
     }
 
     /// `systemctl enable|start` in a session that just wrote a unit: the unit
     /// is being activated — escalate the persistence finding to High.
-    pub fn observe_systemctl(&mut self, session: &str, cmdline: &str, now: f64) -> Option<DetectionData> {
+    pub fn observe_systemctl(
+        &mut self,
+        session: &str,
+        cmdline: &str,
+        now: f64,
+    ) -> Option<DetectionData> {
         let lower = cmdline.to_ascii_lowercase();
-        if !(lower.contains(" enable") || lower.contains(" start") || lower.contains(" daemon-reload")) {
+        if !(lower.contains(" enable")
+            || lower.contains(" start")
+            || lower.contains(" daemon-reload"))
+        {
             return None;
         }
         let (t, path) = self.units.get(session).cloned()?;
@@ -242,10 +261,37 @@ mod tests {
         assert!(s.observe_exec_recon("r", "id", "id", 0.0).is_none());
         assert!(s.observe_exec_recon("r", "id", "id", 1.0).is_none());
         assert!(s.observe_exec_recon("r", "whoami", "whoami", 2.0).is_none());
-        assert!(s.observe_exec_recon("r", "uname", "uname -a", 3.0).is_none());
+        assert!(s
+            .observe_exec_recon("r", "uname", "uname -a", 3.0)
+            .is_none());
         let d = s.observe_exec_recon("r", "ss", "ss -tan", 4.0).unwrap();
         assert_eq!(d.rule_id, "discovery.recon_burst");
         assert_eq!(d.subject, "r");
+    }
+
+    #[test]
+    fn recon_burst_matches_windows_image_names() {
+        let mut s = StatefulRules::new();
+        assert!(s
+            .observe_exec_recon("r", "whoami.exe", "whoami", 0.0)
+            .is_none());
+        assert!(s
+            .observe_exec_recon("r", "HOSTNAME.EXE", "hostname", 1.0)
+            .is_none());
+        assert!(s
+            .observe_exec_recon("r", "netstat.exe", "netstat -an", 2.0)
+            .is_none());
+        let d = s.observe_exec_recon("r", "arp.exe", "arp -a", 3.0).unwrap();
+        assert_eq!(d.rule_id, "discovery.recon_burst");
+    }
+
+    #[test]
+    fn recon_ignores_net_subcommands_that_are_not_discovery() {
+        assert_eq!(
+            recon_command("net.exe", "net user"),
+            Some("net user".into())
+        );
+        assert_eq!(recon_command("net.exe", "net use z: \\\\srv\\share"), None);
     }
 
     #[test]
@@ -261,7 +307,12 @@ mod tests {
     #[test]
     fn recon_rearms_after_firing() {
         let mut s = StatefulRules::new();
-        let cmds = [("id", "id"), ("whoami", "whoami"), ("uname", "uname"), ("ss", "ss")];
+        let cmds = [
+            ("id", "id"),
+            ("whoami", "whoami"),
+            ("uname", "uname"),
+            ("ss", "ss"),
+        ];
         let fire = |s: &mut StatefulRules, t: f64| {
             cmds.iter()
                 .enumerate()
@@ -269,7 +320,11 @@ mod tests {
                 .count()
         };
         assert_eq!(fire(&mut s, 0.0), 1);
-        assert_eq!(fire(&mut s, 10.0), 1, "a second burst fires again (the gate folds it)");
+        assert_eq!(
+            fire(&mut s, 10.0),
+            1,
+            "a second burst fires again (the gate folds it)"
+        );
     }
 
     #[test]
@@ -284,7 +339,9 @@ mod tests {
     fn brute_force_then_success() {
         let mut s = StatefulRules::new();
         for i in 0..5 {
-            assert!(s.observe_logon("root", "198.51.100.7", false, i as f64).is_none());
+            assert!(s
+                .observe_logon("root", "198.51.100.7", false, i as f64)
+                .is_none());
         }
         let d = s.observe_logon("root", "198.51.100.7", true, 10.0).unwrap();
         assert_eq!(d.rule_id, "auth.ssh_bruteforce_success");
@@ -323,8 +380,12 @@ mod tests {
     fn unit_write_then_enable() {
         let mut s = StatefulRules::new();
         s.observe_unit_write("r", "/etc/systemd/system/evil.service", 0.0);
-        assert!(s.observe_systemctl("other", "systemctl enable evil", 1.0).is_none());
-        let d = s.observe_systemctl("r", "systemctl enable --now evil", 2.0).unwrap();
+        assert!(s
+            .observe_systemctl("other", "systemctl enable evil", 1.0)
+            .is_none());
+        let d = s
+            .observe_systemctl("r", "systemctl enable --now evil", 2.0)
+            .unwrap();
         assert_eq!(d.base_severity, Some(Severity::High));
     }
 }

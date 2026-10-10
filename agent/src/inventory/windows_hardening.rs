@@ -405,7 +405,10 @@ mod tests {
         let key = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Audit";
         let on = Fake(HashMap::new()).with(key, "ProcessCreationIncludeCmdLine_Enabled", 1);
         assert_eq!(status(&evaluate(&on), "WIN-AUDIT-CMDLINE"), "pass");
-        assert_eq!(status(&evaluate(&Fake(HashMap::new())), "WIN-AUDIT-CMDLINE"), "fail");
+        assert_eq!(
+            status(&evaluate(&Fake(HashMap::new())), "WIN-AUDIT-CMDLINE"),
+            "fail"
+        );
         let off = Fake(HashMap::new()).with(key, "ProcessCreationIncludeCmdLine_Enabled", 0);
         assert_eq!(status(&evaluate(&off), "WIN-AUDIT-CMDLINE"), "fail");
     }

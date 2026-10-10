@@ -100,14 +100,22 @@ impl SuppressionRule {
             .and_then(|e| e.get("exe"))
             .and_then(|v| v.as_str())
             .map(String::from);
-        field_ok(&self.exe, corr.exe.clone().or_else(|| Some(d.subject.clone())))
-            && field_ok(&self.cmdline, evidence_str("cmdline"))
+        field_ok(
+            &self.exe,
+            corr.exe.clone().or_else(|| Some(d.subject.clone())),
+        ) && field_ok(&self.cmdline, evidence_str("cmdline"))
             && field_ok(&self.user, corr.user.clone())
             && field_ok(&self.parent_exe, parent_exe)
-            && field_ok(&self.path, corr.file_path.clone().or_else(|| evidence_str("path")))
+            && field_ok(
+                &self.path,
+                corr.file_path.clone().or_else(|| evidence_str("path")),
+            )
             && match &self.sha256 {
                 None => true,
-                Some(h) => corr.exe_sha256.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(h)),
+                Some(h) => corr
+                    .exe_sha256
+                    .as_deref()
+                    .is_some_and(|x| x.eq_ignore_ascii_case(h)),
             }
             && match &self.remote {
                 None => true,
@@ -137,11 +145,19 @@ fn remote_match(pattern: &str, ip: Option<&str>, domain: Option<&str>) -> bool {
         };
         return match (net, ip) {
             (std::net::IpAddr::V4(n), std::net::IpAddr::V4(i)) if bits <= 32 => {
-                let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - bits)
+                };
                 u32::from(n) & mask == u32::from(i) & mask
             }
             (std::net::IpAddr::V6(n), std::net::IpAddr::V6(i)) if bits <= 128 => {
-                let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - bits)
+                };
                 u128::from(n) & mask == u128::from(i) & mask
             }
             _ => false,
@@ -243,7 +259,8 @@ impl FindingGate {
                     };
                     event.severity = lowered.max(floor);
                     d.context_flags.push(FLAG_SUPPRESSION_DOWNGRADE.into());
-                    d.severity_reasons.push(format!("-{FLAG_SUPPRESSION_DOWNGRADE}"));
+                    d.severity_reasons
+                        .push(format!("-{FLAG_SUPPRESSION_DOWNGRADE}"));
                 }
             }
             set_evidence(&mut d.evidence, "suppression_id", rule.id.clone().into());
@@ -350,9 +367,8 @@ impl FindingGate {
                 entry.last_emit = now;
             }
         }
-        self.entries.retain(|_, e| {
-            !(e.count == e.emitted_count && now >= e.window_end + e.window)
-        });
+        self.entries
+            .retain(|_, e| !(e.count == e.emitted_count && now >= e.window_end + e.window));
         out
     }
 
@@ -491,10 +507,15 @@ mod tests {
         let mut g = FindingGate::new();
         let t0 = Instant::now();
         g.admit(det("creds.shadow_read", "k", Severity::Medium), t0);
-        g.admit(det("creds.shadow_read", "k", Severity::Medium), t0 + Duration::from_secs(5));
+        g.admit(
+            det("creds.shadow_read", "k", Severity::Medium),
+            t0 + Duration::from_secs(5),
+        );
         let out = g.flush(t0 + PROGRESS_EVERY, false);
         assert_eq!(out.len(), 1, "a storm reports every PROGRESS_EVERY");
-        assert!(g.flush(t0 + PROGRESS_EVERY + Duration::from_secs(1), false).is_empty());
+        assert!(g
+            .flush(t0 + PROGRESS_EVERY + Duration::from_secs(1), false)
+            .is_empty());
     }
 
     #[test]
@@ -515,8 +536,16 @@ mod tests {
     fn distinct_keys_are_independent() {
         let mut g = FindingGate::new();
         let t0 = Instant::now();
-        assert_eq!(g.admit(det("creds.shadow_read", "a", Severity::Medium), t0).len(), 1);
-        assert_eq!(g.admit(det("creds.shadow_read", "b", Severity::Medium), t0).len(), 1);
+        assert_eq!(
+            g.admit(det("creds.shadow_read", "a", Severity::Medium), t0)
+                .len(),
+            1
+        );
+        assert_eq!(
+            g.admit(det("creds.shadow_read", "b", Severity::Medium), t0)
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -524,7 +553,10 @@ mod tests {
         let mut g = FindingGate::new();
         let t0 = Instant::now();
         g.admit(det("privesc.gtfobin", "k", Severity::High), t0);
-        g.admit(det("privesc.gtfobin", "k", Severity::High), t0 + Duration::from_secs(1));
+        g.admit(
+            det("privesc.gtfobin", "k", Severity::High),
+            t0 + Duration::from_secs(1),
+        );
         // gtfobin window is 10 min; the next occurrence after it is emitted.
         let out = g.admit(
             det("privesc.gtfobin", "k", Severity::High),
@@ -592,7 +624,10 @@ mod tests {
         let mut g = FindingGate::new();
         g.set_suppressions(vec![rule(SuppressionAction::Drop)]);
         assert!(g
-            .admit(det("creds.shadow_read", "k", Severity::Medium), Instant::now())
+            .admit(
+                det("creds.shadow_read", "k", Severity::Medium),
+                Instant::now()
+            )
             .is_empty());
         // A different rule family is untouched.
         assert_eq!(
@@ -606,7 +641,10 @@ mod tests {
     fn suppression_signal_only_and_downgrade_are_audited() {
         let mut g = FindingGate::new();
         g.set_suppressions(vec![rule(SuppressionAction::SignalOnly)]);
-        let out = g.admit(det("creds.shadow_read", "k", Severity::High), Instant::now());
+        let out = g.admit(
+            det("creds.shadow_read", "k", Severity::High),
+            Instant::now(),
+        );
         let EventData::Detection(d) = &out[0].event.data else {
             panic!()
         };
@@ -616,7 +654,10 @@ mod tests {
 
         let mut g = FindingGate::new();
         g.set_suppressions(vec![rule(SuppressionAction::Downgrade)]);
-        let out = g.admit(det("creds.shadow_read", "k", Severity::High), Instant::now());
+        let out = g.admit(
+            det("creds.shadow_read", "k", Severity::High),
+            Instant::now(),
+        );
         assert_eq!(out[0].event.severity, Severity::Medium);
     }
 
@@ -627,8 +668,11 @@ mod tests {
         let mut g = FindingGate::new();
         g.set_suppressions(vec![r]);
         assert_eq!(
-            g.admit(det("creds.shadow_read", "k", Severity::Medium), Instant::now())
-                .len(),
+            g.admit(
+                det("creds.shadow_read", "k", Severity::Medium),
+                Instant::now()
+            )
+            .len(),
             1
         );
     }
@@ -640,8 +684,11 @@ mod tests {
         let mut g = FindingGate::new();
         g.set_suppressions(vec![r]);
         assert_eq!(
-            g.admit(det("creds.shadow_read", "k", Severity::Medium), Instant::now())
-                .len(),
+            g.admit(
+                det("creds.shadow_read", "k", Severity::Medium),
+                Instant::now()
+            )
+            .len(),
             1
         );
     }
@@ -703,7 +750,10 @@ mod tests {
         let mut emitted = 0;
         for i in 0..(SIGNAL_NEW_FINDINGS_PER_WINDOW + 30) {
             emitted += g
-                .admit(det("creds.shadow_read", &format!("k{i}"), Severity::High), t)
+                .admit(
+                    det("creds.shadow_read", &format!("k{i}"), Severity::High),
+                    t,
+                )
                 .len();
         }
         assert_eq!(emitted as u32, SIGNAL_NEW_FINDINGS_PER_WINDOW + 30);

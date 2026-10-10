@@ -76,8 +76,7 @@ impl TelemetryReport {
         }
         // Distinct temp name per process so two agents cannot interleave writes.
         let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        let body = serde_json::to_vec_pretty(self)
-            .map_err(std::io::Error::other)?;
+        let body = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
 
         let result = (|| -> std::io::Result<()> {
             let mut f = create_private(&tmp)?;
@@ -220,7 +219,10 @@ mod tests {
         let path = tmp_path("notemp");
         sample().write_atomic(&path).unwrap();
         let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        assert!(!tmp.exists(), "temp file must be renamed away, not orphaned");
+        assert!(
+            !tmp.exists(),
+            "temp file must be renamed away, not orphaned"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

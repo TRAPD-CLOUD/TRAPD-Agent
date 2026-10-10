@@ -1581,9 +1581,15 @@ fn is_user_writable_path(path: &str) -> bool {
     ["/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/"]
         .iter()
         .any(|d| p.starts_with(d))
-        || ["/appdata/local/temp/", "/appdata/roaming/", "/downloads/", "/users/public/", "/windows/temp/"]
-            .iter()
-            .any(|d| p.contains(d))
+        || [
+            "/appdata/local/temp/",
+            "/appdata/roaming/",
+            "/downloads/",
+            "/users/public/",
+            "/windows/temp/",
+        ]
+        .iter()
+        .any(|d| p.contains(d))
 }
 
 /// True if `addr` is a routable destination worth cadence-tracking (skips
@@ -1892,13 +1898,32 @@ mod tests {
     #[test]
     fn public_destination_excludes_lan_and_local_ranges() {
         for lan in [
-            "10.0.0.36", "10.0.0.1", "192.168.1.5", "172.16.0.9", "127.0.0.1", "169.254.169.254",
-            "100.64.0.1", "224.0.0.251", "0.0.0.0", "::1", "fe80::1", "fe80::1%12", "fd12:3456::1",
-            "ff02::fb", "::ffff:10.0.0.1", "", "not-an-ip",
+            "10.0.0.36",
+            "10.0.0.1",
+            "192.168.1.5",
+            "172.16.0.9",
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "224.0.0.251",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fe80::1%12",
+            "fd12:3456::1",
+            "ff02::fb",
+            "::ffff:10.0.0.1",
+            "",
+            "not-an-ip",
         ] {
             assert!(!is_public_destination(lan), "{lan} must not be public");
         }
-        for public in ["40.90.8.111", "185.22.141.18", "2001:4860:4840:400::443", "::ffff:8.8.8.8"] {
+        for public in [
+            "40.90.8.111",
+            "185.22.141.18",
+            "2001:4860:4840:400::443",
+            "::ffff:8.8.8.8",
+        ] {
             assert!(is_public_destination(public), "{public} must be public");
         }
     }
@@ -1906,13 +1931,22 @@ mod tests {
     #[test]
     fn user_writable_path_covers_linux_and_windows() {
         for p in [
-            "/tmp/x", "/dev/shm/a", "C:\\Users\\bob\\AppData\\Local\\Temp\\a.exe",
-            "c:\\users\\bob\\appdata\\roaming\\x\\y.exe", "C:\\Users\\bob\\Downloads\\a.exe",
-            "C:\\Users\\Public\\a.exe", "C:\\Windows\\Temp\\a.exe",
+            "/tmp/x",
+            "/dev/shm/a",
+            "C:\\Users\\bob\\AppData\\Local\\Temp\\a.exe",
+            "c:\\users\\bob\\appdata\\roaming\\x\\y.exe",
+            "C:\\Users\\bob\\Downloads\\a.exe",
+            "C:\\Users\\Public\\a.exe",
+            "C:\\Windows\\Temp\\a.exe",
         ] {
             assert!(is_user_writable_path(p), "{p}");
         }
-        for p in ["", "/usr/bin/curl", "C:\\Program Files\\Mozilla Firefox\\firefox.exe", "C:\\Windows\\System32\\svchost.exe"] {
+        for p in [
+            "",
+            "/usr/bin/curl",
+            "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+            "C:\\Windows\\System32\\svchost.exe",
+        ] {
             assert!(!is_user_writable_path(p), "{p}");
         }
     }
@@ -1947,7 +1981,11 @@ mod tests {
     fn lan_beacons_are_not_reported() {
         // Chromecast (10.0.0.36:8009) and the router (10.0.0.1:49000) from a
         // real host produced "high" C2 alerts before.
-        assert!(beacon_through_engine("10.0.0.36", "C:\\Program Files\\Google\\Chrome\\chrome.exe").is_none());
+        assert!(beacon_through_engine(
+            "10.0.0.36",
+            "C:\\Program Files\\Google\\Chrome\\chrome.exe"
+        )
+        .is_none());
         assert!(beacon_through_engine("10.0.0.1", "").is_none());
     }
 
@@ -1955,16 +1993,23 @@ mod tests {
     fn routine_public_beacon_is_a_low_signal() {
         let f = beacon_through_engine("40.90.8.111", "C:\\Windows\\System32\\svchost.exe")
             .expect("regular public cadence is still observed");
-        let EventData::Detection(d) = &f.data else { unreachable!() };
+        let EventData::Detection(d) = &f.data else {
+            unreachable!()
+        };
         assert_eq!(d.mode, Some(DetectionMode::Signal));
         assert!(f.severity <= Severity::Low, "{:?}", f.severity);
     }
 
     #[test]
     fn beacon_from_user_writable_exe_alerts() {
-        let f = beacon_through_engine("185.22.141.18", "C:\\Users\\bob\\AppData\\Local\\Temp\\upd.exe")
-            .expect("beacon expected");
-        let EventData::Detection(d) = &f.data else { unreachable!() };
+        let f = beacon_through_engine(
+            "185.22.141.18",
+            "C:\\Users\\bob\\AppData\\Local\\Temp\\upd.exe",
+        )
+        .expect("beacon expected");
+        let EventData::Detection(d) = &f.data else {
+            unreachable!()
+        };
         assert_eq!(d.mode, Some(DetectionMode::Alert));
         assert!(f.severity >= Severity::Medium, "{:?}", f.severity);
     }
@@ -1994,7 +2039,9 @@ mod tests {
     }
 
     fn mode_of(f: &AgentEvent) -> DetectionMode {
-        let EventData::Detection(d) = &f.data else { unreachable!() };
+        let EventData::Detection(d) = &f.data else {
+            unreachable!()
+        };
         d.mode.expect("finalised finding has a mode")
     }
 
@@ -2015,16 +2062,27 @@ mod tests {
         let mut alerts = 0;
         for i in 0..4 {
             let f = ransomware_findings_at(&e, &indicator("high_write_rate", None), i as f64);
-            alerts += e.admit(f).iter().filter(|x| mode_of(&x.event) == DetectionMode::Alert).count();
+            alerts += e
+                .admit(f)
+                .iter()
+                .filter(|x| mode_of(&x.event) == DetectionMode::Alert)
+                .count();
         }
         assert_eq!(alerts, 0, "no corroboration yet");
         let f = ransomware_findings_at(
             &e,
-            &indicator("suspicious_extension", Some("C:\\Users\\bob\\Documents\\a.txt.locked")),
+            &indicator(
+                "suspicious_extension",
+                Some("C:\\Users\\bob\\Documents\\a.txt.locked"),
+            ),
             5.0,
         );
         assert!(f.iter().any(|x| matches!(&x.data, EventData::Detection(d) if d.rule_id == "ransomware.mass_modification")), "burst re-raised");
-        alerts += e.admit(f).iter().filter(|x| mode_of(&x.event) == DetectionMode::Alert).count();
+        alerts += e
+            .admit(f)
+            .iter()
+            .filter(|x| mode_of(&x.event) == DetectionMode::Alert)
+            .count();
         assert!(alerts >= 1);
     }
 
@@ -2059,7 +2117,9 @@ mod tests {
         for i in 0..20 {
             let path = format!("C:\\Users\\bob\\Documents\\f{i}.docx.locked");
             let found = ransomware_findings(&e, &indicator("suspicious_extension", Some(&path)));
-            let EventData::Detection(d) = &found[0].data else { unreachable!() };
+            let EventData::Detection(d) = &found[0].data else {
+                unreachable!()
+            };
             assert_eq!(d.rule_id, "ransomware.suspicious_extension");
             emitted += e.admit(found).len();
         }
@@ -2070,12 +2130,19 @@ mod tests {
     fn backup_deletion_alerts_and_entropy_alone_never_does() {
         let e = engine();
         let f = ransomware_findings(&e, &indicator("backup_deletion", Some("C:\\Backup\\a.bak")));
-        let EventData::Detection(d) = &f[0].data else { unreachable!() };
+        let EventData::Detection(d) = &f[0].data else {
+            unreachable!()
+        };
         assert_eq!(d.rule_id, "ransomware.backup_tamper");
         assert_eq!(d.mode, Some(DetectionMode::Alert));
 
-        let f = ransomware_findings(&e, &indicator("high_entropy", Some("C:\\Users\\bob\\a.txt")));
-        let EventData::Detection(d) = &f[0].data else { unreachable!() };
+        let f = ransomware_findings(
+            &e,
+            &indicator("high_entropy", Some("C:\\Users\\bob\\a.txt")),
+        );
+        let EventData::Detection(d) = &f[0].data else {
+            unreachable!()
+        };
         assert_eq!(d.rule_id, "ransomware.high_entropy");
         assert_eq!(d.mode, Some(DetectionMode::Signal));
         assert!(f[0].severity <= Severity::Low);
@@ -2144,7 +2211,9 @@ mod tests {
         let e = engine();
         assert!(e.inspect(&process_audit_event("")).is_empty());
         assert!(e
-            .inspect(&process_audit_event("certutil -hashfile C:\\Install\\setup.msi SHA256"))
+            .inspect(&process_audit_event(
+                "certutil -hashfile C:\\Install\\setup.msi SHA256"
+            ))
             .is_empty());
     }
 

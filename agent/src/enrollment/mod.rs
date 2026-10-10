@@ -374,8 +374,7 @@ fn read_os_version() -> String {
 #[cfg(not(target_os = "linux"))]
 fn read_os_version() -> String {
     // e.g. "Windows 11 Pro" — same role as PRETTY_NAME on Linux.
-    sysinfo::System::long_os_version()
-        .unwrap_or_else(|| std::env::consts::OS.to_string())
+    sysinfo::System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string())
 }
 
 #[cfg(test)]
