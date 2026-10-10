@@ -75,7 +75,11 @@ fn crc32(data: &[u8]) -> u32 {
     for (i, entry) in table.iter_mut().enumerate() {
         let mut c = i as u32;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
         *entry = c;
     }
@@ -305,7 +309,10 @@ fn an_unknown_diagnostics_topic_exits_nonzero() {
         .env("TRAPD_CONFIG_DIR", sandbox.root.join("config"))
         .output()
         .expect("must run");
-    assert!(!status.status.success(), "a typo must not look like success");
+    assert!(
+        !status.status.success(),
+        "a typo must not look like success"
+    );
 }
 
 // ── Journal fixtures the agent must tolerate ────────────────────────────────
@@ -352,7 +359,9 @@ fn recovery_tolerates_every_shape_of_damaged_journal() {
 fn a_journal_with_many_records_stays_within_its_declared_size() {
     // Guards the byte accounting: a journal is only as large as its records.
     let sandbox = Sandbox::new("size");
-    let records: Vec<Vec<u8>> = (1..=500).map(|i| record_line(&uuid(i), i as u64, 0)).collect();
+    let records: Vec<Vec<u8>> = (1..=500)
+        .map(|i| record_line(&uuid(i), i as u64, 0))
+        .collect();
     let expected: usize = records.iter().map(Vec::len).sum::<usize>() + b"TRAPD-SPOOL v1\n".len();
 
     write_journal(&sandbox.journal(), &records);

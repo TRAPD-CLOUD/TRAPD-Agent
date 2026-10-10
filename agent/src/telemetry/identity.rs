@@ -20,8 +20,8 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-pub use trapd_schema::{EventOrigin};
 pub use trapd_schema::runtime::issued_sequences;
+pub use trapd_schema::EventOrigin;
 
 /// Identifier of the current *system boot*.
 ///

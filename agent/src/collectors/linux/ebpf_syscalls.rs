@@ -77,8 +77,8 @@ use tracing::{info, warn};
 use crate::collectors::linux::ebpf_drops::DropMonitor;
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
-use crate::detection_host::RealProc;
 use crate::detection::honeytoken::{self, AccessHit, AccessKind, Allowlist};
+use crate::detection_host::RealProc;
 use crate::schema::{
     AgentEvent, DnsData, EventAction, EventClass, EventData, FileChmodData, FileChownData,
     FileOpenData, FileRenameData, FileUnlinkData, ForkData, KillAttemptData, MemfdCreateData,
@@ -1798,7 +1798,12 @@ mod lifecycle_tests {
         let mut current = old.clone();
         current.extend_from_slice(&42_000_000_u64.to_ne_bytes());
         assert_eq!(honeytoken_observed_ns(&current), Some(42_000_000));
-        assert_eq!(unsafe { read_raw::<RawHoneytokenAccessEvent>(&current) }.unwrap().pid, 123);
+        assert_eq!(
+            unsafe { read_raw::<RawHoneytokenAccessEvent>(&current) }
+                .unwrap()
+                .pid,
+            123
+        );
         old.extend_from_slice(&0_u64.to_ne_bytes());
         assert_eq!(honeytoken_observed_ns(&old), None);
     }

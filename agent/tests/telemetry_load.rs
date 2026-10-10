@@ -24,7 +24,11 @@ mod format {
         for (i, entry) in table.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *entry = c;
         }
@@ -144,7 +148,11 @@ fn sustains_100_events_per_second() {
         r.bytes + b"TRAPD-SPOOL v1\n".len() as u64,
         "every enqueued byte must be on disk — no silent loss"
     );
-    assert!(r.achieved_rate() >= 90.0, "fell behind: {:.0}/s", r.achieved_rate());
+    assert!(
+        r.achieved_rate() >= 90.0,
+        "fell behind: {:.0}/s",
+        r.achieved_rate()
+    );
 }
 
 #[test]
@@ -216,8 +224,7 @@ fn every_record_in_a_large_journal_validates() {
         }
         let text = String::from_utf8_lossy(line);
         let mut parts = text.splitn(3, ' ');
-        let (Some(crc), Some(len), Some(payload)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(crc), Some(len), Some(payload)) = (parts.next(), parts.next(), parts.next())
         else {
             invalid += 1;
             continue;
