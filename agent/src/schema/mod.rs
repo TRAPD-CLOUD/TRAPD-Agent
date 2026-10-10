@@ -719,6 +719,16 @@ pub struct DnsResolutionData {
     pub transaction_id: u16,
     /// Response code as text (`NOERROR`, `NXDOMAIN`, …).
     pub rcode: String,
+    /// Requesting process, when the sensor can attribute it (Windows ETW
+    /// DNS-Client; the packet-capture path cannot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// Image name of the requesting process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+    /// Creation FILETIME of the requesting process (PID-reuse guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
 }
 
 /// A TLS ClientHello observed on the wire — SNI plus the JA3 fingerprint, the
