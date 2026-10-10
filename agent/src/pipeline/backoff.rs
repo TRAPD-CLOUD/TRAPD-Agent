@@ -89,7 +89,11 @@ mod tests {
     #[test]
     fn delay_is_capped() {
         assert_eq!(delay_for(100), MAX_DELAY);
-        assert_eq!(delay_for(u32::MAX), MAX_DELAY, "must not overflow the shift");
+        assert_eq!(
+            delay_for(u32::MAX),
+            MAX_DELAY,
+            "must not overflow the shift"
+        );
     }
 
     #[test]
@@ -117,9 +121,8 @@ mod tests {
     fn jitter_actually_varies() {
         // A constant "jitter" would leave the thundering herd intact, so this
         // is the property that matters, not the exact distribution.
-        let samples: std::collections::BTreeSet<u128> = (0..200)
-            .map(|_| jittered_delay(8).as_millis())
-            .collect();
+        let samples: std::collections::BTreeSet<u128> =
+            (0..200).map(|_| jittered_delay(8).as_millis()).collect();
         assert!(
             samples.len() > 50,
             "expected a spread of delays, got {} distinct values",
@@ -141,7 +144,10 @@ mod tests {
                 high += 1;
             }
         }
-        assert!(low > 20 && high > 20, "distribution is lopsided: {low}/{high}");
+        assert!(
+            low > 20 && high > 20,
+            "distribution is lopsided: {low}/{high}"
+        );
     }
 
     #[test]

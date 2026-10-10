@@ -35,11 +35,11 @@ pub mod runtime;
 pub mod software;
 #[cfg(windows)]
 pub mod winfirewall;
-#[cfg(windows)]
-mod winquarantine;
 pub mod winguard;
 #[cfg(windows)]
 pub mod winproc;
+#[cfg(windows)]
+mod winquarantine;
 
 use std::path::PathBuf;
 

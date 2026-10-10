@@ -25,8 +25,8 @@ pub mod honeytokens;
 pub mod memscan;
 pub mod network;
 pub mod process;
-pub mod regwatch;
 pub mod registry;
+pub mod regwatch;
 pub mod users;
 
 pub mod sensor_supervisor;

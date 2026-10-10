@@ -502,7 +502,9 @@ fn normalized_hit<'a>(hit: &AccessHit<'a>) -> AccessHit<'a> {
 /// after suspend this may conservatively decline attribution, never accept a
 /// process born after the recorded access. Legacy records have no timestamp.
 fn generation_before_access(start: u64, observed_ns: u64, ticks_per_second: u64) -> bool {
-    start > 0 && observed_ns > 0 && ticks_per_second > 0
+    start > 0
+        && observed_ns > 0
+        && ticks_per_second > 0
         && (u128::from(start) + 1) * 1_000_000_000
             <= u128::from(observed_ns) * u128::from(ticks_per_second)
 }
@@ -541,8 +543,8 @@ fn build_event(
         cmdline: proc.cmdline(hit.pid),
         ancestors: build_ancestry(hit.pid, proc),
     };
-    accessor.process_start_time = observed_start
-        .filter(|start| proc.process_start_time(hit.pid) == Some(*start));
+    accessor.process_start_time =
+        observed_start.filter(|start| proc.process_start_time(hit.pid) == Some(*start));
 
     let (label, severity, confidence, tactic, technique) = hit.access_kind.describe();
 
@@ -635,7 +637,9 @@ fn build_ancestry(pid: i32, proc: &dyn ProcInfo) -> Vec<ProcessAncestor> {
 /// Process-info source. Abstracted so the lineage walk is testable without a
 /// live `/proc`.
 pub trait ProcInfo {
-    fn process_start_time(&self, _pid: i32) -> Option<u64> { None }
+    fn process_start_time(&self, _pid: i32) -> Option<u64> {
+        None
+    }
     fn ppid(&self, pid: i32) -> Option<i32>;
     fn comm(&self, pid: i32) -> Option<String>;
     fn exe(&self, pid: i32) -> Option<String>;
@@ -798,7 +802,9 @@ mod tests {
         session_resolved: bool,
     }
     impl ProcInfo for FakeProc {
-        fn process_start_time(&self, _pid: i32) -> Option<u64> { self.start }
+        fn process_start_time(&self, _pid: i32) -> Option<u64> {
+            self.start
+        }
         fn ppid(&self, pid: i32) -> Option<i32> {
             self.ppid.get(&pid).copied()
         }
@@ -860,12 +866,24 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn honeytoken_generation_is_bound_to_original_access() {
-        let mut proc = fake(); proc.start = Some(1);
-        let hit = AccessHit { pid: 100, observed_monotonic_ns: Some(2_000_000_000),
-            uid: 1000, gid: 1000, comm: "cat", open_flags: 0, token_id: "t",
-            path: "/tmp/token", kind: "test", access_kind: AccessKind::Openat };
+        let mut proc = fake();
+        proc.start = Some(1);
+        let hit = AccessHit {
+            pid: 100,
+            observed_monotonic_ns: Some(2_000_000_000),
+            uid: 1000,
+            gid: 1000,
+            comm: "cat",
+            open_flags: 0,
+            token_id: "t",
+            path: "/tmp/token",
+            kind: "test",
+            access_kind: AccessKind::Openat,
+        };
         let event = build_event("a", "h", &hit, false, &proc).unwrap();
-        let EventData::HoneytokenAccess(data) = event.data else { panic!("payload"); };
+        let EventData::HoneytokenAccess(data) = event.data else {
+            panic!("payload");
+        };
         assert_eq!(data.accessor.process_start_time, Some(1));
     }
 
@@ -1057,7 +1075,7 @@ mod tests {
         ] {
             let hit = AccessHit {
                 pid: 100,
-            observed_monotonic_ns: None,
+                observed_monotonic_ns: None,
                 uid: 1000,
                 gid: 1000,
                 comm: "sh",

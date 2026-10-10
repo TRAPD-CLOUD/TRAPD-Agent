@@ -268,7 +268,11 @@ pub fn crc32(data: &[u8]) -> u32 {
         for (i, entry) in t.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *entry = c;
         }
@@ -321,7 +325,10 @@ mod tests {
         assert_eq!(crc32(b""), 0x0000_0000);
         assert_eq!(crc32(b"a"), 0xE8B7_BE43);
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-        assert_eq!(crc32(b"The quick brown fox jumps over the lazy dog"), 0x414F_A339);
+        assert_eq!(
+            crc32(b"The quick brown fox jumps over the lazy dog"),
+            0x414F_A339
+        );
     }
 
     #[test]
@@ -332,7 +339,11 @@ mod tests {
             for bit in 0..8 {
                 let mut flipped = data.clone();
                 flipped[byte] ^= 1 << bit;
-                assert_ne!(crc32(&flipped), base, "bit {bit} of byte {byte} went undetected");
+                assert_ne!(
+                    crc32(&flipped),
+                    base,
+                    "bit {bit} of byte {byte} went undetected"
+                );
             }
         }
     }
@@ -343,7 +354,11 @@ mod tests {
     fn encoded_records_round_trip() {
         let rec = record();
         let encoded = encode(&rec).unwrap();
-        assert_eq!(*encoded.last().unwrap(), b'\n', "records are newline-framed");
+        assert_eq!(
+            *encoded.last().unwrap(),
+            b'\n',
+            "records are newline-framed"
+        );
 
         let line = &encoded[..encoded.len() - 1];
         match decode(line, true) {
@@ -472,11 +487,20 @@ mod tests {
         let mut r = io::BufReader::new(&data[..]);
         let mut buf = Vec::new();
 
-        assert_eq!(read_line_bounded(&mut r, 100, &mut buf).unwrap(), LineRead::Complete);
+        assert_eq!(
+            read_line_bounded(&mut r, 100, &mut buf).unwrap(),
+            LineRead::Complete
+        );
         assert_eq!(buf, b"first");
-        assert_eq!(read_line_bounded(&mut r, 100, &mut buf).unwrap(), LineRead::Complete);
+        assert_eq!(
+            read_line_bounded(&mut r, 100, &mut buf).unwrap(),
+            LineRead::Complete
+        );
         assert_eq!(buf, b"second");
-        assert_eq!(read_line_bounded(&mut r, 100, &mut buf).unwrap(), LineRead::Eof);
+        assert_eq!(
+            read_line_bounded(&mut r, 100, &mut buf).unwrap(),
+            LineRead::Eof
+        );
     }
 
     #[test]
@@ -485,7 +509,10 @@ mod tests {
         let mut r = io::BufReader::new(&data[..]);
         let mut buf = Vec::new();
 
-        assert_eq!(read_line_bounded(&mut r, 100, &mut buf).unwrap(), LineRead::Complete);
+        assert_eq!(
+            read_line_bounded(&mut r, 100, &mut buf).unwrap(),
+            LineRead::Complete
+        );
         assert_eq!(
             read_line_bounded(&mut r, 100, &mut buf).unwrap(),
             LineRead::Unterminated
@@ -504,11 +531,17 @@ mod tests {
         let mut r = io::BufReader::new(&data[..]);
         let mut buf = Vec::new();
 
-        assert_eq!(read_line_bounded(&mut r, 16, &mut buf).unwrap(), LineRead::Overlong);
+        assert_eq!(
+            read_line_bounded(&mut r, 16, &mut buf).unwrap(),
+            LineRead::Overlong
+        );
         assert!(buf.len() <= 16, "the oversized line must not be buffered");
 
         // Recovery continues with the next record.
-        assert_eq!(read_line_bounded(&mut r, 16, &mut buf).unwrap(), LineRead::Complete);
+        assert_eq!(
+            read_line_bounded(&mut r, 16, &mut buf).unwrap(),
+            LineRead::Complete
+        );
         assert_eq!(buf, b"short");
     }
 
@@ -517,14 +550,20 @@ mod tests {
         let data = vec![b'x'; 1000];
         let mut r = io::BufReader::new(&data[..]);
         let mut buf = Vec::new();
-        assert_eq!(read_line_bounded(&mut r, 10, &mut buf).unwrap(), LineRead::Overlong);
+        assert_eq!(
+            read_line_bounded(&mut r, 10, &mut buf).unwrap(),
+            LineRead::Overlong
+        );
     }
 
     #[test]
     fn empty_input_reads_as_eof() {
         let mut r = io::BufReader::new(&b""[..]);
         let mut buf = Vec::new();
-        assert_eq!(read_line_bounded(&mut r, 10, &mut buf).unwrap(), LineRead::Eof);
+        assert_eq!(
+            read_line_bounded(&mut r, 10, &mut buf).unwrap(),
+            LineRead::Eof
+        );
     }
 
     #[test]
@@ -532,7 +571,10 @@ mod tests {
         let data = b"0123456789\n";
         let mut r = io::BufReader::new(&data[..]);
         let mut buf = Vec::new();
-        assert_eq!(read_line_bounded(&mut r, 10, &mut buf).unwrap(), LineRead::Complete);
+        assert_eq!(
+            read_line_bounded(&mut r, 10, &mut buf).unwrap(),
+            LineRead::Complete
+        );
         assert_eq!(buf, b"0123456789");
     }
 

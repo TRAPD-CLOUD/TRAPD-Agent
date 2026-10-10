@@ -40,7 +40,11 @@ fn recon_command(base: &str, cmdline: &str) -> Option<String> {
         "whoami" | "id" | "uname" | "hostname" | "hostnamectl" | "ifconfig" | "ss" | "netstat"
         | "w" | "who" | "last" | "lastlog" | "lsb_release" | "arp" | "route" | "groups"
         | "getent" | "lscpu" | "lsblk" | "env" | "printenv" | "uptime" => base.to_string(),
-        "ip" if matches!(arg1, "a" | "addr" | "address" | "r" | "route" | "link" | "neigh") => {
+        "ip" if matches!(
+            arg1,
+            "a" | "addr" | "address" | "r" | "route" | "link" | "neigh"
+        ) =>
+        {
             format!("ip {arg1}")
         }
         "ps" if lower.contains("aux") || lower.contains("-ef") || lower.contains("-e") => {
@@ -49,8 +53,13 @@ fn recon_command(base: &str, cmdline: &str) -> Option<String> {
         "sudo" if arg1 == "-l" => "sudo -l".into(),
         "cat" | "head" | "less" => {
             const FILES: &[&str] = &[
-                "/etc/passwd", "/etc/group", "/etc/os-release", "/etc/issue", "/etc/hosts",
-                "/etc/resolv.conf", "/proc/version",
+                "/etc/passwd",
+                "/etc/group",
+                "/etc/os-release",
+                "/etc/issue",
+                "/etc/hosts",
+                "/etc/resolv.conf",
+                "/proc/version",
             ];
             let f = FILES.iter().find(|f| lower.contains(*f))?;
             format!("{base} {f}")
@@ -196,14 +205,23 @@ impl StatefulRules {
     /// A systemd unit was written in `session`.
     pub fn observe_unit_write(&mut self, session: &str, path: &str, now: f64) {
         bound(&mut self.units);
-        self.units.insert(session.to_string(), (now, path.to_string()));
+        self.units
+            .insert(session.to_string(), (now, path.to_string()));
     }
 
     /// `systemctl enable|start` in a session that just wrote a unit: the unit
     /// is being activated — escalate the persistence finding to High.
-    pub fn observe_systemctl(&mut self, session: &str, cmdline: &str, now: f64) -> Option<DetectionData> {
+    pub fn observe_systemctl(
+        &mut self,
+        session: &str,
+        cmdline: &str,
+        now: f64,
+    ) -> Option<DetectionData> {
         let lower = cmdline.to_ascii_lowercase();
-        if !(lower.contains(" enable") || lower.contains(" start") || lower.contains(" daemon-reload")) {
+        if !(lower.contains(" enable")
+            || lower.contains(" start")
+            || lower.contains(" daemon-reload"))
+        {
             return None;
         }
         let (t, path) = self.units.get(session).cloned()?;
@@ -252,7 +270,9 @@ mod tests {
         assert!(s.observe_exec_recon("r", "id", "id", 0.0).is_none());
         assert!(s.observe_exec_recon("r", "id", "id", 1.0).is_none());
         assert!(s.observe_exec_recon("r", "whoami", "whoami", 2.0).is_none());
-        assert!(s.observe_exec_recon("r", "uname", "uname -a", 3.0).is_none());
+        assert!(s
+            .observe_exec_recon("r", "uname", "uname -a", 3.0)
+            .is_none());
         let d = s.observe_exec_recon("r", "ss", "ss -tan", 4.0).unwrap();
         assert_eq!(d.rule_id, "discovery.recon_burst");
         assert_eq!(d.subject, "r");
@@ -271,7 +291,12 @@ mod tests {
     #[test]
     fn recon_rearms_after_firing() {
         let mut s = StatefulRules::new();
-        let cmds = [("id", "id"), ("whoami", "whoami"), ("uname", "uname"), ("ss", "ss")];
+        let cmds = [
+            ("id", "id"),
+            ("whoami", "whoami"),
+            ("uname", "uname"),
+            ("ss", "ss"),
+        ];
         let fire = |s: &mut StatefulRules, t: f64| {
             cmds.iter()
                 .enumerate()
@@ -279,7 +304,11 @@ mod tests {
                 .count()
         };
         assert_eq!(fire(&mut s, 0.0), 1);
-        assert_eq!(fire(&mut s, 10.0), 1, "a second burst fires again (the gate folds it)");
+        assert_eq!(
+            fire(&mut s, 10.0),
+            1,
+            "a second burst fires again (the gate folds it)"
+        );
     }
 
     #[test]
@@ -294,7 +323,9 @@ mod tests {
     fn brute_force_then_success() {
         let mut s = StatefulRules::new();
         for i in 0..5 {
-            assert!(s.observe_logon("root", "198.51.100.7", false, i as f64).is_none());
+            assert!(s
+                .observe_logon("root", "198.51.100.7", false, i as f64)
+                .is_none());
         }
         let d = s.observe_logon("root", "198.51.100.7", true, 10.0).unwrap();
         assert_eq!(d.rule_id, "auth.ssh_bruteforce_success");
@@ -333,8 +364,12 @@ mod tests {
     fn unit_write_then_enable() {
         let mut s = StatefulRules::new();
         s.observe_unit_write("r", "/etc/systemd/system/evil.service", 0.0);
-        assert!(s.observe_systemctl("other", "systemctl enable evil", 1.0).is_none());
-        let d = s.observe_systemctl("r", "systemctl enable --now evil", 2.0).unwrap();
+        assert!(s
+            .observe_systemctl("other", "systemctl enable evil", 1.0)
+            .is_none());
+        let d = s
+            .observe_systemctl("r", "systemctl enable --now evil", 2.0)
+            .unwrap();
         assert_eq!(d.base_severity, Some(Severity::High));
     }
 }

@@ -202,10 +202,18 @@ mod tests {
             "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\PowerShell.EXE",
             script,
         );
-        assert_eq!(&args[..3], ["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+        assert_eq!(
+            &args[..3],
+            ["-NoProfile", "-NonInteractive", "-EncodedCommand"]
+        );
         // Round-trips as UTF-16LE: exactly what PowerShell decodes.
-        let raw = base64::engine::general_purpose::STANDARD.decode(&args[3]).unwrap();
-        let units: Vec<u16> = raw.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&args[3])
+            .unwrap();
+        let units: Vec<u16> = raw
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         assert_eq!(String::from_utf16(&units).unwrap(), script);
         assert!(!args[3].contains(['"', ' ']), "nothing left to quote");
         assert_eq!(script_args("pwsh", "1")[2], "-EncodedCommand");
