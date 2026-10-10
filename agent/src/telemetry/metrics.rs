@@ -361,7 +361,7 @@ impl Metrics {
         self.spool_accepted.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Detection/prevention events evicted because no bulk event was left.
+    /// Detection/prevention events evicted by oldest-first queue overflow.
     pub fn spool_priority_evicted(&self, n: u64) {
         self.spool_evicted_priority.fetch_add(n, Ordering::Relaxed);
     }

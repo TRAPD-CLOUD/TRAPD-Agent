@@ -100,7 +100,7 @@ repeated on `CLT-MBL`.
 | F11 | fixed | single event medium; `rename_burst` high at 10 and critical at 30 files in 10 s | backend alert severity not checked |
 | F12 | partly fixed | accessor from `process.create` command lines, high/90 when attributed; 2 s poll | processes that do not name the decoy (Explorer copy) are not found; no true change notification |
 | F13 | fixed | `agent_uptime_seconds`, `agent_last_restart`, `previous_shutdown` in the heartbeat | none |
-| F14 | agent side fixed | `pipeline` counters in the heartbeat; priority-aware spool eviction | backend must alert on missing heartbeat, `previous_shutdown=unclean`, `dropped_total`; no flush or `agent.stopping` event on shutdown |
+| F14 | agent side fixed | `pipeline` counters in the heartbeat; oldest-first spool eviction with priority-loss counters | backend must alert on missing heartbeat, `previous_shutdown=unclean`, `dropped_total`; no flush or `agent.stopping` event on shutdown |
 
 ### Backend work required (not done in this repo)
 - Normalizer (`backend/libs/detection/src/dcs/normalizers/linux.rs`) must accept `class=registry`.

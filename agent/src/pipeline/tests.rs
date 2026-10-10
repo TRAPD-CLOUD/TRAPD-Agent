@@ -567,6 +567,42 @@ fn capacity_is_enforced_while_replaying() {
     assert_eq!(s2.len(), 5, "a large journal must not overflow a small cap");
 }
 
+#[test]
+fn replayed_events_balance_after_recovery_overflow_new_pushes_and_acknowledgement() {
+    let dir = TempDir::new("replay_accounting");
+    let mut ids = Vec::new();
+    {
+        let mut spool = Spool::durable_at(dir.journal(), 10);
+        for _ in 0..5 {
+            let event = detection_event();
+            ids.push(event.event_id);
+            spool.push(event).unwrap();
+        }
+        spool.checkpoint();
+    }
+    let mut spool = Spool::durable_at(dir.journal(), 3);
+    let recovered = 5u64;
+    assert_eq!(spool.dropped_total(), 2);
+    assert_eq!(recovered, spool.len() as u64 + spool.dropped_total());
+    let current = spool.push(dummy_event()).unwrap();
+    assert!(spool
+        .peek_batch(10)
+        .iter()
+        .any(|entry| entry.seq == current));
+    assert!(spool
+        .peek_batch(10)
+        .iter()
+        .all(|entry| entry.event.event_id != ids[2]));
+    assert_eq!(recovered + 1, spool.len() as u64 + spool.dropped_total());
+    let batch = spool.peek_batch(2);
+    let acked = spool.ack(&batch.iter().map(|entry| entry.seq).collect::<Vec<_>>()) as u64;
+    assert_eq!(acked, 2);
+    assert_eq!(
+        recovered + 1,
+        acked + spool.len() as u64 + spool.dropped_total()
+    );
+}
+
 // ── Damaged journals ─────────────────────────────────────────────────────────
 
 #[test]
@@ -789,19 +825,46 @@ fn every_accepted_event_is_acknowledged_queued_or_counted_as_dropped() {
 // ── Overflow policy ──────────────────────────────────────────────────────────
 
 #[test]
-fn overflow_sheds_bulk_telemetry_before_detections() {
+fn overflow_keeps_current_bulk_telemetry_in_a_queue_of_detections() {
     let mut s = Spool::in_memory(3);
-    let det = s.push(detection_event()).unwrap();
-    for _ in 0..5 {
-        s.push(dummy_event()).unwrap();
-    }
+    let oldest = s.push(detection_event()).unwrap();
+    s.push(detection_event()).unwrap();
+    s.push(detection_event()).unwrap();
+    let current = s.push(dummy_event()).unwrap();
     assert_eq!(s.len(), 3);
-    assert_eq!(s.dropped_total(), 3, "every eviction is counted");
+    assert_eq!(s.dropped_total(), 1);
     let held = s.peek_batch(10);
-    assert!(
-        held.iter().any(|e| e.seq == det),
-        "the oldest entry is a detection and must outlive newer bulk events"
-    );
+    assert!(held.iter().any(|e| e.seq == current));
+    assert!(held.iter().all(|e| e.seq != oldest));
+}
+
+#[test]
+fn overflow_evicts_oldest_detection_before_newer_bulk() {
+    let mut s = Spool::in_memory(3);
+    let oldest = s.push(detection_event()).unwrap();
+    let second = s.push(dummy_event()).unwrap();
+    let third = s.push(dummy_event()).unwrap();
+    let fourth = s.push(detection_event()).unwrap();
+    let mut held: Vec<_> = s.peek_batch(10).iter().map(|e| e.seq).collect();
+    held.sort_unstable();
+    assert_eq!(held, vec![second, third, fourth]);
+    assert!(!held.contains(&oldest));
+    assert_eq!(s.dropped_total(), 1);
+}
+
+#[test]
+fn byte_overflow_keeps_the_newest_bulk_event() {
+    let mut s = Spool::in_memory(10);
+    let oldest = s.push(detection_event()).unwrap();
+    s.push(dummy_event()).unwrap();
+    let limit = s.bytes();
+    let mut s = s.with_max_bytes(limit);
+    let newest = s.push(dummy_event()).unwrap();
+    let held = s.peek_batch(10);
+    assert!(held.iter().any(|e| e.seq == newest));
+    assert!(held.iter().all(|e| e.seq != oldest));
+    assert!(s.bytes() <= limit);
+    assert_eq!(s.dropped_total(), 1);
 }
 
 #[test]

@@ -307,14 +307,7 @@ impl Spool {
         let mut evicted = 0u64;
         let mut priority_evicted = 0u64;
         while self.mem.len() > self.max_events || self.bytes > self.max_bytes {
-            // Shed the oldest bulk telemetry first; detections and prevention
-            // actions are only sacrificed when nothing else is left to shed.
-            let idx = self
-                .mem
-                .iter()
-                .position(|e| !is_priority(&e.event))
-                .unwrap_or(0);
-            let Some(old) = self.mem.remove(idx) else {
+            let Some(old) = self.mem.pop_front() else {
                 break;
             };
             if is_priority(&old.event) {
@@ -325,10 +318,6 @@ impl Spool {
         }
         if priority_evicted > 0 {
             metrics().spool_priority_evicted(priority_evicted);
-            warn!(
-                priority_evicted,
-                "spool at capacity with no bulk events left, evicting detection/prevention events"
-            );
         }
         if evicted > 0 {
             self.dropped_total += evicted;
@@ -338,6 +327,7 @@ impl Spool {
             if self.dropped_total - evicted == 0 || self.dropped_total % 1_000 < evicted {
                 warn!(
                     dropped_total = self.dropped_total,
+                    priority_evicted,
                     max_events = self.max_events,
                     max_bytes = self.max_bytes,
                     "spool at capacity — evicting oldest events (backend unreachable?)"
