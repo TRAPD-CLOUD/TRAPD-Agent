@@ -663,16 +663,20 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
     // Preserve the host's independently provisioned binary-signing trust
     // anchor. Missing/invalid replacement signatures fail BEFORE any swap;
     // never remove an old signature to bypass the startup integrity check.
-    let signature_install = match ctx.baseline.and_then(Path::parent) {
-        Some(config) if config.join("signing.pub").exists() => {
+    // Same key resolution as the startup check (`release_signing.pub`, then
+    // the legacy `signing.pub`), so update and startup can never disagree.
+    let signature_install = match ctx.baseline.and_then(Path::parent).and_then(|config| {
+        crate::selfprotect::binary_integrity::resolve_signing_key(
+            &crate::update::release_key_dir(),
+            config,
+        )
+        .map(|key| (config, key))
+    }) {
+        Some((config, key_path)) => {
             let target = config.join("binary.sig");
             match verified.binary_signature {
                 Some(bytes) => {
-                    let raw = std::fs::read(config.join("signing.pub"))?;
-                    let raw: [u8; 32] = raw
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("update: signing.pub must be 32 raw bytes"))?;
-                    let key = ed25519_dalek::VerifyingKey::from_bytes(&raw)?;
+                    let key = crate::selfprotect::binary_integrity::load_signing_key(&key_path)?;
                     key.verify_strict(
                         &verified.sha256,
                         &ed25519_dalek::Signature::from_bytes(&bytes),
