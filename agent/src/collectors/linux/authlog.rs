@@ -187,6 +187,7 @@ fn parse_accepted(line: &str, method: &str) -> Option<UserLogonData> {
         src_port,
         auth_method: Some(method.to_string()),
         success: true,
+        ..Default::default()
     })
 }
 
@@ -243,6 +244,7 @@ fn parse_failed_for(rest: &str, auth_method: Option<&str>) -> Option<UserLogonDa
         src_port,
         auth_method: auth_method.map(|m| m.to_string()),
         success: false,
+        ..Default::default()
     })
 }
 

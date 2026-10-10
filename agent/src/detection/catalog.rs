@@ -224,6 +224,17 @@ pub const RULES: &[RuleMeta] = &[
     rule("persistence.run_key", PERSIST, "T1547.001", Medium, High, Shadow, Command, HOUR),
     rule("defense_evasion.dll_sideload", EVASION, "T1574.002", Medium, High, Shadow, Path, HOUR),
     rule("discovery.ad_trusts", DISCOVERY, "T1482", Low, Medium, Signal, Command, HOUR),
+    // ── Windows evasion / credential access / logon patterns ───────────────
+    // (detection::windows_evasion_rules, detection::windows_logon)
+    rule("defense_evasion.eventlog_disabled", EVASION, "T1562.002", High, High, Shadow, Command, HOUR),
+    rule("defense_evasion.audit_policy_disabled", EVASION, "T1562.002", High, High, Shadow, Command, HOUR),
+    rule("defense_evasion.boot_config_tamper", EVASION, "T1562.009", Medium, High, Shadow, Command, HOUR),
+    rule("credential_access.ntds_dump", CREDS, "T1003.003", High, Critical, Shadow, Command, HOUR),
+    rule("credential_access.mimikatz", CREDS, "T1003.001", Critical, Critical, Alert, Command, HOUR),
+    rule("lolbin.rundll32_remote", EVASION, "T1218.011", High, High, Shadow, Command, TEN_MIN),
+    rule("auth.windows_bruteforce", CREDS, "T1110.001", Medium, High, Alert, Subject, TEN_MIN),
+    rule("auth.windows_password_spray", CREDS, "T1110.003", High, High, Alert, Subject, TEN_MIN),
+    rule("auth.windows_bruteforce_success", CREDS, "T1110.001", High, Critical, Alert, Subject, TEN_MIN),
     // ── Sensor / self-protection (Windows) ─────────────────────────────────
     rule("selfprotect.etw_session_stopped", EVASION, "T1562.006", High, High, Alert, Subject, HOUR),
     rule("selfprotect.audit_policy_changed", EVASION, "T1562.002", Medium, High, Alert, Subject, HOUR),

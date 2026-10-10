@@ -131,24 +131,13 @@ fn parse(xml: &str, channel: &str) -> Result<(u64, LogEventData, Option<UserLogo
             );
         }
     }
-    let value = |name: &str| {
-        fields
-            .get(name)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let auth = if channel == "Security" && matches!(event_id, 4624 | 4625) {
-        Some(UserLogonData {
-            username: value("TargetUserName"),
-            src_addr: match value("IpAddress").as_str() {
-                "" | "-" => None,
-                other => Some(other.into()),
-            },
-            src_port: value("IpPort").parse().ok(),
-            auth_method: Some(value("AuthenticationPackageName")),
-            success: event_id == 4624,
-        })
+    // 4624/4625 become structured logon events; the operating system's own
+    // service/machine logons (SYSTEM, DWM, machine accounts) are dropped.
+    // 4776 (NTLM validation) only gets readable fields on its raw record: it
+    // accompanies 4625 on workstations and would double-count failures.
+    let auth = if channel == "Security" {
+        crate::detection::windows_logon::enrich_fields(event_id, &mut fields);
+        crate::detection::windows_logon::normalize(event_id, &fields)
     } else {
         None
     };
@@ -302,7 +291,10 @@ fn decoy_access(
 
 /// Security-log clear (1102) or audit-policy change (4719): an attacker
 /// blinding the host. Raised as a self-protection detection.
-fn audit_tamper(fields: &serde_json::Map<String, serde_json::Value>) -> Option<DetectionData> {
+fn audit_tamper(
+    channel: &str,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Option<DetectionData> {
     let id = fields.get("EventID").and_then(|v| v.as_u64())?;
     let (title, detail) = match id {
         1102 => (
@@ -313,6 +305,11 @@ fn audit_tamper(fields: &serde_json::Map<String, serde_json::Value>) -> Option<D
             "System audit policy changed",
             "The system audit policy was changed",
         ),
+        // 104: a non-Security log (System, Application, ...) was cleared.
+        104 if channel == "System" => (
+            "Windows event log cleared",
+            "A Windows event log (System channel event 104) was cleared",
+        ),
         _ => return None,
     };
     Some(DetectionData {
@@ -320,7 +317,7 @@ fn audit_tamper(fields: &serde_json::Map<String, serde_json::Value>) -> Option<D
         title: title.into(),
         category: "defense_evasion".into(),
         mitre_tactic: Some("TA0005 Defense Evasion".into()),
-        mitre_technique: Some(if id == 1102 { "T1070.001" } else { "T1562.002" }.into()),
+        mitre_technique: Some(if id == 4719 { "T1562.002" } else { "T1070.001" }.into()),
         confidence: 80,
         subject: format!("event {id}"),
         detail: detail.into(),
@@ -401,10 +398,28 @@ impl Collector for EventLogCollector {
                 }
                 for xml in records {
                     let (record, data, auth) = parse(&xml, channel)?;
+                    if channel == "System"
+                        && cursor.is_some()
+                        && data.proc.as_deref() == Some("Microsoft-Windows-Eventlog")
+                    {
+                        if let Some(det) = audit_tamper(channel, &data.fields) {
+                            let ev = AgentEvent::new(
+                                agent_id.clone(),
+                                hostname.clone(),
+                                EventClass::Detection,
+                                EventAction::Detected,
+                                Severity::High,
+                                EventData::Detection(Box::new(det)),
+                            );
+                            if tx.send(ev).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
                     if channel == "Security" {
                         capture_logon_type(&data.fields, &mut logon_types);
                         if cursor.is_some() {
-                            if let Some(det) = audit_tamper(&data.fields) {
+                            if let Some(det) = audit_tamper(channel, &data.fields) {
                                 let ev = AgentEvent::new(
                                     agent_id.clone(),
                                     hostname.clone(),
