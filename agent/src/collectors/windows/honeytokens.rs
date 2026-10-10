@@ -393,6 +393,63 @@ mod ownership_regressions {
     }
 
     #[test]
+    fn health_hash_preserves_external_access_waiting_for_attribution() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _serial = serialize();
+        let path =
+            std::env::temp_dir().join(format!("trapd-win-health-access-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(FsState::default());
+        plant_missing(std::slice::from_ref(&path), &state);
+        state
+            .started
+            .set(Instant::now() - Duration::from_secs(60))
+            .unwrap();
+        state.planted.lock().unwrap().clear();
+        // Deterministically represent an external timestamp move. This avoids
+        // depending on the host's deferred/disabled NTFS access-time updates.
+        let observed = accessed_time(&path).unwrap();
+        state
+            .atime
+            .lock()
+            .unwrap()
+            .insert(path.clone(), observed - Duration::from_secs(1));
+        let config = Arc::new(RwLock::new(AgentConfig::default()));
+        config.write().unwrap().honeytoken_paths = vec![path.display().to_string()];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        runtime.block_on(sweep(&tx, "agent", "host", &config, &state, true));
+        assert!(
+            state.pending_access.lock().unwrap().contains_key(&path),
+            "health hash must preserve the external read before rebasing its own read"
+        );
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|e| matches!(e.action, EventAction::HoneytokenAccess)));
+        state
+            .pending_access
+            .lock()
+            .unwrap()
+            .insert(path.clone(), Instant::now() - Duration::from_secs(7));
+        poll_last_access(&tx, "agent", "host", &config, &state);
+        let hits: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|e| matches!(e.action, EventAction::HoneytokenAccess))
+            .collect();
+        assert_eq!(hits.len(), 1);
+        let EventData::HoneytokenAccess(hit) = &hits[0].data else {
+            panic!("access expected")
+        };
+        assert_eq!(hit.access_kind, "last_access");
+        assert!(state.pending_access.lock().unwrap().is_empty());
+        // A subsequent agent health read is not another external access.
+        runtime.block_on(sweep(&tx, "agent", "host", &config, &state, true));
+        poll_last_access(&tx, "agent", "host", &config, &state);
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|e| matches!(e.action, EventAction::HoneytokenAccess)));
+        config.write().unwrap().honeytoken_paths.clear();
+        reconcile_removed(&tx, "agent", "host", &config, &state);
+    }
+
+    #[test]
     fn registry_entries_are_not_treated_as_files() {
         let cfg = AgentConfig {
             honeytoken_paths: vec![
@@ -953,6 +1010,10 @@ async fn sweep(
             if !owns_path(path) {
                 continue;
             }
+            // Observe external access before our content read can advance the
+            // same NTFS timestamp. Waiting observations remain pending across
+            // the post-hash rebaseline and retain normal attribution grace.
+            poll_path_last_access(tx, agent_id, hostname, path, state);
             let expected = state.sha.lock().ok().and_then(|m| m.get(path).cloned());
             let actual = sha256_of_file(path);
             // Hashing is an agent content read. Advance the atime baseline
@@ -997,59 +1058,68 @@ fn poll_last_access(
     config: &Arc<RwLock<AgentConfig>>,
     state: &FsState,
 ) {
-    use crate::detection::accessor_correlation::{attribute, last_access_action, LastAccessAction};
+    for path in &configured_paths(config) {
+        poll_path_last_access(tx, agent_id, hostname, path, state);
+    }
+}
 
+fn poll_path_last_access(
+    tx: &Sender<AgentEvent>,
+    agent_id: &str,
+    hostname: &str,
+    path: &Path,
+    state: &FsState,
+) {
+    use crate::detection::accessor_correlation::{attribute, last_access_action, LastAccessAction};
     let since_start = state
         .started
         .get()
         .map(Instant::elapsed)
         .unwrap_or_default();
-    for path in &configured_paths(config) {
-        if !owns_path(path) {
-            continue;
-        }
-        let Some(now_at) = accessed_time(path) else {
-            continue;
-        };
-        let prev = state.atime.lock().ok().and_then(|m| m.get(path).copied());
-        let Some(prev_at) = prev else {
-            if let Ok(mut m) = state.atime.lock() {
-                m.insert(path.clone(), now_at);
-            }
-            continue;
-        };
-        let moved = now_at > prev_at && !state.recently_planted(path);
-        let pending_since = state
-            .pending_access
-            .lock()
-            .ok()
-            .and_then(|m| m.get(path).copied());
-        if !moved && pending_since.is_none() {
-            continue;
-        }
-        let accessor = attribute(&path.to_string_lossy());
-        let first_seen = pending_since.unwrap_or_else(Instant::now);
-        match last_access_action(since_start, accessor.is_some(), first_seen.elapsed()) {
-            LastAccessAction::Wait => {
-                if let Ok(mut p) = state.pending_access.lock() {
-                    p.entry(path.clone()).or_insert(first_seen);
-                }
-                // Keep the old baseline so the move is seen again next tick.
-                continue;
-            }
-            LastAccessAction::Suppress => {
-                debug!(path = %path.display(), "honeytoken last-access ignored (start-up warm-up, no accessor)");
-            }
-            LastAccessAction::Emit => {
-                emit_fs_event(tx, agent_id, hostname, path, "last_access", accessor);
-            }
-        }
-        if let Ok(mut p) = state.pending_access.lock() {
-            p.remove(path);
-        }
+    if !owns_path(path) {
+        return;
+    }
+    let Some(now_at) = accessed_time(path) else {
+        return;
+    };
+    let prev = state.atime.lock().ok().and_then(|m| m.get(path).copied());
+    let Some(prev_at) = prev else {
         if let Ok(mut m) = state.atime.lock() {
-            m.insert(path.clone(), now_at);
+            m.insert(path.to_path_buf(), now_at);
         }
+        return;
+    };
+    let moved = now_at > prev_at && !state.recently_planted(path);
+    let pending_since = state
+        .pending_access
+        .lock()
+        .ok()
+        .and_then(|m| m.get(path).copied());
+    if !moved && pending_since.is_none() {
+        return;
+    }
+    let accessor = attribute(&path.to_string_lossy());
+    let first_seen = pending_since.unwrap_or_else(Instant::now);
+    match last_access_action(since_start, accessor.is_some(), first_seen.elapsed()) {
+        LastAccessAction::Wait => {
+            if let Ok(mut p) = state.pending_access.lock() {
+                p.entry(path.to_path_buf()).or_insert(first_seen);
+            }
+            // Keep the old baseline so the move is seen again next tick.
+            return;
+        }
+        LastAccessAction::Suppress => {
+            debug!(path = %path.display(), "honeytoken last-access ignored (start-up warm-up, no accessor)");
+        }
+        LastAccessAction::Emit => {
+            emit_fs_event(tx, agent_id, hostname, path, "last_access", accessor);
+        }
+    }
+    if let Ok(mut p) = state.pending_access.lock() {
+        p.remove(path);
+    }
+    if let Ok(mut m) = state.atime.lock() {
+        m.insert(path.to_path_buf(), now_at);
     }
 }
 

@@ -73,3 +73,9 @@ Sysmon renames retain typed original/destination names and emit a conservative
 Low/Signal policy without inventing value data. Both canonical catalogs contain
 106 rules; the platform migration syncs 26 policies and preserves tenant overrides.
 The published registry ingest contract matches the implementation.
+
+Further native review fixes: poll pending honeytoken access before each health
+hash can rebaseline its own read; request executable paths in memory-scanner
+snapshots before applying existing confidence hints; preserve native UTC/source
+on System 104 and Security 1102/4719 audit findings. Undated audit records stay
+raw evidence. These regressions require native Windows test execution.

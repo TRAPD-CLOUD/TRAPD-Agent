@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use sysinfo::{ProcessRefreshKind, System};
+use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
 use tracing::info;
@@ -49,11 +49,17 @@ impl MemScanCollector {
     }
 }
 
+// The snapshot must include image paths used by the shared confidence rules.
+fn snapshot_processes() -> System {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessRefreshKind::new().with_exe(UpdateKind::OnlyIfNotSet));
+    sys
+}
+
 /// One blocking sweep over every process. Returns the new findings and the set
 /// of live generations (to forget findings of exited or reused PIDs).
 fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, LiveGenerations) {
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(ProcessRefreshKind::new());
+    let sys = snapshot_processes();
     let mut findings = Vec::new();
     let mut live = HashSet::new();
     // Capture generations before the thread snapshot: a recycled PID must not
@@ -222,6 +228,17 @@ mod tests {
     use windows_sys::Win32::System::Memory::{
         VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
     };
+
+    #[test]
+    fn sweep_snapshot_contains_the_current_process_image_path() {
+        let sys = snapshot_processes();
+        let own_pid = sysinfo::Pid::from_u32(std::process::id());
+        let process = sys
+            .process(own_pid)
+            .expect("current process must be listed");
+        let executable = process.exe().expect("sweep must request executable paths");
+        assert_eq!(executable, std::env::current_exe().unwrap());
+    }
 
     #[tokio::test]
     async fn initially_disabled_collector_waits_for_config_activation() {

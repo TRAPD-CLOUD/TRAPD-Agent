@@ -233,10 +233,8 @@ fn auth_event(
     agent_id: &str,
     hostname: &str,
 ) -> Option<AgentEvent> {
-    let recorded_at = data.log_timestamp?;
-    let event_id = data.fields.get("EventID")?.as_u64()?;
-    let source = format!("windows_eventlog:{}:{event_id}", data.source_path);
-    let mut event = AgentEvent::new(
+    data.log_timestamp?;
+    let event = AgentEvent::new(
         agent_id.into(),
         hostname.into(),
         EventClass::User,
@@ -251,10 +249,16 @@ fn auth_event(
             Severity::Low
         },
         EventData::UserLogon(auth),
-    )
-    .with_source(&source);
-    event.timestamp = recorded_at;
-    Some(event)
+    );
+    native_provenance(event, data)
+}
+
+/// Authentication and audit findings retain native time and source so replay
+/// cannot authorize a live response. Undated records remain raw evidence only.
+fn native_provenance(mut event: AgentEvent, data: &LogEventData) -> Option<AgentEvent> {
+    event.timestamp = data.log_timestamp?;
+    let event_id = data.fields.get("EventID")?.as_u64()?;
+    Some(event.with_source(&format!("windows_eventlog:{}:{event_id}", data.source_path)))
 }
 
 /// Keep one unacknowledged authentication identity per configured channel.
@@ -405,6 +409,27 @@ fn audit_tamper(
         evidence: serde_json::json!({ "event_id": id }),
         ..Default::default()
     })
+}
+
+fn audit_tamper_event(
+    channel: &str,
+    data: &LogEventData,
+    agent_id: &str,
+    hostname: &str,
+) -> Option<AgentEvent> {
+    data.log_timestamp?;
+    let detection = audit_tamper(channel, &data.fields)?;
+    native_provenance(
+        AgentEvent::new(
+            agent_id.into(),
+            hostname.into(),
+            EventClass::Detection,
+            EventAction::Detected,
+            Severity::High,
+            EventData::Detection(Box::new(detection)),
+        ),
+        data,
+    )
 }
 
 pub struct EventLogCollector {
@@ -561,15 +586,7 @@ impl Collector for EventLogCollector {
                         && cursor.is_some()
                         && data.proc.as_deref() == Some("Microsoft-Windows-Eventlog")
                     {
-                        if let Some(det) = audit_tamper(channel, &data.fields) {
-                            let ev = AgentEvent::new(
-                                agent_id.clone(),
-                                hostname.clone(),
-                                EventClass::Detection,
-                                EventAction::Detected,
-                                Severity::High,
-                                EventData::Detection(Box::new(det)),
-                            );
+                        if let Some(ev) = audit_tamper_event(channel, &data, &agent_id, &hostname) {
                             if tx.send(ev).await.is_err() {
                                 return Ok(());
                             }
@@ -578,15 +595,9 @@ impl Collector for EventLogCollector {
                     if channel == "Security" {
                         capture_logon_type(&data.fields, &mut logon_types);
                         if cursor.is_some() {
-                            if let Some(det) = audit_tamper(channel, &data.fields) {
-                                let ev = AgentEvent::new(
-                                    agent_id.clone(),
-                                    hostname.clone(),
-                                    EventClass::Detection,
-                                    EventAction::Detected,
-                                    Severity::High,
-                                    EventData::Detection(Box::new(det)),
-                                );
+                            if let Some(ev) =
+                                audit_tamper_event(channel, &data, &agent_id, &hostname)
+                            {
                                 if tx.send(ev).await.is_err() {
                                     return Ok(());
                                 }
@@ -804,6 +815,48 @@ mod tests {
             .await
         );
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn replayed_audit_findings_keep_native_time_and_historical_guard() {
+        for (channel, event_id) in [("System", 104), ("Security", 1102), ("Security", 4719)] {
+            let xml = format!(
+                r#"<Event><System><Provider Name="Microsoft-Windows-Eventlog"/><EventID>{event_id}</EventID><EventRecordID>123</EventRecordID><TimeCreated SystemTime="2020-01-01T12:34:56.1234567+02:00"/></System><EventData/></Event>"#
+            );
+            let (_, data, _) = parse(&xml, channel).unwrap();
+            let event = audit_tamper_event(channel, &data, "agent", "host").unwrap();
+            assert_eq!(event.timestamp, data.log_timestamp.unwrap());
+            assert_eq!(
+                event.timestamp.to_rfc3339(),
+                "2020-01-01T10:34:56.123456700+00:00"
+            );
+            assert_eq!(
+                event.origin.as_ref().unwrap().source.as_deref(),
+                Some(format!("windows_eventlog:{channel}:{event_id}").as_str())
+            );
+            assert!(crate::detection::is_historical_windows_record(&event));
+            assert!(matches!(event.data, EventData::Detection(_)));
+        }
+    }
+
+    #[test]
+    fn undated_audit_records_remain_raw_without_live_findings() {
+        for (channel, event_id) in [("System", 104), ("Security", 1102), ("Security", 4719)] {
+            for timestamp in [
+                "",
+                r#"<TimeCreated/>"#,
+                r#"<TimeCreated SystemTime="invalid"/>"#,
+            ] {
+                let xml = format!(
+                    r#"<Event><System><EventID>{event_id}</EventID><EventRecordID>123</EventRecordID>{timestamp}</System><EventData/></Event>"#
+                );
+                let (record, data, _) = parse(&xml, channel).unwrap();
+                assert_eq!(record, 123);
+                assert_eq!(data.fields["EventID"], event_id);
+                assert!(data.log_timestamp.is_none());
+                assert!(audit_tamper_event(channel, &data, "agent", "host").is_none());
+            }
+        }
     }
 
     #[test]
