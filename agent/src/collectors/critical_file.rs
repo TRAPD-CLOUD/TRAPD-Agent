@@ -96,6 +96,20 @@ pub fn compare(before: Option<&Snapshot>, after: &Snapshot) -> Verdict {
     }
 }
 
+/// The caller has confirmed the tracked path is missing, rather than unreadable.
+pub fn compare_missing(before: Option<&Snapshot>) -> Verdict {
+    let Some(before) = before else {
+        return Verdict::NoBaseline;
+    };
+    Verdict::Changed {
+        size_delta: -(before.size as i64),
+        summary: before
+            .text
+            .as_ref()
+            .map(|text| format!("file missing; {}", line_diff(text, ""))),
+    }
+}
+
 fn clip(line: &str) -> String {
     let t: String = line.trim().chars().take(MAX_LINE_CHARS).collect();
     if line.trim().chars().count() > MAX_LINE_CHARS {
@@ -193,6 +207,39 @@ mod tests {
         let a = snapshot_of(HOSTS.as_bytes(), true);
         assert_eq!(compare(Some(&a), &a.clone()), Verdict::Unchanged);
         assert_eq!(compare(None, &a), Verdict::NoBaseline);
+    }
+
+    #[test]
+    fn known_missing_hosts_content_is_a_change_with_the_prior_fingerprint() {
+        let directory =
+            std::env::temp_dir().join(format!("trapd-missing-hosts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("hosts");
+        std::fs::write(&path, HOSTS).unwrap();
+        let before = read_snapshot(&path, true).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_snapshot(&path, true).is_none());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let verdict = compare_missing(Some(&before));
+        std::fs::remove_dir_all(directory).unwrap();
+        let Verdict::Changed {
+            size_delta,
+            summary,
+        } = verdict
+        else {
+            panic!("known disappearance must violate the prior baseline")
+        };
+        assert_eq!(size_delta, -(before.size as i64));
+        let summary = summary.unwrap();
+        assert!(summary.contains("- 127.0.0.1 localhost"));
+        assert_eq!(
+            compare_missing(None),
+            Verdict::NoBaseline,
+            "a first missing file has no prior fingerprint to violate"
+        );
     }
 
     #[test]

@@ -666,14 +666,17 @@ impl Collector for FilesystemCollector {
                                     let event = match action {
                                         Action::Generic { path, change } => {
                                             let key = fs_plan::normalise(&path);
-                                            if critical::is_hosts_file(&key) && change != Change::Deleted {
+                                            if critical::is_hosts_file(&key) {
                                                 // Content check: what changed in the hosts file?
                                                 let probe = PathBuf::from(&path);
                                                 let keep = critical::is_diffable(&key);
-                                                let after = tokio::task::spawn_blocking(move || critical::read_snapshot(&probe, keep))
-                                                    .await
-                                                    .ok()
-                                                    .flatten();
+                                                let (after, missing) = tokio::task::spawn_blocking(move || {
+                                                    let snapshot = critical::read_snapshot(&probe, keep);
+                                                    // An unreadable/oversize file is not proof of deletion.
+                                                    let missing = snapshot.is_none() && std::fs::metadata(&probe)
+                                                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                                                    (snapshot, missing)
+                                                }).await.ok().unwrap_or((None, false));
                                                 let ev = match after {
                                                     Some(after) => {
                                                         let before = critical_state.get(&key);
@@ -683,6 +686,17 @@ impl Collector for FilesystemCollector {
                                                             operation_for(change), &verdict, before, Some(&after),
                                                         );
                                                         critical_state.insert(key, after);
+                                                        ev
+                                                    }
+                                                    None if missing => {
+                                                        let before = critical_state.get(&key);
+                                                        let verdict = critical::compare_missing(before);
+                                                        let ev = checked_event(
+                                                            &agent_id, &hostname, path.clone(),
+                                                            FilesystemOperation::Deleted, &verdict, before, None,
+                                                        );
+                                                        // Keep the last known fingerprint so a later
+                                                        // recreation is checked against it, not re-baselined.
                                                         ev
                                                     }
                                                     None => event(
@@ -779,6 +793,54 @@ mod tests {
             .change_summary
             .unwrap()
             .contains("203.0.113.1 bank.example"));
+    }
+
+    #[test]
+    fn known_hosts_delete_and_rename_away_preserve_the_expected_fingerprint() {
+        let before = critical::snapshot_of(b"127.0.0.1 localhost\n", true);
+        for change in [Change::Deleted, Change::RenamedFrom] {
+            let verdict = critical::compare_missing(Some(&before));
+            let ev = checked_event(
+                "agent",
+                "host",
+                "hosts".into(),
+                operation_for(change),
+                &verdict,
+                Some(&before),
+                None,
+            );
+            assert_eq!(ev.severity, Severity::High);
+            assert!(matches!(ev.action, EventAction::Delete));
+            let EventData::Filesystem(data) = ev.data else {
+                panic!("filesystem event expected")
+            };
+            assert_eq!(data.integrity, IntegrityStatus::Violation);
+            assert_eq!(data.expected_hash.as_deref(), Some(before.sha256.as_str()));
+            assert!(
+                data.actual_hash.is_none(),
+                "absence is not an empty file fingerprint"
+            );
+            assert_eq!(data.size_delta, Some(-(before.size as i64)));
+            assert!(data.change_summary.unwrap().contains("file missing"));
+        }
+        let verdict = critical::compare_missing(None);
+        let ev = checked_event(
+            "agent",
+            "host",
+            "hosts".into(),
+            FilesystemOperation::Deleted,
+            &verdict,
+            None,
+            None,
+        );
+        assert_eq!(ev.severity, Severity::Info);
+        let EventData::Filesystem(data) = ev.data else {
+            panic!("filesystem event expected")
+        };
+        assert_eq!(data.integrity, IntegrityStatus::NotChecked);
+        assert!(data.expected_hash.is_none());
+        assert!(data.actual_hash.is_none());
+        assert!(data.change_summary.is_none());
     }
 
     #[test]
