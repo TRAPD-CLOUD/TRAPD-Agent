@@ -12,7 +12,7 @@
 //! on-disk diagnostics file and `trapd-agent diagnostics telemetry`.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +116,7 @@ pub struct Metrics {
     spool_capacity_bytes: AtomicU64,
     spool_capacity_events: AtomicU64,
     spool_corrupt_records: AtomicU64,
+    spool_durability_lost: AtomicBool,
     spool_truncated_tail_records: AtomicU64,
     spool_recovered_records: AtomicU64,
     spool_oldest_age_ms: AtomicU64,
@@ -172,6 +173,7 @@ impl Metrics {
             spool_capacity_bytes: AtomicU64::new(0),
             spool_capacity_events: AtomicU64::new(0),
             spool_corrupt_records: AtomicU64::new(0),
+            spool_durability_lost: AtomicBool::new(false),
             spool_truncated_tail_records: AtomicU64::new(0),
             spool_recovered_records: AtomicU64::new(0),
             spool_oldest_age_ms: AtomicU64::new(0),
@@ -332,6 +334,11 @@ impl Metrics {
     pub fn set_spool_state(&self, events: u64, bytes: u64) {
         self.spool_events.store(events, Ordering::Relaxed);
         self.spool_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Loss of journal backing, independent of confirmed event loss.
+    pub fn set_spool_durability_lost(&self, lost: bool) {
+        self.spool_durability_lost.store(lost, Ordering::Relaxed);
     }
 
     pub fn set_spool_oldest_age_ms(&self, age: u64) {
@@ -506,6 +513,7 @@ impl Metrics {
             spool_capacity_events: self.spool_capacity_events.load(Ordering::Relaxed),
             spool_capacity_bytes: self.spool_capacity_bytes.load(Ordering::Relaxed),
             spool_corrupt_records_total: self.spool_corrupt_records.load(Ordering::Relaxed),
+            spool_durability_lost: self.spool_durability_lost.load(Ordering::Relaxed),
             spool_truncated_tail_records_total: self
                 .spool_truncated_tail_records
                 .load(Ordering::Relaxed),
@@ -566,6 +574,7 @@ impl Metrics {
         self.spool_capacity_events.store(0, Ordering::Relaxed);
         self.spool_capacity_bytes.store(0, Ordering::Relaxed);
         self.spool_corrupt_records.store(0, Ordering::Relaxed);
+        self.spool_durability_lost.store(false, Ordering::Relaxed);
         self.spool_truncated_tail_records
             .store(0, Ordering::Relaxed);
         self.spool_recovered_records.store(0, Ordering::Relaxed);
@@ -642,6 +651,9 @@ pub struct MetricsSnapshot {
     pub spool_capacity_events: u64,
     pub spool_capacity_bytes: u64,
     pub spool_corrupt_records_total: u64,
+    /// True when an intended durable spool has fallen back to memory.
+    #[serde(default)]
+    pub spool_durability_lost: bool,
     pub spool_truncated_tail_records_total: u64,
     pub spool_recovered_records_total: u64,
     #[serde(default)]
@@ -761,6 +773,28 @@ mod tests {
         m.events_dropped(DropReason::InternalError, 0);
         assert_eq!(m.snapshot().collector_events_dropped_total, 0);
         assert!(m.snapshot().collector_events_dropped_by_reason.is_empty());
+    }
+
+    #[test]
+    fn durability_loss_round_trips_and_clears_without_event_loss() {
+        let m = fresh();
+        m.set_spool_durability_lost(true);
+        let json = serde_json::to_value(m.snapshot()).unwrap();
+        let back: MetricsSnapshot = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.spool_durability_lost);
+        assert_eq!(back.collector_events_dropped_total, 0);
+        m.set_spool_durability_lost(false);
+        assert!(!m.snapshot().spool_durability_lost);
+        let mut older = json;
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("spool_durability_lost");
+        assert!(
+            !serde_json::from_value::<MetricsSnapshot>(older)
+                .unwrap()
+                .spool_durability_lost
+        );
     }
 
     #[test]

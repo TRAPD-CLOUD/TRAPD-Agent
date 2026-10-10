@@ -78,6 +78,8 @@ struct PipelineCounters {
     /// Valid records replayed at startup, including those evicted by recovery
     /// capacity limits. Corrupt/unsupported records are excluded.
     replayed_from_disk: u64,
+    /// Journal backing failed; queued events are still available in memory.
+    durability_lost: bool,
     /// Events re-queued for another attempt after a failed send.
     retried: u64,
     /// Current queue depth / bytes / age of the oldest queued event.
@@ -98,11 +100,28 @@ impl PipelineCounters {
             dropped_by_reason: s.collector_events_dropped_by_reason.clone(),
             priority_evicted: s.spool_priority_evicted_total,
             replayed_from_disk: s.spool_recovered_records_total,
+            durability_lost: s.spool_durability_lost,
             retried: s.transport_events_retried_total,
             queued: s.spool_events,
             queued_bytes: s.spool_bytes,
             oldest_queued_age_ms: s.spool_oldest_event_age_ms,
         }
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_surfaces_durability_loss_without_claiming_event_loss() {
+        let mut value =
+            serde_json::to_value(crate::telemetry::metrics::MetricsSnapshot::default()).unwrap();
+        value["spool_durability_lost"] = serde_json::json!(true);
+        let snapshot = serde_json::from_value(value).unwrap();
+        let counters = serde_json::to_value(PipelineCounters::from_snapshot(&snapshot)).unwrap();
+        assert_eq!(counters["durability_lost"], true);
+        assert_eq!(counters["dropped_total"], 0);
     }
 }
 

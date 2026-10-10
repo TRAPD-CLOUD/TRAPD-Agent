@@ -18,6 +18,8 @@ use crate::telemetry::{metrics::metrics, DropReason};
 
 pub mod backoff;
 pub mod journal;
+#[cfg(any(windows, test))]
+pub mod receipt;
 pub mod spool;
 
 // The env-override helpers are called from the Linux `main` only; the Windows
