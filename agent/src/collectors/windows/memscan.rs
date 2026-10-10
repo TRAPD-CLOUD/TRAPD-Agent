@@ -92,6 +92,7 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
         if regions.is_empty() {
             continue;
         }
+        let image = process.exe().map(|p| p.to_string_lossy().into_owned());
         let mut process_findings = Vec::new();
         let starts = thread_starts.get(&pid).map(Vec::as_slice).unwrap_or(&[]);
         // Resolve the (more expensive) module list only when a rule would
@@ -124,6 +125,13 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
                 r.region.is_writable_executable(),
             );
             let mut det = finding_to_detection(pid, &name, &f);
+            // Full image path, so suppressions match the binary (`exe`) and
+            // not the spoofable process name in the subject.
+            det.correlation = Some(crate::schema::CorrelationKeys {
+                pid: Some(pid),
+                exe: image.clone(),
+                ..Default::default()
+            });
             det.evidence["process_start_time"] = process_start_time.into();
             process_findings.push((key, f.severity, det));
         }

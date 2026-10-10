@@ -345,8 +345,7 @@ pub fn inspect_registry(r: &RegistryEventData) -> Vec<DetectionData> {
                 "userinit" => {
                     let mut parts = n.split(',').map(str::trim).filter(|p| !p.is_empty());
                     let first = parts.next().unwrap_or("");
-                    let default =
-                        first == "c:\\windows\\system32\\userinit.exe" || first == "userinit.exe";
+                    let default = is_default_userinit(first);
                     !default || parts.next().is_some()
                 }
                 "taskman" => !n.is_empty(),
@@ -548,6 +547,19 @@ pub fn inspect_eventlog(log: &LogEventData) -> Vec<DetectionData> {
         }
         _ => Vec::new(),
     }
+}
+
+/// The stock `Userinit` program: bare name, `%SystemRoot%` spelling, or the
+/// host's actual system root (not necessarily `C:\\Windows`). `first` is
+/// lower-cased.
+fn is_default_userinit(first: &str) -> bool {
+    let first = first.replace('\\', "/");
+    first == "userinit.exe"
+        || first == "%systemroot%/system32/userinit.exe"
+        || crate::collectors::win_mem_rules::install_roots()
+            .windows
+            .iter()
+            .any(|w| first == format!("{w}system32/userinit.exe"))
 }
 
 #[cfg(test)]
@@ -755,6 +767,7 @@ mod tests {
             ("Shell", "explorer.exe"),
             ("Userinit", r"C:\Windows\system32\userinit.exe,"),
             ("Userinit", r"C:\WINDOWS\system32\userinit.exe"),
+            ("Userinit", r"%SystemRoot%\system32\userinit.exe,"),
         ] {
             assert!(
                 inspect_registry(&change("winlogon", key, name, Some(v))).is_empty(),
