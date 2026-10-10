@@ -33,15 +33,19 @@ impl Drop for Agent {
 }
 
 #[test]
-fn shutdown_during_linux_pairing_removes_instructions() {
+fn pending_linux_pairing_records_clean_signals_and_unclean_kills() {
     for signal in [
         nix::sys::signal::Signal::SIGTERM,
         nix::sys::signal::Signal::SIGINT,
+        nix::sys::signal::Signal::SIGKILL,
     ] {
         let root = std::env::temp_dir().join(format!("trapd-shutdown-{}", uuid::Uuid::new_v4()));
         let config = root.join("config");
         let state = root.join("state");
         std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let marker = state.join("run_state");
+        std::fs::write(&marker, "clean").unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -91,6 +95,7 @@ fn shutdown_during_linux_pairing_removes_instructions() {
                 .env("TRAPD_CONFIG_DIR", &config)
                 .env("TRAPD_STATE_DIR", &state)
                 .env("TRAPD_LOG_DIR", root.join("logs"))
+                .env("TRAPD_OUTPUT", "file")
                 .env("TRAPD_BACKEND_URL", format!("http://{addr}"))
                 .env("TRAPD_TLS_ALLOW_SYSTEM_ROOTS", "1")
                 .env_remove("TRAPD_OFFLINE")
@@ -112,6 +117,19 @@ fn shutdown_during_linux_pairing_removes_instructions() {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(file.exists(), "pairing instructions were never published");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "running",
+            "pending enrollment must claim the process lifecycle before credentials exist"
+        );
+        assert!(
+            !state.join("spool/queue.journal").exists(),
+            "pairing must not start the event pipeline"
+        );
+        assert!(
+            !root.join("logs/events.ndjson").exists(),
+            "pairing must not emit telemetry"
+        );
         agent.stop_watchdog();
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(agent.0.id() as i32), signal).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -125,8 +143,29 @@ fn shutdown_during_linux_pairing_removes_instructions() {
             );
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert!(status.success(), "shutdown was not graceful: {status}");
-        assert!(!file.exists(), "shutdown left stale pairing instructions");
+        if signal == nix::sys::signal::Signal::SIGKILL {
+            assert!(
+                !status.success(),
+                "killed process exited successfully: {status}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                "running",
+                "abrupt exit during pairing must retain the unclean-shutdown marker"
+            );
+        } else {
+            assert!(status.success(), "shutdown was not graceful: {status}");
+            assert!(!file.exists(), "shutdown left stale pairing instructions");
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                "clean",
+                "signal-driven exit while pairing must record an orderly shutdown"
+            );
+        }
+        assert!(
+            !root.join("logs/events.ndjson").exists(),
+            "cancelled pairing must not emit telemetry"
+        );
         server.join().unwrap();
         drop(agent);
         std::fs::remove_dir_all(root).unwrap();

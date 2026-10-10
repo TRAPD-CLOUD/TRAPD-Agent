@@ -188,6 +188,8 @@ async fn main() -> Result<()> {
     // Resolve & create the (HOME-independent) state directory up front so every
     // later component agrees on where identity/credentials live.
     paths::init_state_dir();
+    // Enrollment can wait indefinitely; claim the run before credentials exist.
+    heartbeat::lifecycle::begin_process();
 
     let device_id = load_or_create_device_id()
         .await
@@ -232,10 +234,12 @@ async fn main() -> Result<()> {
             biased;
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT during enrollment, shutting down");
+                heartbeat::lifecycle::mark_clean_shutdown();
                 return Ok(());
             }
             _ = terminate_signal() => {
                 info!("Received SIGTERM during enrollment, shutting down");
+                heartbeat::lifecycle::mark_clean_shutdown();
                 return Ok(());
             }
             result = enrollment::load_or_enroll(&backend_url, &device_id, &hostname) => {
@@ -254,7 +258,6 @@ async fn main() -> Result<()> {
         OutputMode::File => "file",
     };
 
-    heartbeat::lifecycle::begin_process();
     info!(
         agent_id   = %agent_id,
         device_id  = %device_id,

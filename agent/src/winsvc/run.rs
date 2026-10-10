@@ -159,6 +159,8 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     load_env_file();
     load_msi_config();
     paths::init_state_dir();
+    // Include startup recovery and pending enrollment in this process run.
+    crate::heartbeat::lifecycle::begin_process();
 
     // Self-integrity, like the Linux agent: refuse to run a binary that no
     // longer matches its recorded digest (or whose signature fails). An MSI
@@ -171,7 +173,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         if let Some(hold) = crate::selfprotect::binary_integrity::hold_duration(&e) {
             tokio::select! {
                 _ = tokio::time::sleep(hold) => {}
-                _ = stop.recv() => {}
+                _ = stop.recv() => { crate::heartbeat::lifecycle::mark_clean_shutdown(); }
             }
         }
         return Err(e);
@@ -227,6 +229,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
                     _ = expiry_tick.tick() => { startup_expired.extend(reconcile_pending_firewall_expiry().await); },
                     _ = stop.recv() => {
                         info!("stop requested before enrollment completed");
+                        crate::heartbeat::lifecycle::mark_clean_shutdown();
                         return Ok(());
                     }
                 }
@@ -241,7 +244,6 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
 
     let output_mode = OutputMode::from_env();
 
-    crate::heartbeat::lifecycle::begin_process();
     info!(
         agent_id  = %agent_id,
         device_id = %device_id,
