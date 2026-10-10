@@ -48,6 +48,10 @@ impl MemScanCollector {
 }
 
 // The snapshot must include image paths used by the shared confidence rules.
+/// Images larger than this are not hashed (cost bound, same as the process
+/// collector); such findings can still be suppressed by path.
+const MAX_IMAGE_HASH_BYTES: u64 = 64 * 1024 * 1024;
+
 fn snapshot_processes() -> System {
     let mut sys = System::new();
     sys.refresh_processes_specifics(ProcessRefreshKind::new().with_exe(UpdateKind::OnlyIfNotSet));
@@ -141,10 +145,26 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
             live.remove(&(pid, process_start_time));
             continue;
         }
-        for (key, severity, det) in process_findings {
-            if seen.insert(key) {
-                findings.push((severity, det));
+        // Hash the on-disk image once per process, and only when a finding is
+        // actually new, so suppressions can match `sha256` as well as `exe`.
+        // This identifies the file at that path, not the in-memory image of a
+        // hollowed process; it is the same trust level as the path itself.
+        let mut image_hash: Option<Option<String>> = None;
+        for (key, severity, mut det) in process_findings {
+            if !seen.insert(key) {
+                continue;
             }
+            if let (Some(path), Some(corr)) = (&image, det.correlation.as_mut()) {
+                let hash = image_hash.get_or_insert_with(|| {
+                    crate::paths::bounded_regular_sha256_label(
+                        std::path::Path::new(path),
+                        MAX_IMAGE_HASH_BYTES,
+                    )
+                    .ok()
+                });
+                corr.exe_sha256 = hash.clone();
+            }
+            findings.push((severity, det));
         }
     }
     (findings, live)
