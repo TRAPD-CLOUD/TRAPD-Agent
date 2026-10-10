@@ -577,6 +577,7 @@ impl DecodeState {
                     };
                     if let Some(data) = etw_map::process_start(rec, &self.devices, enrich) {
                         crate::deception::activity::record_exec(&data.username, &data.exe);
+                        crate::detection::accessor_correlation::record_process(&data);
                         if self.proc_images.len() >= 8192 {
                             self.proc_images.clear();
                         }

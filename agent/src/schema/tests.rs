@@ -198,6 +198,8 @@ fn filesystem_notifications_share_one_wire_model() {
             expected_hash: Some("old".into()),
             actual_hash: Some("new".into()),
             size_delta: Some(12),
+            actor: None,
+            change_summary: None,
         }),
     );
     let value: serde_json::Value =
