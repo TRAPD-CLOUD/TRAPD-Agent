@@ -120,18 +120,16 @@ fn identity(user: &str, exe: &str) -> Option<(String, String)> {
 /// novel binary; planting one needs admin and is covered by the integrity,
 /// FIM and persistence rules. The binary is still learned.
 fn is_os_protected_image(exe: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "c:/windows/system32/",
-        "c:/windows/syswow64/",
-        "c:/windows/systemapps/",
-        "c:/windows/winsxs/",
-        "c:/windows/immersivecontrolpanel/",
-        "c:/windows/servicing/",
-        "c:/program files/windowsapps/",
-        "c:/program files/",
-        "c:/program files (x86)/",
+    use crate::collectors::win_mem_rules::{install_roots, under_install_roots};
+    const WINDOWS_SUBDIRS: &[&str] = &[
+        "system32/",
+        "syswow64/",
+        "systemapps/",
+        "winsxs/",
+        "immersivecontrolpanel/",
+        "servicing/",
     ];
-    PREFIXES.iter().any(|p| exe.starts_with(p))
+    under_install_roots(exe, install_roots(), WINDOWS_SUBDIRS, true)
 }
 
 impl BaselineEngine {
