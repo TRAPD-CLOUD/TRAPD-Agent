@@ -480,9 +480,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn sha256_of_file(path: &Path) -> Option<String> {
-    crate::paths::bounded_regular_sha256(path, MAX_TOKEN_HASH_BYTES)
-        .ok()
-        .map(|digest| format!("sha256:{digest}"))
+    crate::paths::bounded_regular_sha256_label(path, MAX_TOKEN_HASH_BYTES).ok()
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────

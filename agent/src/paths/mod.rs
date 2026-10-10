@@ -180,6 +180,13 @@ pub(crate) fn bounded_regular_sha256(path: &Path, max_bytes: u64) -> std::io::Re
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// [`bounded_regular_sha256`] in the telemetry label form `sha256:<64 hex>`.
+/// The inner function already returns hex, so callers must not hex-encode it
+/// again (that produced 128-char `exe_sha256` values on Windows).
+pub(crate) fn bounded_regular_sha256_label(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    bounded_regular_sha256(path, max_bytes).map(|hex| format!("sha256:{hex}"))
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn dir_from_env(env: &str, default: PathBuf) -> PathBuf {
@@ -400,6 +407,23 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Regression (F2): the label was hex-encoded twice (135 chars).
+    #[test]
+    fn sha256_label_is_prefix_plus_single_64_hex_and_matches_known_digest() {
+        let dir = scratch_dir("sha_label");
+        let file = dir.join("abc.bin");
+        std::fs::write(&file, b"abc").unwrap();
+        let label = bounded_regular_sha256_label(&file, 1024).unwrap();
+        // NIST test vector for "abc".
+        assert_eq!(
+            label,
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(label.len(), 71);
+        assert!(label[7..].bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(bounded_regular_sha256_label(&file, 2).is_err());
     }
 
     /// The whole point of the fix: the temp file must come into existence

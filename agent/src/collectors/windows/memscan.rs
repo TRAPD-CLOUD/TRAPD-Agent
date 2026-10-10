@@ -20,7 +20,9 @@ use tokio::time::{interval, Duration};
 use tracing::info;
 
 use crate::collectors::mem_finding::{finding_to_detection, MemFindingKey};
-use crate::collectors::win_mem_rules::{classify, is_jit_module, is_jit_process, RegionContext};
+use crate::collectors::win_mem_rules::{
+    classify, is_jit_module, is_jit_process, is_protected_image_path, RegionContext,
+};
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
 use crate::prevention::winproc;
@@ -86,6 +88,9 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
         if regions.is_empty() {
             continue;
         }
+        let protected_image = process
+            .exe()
+            .is_some_and(|exe| is_protected_image_path(&exe.to_string_lossy()));
         let mut process_findings = Vec::new();
         let starts = thread_starts.get(&pid).map(Vec::as_slice).unwrap_or(&[]);
         // Resolve the (more expensive) module list only when a rule would
@@ -97,6 +102,7 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
                 header_is_pe: r.header_is_pe,
                 thread_started_here: starts.iter().any(|a| r.region.contains(*a)),
                 jit_runtime: jit,
+                protected_image,
             };
             let mut finding = classify(&r.region, ctx);
             if finding.is_some()

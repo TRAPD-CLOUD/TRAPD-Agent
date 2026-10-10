@@ -116,6 +116,8 @@ pub struct RegionContext {
     pub thread_started_here: bool,
     /// The process legitimately generates code at run time.
     pub jit_runtime: bool,
+    /// The process image lives in an admin-only location ([`is_protected_image_path`]).
+    pub protected_image: bool,
 }
 
 /// Classify one unbacked-executable region.
@@ -130,6 +132,20 @@ pub fn classify(region: &WinRegion, ctx: RegionContext) -> Option<MemFinding> {
             technique: "T1055.001",
             confidence: 88,
             severity: Severity::High,
+            region: region.describe(),
+        });
+    }
+    if ctx.thread_started_here && ctx.protected_image && !region.is_writable_executable() {
+        // Shell and vendor processes (explorer, RuntimeBroker, WARP, Copilot)
+        // start threads in sealed (r-x) generated code or hook trampolines.
+        // Shellcode injection allocates RWX, which stays an alert below, so
+        // this is context only; a PE header is handled above.
+        return Some(MemFinding {
+            rule_id: "memory.anon_exec",
+            title: "Thread started in sealed executable memory of a protected-location image",
+            technique: "T1055",
+            confidence: 45,
+            severity: Severity::Low,
             region: region.describe(),
         });
     }
@@ -247,6 +263,24 @@ const JIT_MODULES: &[&str] = &[
     "luajit.dll",
 ];
 
+/// Whether a process image path is under an admin-only Windows install
+/// location. Path based on purpose: writing there needs admin, so it is a
+/// provenance hint, not a signature check (a hollowed image keeps its path,
+/// which is why RWX thread starts and PE headers are never downgraded).
+pub fn is_protected_image_path(path: &str) -> bool {
+    let p = path.replace('/', "\\").to_ascii_lowercase();
+    [
+        "c:\\windows\\system32\\",
+        "c:\\windows\\syswow64\\",
+        "c:\\windows\\systemapps\\",
+        "c:\\windows\\explorer.exe",
+        "c:\\program files\\",
+        "c:\\program files (x86)\\",
+    ]
+    .iter()
+    .any(|prefix| p.starts_with(prefix))
+}
+
 pub fn is_jit_process(image_name: &str) -> bool {
     let name = image_name.to_ascii_lowercase();
     JIT_PROCESSES.iter().any(|j| name == *j)
@@ -317,6 +351,66 @@ mod tests {
     }
 
     #[test]
+    fn protected_image_path_is_admin_only_locations_only() {
+        for p in [
+            "C:\\Windows\\explorer.exe",
+            "c:\\windows\\System32\\RuntimeBroker.exe",
+            "C:\\Program Files\\Cloudflare\\Cloudflare WARP\\warp-svc.exe",
+            "C:\\Windows\\SystemApps\\Microsoft.LockApp_x\\LockApp.exe",
+        ] {
+            assert!(is_protected_image_path(p), "{p}");
+        }
+        for p in [
+            "C:\\Users\\bob\\AppData\\Local\\Temp\\evil.exe",
+            "C:\\Windows\\Temp\\evil.exe",
+            "C:\\ProgramData\\x.exe",
+            "C:\\Program Files Evil\\x.exe",
+            "",
+        ] {
+            assert!(!is_protected_image_path(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn thread_start_in_sealed_memory_of_a_protected_image_is_context() {
+        let started = RegionContext {
+            thread_started_here: true,
+            protected_image: true,
+            ..ctx()
+        };
+        let f = classify(&region(MEM_PRIVATE, PAGE_EXECUTE_READ), started).unwrap();
+        assert_eq!(f.rule_id, "memory.anon_exec");
+        assert!(f.confidence < 50);
+    }
+
+    #[test]
+    fn thread_start_still_alerts_for_rwx_unprotected_images_and_pe() {
+        // RWX shellcode thread inside a protected-location process (explorer).
+        let in_protected = RegionContext {
+            thread_started_here: true,
+            protected_image: true,
+            ..ctx()
+        };
+        let f = classify(&region(MEM_PRIVATE, PAGE_EXECUTE_READWRITE), in_protected).unwrap();
+        assert!(f.confidence >= 90);
+        // Sealed memory, but the image is in a user-writable location.
+        let unprotected = RegionContext {
+            thread_started_here: true,
+            ..ctx()
+        };
+        let f = classify(&region(MEM_PRIVATE, PAGE_EXECUTE_READ), unprotected).unwrap();
+        assert!(f.confidence >= 90);
+        // Reflective PE is never downgraded.
+        let pe = RegionContext {
+            header_is_pe: true,
+            protected_image: true,
+            ..ctx()
+        };
+        let f = classify(&region(MEM_PRIVATE, PAGE_EXECUTE_READ), pe).unwrap();
+        assert_eq!(f.rule_id, "memory.injected_pe");
+    }
+
+    #[test]
     fn rwx_alone_is_context_not_an_alert() {
         // Security products hook APIs with RWX trampolines in many processes.
         for kind in [MEM_PRIVATE, MEM_MAPPED] {
@@ -352,6 +446,7 @@ mod tests {
             thread_started_here: true,
             header_is_pe: true,
             jit_runtime: false,
+            protected_image: false,
         };
         // Even a thread start or a PE header means nothing in a real module …
         assert!(classify(&region(MEM_IMAGE, PAGE_EXECUTE_READ), started).is_none());
@@ -390,6 +485,7 @@ mod tests {
             header_is_pe: true,
             thread_started_here: true,
             jit_runtime: false,
+            protected_image: false,
         };
         let f = classify(&region(MEM_PRIVATE, PAGE_EXECUTE_READWRITE), both).unwrap();
         assert_eq!(f.rule_id, "memory.injected_pe");
