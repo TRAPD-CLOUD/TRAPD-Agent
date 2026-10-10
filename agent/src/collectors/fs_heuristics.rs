@@ -127,18 +127,42 @@ pub fn has_ransom_extension(path: &str) -> bool {
 #[derive(Default)]
 pub struct MassModification {
     seen: HashMap<String, Instant>,
+    reported_tier: u8,
 }
 
 impl MassModification {
-    /// Record a modification. Returns the number of distinct paths once the
-    /// threshold is crossed (and resets, so a burst alerts once).
+    /// Report once at the high tier and again at the critical tier. Retain
+    /// the window between tiers; rearm when it falls below the high threshold.
     pub fn record(&mut self, path: &str, now: Instant) -> Option<usize> {
         self.seen
             .retain(|_, last| now.duration_since(*last) <= MASS_MOD_WINDOW);
+        // Check before inserting so a new path cannot hide an expired burst.
+        if self.seen.len() < MASS_MOD_THRESHOLD {
+            self.reported_tier = 0;
+        }
         self.seen.insert(path.to_string(), now);
-        if self.seen.len() >= MASS_MOD_THRESHOLD {
-            let n = self.seen.len();
-            self.seen.clear();
+        // Only the most recent critical-threshold paths are needed to decide
+        // either tier. Bound memory even during a sustained modification storm.
+        if self.seen.len() > MASS_MOD_CRITICAL {
+            let oldest = self
+                .seen
+                .iter()
+                .min_by_key(|(_, last)| **last)
+                .map(|(path, _)| path.clone());
+            if let Some(oldest) = oldest {
+                self.seen.remove(&oldest);
+            }
+        }
+        let n = self.seen.len();
+        let tier = if n >= MASS_MOD_CRITICAL {
+            2
+        } else if n >= MASS_MOD_THRESHOLD {
+            1
+        } else {
+            0
+        };
+        if tier > self.reported_tier {
+            self.reported_tier = tier;
             Some(n)
         } else {
             None
@@ -474,10 +498,64 @@ mod tests {
             );
         }
         assert_eq!(fired, Some(MASS_MOD_THRESHOLD));
-        // It resets, so the same burst alerts once.
+        // Repeated notifications do not report the same tier again.
         assert!(m
             .record("/home/a/f0.txt", t0 + Duration::from_millis(100))
             .is_none());
+    }
+
+    #[test]
+    fn mass_modification_escalates_once_per_tier_and_rearms_after_expiry() {
+        let now = Instant::now();
+        let mut m = MassModification::default();
+        let mut alarms = Vec::new();
+        for i in 0..250 {
+            if let Some(count) = m.record(&format!("/doc{i}.txt"), now) {
+                alarms.push((
+                    count,
+                    high_write_rate_event("agent", "host", count as u64).severity,
+                ));
+            }
+        }
+        assert_eq!(
+            alarms,
+            vec![(50, Severity::High), (200, Severity::Critical)]
+        );
+        for i in 0..250 {
+            assert_eq!(m.record(&format!("/doc{i}.txt"), now), None);
+        }
+        let later = now + Duration::from_secs(11);
+        let mut alarms = Vec::new();
+        for i in 0..200 {
+            if let Some(count) = m.record(&format!("/doc{i}.txt"), later) {
+                alarms.push(count);
+            }
+        }
+        assert_eq!(alarms, vec![50, 200]);
+    }
+
+    #[test]
+    fn mass_modification_retains_recent_paths_with_bounded_memory() {
+        let now = Instant::now();
+        let mut m = MassModification::default();
+        for i in 0..1000 {
+            m.record(&format!("/old{i}"), now + Duration::from_millis(i));
+            assert!(m.seen.len() <= MASS_MOD_CRITICAL);
+        }
+        // Refresh the most recent files just before the original window ends.
+        for i in 800..1000 {
+            assert_eq!(
+                m.record(&format!("/old{i}"), now + Duration::from_secs(10)),
+                None
+            );
+        }
+        assert_eq!(m.record("/new", now + Duration::from_secs(11)), None);
+        assert_eq!(m.seen.len(), 200);
+        // Once enough files expire, the next burst can report high again.
+        for i in 0..50 {
+            let report = m.record(&format!("/later{i}"), now + Duration::from_secs(22));
+            assert_eq!(report, (i == 49).then_some(50));
+        }
     }
 
     #[test]
