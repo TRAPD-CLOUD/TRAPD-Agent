@@ -11,6 +11,7 @@
 //! | [`process`]          | `process/create` + `process/terminate`           |
 //! | [`users`]            | `user/session_open` + `user/session_close`       |
 //! | [`honeytokens`]      | filesystem decoys + registry decoys (deception)  |
+//! | [`regwatch`]         | `registry/{create,modify,delete}` persistence    |
 //! | [`memscan`]          | code-injection detections (RWX / injected PE)    |
 //!
 //! OS-neutral `system/snapshot` telemetry (CPU, RAM, OS version, uptime) is
@@ -24,6 +25,7 @@ pub mod honeytokens;
 pub mod memscan;
 pub mod network;
 pub mod process;
+pub mod regwatch;
 pub mod registry;
 pub mod users;
 

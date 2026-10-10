@@ -235,6 +235,26 @@ pub const RULES: &[RuleMeta] = &[
     rule("auth.windows_bruteforce", CREDS, "T1110.001", Medium, High, Alert, Subject, TEN_MIN),
     rule("auth.windows_password_spray", CREDS, "T1110.003", High, High, Alert, Subject, TEN_MIN),
     rule("auth.windows_bruteforce_success", CREDS, "T1110.001", High, Critical, Alert, Subject, TEN_MIN),
+
+    // ── Windows registry / service / task persistence (detection::registry_rules)
+    // A plain new autorun, service or task is context only; forms installers
+    // also produce start in shadow; encoded/download forms and the
+    // unambiguous hijack points (IFEO, Winlogon, AppInit) alert.
+    rule("persistence.registry_run_key_added", PERSIST, "T1547.001", Low, Low, Signal, Subject, HOUR),
+    rule("persistence.registry_run_userpath", PERSIST, "T1547.001", Medium, High, Shadow, Subject, HOUR),
+    rule("persistence.registry_run_suspicious", PERSIST, "T1547.001", High, Critical, Alert, Subject, HOUR),
+    rule("persistence.service_installed", PERSIST, "T1543.003", Low, Low, Signal, Subject, HOUR),
+    rule("persistence.service_image_userpath", PERSIST, "T1543.003", Medium, High, Shadow, Subject, HOUR),
+    rule("persistence.service_image_suspicious", PERSIST, "T1543.003", High, Critical, Alert, Subject, HOUR),
+    rule("persistence.scheduled_task_created", PERSIST, "T1053.005", Low, Low, Signal, Subject, HOUR),
+    rule("persistence.scheduled_task_userpath", PERSIST, "T1053.005", Medium, High, Shadow, Subject, HOUR),
+    rule("persistence.scheduled_task_suspicious", PERSIST, "T1053.005", High, Critical, Alert, Subject, HOUR),
+    rule("persistence.ifeo_debugger", PERSIST, "T1546.012", High, Critical, Alert, Subject, HOUR),
+    rule("persistence.winlogon_modified", PERSIST, "T1547.004", High, Critical, Alert, Subject, HOUR),
+    rule("persistence.appinit_dlls", PERSIST, "T1546.010", High, Critical, Alert, Subject, HOUR),
+    rule("persistence.com_hijack", PERSIST, "T1546.015", Medium, High, Shadow, Subject, HOUR),
+    rule("defense_evasion.defender_exclusion", EVASION, "T1562.001", Medium, High, Alert, Subject, HOUR),
+    rule("defense_evasion.defender_disabled", EVASION, "T1562.001", High, Critical, Alert, Subject, HOUR),
     // ── Sensor / self-protection (Windows) ─────────────────────────────────
     rule("selfprotect.etw_session_stopped", EVASION, "T1562.006", High, High, Alert, Subject, HOUR),
     rule("selfprotect.audit_policy_changed", EVASION, "T1562.002", Medium, High, Alert, Subject, HOUR),

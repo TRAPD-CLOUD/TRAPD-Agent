@@ -4,7 +4,7 @@ use super::{
     AgentEvent, DnsData, EbpfDropsData, EventAction, EventClass, EventData, FileOpenData,
     FilesystemEventData, FilesystemOperation, FilesystemSource, ForkData, HoneytokenAccessData,
     IntegrityStatus, LogEventData, MmapData, ModuleLoadData, NamespaceIds, NetworkSocketData,
-    NsChangeData, ProcessCreateData, ProcessLineage, PtraceData, SessionContext, Severity, ShmData,
+    NsChangeData, ProcessCreateData, ProcessLineage, PtraceData, RegistryEventData, SessionContext, Severity, ShmData,
     SystemSnapshotData,
 };
 
@@ -820,4 +820,34 @@ fn windows_authentication_log_keeps_fields_after_queue_round_trip() {
     let parsed: EventData = serde_json::from_value(payload.clone()).unwrap();
     assert!(matches!(&parsed, EventData::Log(log) if log.fields["EventID"] == 4625));
     assert_eq!(serde_json::to_value(parsed).unwrap(), payload);
+}
+
+#[test]
+fn test_registry_event_roundtrip() {
+    let event = AgentEvent::new(
+        "agent".to_string(),
+        "host".to_string(),
+        EventClass::Registry,
+        EventAction::Create,
+        Severity::Info,
+        EventData::Registry(RegistryEventData {
+            key_path: r"HKU\S-1-5-21-1\Software\Microsoft\Windows\CurrentVersion\Run".into(),
+            value_name: "trapdtest".into(),
+            category: "run_key".into(),
+            user_sid: Some("S-1-5-21-1".into()),
+            old_value: None,
+            new_value: Some("cmd /c echo x".into()),
+            suppressed: None,
+        }),
+    );
+    let json = serde_json::to_string(&event).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(val["class"], "registry");
+    assert_eq!(val["action"], "create");
+    assert_eq!(val["data"]["value_name"], "trapdtest");
+    assert!(val["data"].get("old_value").is_none());
+    // Journal/replay recovery must come back as a Registry payload, not a
+    // different untagged variant.
+    let back: AgentEvent = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back.data, EventData::Registry(_)));
 }

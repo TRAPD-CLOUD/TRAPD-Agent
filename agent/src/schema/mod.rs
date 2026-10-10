@@ -77,6 +77,8 @@ pub enum EventClass {
     System,
     User,
     Filesystem,
+    /// Windows registry value changes on persistence-relevant keys.
+    Registry,
     /// Anonymous/executable memory mappings (fileless malware).
     Memory,
     /// Kernel-level events (module loads).
@@ -94,7 +96,7 @@ pub enum EventClass {
 
 impl EventClass {
     /// Every class, in `index()` order.
-    pub const ALL: [EventClass; 11] = [
+    pub const ALL: [EventClass; 12] = [
         EventClass::Process,
         EventClass::Network,
         EventClass::System,
@@ -106,6 +108,7 @@ impl EventClass {
         EventClass::Prevention,
         EventClass::Detection,
         EventClass::Log,
+        EventClass::Registry,
     ];
 
     /// Stable lowercase label (identical to the serde spelling).
@@ -122,6 +125,7 @@ impl EventClass {
             EventClass::Prevention => "prevention",
             EventClass::Detection => "detection",
             EventClass::Log => "log",
+            EventClass::Registry => "registry",
         }
     }
 
@@ -138,6 +142,7 @@ impl EventClass {
             EventClass::Prevention => 8,
             EventClass::Detection => 9,
             EventClass::Log => 10,
+            EventClass::Registry => 11,
         }
     }
 }
@@ -280,6 +285,8 @@ pub enum EventData {
     /// periodic integrity scanner emit this shape so consumers do not need
     /// separate pipelines for FIM and ordinary filesystem activity.
     Filesystem(FilesystemEventData),
+    /// Windows registry change on a watched persistence location.
+    Registry(RegistryEventData),
     /// Legacy journal compatibility only. New collectors emit `Filesystem`.
     FileEvent(FileEventData),
     // ── eBPF-sourced event data ──────────────────────────────────────
@@ -603,6 +610,34 @@ pub struct FilesystemEventData {
     pub actual_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_delta: Option<i64>,
+}
+
+/// One value-level change on a watched Windows registry location. Emitted by
+/// the registry watcher with `class=registry` and action `create` / `modify` /
+/// `delete`. There is no process attribution (polling snapshots); correlate
+/// with process events by time and command line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryEventData {
+    /// Full key path with hive prefix, e.g.
+    /// `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`.
+    pub key_path: String,
+    /// Value name; `(Default)` for the unnamed value.
+    pub value_name: String,
+    /// Watch category: `run_key`, `service`, `ifeo`, `winlogon`, `appinit`,
+    /// `defender`, `com_hijack`, `scheduled_task`, `startup_env`, or `storm`.
+    pub category: String,
+    /// Owning user SID for per-user hives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_sid: Option<String>,
+    /// Previous data (absent for a created value). Truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_value: Option<String>,
+    /// New data (absent for a deleted value). Truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_value: Option<String>,
+    /// Set only on a `storm` summary: changes dropped by the rate limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed: Option<u32>,
 }
 
 /// Legacy pre-consolidation filesystem notification payload.
