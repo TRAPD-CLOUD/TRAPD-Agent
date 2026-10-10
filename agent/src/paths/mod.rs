@@ -183,6 +183,7 @@ pub(crate) fn bounded_regular_sha256(path: &Path, max_bytes: u64) -> std::io::Re
 /// [`bounded_regular_sha256`] in the telemetry label form `sha256:<64 hex>`.
 /// The inner function already returns hex, so callers must not hex-encode it
 /// again (that produced 128-char `exe_sha256` values on Windows).
+#[cfg_attr(not(windows), allow(dead_code))] // used by the Windows ETW/honeytoken collectors
 pub(crate) fn bounded_regular_sha256_label(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     bounded_regular_sha256(path, max_bytes).map(|hex| format!("sha256:{hex}"))
 }
