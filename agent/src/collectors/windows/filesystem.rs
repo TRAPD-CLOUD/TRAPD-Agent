@@ -27,12 +27,19 @@ const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 pub fn windows_paths(configured: &[String], defaults: &[String]) -> Vec<PathBuf> {
     if configured == defaults {
-        vec![
-            PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
-                .join("System32\\drivers\\etc"),
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let data = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".into());
+        let mut paths = vec![
+            PathBuf::from(&root).join("System32\\drivers\\etc"),
             PathBuf::from(std::env::var_os("PUBLIC").unwrap_or_else(|| "C:\\Users\\Public".into()))
                 .join("Documents"),
-        ]
+        ];
+        paths.extend(
+            fs_plan::default_persistence_dirs(&root, &data)
+                .into_iter()
+                .map(PathBuf::from),
+        );
+        paths
     } else {
         configured
             .iter()

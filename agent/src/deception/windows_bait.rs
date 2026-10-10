@@ -582,11 +582,15 @@ fn entries(
         if generated {
             secrets.push(password.clone());
         }
+        // Bind first: with an expected `&str` type, older rustc infers
+        // `T = str` for `pick` and rejects the call.
+        let base_user = *rng.pick(users);
+        let note = *rng.pick(NOTES);
         out.push(Entry {
             host: persona.server(role, rng),
-            user: persona.account(rng.pick(users), rng),
+            user: persona.account(base_user, rng),
             password,
-            note: rng.pick(NOTES),
+            note,
         });
     }
     out

@@ -758,6 +758,16 @@ pub const RULES: &[RuleMeta] = &[
         HOUR,
     ),
     rule(
+        "defense_evasion.amsi_bypass",
+        EVASION,
+        "T1562.001",
+        High,
+        Critical,
+        Shadow,
+        Subject,
+        HOUR,
+    ),
+    rule(
         "defense_evasion.defender_tamper",
         EVASION,
         "T1562.001",
@@ -1104,6 +1114,26 @@ pub const RULES: &[RuleMeta] = &[
         HOUR,
     ),
     rule(
+        "persistence.wmi_subscription",
+        PERSIST,
+        "T1546.003",
+        Low,
+        Medium,
+        Signal,
+        Subject,
+        HOUR,
+    ),
+    rule(
+        "persistence.wmi_command_consumer",
+        PERSIST,
+        "T1546.003",
+        High,
+        Critical,
+        Alert,
+        Subject,
+        HOUR,
+    ),
+    rule(
         "persistence.scheduled_task_created",
         PERSIST,
         "T1053.005",
@@ -1204,6 +1234,18 @@ pub const RULES: &[RuleMeta] = &[
         Subject,
         HOUR,
     ),
+    // Raised once at start when the previous run never recorded an orderly
+    // shutdown (kill, crash, power loss). A hint, not proof of tampering.
+    rule(
+        "selfprotect.unclean_shutdown",
+        EVASION,
+        "T1562",
+        Low,
+        Medium,
+        Signal,
+        Subject,
+        HOUR,
+    ),
     rule(
         "selfprotect.audit_policy_changed",
         EVASION,
@@ -1256,6 +1298,97 @@ pub fn to_json() -> serde_json::Value {
         "rules": RULES,
         "prefixes": PREFIXES,
     })
+}
+
+/// ATT&CK coverage of the rule catalog as Markdown: per tactic, which
+/// techniques have rules and in which mode. "Covered" here means a rule exists,
+/// not that it was measured against real attack traffic.
+#[cfg(test)]
+fn attack_coverage_markdown() -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    const TACTICS: &[&str] = &[
+        "TA0001 Initial Access",
+        "TA0002 Execution",
+        "TA0003 Persistence",
+        "TA0004 Privilege Escalation",
+        "TA0005 Defense Evasion",
+        "TA0006 Credential Access",
+        "TA0007 Discovery",
+        "TA0008 Lateral Movement",
+        "TA0009 Collection",
+        "TA0010 Exfiltration",
+        "TA0011 Command and Control",
+        "TA0040 Impact",
+    ];
+    let mut by_tactic: BTreeMap<&str, BTreeMap<&str, Vec<&RuleMeta>>> = BTreeMap::new();
+    for m in RULES.iter().chain(PREFIXES) {
+        let technique = if m.technique.is_empty() {
+            "(unmapped)"
+        } else {
+            m.technique
+        };
+        by_tactic
+            .entry(m.tactic)
+            .or_default()
+            .entry(technique)
+            .or_default()
+            .push(m);
+    }
+    let mode = |m: &RuleMeta| format!("{:?}", m.mode).to_lowercase();
+    let mut out = String::from(
+        "# ATT&CK coverage of the detection rule catalog\n\n\
+Generated from `crates/trapd-detection/src/catalog.rs` by\n\
+`TRAPD_UPDATE_CATALOG=1 cargo test -p trapd-detection catalog`. A technique is\n\
+listed when a rule exists for it. That says nothing about detection quality:\n\
+the per-technique true-positive and false-positive rates still have to be\n\
+measured (adversary emulation and a week of idle use per host profile).\n\n",
+    );
+    let total: usize = by_tactic
+        .values()
+        .flat_map(|t| t.values())
+        .map(Vec::len)
+        .sum();
+    let techniques: BTreeSet<&str> = by_tactic.values().flat_map(|t| t.keys().copied()).collect();
+    out += &format!("{total} rules, {} techniques.\n\n", techniques.len());
+    out += "| Tactic | Techniques | Rules | alert | signal | shadow |\n|---|---|---|---|---|---|\n";
+    for tactic in TACTICS {
+        let t = by_tactic.get(tactic);
+        let rules: Vec<&&RuleMeta> = t
+            .map(|t| t.values().flatten().collect())
+            .unwrap_or_default();
+        let count = |name: &str| rules.iter().filter(|m| mode(m) == name).count();
+        out += &format!(
+            "| {tactic} | {} | {} | {} | {} | {} |\n",
+            t.map_or(0, BTreeMap::len),
+            rules.len(),
+            count("alert"),
+            count("signal"),
+            count("shadow")
+        );
+    }
+    for (tactic, techs) in &by_tactic {
+        out += &format!("\n## {tactic}\n\n| Technique | Rules (mode) |\n|---|---|\n");
+        for (tech, rules) in techs {
+            let list: Vec<String> = rules
+                .iter()
+                .map(|m| format!("`{}` ({})", m.id, mode(m)))
+                .collect();
+            out += &format!("| {tech} | {} |\n", list.join(", "));
+        }
+    }
+    let missing: Vec<&&str> = TACTICS
+        .iter()
+        .filter(|t| !by_tactic.contains_key(**t))
+        .collect();
+    out += "\n## Tactics without any rule\n\n";
+    if missing.is_empty() {
+        out += "None.\n";
+    } else {
+        for t in missing {
+            out += &format!("- {t}\n");
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1370,6 +1503,24 @@ mod tests {
             committed.replace("\r\n", "\n"),
             current,
             "rule-catalog.json is stale; run TRAPD_UPDATE_CATALOG=1 cargo test catalog"
+        );
+    }
+
+    /// The coverage document must match the table.
+    /// Regenerate with `TRAPD_UPDATE_CATALOG=1 cargo test catalog`.
+    #[test]
+    fn attack_coverage_doc_matches_table() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/attack-coverage.md");
+        let current = attack_coverage_markdown();
+        if std::env::var("TRAPD_UPDATE_CATALOG").is_ok() {
+            std::fs::write(&path, &current).unwrap();
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            committed.replace("\r\n", "\n"),
+            current,
+            "docs/attack-coverage.md is stale; run TRAPD_UPDATE_CATALOG=1 cargo test catalog"
         );
     }
 }

@@ -538,6 +538,51 @@ pub fn inspect_eventlog(log: &LogEventData) -> Vec<DetectionData> {
                 ev,
             )]
         }
+        // Permanent WMI event subscription registered (filter + consumer
+        // binding): a classic fileless persistence mechanism. Only the
+        // consumer types that run code are rated as an alert.
+        5861 => {
+            const CAP: usize = 1024;
+            let cap = |s: &str| s.chars().take(CAP).collect::<String>();
+            let consumer = cap(field(fields, "CONSUMER"));
+            let cause = cap(field(fields, "PossibleCause"));
+            if consumer.is_empty() && cause.is_empty() {
+                return Vec::new();
+            }
+            let lower = format!("{consumer} {cause}").to_ascii_lowercase();
+            let runs_code = lower.contains("commandlineeventconsumer")
+                || lower.contains("activescripteventconsumer");
+            let (rule, confidence) = if runs_code {
+                ("persistence.wmi_command_consumer", 85)
+            } else {
+                ("persistence.wmi_subscription", 55)
+            };
+            vec![DetectionData {
+                rule_id: rule.into(),
+                title: "WMI permanent event subscription registered".into(),
+                category: "persistence".into(),
+                mitre_tactic: Some("TA0003 Persistence".into()),
+                mitre_technique: Some("T1546.003".into()),
+                confidence,
+                subject: format!(
+                    "wmi:{}",
+                    if consumer.is_empty() {
+                        &cause
+                    } else {
+                        &consumer
+                    }
+                ),
+                detail: format!("A permanent WMI subscription was registered: {consumer}"),
+                evidence: serde_json::json!({
+                    "event_id": id,
+                    "namespace": cap(field(fields, "Namespace")),
+                    "consumer": consumer,
+                    "possible_cause": cause,
+                    "source": "eventlog",
+                }),
+                ..Default::default()
+            }]
+        }
         _ => Vec::new(),
     }
 }
@@ -844,6 +889,11 @@ mod tests {
     fn native_log(v: serde_json::Value) -> LogEventData {
         let (channel, provider) = if v["EventID"] == 7045 {
             ("System", "Service Control Manager")
+        } else if v["EventID"] == 5861 {
+            (
+                "Microsoft-Windows-WMI-Activity/Operational",
+                "Microsoft-Windows-WMI-Activity",
+            )
         } else {
             ("Security", "Microsoft-Windows-Security-Auditing")
         };
@@ -854,6 +904,43 @@ mod tests {
             "log_timestamp": "2020-09-13T12:26:40Z"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn event_5861_wmi_command_consumer_is_the_alert_rule() {
+        let d = inspect_eventlog(&native_log(serde_json::json!({
+            "EventID": 5861, "Namespace": "//./root/subscription",
+            "CONSUMER": "CommandLineEventConsumer.Name=\"upd\"",
+            "PossibleCause": "Binding EventFilter: instance of __EventFilter { Name = \"upd\"; }"
+        })));
+        assert_eq!(ids(&d), ["persistence.wmi_command_consumer"]);
+        assert!(d[0].subject.starts_with("wmi:CommandLineEventConsumer"));
+    }
+
+    #[test]
+    fn event_5861_other_consumer_is_only_a_signal_and_empty_is_ignored() {
+        let d = inspect_eventlog(&native_log(serde_json::json!({
+            "EventID": 5861, "CONSUMER": "NTEventLogEventConsumer.Name=\"x\""
+        })));
+        assert_eq!(ids(&d), ["persistence.wmi_subscription"]);
+        assert!(inspect_eventlog(&native_log(serde_json::json!({ "EventID": 5861 }))).is_empty());
+    }
+
+    #[test]
+    fn event_5861_on_the_wrong_channel_is_not_trusted() {
+        let mut log = native_log(serde_json::json!({
+            "EventID": 5861, "CONSUMER": "CommandLineEventConsumer.Name=\"x\""
+        }));
+        log.source_path = "Application".into();
+        assert!(inspect_eventlog(&log).is_empty());
+    }
+
+    #[test]
+    fn event_5861_strings_are_bounded() {
+        let d = inspect_eventlog(&native_log(serde_json::json!({
+            "EventID": 5861, "CONSUMER": "CommandLineEventConsumer".to_string() + &"x".repeat(100_000)
+        })));
+        assert!(d[0].evidence["consumer"].as_str().unwrap().chars().count() <= 1024);
     }
 
     #[test]

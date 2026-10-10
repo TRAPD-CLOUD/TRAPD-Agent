@@ -294,6 +294,20 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
 
+    // A start after a kill/crash/power loss is worth one low-severity signal.
+    if let Some(finding) = heartbeat::lifecycle::unclean_shutdown_finding(
+        heartbeat::lifecycle::begin_process().previous_shutdown(),
+    ) {
+        let _ = tx.try_send(schema::AgentEvent::new(
+            agent_id.clone(),
+            hostname.clone(),
+            schema::EventClass::Detection,
+            schema::EventAction::Detected,
+            schema::Severity::Low,
+            schema::EventData::Detection(Box::new(finding)),
+        ));
+    }
+
     // ── Prevention subsystem (active response) ────────────────────────────────
     // Requires the backend (signed command channel), so it is skipped offline.
     // Keep the runtime available online even when initially disabled: each

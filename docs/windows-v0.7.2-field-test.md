@@ -101,13 +101,51 @@ The integration fixes are tracked in [agent PR 135](https://github.com/TRAPD-CLO
 ### Backend work required (not done in this repo)
 - Registry normalization and the missing Windows runtime catalog policies are prepared in the companion platform branch `fix/agent-registry-normalization`; they require platform release and migration deployment.
 - ClickHouse payload schema: registry fields, new heartbeat fields (`pipeline.*`), logon fields, filesystem `actor`/`change_summary`, DNS `pid`/`process`.
-- Missing-heartbeat and unclean-shutdown alerting.
+- Missing-heartbeat alerting exists only as the console notification "device is not reporting" (`frontend/lib/notifications/derive.ts`), not as a signal. `previous_shutdown=unclean` and `dropped_total` are not evaluated yet.
+
+Done in the TRAPD repo: the normalizer accepts `class=registry` (with a backend-side length cap) and migration `20261010160000_windows_registry_logon_rules.sql` adds the 26 missing catalog rules.
 
 ### Not covered by any fix yet
 - Tamper detection for deleted `config` files or edited `agent.env`. Journal checkpoint now performs a checked final fsync; durability failure is visible in diagnostics, health and heartbeat.
-- Scheduled-task subfolders, WMI subscriptions and startup folder.
+- Per-user Startup folders. The all-users Startup folder and `System32\Tasks` (with subfolders) are now in the default watch set (`fs_plan::default_persistence_dirs`); not yet confirmed on a real host.
 - LSASS access without an existing configured Sysmon process-access source; script block logging 4104. Sysmon 10 memory-capable LSASS access is a low-severity signal, not a confirmed dump.
-- Repeatable field-test script and ATT&CK coverage measurement (P2).
+- ATT&CK coverage measurement and a week-long false-positive measurement (P2). The repeatable script is `deploy/windows/field-test.ps1` (not yet run on Windows).
+
+## Field repeat with the fixed build (2026-10-10, CLT-MBL)
+
+Build of `feat/windows-gap-closure` (MSVC, rustc 1.92) installed as the service,
+baseline reset by deleting `binary.sha256` (documented operator path): started
+cleanly, wrote the new baseline, no integrity violation. Test run with
+`deploy/windows/field-test.ps1 -HostsTest`, evidence from the agent's local
+`events.ndjson` (backend ingest was not used for this run).
+
+| Finding | Result on real Windows |
+|---------|------------------------|
+| F1 | manual copy + baseline deletion starts cleanly. Signed `binary.sig` path and tampered-binary refusal not exercised. |
+| F2 | fixed: `sha256:` + 64 hex (71 chars). |
+| F3 | fixed when the command-line audit policy is on: with `auditpol` Process Creation (Success) and `ProcessCreationIncludeCmdLine_Enabled=1`, the short-lived `cmd /c echo <marker>` carries its full command line and user (4688 fallback). Without the policy the command line stays empty. The long-lived PowerShell then also gets a second `process.create` from 4688 (`origin.source=windows_eventlog:Security:4688` next to `windows_etw`, same PID). That is the intended audit-evidence record; consumers that count processes must key on (pid, source) or ignore the 4688 source. Policy and registry were restored afterwards. |
+| F4/F5 | fixed for process/PID and rcode (`NXDOMAIN`); client/server address still empty, `transaction_id` 0. |
+| F6 | hosts change reported as `filesystem.modify` with diff and `integrity=violation`; no separate detection event. |
+| F7 | fixed: failure reason, logon type and status are structured. |
+| F8 | fixed: `registry` create and delete for the Run value plus `persistence.registry_run_key_added` (low/signal). |
+| F11 | fixed: 30 per-file indicators at `medium`, plus `rename_burst` at `high` (10 files) and `critical` (30 files). An earlier reading of "not fixed" came from filtering by the marker string, which the path-less burst event does not contain. Backend alert severity for the burst not checked. |
+
+### Incident during this run (fixed)
+
+The first `-HostsTest` run left `drivers\etc\hosts` empty: the script
+rewrote the file from parsed text with `Set-Content`, which failed with an
+IOException after truncating. The file was restored byte for byte from a
+volume shadow copy (11:02, same day) and the script now saves the original
+bytes, writes them back and verifies the SHA-256. A repeat run left the hash
+unchanged. Docker Desktop re-creates its own section on start.
+
+### Environment findings
+
+- Defender flags `windows_rules.rs` (`HackTool:Win32/Mimikatz.NPTT`) and the
+  built `trapd-agent.exe` (`Trojan:Win32/Ceprolad.A`, generic heuristic). Any
+  customer rollout needs code signing and a Microsoft submission first.
+- The host's rustc is 1.92; code that needs newer inference does not build
+  there (fixed in `deception/windows_bait.rs`). Pin the toolchain in the repo.
 
 ## Honest scope statement
 
@@ -126,3 +164,35 @@ from `C:\ProgramData\TRAPD\logs`. Findings F4/F5 (cause) and F2 (effect on
 folding) are hypotheses and have not been confirmed in the agent code.
 
 Runtime coverage prerequisites and failure behavior are documented in [Persisted Windows event coverage](windows-native-event-coverage.md). Historical test results above remain unchanged; code fixes do not substitute for repeating the host test.
+
+## WMI permanent subscriptions (verified on CLT-MBL, 2026-10-10)
+
+Event 5861 of `Microsoft-Windows-WMI-Activity/Operational` is now collected
+(that channel only, that event only; the rest is provider chatter). It lives in
+`UserData`, so the event-log parser flattens the operation element's children
+under the existing field limits. A subscription whose consumer runs code
+(`CommandLineEventConsumer`, `ActiveScriptEventConsumer`) raises
+`persistence.wmi_command_consumer` (alert, high), other consumers
+`persistence.wmi_subscription` (signal). A harmless test subscription (filter on
+a class that never fires) raised the alert as `high` and was removed afterwards.
+Windows unit test `userdata_events_expose_their_fields` passes on the host.
+
+## PowerShell script blocks, evaluated on the host (verified on CLT-MBL)
+
+Event 4104 of `Microsoft-Windows-PowerShell/Operational` is read, matched
+locally and **dropped**: no raw record leaves the host. Only findings are
+emitted, and their evidence is the SHA-256 and length of the block plus the
+rule id (subject `scriptblock:<hash prefix>`), never the text. Rules are
+narrow on purpose: download cradle with a whole-word `iex`/`invoke-expression`
+(`execution.powershell_download_exec`), AMSI bypass (`defense_evasion.amsi_bypass`,
+shadow), Mimikatz syntax, Defender disable/exclusion. Windows only records
+4104 when script-block logging is enabled by policy or when its own heuristic
+finds suspicious commands; enabling the policy is a host decision and was not
+changed. On CLT-MBL a real script block (the test harness adding a Defender
+exclusion) produced `defense_evasion.defender_tamper` (high) with a 64-hex
+hash and no text; `raw 4104 forwarded = 0`. The string-literal test case did
+not trigger Windows' own logging, so the download-cradle rule is covered by
+unit tests only. Limits: blocks over 16 KiB are truncated by the parser, multi-part
+blocks are judged per part, and the backend `command` dedup strategy has no
+command to key on for these findings (rule `defense_evasion.amsi_bypass` uses
+`subject`).
