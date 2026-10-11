@@ -19,8 +19,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceDependency, ServiceErrorControl,
-    ServiceExitCode,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
