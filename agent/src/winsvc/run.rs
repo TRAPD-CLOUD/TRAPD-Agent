@@ -109,6 +109,22 @@ fn load_env_file() {
     info!(path = %path.display(), "loaded agent.env");
 }
 
+/// Remove the MSI-staged enrollment token from HKLM once it is no longer
+/// needed (credentials exist). A token left there is a standing secret and the
+/// registry value would also be re-read on every start.
+fn purge_staged_enroll_token() {
+    use crate::collectors::windows::registry;
+    use windows_sys::Win32::System::Registry::KEY_WOW64_64KEY;
+    if let Err(status) =
+        registry::delete_value("SOFTWARE\\TRAPD\\Agent", "EnrollToken", KEY_WOW64_64KEY)
+    {
+        warn!(
+            status,
+            "could not delete the staged enrollment token from the registry"
+        );
+    }
+}
+
 fn load_msi_config() {
     use crate::collectors::windows::registry;
     use windows_sys::Win32::System::Registry::RRF_SUBKEY_WOW6464KEY;
@@ -214,7 +230,9 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             loop {
                 tokio::select! {
                     creds = &mut enrollment => {
-                        break creds.context("Failed to obtain agent credentials")?;
+                        let creds = creds.context("Failed to obtain agent credentials")?;
+                        purge_staged_enroll_token();
+                        break creds;
                     }
                     _ = expiry_tick.tick() => { startup_expired.extend(reconcile_pending_firewall_expiry().await); },
                     _ = stop.recv() => {

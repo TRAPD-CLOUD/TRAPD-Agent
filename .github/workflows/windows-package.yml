@@ -1,9 +1,16 @@
 name: Windows MSI
 on:
   workflow_call:
+    inputs:
+      # Release builds must be Authenticode-signed: the job fails closed when the
+      # SignPath configuration is incomplete. CI/PR builds leave this false and
+      # may ship an unsigned MSI.
+      require_signing:
+        type: boolean
+        default: false
     secrets:
-      # Optional. Only needed for Authenticode signing through SignPath; without
-      # it the MSI is built unsigned. The caller must pass it (`secrets: inherit`).
+      # Required when `require_signing` is true; otherwise optional (unsigned MSI).
+      # The caller must pass it (`secrets: inherit`).
       SIGNPATH_API_TOKEN:
         required: false
 
@@ -99,10 +106,12 @@ jobs:
               catch { if ($i -eq 5) { throw }; Start-Sleep -Seconds 3 }
           }
 
-      # Authenticode signing through SignPath (optional, skipped until configured).
+      # Authenticode signing through SignPath (mandatory for release builds,
+      # optional for CI builds).
       - name: Check SignPath configuration
         id: signpath
         env:
+          REQUIRE_SIGNING: ${{ inputs.require_signing }}
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
           SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
           SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
@@ -110,6 +119,9 @@ jobs:
         run: |
           $required = 'SIGNPATH_API_TOKEN', 'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG', 'SIGNPATH_SIGNING_POLICY_SLUG'
           $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          if ($missing.Count -gt 0 -and $env:REQUIRE_SIGNING -eq 'true') {
+            throw "Release build requires Authenticode signing; SignPath is not configured (missing: $($missing -join ', '))."
+          }
           if ($missing.Count -gt 0) {
             Write-Host "::notice::SignPath signing skipped (not configured: $($missing -join ', ')) - the MSI is unsigned."
             'enabled=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8

@@ -14,7 +14,10 @@ permissions:
 jobs:
   windows-msi:
     uses: ./.github/workflows/windows-package.yml
-    # Passes SIGNPATH_API_TOKEN (optional) to the called workflow.
+    with:
+      # Release MSIs must be signed; the build fails if SignPath is not configured.
+      require_signing: true
+    # Passes SIGNPATH_API_TOKEN to the called workflow.
     secrets: inherit
 
   release:

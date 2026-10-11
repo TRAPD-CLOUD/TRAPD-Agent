@@ -108,16 +108,25 @@
         </Directory>
       </Directory>
     </StandardDirectory>
+    <!-- Every component writing into HKLM\SOFTWARE\TRAPD\Agent carries the same
+         SYSTEM/Administrators-only descriptor: MSI applies the descriptor of the
+         value that creates the key, so relying on "Installed" alone left the
+         BackendUrl/EnrollToken values exposed depending on write order. The agent
+         deletes EnrollToken after a successful enrollment. -->
     <Component Id="RegistryConfig" Directory="INSTALLFOLDER" Guid="9625220B-260F-4E51-BFBE-476EF6BE1543" Permanent="yes" Bitness="always64">
       <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="Installed" Type="integer" Value="1" KeyPath="yes">
         <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
       </RegistryValue>
     </Component>
     <Component Id="BackendConfig" Directory="INSTALLFOLDER" Guid="0C71EE73-B218-46C4-AE14-839BED9F71FC" Permanent="yes" Bitness="always64" Condition="BACKENDURL">
-      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="string" Value="[BACKENDURL]" KeyPath="yes" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="string" Value="[BACKENDURL]" KeyPath="yes">
+        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
+      </RegistryValue>
     </Component>
     <Component Id="EnrollmentConfig" Directory="INSTALLFOLDER" Guid="91605497-3A06-4D6A-90AA-C6857E11B074" Permanent="yes" Bitness="always64" Condition="ENROLLTOKEN">
-      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="string" Value="[ENROLLTOKEN]" KeyPath="yes" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="string" Value="[ENROLLTOKEN]" KeyPath="yes">
+        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
+      </RegistryValue>
     </Component>
 
     <!-- MSI owns service registration. Remove persistent containment and

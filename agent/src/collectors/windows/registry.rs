@@ -1,7 +1,8 @@
 //! Bounded registry reads shared by MSI configuration and Windows inventory.
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS,
-    KEY_READ, RRF_NOEXPAND, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY,
+    HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, KEY_SET_VALUE, RRF_NOEXPAND, RRF_RT_REG_DWORD,
+    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 
 /// Which hive a read targets.
@@ -141,4 +142,35 @@ pub fn subkeys_in(hive: Hive, path: &str, view: u32) -> Vec<String> {
         RegCloseKey(key);
     }
     names
+}
+
+/// Delete one value of a `HKEY_LOCAL_MACHINE` key. `view` is a `KEY_WOW64_*`
+/// flag. A value that is already absent counts as success.
+pub fn delete_value(path: &str, name: &str, view: u32) -> Result<(), u32> {
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let mut key = std::ptr::null_mut();
+    // SAFETY: terminated strings, valid out-pointer, handle closed below.
+    unsafe {
+        let status = RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            0,
+            KEY_SET_VALUE | view,
+            &mut key,
+        );
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(());
+        }
+        if status != 0 {
+            return Err(status);
+        }
+        let status = RegDeleteValueW(key, name.as_ptr());
+        RegCloseKey(key);
+        match status {
+            0 | ERROR_FILE_NOT_FOUND => Ok(()),
+            other => Err(other),
+        }
+    }
 }
