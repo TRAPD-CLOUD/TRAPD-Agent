@@ -123,12 +123,52 @@ fn load_env_file() {
     info!(path = %path.display(), "loaded agent.env");
 }
 
+/// Drop `TRAPD_ENROLL_TOKEN=` lines from `agent.env` content. Returns the
+/// scrubbed text, or `None` when there was nothing to remove.
+fn scrub_enroll_token(contents: &str) -> Option<String> {
+    let is_token = |line: &str| {
+        line.trim()
+            .split_once('=')
+            .is_some_and(|(k, _)| k.trim() == "TRAPD_ENROLL_TOKEN")
+    };
+    if !contents.lines().any(is_token) {
+        return None;
+    }
+    let mut out: String = contents
+        .lines()
+        .filter(|l| !is_token(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push('\n');
+    Some(out)
+}
+
+/// A one-time token left in `agent.env` is a standing secret once credentials
+/// exist. Rewrite the file without it (temp file + rename in the same, private
+/// directory).
+fn purge_env_file_enroll_token() {
+    let path = paths::config_dir().join("agent.env");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Some(scrubbed) = scrub_enroll_token(&contents) else {
+        return;
+    };
+    let tmp = path.with_extension("env.tmp");
+    let result = std::fs::write(&tmp, scrubbed).and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&tmp);
+        warn!(%error, "could not remove the enrollment token from agent.env");
+    }
+}
+
 /// Remove the MSI-staged enrollment token from HKLM once it is no longer
 /// needed (credentials exist). A token left there is a standing secret and the
 /// registry value would also be re-read on every start.
 fn purge_staged_enroll_token() {
     use crate::collectors::windows::registry;
     use windows_sys::Win32::System::Registry::KEY_WOW64_64KEY;
+    purge_env_file_enroll_token();
     if let Err(status) =
         registry::delete_value("SOFTWARE\\TRAPD\\Agent", "EnrollToken", KEY_WOW64_64KEY)
     {
@@ -617,4 +657,22 @@ pub async fn run_agent(
     }
     info!("Shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scrub_enroll_token;
+
+    #[test]
+    fn enroll_token_line_is_removed_and_the_rest_kept() {
+        let input = "# c\nRUST_LOG=info\n TRAPD_ENROLL_TOKEN = abc\nTRAPD_BACKEND_URL=https://x\n";
+        let out = scrub_enroll_token(input).unwrap();
+        assert_eq!(out, "# c\nRUST_LOG=info\nTRAPD_BACKEND_URL=https://x\n");
+        assert!(!out.contains("abc"));
+    }
+
+    #[test]
+    fn nothing_to_scrub_returns_none() {
+        assert!(scrub_enroll_token("RUST_LOG=info\n# TRAPD_ENROLL_TOKEN=x\n").is_none());
+    }
 }

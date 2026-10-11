@@ -274,7 +274,8 @@ subject so users can pass it to `install.ps1`.
 Not covered yet: the `trapd-agent.exe` inside the MSI and the standalone
 `trapd-agent-windows-x86_64.exe` asset are unsigned (signing the executable
 changes its hash, which the signed release statement covers, so it has to happen
-before that statement is created), and there is no signed self-update on Windows;
+before that statement is created). Signed self-update is available once the
+release and command keys are provisioned (see `stage-trust.ps1`); otherwise
 updates ship as a new MSI.
 
 Packaging references: [WiX services](https://docs.firegiant.com/wix/schema/wxs/serviceinstall/),
