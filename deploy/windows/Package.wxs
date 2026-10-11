@@ -32,6 +32,11 @@
                           Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" Vital="yes">
             <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
                                 ThirdFailureActionType="restart" ResetPeriodInDays="1" RestartServiceDelayInSeconds="10" />
+            <!-- Hardened service DACL: SYSTEM full control; Administrators can query,
+                 start, stop and delete (MSI maintenance, Stop-Service) but cannot
+                 rewrite the DACL or take ownership; interactive and service
+                 accounts may only query. -->
+            <PermissionEx Sddl="D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)" />
           </ServiceInstall>
           <ServiceControl Id="ManageService" Name="trapd-agent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
           <!-- MSI authorizes replacement, not the executable's claimed

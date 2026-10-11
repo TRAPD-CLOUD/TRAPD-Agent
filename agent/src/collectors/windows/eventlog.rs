@@ -439,7 +439,9 @@ impl Collector for EventLogCollector {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
         // A channel hit the per-tick cap: read again without waiting.
         let mut backlog = false;
+        crate::telemetry::liveness::expect(self.name(), std::time::Duration::from_secs(120));
         loop {
+            crate::telemetry::liveness::beat("WindowsEventLogCollector");
             if !backlog {
                 ticker.tick().await;
             }
@@ -450,6 +452,8 @@ impl Collector for EventLogCollector {
             for channel in ["Security", "System", "Application"] {
                 let mut drained = 0usize;
                 loop {
+                    // A long drain must not look like a stall.
+                    crate::telemetry::liveness::beat("WindowsEventLogCollector");
                     let cursor = cursors.get(channel).copied();
                     let batch = match tokio::task::spawn_blocking(move || {
                         read_batch(channel, cursor, READ_LIMIT)

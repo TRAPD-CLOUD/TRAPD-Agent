@@ -43,6 +43,7 @@ pub mod health;
 pub mod histogram;
 pub mod identity;
 pub mod limits;
+pub mod liveness;
 pub mod metrics;
 pub mod snapshot;
 

@@ -116,11 +116,15 @@ impl Collector for EtwCollector {
             .set_collector_mode(crate::telemetry::metrics::CollectorMode::WindowsEtw);
 
         let mut state = DecodeState::new();
+        // The loop below wakes at least once a second, so a long silence means
+        // it is blocked (full pipeline or a hung decode).
+        crate::telemetry::liveness::expect(self.name(), std::time::Duration::from_secs(120));
         // Records are decoded in batches: one blocking task per batch instead of
         // one per record, with the decode state moved in and out once. Order is
         // preserved (a batch is decoded sequentially, batches are sequential).
         let mut batch: Vec<EtwRecord> = Vec::with_capacity(DECODE_BATCH);
         loop {
+            crate::telemetry::liveness::beat("WindowsEtwCollector");
             batch.clear();
             tokio::select! {
                 n = rec_rx.recv_many(&mut batch, DECODE_BATCH) => if n == 0 { break },
@@ -146,6 +150,7 @@ impl Collector for EtwCollector {
                 }
             }
         }
+        crate::telemetry::liveness::forget("WindowsEtwCollector");
         // The session stopped: either we are shutting down, or something (a
         // tampering actor stopping the logger, a provider reset) killed it.
         coverage::update(|c| c.etw_session = Some(false));

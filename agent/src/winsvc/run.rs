@@ -17,7 +17,6 @@ use crate::collectors::system::SystemCollector;
 use crate::collectors::windows::honeytokens::HoneytokenCollector;
 
 use crate::collectors::windows::users::UserSessionCollector;
-use crate::collectors::Collector;
 use crate::config::{self, AgentConfig, ConfigPuller};
 use crate::heartbeat::Heartbeat;
 use crate::output::OutputMode;
@@ -175,6 +174,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     load_env_file();
     load_msi_config();
     paths::init_state_dir();
+    crate::selfprotect::process_mitigation::apply();
 
     // Self-integrity, like the Linux agent: refuse to run a binary that no
     // longer matches its recorded digest (or whose signature fails). An MSI
@@ -344,32 +344,49 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         }));
     }
 
-    macro_rules! spawn_collector {
-        ($collector:expr) => {{
-            let mut c = $collector;
+    // Every collector runs under the generic supervisor: an error exit is
+    // counted, shown in coverage and followed by a capped exponential-backoff
+    // restart. `spawn_collector_once!` only observes (SensorSupervisor owns its
+    // restart logic).
+    macro_rules! spawn_supervised {
+        ($collector:expr, $restart:expr) => {{
+            let c = $collector;
             let tx2 = tx.clone();
             let aid = agent_id.clone();
             let host = hostname.clone();
-            let cname = c.name();
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = c.run(tx2, aid, host).await {
-                    crate::telemetry::metrics::metrics().collector_failed();
-                    if cname == "WindowsProcessCollector" {
-                        crate::telemetry::metrics::metrics()
-                            .set_collector_mode(crate::telemetry::metrics::CollectorMode::Failed);
-                    }
-                    error!("{cname} exited with error: {e:#}");
-                }
-            }));
+            handles.push(tokio::spawn(crate::collectors::supervisor::supervise(
+                c,
+                tx2,
+                aid,
+                host,
+                crate::collectors::supervisor::RestartPolicy::default(),
+                $restart,
+            )));
         }};
+    }
+    macro_rules! spawn_collector {
+        ($collector:expr) => {
+            spawn_supervised!($collector, true)
+        };
+    }
+    macro_rules! spawn_collector_once {
+        ($collector:expr) => {
+            spawn_supervised!($collector, false)
+        };
     }
 
     spawn_collector!(SystemCollector::new());
-    spawn_collector!(
+    spawn_collector_once!(
         crate::collectors::windows::sensor_supervisor::SensorSupervisor::new(Arc::clone(
             &agent_config
         ))
     );
+    // Runtime self-protection: periodic binary recheck and a health watchdog
+    // over the liveness beats (consumer, event log, ETW).
+    spawn_collector!(crate::selfprotect::runtime_guard::BinaryIntegrityMonitor);
+    handles.push(tokio::spawn(
+        crate::selfprotect::runtime_guard::run_health_watchdog(),
+    ));
     spawn_collector!(UserSessionCollector::new());
     spawn_collector!(
         crate::collectors::windows::eventlog::EventLogCollector::new(Arc::clone(&agent_config))
@@ -428,12 +445,16 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     let consumer_engine = Arc::clone(&engine);
     let prev_tx = prev_event_tx.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    crate::telemetry::liveness::expect("pipeline_consumer", std::time::Duration::from_secs(180));
     let mut consumer = tokio::spawn(async move {
         let mut shutting_down = false;
         // Aggregate updates for repeated findings are released on this tick.
         let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(30));
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            // Idle wake-ups come from `flush_tick` (30 s), so a missing beat
+            // means the consumer is stuck inside event handling.
+            crate::telemetry::liveness::beat("pipeline_consumer");
             let event = tokio::select! {
                 _ = &mut shutdown_rx, if !shutting_down => {
                     rx.close();

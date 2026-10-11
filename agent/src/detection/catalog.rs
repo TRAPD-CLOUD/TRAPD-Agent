@@ -227,6 +227,7 @@ pub const RULES: &[RuleMeta] = &[
     // ── Sensor / self-protection (Windows) ─────────────────────────────────
     rule("selfprotect.etw_session_stopped", EVASION, "T1562.006", High, High, Alert, Subject, HOUR),
     rule("selfprotect.audit_policy_changed", EVASION, "T1562.002", Medium, High, Alert, Subject, HOUR),
+    rule("selfprotect.binary_modified", EVASION, "T1562.001", High, Critical, Alert, Subject, HOUR),
 ];
 
 /// Rule families whose individual ids are open-ended.
