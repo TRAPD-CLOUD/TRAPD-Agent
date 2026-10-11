@@ -116,24 +116,30 @@ impl Collector for EtwCollector {
             .set_collector_mode(crate::telemetry::metrics::CollectorMode::WindowsEtw);
 
         let mut state = DecodeState::new();
-        // Callback handoff is bounded; native waits and enrichment never block Tokio.
+        // Records are decoded in batches: one blocking task per batch instead of
+        // one per record, with the decode state moved in and out once. Order is
+        // preserved (a batch is decoded sequentially, batches are sequential).
+        let mut batch: Vec<EtwRecord> = Vec::with_capacity(DECODE_BATCH);
         loop {
-            let rec = tokio::select! {
-                record = rec_rx.recv() => match record { Some(r) => r, None => break },
+            batch.clear();
+            tokio::select! {
+                n = rec_rx.recv_many(&mut batch, DECODE_BATCH) => if n == 0 { break },
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                     if trace_thread.is_finished() { break; }
                     continue;
                 }
                 _ = tx.closed() => return Ok(()),
-            };
+            }
             let aid = agent_id.clone();
             let host = hostname.clone();
-            let (next_state, events) = tokio::task::spawn_blocking(move || {
-                let events = state.map(&rec, &aid, &host);
-                (state, events)
+            let records = std::mem::take(&mut batch);
+            let (next_state, recycled, events) = tokio::task::spawn_blocking(move || {
+                let events = map_batch(&mut state, &records, &aid, &host);
+                (state, records, events)
             })
             .await?;
             state = next_state;
+            batch = recycled;
             for event in events {
                 if tx.send(event).await.is_err() {
                     return Ok(());
@@ -168,6 +174,22 @@ impl Collector for EtwCollector {
             .await;
         Err(anyhow!("ETW session ended"))
     }
+}
+
+/// Records decoded per blocking task.
+const DECODE_BATCH: usize = 256;
+
+/// Decode `records` in order with one shared state.
+fn map_batch(
+    state: &mut DecodeState,
+    records: &[EtwRecord],
+    agent_id: &str,
+    hostname: &str,
+) -> Vec<AgentEvent> {
+    records
+        .iter()
+        .flat_map(|rec| state.map(rec, agent_id, hostname))
+        .collect()
 }
 
 /// Owns the controller + consumer handles and the enabled providers.
@@ -769,6 +791,14 @@ pub(super) fn device_map() -> DeviceMap {
 #[cfg(test)]
 mod native_tests {
     use super::*;
+
+    #[test]
+    fn batch_of_unrelated_records_decodes_to_nothing() {
+        let mut state = DecodeState::new();
+        let records = vec![EtwRecord::default(), EtwRecord::default()];
+        assert!(map_batch(&mut state, &records, "agent", "host").is_empty());
+        assert!(map_batch(&mut state, &[], "agent", "host").is_empty());
+    }
 
     #[test]
     fn tdh_filetime_preserves_create_time_generation() {
