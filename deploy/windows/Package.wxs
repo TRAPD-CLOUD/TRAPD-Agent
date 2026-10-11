@@ -37,6 +37,13 @@
                  rewrite the DACL or take ownership; interactive and service
                  accounts may only query. -->
             <PermissionEx Sddl="D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)" />
+
+            <!-- Only EventLog: the Security/System channels the sensors read.
+                 Deliberately NOT BFE: hosts with a third-party firewall
+                 commonly run with BFE stopped or disabled, and a hard
+                 dependency would then keep the whole agent from starting.
+                 Firewall containment reports its own error instead. -->
+            <ServiceDependency Id="EventLog" />
           </ServiceInstall>
           <ServiceControl Id="ManageService" Name="trapd-agent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
           <!-- MSI authorizes replacement, not the executable's claimed
