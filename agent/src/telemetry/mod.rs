@@ -42,9 +42,11 @@ pub mod enrichment;
 pub mod health;
 pub mod histogram;
 pub mod identity;
+pub mod image_hash;
 pub mod limits;
 pub mod liveness;
 pub mod metrics;
+pub mod rotating_log;
 pub mod snapshot;
 
 // Re-exported because they appear in the shared event schema and in collector

@@ -143,6 +143,14 @@
 
     <!-- MSI owns service registration. Remove persistent containment and
          decoys after StopServices, before DeleteServices; upgrades preserve both. -->
+    <!-- Return="check" is deliberate and narrow. `trapd-agent.exe cleanup`
+         removes decoys best-effort (failures are logged, never fatal) and
+         exits non-zero ONLY when TRAPD containment firewall rules could not
+         be removed: leaving them would keep the host isolated with no agent
+         left to lift them, so the uninstall must not proceed silently.
+         Recovery if it fails: restore the Windows Firewall services (BFE,
+         MpsSvc) or delete the TRAPD rule group manually, then repeat the
+         removal; the cause is in C:\ProgramData\TRAPD\logs\agent.log. -->
     <CustomAction Id="CleanupDecoys" FileRef="AgentExe" ExeCommand="cleanup" Execute="deferred" Impersonate="no" Return="check" />
     <InstallExecuteSequence>
       <Custom Action="CleanupDecoys" Before="DeleteServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />

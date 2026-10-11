@@ -125,6 +125,45 @@ pub trait Platform {
     }
 }
 
+/// Whether an SDDL string (owner + DACL, as `winacl::get_file_security`
+/// renders it) grants access only to `SYSTEM` and `Administrators`, and is
+/// owned by one of them. An owner outside that set keeps implicit WRITE_DAC and
+/// could re-open the directory later; a null DACL, deny ACEs or any other
+/// trustee fail closed. Pure text parsing so it is unit-tested on every host.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn sddl_is_system_admin_only(sddl: &str) -> bool {
+    let trusted = |t: &str| matches!(t, "SY" | "BA" | "S-1-5-18" | "S-1-5-32-544");
+    let Some(owner_at) = sddl.find("O:") else {
+        return false;
+    };
+    let after_owner = &sddl[owner_at + 2..];
+    let owner_end = ["G:", "D:"]
+        .iter()
+        .filter_map(|m| after_owner.find(m))
+        .min()
+        .unwrap_or(after_owner.len());
+    if !trusted(&after_owner[..owner_end]) {
+        return false;
+    }
+    let Some(dacl_at) = sddl.find("D:") else {
+        return false;
+    };
+    let dacl = &sddl[dacl_at + 2..];
+    let dacl = dacl.split("S:").next().unwrap_or(dacl);
+    let Some(first_ace) = dacl.find('(') else {
+        return false; // null or empty DACL
+    };
+    let mut aces = 0;
+    for ace in dacl[first_ace..].split(')').filter(|a| !a.is_empty()) {
+        let fields: Vec<&str> = ace.trim_start_matches('(').split(';').collect();
+        if fields.len() < 6 || fields[0] != "A" || !trusted(fields[5]) {
+            return false;
+        }
+        aces += 1;
+    }
+    aces > 0
+}
+
 /// Path next to `target` used for the previous version of the file.
 pub fn prev_path(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
@@ -823,6 +862,32 @@ fn wait_for_healthy(paths: &StagingPaths, version: &str, timeout: Duration) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_sddl_accepts_only_system_and_admins() {
+        for ok in [
+            "O:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+            "O:BAG:SYD:AI(A;OICIID;FA;;;BA)(A;OICIID;FA;;;SY)",
+            "O:S-1-5-18D:(A;;FA;;;S-1-5-32-544)",
+        ] {
+            assert!(sddl_is_system_admin_only(ok), "{ok}");
+        }
+        for bad in [
+            "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)", // users
+            "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;WD)",                   // everyone
+            "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",  // a user SID
+            "O:BUD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",                   // non-admin owner
+            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",                       // no owner
+            "O:SYD:P(D;OICI;FA;;;BU)(A;OICI;FA;;;SY)",                   // deny ACE
+            "O:SYD:",                                                    // null DACL
+            "O:SYD:P",                                                   // empty DACL
+            "O:SY",                                                      // no DACL
+            "",
+        ] {
+            assert!(!sddl_is_system_admin_only(bad), "{bad}");
+        }
+    }
     use base64::{engine::general_purpose::STANDARD, Engine};
     use ed25519_dalek::{Signer, SigningKey};
     use std::cell::Cell;

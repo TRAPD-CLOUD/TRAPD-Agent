@@ -334,6 +334,9 @@ pub fn run_apply_helper() -> Result<()> {
         info!("update: nothing staged");
         return Ok(());
     }
+    // The helper runs from, and trusts files in, the staging directory.
+    #[cfg(windows)]
+    windows::verify_private_staging(&paths.dir)?;
     let agent_id = std::fs::read(crate::paths::credentials_file())
         .ok()
         .and_then(|b| serde_json::from_slice::<CredentialsFile>(&b).ok())

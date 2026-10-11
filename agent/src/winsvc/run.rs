@@ -21,6 +21,7 @@ use crate::config::{self, AgentConfig, ConfigPuller};
 use crate::heartbeat::Heartbeat;
 use crate::output::OutputMode;
 use crate::pipeline::{self, create_pipeline, Spool};
+use crate::telemetry::rotating_log::{self, RotatingFile};
 use crate::transport::Transport;
 use crate::{emit_finding, env_truthy, handle_event, load_or_create_device_id, paths};
 
@@ -37,14 +38,16 @@ pub fn init_tracing_stderr() {
 }
 
 /// A service has no console, so logs go to `<log_dir>\agent.log` (the NDJSON
-/// event log is a separate file, written by [`crate::output`]).
+/// event log is a separate file, written by [`crate::output`]). The file is
+/// size-rotated so a long-running service cannot fill the disk.
 pub fn init_tracing_file() {
     let path = paths::log_dir().join("agent.log");
     let _ = std::fs::create_dir_all(paths::log_dir());
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path);
+    let file = RotatingFile::open(
+        &path,
+        rotating_log::DEFAULT_MAX_BYTES,
+        rotating_log::DEFAULT_KEEP,
+    );
     match file {
         Ok(f) => {
             let writer = SharedFile(Arc::new(Mutex::new(f)));
@@ -58,13 +61,14 @@ pub fn init_tracing_file() {
                 .init();
         }
         // Nowhere to log *that* logging failed; fall back to (invisible)
-        // stderr so `tracing` macros stay safe to call.
+        // stderr so `tracing` macros stay safe to call. Fatal service errors
+        // still reach the Application event log.
         Err(_) => init_tracing_stderr(),
     }
 }
 
 #[derive(Clone)]
-struct SharedFile(Arc<Mutex<std::fs::File>>);
+struct SharedFile(Arc<Mutex<RotatingFile>>);
 
 impl std::io::Write for SharedFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -87,6 +91,17 @@ impl std::io::Write for SharedFile {
 /// process environment. On Linux systemd's `EnvironmentFile=` does this before
 /// the agent starts; the SCM has no equivalent, so the agent reads the same
 /// file format itself. Existing process/machine environment wins.
+/// Apply `agent.env` and the MSI registry configuration to the process
+/// environment.
+///
+/// `std::env::set_var` is not thread-safe against concurrent environment
+/// reads. Call this exactly once, on the entry thread, **before** the Tokio
+/// runtime (and any other thread that reads the environment) exists.
+pub fn load_config_env() {
+    load_env_file();
+    load_msi_config();
+}
+
 fn load_env_file() {
     let path = paths::config_dir().join("agent.env");
     let Ok(contents) = std::fs::read_to_string(&path) else {
@@ -170,9 +185,14 @@ async fn reconcile_pending_firewall_expiry() -> Vec<crate::prevention::winfirewa
 
 /// Run the agent until `stop` fires (SCM stop/shutdown or Ctrl-C in console
 /// mode) or the event pipeline closes.
-pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Result<()> {
-    load_env_file();
-    load_msi_config();
+///
+/// `on_ready` runs once start-up is past the self-integrity check (the point
+/// where the service may report `SERVICE_RUNNING`). Environment configuration
+/// must already be loaded via [`load_config_env`].
+pub async fn run_agent(
+    mut stop: tokio::sync::mpsc::UnboundedReceiver<()>,
+    on_ready: impl FnOnce(),
+) -> Result<()> {
     paths::init_state_dir();
     crate::selfprotect::process_mitigation::apply();
 
@@ -184,6 +204,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         error!("{e:#}");
         return Err(e);
     }
+    on_ready();
 
     // Expired rules may be what prevents enrollment reaching the backend.
     // Recover before ANY backend request, including pending pairing.
