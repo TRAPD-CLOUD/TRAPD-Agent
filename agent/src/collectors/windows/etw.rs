@@ -40,12 +40,11 @@ use crate::collectors::etw_map::{self, DeviceMap, EtwRecord, EtwValue, ProcessEn
 use crate::collectors::Collector;
 use crate::schema::{AgentEvent, EventAction, EventClass, EventData, Severity};
 use crate::telemetry::coverage;
+use crate::telemetry::image_hash::{self, HashOutcome};
 
 const SESSION_NAME: &str = "TRAPD-Agent";
 /// Cap on a single property's decoded size (defensive).
 const MAX_PROP_BYTES: usize = 64 * 1024;
-const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_HASH_CACHE: usize = 4096;
 
 /// Shared sink the C callback writes decoded records into, drained by the async
 /// side. A plain channel keeps the `unsafe extern "system"` callback tiny.
@@ -519,7 +518,6 @@ fn guid_to_u128(g: &GUID) -> u128 {
 struct DecodeState {
     sys: System,
     devices: DeviceMap,
-    hash_cache: HashMap<String, (u64, Option<std::time::SystemTime>, String)>,
     /// pid → image path, so a network/DNS event can name its process.
     proc_images: HashMap<i32, (String, u64)>,
 }
@@ -529,7 +527,6 @@ impl DecodeState {
         Self {
             sys: System::new(),
             devices: device_map(),
-            hash_cache: HashMap::new(),
             proc_images: HashMap::new(),
         }
     }
@@ -708,39 +705,19 @@ impl DecodeState {
             (!c.is_empty()).then_some(c)
         };
         let username = crate::telemetry::identity::windows_process_account(pid);
-        let exe_sha256 = exe.as_deref().and_then(|e| self.exe_sha256(e));
+        // Runs inside `spawn_blocking` (see the decode loop), so the streaming
+        // hash never occupies an async worker.
+        let hash = exe
+            .as_deref()
+            .map(|e| image_hash::hash_image(std::path::Path::new(e)))
+            .unwrap_or(HashOutcome::NoPath);
         ProcessEnrichment {
             exe,
             cmdline,
             username,
-            exe_sha256,
+            exe_sha256: hash.digest().map(str::to_owned),
+            exe_sha256_error: hash.failure(),
         }
-    }
-
-    fn exe_sha256(&mut self, path: &str) -> Option<String> {
-        let meta = std::fs::metadata(path).ok()?;
-        if !meta.is_file() || meta.len() > MAX_HASH_BYTES {
-            return None;
-        }
-        let modified = meta.modified().ok();
-        if let Some((len, mtime, hash)) = self.hash_cache.get(path) {
-            if modified.is_some() && *len == meta.len() && *mtime == modified {
-                return Some(hash.clone());
-            }
-        }
-        let digest = format!(
-            "sha256:{}",
-            hex::encode(
-                crate::paths::bounded_regular_sha256(std::path::Path::new(path), MAX_HASH_BYTES)
-                    .ok()?
-            )
-        );
-        if self.hash_cache.len() >= MAX_HASH_CACHE {
-            self.hash_cache.clear();
-        }
-        self.hash_cache
-            .insert(path.to_string(), (meta.len(), modified, digest.clone()));
-        Some(digest)
     }
 }
 

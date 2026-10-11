@@ -127,6 +127,9 @@ pub struct ProcessEnrichment {
     pub cmdline: Option<String>,
     pub username: Option<String>,
     pub exe_sha256: Option<String>,
+    /// Why `exe_sha256` is absent although an image path was known
+    /// (oversize / unreadable); recorded in the event's enrichment errors.
+    pub exe_sha256_error: Option<crate::telemetry::EnrichmentError>,
 }
 
 /// Enrichment is valid only for the generation that produced this source event.
@@ -159,6 +162,9 @@ pub fn process_start(
         // The process may have exited before the lookup (the reason ETW is
         // needed at all); the start itself is still recorded.
         notes.fail("cmdline", crate::telemetry::EnrichmentError::IoError);
+    }
+    if let Some(cause) = enrich.exe_sha256_error {
+        notes.fail("exe_sha256", cause);
     }
     let username = enrich.username.unwrap_or_else(|| "unknown".into());
     Some(ProcessCreateData {
@@ -447,6 +453,23 @@ mod tests {
         let p = process_start(&r, &devices(), ProcessEnrichment::default()).unwrap();
         assert!(p.cmdline.is_empty());
         assert_eq!(p.username, "unknown");
+
+        // An image that could not be hashed is recorded, not silently omitted.
+        let p = process_start(
+            &r,
+            &devices(),
+            ProcessEnrichment {
+                cmdline: Some("x".into()),
+                exe_sha256_error: Some(crate::telemetry::EnrichmentError::Unsupported),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(p.exe_sha256.is_none());
+        assert_eq!(
+            p.enrichment.enrichment_errors["exe_sha256"],
+            crate::telemetry::EnrichmentError::Unsupported
+        );
 
         // Aliases of older builds.
         let old = rec(

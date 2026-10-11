@@ -143,6 +143,62 @@ logs and enrollment registry settings are retained after uninstall for a later
 reinstall. MSI removal stops/removes the service, removes the executable and
 revokes planted decoys. Use MSI removal for an MSI-managed installation.
 
+If MSI removal fails in the `CleanupDecoys` step, the cause is in
+`C:\ProgramData\TRAPD\logs\agent.log`. Decoy removal there is best effort; the
+step fails only when TRAPD containment firewall rules cannot be removed
+(leftover rules would keep the host isolated once the agent is gone). Restore
+the Windows Firewall services (`BFE`, `MpsSvc`) or delete the TRAPD rule group
+manually, then repeat the removal.
+
+### Developer-only `install` / `uninstall` verbs
+
+`trapd-agent.exe install` / `uninstall` register and delete the service
+directly. They bypass the MSI (no recovery actions, no directory ACLs, and
+`uninstall` deletes the binary behind Windows Installer's back), so they are
+for development builds only and **refuse to run on a machine the MSI manages**
+(`HKLM\SOFTWARE\TRAPD\Agent`, `Installed=1`). That marker survives MSI removal
+by design (configuration is retained), so a developer machine that once had the
+MSI must set `TRAPD_ALLOW_DEV_INSTALL=1` to use the verbs. Never use them on a
+production host. The registered service path is quoted by the service API
+whenever it contains spaces, so it is not an unquoted-service-path
+(CWE-428) risk.
+
+### Logs and the Windows Event Log
+
+`C:\ProgramData\TRAPD\logs\agent.log` rotates at 10 MiB and keeps three
+generations (`agent.log.1` to `agent.log.3`). If the file cannot be opened,
+logging falls back to stderr (invisible for a service). Service start, stop and
+fatal start-up errors are also written to the **Application** event log under
+the source `TRAPD Agent` (event ids 1 started, 2 stopped, 3 fatal). The service
+registers that source itself at start-up (the MSI is not involved); the key
+`HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\TRAPD Agent`
+remains after removal, which is harmless. Messages are short summaries on
+purpose, because the Application log is readable by standard users; details stay
+in `agent.log`.
+
+### Service status
+
+The service reports `START_PENDING` (with checkpoints and a wait hint) while it
+initialises and `RUNNING` only after the binary-integrity check has passed, so a
+tampered binary never appears as running. Waiting for pairing/enrollment happens
+in `RUNNING` and still honours stop. On stop it reports `STOP_PENDING`; if
+background tasks (Event Log reads, firewall calls) do not finish within 10 s
+they are abandoned so the stop cannot hang.
+
+### Self-update and the MSI version
+
+A signed self-update (when a release key is provisioned) replaces
+`trapd-agent.exe` without changing what Windows Installer recorded: *Apps &
+features* keeps showing the version of the MSI that was installed, while
+`trapd-agent.exe --version`, the heartbeat and the Event Log entry show the
+running version. Editing Windows Installer's own uninstall entry is deliberately
+not done (it is owned by the MSI and rewritten on repair). Consequences: use the
+reported agent version for inventory; a *repair* or reinstall of an older MSI
+puts that MSI's binary back (and resets the integrity baseline), and a newer MSI
+upgrades normally. The update helper only runs from a staging directory that is
+private to SYSTEM and Administrators and launches a copy whose hash it has
+re-verified while holding it write-locked.
+
 ## Build and verification
 
 On Windows, install WiX 4.0.6 and its utility extension, then build:
