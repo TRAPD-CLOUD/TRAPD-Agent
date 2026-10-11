@@ -32,6 +32,12 @@
                           Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" Vital="yes">
             <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
                                 ThirdFailureActionType="restart" ResetPeriodInDays="1" RestartServiceDelayInSeconds="10" />
+            <!-- Only EventLog: the Security/System channels the sensors read.
+                 Deliberately NOT BFE: hosts with a third-party firewall
+                 commonly run with BFE stopped or disabled, and a hard
+                 dependency would then keep the whole agent from starting.
+                 Firewall containment reports its own error instead. -->
+            <ServiceDependency Id="EventLog" />
           </ServiceInstall>
           <ServiceControl Id="ManageService" Name="trapd-agent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
           <!-- MSI authorizes replacement, not the executable's claimed

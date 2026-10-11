@@ -28,6 +28,16 @@ use super::winguard;
 /// Owned process handle, closed on drop.
 struct Process(HANDLE);
 
+/// Any other kernel handle (toolhelp snapshot, thread), closed on drop.
+struct Owned(HANDLE);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        // SAFETY: the handle was returned by the opening call and is closed once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
 // SAFETY: owned process handles can be used/closed from any Windows thread;
 // transfers remain exclusive and the suspension map serializes mutations.
 unsafe impl Send for Process {}
@@ -430,37 +440,39 @@ pub fn thread_start_addresses() -> std::collections::HashMap<i32, Vec<u64>> {
     use windows_sys::Wdk::System::Threading::{
         NtQueryInformationThread, ThreadQuerySetWin32StartAddress,
     };
-    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
     use windows_sys::Win32::System::Threading::{OpenThread, THREAD_QUERY_INFORMATION};
 
     let mut out: HashMap<i32, Vec<u64>> = HashMap::new();
-    // SAFETY: the snapshot handle is closed on every path; `entry` is a
-    // correctly sized, initialised THREADENTRY32.
+    // SAFETY: the snapshot is owned by a drop guard; `entry` is a correctly
+    // sized, initialised THREADENTRY32.
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if snapshot.is_null() || snapshot == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        let raw = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if raw.is_null() || raw == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
             return out;
         }
+        let snapshot_guard = Owned(raw);
+        let snapshot = snapshot_guard.0;
         let mut entry: THREADENTRY32 = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
         let mut more = Thread32First(snapshot, &mut entry);
         while more != 0 {
             // ThreadQuerySetWin32StartAddress needs QUERY_INFORMATION; a
             // limited handle can open successfully and still reject the query.
-            let handle = OpenThread(THREAD_QUERY_INFORMATION, 0, entry.th32ThreadID);
-            if !handle.is_null() {
+            let thread = OpenThread(THREAD_QUERY_INFORMATION, 0, entry.th32ThreadID);
+            if !thread.is_null() {
+                let thread = Owned(thread);
                 let mut start: usize = 0;
                 let status = NtQueryInformationThread(
-                    handle,
+                    thread.0,
                     ThreadQuerySetWin32StartAddress,
                     (&mut start as *mut usize).cast(),
                     std::mem::size_of::<usize>() as u32,
                     std::ptr::null_mut(),
                 );
-                CloseHandle(handle);
+                drop(thread);
                 if status >= 0 && start != 0 {
                     out.entry(entry.th32OwnerProcessID as i32)
                         .or_default()
@@ -469,7 +481,6 @@ pub fn thread_start_addresses() -> std::collections::HashMap<i32, Vec<u64>> {
             }
             more = Thread32Next(snapshot, &mut entry);
         }
-        CloseHandle(snapshot);
     }
     out
 }

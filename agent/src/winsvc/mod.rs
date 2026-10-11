@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceDependency, ServiceErrorControl,
+    ServiceExitCode,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
@@ -199,7 +200,9 @@ fn install() -> Result<()> {
         error_control: ServiceErrorControl::Normal,
         executable_path: exe.clone(),
         launch_arguments: vec![],
-        dependencies: vec![],
+        // EventLog only (matches the MSI). Not BFE: with a third-party firewall
+        // BFE may be disabled, and the agent must still start.
+        dependencies: vec![ServiceDependency::Service(OsString::from("EventLog"))],
         // None = LocalSystem, the standard identity for an endpoint sensor.
         account_name: None,
         account_password: None,
