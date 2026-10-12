@@ -550,9 +550,14 @@ fn guid_to_u128(g: &GUID) -> u128 {
 }
 
 /// Turns decoded records into events, enriching process starts and mapping the
-/// device→drive table. Keeps the `sysinfo` handles for enrichment.
+/// device→drive table.
+///
+/// It deliberately holds no `sysinfo::System`: `refresh_process_specifics` adds
+/// the process to the table and never removes it, and every entry keeps an open
+/// process handle. A long-lived `System` here grew by every process that was
+/// ever enriched (about 6 handles a minute on a workstation), and each held
+/// handle keeps the exited process object alive in the kernel.
 struct DecodeState {
-    sys: System,
     devices: DeviceMap,
     hash_cache: HashMap<String, (u64, Option<std::time::SystemTime>, String)>,
     /// pid → image path, so a network/DNS event can name its process.
@@ -562,7 +567,6 @@ struct DecodeState {
 impl DecodeState {
     fn new() -> Self {
         Self {
-            sys: System::new(),
             devices: device_map(),
             hash_cache: HashMap::new(),
             proc_images: HashMap::new(),
@@ -752,9 +756,10 @@ impl DecodeState {
             .map(|(image, _)| image.rsplit('\\').next().unwrap_or(image).to_string());
         let spid = Pid::from_u32(pid as u32);
         let name = known.or_else(|| {
-            self.sys
-                .refresh_process_specifics(spid, ProcessRefreshKind::new());
-            self.sys.process(spid).map(|p| p.name().to_string())
+            // A throwaway table: its handle is released on return.
+            let mut sys = System::new();
+            sys.refresh_process_specifics(spid, ProcessRefreshKind::new());
+            sys.process(spid).map(|p| p.name().to_string())
         });
         data.pid = Some(pid);
         data.process = name.filter(|n| !n.is_empty());
@@ -769,14 +774,16 @@ impl DecodeState {
             return ProcessEnrichment::default();
         }
         let spid = Pid::from_u32(pid as u32);
-        self.sys.refresh_process_specifics(
+        // A throwaway table: its handle is released when this function returns.
+        let mut sys = System::new();
+        sys.refresh_process_specifics(
             spid,
             ProcessRefreshKind::new()
                 .with_cmd(UpdateKind::Always)
                 .with_exe(UpdateKind::Always)
                 .with_user(UpdateKind::Always),
         );
-        let Some(proc_) = self.sys.process(spid) else {
+        let Some(proc_) = sys.process(spid) else {
             return ProcessEnrichment::default();
         };
         let exe = proc_.exe().map(|p| p.to_string_lossy().into_owned());
@@ -852,6 +859,53 @@ mod native_tests {
             interpret(TDH_INTYPE_FILETIME as u16, vec![0; 7]),
             EtwValue::Bytes(_)
         ));
+    }
+
+    fn own_handle_count() -> u32 {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+        let mut count = 0u32;
+        // SAFETY: the pseudo handle is always valid; `count` is a valid out slot.
+        assert_ne!(
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
+            0
+        );
+        count
+    }
+
+    /// Regression: the decoder kept a `sysinfo::System` that accumulated every
+    /// enriched process together with an open handle to it. After the children
+    /// have exited and been reaped, no handle to them may be left behind.
+    #[test]
+    fn enriching_processes_does_not_retain_their_handles() {
+        const CHILDREN: usize = 40;
+        let mut state = DecodeState::new();
+        // Warm up lazily initialised OS state, then take the baseline before any
+        // child exists: Rust's own `Child` handles are part of the later count
+        // only while the children are alive.
+        let _ = state.enrich_process(std::process::id() as i32);
+        let baseline = own_handle_count();
+        let mut children: Vec<std::process::Child> = (0..CHILDREN)
+            .map(|_| {
+                std::process::Command::new("cmd.exe")
+                    .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in &children {
+            let _ = state.enrich_process(child.id() as i32);
+        }
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        drop(children);
+        let after = own_handle_count();
+        assert!(
+            after < baseline + 8,
+            "{} process handles were retained across {CHILDREN} enrichments ({baseline} -> {after})",
+            after.saturating_sub(baseline)
+        );
     }
 
     /// Requires elevation; deliberately fails instead of claiming a skipped sensor worked.
