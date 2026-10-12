@@ -544,6 +544,24 @@ impl ConfigVerifier {
         debug!(%issued_at, "signed config verified");
         Ok(signed.envelope.config.clone())
     }
+
+    /// True when `signed` is the envelope that is already applied: authentic,
+    /// addressed to us, carrying exactly the last accepted `issued_at` and the
+    /// same config as `current`. The server re-serves it on every poll; that is
+    /// not a rollback, so it must not be reported as a rejection. A different
+    /// config under the same `issued_at` still is one.
+    pub fn is_applied_replay(&self, signed: &SignedConfig, current: &AgentConfig) -> bool {
+        verify_canonical(&self.key, &signed.envelope, &signed.signature).is_ok()
+            && signed.envelope.agent_id == self.agent_id
+            && self.watermark.last() == Some(signed.envelope.issued_at)
+            && matches!(
+                (
+                    serde_json::to_value(&signed.envelope.config),
+                    serde_json::to_value(current)
+                ),
+                (Ok(a), Ok(b)) if a == b
+            )
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -791,6 +809,15 @@ impl ConfigPuller {
                 }
             },
             Err(why) => {
+                let unchanged = self
+                    .config
+                    .read()
+                    .map(|cur| verifier.is_applied_replay(&signed, &cur))
+                    .unwrap_or(false);
+                if unchanged {
+                    debug!("backend re-served the config that is already applied");
+                    return true;
+                }
                 warn!("Rejected backend config: {why} — keeping last-known-good");
                 false
             }
@@ -863,6 +890,59 @@ mod signed_config_tests {
         let (mut v, p, w) = verifier(&key, "agent-1");
         let signed = make_signed(&key, "agent-1", Utc::now());
         assert!(v.verify(&signed).is_ok(), "valid signed config rejected");
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn identical_replay_is_recognised_as_already_applied() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let signed = make_signed(&key, "agent-1", Utc::now());
+        let applied = v.verify(&signed).unwrap();
+        assert!(
+            v.verify(&signed).is_err(),
+            "replay must stay rejected by verify"
+        );
+        assert!(v.is_applied_replay(&signed, &applied));
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn same_issued_at_with_different_config_is_not_a_harmless_replay() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let now = Utc::now();
+        let applied = v.verify(&make_signed(&key, "agent-1", now)).unwrap();
+        let mut other = ConfigEnvelope {
+            issued_at: now,
+            agent_id: "agent-1".into(),
+            config: AgentConfig::default(),
+        };
+        other.config.poll_interval_secs = 1;
+        let signature = {
+            let bytes = serde_json::to_vec(&other).unwrap();
+            base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).to_bytes())
+        };
+        let signed = SignedConfig {
+            envelope: other,
+            signature,
+        };
+        assert!(!v.is_applied_replay(&signed, &applied));
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn replay_with_a_bad_signature_is_not_treated_as_applied() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let signed = make_signed(&key, "agent-1", Utc::now());
+        let applied = v.verify(&signed).unwrap();
+        let forged = make_signed(
+            &SigningKey::from_bytes(&[9u8; 32]),
+            "agent-1",
+            signed.envelope.issued_at,
+        );
+        assert!(!v.is_applied_replay(&forged, &applied));
         cleanup(p, w);
     }
 

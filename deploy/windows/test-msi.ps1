@@ -42,6 +42,28 @@ function Read-Events {
         } catch {}
     })
 }
+# Audit baseline (command lines in 4688): the installer enables it, removal puts
+# back exactly what it found. Compared against the state before the first
+# install, so a runner that already had it on is also a valid case.
+function Get-AuditBaseline {
+    $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit'
+    $success = {
+        param($guid)
+        $csv = (& "$env:SystemRoot\System32\auditpol.exe" /get "/subcategory:$guid" /r) -join "`n"
+        [bool]($csv -match 'Success')
+    }
+    [pscustomobject]@{
+        Success = (& $success '{0CCE922B-69AE-11D9-BED3-505054503030}')   # Process Creation
+        FileSuccess = (& $success '{0CCE921D-69AE-11D9-BED3-505054503030}') # File System (honeytoken accessors)
+        CmdLine = (Get-ItemProperty $key -ErrorAction SilentlyContinue).ProcessCreationIncludeCmdLine_Enabled
+    }
+}
+function Assert-AuditBaseline($Expected, [string]$When) {
+    $now = Get-AuditBaseline
+    if ($now.Success -ne $Expected.Success -or $now.FileSuccess -ne $Expected.FileSuccess -or $now.CmdLine -ne $Expected.CmdLine) {
+        throw "Audit baseline ${When}: expected Success=$($Expected.Success) FileSuccess=$($Expected.FileSuccess) CmdLine=$($Expected.CmdLine), got Success=$($now.Success) FileSuccess=$($now.FileSuccess) CmdLine=$($now.CmdLine)."
+    }
+}
 function Read-Requests {
     $p = Join-Path $root 'requests.ndjson'
     if (-not (Test-Path $p)) { return @() }
@@ -84,7 +106,9 @@ try {
     $url = Get-Content -Raw (Join-Path $root 'url.txt')
     # First install has no backend properties: local collection must start
     # immediately, with no enrollment requirement.
+    $auditBefore = Get-AuditBaseline
     Invoke-Msi @('/i', "`"$Msi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'offline-install.log')`"")
+    Assert-AuditBaseline ([pscustomobject]@{ Success = $true; FileSuccess = $true; CmdLine = 1 }) 'after install (default AUDITBASELINE=1)'
     # Check before enrollment too: shortcut bookkeeping must not create the
     # credential key with inherited Users access ahead of RegistryConfig.
     foreach ($rule in (Get-Acl 'HKLM:\SOFTWARE\TRAPD\Agent').Access) {
@@ -99,12 +123,14 @@ try {
     $offlineDevice = Get-Content -Raw (Join-Path $state 'device_id')
     Invoke-Msi @('/x', "`"$Msi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'offline-uninstall.log')`"")
     Wait-Until { $null -eq (Get-Service trapd-agent -ErrorAction SilentlyContinue) } 'Offline uninstall left the service.'
+    Assert-AuditBaseline $auditBefore 'after uninstall (must restore what the installer changed)'
 
     # Pairing mode (backend, no token): the agent publishes a code and waits for
     # a person. It must still honour a service stop, otherwise MSI removal or
     # upgrade of an unpaired agent would hang (regression: stop was ignored
     # while enrolling).
-    Invoke-Msi @('/i', "`"$Msi`"", '/qn', '/norestart', "BACKENDURL=$url", '/L*v', "`"$(Join-Path $root 'pairing-install.log')`"")
+    Invoke-Msi @('/i', "`"$Msi`"", '/qn', '/norestart', "BACKENDURL=$url", 'AUDITBASELINE=0', '/L*v', "`"$(Join-Path $root 'pairing-install.log')`"")
+    Assert-AuditBaseline $auditBefore 'after install with AUDITBASELINE=0 (opt-out must not touch the policy)'
     Wait-Until { (Get-Service trapd-agent -ErrorAction SilentlyContinue).Status -eq 'Running' } 'Pairing-mode service did not start.'
     $pairingFile = Join-Path $state 'pairing.txt'
     Wait-Until { Test-Path $pairingFile } 'Agent did not publish pairing.txt.'

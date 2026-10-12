@@ -19,6 +19,12 @@
       <RegistrySearch Id="ExistingBackend" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="raw" Bitness="always64" />
     </Property>
     <?endif?>
+    <!-- Audit settings two detections depend on: command lines of short-lived
+         processes (event 4688, field test F3) and who opened a honeytoken
+         (event 4663, needs "Audit File System"). On by default; AUDITBASELINE=0
+         leaves the machine's audit policy alone. Only settings the installer
+         itself turned on are reverted on removal. -->
+    <Property Id="AUDITBASELINE" Secure="yes" Value="1" />
     <Property Id="ENROLLTOKEN" Secure="yes" Hidden="yes">
       <RegistrySearch Id="ExistingEnrollToken" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="raw" Bitness="always64" />
     </Property>
@@ -124,7 +130,11 @@
     <!-- MSI owns service registration. Remove persistent containment and
          decoys after StopServices, before DeleteServices; upgrades preserve both. -->
     <CustomAction Id="CleanupDecoys" FileRef="AgentExe" ExeCommand="cleanup" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="ApplyAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline apply" Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RestoreAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline restore" Execute="deferred" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
+      <Custom Action="ApplyAuditBaseline" After="InstallFiles" Condition="AUDITBASELINE&lt;&gt;&quot;0&quot; AND NOT REMOVE" />
+      <Custom Action="RestoreAuditBaseline" Before="DeleteServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="CleanupDecoys" Before="DeleteServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
     <Feature Id="Agent" Title="TRAPD Agent" Level="1">
