@@ -14,6 +14,7 @@ use tokio::fs;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod audit_baseline;
 mod collectors;
 mod config;
 mod deception;
