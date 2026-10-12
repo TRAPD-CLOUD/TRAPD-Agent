@@ -19,9 +19,11 @@
       <RegistrySearch Id="ExistingBackend" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="raw" Bitness="always64" />
     </Property>
     <?endif?>
-    <!-- Command lines of short-lived processes need event 4688 (field test F3).
-         On by default; AUDITBASELINE=0 leaves the machine's audit policy alone.
-         Only settings the installer itself turned on are reverted on removal. -->
+    <!-- Audit settings two detections depend on: command lines of short-lived
+         processes (event 4688, field test F3) and who opened a honeytoken
+         (event 4663, needs "Audit File System"). On by default; AUDITBASELINE=0
+         leaves the machine's audit policy alone. Only settings the installer
+         itself turned on are reverted on removal. -->
     <Property Id="AUDITBASELINE" Secure="yes" Value="1" />
     <Property Id="ENROLLTOKEN" Secure="yes" Hidden="yes">
       <RegistrySearch Id="ExistingEnrollToken" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="raw" Bitness="always64" />

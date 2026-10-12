@@ -1,9 +1,17 @@
-//! Installer-owned audit baseline for process command lines.
+//! Installer-owned audit baseline: command lines and honeytoken accessors.
 //!
-//! ETW reads a command line from the live process, so a one-shot `cmd /c ...`
-//! that exits first has none (field test F3). Windows delivers it reliably only
-//! in event 4688, which needs two machine settings: "Audit Process Creation:
-//! Success" and `ProcessCreationIncludeCmdLine_Enabled=1`.
+//! Two detections depend on Windows audit settings the agent must not change at
+//! runtime:
+//!
+//! * Command lines of short-lived processes. ETW reads a command line from the
+//!   live process, so a one-shot `cmd /c ...` that exits first has none (field
+//!   test F3). Event 4688 carries it reliably but needs "Audit Process
+//!   Creation: Success" and `ProcessCreationIncludeCmdLine_Enabled=1`.
+//! * Who opened a honeytoken. The decoy carries a read-audit SACL, but Security
+//!   event 4663 (process and account) only fires when "Audit File System:
+//!   Success" is on; otherwise the accessor stays `unknown` and the detection
+//!   falls back to the last-access timestamp. The setting only produces events
+//!   for objects that carry a SACL, i.e. our decoys.
 //!
 //! The running agent never changes audit policy (see `decoy_audit`: it only
 //! queries operator-owned settings). This module is the installer's one-time,
@@ -24,22 +32,51 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// The audit subcategories this module may turn on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audit {
+    ProcessCreation,
+    FileSystem,
+}
+
+const AUDITS: [Audit; 2] = [Audit::ProcessCreation, Audit::FileSystem];
+
 /// What this module changed, persisted between install and removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Receipt {
     /// We switched "Audit Process Creation: Success" on.
-    pub set_audit_success: bool,
+    #[serde(alias = "set_audit_success")]
+    pub set_process_audit: bool,
+    /// We switched "Audit File System: Success" on (absent in older receipts).
+    #[serde(default)]
+    pub set_file_audit: bool,
     /// We wrote the command-line policy value.
     pub set_cmdline: bool,
     /// The command-line value before we wrote it (`None` = it did not exist).
     pub prev_cmdline: Option<u32>,
 }
 
-/// The two machine settings, abstracted so the decisions are testable.
+impl Receipt {
+    fn owns(&self, audit: Audit) -> bool {
+        match audit {
+            Audit::ProcessCreation => self.set_process_audit,
+            Audit::FileSystem => self.set_file_audit,
+        }
+    }
+
+    fn set_owned(&mut self, audit: Audit, owned: bool) {
+        match audit {
+            Audit::ProcessCreation => self.set_process_audit = owned,
+            Audit::FileSystem => self.set_file_audit = owned,
+        }
+    }
+}
+
+/// The machine settings, abstracted so the decisions are testable.
 pub trait Host {
-    /// Whether "Audit Process Creation" currently audits success.
-    fn audit_success(&self) -> Result<bool>;
-    fn set_audit_success(&mut self, on: bool) -> Result<()>;
+    /// Whether the subcategory currently audits success.
+    fn audit_success(&self, audit: Audit) -> Result<bool>;
+    fn set_audit_success(&mut self, audit: Audit, on: bool) -> Result<()>;
     /// `ProcessCreationIncludeCmdLine_Enabled`, `None` when absent.
     fn cmdline(&self) -> Result<Option<u32>>;
     fn set_cmdline(&mut self, value: Option<u32>) -> Result<()>;
@@ -50,11 +87,13 @@ pub trait Host {
 pub fn apply(host: &mut dyn Host, prior: Receipt) -> Result<Receipt> {
     let mut receipt = Receipt::default();
 
-    if host.audit_success()? {
-        receipt.set_audit_success = prior.set_audit_success;
-    } else {
-        host.set_audit_success(true)?;
-        receipt.set_audit_success = true;
+    for audit in AUDITS {
+        if host.audit_success(audit)? {
+            receipt.set_owned(audit, prior.owns(audit));
+        } else {
+            host.set_audit_success(audit, true)?;
+            receipt.set_owned(audit, true);
+        }
     }
 
     let current = host.cmdline()?;
@@ -72,17 +111,30 @@ pub fn apply(host: &mut dyn Host, prior: Receipt) -> Result<Receipt> {
 /// Undo exactly what [`apply`] did, and only while the setting is still as we
 /// left it. Both reverts are attempted; the first error is returned.
 pub fn restore(host: &mut dyn Host, receipt: Receipt) -> Result<()> {
-    let audit = if receipt.set_audit_success && host.audit_success()? {
-        host.set_audit_success(false)
-    } else {
-        Ok(())
+    let mut first_error = None;
+    let mut note = |result: Result<()>| {
+        if let Err(e) = result {
+            first_error.get_or_insert(e);
+        }
     };
-    let cmdline = if receipt.set_cmdline && host.cmdline()? == Some(1) {
-        host.set_cmdline(receipt.prev_cmdline)
-    } else {
+    for audit in AUDITS {
+        note((|| {
+            if receipt.owns(audit) && host.audit_success(audit)? {
+                host.set_audit_success(audit, false)?;
+            }
+            Ok(())
+        })());
+    }
+    note((|| {
+        if receipt.set_cmdline && host.cmdline()? == Some(1) {
+            host.set_cmdline(receipt.prev_cmdline)?;
+        }
         Ok(())
-    };
-    audit.and(cmdline)
+    })());
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(windows)]
@@ -95,7 +147,15 @@ mod windows_host {
     use std::path::PathBuf;
     use std::process::Command;
 
-    const PROCESS_CREATION_GUID: &str = "{0CCE922B-69AE-11D9-BED3-505054503030}";
+    use super::Audit;
+
+    fn guid(audit: Audit) -> &'static str {
+        match audit {
+            Audit::ProcessCreation => "{0CCE922B-69AE-11D9-BED3-505054503030}",
+            Audit::FileSystem => "{0CCE921D-69AE-11D9-BED3-505054503030}",
+        }
+    }
+
     const AUDIT_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Audit";
     const CMDLINE_VALUE: &str = "ProcessCreationIncludeCmdLine_Enabled";
 
@@ -118,12 +178,16 @@ mod windows_host {
     struct WindowsHost;
 
     impl Host for WindowsHost {
-        fn audit_success(&self) -> Result<bool> {
-            crate::collectors::windows::decoy_audit::process_audit_enabled()
-                .ok_or_else(|| anyhow!("cannot query the process-creation audit policy"))
+        fn audit_success(&self, audit: Audit) -> Result<bool> {
+            use crate::collectors::windows::decoy_audit;
+            match audit {
+                Audit::ProcessCreation => decoy_audit::process_audit_enabled(),
+                Audit::FileSystem => decoy_audit::file_audit_enabled(),
+            }
+            .ok_or_else(|| anyhow!("cannot query the {audit:?} audit policy"))
         }
 
-        fn set_audit_success(&mut self, on: bool) -> Result<()> {
+        fn set_audit_success(&mut self, audit: Audit, on: bool) -> Result<()> {
             let flag = if on {
                 "/success:enable"
             } else {
@@ -131,11 +195,7 @@ mod windows_host {
             };
             run(
                 "auditpol.exe",
-                &[
-                    "/set",
-                    &format!("/subcategory:{PROCESS_CREATION_GUID}"),
-                    flag,
-                ],
+                &["/set", &format!("/subcategory:{}", guid(audit)), flag],
             )
         }
 
@@ -210,22 +270,36 @@ mod tests {
 
     #[derive(Default)]
     struct Fake {
-        audit: bool,
+        process_audit: bool,
+        file_audit: bool,
         cmdline: Option<u32>,
-        fail_audit_set: bool,
+        /// Fail every change to this subcategory.
+        fail_on: Option<Audit>,
         writes: Vec<String>,
     }
 
-    impl Host for Fake {
-        fn audit_success(&self) -> Result<bool> {
-            Ok(self.audit)
+    impl Fake {
+        fn flag(&mut self, audit: Audit) -> &mut bool {
+            match audit {
+                Audit::ProcessCreation => &mut self.process_audit,
+                Audit::FileSystem => &mut self.file_audit,
+            }
         }
-        fn set_audit_success(&mut self, on: bool) -> Result<()> {
-            self.writes.push(format!("audit={on}"));
-            if self.fail_audit_set {
+    }
+
+    impl Host for Fake {
+        fn audit_success(&self, audit: Audit) -> Result<bool> {
+            Ok(match audit {
+                Audit::ProcessCreation => self.process_audit,
+                Audit::FileSystem => self.file_audit,
+            })
+        }
+        fn set_audit_success(&mut self, audit: Audit, on: bool) -> Result<()> {
+            self.writes.push(format!("{audit:?}={on}"));
+            if self.fail_on == Some(audit) {
                 return Err(anyhow!("denied"));
             }
-            self.audit = on;
+            *self.flag(audit) = on;
             Ok(())
         }
         fn cmdline(&self) -> Result<Option<u32>> {
@@ -238,15 +312,25 @@ mod tests {
         }
     }
 
+    fn everything_on() -> Fake {
+        Fake {
+            process_audit: true,
+            file_audit: true,
+            cmdline: Some(1),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn fresh_host_gets_both_settings_and_a_full_receipt() {
+    fn fresh_host_gets_every_setting_and_a_full_receipt() {
         let mut host = Fake::default();
         let receipt = apply(&mut host, Receipt::default()).unwrap();
-        assert!(host.audit && host.cmdline == Some(1));
+        assert!(host.process_audit && host.file_audit && host.cmdline == Some(1));
         assert_eq!(
             receipt,
             Receipt {
-                set_audit_success: true,
+                set_process_audit: true,
+                set_file_audit: true,
                 set_cmdline: true,
                 prev_cmdline: None,
             }
@@ -254,12 +338,23 @@ mod tests {
     }
 
     #[test]
-    fn settings_the_admin_already_enabled_are_not_touched_or_claimed() {
+    fn honeytoken_accessors_need_file_system_auditing() {
+        // The decoy's read-audit SACL only produces event 4663 (process and
+        // account) when this subcategory is on.
         let mut host = Fake {
-            audit: true,
+            process_audit: true,
             cmdline: Some(1),
             ..Default::default()
         };
+        let receipt = apply(&mut host, Receipt::default()).unwrap();
+        assert!(host.file_audit);
+        assert_eq!(host.writes, vec!["FileSystem=true"]);
+        assert!(receipt.set_file_audit && !receipt.set_process_audit);
+    }
+
+    #[test]
+    fn settings_the_admin_already_enabled_are_not_touched_or_claimed() {
+        let mut host = everything_on();
         let receipt = apply(&mut host, Receipt::default()).unwrap();
         assert!(host.writes.is_empty());
         assert_eq!(receipt, Receipt::default());
@@ -268,7 +363,7 @@ mod tests {
             host.writes.is_empty(),
             "must not revert the admin's setting"
         );
-        assert!(host.audit && host.cmdline == Some(1));
+        assert!(host.process_audit && host.file_audit && host.cmdline == Some(1));
     }
 
     #[test]
@@ -281,7 +376,7 @@ mod tests {
         assert_eq!(host.cmdline, Some(1));
         restore(&mut host, receipt).unwrap();
         assert_eq!(host.cmdline, Some(0));
-        assert!(!host.audit);
+        assert!(!host.process_audit && !host.file_audit);
     }
 
     #[test]
@@ -289,7 +384,7 @@ mod tests {
         let mut host = Fake::default();
         let receipt = apply(&mut host, Receipt::default()).unwrap();
         restore(&mut host, receipt).unwrap();
-        assert!(!host.audit);
+        assert!(!host.process_audit && !host.file_audit);
         assert_eq!(host.cmdline, None);
     }
 
@@ -297,11 +392,11 @@ mod tests {
     fn upgrade_keeps_ownership_recorded_by_the_first_install() {
         let mut host = Fake::default();
         let first = apply(&mut host, Receipt::default()).unwrap();
-        // A second apply (upgrade/repair) sees both settings on already.
+        // A second apply (upgrade/repair) sees every setting on already.
         let second = apply(&mut host, first).unwrap();
         assert_eq!(second, first);
         restore(&mut host, second).unwrap();
-        assert!(!host.audit && host.cmdline.is_none());
+        assert!(!host.process_audit && !host.file_audit && host.cmdline.is_none());
     }
 
     #[test]
@@ -309,16 +404,18 @@ mod tests {
         let mut host = Fake::default();
         let receipt = apply(&mut host, Receipt::default()).unwrap();
         host.cmdline = Some(0); // admin deliberately turned it off afterwards
+        host.file_audit = false;
         host.writes.clear();
         restore(&mut host, receipt).unwrap();
         assert!(!host.writes.iter().any(|w| w.starts_with("cmdline")));
+        assert!(!host.writes.iter().any(|w| w.starts_with("FileSystem")));
         assert_eq!(host.cmdline, Some(0));
     }
 
     #[test]
     fn failed_audit_change_does_not_pretend_to_own_it_and_stops_before_cmdline() {
         let mut host = Fake {
-            fail_audit_set: true,
+            fail_on: Some(Audit::ProcessCreation),
             ..Default::default()
         };
         assert!(apply(&mut host, Receipt::default()).is_err());
@@ -326,19 +423,24 @@ mod tests {
     }
 
     #[test]
-    fn restore_attempts_both_reverts_and_reports_the_first_error() {
-        let mut host = Fake {
-            audit: true,
-            cmdline: Some(1),
-            fail_audit_set: true,
-            ..Default::default()
-        };
+    fn restore_attempts_every_revert_and_reports_the_first_error() {
+        let mut host = everything_on();
+        host.fail_on = Some(Audit::ProcessCreation);
         let receipt = Receipt {
-            set_audit_success: true,
+            set_process_audit: true,
+            set_file_audit: true,
             set_cmdline: true,
             prev_cmdline: None,
         };
         assert!(restore(&mut host, receipt).is_err());
+        assert!(!host.file_audit, "file-system revert must still run");
         assert_eq!(host.cmdline, None, "command-line revert must still run");
+    }
+
+    #[test]
+    fn a_receipt_written_before_file_auditing_existed_still_loads() {
+        let old = r#"{"set_audit_success":true,"set_cmdline":true,"prev_cmdline":null}"#;
+        let receipt: Receipt = serde_json::from_str(old).unwrap();
+        assert!(receipt.set_process_audit && !receipt.set_file_audit && receipt.set_cmdline);
     }
 }

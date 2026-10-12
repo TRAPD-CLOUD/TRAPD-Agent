@@ -46,18 +46,22 @@ function Read-Events {
 # back exactly what it found. Compared against the state before the first
 # install, so a runner that already had it on is also a valid case.
 function Get-AuditBaseline {
-    $guid = '{0CCE922B-69AE-11D9-BED3-505054503030}'
-    $csv = (& "$env:SystemRoot\System32\auditpol.exe" /get "/subcategory:$guid" /r) -join "`n"
     $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit'
+    $success = {
+        param($guid)
+        $csv = (& "$env:SystemRoot\System32\auditpol.exe" /get "/subcategory:$guid" /r) -join "`n"
+        [bool]($csv -match 'Success')
+    }
     [pscustomobject]@{
-        Success = [bool]($csv -match 'Success')
+        Success = (& $success '{0CCE922B-69AE-11D9-BED3-505054503030}')   # Process Creation
+        FileSuccess = (& $success '{0CCE921D-69AE-11D9-BED3-505054503030}') # File System (honeytoken accessors)
         CmdLine = (Get-ItemProperty $key -ErrorAction SilentlyContinue).ProcessCreationIncludeCmdLine_Enabled
     }
 }
 function Assert-AuditBaseline($Expected, [string]$When) {
     $now = Get-AuditBaseline
-    if ($now.Success -ne $Expected.Success -or $now.CmdLine -ne $Expected.CmdLine) {
-        throw "Audit baseline ${When}: expected Success=$($Expected.Success) CmdLine=$($Expected.CmdLine), got Success=$($now.Success) CmdLine=$($now.CmdLine)."
+    if ($now.Success -ne $Expected.Success -or $now.FileSuccess -ne $Expected.FileSuccess -or $now.CmdLine -ne $Expected.CmdLine) {
+        throw "Audit baseline ${When}: expected Success=$($Expected.Success) FileSuccess=$($Expected.FileSuccess) CmdLine=$($Expected.CmdLine), got Success=$($now.Success) FileSuccess=$($now.FileSuccess) CmdLine=$($now.CmdLine)."
     }
 }
 function Read-Requests {
@@ -104,7 +108,7 @@ try {
     # immediately, with no enrollment requirement.
     $auditBefore = Get-AuditBaseline
     Invoke-Msi @('/i', "`"$Msi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'offline-install.log')`"")
-    Assert-AuditBaseline ([pscustomobject]@{ Success = $true; CmdLine = 1 }) 'after install (default AUDITBASELINE=1)'
+    Assert-AuditBaseline ([pscustomobject]@{ Success = $true; FileSuccess = $true; CmdLine = 1 }) 'after install (default AUDITBASELINE=1)'
     # Check before enrollment too: shortcut bookkeeping must not create the
     # credential key with inherited Users access ahead of RegistryConfig.
     foreach ($rule in (Get-Acl 'HKLM:\SOFTWARE\TRAPD\Agent').Access) {
