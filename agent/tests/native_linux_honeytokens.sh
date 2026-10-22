@@ -41,16 +41,46 @@ mounts=()
 if [[ "$mode" == fallback ]]; then mounts=(-v "$dir/no-btf:/sys/kernel/btf/vmlinux:ro"); fi
 docker run --rm --name "$container" --privileged --pid host --network none -e MODE="$mode" \
   -v "$dir:/test" "${mounts[@]}" "$image" bash /test/run.sh > "$dir/actions.log" 2>&1
-python3 - "$dir" "$mode" <<'PY'
+# On failure: everything needed to tell a sensor that did not fire from one
+# whose event was lost or folded later, without rerunning on that kernel.
+diagnose() {
+  echo "--- kernel $(uname -r)"
+  local sudo=(); [[ $EUID -eq 0 ]] || sudo=(sudo -n)
+  for tp in sys_enter_statx sys_enter_renameat2 sys_enter_linkat; do
+    "${sudo[@]}" cat "/sys/kernel/tracing/events/syscalls/$tp/format" 2>/dev/null | grep -E "^name|field:" | grep -v common_ || echo "($tp format unreadable)"
+  done
+  echo "--- agent warnings/errors"
+  grep -E "WARN|ERROR|SIGTERM|Shutdown|Consumer|honeytoken" "$dir/agent.log" | grep -v "/proc/net/" | sed 's/\x1b\[[0-9;]*m//g' | tail -40
+  echo "--- actions"; tail -15 "$dir/actions.log"
+  echo "--- agent eBPF programs (hook run_cnt recursion_misses)"
+  python3 -c 'import re,sys
+progs,hooks={},{}
+for l in open(sys.argv[1]):
+ f=dict(re.findall(r"(\w+): (\S+)",l))
+ if "bpf-prog" in l:progs[f.get("prog_id")]=f
+ elif "tp_name" in f or "func_name" in f:hooks[f.get("prog_id")]=f.get("tp_name") or f.get("func_name")
+for pid,f in sorted(progs.items(),key=lambda x:int(x[0] or 0)):print(hooks.get(pid,"prog_id="+str(pid)),f.get("run_cnt"),f.get("recursion_misses"))' "$dir/bpf-progs.txt" 2>/dev/null
+  echo "--- honeytoken hits (kind mode accessor pid exe path) and raw sensor events of the actors (class comm path)"
+  python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+ try:d=json.loads(l).get("unmapped",{}).get("trapd",{}).get("data",{})
+ except ValueError:continue
+ if not isinstance(d,dict):continue
+ if "token_id" in d:a=d.get("accessor",{});print("hit",d.get("access_kind"),d.get("mode"),a.get("comm"),a.get("pid"),a.get("exe"),d.get("path"))
+ elif d.get("comm") in ("probe","stat","ln","mv"):print("raw",json.loads(l).get("class_uid"),d.get("comm"),repr(d.get("path",d.get("old_path"))))' "$dir/events.ndjson"
+}
+python3 - "$dir" "$mode" <<'PY' || { diagnose; exit 1; }
 import collections,json,sys
 from pathlib import Path
-p=Path(sys.argv[1]);mode=sys.argv[2];pid=int((p/'agent.pid').read_text());hits=[]
+p=Path(sys.argv[1]);mode=sys.argv[2];pid=int((p/'agent.pid').read_text());hits=[];file_events=collections.Counter()
 for line in (p/'events.ndjson').read_text().splitlines():
  try:e=json.loads(line)
  except ValueError:continue
  assert e.get('metadata',{}).get('version')=='1.9.0','local telemetry is not OCSF 1.9.0'
  source=e.get('unmapped',{}).get('trapd',{})
  d=source.get('data',{})
+ if isinstance(d,dict) and e.get('class_uid')==1001 and d.get('comm') in ('probe','mv') and '/test/decoy.txt' in (d.get('path'),d.get('old_path')):
+  file_events[d['comm']]+=1
  if isinstance(d,dict) and d.get('token_id','').startswith(('11111111-','22222222-','33333333-')):
   assert e.get('class_uid')==2004 and e.get('activity_id')==1,'incorrect finding class'
   assert e.get('finding_info',{}).get('uid')==e['metadata']['uid'],'finding identity changed'
@@ -58,6 +88,8 @@ for line in (p/'events.ndjson').read_text().splitlines():
 assert hits,'no Honeytoken data'
 assert not any(e['data']['token_id'].startswith('33333333-') and e['data']['access_kind'] in ['exec','open'] for e in hits),'failed exec became content access'
 assert not any(e['data'].get('accessor',{}).get('pid')==pid for e in hits),'agent self access leaked'
+# File telemetry of the same actions (write opens, rename) must arrive too.
+assert file_events['probe']>=3 and file_events['mv']>=1,('file telemetry',file_events)
 counts=collections.Counter((e['data']['access_kind'],e['data'].get('mode')) for e in hits)
 assert counts['open','alert'] >= (7 if mode=='inode' else 2),counts
 assert counts['modify','alert']==3,counts

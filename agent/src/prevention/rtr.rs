@@ -46,6 +46,170 @@ pub fn cap_and_encode(data: &[u8], max: usize) -> Artifact {
     }
 }
 
+/// An artifact for `captured` bytes that are a prefix of `total_len` bytes:
+/// the reader already stopped at the cap, so only the count is known.
+pub fn encode_prefix(captured: &[u8], total_len: usize) -> Artifact {
+    Artifact {
+        b64: base64::engine::general_purpose::STANDARD.encode(captured),
+        returned_len: captured.len(),
+        total_len: total_len.max(captured.len()),
+        truncated: captured.len() < total_len,
+    }
+}
+
+/// Read at most `cap` bytes of a regular file for `CollectFile`.
+///
+/// `std::fs::read` would load the whole file: a signed `collect /dev/zero`
+/// or a multi-gigabyte log would exhaust the agent's memory, and a FIFO
+/// would block the response engine forever. The file is opened without
+/// blocking and refused unless it is a regular file; reading stops at the cap.
+/// Procfs files report a length of zero, so the size is what was read when
+/// the metadata does not know better.
+pub fn collect_file(path: &str, cap: usize) -> std::io::Result<Artifact> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file (devices, FIFOs, sockets and directories are refused)",
+        ));
+    }
+    let mut buf = Vec::with_capacity(cap.min(1 << 20));
+    // One byte past the cap tells a file of exactly `cap` bytes from a longer one.
+    file.take(cap as u64 + 1).read_to_end(&mut buf)?;
+    let read = buf.len();
+    buf.truncate(cap);
+    let total = usize::try_from(meta.len()).unwrap_or(usize::MAX).max(read);
+    Ok(encode_prefix(&buf, total))
+}
+
+/// Outcome of a bounded script run.
+#[derive(Debug)]
+pub struct ScriptRun {
+    pub success: bool,
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stdout_total: usize,
+    pub stderr: Vec<u8>,
+    pub stderr_total: usize,
+    pub note: String,
+}
+
+/// Keep the first `cap` bytes of a stream and count the rest. The stream is
+/// drained to the end so the script never blocks on a full pipe, but what is
+/// kept in memory never exceeds the cap.
+async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
+    stream: Option<R>,
+    cap: usize,
+) -> (Vec<u8>, usize) {
+    use tokio::io::AsyncReadExt;
+    let Some(mut stream) = stream else {
+        return (Vec::new(), 0);
+    };
+    let mut kept = Vec::new();
+    let mut total = 0usize;
+    let mut chunk = vec![0u8; 16 * 1024];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                total = total.saturating_add(n);
+                let room = cap.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        }
+    }
+    (kept, total)
+}
+
+/// Run a signed RTR script with bounded output and a hard deadline.
+///
+/// The script runs in its own process group. On timeout the whole group is
+/// killed, not just the interpreter: a backgrounded child would otherwise
+/// keep running unobserved and hold the output pipes open. Output beyond
+/// `cap` bytes per stream is counted but not kept, so a script that prints
+/// gigabytes cannot exhaust the agent's memory.
+pub async fn run_script_bounded(
+    program: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+    cap: usize,
+) -> ScriptRun {
+    use std::process::Stdio;
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ScriptRun {
+                success: false,
+                code: None,
+                stdout: Vec::new(),
+                stdout_total: 0,
+                stderr: Vec::new(),
+                stderr_total: 0,
+                note: format!("spawn failed: {e}"),
+            }
+        }
+    };
+    let pgid = child.id();
+    let out = tokio::spawn(read_bounded(child.stdout.take(), cap));
+    let err = tokio::spawn(read_bounded(child.stderr.take(), cap));
+    let (status, note) = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => (Some(status), String::new()),
+        Ok(Err(e)) => (None, format!("wait failed: {e}")),
+        Err(_) => (None, "timed out".to_string()),
+    };
+    // Whatever the outcome, nothing the script started outlives it.
+    #[cfg(unix)]
+    if let Some(pgid) = pgid.and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 1) {
+        // SAFETY: kill(2) with a negative pid signals the process group the
+        // script was placed in above; it has no memory-safety preconditions.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+    let _ = child.kill().await;
+    // The pipes close once the group is gone; bound the wait regardless, in
+    // case a descendant left the group and still holds them.
+    let drain = std::time::Duration::from_secs(2);
+    let (stdout, stdout_total) = tokio::time::timeout(drain, out)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let (stderr, stderr_total) = tokio::time::timeout(drain, err)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    ScriptRun {
+        success: status.is_some_and(|s| s.success()),
+        code: status.and_then(|s| s.code()),
+        stdout,
+        stdout_total,
+        stderr,
+        stderr_total,
+        note,
+    }
+}
+
 /// Interpreter used when a `RunScript` names none: `/bin/sh` on Unix, the
 /// built-in Windows PowerShell (absolute path, so `PATH` cannot redirect a
 /// SYSTEM-level script run) on Windows.
@@ -155,6 +319,72 @@ pub fn dumpable_regions(maps: &str, max_total: u64) -> Vec<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_file_is_capped_and_refuses_devices_and_fifos() {
+        let dir = std::env::temp_dir().join(format!("trapd-rtr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("big");
+        std::fs::write(&f, vec![b'x'; 10_000]).unwrap();
+        let a = collect_file(f.to_str().unwrap(), 100).unwrap();
+        assert_eq!(
+            (a.returned_len, a.total_len, a.truncated),
+            (100, 10_000, true)
+        );
+        let a = collect_file(f.to_str().unwrap(), 10_000).unwrap();
+        assert_eq!((a.returned_len, a.truncated), (10_000, false));
+        // /dev/zero never ends; it must be refused, not read.
+        assert!(collect_file("/dev/zero", 100).is_err());
+        assert!(collect_file(dir.to_str().unwrap(), 100).is_err());
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo with a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(
+            collect_file(fifo.to_str().unwrap(), 100).is_err(),
+            "a FIFO must not block"
+        );
+        // Procfs reports length 0; the read length is the size.
+        let a = collect_file("/proc/self/status", 1 << 16).unwrap();
+        assert!(a.returned_len > 0 && !a.truncated);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_output_is_bounded_and_the_run_is_reported() {
+        let args = script_args("/bin/sh", "head -c 5000000 /dev/zero; echo err >&2; exit 3");
+        let r =
+            run_script_bounded("/bin/sh", &args, std::time::Duration::from_secs(20), 1000).await;
+        assert_eq!(r.code, Some(3));
+        assert!(!r.success);
+        assert_eq!(r.stdout.len(), 1000);
+        assert_eq!(r.stdout_total, 5_000_000);
+        assert_eq!(r.stderr, b"err\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_group() {
+        let dir = std::env::temp_dir().join(format!("trapd-rtr-pg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("survived");
+        // A backgrounded child holds the pipes open and would outlive the shell.
+        let script = format!("(sleep 3; touch {}) & sleep 60", marker.display());
+        let args = script_args("/bin/sh", &script);
+        let started = std::time::Instant::now();
+        let r =
+            run_script_bounded("/bin/sh", &args, std::time::Duration::from_millis(300), 100).await;
+        assert_eq!(r.note, "timed out");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "pipes held the run open"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(!marker.exists(), "a background child survived the timeout");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn cap_and_encode_truncates_and_records_total() {

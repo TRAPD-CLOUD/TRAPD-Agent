@@ -150,7 +150,9 @@ fn run_sync(
 
     // Optional YARA scanner — loads *.yar rules once; inert if none present.
     #[cfg(feature = "yara")]
-    let yara_scanner = crate::detection::yara_scanner::YaraScanner::load();
+    let yara_scanner = crate::detection::yara_scanner::YaraScanner::load_from(
+        &crate::paths::config_dir().join("rules"),
+    );
 
     // Sliding window for mass-modification (ransomware) detection.
     let mut mod_window = MassModification::default();

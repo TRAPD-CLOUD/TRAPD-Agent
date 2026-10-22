@@ -652,12 +652,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    tokio::select! {
+    let consumer_done = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down");
             for handle in &handles {
                 handle.abort();
             }
+            false
         }
         // `systemctl stop` sends SIGTERM: shut down the same orderly way, so
         // the consumer drains and flushes pending finding aggregates.
@@ -666,13 +667,30 @@ async fn main() -> Result<()> {
             for handle in &handles {
                 handle.abort();
             }
+            false
         }
         _ = &mut consumer => {
             info!("Consumer task exited");
+            true
         }
-    }
+    };
 
-    consumer.await.ok();
+    // The consumer ends once every event sender is gone, but tasks outside
+    // `handles` (prevention audit, heartbeat, the detection feedback path)
+    // hold senders for the life of the process. An unbounded wait here hung
+    // shutdown until systemd's stop timeout killed the agent, losing the
+    // spool checkpoint and the clean-shutdown mark on every stop and update.
+    if !consumer_done
+        && tokio::time::timeout(SHUTDOWN_DRAIN, &mut consumer)
+            .await
+            .is_err()
+    {
+        info!(
+            drain_secs = SHUTDOWN_DRAIN.as_secs(),
+            "event consumer still has live senders after the drain window — stopping it"
+        );
+        consumer.abort();
+    }
 
     // Reconcile the journal to exactly the un-acknowledged set, so the next
     // start replays those and nothing else.
@@ -688,9 +706,16 @@ async fn main() -> Result<()> {
     }
 
     heartbeat::lifecycle::mark_clean_shutdown();
+    selfprotect::watchdog::stop();
     info!("Shutdown complete");
-    Ok(())
+    // Returning would drop the runtime, which waits for every blocking task
+    // (blocking sensor reads that never return on their own) and so would
+    // hang the exit. All state worth keeping is persisted above.
+    std::process::exit(0);
 }
+
+/// How long shutdown waits for the event consumer to drain what is queued.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Persist one event locally and enqueue it for the backend.
 ///

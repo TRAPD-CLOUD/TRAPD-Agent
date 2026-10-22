@@ -72,6 +72,11 @@ drop counter exported as `EbpfDrops` events:
 | Kernel/NS | `module_load`, `namespace` | ✅ |
 | Response | `process_block` (`bpf_send_signal`), `dropcount` | ✅ / 🟡 |
 
+Kernel-configuration-dependent hooks (`module_load`, SysV `shm*`, the
+`udp_sendmsg` kprobe, …) attach best-effort: a missing hook disables only its
+own events, and per-hook results are reported in the heartbeat coverage
+(`ebpf_telemetry_programs`).
+
 Userspace enrichment: image SHA-256 per exec (cached), loaded-library inventory,
 curated env + interpreter-script decode, container/K8s context, DNS responses
 (AF_PACKET), netflow depth (INET_DIAG: bytes/packets/RTT), TLS SNI/JA3.
@@ -97,8 +102,10 @@ back through the pipeline (persist + backend + auto-response).
 | Privilege escalation (`setuid(0)`) | ✅ | direct + IOA chain |
 | **Sigma rule engine** | ✅ **NEW** | `detection/sigma/` — Sigma YAML → in-process rules; logsource gating, field modifiers (`contains`/`startswith`/`endswith`/`re`/`cased`/`all`), value lists, keyword search, full condition grammar (`and`/`or`/`not`, `N of`, `all of them`, wildcards). Loaded from `<config>/sigma/*.yml` **and** inline over the signed config channel. |
 | **Statistical anomaly baseline** | ✅ **NEW** | `detection/baseline.rs` — per-user binary novelty + EWMA exec-rate z-score (Poisson std floor), online-learning, bounded, runtime-gated. |
+| **Linux command-line rules** | ✅ **NEW** | `detection/linux_rules.rs` — netcat/socat/pipe/FIFO reverse & bind shells, security-service stop + `auditctl -D`, firewall flush, UID-0 / admin-group accounts, timestomping, setuid/capability grants, `chattr` tamper, tunnelling & MitM tools, disk wipe, privileged containers, K8s token / `/proc/*/environ` reads, sudo/pkexec exploit command lines, kernel-thread and daemon-name masquerading. Shell `-c` scripts are parsed into simple commands; the subject key folds a shell's and its child's finding. FP-prone forms start in shadow/signal mode. |
+| PAM / udev / `at` / systemd drop-in persistence | ✅ **NEW** | path rules shared by the command-line and eBPF file-write detectors |
 | Honeytoken access detection | ✅ | full deploy/detect/respond lifecycle |
-| YARA scanning | 🧪 | `--features yara`; **file** scanning today. ⏳ process-memory scanning (memscan bytes already available). |
+| YARA scanning | ✅ | `--features yara` (vendored libyara, no system library; built and tested in CI). Rules from `<config>/rules/*.yar`. **Files**: newly created files. **Process memory**: the regions the memory scanner flags (anonymous executable, memfd-backed, deleted-image mappings) are read from `/proc/<pid>/mem` — ≤ 16 MiB per region, ≤ 64 MiB per process, once per region and process generation — and emitted as `yara_mem.<rule>` findings (T1055). JIT runtimes are excluded, as for `memory.anon_exec`. |
 | Threat-intel feeds | 🟡 | JSON IOC feed + CVE feed file. ⏳ STIX/TAXII consumer · ⏳ SQLite IOC store with auto-sync · ⏳ IP/domain reputation lookup. |
 
 ---
@@ -216,8 +223,8 @@ reject config from a backend not updated in lockstep.
 | Network containment / isolation | ✅ | nftables (preferred) + iptables fallback, allow-list carve-outs |
 | File quarantine | ✅ | move + `chmod 000` + `chattr +i`, restore by id |
 | Auto-response playbooks | ✅ | opt-in, severity/confidence-gated, cooldown, allowlist, fully audited |
-| Signed command channel | ✅ | Ed25519, nonce + monotonic replay protection |
-| RTR (script exec, file/dir/memory collection) | ✅ | `rtr_enabled`-gated, signed, size-capped; Windows memory requests require an exact observed `process_start_time` FILETIME |
+| Signed command channel | ✅ | Ed25519, nonce + monotonic replay protection; a corrupt/unreadable nonce store fails closed for commands issued before the loss |
+| RTR (script exec, file/dir/memory collection) | ✅ | `rtr_enabled`-gated, signed, size-capped; Windows memory requests require an exact observed `process_start_time` FILETIME. Script output is capped while it streams (not after), a timeout kills the script's whole process group, and `collect_file` reads regular files only, up to the cap (no `/dev/zero`, FIFOs or multi-GB reads) |
 | Kernel-side SHA-256 inode blocking | 🟡 | intentionally userspace post-exec today; ⏳ resolve SHA-256→inode for kernel map |
 | Real **BPF-LSM** enforcement | ⏳🧪 | replace tracepoint signal-kill with `lsm/bprm_check_security` etc. to close the exec race (kernel ≥5.7, `CONFIG_BPF_LSM`) |
 | Memory-injection **prevention** | ⏳🧪 | mmap/memfd/ptrace are detected; LSM-based blocking planned |
@@ -358,7 +365,7 @@ Provisioned files under `<config>` (default `/etc/trapd`): `ca.crt`, `agent.crt`
 
 **P1 — detection breadth/fidelity**
 - ✅ Generic Linux log collector (file / journal / syslog, parsers, rotation).
-- ⏳ YARA over process memory.
+- ✅ YARA over process memory (flagged regions).
 - ⏳ Threat-intel: SQLite IOC store + STIX/TAXII consumer + IP/domain reputation.
 
 **P2 — enterprise ops**

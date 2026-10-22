@@ -32,6 +32,14 @@
 //! | sys_enter_setns       | syscalls/sys_enter_setns              | NsChange     |
 //! | kprobe__udp_sendmsg   | kprobe:udp_sendmsg                    | Dns          |
 //! | vfs_open*             | kprobe:vfs_open                       | Honeytoken   |
+//! | raw_sys_enter         | raw_syscalls/sys_enter (x86_64)       | see below    |
+//!
+//! On x86_64 `raw_sys_enter` replaces the per-syscall programs for the
+//! path-argument syscalls (open family incl. creat, newfstatat/statx/
+//! readlinkat/linkat, unlinkat, renameat2, fchmodat, fchownat, plus their
+//! legacy forms); those are attached only when it is unavailable. Current
+//! kernels can skip BPF on the per-syscall tracepoints of exactly those
+//! syscalls (see `attach_raw_sys_enter`).
 //!
 //! Honeytoken detection spans several programs, all feeding
 //! `HoneytokenAccessEvent` tagged with an `access_kind`:
@@ -61,7 +69,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aya::{
     maps::RingBuf,
-    programs::{KProbe, TracePoint},
+    programs::{KProbe, RawTracePoint, TracePoint},
     Ebpf,
 };
 // MapData is the owned map type returned by Ebpf::take_map; importing it here
@@ -694,6 +702,51 @@ fn proc_username(uid: u32) -> String {
         .unwrap_or_else(|| format!("uid:{uid}"))
 }
 
+/// Attach `raw_sys_enter`, which handles every syscall with a path argument
+/// the collector watches (open family incl. creat/openat2, the honeytoken
+/// stat/readlink/link gates, unlink, rename, chmod, chown) from the raw
+/// `sys_enter` tracepoint.
+///
+/// The per-syscall tracepoints run BPF from `perf_syscall_enter()`, which on
+/// kernels that copy user-space string arguments into syscall events returns
+/// before BPF whenever that copy or its buffer fails. On the ubuntu-26.04 CI
+/// kernel `sys_enter_linkat`/`sys_enter_renameat2` never ran for `ln`/`mv` and
+/// write opens produced no telemetry. The raw tracepoint does not take that
+/// path.
+///
+/// Returns false, leaving the per-syscall programs in charge, when this is not
+/// x86_64 (the program decodes that ABI) or the program is missing or
+/// rejected. The caller attaches the per-syscall programs only then, so no
+/// event is reported twice.
+fn attach_raw_sys_enter(bpf: &mut Ebpf) -> bool {
+    let attached = cfg!(target_arch = "x86_64")
+        && match bpf
+            .program_mut("raw_sys_enter")
+            .and_then(|p| TryInto::<&mut RawTracePoint>::try_into(p).ok())
+        {
+            Some(prog) => match prog.load().and_then(|_| prog.attach("sys_enter")) {
+                Ok(_) => true,
+                Err(e) => {
+                    warn!(error = %e, "raw sys_enter not attached — using per-syscall tracepoints");
+                    false
+                }
+            },
+            None => {
+                info!(
+                    "raw sys_enter program absent in eBPF binary — using per-syscall tracepoints"
+                );
+                false
+            }
+        };
+    crate::telemetry::coverage::update(|c| {
+        c.ebpf_honeytoken_programs
+            .insert("raw_syscalls/sys_enter".into(), attached);
+        c.ebpf_telemetry_programs
+            .insert("raw_syscalls/sys_enter".into(), attached);
+    });
+    attached
+}
+
 /// Build the fixed-size, NUL-padded `HONEYTOKEN_PATHS` key for an absolute
 /// path. Must mirror how the kernel reads the path into a zeroed buffer.
 fn path_key(path: &str) -> [u8; PATH_LEN] {
@@ -734,7 +787,18 @@ fn reconcile_honeytokens(
     let mut index: StdHashMap<u64, (String, String, String)> = StdHashMap::new();
 
     if enabled {
-        for rec in crate::deception::HoneytokenStore::load().list() {
+        // A register that exists but cannot be read right now (fd exhaustion,
+        // I/O error, a parse failure) says nothing about which tokens are
+        // deployed. Keep what is armed instead of disarming every token until
+        // the next tick, which silently blinded the path-based gates.
+        let store = match crate::deception::HoneytokenStore::try_load() {
+            Ok(store) => store,
+            Err(e) => {
+                warn!(error = %e, "honeytoken register unreadable — keeping the armed set");
+                return;
+            }
+        };
+        for rec in store.list() {
             let key = path_key(&rec.path);
             let tid = honeytoken::token_id_u64(&rec.id);
             desired.insert(key, tid);
@@ -1019,16 +1083,60 @@ impl Collector for EbpfSyscallCollector {
             }};
         }
 
-        attach_tp!("syscalls", "sys_enter_openat");
-        // ── Honeytoken coverage: additional access paths (issue #32, point 1) ──
-        // open/openat2 round out file-open coverage; the stat/statx/readlink
-        // tracepoints catch metadata recon; linkat catches hardlink evasion.
-        attach_tp_optional!("syscalls", "sys_enter_open");
-        attach_tp_optional!("syscalls", "sys_enter_openat2");
-        attach_tp_optional!("syscalls", "sys_enter_newfstatat");
-        attach_tp_optional!("syscalls", "sys_enter_statx");
-        attach_tp_optional!("syscalls", "sys_enter_readlinkat");
-        attach_tp_optional!("syscalls", "sys_enter_linkat");
+        // Telemetry hooks that depend on the kernel's configuration
+        // (`module_load` needs CONFIG_MODULES, `shm*` CONFIG_SYSVIPC, the
+        // `udp_sendmsg` kprobe CONFIG_KPROBES). A missing one costs its own
+        // events only: aborting here would take every other hook with it.
+        // Attachment results go to the heartbeat's coverage record.
+        macro_rules! attach_tp_telemetry {
+            ($cat:expr, $name:expr) => {{
+                let attached = match bpf
+                    .program_mut($name)
+                    .and_then(|p| TryInto::<&mut TracePoint>::try_into(p).ok())
+                {
+                    Some(prog) => match prog.load().and_then(|_| prog.attach($cat, $name)) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            warn!(
+                                tracepoint = format!("{}/{}", $cat, $name),
+                                error = %e,
+                                "telemetry tracepoint not attached — its events are unavailable on this host"
+                            );
+                            false
+                        }
+                    },
+                    None => {
+                        warn!(
+                            tracepoint = format!("{}/{}", $cat, $name),
+                            "telemetry program absent in eBPF binary — skipping"
+                        );
+                        false
+                    }
+                };
+                crate::telemetry::coverage::update(|c| {
+                    c.ebpf_telemetry_programs
+                        .insert(format!("{}/{}", $cat, $name), attached);
+                });
+            }};
+        }
+
+        // Syscalls with path arguments go on raw_syscalls:sys_enter when
+        // possible (see `attach_raw_sys_enter` for why the per-syscall
+        // tracepoints are not reliable for them on current kernels); the
+        // per-syscall programs it replaces are then not attached.
+        let raw_sys_enter = attach_raw_sys_enter(&mut bpf);
+        if !raw_sys_enter {
+            attach_tp!("syscalls", "sys_enter_openat");
+            // ── Honeytoken coverage: additional access paths (issue #32, point 1) ──
+            // open/openat2 round out file-open coverage; the stat/statx/readlink
+            // tracepoints catch metadata recon; linkat catches hardlink evasion.
+            attach_tp_optional!("syscalls", "sys_enter_open");
+            attach_tp_optional!("syscalls", "sys_enter_openat2");
+            attach_tp_optional!("syscalls", "sys_enter_newfstatat");
+            attach_tp_optional!("syscalls", "sys_enter_statx");
+            attach_tp_optional!("syscalls", "sys_enter_readlinkat");
+            attach_tp_optional!("syscalls", "sys_enter_linkat");
+        }
         // fd correlation for mmap (content read) + getdents64 (directory recon):
         // the exit hooks bind a token open's returned fd, close prunes it.
         attach_tp!("syscalls", "sys_exit_openat");
@@ -1041,41 +1149,51 @@ impl Collector for EbpfSyscallCollector {
         attach_tp_optional!("syscalls", "sys_exit_mmap");
         attach_tp_optional!("syscalls", "sys_enter_getdents64");
         attach_tp_optional!("syscalls", "sys_enter_close");
-        attach_tp!("syscalls", "sys_enter_connect");
-        attach_tp!("syscalls", "sys_enter_bind");
-        attach_tp!("syscalls", "sys_enter_accept4");
-        attach_tp!("sched", "sched_process_fork");
-        attach_tp!("syscalls", "sys_enter_unlinkat");
-        attach_tp!("syscalls", "sys_enter_renameat2");
-        attach_tp!("syscalls", "sys_enter_fchmodat");
-        attach_tp!("syscalls", "sys_enter_fchownat");
-        attach_tp!("syscalls", "sys_enter_mmap");
-        attach_tp!("syscalls", "sys_enter_ptrace");
-        attach_tp!("module", "module_load");
-        attach_tp!("syscalls", "sys_enter_shmget");
-        attach_tp!("syscalls", "sys_enter_shmat");
-        attach_tp!("syscalls", "sys_enter_unshare");
-        attach_tp!("syscalls", "sys_enter_setns");
-        attach_tp!("syscalls", "sys_enter_write");
-        attach_tp!("syscalls", "sys_enter_kill");
-        attach_tp!("syscalls", "sys_enter_tkill");
-        attach_tp!("syscalls", "sys_enter_tgkill");
-        attach_tp!("syscalls", "sys_enter_setuid");
-        attach_tp!("syscalls", "sys_enter_setreuid");
-        attach_tp!("syscalls", "sys_enter_setresuid");
-        attach_tp!("syscalls", "sys_enter_memfd_create");
+        attach_tp_telemetry!("syscalls", "sys_enter_connect");
+        attach_tp_telemetry!("syscalls", "sys_enter_bind");
+        attach_tp_telemetry!("syscalls", "sys_enter_accept4");
+        attach_tp_telemetry!("sched", "sched_process_fork");
+        if !raw_sys_enter {
+            attach_tp_telemetry!("syscalls", "sys_enter_unlinkat");
+            attach_tp_telemetry!("syscalls", "sys_enter_renameat2");
+            attach_tp_telemetry!("syscalls", "sys_enter_fchmodat");
+            attach_tp_telemetry!("syscalls", "sys_enter_fchownat");
+        }
+        attach_tp_telemetry!("syscalls", "sys_enter_mmap");
+        attach_tp_telemetry!("syscalls", "sys_enter_ptrace");
+        attach_tp_telemetry!("module", "module_load");
+        attach_tp_telemetry!("syscalls", "sys_enter_shmget");
+        attach_tp_telemetry!("syscalls", "sys_enter_shmat");
+        attach_tp_telemetry!("syscalls", "sys_enter_unshare");
+        attach_tp_telemetry!("syscalls", "sys_enter_setns");
+        attach_tp_telemetry!("syscalls", "sys_enter_write");
+        attach_tp_telemetry!("syscalls", "sys_enter_kill");
+        attach_tp_telemetry!("syscalls", "sys_enter_tkill");
+        attach_tp_telemetry!("syscalls", "sys_enter_tgkill");
+        attach_tp_telemetry!("syscalls", "sys_enter_setuid");
+        attach_tp_telemetry!("syscalls", "sys_enter_setreuid");
+        attach_tp_telemetry!("syscalls", "sys_enter_setresuid");
+        attach_tp_telemetry!("syscalls", "sys_enter_memfd_create");
 
         // ── Attach kprobe ─────────────────────────────────────────────────────
         {
-            let prog: &mut KProbe = bpf
+            let attached = match bpf
                 .program_mut("kprobe__udp_sendmsg")
-                .context("kprobe__udp_sendmsg not found in eBPF binary")?
-                .try_into()
-                .context("kprobe__udp_sendmsg is not a KProbe")?;
-            prog.load()
-                .context("BPF verifier rejected kprobe__udp_sendmsg")?;
-            prog.attach("udp_sendmsg", 0)
-                .context("failed to attach kprobe on udp_sendmsg")?;
+                .and_then(|p| TryInto::<&mut KProbe>::try_into(p).ok())
+            {
+                Some(prog) => match prog.load().and_then(|_| prog.attach("udp_sendmsg", 0)) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        warn!(error = %e, "kprobe udp_sendmsg not attached — UDP DNS telemetry unavailable");
+                        false
+                    }
+                },
+                None => false,
+            };
+            crate::telemetry::coverage::update(|c| {
+                c.ebpf_telemetry_programs
+                    .insert("kprobe/udp_sendmsg".into(), attached);
+            });
         }
 
         // These hooks use this object's token maps, unlike the separate exec collector.

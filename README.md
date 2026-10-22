@@ -199,8 +199,9 @@ findings (each carrying a MITRE ATT&CK mapping, a confidence score and evidence)
 - **Recon / lateral movement** (`netscan.rs`) — port scans, address sweeps on
   admin ports (SSH/SMB/RDP/WinRM), and cloud-metadata (`169.254.169.254`) access.
 - **Honeytoken access** (`honeytoken.rs`) — see [Deception](#4-deception-honeytokens).
-- **YARA** (`yara_scanner.rs`, optional `--features yara`) — file scanning when
-  the `libyara` C library is available at build time.
+- **YARA** (`yara_scanner.rs`, optional `--features yara`) — scans newly
+  created files and the suspicious memory regions the memory scanner flags;
+  libyara is compiled from vendored sources (OpenSSL headers needed).
 - **Stateful IOA correlation** (`ioa/`) — the layer *above* the stateless
   heuristics. Where the above ask "is this one event bad?", the IOA engine asks
   "do these events, **in this process lineage**, **in this order**, **within
@@ -606,7 +607,7 @@ cargo clippy --manifest-path agent/Cargo.toml -- -D warnings
 **Optional YARA support:**
 
 ```sh
-# Requires the libyara C library + headers at build time
+# Compiles a vendored libyara; needs a C compiler and OpenSSL (libcrypto) headers
 cargo build --release --manifest-path agent/Cargo.toml --features yara
 ```
 

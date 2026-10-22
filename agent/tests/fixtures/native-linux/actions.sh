@@ -2,6 +2,9 @@
 set -euo pipefail
 mkdir -p /sys/kernel/tracing
 mount -t tracefs tracefs /sys/kernel/tracing || true
+# Per-program run counters, so a failure can tell a hook that never ran from one
+# whose event was lost later (diagnostics only; read back before the stop).
+sysctl -qw kernel.bpf_stats_enabled=1 || true
 export TRAPD_OFFLINE=1 TRAPD_OUTPUT=stdout TRAPD_STATE_DIR=/test/state TRAPD_LOG_DIR=/test/logs TRAPD_EBPF_PATH=/test/trapd-agent-exec
 /test/agent > /test/events.ndjson 2>/test/agent.log & agent=$!
 echo "$agent" > /test/agent.pid
@@ -39,6 +42,11 @@ ln -s decoy-exec /test/exec-link
 fi
 mv /test/decoy.txt /test/decoy-renamed.txt
 sleep 4
+for fd in /proc/"$agent"/fd/*; do
+  kind=$(readlink "$fd" 2>/dev/null) || continue
+  [[ "$kind" == anon_inode:bpf* || "$kind" == "anon_inode:[perf_event]" ]] || continue
+  echo "$kind $(grep -vE '^(pos|flags|mnt_id|ino):' /proc/"$agent"/fdinfo/"${fd##*/}" | tr -s ' \t' ' ' | tr '\n' ' ')"
+done > /test/bpf-progs.txt 2>&1 || true
 kill -TERM "$agent"
 # Give the collector a bounded drain period.
 for i in {1..25}; do kill -0 "$agent" 2>/dev/null || break; sleep 1; done

@@ -23,6 +23,13 @@ jobs:
       - run: cargo build --release --manifest-path agent/Cargo.toml
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # The optional YARA feature compiles a vendored libyara (needs libcrypto
+      # headers for its hash module); build and test it so it cannot rot.
+      - name: YARA feature (file + process-memory scanning)
+        run: |
+          sudo apt-get install -y --no-install-recommends libssl-dev
+          cargo clippy -p trapd-agent --all-targets --features yara -- -D warnings
+          cargo test -p trapd-agent -p trapd-detection --features trapd-agent/yara,trapd-detection/yara
       - name: Validate OCSF contract against pinned official schema
         run: |
           python3 -m pip install -r scripts/ocsf/requirements.txt

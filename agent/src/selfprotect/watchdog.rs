@@ -13,6 +13,10 @@
 //!    `--watchdog-for` flag, so the new instance spawns its own watchdog).
 //! 4. After a successful restart the watchdog exits.  Systemd's
 //!    `Restart=always` ensures the chain is never permanently broken.
+//! 5. An orderly shutdown (SIGTERM / SIGINT) ends the watchdog first via
+//!    [`stop`]: the watchdog exists to recover from an *unexpected* death, and
+//!    restarting an agent an operator deliberately stopped would make it
+//!    impossible to stop outside systemd.
 //!
 //! Detection
 //! ─────────
@@ -22,6 +26,7 @@
 
 use std::path::Path;
 use std::process;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tracing::{info, warn};
@@ -32,6 +37,9 @@ const MAX_RESTART_ATTEMPTS: u32 = 5;
 
 /// CLI argument that marks this invocation as a watchdog.
 pub const WATCHDOG_ARG: &str = "--watchdog-for";
+
+/// The watchdog this agent spawned, kept so an orderly shutdown can end it.
+static WATCHDOG: Mutex<Option<process::Child>> = Mutex::new(None);
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -81,11 +89,16 @@ pub fn spawn_detached() {
         }
 
         match cmd.spawn() {
-            Ok(child) => info!(
-                watchdog_pid = child.id(),
-                agent_pid = my_pid,
-                "Watchdog spawned"
-            ),
+            Ok(child) => {
+                info!(
+                    watchdog_pid = child.id(),
+                    agent_pid = my_pid,
+                    "Watchdog spawned"
+                );
+                if let Ok(mut slot) = WATCHDOG.lock() {
+                    *slot = Some(child);
+                }
+            }
             Err(e) => warn!("Watchdog: spawn failed: {e} — agent runs without watchdog"),
         }
     }
@@ -94,6 +107,21 @@ pub fn spawn_detached() {
     {
         let _ = (exe, my_pid);
         warn!("Watchdog: only supported on Linux — skipping");
+    }
+}
+
+/// End the watchdog this agent spawned, before an orderly exit, so it does not
+/// restart an agent that was deliberately stopped. A no-op without one.
+pub fn stop() {
+    let child = WATCHDOG.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(mut child) = child {
+        // The watchdog holds no state; it only polls for our death.
+        let _ = child.kill();
+        let _ = child.wait();
+        info!(
+            watchdog_pid = child.id(),
+            "Watchdog stopped for orderly shutdown"
+        );
     }
 }
 

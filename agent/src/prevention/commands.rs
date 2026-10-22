@@ -340,8 +340,15 @@ impl Verifier {
             .nonces
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if !store.try_insert(cmd.envelope.nonce, cmd.envelope.expires_at) {
-            return Verdict::Rejected(format!("replay: nonce {} already seen", cmd.envelope.nonce));
+        if !store.try_insert(
+            cmd.envelope.nonce,
+            cmd.envelope.issued_at,
+            cmd.envelope.expires_at,
+        ) {
+            return Verdict::Rejected(format!(
+                "replay: nonce {} already seen, or issued before the nonce store was lost",
+                cmd.envelope.nonce
+            ));
         }
         drop(store);
 
@@ -365,24 +372,57 @@ struct NonceStore {
     path: std::path::PathBuf,
     seen: HashSet<Uuid>,
     records: Vec<NonceRecord>,
+    /// Commands issued before this instant are refused. Set when the store
+    /// on disk could not be read: the nonces it held are unknown, so any
+    /// still-valid command issued before the loss might be a replay.
+    replay_floor: Option<DateTime<Utc>>,
 }
 
 impl NonceStore {
     fn load(path: &Path) -> Self {
-        let records: Vec<NonceRecord> = std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let (records, replay_floor) = match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<Vec<NonceRecord>>(&bytes) {
+                Ok(records) => (records, None),
+                Err(e) => {
+                    // Fail closed: an unreadable store must not reopen the
+                    // replay window for every command it recorded.
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "command nonce store is corrupt; refusing commands issued before now"
+                    );
+                    (Vec::new(), Some(Utc::now()))
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "command nonce store is unreadable; refusing commands issued before now"
+                );
+                (Vec::new(), Some(Utc::now()))
+            }
+        };
         let seen = records.iter().map(|r| r.nonce).collect();
         Self {
             path: path.to_path_buf(),
             seen,
             records,
+            replay_floor,
         }
     }
 
-    fn try_insert(&mut self, nonce: Uuid, expires_at: DateTime<Utc>) -> bool {
+    fn try_insert(
+        &mut self,
+        nonce: Uuid,
+        issued_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> bool {
         if self.seen.contains(&nonce) {
+            return false;
+        }
+        if self.replay_floor.is_some_and(|floor| issued_at < floor) {
             return false;
         }
         let now = Utc::now();
@@ -637,6 +677,30 @@ mod cross_lang_tests {
         }
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(n);
+    }
+
+    #[test]
+    fn corrupt_nonce_store_refuses_commands_issued_before_the_loss() {
+        let pub_path = temp_path("pub");
+        let nonce_path = temp_path("nonces.json");
+        std::fs::write(&pub_path, hex::decode(PUB_HEX).unwrap()).unwrap();
+        std::fs::write(&nonce_path, b"{not json").unwrap();
+        let v = Verifier::new(&pub_path, "agent-test".into(), &nonce_path).unwrap();
+        let cmd: SignedCommand =
+            serde_json::from_str(&format!(r#"{{"envelope":{ENV1},"signature":"{SIG1}"}}"#))
+                .unwrap();
+        match v.verify(&cmd) {
+            Verdict::Rejected(why) => assert!(why.contains("replay"), "{why}"),
+            Verdict::Ok(_) => panic!("command issued before the store loss was accepted"),
+        }
+        // A missing store is a first start, not a loss.
+        let _ = std::fs::remove_file(&nonce_path);
+        let v = Verifier::new(&pub_path, "agent-test".into(), &nonce_path).unwrap();
+        assert!(matches!(v.verify(&cmd), Verdict::Ok(_)));
+        // …and the nonce is now recorded, so a second delivery is a replay.
+        assert!(matches!(v.verify(&cmd), Verdict::Rejected(_)));
+        let _ = std::fs::remove_file(pub_path);
+        let _ = std::fs::remove_file(nonce_path);
     }
 
     #[test]

@@ -1,12 +1,14 @@
-//! Optional YARA-based file scanning.
+//! Optional YARA-based file and process-memory scanning.
 //!
 //! Compiled only with `--features yara` (which pulls in the `yara-rust`
-//! binding and, transitively, the libyara C library).  At start the scanner
-//! compiles every `*.yar` rule file found in [`RULES_DIR`]; newly-created files
-//! reported by the filesystem collector's inotify watch (`CREATE` only) are
-//! scanned against the compiled rule set.  A match yields a detection carrying
-//! the matched rule name, the file path and the `severity` taken from the
-//! rule's YARA metadata (defaulting to `high`).
+//! binding and a vendored libyara).  At start the scanner compiles every
+//! `*.yar` rule file found in the rules directory (`<config>/rules`); newly
+//! created files reported by the filesystem collector's inotify watch
+//! (`CREATE` only) are scanned against the compiled rule set, and so are the
+//! suspicious memory regions the memory scanner finds (anonymous executable,
+//! memfd-backed and deleted-image mappings), via [`YaraScanner::scan_bytes`].
+//! A match yields a detection carrying the matched rule name and the
+//! `severity` taken from the rule's YARA metadata (defaulting to `high`).
 //!
 //! If the rules directory is missing or contains no usable rules, the scanner
 //! is a silent no-op — never an error — so an agent without rules behaves
@@ -18,7 +20,7 @@ use tracing::{info, warn};
 
 use trapd_schema::{DetectionData, Severity};
 
-/// Directory scanned for `*.yar` rule files.
+/// Default directory scanned for `*.yar` rule files.
 const RULES_DIR: &str = "/etc/trapd/rules";
 
 /// Per-scan timeout passed to libyara, in seconds.
@@ -30,13 +32,18 @@ pub struct YaraScanner {
 }
 
 impl YaraScanner {
-    /// Compile all `*.yar` files under [`RULES_DIR`].  Returns an inert scanner
-    /// (no rules) when the directory is absent or no rules compile — by design
-    /// this never fails.
+    /// Compile all `*.yar` files under [`RULES_DIR`].
     pub fn load() -> Self {
-        let dir = Path::new(RULES_DIR);
+        Self::load_from(Path::new(RULES_DIR))
+    }
+
+    /// Compile all `*.yar` files under `dir`.  Returns an inert scanner (no
+    /// rules) when the directory is absent or no rules compile — by design
+    /// this never fails.
+    pub fn load_from(dir: &Path) -> Self {
+        let shown = dir.display();
         if !dir.is_dir() {
-            info!("YaraScanner: {RULES_DIR} absent — YARA scanning disabled");
+            info!("YaraScanner: {shown} absent — YARA scanning disabled");
             return Self { rules: None };
         }
 
@@ -51,7 +58,7 @@ impl YaraScanner {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
-                warn!("YaraScanner: cannot read {RULES_DIR}: {e}");
+                warn!("YaraScanner: cannot read {shown}: {e}");
                 return Self { rules: None };
             }
         };
@@ -87,13 +94,13 @@ impl YaraScanner {
         }
 
         if added == 0 {
-            info!("YaraScanner: no *.yar rules in {RULES_DIR} — YARA scanning disabled");
+            info!("YaraScanner: no *.yar rules in {shown} — YARA scanning disabled");
             return Self { rules: None };
         }
 
         match compiler.compile_rules() {
             Ok(rules) => {
-                info!("YaraScanner: {added} rule file(s) compiled from {RULES_DIR}");
+                info!("YaraScanner: {added} rule file(s) compiled from {shown}");
                 Self { rules: Some(rules) }
             }
             Err(e) => {
@@ -101,6 +108,32 @@ impl YaraScanner {
                 Self { rules: None }
             }
         }
+    }
+
+    /// Compile rules from source text (tests and embedded rule sets).
+    pub fn from_source(source: &str) -> Option<Self> {
+        let rules = yara_rust::Compiler::new()
+            .ok()?
+            .add_rules_str(source)
+            .ok()?
+            .compile_rules()
+            .ok()?;
+        Some(Self { rules: Some(rules) })
+    }
+
+    /// Scan a buffer — a region read from a process's memory. Returns the
+    /// first matching rule's identifier and severity.
+    pub fn scan_bytes(&self, data: &[u8]) -> Option<(String, Severity)> {
+        let rules = self.rules.as_ref()?;
+        let matches = match rules.scan_mem(data, SCAN_TIMEOUT_SECS) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("YaraScanner: memory scan failed: {e}");
+                return None;
+            }
+        };
+        let m = matches.first()?;
+        Some((m.identifier.to_string(), rule_severity(m)))
     }
 
     /// `true` when rules are loaded and scanning is active.
@@ -172,12 +205,49 @@ fn severity_str(s: &Severity) -> &'static str {
     }
 }
 
-fn confidence_for(s: &Severity) -> u8 {
+pub fn confidence_for(s: &Severity) -> u8 {
     match s {
         Severity::Critical => 95,
         Severity::High => 80,
         Severity::Medium => 55,
         Severity::Low => 30,
         Severity::Info => 10,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RULE: &str = r#"
+rule test_shellcode_marker {
+    meta:
+        severity = "critical"
+    strings:
+        $m = "TRAPD-YARA-TEST-MARKER"
+    condition:
+        $m
+}
+"#;
+
+    #[test]
+    fn scan_bytes_matches_and_carries_rule_severity() {
+        let s = YaraScanner::from_source(RULE).unwrap();
+        assert!(s.is_active());
+        let mut buf = vec![0x90u8; 8192];
+        buf[4000..4022].copy_from_slice(b"TRAPD-YARA-TEST-MARKER");
+        assert_eq!(
+            s.scan_bytes(&buf),
+            Some(("test_shellcode_marker".to_string(), Severity::Critical))
+        );
+        assert_eq!(s.scan_bytes(&[0x90u8; 8192]), None);
+    }
+
+    #[test]
+    fn invalid_source_and_missing_dir_are_inert() {
+        assert!(YaraScanner::from_source("rule broken {").is_none());
+        let s = YaraScanner::load_from(Path::new("/nonexistent/trapd/rules"));
+        assert!(!s.is_active());
+        assert_eq!(s.scan_bytes(b"TRAPD-YARA-TEST-MARKER"), None);
     }
 }
