@@ -216,9 +216,11 @@ pub(crate) fn check_honeytoken_user(path_uptr: u64, flags: u64, access_kind: u32
 // per-CPU buffer and returns *before* calling BPF when that copy or the perf
 // buffer allocation fails. On such kernels `sys_enter_linkat` and
 // `sys_enter_renameat2` were observed never to run while `ln`/`mv` executed,
-// so the path gates went blind. The raw `sys_enter` tracepoint does not go
-// through that function, which is why it now carries the gates whenever
-// userspace manages to attach it.
+// so the path gates went blind, and `sys_enter_openat` lost the open-time fd
+// stash that the no-BTF content-read detection depends on. The raw
+// `sys_enter` tracepoint does not go through that function, which is why it
+// now carries the gates and the open-family stash whenever userspace manages
+// to attach it.
 
 /// Slot 0 is set to 1 by userspace once [`honeytoken_sys_enter`] is attached.
 /// The per-syscall programs then leave the path gates to it, so a hit is not
@@ -230,14 +232,20 @@ static HT_RAW_GATE: Array<u32> = Array::<u32>::with_max_entries(1, 0);
 /// the raw gate covers the same syscalls.
 #[inline(always)]
 pub(crate) fn check_honeytoken_user_tp(path_uptr: u64, flags: u64, access_kind: u32) {
-    if HT_RAW_GATE.get(0).copied().unwrap_or(0) != 0 {
+    if raw_gate_active() {
         return;
     }
     check_honeytoken_user(path_uptr, flags, access_kind);
 }
 
+#[inline(always)]
+fn raw_gate_active() -> bool {
+    HT_RAW_GATE.get(0).copied().unwrap_or(0) != 0
+}
+
 // x86_64 only (the agent ships for amd64; userspace attaches this program only
 // there): `struct pt_regs` offsets and syscall numbers of that ABI.
+const PT_REGS_DX: usize = 96; // syscall argument 2
 const PT_REGS_SI: usize = 104; // syscall argument 1
 const PT_REGS_DI: usize = 112; // syscall argument 0
 const PT_REGS_CS: usize = 136;
@@ -273,22 +281,42 @@ fn path_gate_for(nr: u64) -> Option<(usize, u32)> {
 pub fn honeytoken_sys_enter(ctx: RawTracePointContext) -> i32 {
     let args = ctx.as_ptr() as *const u64;
     let nr = unsafe { *args.add(1) };
-    let Some((arg_offset, access_kind)) = path_gate_for(nr) else {
-        return 0;
-    };
-    let regs = unsafe { *args } as *const u8;
-    let cs: u64 = match unsafe { bpf_probe_read_kernel(regs.add(PT_REGS_CS) as *const u64) } {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-    if cs & 0xffff != USER_CS_64 {
+    // open, openat, openat2: the open-time fd stash (the exit hooks bind the
+    // returned fd; without kernel BTF that is also the content-read detector).
+    let open_family = matches!(nr, 2 | 257 | 437);
+    let gate = path_gate_for(nr);
+    if !open_family && gate.is_none() {
         return 0;
     }
-    let path_uptr: u64 = match unsafe { bpf_probe_read_kernel(regs.add(arg_offset) as *const u64) } {
-        Ok(v) => v,
-        Err(_) => return 0,
+    let regs = unsafe { *args } as *const u8;
+    let read_reg = |offset: usize| -> Option<u64> {
+        unsafe { bpf_probe_read_kernel(regs.add(offset) as *const u64) }.ok()
     };
-    check_honeytoken_user(path_uptr, 0, access_kind);
+    match read_reg(PT_REGS_CS) {
+        Some(cs) if cs & 0xffff == USER_CS_64 => {}
+        _ => return 0,
+    }
+    if open_family {
+        let (path_uptr, flags) = match nr {
+            2 => (read_reg(PT_REGS_DI), read_reg(PT_REGS_SI)),
+            257 => (read_reg(PT_REGS_SI), read_reg(PT_REGS_DX)),
+            // openat2: flags are the first field of the user `struct open_how`.
+            _ => (
+                read_reg(PT_REGS_SI),
+                read_reg(PT_REGS_DX)
+                    .and_then(|how| unsafe { bpf_probe_read_user(how as *const u64) }.ok()),
+            ),
+        };
+        if let (Some(path_uptr), Some(flags)) = (path_uptr, flags) {
+            track_open_for_fd(path_uptr, flags);
+        }
+        return 0;
+    }
+    if let Some((arg_offset, access_kind)) = gate {
+        if let Some(path_uptr) = read_reg(arg_offset) {
+            check_honeytoken_user(path_uptr, 0, access_kind);
+        }
+    }
     0
 }
 
@@ -447,8 +475,13 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
 
 #[inline(always)]
 fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
-    let _ = HT_INODE_PENDING.remove(&bpf_get_current_pid_tgid());
-    let _ = HT_OPEN_PENDING.remove(&bpf_get_current_pid_tgid());
+    // With the raw gate attached it owns the fd stash for this open; clearing
+    // or re-stashing here could undo it, depending on which probe runs first.
+    let raw_gate = raw_gate_active();
+    if !raw_gate {
+        let _ = HT_INODE_PENDING.remove(&bpf_get_current_pid_tgid());
+        let _ = HT_OPEN_PENDING.remove(&bpf_get_current_pid_tgid());
+    }
     let filename_uptr: u64 = unsafe { ctx.read_at(24).map_err(|_| -1i64)? };
     if filename_uptr == 0 {
         return Ok(());
@@ -479,7 +512,9 @@ fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
     // matches by inode (robust against symlinks/relative/`..`). Here we only
     // remember a token file/dir open so the matching `sys_exit_openat` can bind
     // the returned fd for mmap/getdents correlation.
-    stash_open_pending(&path, flags);
+    if !raw_gate {
+        stash_open_pending(&path, flags);
+    }
 
     // ── Normal file-open telemetry (unchanged read-only suppression) ─────────
     // O_WRONLY=1, O_RDWR=2, O_CREAT=0x40, O_TRUNC=0x200 – skip pure read-only opens to
@@ -530,7 +565,9 @@ pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
         Err(_) => return 0,
     };
     let flags: u64 = match unsafe { ctx.read_at(24) } { Ok(v) => v, Err(_) => return 0 };
-    track_open_for_fd(filename_uptr, flags);
+    if !raw_gate_active() {
+        track_open_for_fd(filename_uptr, flags);
+    }
     0
 }
 
@@ -553,7 +590,9 @@ pub fn sys_enter_openat2(ctx: TracePointContext) -> u32 {
     };
     let how: u64 = match unsafe { ctx.read_at(32) } { Ok(v) => v, Err(_) => return 0 };
     let flags: u64 = match unsafe { bpf_probe_read_user(how as *const u64) } { Ok(v) => v, Err(_) => return 0 };
-    track_open_for_fd(filename_uptr, flags);
+    if !raw_gate_active() {
+        track_open_for_fd(filename_uptr, flags);
+    }
     0
 }
 

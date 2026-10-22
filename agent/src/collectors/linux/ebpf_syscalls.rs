@@ -694,8 +694,9 @@ fn proc_username(uid: u32) -> String {
         .unwrap_or_else(|| format!("uid:{uid}"))
 }
 
-/// Attach the honeytoken path gates on the raw `sys_enter` tracepoint and
-/// switch off their per-syscall copies (`HT_RAW_GATE`).
+/// Attach the honeytoken path gates and the open-family fd stash on the raw
+/// `sys_enter` tracepoint and switch off their per-syscall copies
+/// (`HT_RAW_GATE`).
 ///
 /// The per-syscall tracepoints run BPF from `perf_syscall_enter()`, which on
 /// kernels that copy user-space string arguments into syscall events returns
