@@ -3,9 +3,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
         bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
-    macros::{kprobe, map, tracepoint},
+    macros::{kprobe, map, raw_tracepoint, tracepoint},
     maps::{Array, HashMap, RingBuf},
-    programs::{ProbeContext, TracePointContext},
+    programs::{ProbeContext, RawTracePointContext, TracePointContext},
     EbpfContext,
 };
 
@@ -206,6 +206,90 @@ pub(crate) fn check_honeytoken_user(path_uptr: u64, flags: u64, access_kind: u32
             .unwrap_or(0)
     };
     emit_honeytoken_buf(&path, written as u32, flags, access_kind);
+}
+
+// ── Path gates on raw_syscalls:sys_enter ─────────────────────────────────────
+//
+// The per-syscall tracepoints (`syscalls/sys_enter_*`) run BPF from
+// `perf_syscall_enter()`. Since kernels that copy user-space string arguments
+// into syscall trace events, that function first faults those strings into a
+// per-CPU buffer and returns *before* calling BPF when that copy or the perf
+// buffer allocation fails. On such kernels `sys_enter_linkat` and
+// `sys_enter_renameat2` were observed never to run while `ln`/`mv` executed,
+// so the path gates went blind. The raw `sys_enter` tracepoint does not go
+// through that function, which is why it now carries the gates whenever
+// userspace manages to attach it.
+
+/// Slot 0 is set to 1 by userspace once [`honeytoken_sys_enter`] is attached.
+/// The per-syscall programs then leave the path gates to it, so a hit is not
+/// reported twice on kernels where both fire.
+#[map]
+static HT_RAW_GATE: Array<u32> = Array::<u32>::with_max_entries(1, 0);
+
+/// [`check_honeytoken_user`] for the per-syscall tracepoints: a no-op while
+/// the raw gate covers the same syscalls.
+#[inline(always)]
+pub(crate) fn check_honeytoken_user_tp(path_uptr: u64, flags: u64, access_kind: u32) {
+    if HT_RAW_GATE.get(0).copied().unwrap_or(0) != 0 {
+        return;
+    }
+    check_honeytoken_user(path_uptr, flags, access_kind);
+}
+
+// x86_64 only (the agent ships for amd64; userspace attaches this program only
+// there): `struct pt_regs` offsets and syscall numbers of that ABI.
+const PT_REGS_SI: usize = 104; // syscall argument 1
+const PT_REGS_DI: usize = 112; // syscall argument 0
+const PT_REGS_CS: usize = 136;
+/// `__USER_CS`: a 64-bit syscall. ia32 compat syscalls (`__USER32_CS`) number
+/// differently (4 is `write` there, not `stat`) and are not decoded; the
+/// per-syscall tracepoints do not report compat syscalls either. Only the low
+/// 16 bits are the selector: with FRED the same slot carries further state.
+const USER_CS_64: u64 = 0x33;
+
+/// (pointer argument holding the path, access kind) for a gated syscall.
+#[inline(always)]
+fn path_gate_for(nr: u64) -> Option<(usize, u32)> {
+    Some(match nr {
+        4 | 6 => (PT_REGS_DI, ACCESS_STAT),      // stat, lstat
+        262 => (PT_REGS_SI, ACCESS_STAT),        // newfstatat
+        332 => (PT_REGS_SI, ACCESS_STATX),       // statx
+        89 => (PT_REGS_DI, ACCESS_READLINK),     // readlink
+        267 => (PT_REGS_SI, ACCESS_READLINK),    // readlinkat
+        86 => (PT_REGS_DI, ACCESS_LINK),         // link (oldpath)
+        265 => (PT_REGS_SI, ACCESS_LINK),        // linkat (oldpath)
+        87 => (PT_REGS_DI, ACCESS_UNLINK),       // unlink
+        263 => (PT_REGS_SI, ACCESS_UNLINK),      // unlinkat
+        82 => (PT_REGS_DI, ACCESS_RENAME),       // rename (oldpath)
+        264 | 316 => (PT_REGS_SI, ACCESS_RENAME), // renameat, renameat2 (oldpath)
+        _ => return None,
+    })
+}
+
+/// Raw tracepoint: raw_syscalls/sys_enter (`args[0]` = user `pt_regs *`,
+/// `args[1]` = syscall number). Runs for every syscall, so anything that is
+/// not a gated syscall returns after one comparison chain.
+#[raw_tracepoint(tracepoint = "sys_enter")]
+pub fn honeytoken_sys_enter(ctx: RawTracePointContext) -> i32 {
+    let args = ctx.as_ptr() as *const u64;
+    let nr = unsafe { *args.add(1) };
+    let Some((arg_offset, access_kind)) = path_gate_for(nr) else {
+        return 0;
+    };
+    let regs = unsafe { *args } as *const u8;
+    let cs: u64 = match unsafe { bpf_probe_read_kernel(regs.add(PT_REGS_CS) as *const u64) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    if cs & 0xffff != USER_CS_64 {
+        return 0;
+    }
+    let path_uptr: u64 = match unsafe { bpf_probe_read_kernel(regs.add(arg_offset) as *const u64) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    check_honeytoken_user(path_uptr, 0, access_kind);
+    0
 }
 
 /// Front half of `mmap`/`getdents64` correlation for the `open` family: if the
@@ -486,7 +570,7 @@ pub fn sys_enter_newfstatat(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    check_honeytoken_user(pathname_uptr, 0, ACCESS_STAT);
+    check_honeytoken_user_tp(pathname_uptr, 0, ACCESS_STAT);
     0
 }
 
@@ -500,7 +584,7 @@ pub fn sys_enter_statx(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    check_honeytoken_user(pathname_uptr, 0, ACCESS_STATX);
+    check_honeytoken_user_tp(pathname_uptr, 0, ACCESS_STATX);
     0
 }
 
@@ -514,7 +598,7 @@ pub fn sys_enter_readlinkat(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    check_honeytoken_user(pathname_uptr, 0, ACCESS_READLINK);
+    check_honeytoken_user_tp(pathname_uptr, 0, ACCESS_READLINK);
     0
 }
 
@@ -537,7 +621,7 @@ pub fn sys_enter_linkat(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    check_honeytoken_user(oldname_uptr, 0, ACCESS_LINK);
+    check_honeytoken_user_tp(oldname_uptr, 0, ACCESS_LINK);
     0
 }
 

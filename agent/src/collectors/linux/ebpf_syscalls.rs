@@ -61,7 +61,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aya::{
     maps::RingBuf,
-    programs::{KProbe, TracePoint},
+    programs::{KProbe, RawTracePoint, TracePoint},
     Ebpf,
 };
 // MapData is the owned map type returned by Ebpf::take_map; importing it here
@@ -694,6 +694,65 @@ fn proc_username(uid: u32) -> String {
         .unwrap_or_else(|| format!("uid:{uid}"))
 }
 
+/// Attach the honeytoken path gates on the raw `sys_enter` tracepoint and
+/// switch off their per-syscall copies (`HT_RAW_GATE`).
+///
+/// The per-syscall tracepoints run BPF from `perf_syscall_enter()`, which on
+/// kernels that copy user-space string arguments into syscall events returns
+/// before BPF whenever that copy or its buffer fails. On the ubuntu-26.04 CI
+/// kernel `sys_enter_linkat`/`sys_enter_renameat2` never ran for `ln`/`mv`.
+/// The raw tracepoint does not take that path.
+///
+/// Returns false, leaving the per-syscall gates in charge, when this is not
+/// x86_64 (the raw program decodes that ABI), the program is missing or
+/// rejected, or the switch-over flag cannot be set (the raw link is detached
+/// again then, so no hit is reported twice).
+fn attach_raw_path_gate(bpf: &mut Ebpf) -> bool {
+    const NAME: &str = "honeytoken_sys_enter";
+    let record = |active: bool| {
+        crate::telemetry::coverage::update(|c| {
+            c.ebpf_honeytoken_programs
+                .insert("raw_syscalls/sys_enter".into(), active);
+        });
+    };
+    record(false);
+    if !cfg!(target_arch = "x86_64") {
+        return false;
+    }
+    let Some(prog) = bpf
+        .program_mut(NAME)
+        .and_then(|p| TryInto::<&mut RawTracePoint>::try_into(p).ok())
+    else {
+        info!(
+            "raw sys_enter honeytoken gate absent in eBPF binary — using per-syscall tracepoints"
+        );
+        return false;
+    };
+    let link = match prog.load().and_then(|_| prog.attach("sys_enter")) {
+        Ok(link) => link,
+        Err(e) => {
+            warn!(error = %e, "raw sys_enter honeytoken gate not attached — using per-syscall tracepoints");
+            return false;
+        }
+    };
+    let switched = bpf
+        .map_mut("HT_RAW_GATE")
+        .and_then(|m| aya::maps::Array::<_, u32>::try_from(m).ok())
+        .is_some_and(|mut gate| gate.set(0, 1, 0).is_ok());
+    if !switched {
+        warn!("HT_RAW_GATE not writable — detaching the raw gate, using per-syscall tracepoints");
+        if let Some(prog) = bpf
+            .program_mut(NAME)
+            .and_then(|p| TryInto::<&mut RawTracePoint>::try_into(p).ok())
+        {
+            let _ = prog.detach(link);
+        }
+        return false;
+    }
+    record(true);
+    true
+}
+
 /// Build the fixed-size, NUL-padded `HONEYTOKEN_PATHS` key for an absolute
 /// path. Must mirror how the kernel reads the path into a zeroed buffer.
 fn path_key(path: &str) -> [u8; PATH_LEN] {
@@ -1067,16 +1126,23 @@ impl Collector for EbpfSyscallCollector {
             }};
         }
 
+        // The honeytoken path gates (stat/statx/readlink, link, unlink,
+        // rename) go on raw_syscalls:sys_enter when possible; see
+        // `attach_raw_path_gate` for why the per-syscall tracepoints are not
+        // reliable for them on current kernels.
+        let raw_path_gate = attach_raw_path_gate(&mut bpf);
         attach_tp!("syscalls", "sys_enter_openat");
         // ── Honeytoken coverage: additional access paths (issue #32, point 1) ──
         // open/openat2 round out file-open coverage; the stat/statx/readlink
         // tracepoints catch metadata recon; linkat catches hardlink evasion.
         attach_tp_optional!("syscalls", "sys_enter_open");
         attach_tp_optional!("syscalls", "sys_enter_openat2");
-        attach_tp_optional!("syscalls", "sys_enter_newfstatat");
-        attach_tp_optional!("syscalls", "sys_enter_statx");
-        attach_tp_optional!("syscalls", "sys_enter_readlinkat");
-        attach_tp_optional!("syscalls", "sys_enter_linkat");
+        if !raw_path_gate {
+            attach_tp_optional!("syscalls", "sys_enter_newfstatat");
+            attach_tp_optional!("syscalls", "sys_enter_statx");
+            attach_tp_optional!("syscalls", "sys_enter_readlinkat");
+            attach_tp_optional!("syscalls", "sys_enter_linkat");
+        }
         // fd correlation for mmap (content read) + getdents64 (directory recon):
         // the exit hooks bind a token open's returned fd, close prunes it.
         attach_tp!("syscalls", "sys_exit_openat");
