@@ -734,7 +734,18 @@ fn reconcile_honeytokens(
     let mut index: StdHashMap<u64, (String, String, String)> = StdHashMap::new();
 
     if enabled {
-        for rec in crate::deception::HoneytokenStore::load().list() {
+        // A register that exists but cannot be read right now (fd exhaustion,
+        // I/O error, a parse failure) says nothing about which tokens are
+        // deployed. Keep what is armed instead of disarming every token until
+        // the next tick, which silently blinded the path-based gates.
+        let store = match crate::deception::HoneytokenStore::try_load() {
+            Ok(store) => store,
+            Err(e) => {
+                warn!(error = %e, "honeytoken register unreadable — keeping the armed set");
+                return;
+            }
+        };
+        for rec in store.list() {
             let key = path_key(&rec.path);
             let tid = honeytoken::token_id_u64(&rec.id);
             desired.insert(key, tid);
