@@ -41,7 +41,7 @@ mounts=()
 if [[ "$mode" == fallback ]]; then mounts=(-v "$dir/no-btf:/sys/kernel/btf/vmlinux:ro"); fi
 docker run --rm --name "$container" --privileged --pid host --network none -e MODE="$mode" \
   -v "$dir:/test" "${mounts[@]}" "$image" bash /test/run.sh > "$dir/actions.log" 2>&1
-python3 - "$dir" "$mode" <<'PY'
+python3 - "$dir" "$mode" <<'PY' || { echo "--- agent warnings/errors"; grep -E "WARN|ERROR|SIGTERM|Shutdown|Consumer|honeytoken" "$dir/agent.log" | grep -v "/proc/net/" | sed 's/\x1b\[[0-9;]*m//g' | tail -40; echo "--- actions"; tail -15 "$dir/actions.log"; exit 1; }
 import collections,json,sys
 from pathlib import Path
 p=Path(sys.argv[1]);mode=sys.argv[2];pid=int((p/'agent.pid').read_text());hits=[]

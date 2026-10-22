@@ -1913,3 +1913,125 @@ mod tests {
         assert!(rules_for("a", "/tmp/build/a", "./a").is_empty());
     }
 }
+
+/// The rules run inside the single event consumer: a panic there would end
+/// the consumer and silently drop every later event. Seeded fuzzing over
+/// shell-syntax fragments guards that no command line can panic them.
+#[cfg(test)]
+mod fuzz {
+    #[test]
+    fn no_command_line_panics_the_rules() {
+        let alphabet: Vec<&str> = vec![
+            " ",
+            "-",
+            "--",
+            "=",
+            "'",
+            "\"",
+            "\\",
+            "|",
+            "||",
+            "&",
+            "&&",
+            ";",
+            "(",
+            ")",
+            "$(",
+            "`",
+            ">",
+            ">>",
+            "<",
+            "2>&1",
+            "&>",
+            "a",
+            "é",
+            "日",
+            "[",
+            "]",
+            ":",
+            "/",
+            "#",
+            "-u",
+            "-c",
+            "-e",
+            "sh",
+            "bash",
+            "nc",
+            "socat",
+            "chmod",
+            "touch",
+            "useradd",
+            "usermod",
+            "-G",
+            "-u",
+            "0",
+            "4",
+            "+s",
+            "u+",
+            "systemctl",
+            "kill",
+            "-s",
+            "sudo",
+            "env",
+            "timeout",
+            "dd",
+            "of=",
+            "if=",
+            "/dev/sd",
+            "chattr",
+            "-i",
+            "setcap",
+            "cap_",
+            "docker",
+            "run",
+            "-v",
+            "/:",
+            "ssh",
+            "-R",
+            "/proc/",
+            "/environ",
+            "mkfifo",
+            "mknod",
+            "p",
+            "openssl",
+            "s_client",
+            "echo",
+            "/etc/passwd",
+            ":0:",
+            "x",
+            "sudoedit",
+            "-s",
+            "pkexec",
+            "\n",
+            "\t",
+            "\u{0}",
+            "=",
+            "A=B",
+        ];
+        let mut seed: u64 = 0x9e3779b97f4a7c15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..60_000 {
+            let n = (next() % 14) as usize;
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push_str(alphabet[(next() as usize) % alphabet.len()]);
+            }
+            let exe = if next() % 3 == 0 {
+                "/tmp/.x/kworker"
+            } else {
+                "/usr/bin/x"
+            };
+            let comm = alphabet[(next() as usize) % alphabet.len()];
+            let r = std::panic::catch_unwind(|| super::inspect_process(comm, exe, &s, None));
+            assert!(
+                r.is_ok(),
+                "panic on comm={comm:?} exe={exe:?} cmdline={s:?}"
+            );
+        }
+    }
+}
