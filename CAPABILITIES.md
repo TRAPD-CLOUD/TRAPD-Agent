@@ -23,7 +23,7 @@ else on Windows is type-checked and unit-tested on shared logic only.
 | Detection engine, Sigma, IOA, baseline | ✅ | ✅ same engine |
 | Honeytokens (deploy / detect / respond) | ✅ | ✅ file + registry decoys, 4663 audit |
 | Ransomware indicators (entropy, mass-write, extension, backup deletion) | ✅ | ✅ shared heuristics over registered local profile paths (including relocated/Entra profiles), plus the default Users tree; remote redirected folders need separate coverage |
-| Agent / binary tamper detection | ✅ `/etc/trapd`, state dir | ✅ config/install directories and their replacement; parent watches rearm protected paths, independent of generic scope changes; integrity-file changes reported immediately; update-aware |
+| Agent / binary tamper detection | 🟡 `/etc/trapd` (config) watched by `FilesystemCollector`; state dir not watched; `agent_protect` watches only `$HOME/.trapd` | ✅ config/install directories and their replacement; parent watches rearm protected paths, independent of generic scope changes; integrity-file changes reported immediately; update-aware |
 | FIM (periodic hashing) | ✅ | ✅ |
 | Process-memory injection scan | ✅ maps: RWX, memfd, deleted exec | ✅ `VirtualQueryEx`: thread started in unbacked executable memory (alert), injected PE (alert), RWX alone (context) |
 | Rootkit cross-view detection | ✅ | ⏳ not planned: depends on `/proc`, `getdents`, `sock_diag` |
@@ -31,13 +31,13 @@ else on Windows is type-checked and unit-tested on shared logic only.
 | Network containment (block IP, isolate) | ✅ nftables / iptables, current backend DNS/config allowances | ✅ native `INetFwPolicy2` / `INetFwRule`, current backend DNS/config allowances, requires every active profile to enforce local rules; preserves profile defaults; native CI |
 | File quarantine + restore | ✅ move + `chmod 000` + `chattr +i` | ✅ SYSTEM ownership + protected DACL, original owner/DACL restored; pins paths and copies into a fresh protected object, preserving NTFS data streams; native CI |
 | Auto-response, signed command channel, RTR | ✅ | ✅ PowerShell via `-EncodedCommand`; memory collection via `ReadProcessMemory` requires the signed observed process generation (LSASS and other protected processes refused) |
-| Pre-exec kernel blocking | 🟡 tracepoint kill (not LSM) | ⏳ none: post-creation kill only (needs a driver) |
+| Kernel-side exec blocking | 🟡 SIGKILL from the `sched_process_exec` tracepoint, comm rules only (not LSM) | ⏳ none: post-creation kill only (needs a driver) |
 | Signed self-update with rollback | ✅ systemd path unit, authenticated recovery targets, resumable completion cleanup | ✅ copied apply helper with staged-launch retries, recovery checks at guard expiry, verified SCM stop, durable recovery and completion cleanup |
 | Binary self-integrity | ✅ | ✅ strict hash check; MSI resets the baseline within its installer transaction, signed updates refresh it with rollback |
 | Inventory (hardware, software, ports) | ✅ | ✅ registry software, native TCP table |
 | Hardening assessment | ✅ CIS-style (sysctl, SSH) | ✅ `WIN-*` checks (UAC, firewall, Defender policy, WDigest, LSA PPL, NTLM, SMB1, RDP NLA, LLMNR, script-block logging, Secure Boot) |
 | Kernel module / driver inventory | ✅ | ✅ loaded drivers (signature `signed` / `unknown`) |
-| Package operations (install / remove) | ✅ apt / dnf | ⏳ not supported |
+| Package operations (install / remove / upgrade) | ✅ apt-get / dnf / yum / zypper | ⏳ not supported |
 | SIEM forwarding | ✅ | ✅ |
 | Forensic snapshot on freeze | ✅ `/proc` incl. open files | ✅ exe, cwd, cmdline, logon session; open handles not enumerated |
 
@@ -59,7 +59,7 @@ streams safely.
 
 ## 1. Kernel & userspace telemetry (eBPF)
 
-The agent ships **18 eBPF programs**, all ring-buffer based and consumed by the
+The agent ships **18 eBPF program sources** (45 attach points: 42 tracepoints, 2 kprobes and 1 raw tracepoint; optional hooks attach only where the running kernel supports them), all ring-buffer based and consumed by the
 userspace collectors (`agent/src/collectors/linux/ebpf_*.rs`), with a per-program
 drop counter exported as `EbpfDrops` events:
 
@@ -70,6 +70,8 @@ drop counter exported as `EbpfDrops` events:
 | Memory | `mmap`, `memfd`, `ptrace`, `shm` | ✅ |
 | Network | `network` (connect/bind/accept), `dns` | ✅ |
 | Kernel/NS | `module_load`, `namespace` | ✅ |
+| Agent protection | `kill` (`kill_attempt`: signals sent to the agent's PID) | ✅ |
+| Syscall fast path | `raw_syscalls` (x86_64; path-argument syscalls, replacing the per-syscall programs when present) | ✅ |
 | Response | `process_block` (`bpf_send_signal`), `dropcount` | ✅ / 🟡 |
 
 Kernel-configuration-dependent hooks (`module_load`, SysV `shm*`, the
@@ -225,7 +227,7 @@ reject config from a backend not updated in lockstep.
 | Auto-response playbooks | ✅ | opt-in, severity/confidence-gated, cooldown, allowlist, fully audited |
 | Signed command channel | ✅ | Ed25519, nonce + monotonic replay protection; a corrupt/unreadable nonce store fails closed for commands issued before the loss |
 | RTR (script exec, file/dir/memory collection) | ✅ | `rtr_enabled`-gated, signed, size-capped; Windows memory requests require an exact observed `process_start_time` FILETIME. Script output is capped while it streams (not after), a timeout kills the script's whole process group, and `collect_file` reads regular files only, up to the cap (no `/dev/zero`, FIFOs or multi-GB reads) |
-| Kernel-side SHA-256 inode blocking | 🟡 | intentionally userspace post-exec today; ⏳ resolve SHA-256→inode for kernel map |
+| Kernel-side hash/inode blocking | 🟡 | SHA-256 rules are enforced in userspace after exec; the kernel program's `BLOCKED_INODES` map is reserved for them. ⏳ resolve SHA-256→inode for the kernel map |
 | Real **BPF-LSM** enforcement | ⏳🧪 | replace tracepoint signal-kill with `lsm/bprm_check_security` etc. to close the exec race (kernel ≥5.7, `CONFIG_BPF_LSM`) |
 | Memory-injection **prevention** | ⏳🧪 | mmap/memfd/ptrace are detected; LSM-based blocking planned |
 
@@ -236,6 +238,7 @@ reject config from a backend not updated in lockstep.
 | Capability | Status |
 |------------|--------|
 | Anti-ptrace (userspace poll + eBPF `ptrace`) | ✅ |
+| Agent-tamper collector (`agent_protect`) | 🟡 watches `$HOME/.trapd` only when it exists, and applies `chattr +i` to legacy paths (`/etc/trapd/agent.conf`, `credentials`, `enrollment.json`) that the agent no longer writes. Config tamper is covered by `FilesystemCollector` instead |
 | Binary integrity (SHA-256 + optional Ed25519) | ✅ |
 | Watchdog (survives SIGKILL, re-execs) | ✅ |
 | Kernel-hardening audit (sysctl posture) | ✅ |
@@ -269,8 +272,8 @@ acknowledged, still queued, or dropped with a named, counted reason.
 | 11 distinct drop reasons, all counted | ✅ | the sum is asserted against the total; a mismatch is `recovery_required` |
 | Derived health state (8 states) | ✅ | pure function of the metrics, so it cannot drift from them |
 | `trapd-agent diagnostics telemetry` | ✅ | collector mode, drops by reason, queue, retries, latency percentiles |
-| Parser fuzzing (journal framing + bounded reader) | ✅ | seeded, ~45 k iterations in the unit suite |
-| Load profiles (100 / 1 000 / 5 000 eps) | ✅ | `--test telemetry_load -- --ignored`; 1 000 eps × 60 s verified lossless |
+| Parser and framing tests | ✅ | unit tests for the log parsers, framing and auditd aggregation; the journal's CRC-32 is tested against every single-bit flip |
+| Load profiles (100 / 1 000 / 5 000 eps) | ✅ | ignored tests that print the measured throughput and loss of each run: `cargo test --release --test telemetry_load -- --ignored --nocapture` |
 | Prometheus/OTEL metric export | ⏳ | counters exist; only the JSON report is exposed today |
 | Multi-day soak profile in CI | ⏳ | bounded load tests gate PRs; long profiles need a reference host |
 
@@ -383,7 +386,7 @@ Provisioned files under `<config>` (default `/etc/trapd`): `ca.crt`, `agent.crt`
 
 ---
 
-_Last updated: 2026-10-08 — adds the platform matrix (§0) and Windows parity work (prevention, containment, quarantine, self-update, memory scan, ransomware heuristics, log collector, hardening). Earlier: 2026-09-08 — adds the generic Linux log collector
+_Last updated: 2026-10-22 — corrections after a code review of the Linux agent: eBPF program count and attach points, `kill` and `raw_syscalls` programs, package managers (`yum`, `zypper`, `upgrade`), exec-blocking and hash-blocking wording, tamper-detection coverage (`agent_protect`, state dir), and unverifiable parser and load-test claims. Earlier: 2026-10-08 — adds the platform matrix (§0) and Windows parity work (prevention, containment, quarantine, self-update, memory scan, ransomware heuristics, log collector, hardening). Earlier: 2026-09-08 — adds the generic Linux log collector
 (§6b: file/journal/syslog pipeline, inode-aware rotation, parsers for
 nginx/apache/postgres/mysql/docker/ssh/sudo/auditd, persisted offsets)
 and cross-view rootkit and manipulation detection (§2b: hidden
