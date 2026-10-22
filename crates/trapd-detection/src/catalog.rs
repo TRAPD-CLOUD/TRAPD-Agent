@@ -1550,6 +1550,18 @@ pub const PREFIXES: &[RuleMeta] = &[
     from_event(rule(
         "yara.", EXEC, "T1204", High, Critical, Alert, Path, HOUR,
     )),
+    // YARA over flagged process-memory regions; the subject is the process,
+    // never a file, so auto-response cannot mistake it for a quarantine path.
+    from_event(rule(
+        "yara_mem.",
+        EVASION,
+        "T1055",
+        High,
+        Critical,
+        Alert,
+        Process,
+        HOUR,
+    )),
     from_event(rule(
         "sigma.", EXEC, "", Medium, Critical, Alert, Command, TEN_MIN,
     )),

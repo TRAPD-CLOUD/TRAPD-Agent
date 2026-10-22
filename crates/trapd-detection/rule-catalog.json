@@ -27,6 +27,19 @@
       "window_s": 3600
     },
     {
+      "base": "high",
+      "base_from_event": true,
+      "container_bump": false,
+      "dedup": "process",
+      "id": "yara_mem.",
+      "max": "critical",
+      "mode": "alert",
+      "root_bump": false,
+      "tactic": "TA0005 Defense Evasion",
+      "technique": "T1055",
+      "window_s": 3600
+    },
+    {
       "base": "medium",
       "base_from_event": true,
       "container_bump": false,

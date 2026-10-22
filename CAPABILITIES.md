@@ -105,7 +105,7 @@ back through the pipeline (persist + backend + auto-response).
 | **Linux command-line rules** | ✅ **NEW** | `detection/linux_rules.rs` — netcat/socat/pipe/FIFO reverse & bind shells, security-service stop + `auditctl -D`, firewall flush, UID-0 / admin-group accounts, timestomping, setuid/capability grants, `chattr` tamper, tunnelling & MitM tools, disk wipe, privileged containers, K8s token / `/proc/*/environ` reads, sudo/pkexec exploit command lines, kernel-thread and daemon-name masquerading. Shell `-c` scripts are parsed into simple commands; the subject key folds a shell's and its child's finding. FP-prone forms start in shadow/signal mode. |
 | PAM / udev / `at` / systemd drop-in persistence | ✅ **NEW** | path rules shared by the command-line and eBPF file-write detectors |
 | Honeytoken access detection | ✅ | full deploy/detect/respond lifecycle |
-| YARA scanning | 🧪 | `--features yara`; **file** scanning today. ⏳ process-memory scanning (memscan bytes already available). |
+| YARA scanning | ✅ | `--features yara` (vendored libyara, no system library; built and tested in CI). Rules from `<config>/rules/*.yar`. **Files**: newly created files. **Process memory**: the regions the memory scanner flags (anonymous executable, memfd-backed, deleted-image mappings) are read from `/proc/<pid>/mem` — ≤ 16 MiB per region, ≤ 64 MiB per process, once per region and process generation — and emitted as `yara_mem.<rule>` findings (T1055). JIT runtimes are excluded, as for `memory.anon_exec`. |
 | Threat-intel feeds | 🟡 | JSON IOC feed + CVE feed file. ⏳ STIX/TAXII consumer · ⏳ SQLite IOC store with auto-sync · ⏳ IP/domain reputation lookup. |
 
 ---
@@ -365,7 +365,7 @@ Provisioned files under `<config>` (default `/etc/trapd`): `ca.crt`, `agent.crt`
 
 **P1 — detection breadth/fidelity**
 - ✅ Generic Linux log collector (file / journal / syslog, parsers, rotation).
-- ⏳ YARA over process memory.
+- ✅ YARA over process memory (flagged regions).
 - ⏳ Threat-intel: SQLite IOC store + STIX/TAXII consumer + IP/domain reputation.
 
 **P2 — enterprise ops**

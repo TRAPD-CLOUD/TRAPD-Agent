@@ -6,7 +6,7 @@ listed when a rule exists for it. That says nothing about detection quality:
 the per-technique true-positive and false-positive rates still have to be
 measured (adversary emulation and a week of idle use per host profile).
 
-141 rules, 91 techniques.
+142 rules, 91 techniques.
 
 | Tactic | Techniques | Rules | alert | signal | shadow |
 |---|---|---|---|---|---|
@@ -14,7 +14,7 @@ measured (adversary emulation and a week of idle use per host profile).
 | TA0002 Execution | 9 | 14 | 7 | 3 | 4 |
 | TA0003 Persistence | 20 | 30 | 16 | 6 | 8 |
 | TA0004 Privilege Escalation | 7 | 12 | 11 | 0 | 1 |
-| TA0005 Defense Evasion | 26 | 37 | 21 | 4 | 12 |
+| TA0005 Defense Evasion | 26 | 38 | 22 | 4 | 12 |
 | TA0006 Credential Access | 15 | 18 | 14 | 3 | 1 |
 | TA0007 Discovery | 3 | 3 | 1 | 2 | 0 |
 | TA0008 Lateral Movement | 1 | 1 | 1 | 0 | 0 |
@@ -88,7 +88,7 @@ measured (adversary emulation and a week of idle use per host profile).
 | T1014 | `rootkit.` (alert) |
 | T1036.004 | `evasion.masquerade_kernel_thread` (alert) |
 | T1036.005 | `evasion.masquerade_system_name` (alert) |
-| T1055 | `memory.anon_exec` (alert) |
+| T1055 | `memory.anon_exec` (alert), `yara_mem.` (alert) |
 | T1055.001 | `memory.injected_pe` (alert) |
 | T1070 | `deception.honeytoken_tamper` (alert) |
 | T1070.001 | `defense_evasion.eventlog_clear` (alert) |

@@ -16,10 +16,13 @@
 //!   * **`LD_PRELOAD` injection** observed at runtime via `/proc/<pid>/environ`
 //!     pointing outside the standard library paths (T1574.006).
 //!
-//! It only reads `maps` and `environ` (never `/proc/<pid>/mem`), so it is cheap
-//! and safe to run on the whole process table; the heavyweight memory *dump*
-//! lives behind a signed RTR command. Findings carry the offending pid in
-//! `evidence`, so the automated-response engine can act on them.
+//! The sweep reads `maps` and `environ`, so it is cheap and safe to run on the
+//! whole process table. With `--features yara` and rules in `<config>/rules`,
+//! the regions it flags (and only those) are also read from
+//! `/proc/<pid>/mem`, bounded per region and per process, and scanned with
+//! YARA (`yara_mem.<rule>` findings). The full memory *dump* stays behind a
+//! signed RTR command. Findings carry the offending pid in `evidence`, so the
+//! automated-response engine can act on them.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -255,7 +258,11 @@ pub struct MemScanCollector {
     cfg: Arc<RwLock<AgentConfig>>,
     /// Already-reported `pid:start:rule:region` keys, so standing conditions
     /// are emitted once per generation, pruned as generations disappear.
+    /// YARA-scanned regions are remembered here too (`pid:start:yara:region`),
+    /// so a region is read once per process generation, not every sweep.
     seen: HashSet<String>,
+    #[cfg(feature = "yara")]
+    yara: crate::detection::yara_scanner::YaraScanner,
 }
 
 impl MemScanCollector {
@@ -263,7 +270,109 @@ impl MemScanCollector {
         Self {
             cfg,
             seen: HashSet::new(),
+            #[cfg(feature = "yara")]
+            yara: crate::detection::yara_scanner::YaraScanner::load_from(
+                &crate::paths::config_dir().join("rules"),
+            ),
         }
+    }
+}
+
+/// YARA reads at most this much of one region…
+#[cfg(feature = "yara")]
+const YARA_REGION_MAX: u64 = 16 << 20;
+/// …and at most this much of one process per sweep, so a process with a huge
+/// suspicious mapping cannot stall the sweep or inflate the agent's memory.
+#[cfg(feature = "yara")]
+const YARA_PROCESS_MAX: u64 = 64 << 20;
+
+/// Read `len` bytes at `start` of `pid`'s address space. `None` when the
+/// region is unreadable or vanished (the process unmapped it, or exited).
+#[cfg(feature = "yara")]
+fn read_region(pid: i32, start: u64, len: u64) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt as _;
+    let mem = std::fs::File::open(format!("/proc/{pid}/mem")).ok()?;
+    let mut buf = vec![0u8; usize::try_from(len).ok()?];
+    let mut done = 0usize;
+    while done < buf.len() {
+        match mem.read_at(&mut buf[done..], start + done as u64) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => done += n,
+        }
+    }
+    (done > 0).then(|| {
+        buf.truncate(done);
+        buf
+    })
+}
+
+/// YARA-scan the given regions of `pid`, within the per-process budget.
+/// Returns `(region, rule, severity)` for each matching region and the
+/// regions that were read (matching or not).
+#[cfg(feature = "yara")]
+fn yara_scan_regions<'a>(
+    scanner: &crate::detection::yara_scanner::YaraScanner,
+    pid: i32,
+    regions: &[&'a MapRegion],
+) -> (Vec<(&'a MapRegion, String, Severity)>, Vec<&'a MapRegion>) {
+    let mut hits = Vec::new();
+    let mut scanned = Vec::new();
+    let mut budget = YARA_PROCESS_MAX;
+    for region in regions {
+        if budget == 0 {
+            break;
+        }
+        if !region.perms.starts_with('r') {
+            continue;
+        }
+        let len = (region.end - region.start).min(YARA_REGION_MAX).min(budget);
+        budget -= len;
+        let Some(bytes) = read_region(pid, region.start, len) else {
+            continue;
+        };
+        scanned.push(*region);
+        if let Some((rule, severity)) = scanner.scan_bytes(&bytes) {
+            hits.push((*region, rule, severity));
+        }
+    }
+    (hits, scanned)
+}
+
+#[cfg(feature = "yara")]
+fn yara_detection(
+    pid: i32,
+    comm: &str,
+    region: &MapRegion,
+    rule: &str,
+    severity: Severity,
+) -> DetectionData {
+    let path = if region.path.is_empty() {
+        "<anonymous>"
+    } else {
+        region.path.as_str()
+    };
+    DetectionData {
+        rule_id: format!("yara_mem.{rule}"),
+        title: format!("YARA rule '{rule}' matched process memory"),
+        category: "memory".into(),
+        mitre_tactic: Some("TA0005 Defense Evasion".into()),
+        mitre_technique: Some("T1055".into()),
+        confidence: crate::detection::yara_scanner::confidence_for(&severity),
+        subject: format!("pid {pid} ({comm})"),
+        detail: format!(
+            "PID {pid} ({comm}): {} region {:#x}-{:#x} {path} matched YARA rule {rule}",
+            region.perms, region.start, region.end
+        ),
+        evidence: serde_json::json!({
+            "pid": pid,
+            "comm": comm,
+            "matched_rule": rule,
+            "region_start": region.start,
+            "region_end": region.end,
+            "perms": region.perms,
+            "mapping": path,
+        }),
+        ..Default::default()
     }
 }
 
@@ -352,12 +461,24 @@ impl MemScanCollector {
             .unwrap_or_else(|_| comm.clone());
         let jit = is_jit_runtime(&exe) || is_jit_runtime(&comm);
         let mut out = Vec::new();
+        #[cfg(feature = "yara")]
+        let mut yara_scanned: Vec<String> = Vec::new();
 
         if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
-            for region in parse_maps(&maps) {
-                if let Some(f) = classify_region(&region) {
+            let regions = parse_maps(&maps);
+            #[cfg(feature = "yara")]
+            let mut suspicious: Vec<&MapRegion> = Vec::new();
+            for region in &regions {
+                if let Some(f) = classify_region(region) {
                     if jit && f.rule_id == "memory.anon_exec" {
                         continue;
+                    }
+                    #[cfg(feature = "yara")]
+                    if !self
+                        .seen
+                        .contains(&format!("{pid}:{start}:yara:{:#x}", region.start))
+                    {
+                        suspicious.push(region);
                     }
                     // Anonymous executable memory is reported once per process
                     // (a JIT-like allocator keeps creating fresh regions);
@@ -368,6 +489,23 @@ impl MemScanCollector {
                         format!("{pid}:{start}:{}:{:#x}", f.rule_id, region.start)
                     };
                     out.push((key, f.severity, finding_to_detection(pid, &comm, &f)));
+                }
+            }
+            #[cfg(feature = "yara")]
+            if self.yara.is_active() && !suspicious.is_empty() {
+                let (hits, scanned) = yara_scan_regions(&self.yara, pid, &suspicious);
+                yara_scanned.extend(
+                    scanned
+                        .iter()
+                        .map(|r| format!("{pid}:{start}:yara:{:#x}", r.start)),
+                );
+                for (region, rule, severity) in hits {
+                    let key = format!("{pid}:{start}:yara_hit:{:#x}:{rule}", region.start);
+                    out.push((
+                        key,
+                        severity,
+                        yara_detection(pid, &comm, region, &rule, severity),
+                    ));
                 }
             }
         }
@@ -397,6 +535,8 @@ impl MemScanCollector {
         if crate::telemetry::identity::process_start_time(pid) != Some(start) {
             return Vec::new();
         }
+        #[cfg(feature = "yara")]
+        self.seen.extend(yara_scanned);
         // Carry the image path and hash so suppressions can match the binary
         // (hashed once per process, only when a finding is new; the hash is
         // cached and size-capped by `exehash`).
@@ -444,6 +584,62 @@ fn live_pids() -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "yara")]
+    #[test]
+    fn yara_finds_a_marker_in_anonymous_executable_memory() {
+        const MARKER: &[u8] = b"TRAPD-YARA-MEM-TEST-7f3a";
+        let scanner = crate::detection::yara_scanner::YaraScanner::from_source(
+            r#"rule injected_marker { meta: severity = "critical"
+               strings: $m = "TRAPD-YARA-MEM-TEST-7f3a" condition: $m }"#,
+        )
+        .unwrap();
+        // An anonymous RWX page in this test process, as injected code would be.
+        // SAFETY: a fresh private anonymous mapping, written only within bounds
+        // and unmapped before returning.
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                MARKER.as_ptr(),
+                (page as *mut u8).add(128),
+                MARKER.len(),
+            );
+        }
+        let addr = page as u64;
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let regions = parse_maps(&maps);
+        let region = regions
+            .iter()
+            .find(|r| r.start <= addr && addr < r.end)
+            .unwrap();
+        assert!(
+            classify_region(region).is_some(),
+            "the page must be flagged first"
+        );
+        let pid = std::process::id() as i32;
+        let (hits, scanned) = yara_scan_regions(&scanner, pid, &[region]);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, "injected_marker");
+        let d = yara_detection(pid, "test", hits[0].0, &hits[0].1, hits[0].2);
+        assert_eq!(d.rule_id, "yara_mem.injected_marker");
+        assert_eq!(d.evidence["pid"], pid);
+        // A clean page is read but does not match.
+        unsafe { std::ptr::write_bytes(page as *mut u8, 0, 4096) };
+        let (hits, _) = yara_scan_regions(&scanner, pid, &[region]);
+        assert!(hits.is_empty());
+        unsafe { libc::munmap(page, 4096) };
+    }
 
     #[test]
     fn parses_a_normal_maps_line() {
