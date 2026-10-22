@@ -32,6 +32,14 @@
 //! | sys_enter_setns       | syscalls/sys_enter_setns              | NsChange     |
 //! | kprobe__udp_sendmsg   | kprobe:udp_sendmsg                    | Dns          |
 //! | vfs_open*             | kprobe:vfs_open                       | Honeytoken   |
+//! | raw_sys_enter         | raw_syscalls/sys_enter (x86_64)       | see below    |
+//!
+//! On x86_64 `raw_sys_enter` replaces the per-syscall programs for the
+//! path-argument syscalls (open family incl. creat, newfstatat/statx/
+//! readlinkat/linkat, unlinkat, renameat2, fchmodat, fchownat, plus their
+//! legacy forms); those are attached only when it is unavailable. Current
+//! kernels can skip BPF on the per-syscall tracepoints of exactly those
+//! syscalls (see `attach_raw_sys_enter`).
 //!
 //! Honeytoken detection spans several programs, all feeding
 //! `HoneytokenAccessEvent` tagged with an `access_kind`:
@@ -694,64 +702,49 @@ fn proc_username(uid: u32) -> String {
         .unwrap_or_else(|| format!("uid:{uid}"))
 }
 
-/// Attach the honeytoken path gates and the open-family fd stash on the raw
-/// `sys_enter` tracepoint and switch off their per-syscall copies
-/// (`HT_RAW_GATE`).
+/// Attach `raw_sys_enter`, which handles every syscall with a path argument
+/// the collector watches (open family incl. creat/openat2, the honeytoken
+/// stat/readlink/link gates, unlink, rename, chmod, chown) from the raw
+/// `sys_enter` tracepoint.
 ///
 /// The per-syscall tracepoints run BPF from `perf_syscall_enter()`, which on
 /// kernels that copy user-space string arguments into syscall events returns
 /// before BPF whenever that copy or its buffer fails. On the ubuntu-26.04 CI
-/// kernel `sys_enter_linkat`/`sys_enter_renameat2` never ran for `ln`/`mv`.
-/// The raw tracepoint does not take that path.
+/// kernel `sys_enter_linkat`/`sys_enter_renameat2` never ran for `ln`/`mv` and
+/// write opens produced no telemetry. The raw tracepoint does not take that
+/// path.
 ///
-/// Returns false, leaving the per-syscall gates in charge, when this is not
-/// x86_64 (the raw program decodes that ABI), the program is missing or
-/// rejected, or the switch-over flag cannot be set (the raw link is detached
-/// again then, so no hit is reported twice).
-fn attach_raw_path_gate(bpf: &mut Ebpf) -> bool {
-    const NAME: &str = "honeytoken_sys_enter";
-    let record = |active: bool| {
-        crate::telemetry::coverage::update(|c| {
-            c.ebpf_honeytoken_programs
-                .insert("raw_syscalls/sys_enter".into(), active);
-        });
-    };
-    record(false);
-    if !cfg!(target_arch = "x86_64") {
-        return false;
-    }
-    let Some(prog) = bpf
-        .program_mut(NAME)
-        .and_then(|p| TryInto::<&mut RawTracePoint>::try_into(p).ok())
-    else {
-        info!(
-            "raw sys_enter honeytoken gate absent in eBPF binary — using per-syscall tracepoints"
-        );
-        return false;
-    };
-    let link = match prog.load().and_then(|_| prog.attach("sys_enter")) {
-        Ok(link) => link,
-        Err(e) => {
-            warn!(error = %e, "raw sys_enter honeytoken gate not attached — using per-syscall tracepoints");
-            return false;
-        }
-    };
-    let switched = bpf
-        .map_mut("HT_RAW_GATE")
-        .and_then(|m| aya::maps::Array::<_, u32>::try_from(m).ok())
-        .is_some_and(|mut gate| gate.set(0, 1, 0).is_ok());
-    if !switched {
-        warn!("HT_RAW_GATE not writable — detaching the raw gate, using per-syscall tracepoints");
-        if let Some(prog) = bpf
-            .program_mut(NAME)
+/// Returns false, leaving the per-syscall programs in charge, when this is not
+/// x86_64 (the program decodes that ABI) or the program is missing or
+/// rejected. The caller attaches the per-syscall programs only then, so no
+/// event is reported twice.
+fn attach_raw_sys_enter(bpf: &mut Ebpf) -> bool {
+    let attached = cfg!(target_arch = "x86_64")
+        && match bpf
+            .program_mut("raw_sys_enter")
             .and_then(|p| TryInto::<&mut RawTracePoint>::try_into(p).ok())
         {
-            let _ = prog.detach(link);
-        }
-        return false;
-    }
-    record(true);
-    true
+            Some(prog) => match prog.load().and_then(|_| prog.attach("sys_enter")) {
+                Ok(_) => true,
+                Err(e) => {
+                    warn!(error = %e, "raw sys_enter not attached — using per-syscall tracepoints");
+                    false
+                }
+            },
+            None => {
+                info!(
+                    "raw sys_enter program absent in eBPF binary — using per-syscall tracepoints"
+                );
+                false
+            }
+        };
+    crate::telemetry::coverage::update(|c| {
+        c.ebpf_honeytoken_programs
+            .insert("raw_syscalls/sys_enter".into(), attached);
+        c.ebpf_telemetry_programs
+            .insert("raw_syscalls/sys_enter".into(), attached);
+    });
+    attached
 }
 
 /// Build the fixed-size, NUL-padded `HONEYTOKEN_PATHS` key for an absolute
@@ -1127,18 +1120,18 @@ impl Collector for EbpfSyscallCollector {
             }};
         }
 
-        // The honeytoken path gates (stat/statx/readlink, link, unlink,
-        // rename) go on raw_syscalls:sys_enter when possible; see
-        // `attach_raw_path_gate` for why the per-syscall tracepoints are not
-        // reliable for them on current kernels.
-        let raw_path_gate = attach_raw_path_gate(&mut bpf);
-        attach_tp!("syscalls", "sys_enter_openat");
-        // ── Honeytoken coverage: additional access paths (issue #32, point 1) ──
-        // open/openat2 round out file-open coverage; the stat/statx/readlink
-        // tracepoints catch metadata recon; linkat catches hardlink evasion.
-        attach_tp_optional!("syscalls", "sys_enter_open");
-        attach_tp_optional!("syscalls", "sys_enter_openat2");
-        if !raw_path_gate {
+        // Syscalls with path arguments go on raw_syscalls:sys_enter when
+        // possible (see `attach_raw_sys_enter` for why the per-syscall
+        // tracepoints are not reliable for them on current kernels); the
+        // per-syscall programs it replaces are then not attached.
+        let raw_sys_enter = attach_raw_sys_enter(&mut bpf);
+        if !raw_sys_enter {
+            attach_tp!("syscalls", "sys_enter_openat");
+            // ── Honeytoken coverage: additional access paths (issue #32, point 1) ──
+            // open/openat2 round out file-open coverage; the stat/statx/readlink
+            // tracepoints catch metadata recon; linkat catches hardlink evasion.
+            attach_tp_optional!("syscalls", "sys_enter_open");
+            attach_tp_optional!("syscalls", "sys_enter_openat2");
             attach_tp_optional!("syscalls", "sys_enter_newfstatat");
             attach_tp_optional!("syscalls", "sys_enter_statx");
             attach_tp_optional!("syscalls", "sys_enter_readlinkat");
@@ -1160,10 +1153,12 @@ impl Collector for EbpfSyscallCollector {
         attach_tp_telemetry!("syscalls", "sys_enter_bind");
         attach_tp_telemetry!("syscalls", "sys_enter_accept4");
         attach_tp_telemetry!("sched", "sched_process_fork");
-        attach_tp_telemetry!("syscalls", "sys_enter_unlinkat");
-        attach_tp_telemetry!("syscalls", "sys_enter_renameat2");
-        attach_tp_telemetry!("syscalls", "sys_enter_fchmodat");
-        attach_tp_telemetry!("syscalls", "sys_enter_fchownat");
+        if !raw_sys_enter {
+            attach_tp_telemetry!("syscalls", "sys_enter_unlinkat");
+            attach_tp_telemetry!("syscalls", "sys_enter_renameat2");
+            attach_tp_telemetry!("syscalls", "sys_enter_fchmodat");
+            attach_tp_telemetry!("syscalls", "sys_enter_fchownat");
+        }
         attach_tp_telemetry!("syscalls", "sys_enter_mmap");
         attach_tp_telemetry!("syscalls", "sys_enter_ptrace");
         attach_tp_telemetry!("module", "module_load");

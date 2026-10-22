@@ -3,9 +3,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
         bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
-    macros::{kprobe, map, raw_tracepoint, tracepoint},
+    macros::{kprobe, map, tracepoint},
     maps::{Array, HashMap, RingBuf},
-    programs::{ProbeContext, RawTracePointContext, TracePointContext},
+    programs::{ProbeContext, TracePointContext},
     EbpfContext,
 };
 
@@ -208,118 +208,6 @@ pub(crate) fn check_honeytoken_user(path_uptr: u64, flags: u64, access_kind: u32
     emit_honeytoken_buf(&path, written as u32, flags, access_kind);
 }
 
-// ── Path gates on raw_syscalls:sys_enter ─────────────────────────────────────
-//
-// The per-syscall tracepoints (`syscalls/sys_enter_*`) run BPF from
-// `perf_syscall_enter()`. Since kernels that copy user-space string arguments
-// into syscall trace events, that function first faults those strings into a
-// per-CPU buffer and returns *before* calling BPF when that copy or the perf
-// buffer allocation fails. On such kernels `sys_enter_linkat` and
-// `sys_enter_renameat2` were observed never to run while `ln`/`mv` executed,
-// so the path gates went blind, and `sys_enter_openat` lost the open-time fd
-// stash that the no-BTF content-read detection depends on. The raw
-// `sys_enter` tracepoint does not go through that function, which is why it
-// now carries the gates and the open-family stash whenever userspace manages
-// to attach it.
-
-/// Slot 0 is set to 1 by userspace once [`honeytoken_sys_enter`] is attached.
-/// The per-syscall programs then leave the path gates to it, so a hit is not
-/// reported twice on kernels where both fire.
-#[map]
-static HT_RAW_GATE: Array<u32> = Array::<u32>::with_max_entries(1, 0);
-
-/// [`check_honeytoken_user`] for the per-syscall tracepoints: a no-op while
-/// the raw gate covers the same syscalls.
-#[inline(always)]
-pub(crate) fn check_honeytoken_user_tp(path_uptr: u64, flags: u64, access_kind: u32) {
-    if raw_gate_active() {
-        return;
-    }
-    check_honeytoken_user(path_uptr, flags, access_kind);
-}
-
-#[inline(always)]
-fn raw_gate_active() -> bool {
-    HT_RAW_GATE.get(0).copied().unwrap_or(0) != 0
-}
-
-// x86_64 only (the agent ships for amd64; userspace attaches this program only
-// there): `struct pt_regs` offsets and syscall numbers of that ABI.
-const PT_REGS_DX: usize = 96; // syscall argument 2
-const PT_REGS_SI: usize = 104; // syscall argument 1
-const PT_REGS_DI: usize = 112; // syscall argument 0
-const PT_REGS_CS: usize = 136;
-/// `__USER_CS`: a 64-bit syscall. ia32 compat syscalls (`__USER32_CS`) number
-/// differently (4 is `write` there, not `stat`) and are not decoded; the
-/// per-syscall tracepoints do not report compat syscalls either. Only the low
-/// 16 bits are the selector: with FRED the same slot carries further state.
-const USER_CS_64: u64 = 0x33;
-
-/// (pointer argument holding the path, access kind) for a gated syscall.
-#[inline(always)]
-fn path_gate_for(nr: u64) -> Option<(usize, u32)> {
-    Some(match nr {
-        4 | 6 => (PT_REGS_DI, ACCESS_STAT),      // stat, lstat
-        262 => (PT_REGS_SI, ACCESS_STAT),        // newfstatat
-        332 => (PT_REGS_SI, ACCESS_STATX),       // statx
-        89 => (PT_REGS_DI, ACCESS_READLINK),     // readlink
-        267 => (PT_REGS_SI, ACCESS_READLINK),    // readlinkat
-        86 => (PT_REGS_DI, ACCESS_LINK),         // link (oldpath)
-        265 => (PT_REGS_SI, ACCESS_LINK),        // linkat (oldpath)
-        87 => (PT_REGS_DI, ACCESS_UNLINK),       // unlink
-        263 => (PT_REGS_SI, ACCESS_UNLINK),      // unlinkat
-        82 => (PT_REGS_DI, ACCESS_RENAME),       // rename (oldpath)
-        264 | 316 => (PT_REGS_SI, ACCESS_RENAME), // renameat, renameat2 (oldpath)
-        _ => return None,
-    })
-}
-
-/// Raw tracepoint: raw_syscalls/sys_enter (`args[0]` = user `pt_regs *`,
-/// `args[1]` = syscall number). Runs for every syscall, so anything that is
-/// not a gated syscall returns after one comparison chain.
-#[raw_tracepoint(tracepoint = "sys_enter")]
-pub fn honeytoken_sys_enter(ctx: RawTracePointContext) -> i32 {
-    let args = ctx.as_ptr() as *const u64;
-    let nr = unsafe { *args.add(1) };
-    // open, openat, openat2: the open-time fd stash (the exit hooks bind the
-    // returned fd; without kernel BTF that is also the content-read detector).
-    let open_family = matches!(nr, 2 | 257 | 437);
-    let gate = path_gate_for(nr);
-    if !open_family && gate.is_none() {
-        return 0;
-    }
-    let regs = unsafe { *args } as *const u8;
-    let read_reg = |offset: usize| -> Option<u64> {
-        unsafe { bpf_probe_read_kernel(regs.add(offset) as *const u64) }.ok()
-    };
-    match read_reg(PT_REGS_CS) {
-        Some(cs) if cs & 0xffff == USER_CS_64 => {}
-        _ => return 0,
-    }
-    if open_family {
-        let (path_uptr, flags) = match nr {
-            2 => (read_reg(PT_REGS_DI), read_reg(PT_REGS_SI)),
-            257 => (read_reg(PT_REGS_SI), read_reg(PT_REGS_DX)),
-            // openat2: flags are the first field of the user `struct open_how`.
-            _ => (
-                read_reg(PT_REGS_SI),
-                read_reg(PT_REGS_DX)
-                    .and_then(|how| unsafe { bpf_probe_read_user(how as *const u64) }.ok()),
-            ),
-        };
-        if let (Some(path_uptr), Some(flags)) = (path_uptr, flags) {
-            track_open_for_fd(path_uptr, flags);
-        }
-        return 0;
-    }
-    if let Some((arg_offset, access_kind)) = gate {
-        if let Some(path_uptr) = read_reg(arg_offset) {
-            check_honeytoken_user(path_uptr, 0, access_kind);
-        }
-    }
-    0
-}
-
 /// Front half of `mmap`/`getdents64` correlation for the `open` family: if the
 /// path is a token file or a token's parent directory, remember it in
 /// [`HT_OPEN_PENDING`] so the matching `sys_exit_*` can bind the returned fd.
@@ -475,18 +363,21 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
 
 #[inline(always)]
 fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
-    // With the raw gate attached it owns the fd stash for this open; clearing
-    // or re-stashing here could undo it, depending on which probe runs first.
-    let raw_gate = raw_gate_active();
-    if !raw_gate {
-        let _ = HT_INODE_PENDING.remove(&bpf_get_current_pid_tgid());
-        let _ = HT_OPEN_PENDING.remove(&bpf_get_current_pid_tgid());
-    }
     let filename_uptr: u64 = unsafe { ctx.read_at(24).map_err(|_| -1i64)? };
+    let flags: u64 = unsafe { ctx.read_at(32).map_err(|_| -1i64)? };
+    open_enter(filename_uptr, flags)
+}
+
+/// Shared by `sys_enter_openat` and the raw `sys_enter` dispatcher (which also
+/// routes open/openat2/creat here): honeytoken fd stash plus write-open
+/// telemetry.
+#[inline(always)]
+pub(crate) fn open_enter(filename_uptr: u64, flags: u64) -> Result<(), i64> {
+    let _ = HT_INODE_PENDING.remove(&bpf_get_current_pid_tgid());
+    let _ = HT_OPEN_PENDING.remove(&bpf_get_current_pid_tgid());
     if filename_uptr == 0 {
         return Ok(());
     }
-    let flags: u64 = unsafe { ctx.read_at(32).map_err(|_| -1i64)? };
 
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let uid_gid = bpf_get_current_uid_gid();
@@ -512,9 +403,7 @@ fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
     // matches by inode (robust against symlinks/relative/`..`). Here we only
     // remember a token file/dir open so the matching `sys_exit_openat` can bind
     // the returned fd for mmap/getdents correlation.
-    if !raw_gate {
-        stash_open_pending(&path, flags);
-    }
+    stash_open_pending(&path, flags);
 
     // ── Normal file-open telemetry (unchanged read-only suppression) ─────────
     // O_WRONLY=1, O_RDWR=2, O_CREAT=0x40, O_TRUNC=0x200 – skip pure read-only opens to
@@ -565,9 +454,7 @@ pub fn sys_enter_open(ctx: TracePointContext) -> u32 {
         Err(_) => return 0,
     };
     let flags: u64 = match unsafe { ctx.read_at(24) } { Ok(v) => v, Err(_) => return 0 };
-    if !raw_gate_active() {
-        track_open_for_fd(filename_uptr, flags);
-    }
+    track_open_for_fd(filename_uptr, flags);
     0
 }
 
@@ -590,9 +477,7 @@ pub fn sys_enter_openat2(ctx: TracePointContext) -> u32 {
     };
     let how: u64 = match unsafe { ctx.read_at(32) } { Ok(v) => v, Err(_) => return 0 };
     let flags: u64 = match unsafe { bpf_probe_read_user(how as *const u64) } { Ok(v) => v, Err(_) => return 0 };
-    if !raw_gate_active() {
-        track_open_for_fd(filename_uptr, flags);
-    }
+    track_open_for_fd(filename_uptr, flags);
     0
 }
 
@@ -609,7 +494,7 @@ pub fn sys_enter_newfstatat(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    check_honeytoken_user_tp(pathname_uptr, 0, ACCESS_STAT);
+    check_honeytoken_user(pathname_uptr, 0, ACCESS_STAT);
     0
 }
 
@@ -623,7 +508,7 @@ pub fn sys_enter_statx(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    check_honeytoken_user_tp(pathname_uptr, 0, ACCESS_STATX);
+    check_honeytoken_user(pathname_uptr, 0, ACCESS_STATX);
     0
 }
 
@@ -637,7 +522,7 @@ pub fn sys_enter_readlinkat(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    check_honeytoken_user_tp(pathname_uptr, 0, ACCESS_READLINK);
+    check_honeytoken_user(pathname_uptr, 0, ACCESS_READLINK);
     0
 }
 
@@ -660,7 +545,7 @@ pub fn sys_enter_linkat(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    check_honeytoken_user_tp(oldname_uptr, 0, ACCESS_LINK);
+    check_honeytoken_user(oldname_uptr, 0, ACCESS_LINK);
     0
 }
 
