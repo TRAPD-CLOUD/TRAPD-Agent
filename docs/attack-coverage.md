@@ -6,22 +6,22 @@ listed when a rule exists for it. That says nothing about detection quality:
 the per-technique true-positive and false-positive rates still have to be
 measured (adversary emulation and a week of idle use per host profile).
 
-113 rules, 73 techniques.
+141 rules, 91 techniques.
 
 | Tactic | Techniques | Rules | alert | signal | shadow |
 |---|---|---|---|---|---|
 | TA0001 Initial Access | 2 | 2 | 2 | 0 | 0 |
 | TA0002 Execution | 9 | 14 | 7 | 3 | 4 |
-| TA0003 Persistence | 16 | 26 | 13 | 5 | 8 |
-| TA0004 Privilege Escalation | 5 | 6 | 6 | 0 | 0 |
-| TA0005 Defense Evasion | 19 | 29 | 16 | 4 | 9 |
-| TA0006 Credential Access | 11 | 14 | 11 | 2 | 1 |
+| TA0003 Persistence | 20 | 30 | 16 | 6 | 8 |
+| TA0004 Privilege Escalation | 7 | 12 | 11 | 0 | 1 |
+| TA0005 Defense Evasion | 26 | 37 | 21 | 4 | 12 |
+| TA0006 Credential Access | 15 | 18 | 14 | 3 | 1 |
 | TA0007 Discovery | 3 | 3 | 1 | 2 | 0 |
 | TA0008 Lateral Movement | 1 | 1 | 1 | 0 | 0 |
 | TA0009 Collection | 1 | 1 | 0 | 1 | 0 |
 | TA0010 Exfiltration | 2 | 2 | 2 | 0 | 0 |
-| TA0011 Command and Control | 6 | 8 | 6 | 0 | 2 |
-| TA0040 Impact | 3 | 7 | 6 | 1 | 0 |
+| TA0011 Command and Control | 7 | 13 | 10 | 1 | 2 |
+| TA0040 Impact | 4 | 8 | 7 | 1 | 0 |
 
 ## TA0001 Initial Access
 
@@ -49,9 +49,11 @@ measured (adversary emulation and a week of idle use per host profile).
 | Technique | Rules (mode) |
 |---|---|
 | T1053 | `persistence.autostart_write` (alert) |
+| T1053.002 | `persistence.at_job` (alert) |
 | T1053.003 | `persistence.cron_write` (alert) |
 | T1053.005 | `persistence.schtasks_user_path` (shadow), `persistence.scheduled_task_created` (signal), `persistence.scheduled_task_userpath` (shadow), `persistence.scheduled_task_suspicious` (alert) |
 | T1098.004 | `persistence.ssh_authorized_keys` (alert) |
+| T1136.001 | `persistence.account_created` (signal) |
 | T1505.003 | `webshell.windows_child_shell` (shadow) |
 | T1543.002 | `persistence.systemd_unit` (alert) |
 | T1543.003 | `persistence.service_user_path` (shadow), `persistence.service_installed` (signal), `persistence.service_image_userpath` (shadow), `persistence.service_image_suspicious` (alert) |
@@ -60,41 +62,52 @@ measured (adversary emulation and a week of idle use per host profile).
 | T1546.010 | `persistence.appinit_dlls` (alert) |
 | T1546.012 | `persistence.ifeo_debugger` (alert) |
 | T1546.015 | `persistence.com_hijack` (shadow) |
+| T1546.017 | `persistence.udev_rule` (alert) |
 | T1547.001 | `persistence.run_key` (shadow), `persistence.registry_run_key_added` (signal), `persistence.registry_run_userpath` (shadow), `persistence.registry_run_suspicious` (alert) |
 | T1547.004 | `persistence.winlogon_modified` (alert) |
 | T1547.006 | `defense.kmod_from_tmp` (alert) |
+| T1556.003 | `persistence.pam_module` (alert) |
 | T1574.006 | `persistence.ld_preload` (alert) |
 
 ## TA0004 Privilege Escalation
 
 | Technique | Rules (mode) |
 |---|---|
-| T1068 | `ioa.privilege_escalation_activity` (alert) |
-| T1548 | `privesc.gtfobin` (alert) |
-| T1548.001 | `privesc.setuid_root` (alert), `privesc.untracked_suid_exec` (alert) |
+| T1068 | `ioa.privilege_escalation_activity` (alert), `privesc.exploit_cmdline` (alert) |
+| T1098 | `privesc.admin_group_added` (alert) |
+| T1136.001 | `privesc.uid0_account` (alert) |
+| T1548 | `privesc.gtfobin` (alert), `privesc.capability_set` (alert) |
+| T1548.001 | `privesc.setuid_root` (alert), `privesc.untracked_suid_exec` (alert), `privesc.setuid_bit_set` (alert) |
 | T1548.003 | `privesc.sudoers_modify` (alert) |
-| T1611 | `container.escape_indicators` (alert) |
+| T1611 | `container.escape_indicators` (alert), `container.privileged_launch` (shadow) |
 
 ## TA0005 Defense Evasion
 
 | Technique | Rules (mode) |
 |---|---|
 | T1014 | `rootkit.` (alert) |
+| T1036.004 | `evasion.masquerade_kernel_thread` (alert) |
+| T1036.005 | `evasion.masquerade_system_name` (alert) |
 | T1055 | `memory.anon_exec` (alert) |
 | T1055.001 | `memory.injected_pe` (alert) |
 | T1070 | `deception.honeytoken_tamper` (alert) |
 | T1070.001 | `defense_evasion.eventlog_clear` (alert) |
 | T1070.002 | `evasion.log_or_history_clear` (alert) |
 | T1070.003 | `evasion.history_clear` (signal) |
+| T1070.006 | `evasion.timestomp` (shadow) |
 | T1112 | `persistence.registry_object_renamed` (signal) |
 | T1218.005 | `lolbin.mshta_remote` (shadow) |
 | T1218.010 | `lolbin.regsvr32_remote` (alert) |
 | T1218.011 | `lolbin.rundll32_script` (shadow), `lolbin.rundll32_no_args` (shadow), `lolbin.rundll32_remote` (shadow) |
+| T1222.002 | `evasion.chattr_tamper` (shadow) |
 | T1562 | `selfprotect.unclean_shutdown` (signal) |
-| T1562.001 | `defense_evasion.amsi_bypass` (shadow), `defense_evasion.defender_tamper` (alert), `defense_evasion.defender_exclusion` (alert), `defense_evasion.defender_disabled` (alert) |
+| T1562.001 | `evasion.security_service_stopped` (alert), `defense_evasion.amsi_bypass` (shadow), `defense_evasion.defender_tamper` (alert), `defense_evasion.defender_exclusion` (alert), `defense_evasion.defender_disabled` (alert) |
 | T1562.002 | `defense_evasion.eventlog_disabled` (shadow), `defense_evasion.audit_policy_disabled` (shadow), `selfprotect.audit_policy_changed` (alert) |
+| T1562.004 | `evasion.firewall_disabled` (shadow) |
 | T1562.006 | `selfprotect.etw_session_stopped` (alert) |
 | T1562.009 | `defense_evasion.boot_config_tamper` (shadow) |
+| T1562.012 | `evasion.audit_rules_cleared` (alert) |
+| T1564.001 | `evasion.hidden_exec_in_temp` (alert) |
 | T1574.002 | `defense_evasion.dll_sideload` (shadow) |
 | T1574.006 | `injection.ld_preload` (alert), `injection.ld_preload_runtime` (alert) |
 | T1620 | `fileless.memfd_exec` (alert), `memory.memfd_exec` (alert), `memory.deleted_exec` (signal) |
@@ -108,12 +121,16 @@ measured (adversary emulation and a week of idle use per host profile).
 | T1003.003 | `credential_access.ntds_dump` (shadow) |
 | T1003.007 | `creds.proc_mem_access` (alert) |
 | T1003.008 | `creds.shadow_read` (alert) |
+| T1040 | `creds.network_sniffing` (signal) |
 | T1110.001 | `auth.windows_bruteforce` (alert), `auth.windows_bruteforce_success` (alert) |
 | T1110.003 | `auth.windows_password_spray` (alert) |
+| T1528 | `creds.k8s_token_access` (alert) |
+| T1552 | `creds.proc_environ_read` (alert) |
 | T1552.001 | `creds.secret_store_access` (alert) |
 | T1552.004 | `creds.private_key_read` (alert) |
 | T1552.005 | `cloud.imds_access` (signal) |
 | T1555 | `creds.sensitive_file_access` (alert) |
+| T1557 | `creds.mitm_tool` (alert) |
 
 ## TA0007 Discovery
 
@@ -146,12 +163,13 @@ measured (adversary emulation and a week of idle use per host profile).
 
 | Technique | Rules (mode) |
 |---|---|
-| T1059.004 | `revshell.dev_tcp_redirect` (alert) |
+| T1059.004 | `revshell.dev_tcp_redirect` (alert), `revshell.netcat_exec` (alert), `revshell.pipe_relay` (alert), `revshell.socat_exec` (alert) |
 | T1059.006 | `revshell.interpreter_socket` (alert) |
 | T1071 | `ioc.network_ip` (alert), `beaconing.regular_interval` (alert) |
 | T1071.004 | `ioc.dns_domain` (alert), `dns_tunnel.anomalous_query_volume` (alert) |
 | T1105 | `lolbin.certutil_download` (shadow) |
 | T1197 | `lolbin.bitsadmin_download` (shadow) |
+| T1572 | `c2.tunnel_tool` (alert), `c2.ssh_tunnel` (signal) |
 
 ## TA0040 Impact
 
@@ -160,6 +178,7 @@ measured (adversary emulation and a week of idle use per host profile).
 | T1486 | `ransomware.mass_modification` (alert), `ransomware.suspicious_extension` (alert), `ransomware.high_entropy` (signal) |
 | T1490 | `impact.shadow_copy_delete` (alert), `ransomware.backup_tamper` (alert), `impact.recovery_disabled` (alert) |
 | T1496 | `impact.cryptominer` (alert) |
+| T1561.001 | `impact.disk_wipe` (alert) |
 
 ## Tactics without any rule
 

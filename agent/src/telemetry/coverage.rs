@@ -69,6 +69,11 @@ pub struct Coverage {
     pub ebpf_honeytoken_programs: BTreeMap<String, bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ebpf_honeytoken_inode: Option<bool>,
+    /// Telemetry hooks (`category/name`) and whether each attached. A `false`
+    /// names events this host cannot produce, e.g. `module/module_load` on a
+    /// kernel built without loadable modules.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ebpf_telemetry_programs: BTreeMap<String, bool>,
 }
 
 impl Coverage {
@@ -82,7 +87,11 @@ impl Coverage {
     }
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn clear_ebpf_attachments(&mut self) {
-        for active in self.ebpf_honeytoken_programs.values_mut() {
+        for active in self
+            .ebpf_honeytoken_programs
+            .values_mut()
+            .chain(self.ebpf_telemetry_programs.values_mut())
+        {
             *active = false;
         }
         self.ebpf_honeytoken_inode = Some(false);

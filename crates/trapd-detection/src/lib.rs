@@ -43,6 +43,7 @@ pub mod honeytoken;
 pub mod honeytoken_policy;
 mod ioa;
 mod ioc;
+mod linux_rules;
 mod netscan;
 pub mod registry_rules;
 pub mod replay;
@@ -1004,6 +1005,9 @@ impl DetectionEngine {
             }
         }
         for d in behavior::inspect_process_context(comm, exe, cmdline, ctx) {
+            out.push(self.detection(Severity::Info, d));
+        }
+        for d in linux_rules::inspect_process(comm, exe, cmdline, ctx) {
             out.push(self.detection(Severity::Info, d));
         }
         // Windows LOLBin / persistence / evasion rules (match `*.exe` only).

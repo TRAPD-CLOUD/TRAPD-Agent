@@ -19,6 +19,9 @@ pub const FILE_COVERED_RULES: &[&str] = &[
     "persistence.autostart_write",
     "persistence.rc_edit",
     "persistence.ld_preload",
+    "persistence.pam_module",
+    "persistence.udev_rule",
+    "persistence.at_job",
     "privesc.sudoers_modify",
 ];
 
@@ -44,6 +47,11 @@ const PKG_WRITERS: &[&str] = &[
 /// Writers sanctioned for a specific location.
 const SANCTIONED: &[(&str, &[&str])] = &[
     ("privesc.sudoers_modify", &["visudo"]),
+    ("persistence.at_job", &["atd"]),
+    (
+        "persistence.pam_module",
+        &["pam-auth-update", "authselect", "authconfig"],
+    ),
     (
         "persistence.ssh_authorized_keys",
         &["sshd", "ssh-copy-id", "google_guest_ag", "cloud-init"],

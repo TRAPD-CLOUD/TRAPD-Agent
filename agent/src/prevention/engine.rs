@@ -1097,37 +1097,15 @@ impl Engine {
         let script_args = response_rtr::script_args(&prog, &script);
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 300));
 
-        // `kill_on_drop`: the timeout below drops this future, and the script
-        // must stop with it rather than keep running unobserved after the
-        // result was reported as timed out.
-        let run = tokio::process::Command::new(&prog)
-            .args(&script_args)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
-
-        let (success, code, stdout, stderr, note) = match tokio::time::timeout(timeout, run).await {
-            Ok(Ok(out)) => (
-                out.status.success(),
-                out.status.code(),
-                out.stdout,
-                out.stderr,
-                String::new(),
-            ),
-            Ok(Err(e)) => (
-                false,
-                None,
-                Vec::new(),
-                Vec::new(),
-                format!("spawn failed: {e}"),
-            ),
-            Err(_) => (false, None, Vec::new(), Vec::new(), "timed out".to_string()),
-        };
-
         let max = max_bytes as usize;
-        let out_art = response_rtr::cap_and_encode(&stdout, max);
-        let err_art =
-            response_rtr::cap_and_encode(&stderr, max.saturating_sub(out_art.b64.len()).max(1));
+        let run = response_rtr::run_script_bounded(&prog, &script_args, timeout, max).await;
+        let (success, code, note) = (run.success, run.code, run.note);
+        let out_art = response_rtr::encode_prefix(&run.stdout, run.stdout_total);
+        let err_cap = max.saturating_sub(out_art.b64.len()).max(1);
+        let err_art = response_rtr::encode_prefix(
+            &run.stderr[..run.stderr.len().min(err_cap)],
+            run.stderr_total,
+        );
 
         self.audit.emit(
             EventAction::CommandAccepted,
@@ -1171,9 +1149,8 @@ impl Engine {
             return self.rtr_refuse("rtr_collect_file", path.to_string(), cmd_id);
         }
         let cap = max_bytes.unwrap_or(default_max).min(default_max) as usize;
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let art = response_rtr::cap_and_encode(&bytes, cap);
+        match response_rtr::collect_file(path, cap) {
+            Ok(art) => {
                 self.audit.emit(
                     EventAction::CommandAccepted,
                     Severity::Info,

@@ -571,6 +571,33 @@ pub fn persistence_rule_for_path(path: &str) -> Option<(&'static str, &'static s
             "sudoers policy modified",
         ));
     }
+    // `at` jobs live under the cron spool on Debian; check them first.
+    if p.starts_with("/var/spool/cron/atjobs") || p.starts_with("/var/spool/at/") {
+        return Some(("persistence.at_job", "T1053.002", "at job scheduled"));
+    }
+    // A PAM module or stack change runs attacker code inside every login.
+    if p.starts_with("/etc/pam.d/")
+        || p == "/etc/pam.conf"
+        || (p.contains("/security/")
+            && p.ends_with(".so")
+            && ["/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/"]
+                .iter()
+                .any(|r| p.starts_with(r)))
+    {
+        return Some((
+            "persistence.pam_module",
+            "T1556.003",
+            "PAM configuration or module modified",
+        ));
+    }
+    if (p.starts_with("/etc/udev/rules.d/")
+        || p.starts_with("/lib/udev/rules.d/")
+        || p.starts_with("/usr/lib/udev/rules.d/")
+        || p.starts_with("/run/udev/rules.d/"))
+        && p.ends_with(".rules")
+    {
+        return Some(("persistence.udev_rule", "T1546.017", "udev rule written"));
+    }
     if p.starts_with("/etc/cron")
         || p.starts_with("/var/spool/cron")
         || p.starts_with("/etc/anacrontab")
@@ -583,10 +610,16 @@ pub fn persistence_rule_for_path(path: &str) -> Option<(&'static str, &'static s
         || p.contains("/.config/systemd/user/")
         || p.starts_with("/etc/systemd/user/")
     {
+        // A drop-in (`foo.service.d/override.conf`) can replace ExecStart.
+        let drop_in = p.ends_with(".conf")
+            && p.rsplit('/')
+                .nth(1)
+                .is_some_and(|dir| dir.ends_with(".service.d") || dir.ends_with(".timer.d"));
         if p.ends_with(".service")
             || p.ends_with(".timer")
             || p.ends_with(".socket")
             || p.ends_with(".path")
+            || drop_in
         {
             return Some((
                 "persistence.systemd_unit",
@@ -597,6 +630,10 @@ pub fn persistence_rule_for_path(path: &str) -> Option<(&'static str, &'static s
         return None;
     }
     if p.starts_with("/etc/init.d/")
+        || p.starts_with("/etc/systemd/system-generators/")
+        || p.starts_with("/usr/lib/systemd/system-generators/")
+        || p.starts_with("/usr/local/lib/systemd/system-generators/")
+        || p.starts_with("/etc/rc.d/rc.local")
         || p.starts_with("/etc/rc.local")
         || p.starts_with("/etc/profile.d/")
         || p.starts_with("/etc/update-motd.d/")
@@ -1259,6 +1296,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(d.rule_id, "persistence.rc_edit");
+    }
+
+    #[test]
+    fn pam_udev_at_and_drop_in_paths() {
+        let rule = |p: &str| persistence_rule_for_path(p).map(|r| r.0);
+        assert_eq!(rule("/etc/pam.d/sshd"), Some("persistence.pam_module"));
+        assert_eq!(
+            rule("/lib/x86_64-linux-gnu/security/pam_unix.so"),
+            Some("persistence.pam_module")
+        );
+        assert_eq!(
+            rule("/usr/lib64/security/pam_evil.so"),
+            Some("persistence.pam_module")
+        );
+        assert_eq!(rule("/opt/app/security/x.so"), None);
+        assert_eq!(
+            rule("/etc/udev/rules.d/99-x.rules"),
+            Some("persistence.udev_rule")
+        );
+        assert_eq!(
+            rule("/var/spool/cron/atjobs/a0001"),
+            Some("persistence.at_job")
+        );
+        assert_eq!(
+            rule("/var/spool/cron/crontabs/root"),
+            Some("persistence.cron_write")
+        );
+        assert_eq!(
+            rule("/etc/systemd/system/ssh.service.d/override.conf"),
+            Some("persistence.systemd_unit")
+        );
+        assert_eq!(rule("/etc/systemd/system/x.conf"), None);
+        assert_eq!(
+            rule("/etc/systemd/system-generators/g"),
+            Some("persistence.autostart_write")
+        );
+        let d = inspect_process("tee", "/usr/bin/tee", "tee -a /etc/pam.d/common-auth").unwrap();
+        assert_eq!(d.rule_id, "persistence.pam_module");
     }
 
     #[test]

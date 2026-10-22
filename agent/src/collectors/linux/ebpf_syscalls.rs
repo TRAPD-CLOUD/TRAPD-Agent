@@ -1019,6 +1019,43 @@ impl Collector for EbpfSyscallCollector {
             }};
         }
 
+        // Telemetry hooks that depend on the kernel's configuration
+        // (`module_load` needs CONFIG_MODULES, `shm*` CONFIG_SYSVIPC, the
+        // `udp_sendmsg` kprobe CONFIG_KPROBES). A missing one costs its own
+        // events only: aborting here would take every other hook with it.
+        // Attachment results go to the heartbeat's coverage record.
+        macro_rules! attach_tp_telemetry {
+            ($cat:expr, $name:expr) => {{
+                let attached = match bpf
+                    .program_mut($name)
+                    .and_then(|p| TryInto::<&mut TracePoint>::try_into(p).ok())
+                {
+                    Some(prog) => match prog.load().and_then(|_| prog.attach($cat, $name)) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            warn!(
+                                tracepoint = format!("{}/{}", $cat, $name),
+                                error = %e,
+                                "telemetry tracepoint not attached — its events are unavailable on this host"
+                            );
+                            false
+                        }
+                    },
+                    None => {
+                        warn!(
+                            tracepoint = format!("{}/{}", $cat, $name),
+                            "telemetry program absent in eBPF binary — skipping"
+                        );
+                        false
+                    }
+                };
+                crate::telemetry::coverage::update(|c| {
+                    c.ebpf_telemetry_programs
+                        .insert(format!("{}/{}", $cat, $name), attached);
+                });
+            }};
+        }
+
         attach_tp!("syscalls", "sys_enter_openat");
         // ── Honeytoken coverage: additional access paths (issue #32, point 1) ──
         // open/openat2 round out file-open coverage; the stat/statx/readlink
@@ -1041,41 +1078,49 @@ impl Collector for EbpfSyscallCollector {
         attach_tp_optional!("syscalls", "sys_exit_mmap");
         attach_tp_optional!("syscalls", "sys_enter_getdents64");
         attach_tp_optional!("syscalls", "sys_enter_close");
-        attach_tp!("syscalls", "sys_enter_connect");
-        attach_tp!("syscalls", "sys_enter_bind");
-        attach_tp!("syscalls", "sys_enter_accept4");
-        attach_tp!("sched", "sched_process_fork");
-        attach_tp!("syscalls", "sys_enter_unlinkat");
-        attach_tp!("syscalls", "sys_enter_renameat2");
-        attach_tp!("syscalls", "sys_enter_fchmodat");
-        attach_tp!("syscalls", "sys_enter_fchownat");
-        attach_tp!("syscalls", "sys_enter_mmap");
-        attach_tp!("syscalls", "sys_enter_ptrace");
-        attach_tp!("module", "module_load");
-        attach_tp!("syscalls", "sys_enter_shmget");
-        attach_tp!("syscalls", "sys_enter_shmat");
-        attach_tp!("syscalls", "sys_enter_unshare");
-        attach_tp!("syscalls", "sys_enter_setns");
-        attach_tp!("syscalls", "sys_enter_write");
-        attach_tp!("syscalls", "sys_enter_kill");
-        attach_tp!("syscalls", "sys_enter_tkill");
-        attach_tp!("syscalls", "sys_enter_tgkill");
-        attach_tp!("syscalls", "sys_enter_setuid");
-        attach_tp!("syscalls", "sys_enter_setreuid");
-        attach_tp!("syscalls", "sys_enter_setresuid");
-        attach_tp!("syscalls", "sys_enter_memfd_create");
+        attach_tp_telemetry!("syscalls", "sys_enter_connect");
+        attach_tp_telemetry!("syscalls", "sys_enter_bind");
+        attach_tp_telemetry!("syscalls", "sys_enter_accept4");
+        attach_tp_telemetry!("sched", "sched_process_fork");
+        attach_tp_telemetry!("syscalls", "sys_enter_unlinkat");
+        attach_tp_telemetry!("syscalls", "sys_enter_renameat2");
+        attach_tp_telemetry!("syscalls", "sys_enter_fchmodat");
+        attach_tp_telemetry!("syscalls", "sys_enter_fchownat");
+        attach_tp_telemetry!("syscalls", "sys_enter_mmap");
+        attach_tp_telemetry!("syscalls", "sys_enter_ptrace");
+        attach_tp_telemetry!("module", "module_load");
+        attach_tp_telemetry!("syscalls", "sys_enter_shmget");
+        attach_tp_telemetry!("syscalls", "sys_enter_shmat");
+        attach_tp_telemetry!("syscalls", "sys_enter_unshare");
+        attach_tp_telemetry!("syscalls", "sys_enter_setns");
+        attach_tp_telemetry!("syscalls", "sys_enter_write");
+        attach_tp_telemetry!("syscalls", "sys_enter_kill");
+        attach_tp_telemetry!("syscalls", "sys_enter_tkill");
+        attach_tp_telemetry!("syscalls", "sys_enter_tgkill");
+        attach_tp_telemetry!("syscalls", "sys_enter_setuid");
+        attach_tp_telemetry!("syscalls", "sys_enter_setreuid");
+        attach_tp_telemetry!("syscalls", "sys_enter_setresuid");
+        attach_tp_telemetry!("syscalls", "sys_enter_memfd_create");
 
         // ── Attach kprobe ─────────────────────────────────────────────────────
         {
-            let prog: &mut KProbe = bpf
+            let attached = match bpf
                 .program_mut("kprobe__udp_sendmsg")
-                .context("kprobe__udp_sendmsg not found in eBPF binary")?
-                .try_into()
-                .context("kprobe__udp_sendmsg is not a KProbe")?;
-            prog.load()
-                .context("BPF verifier rejected kprobe__udp_sendmsg")?;
-            prog.attach("udp_sendmsg", 0)
-                .context("failed to attach kprobe on udp_sendmsg")?;
+                .and_then(|p| TryInto::<&mut KProbe>::try_into(p).ok())
+            {
+                Some(prog) => match prog.load().and_then(|_| prog.attach("udp_sendmsg", 0)) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        warn!(error = %e, "kprobe udp_sendmsg not attached — UDP DNS telemetry unavailable");
+                        false
+                    }
+                },
+                None => false,
+            };
+            crate::telemetry::coverage::update(|c| {
+                c.ebpf_telemetry_programs
+                    .insert("kprobe/udp_sendmsg".into(), attached);
+            });
         }
 
         // These hooks use this object's token maps, unlike the separate exec collector.
