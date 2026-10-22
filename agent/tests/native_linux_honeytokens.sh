@@ -52,6 +52,14 @@ diagnose() {
   echo "--- agent warnings/errors"
   grep -E "WARN|ERROR|SIGTERM|Shutdown|Consumer|honeytoken" "$dir/agent.log" | grep -v "/proc/net/" | sed 's/\x1b\[[0-9;]*m//g' | tail -40
   echo "--- actions"; tail -15 "$dir/actions.log"
+  echo "--- agent eBPF programs (hook run_cnt recursion_misses)"
+  python3 -c 'import re,sys
+progs,hooks={},{}
+for l in open(sys.argv[1]):
+ f=dict(re.findall(r"(\w+): (\S+)",l))
+ if "bpf-prog" in l:progs[f.get("prog_id")]=f
+ elif "tp_name" in f or "func_name" in f:hooks[f.get("prog_id")]=f.get("tp_name") or f.get("func_name")
+for pid,f in sorted(progs.items(),key=lambda x:int(x[0] or 0)):print(hooks.get(pid,"prog_id="+str(pid)),f.get("run_cnt"),f.get("recursion_misses"))' "$dir/bpf-progs.txt" 2>/dev/null
   echo "--- honeytoken hits (kind mode accessor pid exe path) and raw sensor events of the actors (class comm path)"
   python3 -c 'import json,sys
 for l in open(sys.argv[1]):
