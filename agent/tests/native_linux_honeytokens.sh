@@ -41,11 +41,27 @@ mounts=()
 if [[ "$mode" == fallback ]]; then mounts=(-v "$dir/no-btf:/sys/kernel/btf/vmlinux:ro"); fi
 docker run --rm --name "$container" --privileged --pid host --network none -e MODE="$mode" \
   -v "$dir:/test" "${mounts[@]}" "$image" bash /test/run.sh > "$dir/actions.log" 2>&1
-python3 - "$dir" "$mode" <<'PY' || { echo "--- agent warnings/errors"; grep -E "WARN|ERROR|SIGTERM|Shutdown|Consumer|honeytoken" "$dir/agent.log" | grep -v "/proc/net/" | sed 's/\x1b\[[0-9;]*m//g' | tail -40; echo "--- actions"; tail -15 "$dir/actions.log"; echo "--- honeytoken hits (kind mode accessor pid exe)"; python3 -c 'import json,sys
+# On failure: everything needed to tell a sensor that did not fire from one
+# whose event was lost or folded later, without rerunning on that kernel.
+diagnose() {
+  echo "--- kernel $(uname -r)"
+  local sudo=(); [[ $EUID -eq 0 ]] || sudo=(sudo -n)
+  for tp in sys_enter_statx sys_enter_renameat2 sys_enter_linkat; do
+    "${sudo[@]}" cat "/sys/kernel/tracing/events/syscalls/$tp/format" 2>/dev/null | grep -E "^name|field:" | grep -v common_ || echo "($tp format unreadable)"
+  done
+  echo "--- agent warnings/errors"
+  grep -E "WARN|ERROR|SIGTERM|Shutdown|Consumer|honeytoken" "$dir/agent.log" | grep -v "/proc/net/" | sed 's/\x1b\[[0-9;]*m//g' | tail -40
+  echo "--- actions"; tail -15 "$dir/actions.log"
+  echo "--- honeytoken hits (kind mode accessor pid exe path) and raw sensor events of the actors (class comm path)"
+  python3 -c 'import json,sys
 for l in open(sys.argv[1]):
  try:d=json.loads(l).get("unmapped",{}).get("trapd",{}).get("data",{})
  except ValueError:continue
- if isinstance(d,dict) and "token_id" in d:a=d.get("accessor",{});print(d.get("access_kind"),d.get("mode"),a.get("comm"),a.get("pid"),a.get("exe"),d.get("path"))' "$dir/events.ndjson"; exit 1; }
+ if not isinstance(d,dict):continue
+ if "token_id" in d:a=d.get("accessor",{});print("hit",d.get("access_kind"),d.get("mode"),a.get("comm"),a.get("pid"),a.get("exe"),d.get("path"))
+ elif d.get("comm") in ("probe","stat","ln","mv"):print("raw",json.loads(l).get("class_uid"),d.get("comm"),repr(d.get("path",d.get("old_path"))))' "$dir/events.ndjson"
+}
+python3 - "$dir" "$mode" <<'PY' || { diagnose; exit 1; }
 import collections,json,sys
 from pathlib import Path
 p=Path(sys.argv[1]);mode=sys.argv[2];pid=int((p/'agent.pid').read_text());hits=[]
