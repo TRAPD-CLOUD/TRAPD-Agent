@@ -6,23 +6,31 @@ lists what the agent still does not capture, and what the move itself costs.
 Every item was checked against the code of this branch; "not found" means a
 search of `agent/src` returned nothing, not that it is impossible.
 
-## A. Regressions caused by removing agent-side rules (backend work required)
+## A. Regressions caused by removing agent-side rules
 
 The 80 removed rules are preserved in `docs/legacy-agent-rules/rule-catalog.json`
-(rule id, MITRE mapping, severity, window). Until the backend has equivalent
-Sigma / sequence rules, these detections are gone:
+(rule id, MITRE mapping, severity, window).
+
+**Ported** (TRAPD-CLOUD/TRAPD#265, 41 Sigma rules with fixtures; 30 enabled,
+11 draft): Windows process/LOLBin/credential/impact/persistence rules, Office
+and web-server child shells (the agent now sends `parent_exe`), PowerShell
+script blocks, service/WMI audit records, registry autostart, and the Linux
+command-line and persistence-path rules that can be expressed in Sigma. The
+Linux rules are approximations: the old engine parsed shell pipelines, Sigma
+matches the raw command line.
+
+**Not ported yet** - these detections do not exist until the backend has them:
 
 | Area | Needs in the backend |
 |---|---|
-| Command-line rules (LOLBins, reverse shells, defence evasion, credential access) | stateless Sigma over `process_create` / `process_exec` |
+| Remaining Linux command-line rules (account manipulation, timestomp, tunnelling tools, MitM tools, container/K8s abuse, exploit command lines, daemon-name masquerading) | more Sigma rules; some need the shell-aware parsing the agent had |
 | Process-tree chains (IOA) | sequence rules; the backend must keep lineage (ppid chain from process events) |
 | IOC hash / IP / domain match | IOC set matched in the pipeline (hash is on every exec event) |
 | Beaconing, DNS tunnelling, port scan, lateral movement | windowed correlation over network/DNS events |
 | Baseline anomaly (binary novelty, exec rate) | `baseline_deviation` stage already exists in `stream-processor` |
-| Windows registry persistence | Sigma over `registry` events |
-| Windows 4688 / 7045 / 4698 / WMI 5861 | Sigma over `log` events (`EventID` in `fields`) |
-| Sysmon 10 (LSASS memory access) | Sigma over the raw Sysmon `log` event (the agent forwards it; no local verdict) |
-| PowerShell 4104 script blocks | **opt-in only** (`script_block_capture_enabled`), see C |
+| Registry persistence beyond the autostart keys (services ImagePath, IFEO, COM hijack, WMI) | extend the registry rules |
+| Sysmon 10 (LSASS memory access) | the agent forwards the raw Sysmon record as a `log` event; the backend maps only 4104/7045/4697/4698/4702/5861 to a class, so Sysmon is stored but not evaluated |
+| PowerShell 4104 script blocks | ported, but only fire with the agent opt-in `script_block_capture_enabled` (see C) |
 | DLL side-loading | no event exists (gap B1) |
 
 Still produced on the host because they need host access, not rule matching:
