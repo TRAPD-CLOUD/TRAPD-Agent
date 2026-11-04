@@ -663,6 +663,41 @@ impl DecodeState {
                         );
                     }
                 }
+                5 => {
+                    if let Some((pid, dll)) = etw_map::image_load(rec, &self.devices) {
+                        let process_exe = self
+                            .proc_images
+                            .get(&pid)
+                            .filter(|(_, start)| {
+                                etw_map::same_process_generation(
+                                    Some(*start),
+                                    crate::telemetry::identity::process_start_time(pid),
+                                    rec.timestamp,
+                                )
+                            })
+                            .map(|(image, _)| image.clone());
+                        // Only side-load candidates are shipped (a volume filter,
+                        // not a verdict); the backend judges them.
+                        if let Some(exe) =
+                            process_exe.filter(|exe| etw_map::is_side_load_candidate(exe, &dll))
+                        {
+                            emit(
+                                EventClass::Kernel,
+                                EventAction::ModuleLoad,
+                                EventData::ModuleLoad(crate::schema::ModuleLoadData {
+                                    pid,
+                                    uid: 0,
+                                    gid: 0,
+                                    username: String::new(),
+                                    name: dll.rsplit('\\').next().unwrap_or(&dll).to_string(),
+                                    taints: 0,
+                                    path: Some(dll),
+                                    process_exe: Some(exe),
+                                }),
+                            );
+                        }
+                    }
+                }
                 _ => {}
             },
             p if p == etw_map::KERNEL_NETWORK => {

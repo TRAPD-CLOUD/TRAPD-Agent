@@ -233,6 +233,39 @@ pub fn image_load(rec: &EtwRecord, devices: &DeviceMap) -> Option<(i32, String)>
     Some((pid, device_to_dos(&image, devices)))
 }
 
+/// A DLL load worth reporting: a process that runs from a protected location
+/// loaded a `.dll` from a folder an unprivileged user can write to (the DLL
+/// search-order hijack / side-loading shape). This is a volume filter, not a
+/// verdict: every DLL load is far too frequent to ship, and judging the
+/// candidate happens in the backend. Per-user sync clients legitimately load
+/// shell extensions from their own AppData folders and are left out.
+pub fn is_side_load_candidate(process_exe: &str, dll: &str) -> bool {
+    let dll_l = dll.to_ascii_lowercase().replace('/', "\\");
+    if !dll_l.ends_with(".dll") {
+        return false;
+    }
+    let exe_l = process_exe.to_ascii_lowercase().replace('/', "\\");
+    let trusted_process = exe_l.contains(":\\windows\\system32\\")
+        || exe_l.contains(":\\windows\\syswow64\\")
+        || exe_l.contains(":\\program files\\")
+        || exe_l.contains(":\\program files (x86)\\");
+    let writable = dll_l.contains("\\appdata\\")
+        || dll_l.contains("\\users\\public\\")
+        || dll_l.contains("\\windows\\temp\\")
+        || dll_l.contains("\\temp\\")
+        || dll_l.contains("\\downloads\\")
+        || dll_l.contains("\\desktop\\")
+        || (dll_l.contains(":\\programdata\\") && !dll_l.contains("\\programdata\\microsoft\\"))
+        || dll_l.contains("\\$recycle.bin\\");
+    const PER_USER_CLIENTS: &[&str] = &[
+        "\\appdata\\local\\microsoft\\onedrive\\",
+        "\\appdata\\local\\microsoft\\teams\\",
+        "\\appdata\\local\\microsoft\\windowsapps\\",
+        "\\appdata\\local\\packages\\",
+    ];
+    trusted_process && writable && !PER_USER_CLIENTS.iter().any(|k| dll_l.contains(k))
+}
+
 /// Address property → text. IPv4 arrives as a 4-byte integer in network
 /// order, IPv6 as 16 raw bytes.
 fn address(rec: &EtwRecord, name: &str) -> Option<String> {
@@ -410,6 +443,43 @@ pub fn dns_query(rec: &EtwRecord) -> Option<(u32, DnsResolutionData)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn side_load_candidates_are_protected_process_plus_writable_dll() {
+        let sys = r"C:\Windows\System32\svchost.exe";
+        assert!(is_side_load_candidate(
+            sys,
+            r"C:\Users\a\AppData\Roaming\x\version.dll"
+        ));
+        assert!(is_side_load_candidate(sys, r"C:\Users\Public\wlbsctrl.DLL"));
+        assert!(is_side_load_candidate(
+            r"C:\Program Files\App\app.exe",
+            r"C:\ProgramData\evil\a.dll"
+        ));
+        // a protected location for the DLL, or not a DLL, is ordinary
+        assert!(!is_side_load_candidate(
+            sys,
+            r"C:\Windows\System32\kernel32.dll"
+        ));
+        assert!(!is_side_load_candidate(
+            sys,
+            r"C:\Users\a\AppData\Roaming\x\data.bin"
+        ));
+        // per-user apps live and load from AppData
+        assert!(!is_side_load_candidate(
+            r"C:\Users\a\AppData\Local\app\app.exe",
+            r"C:\Users\a\AppData\Local\app\lib.dll"
+        ));
+        // known per-user sync clients' shell extensions, and Microsoft's ProgramData
+        assert!(!is_side_load_candidate(
+            r"C:\Windows\System32\explorer.exe",
+            r"C:\Users\a\AppData\Local\Microsoft\OneDrive\24.1\FileSyncShell64.dll"
+        ));
+        assert!(!is_side_load_candidate(
+            sys,
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\x.dll"
+        ));
+    }
 
     fn rec(provider: u128, id: u16, props: &[(&str, EtwValue)]) -> EtwRecord {
         EtwRecord {

@@ -19,19 +19,28 @@ command-line and persistence-path rules that can be expressed in Sigma. The
 Linux rules are approximations: the old engine parsed shell pipelines, Sigma
 matches the raw command line.
 
-**Not ported yet** - these detections do not exist until the backend has them:
+**Also in the pack** (drafts, replay before enabling): port scan and admin-port
+sweep (windowed `value_count`), IMDS access, DNS encoded-label and DNS query
+burst, two attack chains as ordered per-host sequences, DLL side-loading (see
+B1), and IOC template rules (hash / IP / domain; the list lives in the rule
+because the backend has no IOC store).
 
-| Area | Needs in the backend |
+**Covered by what the backend already had:** baseline anomaly (the
+`baseline_deviation` stage: process novelty, active hours, event volume, per
+host) and volume-based beaconing (the starter correlation rule).
+
+**Not covered anywhere:**
+
+| Area | Why |
 |---|---|
-| Remaining Linux command-line rules (account manipulation, timestomp, tunnelling tools, MitM tools, container/K8s abuse, exploit command lines, daemon-name masquerading) | more Sigma rules; some need the shell-aware parsing the agent had |
-| Process-tree chains (IOA) | sequence rules; the backend must keep lineage (ppid chain from process events) |
-| IOC hash / IP / domain match | IOC set matched in the pipeline (hash is on every exec event) |
-| Beaconing, DNS tunnelling, port scan, lateral movement | windowed correlation over network/DNS events |
-| Baseline anomaly (binary novelty, exec rate) | `baseline_deviation` stage already exists in `stream-processor` |
-| Registry persistence beyond the autostart keys (services ImagePath, IFEO, COM hijack, WMI) | extend the registry rules |
-| Sysmon 10 (LSASS memory access) | the agent forwards the raw Sysmon record as a `log` event; the backend maps only 4104/7045/4697/4698/4702/5861 to a class, so Sysmon is stored but not evaluated |
-| PowerShell 4104 script blocks | ported, but only fire with the agent opt-in `script_block_capture_enabled` (see C) |
-| DLL side-loading | no event exists (gap B1) |
+| Beaconing by cadence (regular intervals / low jitter) | needs interval statistics per destination; the correlation engine only counts |
+| Per-domain DNS tunnel rate | the engine cannot group by registrable domain; only the host-level burst rule exists |
+| Privilege-escalation chain (unprivileged, then setuid 0, then action) | setuid events have no Sigma class in the backend |
+| IOC feeds (STIX/TAXII, auto-sync) | no IOC store; indicators are edited into the template rules |
+| Process-tree bound chains | the agent bound chains to one process tree; the backend binds to a host, so the two chain rules are coarser |
+| Remaining Linux command-line rules | account manipulation, timestomp, tunnelling/MitM tools, container abuse, exploit command lines, masquerading by daemon name |
+| Registry persistence beyond autostart keys | services ImagePath, IFEO, COM hijack, WMI |
+| Sysmon event 10 (LSASS access) | forwarded raw as a `log` event; the backend maps only 4104/7045/4697/4698/4702/5861 |
 
 Still produced on the host because they need host access, not rule matching:
 honeytoken access/tamper, rootkit cross-view findings, memory-injection scan
@@ -43,7 +52,7 @@ measurements).
 
 | # | Platform | Gap | Why it matters |
 |---|---|---|---|
-| B1 | Windows, Linux | No image/library load event. Windows ETW image loads were only turned into a verdict (now removed); Linux `dlopen` is listed as planned | DLL side-loading, injected modules, `LD_PRELOAD`-style abuse cannot be detected in the backend. Needs a filtered event (path class, signed state), not every load |
+| B1 | Windows: **closed for side-loading**; Linux open | Windows now ships DLL-load *candidates* only (protected process loads a `.dll` from a user-writable folder) as `kernel/module_load` with `path` and `process_exe`; the backend rule re-checks them. Not every load: that would be far too frequent. Signed state and injected modules are not covered. Linux `dlopen` is still planned | A full image-load stream stays out of scope for the 1 % budget |
 | B2 | Windows | File events carry no acting process (`actor: None`) | Backend cannot say who wrote a file; ransomware and tamper attribution rely on a host-side guess (`accessor_correlation`) |
 | B3 | Windows | DNS events lack client/server address and transaction id (the ETW source does not provide them) | Weaker DNS tunnelling / C2 correlation |
 | B4 | Windows | No LSASS handle-access telemetry of its own; the only source is Sysmon event 10 | Without Sysmon there is no credential-dumping signal |

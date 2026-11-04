@@ -802,6 +802,13 @@ pub struct ModuleLoadData {
     pub username: String,
     pub name: String,
     pub taints: u32,
+    /// Windows: full path of the loaded image (a DLL). Kernel module loads on
+    /// Linux carry only `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Windows: image of the process that loaded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_exe: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
