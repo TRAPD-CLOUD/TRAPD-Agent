@@ -901,3 +901,24 @@ fn accepted_events_are_counted_by_class() {
     };
     assert!(get(&after) > get(&before));
 }
+
+#[tokio::test]
+async fn next_batch_takes_queued_events_up_to_the_limit_and_reports_close() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(super::MAX_BATCH * 2);
+    for _ in 0..(super::MAX_BATCH + 10) {
+        tx.send(dummy_event()).await.unwrap();
+    }
+    let mut batch = Vec::new();
+    assert!(super::next_batch(&mut rx, &mut batch).await);
+    assert_eq!(batch.len(), super::MAX_BATCH, "one pass is bounded");
+    batch.clear();
+    assert!(super::next_batch(&mut rx, &mut batch).await);
+    assert_eq!(batch.len(), 10, "the remainder arrives in the next pass");
+    batch.clear();
+    drop(tx);
+    assert!(
+        !super::next_batch(&mut rx, &mut batch).await,
+        "a closed, drained channel ends the loop"
+    );
+    assert!(batch.is_empty());
+}

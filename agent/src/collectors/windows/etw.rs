@@ -649,32 +649,6 @@ impl DecodeState {
                         );
                     }
                 }
-                5 => {
-                    if let Some((pid, dll)) = etw_map::image_load(rec, &self.devices) {
-                        if let Some(d) = crate::detection::windows_rules::inspect_image_load(
-                            self.proc_images
-                                .get(&pid)
-                                .filter(|(_, start)| {
-                                    etw_map::same_process_generation(
-                                        Some(*start),
-                                        crate::telemetry::identity::process_start_time(pid),
-                                        rec.timestamp,
-                                    )
-                                })
-                                .map(|(image, _)| image.as_str())
-                                .unwrap_or(""),
-                            &dll,
-                        ) {
-                            // Emitted straight as a detection (admit_external
-                            // enriches + gates it like any collector finding).
-                            emit(
-                                EventClass::Detection,
-                                EventAction::Detected,
-                                EventData::Detection(Box::new(d)),
-                            );
-                        }
-                    }
-                }
                 _ => {}
             },
             p if p == etw_map::KERNEL_NETWORK => {

@@ -164,32 +164,6 @@ pub fn normalize(log: &LogEventData, agent: &str, host: &str) -> Option<AgentEve
             }),
         );
     }
-    if sysmon && id == 10 {
-        let target = get("TargetImage");
-        let access = number(get("GrantedAccess"))?;
-        // PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE. Query-only
-        // rights do not establish memory access; memory rights do not prove a dump.
-        if !basename(target).eq_ignore_ascii_case("lsass.exe") || access & 0x38 == 0 {
-            return None;
-        }
-        let source_pid = pid(get("SourceProcessId"))?;
-        let target_pid = pid(get("TargetProcessId"))?;
-        return make(EventClass::Detection, EventAction::Detected, Severity::Low,
-            EventData::Detection(Box::new(DetectionData {
-                rule_id: "credential_access.lsass_memory_access".into(), title: "Observed memory-capable LSASS process access".into(),
-                category: "credential_access".into(), mitre_tactic: Some("TA0006 Credential Access".into()),
-                mitre_technique: Some("T1003.001".into()), confidence: 60,
-                subject: format!("{} (pid {source_pid})", get("SourceImage")),
-                detail: "Sysmon recorded a handle to LSASS with memory access rights. This can be legitimate and does not establish a credential dump.".into(),
-                mode: Some(DetectionMode::Signal), evidence: serde_json::json!({
-                    "event_id": id, "event_record_id": log.offset, "source_channel": log.source_path,
-                    "source_pid": source_pid, "source_image": get("SourceImage"), "source_user": get("SourceUser"),
-                    "source_process_guid": get("SourceProcessGUID"), "target_pid": target_pid,
-                    "target_image": target, "target_process_guid": get("TargetProcessGUID"),
-                    "granted_access": access, "call_trace": get("CallTrace"),
-                    "truncated_fields": log.truncated_fields }), ..Default::default()
-            })));
-    }
     let mut rename_from = None;
     let mut rename_scope = None;
     let (path, value, action, old_value, new_value) = if security && id == 4657 {
@@ -746,7 +720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_source_receipts_survive_suppressed_repeated_signals() {
+    async fn durable_source_receipts_survive_repeated_records() {
         let record = log(
             SYSMON_CHANNEL,
             "Microsoft-Windows-Sysmon",
@@ -763,27 +737,17 @@ mod tests {
             std::env::temp_dir().join(format!("trapd-native-receipt-{}", uuid::Uuid::new_v4()));
         let path = directory.join("queue.journal");
         let mut spool = crate::pipeline::Spool::durable_at(path.clone(), 100);
-        let engine = crate::detection::DetectionEngine::new("agent".into(), "host".into());
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let producer = tokio::spawn(async move {
             emit_record(&tx, record.clone(), "agent", "host", true).await?;
             emit_record(&tx, record, "agent", "host", true).await
         });
-        let mut admitted = 0;
         let mut raw_ids = Vec::new();
         let processing = async {
             while let Some(event) = rx.recv().await {
-                if matches!(event.class, EventClass::Detection) {
-                    let findings = engine.admit_external(event);
-                    admitted += findings.len();
-                    for finding in findings {
-                        spool.push(finding.event).unwrap();
-                    }
-                } else {
-                    assert!(matches!(event.data, EventData::Log(_)));
-                    raw_ids.push(event.event_id);
-                    spool.push(event).unwrap();
-                }
+                assert!(matches!(event.data, EventData::Log(_)));
+                raw_ids.push(event.event_id);
+                spool.push(event).unwrap();
             }
         };
         let completed = tokio::time::timeout(std::time::Duration::from_secs(2), processing).await;
@@ -792,17 +756,13 @@ mod tests {
         }
         assert!(
             completed.is_ok(),
-            "a suppressed signal must not hold the source cursor waiting for a receipt"
+            "a repeated record must not hold the source cursor waiting for a receipt"
         );
         producer.await.unwrap().unwrap();
         assert_eq!(
-            admitted, 1,
-            "real signal gate must suppress the repeated finding"
-        );
-        assert_eq!(
             raw_ids.len(),
             2,
-            "both original source records must survive the gate"
+            "both original source records must be kept"
         );
         assert_ne!(raw_ids[0], raw_ids[1]);
         assert_eq!(
@@ -895,8 +855,8 @@ mod tests {
         }
     }
     #[test]
-    fn lsass_read_access_is_observed_signal_not_proof_of_dump() {
-        let mut record = log(
+    fn sysmon_process_access_gets_no_local_verdict() {
+        let record = log(
             SYSMON_CHANNEL,
             "Microsoft-Windows-Sysmon",
             10,
@@ -908,20 +868,9 @@ mod tests {
                 ("GrantedAccess", "0x1010"),
             ],
         );
-        let event = normalize(&record, "agent", "host").unwrap();
-        let EventData::Detection(d) = event.data else {
-            panic!("detection expected")
-        };
-        assert_eq!(d.rule_id, "credential_access.lsass_memory_access");
-        assert_eq!(d.mode, Some(DetectionMode::Signal));
-        assert_eq!(d.evidence["source_pid"], 101);
-        assert!(!d.detail.contains("dumped"));
-        record
-            .fields
-            .insert("GrantedAccess".into(), "0x1000".into());
         assert!(
             normalize(&record, "agent", "host").is_none(),
-            "query-only access is not memory access"
+            "the raw record is forwarded; judging it is the backend's job"
         );
     }
     #[test]
@@ -1013,10 +962,6 @@ mod tests {
             r.old_value.is_none() && r.new_value.is_none(),
             "names cannot be represented as value data"
         );
-        let findings = crate::detection::registry_rules::inspect_registry(&r);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].rule_id, "persistence.registry_object_renamed");
-        assert_eq!(findings[0].mode, Some(DetectionMode::Signal));
     }
 
     #[test]
@@ -1045,10 +990,6 @@ mod tests {
         assert_eq!(source.key_path, key);
         assert_eq!(source.value_name.as_deref(), Some("Unrelated"));
         assert!(r.old_value.is_none() && r.new_value.is_none());
-        let findings = crate::detection::registry_rules::inspect_registry(&r);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].rule_id, "persistence.registry_object_renamed");
-        assert!(!findings[0].title.contains("installed"));
     }
 
     #[test]
@@ -1122,10 +1063,6 @@ mod tests {
                 panic!("registry expected")
             };
             assert_eq!(r.category, category);
-            assert_eq!(
-                crate::detection::registry_rules::inspect_registry(&r).len(),
-                1
-            );
             for field in ["fields.NewName", "fields.TargetObject"] {
                 record.truncated_fields = Some(std::collections::BTreeMap::from([(
                     field.into(),
