@@ -694,7 +694,6 @@ impl ConfigPuller {
     }
 
     /// Register a hook run with the new config after every successful apply.
-    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn with_apply_hook(mut self, hook: ApplyHook) -> Self {
         self.on_apply = Some(hook);
         self

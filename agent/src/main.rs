@@ -256,6 +256,9 @@ async fn main() -> Result<()> {
     // restart keeps the real configuration even though the signed-config channel
     // re-serves it with an already-accepted (and thus replay-rejected) issued_at.
     let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()));
+    if let Ok(cfg) = agent_config.read() {
+        detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
+    }
     // Backend outbox. Online it is disk-backed (survives crash/restart, replays
     // on the next run); offline it is purely in-memory (the NDJSON output is the
     // system of record).
@@ -520,7 +523,10 @@ async fn main() -> Result<()> {
             &backend_url,
             &agent_id,
             token.clone(),
-        )?;
+        )?
+        .with_apply_hook(std::sync::Arc::new(|cfg: &AgentConfig| {
+            detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
+        }));
         tokio::spawn(async move { config_puller.run().await });
 
         let token_for_update = token.clone();
@@ -657,7 +663,13 @@ pub(crate) async fn consume_batch(
         }
         // Findings the host raises itself carry the mode and severity that
         // local auto-response acts on (and the backend recomputes).
-        detection::sensor_policy::classify(&mut event);
+        if let detection::sensor_policy::Disposition::Shadow(rule) =
+            detection::sensor_policy::classify(&mut event)
+        {
+            // Shadow rules are counted, never emitted or acted on.
+            telemetry::coverage::shadow_hit(&rule);
+            continue;
+        }
         // Forwarding to prevention is best-effort — a stalled enforcement
         // engine must not stall telemetry — but a dropped tee is still
         // counted rather than swallowed.
@@ -888,5 +900,48 @@ mod tests {
         assert_eq!(d.mode, Some(schema::DetectionMode::Signal));
         assert!(teed.severity <= schema::Severity::Low);
         assert_eq!(spool.lock().unwrap().len(), 1);
+    }
+
+    /// A rule the operator put in shadow mode (signed config) is counted but
+    /// must neither reach the spool nor local auto-response.
+    #[tokio::test]
+    async fn consume_batch_drops_findings_of_shadow_rules() {
+        detection::sensor_policy::set_rule_modes(&[detection::RuleModeOverride {
+            rule: "selfprotect.unclean_shutdown".into(),
+            mode: schema::DetectionMode::Shadow,
+        }]);
+        let spool: Arc<Mutex<Spool>> = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let siem = output::siem::SiemForwarder::from_config(
+            &config::AgentConfig::default(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let (tee_tx, mut tee_rx) = tokio::sync::mpsc::channel(4);
+        let finding = schema::AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            schema::EventClass::Detection,
+            schema::EventAction::Detected,
+            schema::Severity::High,
+            schema::EventData::Detection(Box::new(schema::DetectionData {
+                rule_id: "selfprotect.unclean_shutdown".into(),
+                confidence: 90,
+                ..Default::default()
+            })),
+        );
+        consume_batch(
+            vec![finding],
+            &mut detection::CheckpointTracker::default(),
+            Some(&tee_tx),
+            &OutputMode::Off,
+            &spool,
+            &siem,
+        )
+        .await;
+        detection::sensor_policy::set_rule_modes(&[]);
+        assert!(
+            tee_rx.try_recv().is_err(),
+            "shadow finding must not reach prevention"
+        );
+        assert_eq!(spool.lock().unwrap().len(), 0, "and must not be spooled");
     }
 }

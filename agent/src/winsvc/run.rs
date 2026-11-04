@@ -393,6 +393,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
 
     if let Ok(cfg) = agent_config.read() {
         crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
+        crate::detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
     }
 
     // SIEM forwarder — same best-effort export path as the Linux agent.
@@ -483,6 +484,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         )?
         .with_apply_hook(Arc::new(move |cfg: &AgentConfig| {
             crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
+            crate::detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
         }));
         handles.push(tokio::spawn(async move { config_puller.run().await }));
 

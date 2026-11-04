@@ -12,7 +12,8 @@
 //! is treated as a signal and capped at `High`: an unknown finding never
 //! triggers a response on its own.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 
 use serde::Deserialize;
 use trapd_schema::{AgentEvent, DetectionData, DetectionMode, EventData, Severity};
@@ -36,6 +37,33 @@ fn table() -> &'static [Entry] {
         serde_json::from_str(include_str!("../sensor-rules.json"))
             .expect("sensor-rules.json is valid")
     })
+}
+
+fn overrides() -> &'static RwLock<HashMap<String, DetectionMode>> {
+    static OVERRIDES: OnceLock<RwLock<HashMap<String, DetectionMode>>> = OnceLock::new();
+    OVERRIDES.get_or_init(Default::default)
+}
+
+/// Replace the operator's per-rule mode overrides (signed config `rule_modes`).
+/// They take precedence over the table, exactly as they did when the engine
+/// classified these findings.
+pub fn set_rule_modes(modes: &[crate::RuleModeOverride]) {
+    if let Ok(mut map) = overrides().write() {
+        *map = modes.iter().map(|m| (m.rule.clone(), m.mode)).collect();
+    }
+}
+
+fn override_for(rule_id: &str) -> Option<DetectionMode> {
+    overrides().read().ok()?.get(rule_id).copied()
+}
+
+/// What to do with a classified event.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// Persist, ship and let prevention see it.
+    Forward,
+    /// The rule runs in shadow mode: count it, never emit or act on it.
+    Shadow(String),
 }
 
 /// Exact id first, then the longest matching `prefix.` entry.
@@ -63,7 +91,7 @@ const ALERT_MIN_CONFIDENCE: u8 = 50;
 
 fn classify_detection(emitted: Severity, d: &mut DetectionData) -> Severity {
     let entry = lookup(&d.rule_id);
-    let (base, max, configured) = match entry {
+    let (base, max, table_mode) = match entry {
         Some(e) => {
             if d.mitre_tactic.is_none() && !e.tactic.is_empty() {
                 d.mitre_tactic = Some(e.tactic.clone());
@@ -81,6 +109,7 @@ fn classify_detection(emitted: Severity, d: &mut DetectionData) -> Severity {
             (base, Severity::High, DetectionMode::Signal)
         }
     };
+    let configured = override_for(&d.rule_id).unwrap_or(table_mode);
     let mut reasons = vec![format!("base:{base:?}").to_lowercase()];
     let mut mode = if configured == DetectionMode::Shadow {
         DetectionMode::Alert
@@ -122,8 +151,9 @@ fn classify_detection(emitted: Severity, d: &mut DetectionData) -> Severity {
 }
 
 /// Stamp a collector-raised finding with its mode and severity. Events of any
-/// other kind are left untouched.
-pub fn classify(event: &mut AgentEvent) {
+/// other kind are left untouched. A finding whose rule runs in shadow mode is
+/// reported as [`Disposition::Shadow`] and must not be forwarded.
+pub fn classify(event: &mut AgentEvent) -> Disposition {
     match &mut event.data {
         EventData::HoneytokenAccess(data) => {
             let outcome = honeytoken_policy::assess(data, event.severity);
@@ -140,9 +170,13 @@ pub fn classify(event: &mut AgentEvent) {
         EventData::Detection(d) => {
             let emitted = event.severity;
             event.severity = classify_detection(emitted, d);
+            if d.mode == Some(DetectionMode::Shadow) {
+                return Disposition::Shadow(d.rule_id.clone());
+            }
         }
         _ => {}
     }
+    Disposition::Forward
 }
 
 #[cfg(test)]
@@ -217,6 +251,36 @@ mod tests {
         }
         classify(&mut e);
         assert_eq!(mode(&e), Some(DetectionMode::Signal), "self-demotion holds");
+    }
+
+    #[test]
+    fn signed_rule_modes_override_the_table_and_shadow_is_not_forwarded() {
+        // The override map is process-global: keep every assertion on it in
+        // one test so parallel tests never see each other's overrides.
+        set_rule_modes(&[
+            crate::RuleModeOverride {
+                rule: "memory.memfd_exec".into(),
+                mode: DetectionMode::Signal,
+            },
+            crate::RuleModeOverride {
+                rule: "memory.injected_pe".into(),
+                mode: DetectionMode::Shadow,
+            },
+        ]);
+        let mut e = finding("memory.memfd_exec", 90, Severity::Critical);
+        assert_eq!(classify(&mut e), Disposition::Forward);
+        assert_eq!(mode(&e), Some(DetectionMode::Signal));
+        assert!(e.severity <= Severity::Low, "operator-demoted: never acts");
+
+        let mut e = finding("memory.injected_pe", 90, Severity::High);
+        assert_eq!(
+            classify(&mut e),
+            Disposition::Shadow("memory.injected_pe".into())
+        );
+        set_rule_modes(&[]);
+        let mut e = finding("memory.memfd_exec", 90, Severity::Critical);
+        classify(&mut e);
+        assert_eq!(mode(&e), Some(DetectionMode::Alert), "cleared overrides");
     }
 
     #[test]

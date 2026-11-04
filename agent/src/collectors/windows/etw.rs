@@ -620,10 +620,14 @@ impl DecodeState {
                                 data.process_start_time,
                                 crate::telemetry::identity::process_start_time(data.ppid),
                             );
-                        if data.parent_start_time.is_some() {
+                        // Only the cached image of the very generation that created
+                        // this child: a reused PID must not lend its predecessor's
+                        // image to a different parent.
+                        if let Some(parent_start) = data.parent_start_time {
                             data.parent_exe = self
                                 .proc_images
                                 .get(&data.ppid)
+                                .filter(|(_, start)| *start == parent_start)
                                 .map(|(image, _)| image.clone());
                         }
                         crate::deception::activity::record_exec(&data.username, &data.exe);
