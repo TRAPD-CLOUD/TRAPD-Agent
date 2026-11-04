@@ -650,11 +650,14 @@ pub(crate) async fn consume_batch(
 ) {
     let mut fresh = Vec::with_capacity(batch.len());
     let mut to_spool = Vec::with_capacity(batch.len());
-    for event in batch {
+    for mut event in batch {
         if checkpoints.is_retry(&event) {
             to_spool.push(event);
             continue;
         }
+        // Findings the host raises itself carry the mode and severity that
+        // local auto-response acts on (and the backend recomputes).
+        detection::sensor_policy::classify(&mut event);
         // Forwarding to prevention is best-effort — a stalled enforcement
         // engine must not stall telemetry — but a dropped tee is still
         // counted rather than swallowed.
@@ -845,5 +848,45 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A low-confidence host finding must reach the spool (and the prevention
+    /// tee) already classified as a signal: auto-response excludes signals.
+    #[tokio::test]
+    async fn consume_batch_classifies_collector_findings_before_they_are_forwarded() {
+        let spool: Arc<Mutex<Spool>> = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let siem = output::siem::SiemForwarder::from_config(
+            &config::AgentConfig::default(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let (tee_tx, mut tee_rx) = tokio::sync::mpsc::channel(4);
+        let finding = schema::AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            schema::EventClass::Detection,
+            schema::EventAction::Detected,
+            schema::Severity::High,
+            schema::EventData::Detection(Box::new(schema::DetectionData {
+                rule_id: "memory.anon_exec".into(),
+                confidence: 30,
+                ..Default::default()
+            })),
+        );
+        consume_batch(
+            vec![finding],
+            &mut detection::CheckpointTracker::default(),
+            Some(&tee_tx),
+            &OutputMode::Off,
+            &spool,
+            &siem,
+        )
+        .await;
+        let teed = tee_rx.recv().await.expect("finding is teed to prevention");
+        let schema::EventData::Detection(d) = &teed.data else {
+            panic!("detection expected")
+        };
+        assert_eq!(d.mode, Some(schema::DetectionMode::Signal));
+        assert!(teed.severity <= schema::Severity::Low);
+        assert_eq!(spool.lock().unwrap().len(), 1);
     }
 }

@@ -55,18 +55,7 @@ key_file.write_bytes(tls_key.private_bytes(serialization.Encoding.PEM, serializa
 signing_key = ed25519.Ed25519PrivateKey.generate()
 (args.config_dir / 'command_signing.pub').write_bytes(signing_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
 config = json.loads(args.default_config.read_text(encoding='utf-8-sig'))
-config.update(heartbeat_interval_secs=5, fs_watch_paths=[args.watch_dir], fim_paths=[args.watch_dir], fim_interval_secs=10,
-              sigma_rules=['''title: TRAPD MSI Sigma smoke
-id: trapd-msi-smoke
-logsource:
-  product: windows
-  category: process_creation
-detection:
-  selection:
-    CommandLine|contains: TRAPD_MSI_SIGMA_SMOKE
-  condition: selection
-level: high
-'''])
+config.update(heartbeat_interval_secs=5, fs_watch_paths=[args.watch_dir], fim_paths=[args.watch_dir], fim_interval_secs=10)
 # Match serde's ConfigEnvelope field order and the serialized AgentConfig order
 # returned by diagnostics. The current agent verifier signs the typed encoding.
 envelope = {'issued_at': now.replace(microsecond=0).isoformat().replace('+00:00', 'Z'), 'agent_id': 'windows-smoke', 'config': config}
