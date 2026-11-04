@@ -20,7 +20,7 @@ else on Windows is type-checked and unit-tested on shared logic only.
 | Process / network / DNS telemetry | ✅ eBPF | ✅ ETW (+ poller fallback), CI |
 | Authentication / security events | ✅ auth.log, auditd | ✅ Security / System / Application event logs |
 | Generic log collector (file tail, rotation, parsers) | ✅ | ✅ IIS / http.sys (W3C), nginx, Apache, PostgreSQL, MySQL; real file identity for rotation. No journal / syslog-socket sources |
-| Detection engine, Sigma, IOA, baseline | ✅ | ✅ same engine |
+| Rule matching (behavioural, IOC, Sigma, IOA, baseline) | ➡️ backend | ➡️ backend (agent sends raw telemetry; see `docs/telemetry-coverage-gaps.md`) |
 | Honeytokens (deploy / detect / respond) | ✅ | ✅ file + registry decoys, 4663 audit |
 | Ransomware indicators (entropy, mass-write, extension, backup deletion) | ✅ | ✅ shared heuristics over registered local profile paths (including relocated/Entra profiles), plus the default Users tree; remote redirected folders need separate coverage |
 | Agent / binary tamper detection | 🟡 `/etc/trapd` (config) watched by `FilesystemCollector`; state dir not watched; `agent_protect` watches only `$HOME/.trapd` | ✅ config/install directories and their replacement; parent watches rearm protected paths, independent of generic scope changes; integrity-file changes reported immediately; update-aware |
@@ -89,7 +89,14 @@ already used; XDP/TC packet-level visibility.
 
 ---
 
-## 2. Detection engine (`crates/trapd-detection/src/`)
+## 2. Detection engine (`crates/trapd-detection/src/`) — REMOVED from the agent
+
+> **Rule matching no longer runs in the agent.** The agent collects and ships
+> raw telemetry in the canonical schema; the backend detects. The table below
+> describes the **removed** engine and is kept as the migration reference (rule
+> catalog: `docs/legacy-agent-rules/`). The crate now only holds sensor-side
+> policy (honeytokens, filesystem heuristics, Windows log normalisation, optional
+> YARA). Coverage gaps and regressions: `docs/telemetry-coverage-gaps.md`.
 
 Platform-neutral analytics over every event; findings are first-class events fed
 back through the pipeline (persist + backend + auto-response).

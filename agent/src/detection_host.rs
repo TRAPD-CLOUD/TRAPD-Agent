@@ -18,50 +18,10 @@ impl trapd_schema::runtime::Runtime for HostRuntime {
         crate::telemetry::metrics::metrics().enrichment_partial();
     }
 }
-impl trapd_detection::runtime::Runtime for HostRuntime {
-    fn detection_uncatalogued(&self) {
-        crate::telemetry::metrics::metrics().detection_uncatalogued();
-    }
-    fn detection_suppressed(&self) {
-        crate::telemetry::metrics::metrics().detection_suppressed();
-    }
-    fn detection_aggregated(&self) {
-        crate::telemetry::metrics::metrics().detection_aggregated();
-    }
-    fn shadow_hit(&self, rule_id: &str) {
-        crate::telemetry::coverage::shadow_hit(rule_id);
-    }
-    fn write_baseline(&self, path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
-        crate::paths::write_atomic(path, bytes, 0o600)
-    }
-}
 pub fn initialize() {
     trapd_schema::runtime::install(Arc::new(HostRuntime))
         .unwrap_or_else(|_| panic!("schema runtime initialized after event creation"));
 }
-pub fn engine(agent_id: String, hostname: String) -> trapd_detection::DetectionEngine {
-    trapd_detection::DetectionEngine::with_runtime(
-        agent_id,
-        hostname,
-        trapd_detection::runtime::Paths {
-            iocs: Some(crate::paths::config_dir().join("iocs.json")),
-            sigma: Some(crate::paths::config_dir().join("sigma")),
-            baseline: Some(crate::paths::state_dir().join("baseline.json")),
-        },
-        Arc::new(HostRuntime),
-    )
-}
-/// Pick up threat-intel feed updates on the agent runtime without a restart.
-pub fn spawn_ioc_reloader(engine: Arc<trapd_detection::DetectionEngine>, secs: u64) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(secs.max(30)));
-        loop {
-            ticker.tick().await;
-            engine.reload_iocs();
-        }
-    });
-}
-
 #[cfg(target_os = "linux")]
 mod process {
     use trapd_detection::honeytoken::ProcInfo;

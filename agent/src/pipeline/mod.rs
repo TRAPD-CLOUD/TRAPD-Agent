@@ -33,7 +33,31 @@ pub use spool::{
 ///
 /// Sized to absorb a burst (a build, a container start-up storm) without
 /// dropping, while still bounding worst-case memory to a few MiB.
-pub const CHANNEL_CAPACITY: usize = 1_000;
+pub const CHANNEL_CAPACITY: usize = 4_096;
+
+/// Most events one consumer pass handles together. Bounds the latency a single
+/// batch adds and the size of one spool write.
+pub const MAX_BATCH: usize = 256;
+
+/// Wait for at least one event, then take everything already queued, up to
+/// [`MAX_BATCH`]. Returns `false` once the channel is closed and drained.
+///
+/// Cancel-safe: the only await is the first `recv`, and `batch` is untouched
+/// until it completes, so dropping this future (e.g. in a `select!`) loses
+/// nothing.
+pub async fn next_batch(rx: &mut mpsc::Receiver<AgentEvent>, batch: &mut Vec<AgentEvent>) -> bool {
+    let Some(first) = rx.recv().await else {
+        return false;
+    };
+    batch.push(first);
+    while batch.len() < MAX_BATCH {
+        match rx.try_recv() {
+            Ok(event) => batch.push(event),
+            Err(_) => break,
+        }
+    }
+    true
+}
 
 pub fn create_pipeline() -> (mpsc::Sender<AgentEvent>, mpsc::Receiver<AgentEvent>) {
     mpsc::channel(CHANNEL_CAPACITY)

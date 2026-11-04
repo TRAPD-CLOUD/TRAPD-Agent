@@ -23,7 +23,7 @@ use crate::heartbeat::Heartbeat;
 use crate::output::OutputMode;
 use crate::pipeline::{self, create_pipeline, Spool};
 use crate::transport::Transport;
-use crate::{emit_finding, env_truthy, handle_event, load_or_create_device_id, paths};
+use crate::{env_truthy, load_or_create_device_id, paths};
 
 // ── Tracing sinks ─────────────────────────────────────────────────────────────
 
@@ -391,19 +391,11 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
 
     drop(tx);
 
-    let engine = Arc::new(crate::detection_host::engine(
-        agent_id.clone(),
-        hostname.clone(),
-    ));
     if let Ok(cfg) = agent_config.read() {
-        engine.reload_sigma(&cfg.sigma_rules);
-        engine.set_sigma_enabled(cfg.sigma_enabled);
-        engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
-        engine.set_suppressions(cfg.detection_suppressions.clone());
-        engine.set_rule_modes(&cfg.rule_modes);
         crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
+        crate::detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
+        crate::detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
     }
-    crate::detection_host::spawn_ioc_reloader(Arc::clone(&engine), 300);
 
     // SIEM forwarder — same best-effort export path as the Linux agent.
     let siem = {
@@ -424,67 +416,42 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
     let mode = output_mode;
-    let consumer_engine = Arc::clone(&engine);
     let prev_tx = prev_event_tx.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let mut consumer = tokio::spawn(async move {
         let mut checkpoints = crate::detection::CheckpointTracker::default();
         let mut shutting_down = false;
-        // Aggregate updates for repeated findings are released on this tick.
-        let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(30));
-        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut batch = Vec::with_capacity(crate::pipeline::MAX_BATCH);
         loop {
-            let event = tokio::select! {
+            tokio::select! {
                 _ = &mut shutdown_rx, if !shutting_down => {
                     rx.close();
                     shutting_down = true;
-                    continue;
                 }
-                event = rx.recv() => match event { Some(event) => event, None => break },
-                _ = flush_tick.tick() => {
-                    for f in consumer_engine.flush_findings(false) {
-                        emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem).await;
+                more = crate::pipeline::next_batch(&mut rx, &mut batch) => {
+                    if !more {
+                        break;
                     }
-                    continue;
+                    crate::consume_batch(
+                        std::mem::take(&mut batch),
+                        &mut checkpoints,
+                        prev_tx.as_ref(),
+                        &mode,
+                        &buf_for_consumer,
+                        &siem,
+                    )
+                    .await;
                 }
-            };
-            if matches!(event.class, crate::schema::EventClass::Detection) {
-                for f in consumer_engine.admit_external(event) {
-                    emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem).await;
-                }
-                continue;
             }
-            // Retry durability without repeating downstream side effects.
-            if checkpoints.is_retry(&event) {
-                crate::spool_event(&event, &buf_for_consumer).await;
-                continue;
-            }
-            // Best-effort tee: a stalled enforcement engine must not stall
-            // telemetry, but a dropped tee is still counted.
-            if let Some(p) = &prev_tx {
-                crate::pipeline::try_tee(p, event.clone(), "prevention_tee");
-                crate::telemetry::metrics::metrics()
-                    .set_detection_queue_depth(p.max_capacity().saturating_sub(p.capacity()) as u64);
-            }
-            handle_event(&event, &mode, &buf_for_consumer).await;
-            siem.forward(&event).await;
-            for f in consumer_engine.admit(consumer_engine.inspect(&event)) {
-                emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem).await;
-            }
-        }
-        for f in consumer_engine.flush_findings(true) {
-            emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem).await;
         }
     });
 
     let started = std::time::Instant::now();
-    let telemetry_engine = Arc::clone(&engine);
     handles.push(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             ticker.tick().await;
             crate::deception::activity::persist();
-            telemetry_engine.persist_baseline();
             let report =
                 crate::telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
             if let Err(e) = report.write_atomic(&crate::telemetry::TelemetryReport::default_path())
@@ -510,7 +477,6 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
         handles.push(tokio::spawn(async move { transport.run().await }));
 
-        let config_engine = Arc::clone(&engine);
         let config_puller = ConfigPuller::new(
             Arc::clone(&agent_config),
             &backend_url,
@@ -518,12 +484,9 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             token.clone(),
         )?
         .with_apply_hook(Arc::new(move |cfg: &AgentConfig| {
-            config_engine.reload_sigma(&cfg.sigma_rules);
-            config_engine.set_sigma_enabled(cfg.sigma_enabled);
-            config_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
-            config_engine.set_suppressions(cfg.detection_suppressions.clone());
-            config_engine.set_rule_modes(&cfg.rule_modes);
             crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
+            crate::detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
+            crate::detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
         }));
         handles.push(tokio::spawn(async move { config_puller.run().await }));
 

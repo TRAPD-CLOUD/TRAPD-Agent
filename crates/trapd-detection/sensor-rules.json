@@ -1,0 +1,128 @@
+[
+ {
+  "id": "privesc.untracked_suid_exec",
+  "base": "high",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0004 Privilege Escalation",
+  "technique": "T1548.001"
+ },
+ {
+  "id": "memory.memfd_exec",
+  "base": "critical",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1620"
+ },
+ {
+  "id": "memory.anon_exec",
+  "base": "high",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1055"
+ },
+ {
+  "id": "memory.injected_pe",
+  "base": "high",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1055.001"
+ },
+ {
+  "id": "memory.deleted_exec",
+  "base": "low",
+  "max": "medium",
+  "mode": "signal",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1620"
+ },
+ {
+  "id": "injection.ld_preload_runtime",
+  "base": "high",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1574.006"
+ },
+ {
+  "id": "deception.honeytoken_tamper",
+  "base": "critical",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1070"
+ },
+ {
+  "id": "ransomware.high_entropy",
+  "base": "low",
+  "max": "medium",
+  "mode": "signal",
+  "base_from_event": false,
+  "tactic": "TA0040 Impact",
+  "technique": "T1486"
+ },
+ {
+  "id": "selfprotect.etw_session_stopped",
+  "base": "high",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.006"
+ },
+ {
+  "id": "selfprotect.unclean_shutdown",
+  "base": "low",
+  "max": "medium",
+  "mode": "signal",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562"
+ },
+ {
+  "id": "selfprotect.audit_policy_changed",
+  "base": "medium",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.002"
+ },
+ {
+  "id": "rootkit.",
+  "base": "medium",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": true,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1014"
+ },
+ {
+  "id": "yara.",
+  "base": "high",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": true,
+  "tactic": "TA0002 Execution",
+  "technique": "T1204"
+ },
+ {
+  "id": "yara_mem.",
+  "base": "high",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": true,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1055"
+ }
+]

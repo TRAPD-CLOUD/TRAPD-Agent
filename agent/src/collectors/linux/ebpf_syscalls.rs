@@ -1694,6 +1694,8 @@ impl Collector for EbpfSyscallCollector {
                                     username,
                                     name:     cstr(&ev.name).to_string(),
                                     taints:   ev.taints,
+                                    path: None,
+                                    process_exe: None,
                                 }),
                             );
                             if tx.send(event).await.is_err() { return Ok(()); }

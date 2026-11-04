@@ -349,7 +349,7 @@ pub struct AgentConfig {
     /// Last field and omitted when empty, so the canonical (signed) form of a
     /// config without suppressions is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub detection_suppressions: Vec<crate::detection::gate::SuppressionRule>,
+    pub detection_suppressions: Vec<crate::detection::legacy_config::SuppressionRule>,
 
     // ── Fields below are trailing and omitted at their default, so a config
     // that does not set them signs to the same bytes as before. Keep the
@@ -378,6 +378,12 @@ pub struct AgentConfig {
     /// a concrete path locally and reports it after planting.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub adaptive_decoys: Vec<AdaptiveDecoy>,
+    /// Windows: forward PowerShell script blocks (event 4104) to the backend
+    /// so it can run script detections. Off by default: script text can hold
+    /// credentials, so it only leaves the host when the operator opts in
+    /// (bounded in size by the log limits).
+    #[serde(default, skip_serializing_if = "skip_if_false")]
+    pub script_block_capture_enabled: bool,
 }
 
 pub use trapd_detection::RuleModeOverride;
@@ -444,6 +450,7 @@ impl Default for AgentConfig {
             windows_audit_policy_managed: false,
             deception_activity_learning_enabled: false,
             adaptive_decoys: Vec::new(),
+            script_block_capture_enabled: false,
         }
     }
 }

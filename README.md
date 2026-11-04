@@ -349,7 +349,7 @@ Edit the file, then run `systemctl restart trapd-agent`.
 | `TRAPD_ENROLL_TOKEN` | unset | One-time enrollment token. Not needed after enrollment. If unset, device pairing starts. |
 | `TRAPD_ENROLL_MAX_ATTEMPTS` | `0` (retry indefinitely) | Caps enrollment retries |
 | `TRAPD_OFFLINE` | unset | `1` forces offline mode even if a backend URL is set |
-| `TRAPD_OUTPUT` | stdout | `file` writes to `$TRAPD_LOG_DIR/events.ndjson` |
+| `TRAPD_OUTPUT` | `stdout` on a terminal, else `off` | `file` writes to `$TRAPD_LOG_DIR/events.ndjson`; `stdout`; `off` skips the local mirror (cheapest) |
 | `TRAPD_STATE_DIR`, `TRAPD_CONFIG_DIR`, `TRAPD_LOG_DIR` | `/var/lib/trapd`, `/etc/trapd`, `/var/log/trapd` | Directory locations |
 | `TRAPD_TLS_ALLOW_SYSTEM_ROOTS` | off | Accepts the host trust store when no `ca.crt` is provisioned. Not recommended. |
 | `TRAPD_SPOOL_MAX` | `50000` events | Maximum events in the durable spool. Oldest events are evicted, and the eviction is counted. |
