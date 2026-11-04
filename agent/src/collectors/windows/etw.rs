@@ -620,6 +620,12 @@ impl DecodeState {
                                 data.process_start_time,
                                 crate::telemetry::identity::process_start_time(data.ppid),
                             );
+                        if data.parent_start_time.is_some() {
+                            data.parent_exe = self
+                                .proc_images
+                                .get(&data.ppid)
+                                .map(|(image, _)| image.clone());
+                        }
                         crate::deception::activity::record_exec(&data.username, &data.exe);
                         crate::detection::accessor_correlation::record_process(&data);
                         if self.proc_images.len() >= 8192 {

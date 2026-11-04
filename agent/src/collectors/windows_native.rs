@@ -98,7 +98,7 @@ pub fn normalize(log: &LogEventData, agent: &str, host: &str) -> Option<AgentEve
         Some(event)
     };
     if (security && id == 4688) || (sysmon && id == 1) {
-        let (process_id, parent_id, exe, cmdline, username) = if security {
+        let (process_id, parent_id, exe, cmdline, username, parent_image) = if security {
             // Version 2 distinguishes the creator account from the child account.
             let target = get("TargetUserSid");
             let username = if !target.is_empty() && target != "S-1-0-0" && target != "-" {
@@ -112,6 +112,7 @@ pub fn normalize(log: &LogEventData, agent: &str, host: &str) -> Option<AgentEve
                 get("NewProcessName"),
                 get("CommandLine"),
                 username,
+                get("ParentProcessName"),
             )
         } else {
             (
@@ -120,6 +121,7 @@ pub fn normalize(log: &LogEventData, agent: &str, host: &str) -> Option<AgentEve
                 get("Image"),
                 get("CommandLine"),
                 get("User").into(),
+                get("ParentImage"),
             )
         };
         if exe.is_empty() {
@@ -159,6 +161,7 @@ pub fn normalize(log: &LogEventData, agent: &str, host: &str) -> Option<AgentEve
                 exe: exe.into(),
                 cmdline: cmdline.into(),
                 username,
+                parent_exe: Some(parent_image.to_string()).filter(|p| !p.is_empty()),
                 enrichment: enrichment.finish(2),
                 ..Default::default()
             }),
@@ -853,6 +856,47 @@ mod tests {
             assert_eq!(r.value_name, "Rapid");
             assert_eq!(r.new_value.is_none(), op == "%%1906");
         }
+    }
+    #[test]
+    fn process_creation_carries_the_parent_image_for_backend_rules() {
+        let security = log(
+            "Security",
+            "Microsoft-Windows-Security-Auditing",
+            4688,
+            &[
+                ("NewProcessId", "12"),
+                ("ProcessId", "4"),
+                ("NewProcessName", r"C:\Windows\System32\cmd.exe"),
+                (
+                    "ParentProcessName",
+                    r"C:\Program Files\Microsoft Office\WINWORD.EXE",
+                ),
+                ("CommandLine", "cmd /c calc"),
+            ],
+        );
+        let EventData::ProcessCreate(p) = normalize(&security, "a", "h").unwrap().data else {
+            panic!("process expected")
+        };
+        assert_eq!(
+            p.parent_exe.as_deref(),
+            Some(r"C:\Program Files\Microsoft Office\WINWORD.EXE")
+        );
+        let sysmon = log(
+            SYSMON_CHANNEL,
+            "Microsoft-Windows-Sysmon",
+            1,
+            &[
+                ("ProcessId", "12"),
+                ("ParentProcessId", "4"),
+                ("Image", r"C:\Windows\System32\cmd.exe"),
+                ("ParentImage", r"C:\Windows\explorer.exe"),
+                ("CommandLine", "cmd"),
+            ],
+        );
+        let EventData::ProcessCreate(p) = normalize(&sysmon, "a", "h").unwrap().data else {
+            panic!("process expected")
+        };
+        assert_eq!(p.parent_exe.as_deref(), Some(r"C:\Windows\explorer.exe"));
     }
     #[test]
     fn sysmon_process_access_gets_no_local_verdict() {

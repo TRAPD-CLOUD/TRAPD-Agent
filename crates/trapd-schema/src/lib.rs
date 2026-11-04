@@ -373,6 +373,11 @@ pub struct ProcessCreateData {
     /// a generation that already existed when this child was created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_start_time: Option<u64>,
+    /// Image path of the parent process when it is known for the generation
+    /// that created this child. Lets the backend match parent/child rules
+    /// (Office -> shell, web server -> shell) without its own process table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_exe: Option<String>,
     /// Which `/proc` reads failed or were truncated while building this event.
     #[serde(default, flatten)]
     pub enrichment: crate::Enrichment,
