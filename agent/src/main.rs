@@ -258,6 +258,7 @@ async fn main() -> Result<()> {
     let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()));
     if let Ok(cfg) = agent_config.read() {
         detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
+        detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
     }
     // Backend outbox. Online it is disk-backed (survives crash/restart, replays
     // on the next run); offline it is purely in-memory (the NDJSON output is the
@@ -526,6 +527,7 @@ async fn main() -> Result<()> {
         )?
         .with_apply_hook(std::sync::Arc::new(|cfg: &AgentConfig| {
             detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
+            detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
         }));
         tokio::spawn(async move { config_puller.run().await });
 
@@ -663,12 +665,17 @@ pub(crate) async fn consume_batch(
         }
         // Findings the host raises itself carry the mode and severity that
         // local auto-response acts on (and the backend recomputes).
-        if let detection::sensor_policy::Disposition::Shadow(rule) =
-            detection::sensor_policy::classify(&mut event)
-        {
-            // Shadow rules are counted, never emitted or acted on.
-            telemetry::coverage::shadow_hit(&rule);
-            continue;
+        match detection::sensor_policy::classify(&mut event) {
+            detection::sensor_policy::Disposition::Forward => {}
+            detection::sensor_policy::Disposition::Shadow(rule) => {
+                // Shadow rules are counted, never emitted or acted on.
+                telemetry::coverage::shadow_hit(&rule);
+                continue;
+            }
+            detection::sensor_policy::Disposition::Suppressed => {
+                telemetry::metrics::metrics().detection_suppressed();
+                continue;
+            }
         }
         // Forwarding to prevention is best-effort — a stalled enforcement
         // engine must not stall telemetry — but a dropped tee is still

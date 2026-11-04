@@ -15,10 +15,15 @@
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use trapd_schema::{AgentEvent, DetectionData, DetectionMode, EventData, Severity};
 
 use crate::honeytoken_policy;
+use crate::legacy_config::{SuppressionAction, SuppressionRule};
+
+/// Findings of these families may be lowered by a suppression, never dropped.
+const UNDROPPABLE_PREFIXES: &[&str] = &["deception."];
 
 #[derive(Deserialize)]
 struct Entry {
@@ -57,9 +62,25 @@ fn override_for(rule_id: &str) -> Option<DetectionMode> {
     overrides().read().ok()?.get(rule_id).copied()
 }
 
+fn suppressions() -> &'static RwLock<Vec<SuppressionRule>> {
+    static SUPPRESSIONS: OnceLock<RwLock<Vec<SuppressionRule>>> = OnceLock::new();
+    SUPPRESSIONS.get_or_init(Default::default)
+}
+
+/// Replace the operator's signed suppressions (`detection_suppressions`). They
+/// must apply to host findings before local auto-response, because the backend
+/// cannot undo an action the agent already took.
+pub fn set_suppressions(rules: &[SuppressionRule]) {
+    if let Ok(mut list) = suppressions().write() {
+        *list = rules.to_vec();
+    }
+}
+
 /// What to do with a classified event.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Disposition {
+    /// A drop suppression matched: counted, not emitted, not acted on.
+    Suppressed,
     /// Persist, ship and let prevention see it.
     Forward,
     /// The rule runs in shadow mode: count it, never emit or act on it.
@@ -150,6 +171,156 @@ fn classify_detection(emitted: Severity, d: &mut DetectionData) -> Severity {
     severity
 }
 
+fn step_down(s: Severity) -> Severity {
+    match s {
+        Severity::Critical => Severity::High,
+        Severity::High => Severity::Medium,
+        Severity::Medium => Severity::Low,
+        Severity::Low | Severity::Info => Severity::Info,
+    }
+}
+
+/// Apply the first matching signed suppression. Returns `true` when the finding
+/// is to be dropped.
+fn apply_suppression(severity: &mut Severity, at: DateTime<Utc>, d: &mut DetectionData) -> bool {
+    let Ok(list) = suppressions().read() else {
+        return false;
+    };
+    let Some(rule) = list.iter().find(|r| suppression_matches(r, d, at)) else {
+        return false;
+    };
+    let action = if rule.action == SuppressionAction::Drop
+        && UNDROPPABLE_PREFIXES
+            .iter()
+            .any(|p| d.rule_id.starts_with(p))
+    {
+        SuppressionAction::Downgrade
+    } else {
+        rule.action
+    };
+    match action {
+        SuppressionAction::Drop => return true,
+        SuppressionAction::SignalOnly => {
+            d.mode = Some(DetectionMode::Signal);
+            *severity = (*severity).min(Severity::Low);
+            d.severity_reasons.push("signal:suppression".into());
+        }
+        SuppressionAction::Downgrade => {
+            let floor = if d.mode == Some(DetectionMode::Signal) {
+                Severity::Info
+            } else {
+                Severity::Low
+            };
+            *severity = step_down(*severity).max(floor);
+            d.severity_reasons.push("-suppression_downgrade".into());
+        }
+    }
+    if let Some(obj) = d.evidence.as_object_mut() {
+        obj.insert("suppression_id".into(), rule.id.clone().into());
+    } else if d.evidence.is_null() {
+        d.evidence = serde_json::json!({ "suppression_id": rule.id });
+    }
+    false
+}
+
+fn suppression_matches(r: &SuppressionRule, d: &DetectionData, at: DateTime<Utc>) -> bool {
+    if r.expires_at.is_some_and(|t| t <= at) || !glob_match(&r.rule, &d.rule_id) {
+        return false;
+    }
+    let corr = d.correlation.clone().unwrap_or_default();
+    let evidence = |k: &str| d.evidence.get(k).and_then(|v| v.as_str()).map(String::from);
+    let plain = |pattern: &Option<String>, value: Option<String>| match pattern {
+        None => true,
+        Some(p) => value.is_some_and(|v| glob_match(p, &v)),
+    };
+    let identity = |pattern: &Option<String>, value: Option<String>| match pattern {
+        None => true,
+        Some(p) => value.is_some_and(|v| glob_match_identity(p, &v)),
+    };
+    identity(&r.exe, corr.exe.clone().or_else(|| Some(d.subject.clone())))
+        && plain(&r.cmdline, evidence("cmdline"))
+        && identity(&r.user, corr.user.clone())
+        // The agent no longer builds a process tree, so a parent-image
+        // suppression cannot be evaluated here and does not match.
+        && r.parent_exe.is_none()
+        && identity(&r.path, corr.file_path.clone().or_else(|| evidence("path")))
+        && match &r.sha256 {
+            None => true,
+            Some(h) => corr
+                .exe_sha256
+                .as_deref()
+                .is_some_and(|x| digest_hex(x).eq_ignore_ascii_case(digest_hex(h))),
+        }
+        && match &r.remote {
+            None => true,
+            Some(p) => remote_match(p, corr.remote_ip.as_deref(), corr.domain.as_deref()),
+        }
+}
+
+/// Windows spellings are compared the way Windows does: separators equal,
+/// case ignored (a `\` in a glob would otherwise be an escape).
+fn glob_match_identity(pattern: &str, value: &str) -> bool {
+    let windows = value.contains('\\') || value.as_bytes().get(1) == Some(&b':');
+    if windows {
+        glob_match(
+            &pattern.replace('\\', "/").to_ascii_lowercase(),
+            &value.replace('\\', "/").to_ascii_lowercase(),
+        )
+    } else {
+        glob_match(pattern, value)
+    }
+}
+
+fn digest_hex(d: &str) -> &str {
+    let d = d.trim();
+    d.strip_prefix("sha256:")
+        .or_else(|| d.strip_prefix("SHA256:"))
+        .unwrap_or(d)
+}
+
+fn glob_match(pattern: &str, value: &str) -> bool {
+    match globset::GlobBuilder::new(pattern)
+        .literal_separator(false)
+        .build()
+    {
+        Ok(g) => g.compile_matcher().is_match(value),
+        Err(_) => pattern == value,
+    }
+}
+
+fn remote_match(pattern: &str, ip: Option<&str>, domain: Option<&str>) -> bool {
+    if let Some((net, bits)) = pattern.split_once('/') {
+        let (Ok(net), Ok(bits), Some(Ok(ip))) = (
+            net.parse::<std::net::IpAddr>(),
+            bits.parse::<u8>(),
+            ip.map(|i| i.parse::<std::net::IpAddr>()),
+        ) else {
+            return false;
+        };
+        return match (net, ip) {
+            (std::net::IpAddr::V4(n), std::net::IpAddr::V4(i)) if bits <= 32 => {
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - bits)
+                };
+                u32::from(n) & mask == u32::from(i) & mask
+            }
+            (std::net::IpAddr::V6(n), std::net::IpAddr::V6(i)) if bits <= 128 => {
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - bits)
+                };
+                u128::from(n) & mask == u128::from(i) & mask
+            }
+            _ => false,
+        };
+    }
+    ip == Some(pattern)
+        || domain.is_some_and(|d| d == pattern || d.ends_with(&format!(".{pattern}")))
+}
+
 /// Stamp a collector-raised finding with its mode and severity. Events of any
 /// other kind are left untouched. A finding whose rule runs in shadow mode is
 /// reported as [`Disposition::Shadow`] and must not be forwarded.
@@ -172,6 +343,9 @@ pub fn classify(event: &mut AgentEvent) -> Disposition {
             event.severity = classify_detection(emitted, d);
             if d.mode == Some(DetectionMode::Shadow) {
                 return Disposition::Shadow(d.rule_id.clone());
+            }
+            if apply_suppression(&mut event.severity, event.timestamp, d) {
+                return Disposition::Suppressed;
             }
         }
         _ => {}
@@ -281,6 +455,55 @@ mod tests {
         let mut e = finding("memory.memfd_exec", 90, Severity::Critical);
         classify(&mut e);
         assert_eq!(mode(&e), Some(DetectionMode::Alert), "cleared overrides");
+    }
+
+    fn suppression(action: SuppressionAction, rule: &str) -> SuppressionRule {
+        SuppressionRule {
+            id: "s1".into(),
+            rule: rule.into(),
+            exe: None,
+            cmdline: None,
+            user: None,
+            parent_exe: None,
+            path: None,
+            sha256: None,
+            remote: None,
+            action,
+            expires_at: None,
+        }
+    }
+
+    /// Suppressions are process-global like the rule modes: this test owns
+    /// them and uses rule ids no other test classifies.
+    #[test]
+    fn signed_suppressions_apply_before_local_response() {
+        set_suppressions(&[
+            suppression(SuppressionAction::Drop, "yara_mem.*"),
+            suppression(
+                SuppressionAction::SignalOnly,
+                "selfprotect.etw_session_stopped",
+            ),
+            suppression(SuppressionAction::Drop, "deception.*"),
+        ]);
+        let mut e = finding("yara_mem.injected_marker", 90, Severity::Critical);
+        assert_eq!(classify(&mut e), Disposition::Suppressed);
+
+        let mut e = finding("selfprotect.etw_session_stopped", 90, Severity::High);
+        assert_eq!(classify(&mut e), Disposition::Forward);
+        assert_eq!(mode(&e), Some(DetectionMode::Signal));
+        assert!(
+            e.severity <= Severity::Low,
+            "suppressed to a signal: no response"
+        );
+
+        // deception findings can be lowered, never dropped
+        let mut e = finding("deception.honeytoken_tamper", 90, Severity::Critical);
+        assert_eq!(classify(&mut e), Disposition::Forward);
+        assert!(e.severity < Severity::Critical);
+
+        set_suppressions(&[]);
+        let mut e = finding("yara_mem.injected_marker", 90, Severity::Critical);
+        assert_eq!(classify(&mut e), Disposition::Forward, "cleared");
     }
 
     #[test]
