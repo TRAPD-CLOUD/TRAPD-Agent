@@ -897,33 +897,46 @@ mod native_tests {
     #[test]
     fn enriching_processes_does_not_retain_their_handles() {
         const CHILDREN: usize = 40;
-        let mut state = DecodeState::new();
-        // Warm up lazily initialised OS state, then take the baseline before any
-        // child exists: Rust's own `Child` handles are part of the later count
-        // only while the children are alive.
-        let _ = state.enrich_process(std::process::id() as i32);
-        let baseline = own_handle_count();
-        let mut children: Vec<std::process::Child> = (0..CHILDREN)
-            .map(|_| {
-                std::process::Command::new("cmd.exe")
-                    .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
-                    .spawn()
-                    .unwrap()
-            })
-            .collect();
-        for child in &children {
-            let _ = state.enrich_process(child.id() as i32);
+        // The count is for the whole test process, and hundreds of other tests
+        // run in it concurrently, so a single reading can be pushed over the
+        // threshold by unrelated handles. A real leak retains about one handle
+        // per enrichment on *every* attempt; noise does not repeat, so one clean
+        // attempt out of three shows there is no leak.
+        let mut last = (0, 0);
+        for _ in 0..3 {
+            let mut state = DecodeState::new();
+            // Warm up lazily initialised OS state, then take the baseline before
+            // any child exists: Rust's own `Child` handles are part of the later
+            // count only while the children are alive.
+            let _ = state.enrich_process(std::process::id() as i32);
+            let baseline = own_handle_count();
+            let mut children: Vec<std::process::Child> = (0..CHILDREN)
+                .map(|_| {
+                    std::process::Command::new("cmd.exe")
+                        .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            for child in &children {
+                let _ = state.enrich_process(child.id() as i32);
+            }
+            for child in &mut children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            drop(children);
+            let after = own_handle_count();
+            if after < baseline + 8 {
+                return;
+            }
+            last = (baseline, after);
         }
-        for child in &mut children {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        drop(children);
-        let after = own_handle_count();
-        assert!(
-            after < baseline + 8,
-            "{} process handles were retained across {CHILDREN} enrichments ({baseline} -> {after})",
-            after.saturating_sub(baseline)
+        panic!(
+            "{} process handles were retained across {CHILDREN} enrichments ({} -> {}) on every one of 3 attempts",
+            last.1.saturating_sub(last.0),
+            last.0,
+            last.1
         );
     }
 
