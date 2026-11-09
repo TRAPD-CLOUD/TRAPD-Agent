@@ -36,6 +36,7 @@ pub mod response;
 pub mod rtr;
 pub mod runtime;
 pub mod software;
+pub mod usernotify;
 #[cfg(windows)]
 pub mod winfirewall;
 pub mod winguard;
