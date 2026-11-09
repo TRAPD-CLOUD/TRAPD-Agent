@@ -64,7 +64,7 @@ impl AuditEmitter {
                 .map(|c| c.user_response_notifications_enabled)
                 .unwrap_or(false)
         }) {
-            super::usernotify::notify(&action, success);
+            super::usernotify::notify(&action, kind, success, &details);
         }
         let event = AgentEvent::new(
             self.agent_id.clone(),
