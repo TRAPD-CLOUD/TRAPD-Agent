@@ -50,11 +50,35 @@ impl Message {
         ALL.into_iter().find(|message| message.id() == id)
     }
 
-    /// Only successful actions the user can notice. A freeze is left out on
-    /// purpose: it holds a process quietly while it is being investigated.
-    pub fn for_action(action: &EventAction, success: bool) -> Option<Self> {
+    /// Only actions the user can notice and that are confirmed to have happened.
+    /// `success` alone is not enough: an alert-only rule reports success without
+    /// stopping anything, and an automatic response reports success when any one
+    /// of its steps worked. A freeze is left out on purpose: it holds a process
+    /// quietly while it is being investigated.
+    pub fn for_event(
+        action: &EventAction,
+        kind: &str,
+        success: bool,
+        details: &serde_json::Value,
+    ) -> Option<Self> {
         if !success {
             return None;
+        }
+        match kind {
+            "process_block" | "network_isolate" | "network_deisolate" | "quarantine"
+            | "restore" => {}
+            "auto_response" => {
+                let step = match action {
+                    EventAction::NetworkIsolated => "isolated",
+                    EventAction::ProcessBlocked => "killed",
+                    EventAction::FileQuarantined => "quarantined",
+                    _ => return None,
+                };
+                if details.get(step).and_then(serde_json::Value::as_bool) != Some(true) {
+                    return None;
+                }
+            }
+            _ => return None,
         }
         match action {
             EventAction::NetworkIsolated => Some(Self::HostIsolated),
@@ -172,8 +196,8 @@ mod windows_impl {
     }
 
     /// Never blocks and never fails the response action it reports on.
-    pub fn notify(action: &EventAction, success: bool) {
-        let Some(message) = Message::for_action(action, success) else {
+    pub fn notify(action: &EventAction, kind: &str, success: bool, details: &serde_json::Value) {
+        let Some(message) = Message::for_event(action, kind, success, details) else {
             return;
         };
         let allowed = LIMITER
@@ -380,15 +404,75 @@ mod tests {
 
     #[test]
     fn only_successful_visible_actions_notify() {
+        let none = serde_json::Value::Null;
         assert_eq!(
-            Message::for_action(&EventAction::NetworkIsolated, true),
+            Message::for_event(
+                &EventAction::NetworkIsolated,
+                "network_isolate",
+                true,
+                &none
+            ),
             Some(Message::HostIsolated)
         );
         assert_eq!(
-            Message::for_action(&EventAction::NetworkIsolated, false),
+            Message::for_event(
+                &EventAction::NetworkIsolated,
+                "network_isolate",
+                false,
+                &none
+            ),
             None
         );
-        assert_eq!(Message::for_action(&EventAction::ProcessFrozen, true), None);
+        assert_eq!(
+            Message::for_event(&EventAction::ProcessFrozen, "process_block", true, &none),
+            None
+        );
+    }
+
+    #[test]
+    fn an_alert_only_rule_never_claims_a_program_was_stopped() {
+        let none = serde_json::Value::Null;
+        assert_eq!(
+            Message::for_event(&EventAction::ProcessBlocked, "process_alert", true, &none),
+            None
+        );
+        assert_eq!(
+            Message::for_event(&EventAction::ProcessBlocked, "process_block", true, &none),
+            Some(Message::ProcessStopped)
+        );
+    }
+
+    #[test]
+    fn an_automatic_response_only_reports_the_step_that_worked() {
+        let details =
+            serde_json::json!({ "killed": true, "isolated": false, "quarantined": false });
+        assert_eq!(
+            Message::for_event(
+                &EventAction::NetworkIsolated,
+                "auto_response",
+                true,
+                &details
+            ),
+            None
+        );
+        assert_eq!(
+            Message::for_event(
+                &EventAction::ProcessBlocked,
+                "auto_response",
+                true,
+                &details
+            ),
+            Some(Message::ProcessStopped)
+        );
+        assert_eq!(
+            Message::for_event(
+                &EventAction::FileQuarantined,
+                "auto_response",
+                true,
+                &serde_json::Value::Null
+            ),
+            None
+        );
     }
 
     #[test]
