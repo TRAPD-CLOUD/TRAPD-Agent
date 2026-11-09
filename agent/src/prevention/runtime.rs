@@ -90,6 +90,8 @@ pub async fn start(
     );
     #[cfg(windows)]
     Arc::clone(&engine).start_firewall_expiry().await;
+    #[cfg(not(windows))]
+    engine.restore_isolation().await;
     Arc::clone(&engine).spawn_event_loop(event_rx);
 
     if let Some(v) = verifier {

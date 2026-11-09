@@ -110,6 +110,9 @@ const NEVER_QUARANTINE: &[&str] = &[
     "/var/lib/dpkg/",
     "/var/lib/rpm/",
     "/snap/",
+    "/proc/",
+    "/sys/",
+    "/dev/",
 ];
 
 /// Windows OS and agent locations, matched on the part after the drive letter
@@ -256,7 +259,24 @@ pub fn validated_quarantine_path(p: &str) -> Option<String> {
     }
     #[cfg(not(windows))]
     {
-        Some(p.to_string())
+        // Resolve links first: a safe-looking path may point into the OS.
+        let resolved = std::fs::canonicalize(p).ok()?;
+        if resolved == std::env::current_exe().ok()? {
+            return None;
+        }
+        let protected_dirs = [
+            crate::paths::state_dir().to_path_buf(),
+            crate::paths::config_dir().to_path_buf(),
+            crate::paths::log_dir().to_path_buf(),
+        ];
+        for directory in protected_dirs {
+            let directory = std::fs::canonicalize(&directory).unwrap_or(directory);
+            if resolved.starts_with(directory) {
+                return None;
+            }
+        }
+        let resolved = resolved.to_str()?;
+        safe_quarantine_candidate(resolved).then(|| resolved.to_string())
     }
 }
 
@@ -473,6 +493,40 @@ mod tests {
         assert!(validated_quarantine_path(alias.to_str().unwrap()).is_none());
         std::fs::remove_file(&alias).unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validated_target_resolves_links_before_the_protected_check() {
+        let directory = std::env::temp_dir().join(format!("trapd-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("payload");
+        std::fs::write(&file, b"x").unwrap();
+        let link = directory.join("link");
+        std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
+
+        let resolved = std::fs::canonicalize(&file).unwrap();
+        assert_eq!(
+            validated_quarantine_path(file.to_str().unwrap()).as_deref(),
+            resolved.to_str()
+        );
+        assert_eq!(validated_quarantine_path(link.to_str().unwrap()), None);
+        assert_eq!(validated_quarantine_path("/etc/passwd"), None);
+        assert_eq!(validated_quarantine_path("/proc/self/status"), None);
+        assert_eq!(
+            validated_quarantine_path(std::env::current_exe().unwrap().to_str().unwrap()),
+            None
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_quarantine_refuses_a_protected_file_and_leaves_it_in_place() {
+        let error =
+            super::super::quarantine::quarantine(std::path::Path::new("/etc/passwd")).unwrap_err();
+        assert!(format!("{error:#}").contains("protected"));
+        assert!(std::path::Path::new("/etc/passwd").exists());
     }
 
     #[test]

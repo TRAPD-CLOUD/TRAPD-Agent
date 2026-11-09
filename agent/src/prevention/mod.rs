@@ -25,6 +25,9 @@ pub mod audit;
 pub mod command_puller;
 pub mod engine;
 pub mod firewall;
+pub mod isolation_state;
+#[cfg(target_os = "linux")]
+mod linuxpin;
 pub mod lsm_loader;
 pub mod network;
 pub mod process;
