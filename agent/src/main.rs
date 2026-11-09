@@ -71,6 +71,10 @@ use transport::Transport;
 /// from the same modules the Linux agent uses.
 #[cfg(windows)]
 fn main() -> Result<()> {
+    // One-shot toast helper in the user's session: runs none of the agent.
+    if std::env::args().nth(1).as_deref() == Some(prevention::usernotify::NOTIFY_FLAG) {
+        return prevention::usernotify::run_helper(std::env::args().nth(2).as_deref());
+    }
     detection_host::initialize();
     winsvc::entry()
 }

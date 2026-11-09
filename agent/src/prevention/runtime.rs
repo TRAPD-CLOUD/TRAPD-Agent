@@ -39,6 +39,8 @@ pub async fn start(
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<crate::schema::AgentEvent>(1024);
 
     let audit = AuditEmitter::new(pipeline_tx.clone(), agent_id.into(), hostname.into());
+    #[cfg(windows)]
+    let audit = audit.with_user_notifications(Arc::clone(&cfg_handle));
 
     let policy_path = local_policy_path();
     let store = load_local_policy(&policy_path)
