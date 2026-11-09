@@ -1777,6 +1777,7 @@ impl Engine {
                 requested,
                 resolved,
             },
+            || network::holds_isolation(backend),
             |ips| network::isolate(backend, ips),
             || network::deisolate(backend),
         )

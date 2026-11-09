@@ -238,6 +238,17 @@ pub fn restore(quarantine_id: &Uuid) -> Result<QuarantineRecord> {
     Ok(record)
 }
 
+/// Compare resolved paths, ignoring the Windows verbatim prefix that records
+/// written by earlier agent versions may carry.
+fn same_directory(a: &str, b: &str) -> bool {
+    let plain = |path: &'_ str| {
+        path.strip_prefix(r"\\?\")
+            .map(str::to_owned)
+            .unwrap_or_else(|| path.to_owned())
+    };
+    plain(a) == plain(b)
+}
+
 /// Put a quarantined file back only if it is still the file that was taken and
 /// nothing has appeared in its place. On failure it stays locked in quarantine.
 fn place_restored(stored: &Path, original: &Path, sha256: &str) -> Result<()> {
@@ -252,9 +263,8 @@ fn place_restored(stored: &Path, original: &Path, sha256: &str) -> Result<()> {
         let parent = original.parent().context("restore target has no parent")?;
         fs::create_dir_all(parent).context("create restore directory")?;
         let resolved = fs::canonicalize(parent).context("resolve restore directory")?;
-        let resolved = resolved.to_string_lossy();
-        let expected = parent.to_string_lossy();
-        if resolved.strip_prefix(r"\\?\").unwrap_or(&resolved) != expected {
+        let (resolved, expected) = (resolved.to_string_lossy(), parent.to_string_lossy());
+        if !same_directory(&resolved, &expected) {
             bail!("restore directory was redirected: {expected}");
         }
         #[cfg(target_os = "linux")]
@@ -545,6 +555,19 @@ mod restore_tests {
         assert!(place_restored(&stored, &root.join("alias/file"), &sha).is_err());
         assert!(!root.join("real/file").exists());
         assert!(stored.exists());
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::same_directory;
+
+    #[test]
+    fn the_verbatim_prefix_is_ignored_on_either_side() {
+        assert!(same_directory(r"\\?\C:\Users\a", r"C:\Users\a"));
+        assert!(same_directory(r"C:\Users\a", r"\\?\C:\Users\a"));
+        assert!(same_directory(r"\\?\C:\Users\a", r"\\?\C:\Users\a"));
+        assert!(!same_directory(r"\\?\C:\Windows", r"C:\Users\a"));
     }
 }
 

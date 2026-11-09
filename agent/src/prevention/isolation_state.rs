@@ -64,14 +64,18 @@ fn clear(path: &Path) -> Result<()> {
 /// Apply isolation and record it. Returns whether the record was stored: a
 /// storage failure must not delay containment, so the caller reports it instead.
 /// A failed apply returns to the earlier state and never releases a host that
-/// was already isolated.
+/// was or may have been isolated. A missing record proves nothing on its own,
+/// because isolation can predate this record or have failed to store it, so
+/// `held` reports what the firewall holds before anything changes.
 pub fn isolate(
     path: &Path,
     state: &IsolationState,
+    held: impl Fn() -> Result<bool>,
     apply: impl Fn(&[IpAddr]) -> Result<()>,
     lift: impl Fn() -> Result<()>,
 ) -> Result<bool> {
     let previous = load(path);
+    let held_before = matches!(previous, Ok(None)).then(held);
     let persisted = match save(path, state) {
         Ok(()) => true,
         Err(error) => {
@@ -83,8 +87,15 @@ pub fn isolate(
         return Ok(persisted);
     };
     let rollback = match &previous {
-        Ok(Some(earlier)) => save(path, earlier).and_then(|()| apply(&earlier.resolved)),
-        Ok(None) => lift().and_then(|()| clear(path)),
+        // Restore the rules even if the record cannot be written.
+        Ok(Some(earlier)) => {
+            let saved = save(path, earlier);
+            apply(&earlier.resolved).and(saved)
+        }
+        Ok(None) if matches!(held_before, Some(Ok(false))) => lift().and_then(|()| clear(path)),
+        Ok(None) => clear(path).and(Err(anyhow!(
+            "earlier isolation cannot be ruled out; firewall left as is"
+        ))),
         Err(_) => Err(anyhow!("earlier isolation state is unreadable; left as is")),
     };
     match rollback {
@@ -120,7 +131,7 @@ mod tests {
     fn a_successful_isolation_is_recorded_and_release_forgets_it() {
         let path = temp();
         let wanted = state("10.0.0.1");
-        assert!(isolate(&path, &wanted, |_| Ok(()), || Ok(())).unwrap());
+        assert!(isolate(&path, &wanted, || Ok(false), |_| Ok(()), || Ok(())).unwrap());
         assert_eq!(load(&path).unwrap(), Some(wanted));
         release(&path, || Ok(())).unwrap();
         assert_eq!(load(&path).unwrap(), None);
@@ -140,6 +151,7 @@ mod tests {
         let result = isolate(
             &path,
             &state("10.0.0.1"),
+            || Ok(false),
             |_| Err(anyhow!("nft failed")),
             || {
                 *lifted.borrow_mut() += 1;
@@ -155,11 +167,12 @@ mod tests {
     fn a_failed_change_never_releases_an_isolated_host() {
         let path = temp();
         let earlier = state("10.0.0.1");
-        isolate(&path, &earlier, |_| Ok(()), || Ok(())).unwrap();
+        isolate(&path, &earlier, || Ok(false), |_| Ok(()), || Ok(())).unwrap();
         let applied = RefCell::new(Vec::new());
         let result = isolate(
             &path,
             &state("10.0.0.2"),
+            || Ok(false),
             |ips| {
                 applied.borrow_mut().push(ips.to_vec());
                 if applied.borrow().len() == 1 {
@@ -177,10 +190,59 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_record_never_releases_rules_already_in_place() {
+        for held in [true, false] {
+            let path = temp();
+            let result = isolate(
+                &path,
+                &state("10.0.0.1"),
+                || {
+                    if held {
+                        Ok(true)
+                    } else {
+                        Err(anyhow!("cannot inspect firewall"))
+                    }
+                },
+                |_| Err(anyhow!("nft failed")),
+                || panic!("possibly isolated host must not be released"),
+            );
+            assert!(format!("{:#}", result.unwrap_err()).contains("left as is"));
+            assert_eq!(load(&path).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn earlier_rules_are_restored_even_when_the_record_cannot_be_written() {
+        let directory = std::env::temp_dir().join(format!("trapd-iso-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("isolation.json");
+        let earlier = state("10.0.0.1");
+        save(&path, &earlier).unwrap();
+        let applied = RefCell::new(Vec::new());
+        let result = isolate(
+            &path,
+            &state("10.0.0.2"),
+            || panic!("the record already answers this"),
+            |ips| {
+                applied.borrow_mut().push(ips.to_vec());
+                if applied.borrow().len() == 1 {
+                    fs::remove_dir_all(&directory).unwrap();
+                    Err(anyhow!("nft failed"))
+                } else {
+                    Ok(())
+                }
+            },
+            || panic!("an isolated host must not be released"),
+        );
+        assert!(result.is_err());
+        assert_eq!(applied.borrow().last().unwrap(), &earlier.resolved);
+    }
+
+    #[test]
     fn a_failed_release_keeps_the_record() {
         let path = temp();
         let wanted = state("10.0.0.1");
-        isolate(&path, &wanted, |_| Ok(()), || Ok(())).unwrap();
+        isolate(&path, &wanted, || Ok(false), |_| Ok(()), || Ok(())).unwrap();
         assert!(release(&path, || Err(anyhow!("nft failed"))).is_err());
         assert_eq!(load(&path).unwrap(), Some(wanted));
         clear(&path).unwrap();
@@ -194,6 +256,7 @@ mod tests {
         let result = isolate(
             &path,
             &state("10.0.0.1"),
+            || Ok(false),
             |_| Err(anyhow!("nft failed")),
             || panic!("unknown state must not be released"),
         );
@@ -208,6 +271,7 @@ mod tests {
         let persisted = isolate(
             &path,
             &state("10.0.0.1"),
+            || Ok(false),
             |_| {
                 *applied.borrow_mut() = true;
                 Ok(())
