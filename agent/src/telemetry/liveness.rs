@@ -41,6 +41,23 @@ pub fn forget(name: &'static str) {
     }
 }
 
+/// Unregisters a component when dropped, so a cancelled or failed collector
+/// future cannot leave a registration behind that later reads as a stall.
+pub struct WatchGuard(&'static str);
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        forget(self.0);
+    }
+}
+
+/// [`expect`], tied to the returned guard's lifetime.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn watch(name: &'static str, max_silence: Duration) -> WatchGuard {
+    expect(name, max_silence);
+    WatchGuard(name)
+}
+
 /// Record progress of `name`. Unregistered names are ignored.
 pub fn beat(name: &'static str) {
     if let Ok(mut r) = registry().lock() {
@@ -84,5 +101,15 @@ mod tests {
         beat("liveness_never_registered");
         let far = Instant::now() + Duration::from_secs(3600);
         assert!(!stalled_at(far).contains(&"liveness_never_registered".to_string()));
+    }
+
+    #[test]
+    fn dropping_the_guard_unregisters_a_cancelled_component() {
+        let far = Instant::now() + Duration::from_secs(3600);
+        {
+            let _guard = watch("liveness_guarded_component", Duration::from_secs(30));
+            assert!(stalled_at(far).contains(&"liveness_guarded_component".to_string()));
+        }
+        assert!(!stalled_at(far).contains(&"liveness_guarded_component".to_string()));
     }
 }

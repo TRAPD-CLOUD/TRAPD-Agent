@@ -180,7 +180,12 @@ fn read_batch(channel: &str, cursor: Option<u64>, limit: usize) -> Result<Batch>
             match render(event.0) {
                 Ok(xml) => out.push(xml),
                 // One unrenderable record must not wedge the channel.
-                Err(e) => tracing::warn!(error = %e, "skipping unrenderable event-log record"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "skipping unrenderable event-log record");
+                    // The cursor moves past this record, so the loss must be counted.
+                    crate::telemetry::metrics::metrics()
+                        .event_dropped(crate::telemetry::DropReason::InternalError);
+                }
             }
         }
     }

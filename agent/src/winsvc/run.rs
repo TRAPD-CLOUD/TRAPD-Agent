@@ -244,9 +244,12 @@ pub async fn run_agent(
     // a self-reported version to excuse a hash mismatch.
     if let Err(e) = crate::selfprotect::binary_integrity::check() {
         error!("{e:#}");
-        // Not transient: hold (service stays STOP-able) before reporting the
-        // failure, so the SCM recovery policy cannot restart-loop every 10 s.
+        // Not transient: hold before reporting the failure, so the SCM recovery
+        // policy cannot restart-loop every 10 s. A pending service accepts no
+        // controls, so report the service as started first: the hold can last
+        // 15 minutes and must stay interruptible by Stop and MSI maintenance.
         if let Some(hold) = crate::selfprotect::binary_integrity::hold_duration(&e) {
+            on_ready();
             tokio::select! {
                 _ = tokio::time::sleep(hold) => {}
                 _ = stop.recv() => { crate::heartbeat::lifecycle::mark_clean_shutdown(); }
