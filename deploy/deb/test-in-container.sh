@@ -127,10 +127,13 @@ rm -f /etc/systemd/system/trapd-agent.service
 echo "== script installer upgrade after signed self-update (offline fixtures)"
 # Run the actual full installer in this disposable container. Only network and
 # service calls are stubbed; replacement files and integrity state are real.
+# These are production installer prerequisites; retain real verification in tests.
+apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 openssl >/tmp/prerequisites.log 2>&1 \
+    || { cat /tmp/prerequisites.log; exit 1; }
 mkdir -p /etc/trapd /etc/trapd-release /etc/logrotate.d /var/lib/trapd
 echo '# operator config' > /etc/trapd/agent.env
 echo identity > /var/lib/trapd/device_id
-echo pinned-key > /etc/trapd-release/release_signing.pub
+install -m 644 /work/release_signing.pub /etc/trapd-release/release_signing.pub
 head -c 64 /dev/zero > /etc/trapd/binary.sig
 cat > "$STUB/curl" <<'CURLEOF'
 #!/bin/bash
@@ -143,33 +146,23 @@ while (( $# )); do
     esac
 done
 if [[ "$url" == */releases/latest ]]; then
-    printf '{"tag_name":"v0.7.2"}\n'
+    printf '{"tag_name":"v9.8.7"}\n'
     exit 0
 fi
 artifact="${url##*/}"
-body='script-upgrade-binary'
-case "$artifact" in
-    trapd-agent-exec*) body='script-upgrade-ebpf' ;;
-    trapd-update.sh*) body='script-upgrade-updater' ;;
-esac
-if [[ "$artifact" == *.sha256 ]]; then
-    if [[ -n "${TRAPD_INSTALL_TEST_BAD_CHECKSUM:-}" ]]; then
-        printf '%064d\n' 0 > "$out"
-    else
-        printf '%s\n' "$body" | sha256sum > "$out"
-    fi
-else
-    printf '%s\n' "$body" > "$out"
+cp "/work/assets/$artifact" "$out" || exit 22
+if [[ "$artifact" == trapd-agent-linux-x86_64 && -n "${TRAPD_INSTALL_TEST_BAD_CHECKSUM:-}" ]]; then
+    printf 'tampered binary\n' > "$out"
 fi
 CURLEOF
 chmod +x "$STUB/curl"
 PATH="$STUB:$PATH" bash /work/install.sh >/tmp/script-install.log 2>&1 \
     && ok "full script reinstall succeeds" || { fail "script reinstall"; cat /tmp/script-install.log; }
-check "script replaces the binary" grep -qx 'script-upgrade-binary' /usr/local/bin/trapd-agent
+check "script replaces the binary" cmp /work/assets/trapd-agent-linux-x86_64 /usr/local/bin/trapd-agent
 check "script refreshes binary baseline" \
     bash -c '[ "$(cat /etc/trapd/binary.sha256)" = "sha256:$(sha256sum /usr/local/bin/trapd-agent | cut -d" " -f1)" ]'
 check "script removes prior self-update signature" test ! -e /etc/trapd/binary.sig
-check "script preserves release verification key" grep -qx 'pinned-key' /etc/trapd-release/release_signing.pub
+check "script preserves release verification key" cmp /work/release_signing.pub /etc/trapd-release/release_signing.pub
 check "script preserves operator config" grep -qx '# operator config' /etc/trapd/agent.env
 check "script preserves device identity" grep -qx 'identity' /var/lib/trapd/device_id
 head -c 64 /dev/zero > /etc/trapd/binary.sig
