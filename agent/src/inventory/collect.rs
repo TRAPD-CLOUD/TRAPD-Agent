@@ -777,6 +777,7 @@ fn dpkg_packages() -> Option<Vec<SoftwarePackage>> {
                 name: name.to_string(),
                 version,
                 architecture: arch,
+                product_code: None,
             })
         })
         .collect();
@@ -809,6 +810,7 @@ fn rpm_packages() -> Option<Vec<SoftwarePackage>> {
                 name: name.to_string(),
                 version,
                 architecture: arch,
+                product_code: None,
             })
         })
         .collect();
