@@ -59,7 +59,7 @@ use collectors::Collector;
 use config::{AgentConfig, ConfigPuller};
 #[cfg(target_os = "linux")]
 use heartbeat::Heartbeat;
-use output::{write_event, OutputMode};
+use output::{write_events, OutputMode};
 #[cfg(target_os = "linux")]
 use pipeline::create_pipeline;
 use pipeline::Spool;
@@ -72,6 +72,10 @@ use transport::Transport;
 /// from the same modules the Linux agent uses.
 #[cfg(windows)]
 fn main() -> Result<()> {
+    // One-shot toast helper in the user's session: runs none of the agent.
+    if std::env::args().nth(1).as_deref() == Some(prevention::usernotify::NOTIFY_FLAG) {
+        return prevention::usernotify::run_helper(std::env::args().nth(2).as_deref());
+    }
     detection_host::initialize();
     winsvc::entry()
 }
@@ -112,7 +116,7 @@ async fn main() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
             paths::init_state_dir();
-            collectors::windows::honeytokens::uninstall(&config::load_persisted());
+            collectors::windows::honeytokens::uninstall();
             crate::deception::activity::ActivityStore::purge(
                 &crate::deception::activity::state_path(),
             );
@@ -121,20 +125,6 @@ async fn main() -> Result<()> {
         #[cfg(not(target_os = "windows"))]
         info!("Uninstall: no local honeytoken artifacts on this platform — nothing to do");
         return Ok(());
-    }
-
-    // `trapd-agent replay <events.ndjson> [--budget <file>]` — evaluate recorded
-    // telemetry with a fresh detection engine on its original timeline and
-    // report the findings per rule (noise budgets for rule changes). Offline
-    // and side-effect free: it touches no state, credentials or backend.
-    {
-        let args: Vec<String> = std::env::args().collect();
-        if args.get(1).map(String::as_str) == Some("replay") {
-            std::process::exit(detection::replay::run_cli(
-                &args[2..],
-                &crate::detection_host::engine("replay".into(), "replay".into()),
-            ));
-        }
     }
 
     // `trapd-agent diagnostics telemetry` — report on the running agent's
@@ -159,18 +149,9 @@ async fn main() -> Result<()> {
                     print!("{}", rootkit::diagnostics());
                     Ok(())
                 }
-                // The rule catalog (base / max severity, mode, dedup window per
-                // rule) as JSON — the file the backend seeds its catalog from.
-                Some("rule-catalog") => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&detection::catalog::to_json())?
-                    );
-                    Ok(())
-                }
                 other => {
                     eprintln!(
-                        "unknown diagnostics topic {:?}\n\nusage: trapd-agent diagnostics <telemetry|rootkit|rule-catalog>",
+                        "unknown diagnostics topic {:?}\n\nusage: trapd-agent diagnostics <telemetry|rootkit>",
                         other.unwrap_or("(none)")
                     );
                     std::process::exit(2);
@@ -263,6 +244,7 @@ async fn main() -> Result<()> {
     let output_label = match output_mode {
         OutputMode::Stdout => "stdout",
         OutputMode::File => "file",
+        OutputMode::Off => "off",
     };
 
     info!(
@@ -278,7 +260,11 @@ async fn main() -> Result<()> {
     // Start from the last verified config on disk (defaults on first run), so a
     // restart keeps the real configuration even though the signed-config channel
     // re-serves it with an already-accepted (and thus replay-rejected) issued_at.
-    let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()));
+    let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()?));
+    if let Ok(cfg) = agent_config.read() {
+        detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
+        detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
+    }
     // Backend outbox. Online it is disk-backed (survives crash/restart, replays
     // on the next run); offline it is purely in-memory (the NDJSON output is the
     // system of record).
@@ -441,38 +427,6 @@ async fn main() -> Result<()> {
 
     drop(tx);
 
-    // Local detection engine — behavioural + IOC analytics over every event.
-    // Platform-neutral, so the future Windows agent reuses it unchanged.
-    let engine = std::sync::Arc::new(detection_host::engine(agent_id.clone(), hostname.clone()));
-    // Compile Sigma rules = on-disk `<config>/sigma/` baseline + any inline
-    // rules carried in the (last-known-good) config, so detections are active
-    // from boot before the first backend config pull.
-    {
-        let (docs, anomaly) = agent_config
-            .read()
-            .map(|c| (c.sigma_rules.clone(), c.anomaly_detection_enabled))
-            .unwrap_or_default();
-        engine.reload_sigma(&docs);
-        engine.set_sigma_enabled(agent_config.read().map(|c| c.sigma_enabled).unwrap_or(true));
-        engine.set_anomaly_enabled(anomaly);
-        engine.set_suppressions(
-            agent_config
-                .read()
-                .map(|c| c.detection_suppressions.clone())
-                .unwrap_or_default(),
-        );
-        if let Ok(c) = agent_config.read() {
-            engine.set_rule_modes(&c.rule_modes);
-        }
-    }
-    info!(
-        iocs = engine.ioc_count(),
-        sigma = engine.sigma_count(),
-        "Detection engine started"
-    );
-    // Pick up threat-intel feed updates without a restart.
-    crate::detection_host::spawn_ioc_reloader(Arc::clone(&engine), 300);
-
     // SIEM forwarder — best-effort export of every event (and detection) to
     // external syslog/HEC infrastructure, in parallel with backend ingest.
     let siem = {
@@ -494,63 +448,20 @@ async fn main() -> Result<()> {
     let buf_for_consumer = Arc::clone(&ring_buffer);
     let mode = output_mode;
     let prev_tx = prev_event_tx.clone();
-    let det_engine = Arc::clone(&engine);
     let siem_fwd = siem.clone();
     let mut consumer = tokio::spawn(async move {
         let mut checkpoints = detection::CheckpointTracker::default();
-        // Aggregate updates for repeated findings are released on this tick.
-        let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(30));
-        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            let event = tokio::select! {
-                event = rx.recv() => match event { Some(event) => event, None => break },
-                _ = flush_tick.tick() => {
-                    for f in det_engine.flush_findings(false) {
-                        emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem_fwd).await;
-                    }
-                    continue;
-                }
-            };
-
-            // A detection a collector raised itself (memory scan, rootkit,
-            // filesystem, honeytoken) goes through the same gate as engine
-            // findings; only what the gate admits is persisted and acted on.
-            if matches!(event.class, schema::EventClass::Detection) {
-                for f in det_engine.admit_external(event) {
-                    emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem_fwd).await;
-                }
-                continue;
-            }
-
-            // A retry still needs a fresh journal receipt, but has already
-            // been counted, exported and analysed by this consumer.
-            if checkpoints.is_retry(&event) {
-                spool_event(&event, &buf_for_consumer).await;
-                continue;
-            }
-
-            // Forwarding to prevention is best-effort — a stalled enforcement
-            // engine must not stall telemetry — but a dropped tee is still
-            // counted rather than swallowed.
-            if let Some(p) = &prev_tx {
-                pipeline::try_tee(p, event.clone(), "prevention_tee");
-                telemetry::metrics::metrics()
-                    .set_detection_queue_depth(p.max_capacity().saturating_sub(p.capacity()) as u64);
-            }
-            handle_event(&event, &mode, &buf_for_consumer).await;
-            siem_fwd.forward(&event).await;
-
-            // Run detections and treat each admitted finding as a first-class
-            // event: persisted, buffered for the backend, and forwarded to
-            // prevention.
-            for f in det_engine.admit(det_engine.inspect(&event)) {
-                emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem_fwd).await;
-            }
-        }
-        // Channel closed (shutdown): release every pending aggregate so no
-        // occurrence count is lost.
-        for f in det_engine.flush_findings(true) {
-            emit_finding(f, prev_tx.as_ref(), &mode, &buf_for_consumer, &siem_fwd).await;
+        let mut batch = Vec::with_capacity(pipeline::MAX_BATCH);
+        while pipeline::next_batch(&mut rx, &mut batch).await {
+            consume_batch(
+                std::mem::take(&mut batch),
+                &mut checkpoints,
+                prev_tx.as_ref(),
+                &mode,
+                &buf_for_consumer,
+                &siem_fwd,
+            )
+            .await;
         }
     });
 
@@ -560,14 +471,12 @@ async fn main() -> Result<()> {
     {
         let started = std::time::Instant::now();
         let report_path = telemetry::TelemetryReport::default_path();
-        let baseline_engine = std::sync::Arc::clone(&engine);
         #[cfg(windows)]
         let learning_config = Arc::clone(&agent_config);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 ticker.tick().await;
-                baseline_engine.persist_baseline();
                 #[cfg(windows)]
                 {
                     let enabled = learning_config
@@ -615,21 +524,15 @@ async fn main() -> Result<()> {
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
         tokio::spawn(async move { transport.run().await });
 
-        // Recompile Sigma rules whenever a freshly-signed config is applied, so
-        // the backend can ship detections over the config channel live.
-        let sigma_engine = Arc::clone(&engine);
         let config_puller = ConfigPuller::new(
             Arc::clone(&agent_config),
             &backend_url,
             &agent_id,
             token.clone(),
         )?
-        .with_apply_hook(std::sync::Arc::new(move |cfg: &AgentConfig| {
-            sigma_engine.reload_sigma(&cfg.sigma_rules);
-            sigma_engine.set_sigma_enabled(cfg.sigma_enabled);
-            sigma_engine.set_anomaly_enabled(cfg.anomaly_detection_enabled);
-            sigma_engine.set_suppressions(cfg.detection_suppressions.clone());
-            sigma_engine.set_rule_modes(&cfg.rule_modes);
+        .with_apply_hook(std::sync::Arc::new(|cfg: &AgentConfig| {
+            detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
+            detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
         }));
         tokio::spawn(async move { config_puller.run().await });
 
@@ -653,12 +556,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    tokio::select! {
+    let consumer_done = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down");
             for handle in &handles {
                 handle.abort();
             }
+            false
         }
         // `systemctl stop` sends SIGTERM: shut down the same orderly way, so
         // the consumer drains and flushes pending finding aggregates.
@@ -667,13 +571,30 @@ async fn main() -> Result<()> {
             for handle in &handles {
                 handle.abort();
             }
+            false
         }
         _ = &mut consumer => {
             info!("Consumer task exited");
+            true
         }
-    }
+    };
 
-    consumer.await.ok();
+    // The consumer ends once every event sender is gone, but tasks outside
+    // `handles` (prevention audit, heartbeat, the detection feedback path)
+    // hold senders for the life of the process. An unbounded wait here hung
+    // shutdown until systemd's stop timeout killed the agent, losing the
+    // spool checkpoint and the clean-shutdown mark on every stop and update.
+    if !consumer_done
+        && tokio::time::timeout(SHUTDOWN_DRAIN, &mut consumer)
+            .await
+            .is_err()
+    {
+        info!(
+            drain_secs = SHUTDOWN_DRAIN.as_secs(),
+            "event consumer still has live senders after the drain window — stopping it"
+        );
+        consumer.abort();
+    }
 
     // Reconcile the journal to exactly the un-acknowledged set, so the next
     // start replays those and nothing else.
@@ -689,9 +610,16 @@ async fn main() -> Result<()> {
     }
 
     heartbeat::lifecycle::mark_clean_shutdown();
+    selfprotect::watchdog::stop();
     info!("Shutdown complete");
-    Ok(())
+    // Returning would drop the runtime, which waits for every blocking task
+    // (blocking sensor reads that never return on their own) and so would
+    // hang the exit. All state worth keeping is persisted above.
+    std::process::exit(0);
 }
+
+/// How long shutdown waits for the event consumer to drain what is queued.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Persist one event locally and enqueue it for the backend.
 ///
@@ -719,49 +647,82 @@ async fn terminate_signal() {
     std::future::pending::<()>().await;
 }
 
-/// Emit one finding that left the detection gate: persist + ship it, forward
-/// it to the SIEM, and hand first emissions (not aggregate updates, which
-/// only refresh a count) to the prevention engine for auto-response.
-pub(crate) async fn emit_finding(
-    finding: detection::gate::Emitted,
+/// Consume one batch from the collector channel: count, tee to prevention,
+/// write the local mirror and export once per batch, then hand the whole batch
+/// to the spool in a single blocking call.
+///
+/// A retried checkpoint record skips everything except the spool: it has
+/// already been counted and exported by this consumer.
+pub(crate) async fn consume_batch(
+    batch: Vec<schema::AgentEvent>,
+    checkpoints: &mut detection::CheckpointTracker,
     prev_tx: Option<&tokio::sync::mpsc::Sender<schema::AgentEvent>>,
     mode: &OutputMode,
     buf: &Arc<Mutex<Spool>>,
     siem: &output::siem::SiemForwarder,
 ) {
-    if let (Some(p), false) = (prev_tx, finding.aggregate) {
-        pipeline::try_tee(p, finding.event.clone(), "prevention_tee");
+    let mut fresh = Vec::with_capacity(batch.len());
+    let mut to_spool = Vec::with_capacity(batch.len());
+    for mut event in batch {
+        if checkpoints.is_retry(&event) {
+            to_spool.push(event);
+            continue;
+        }
+        // Findings the host raises itself carry the mode and severity that
+        // local auto-response acts on (and the backend recomputes).
+        match detection::sensor_policy::classify(&mut event) {
+            detection::sensor_policy::Disposition::Forward => {}
+            detection::sensor_policy::Disposition::Shadow(rule) => {
+                // Shadow rules are counted, never emitted or acted on.
+                telemetry::coverage::shadow_hit(&rule);
+                continue;
+            }
+            detection::sensor_policy::Disposition::Suppressed => {
+                telemetry::metrics::metrics().detection_suppressed();
+                continue;
+            }
+        }
+        // Forwarding to prevention is best-effort — a stalled enforcement
+        // engine must not stall telemetry — but a dropped tee is still
+        // counted rather than swallowed.
+        if let Some(p) = prev_tx {
+            pipeline::try_tee(p, event.clone(), "prevention_tee");
+            telemetry::metrics::metrics()
+                .set_detection_queue_depth(p.max_capacity().saturating_sub(p.capacity()) as u64);
+        }
+        pipeline::accepted(&event);
+        fresh.push(event);
     }
-    handle_event(&finding.event, mode, buf).await;
-    siem.forward(&finding.event).await;
+    if let Err(err) = write_events(&fresh, mode).await {
+        error!("Failed to write events: {err}");
+    }
+    for event in &fresh {
+        siem.forward(event).await;
+    }
+    to_spool.extend(fresh);
+    spool_events(to_spool, buf).await;
 }
 
-async fn handle_event(event: &schema::AgentEvent, mode: &OutputMode, buf: &Arc<Mutex<Spool>>) {
-    pipeline::accepted(event);
-    if let Err(err) = write_event(event, mode).await {
-        error!("Failed to write event: {err}");
+/// Hand a batch to the spool with one task switch and one lock. `Spool::push`
+/// does synchronous disk I/O (journal append, periodic fsync — see
+/// `pipeline::spool::FSYNC_EVERY`), so it must not run on the async executor.
+async fn spool_events(events: Vec<schema::AgentEvent>, buf: &Arc<Mutex<Spool>>) {
+    if events.is_empty() {
+        return;
     }
-    spool_event(event, buf).await;
-}
-
-/// Retry a checkpoint handoff without repeating analysis, exports or accounting.
-async fn spool_event(event: &schema::AgentEvent, buf: &Arc<Mutex<Spool>>) {
-    // Spool::push() does synchronous disk I/O (journal append, and
-    // periodically an fsync — see pipeline::spool::FSYNC_EVERY). handle_event
-    // runs inside the single async consumer task, so doing that inline would
-    // block the executor thread and stall every other task on it; offload it
-    // to the blocking thread pool instead.
     let buf = Arc::clone(buf);
-    let event = event.clone();
     if let Err(e) = tokio::task::spawn_blocking(move || match buf.lock() {
         // A rejected push is already counted against a named drop reason by the
         // spool itself, so there is nothing to attribute here.
         Ok(mut b) => {
-            let _ = b.push(event);
+            for event in events {
+                let _ = b.push(event);
+            }
         }
         Err(e) => {
             error!("Spool mutex poisoned: {e}");
-            telemetry::metrics::metrics().event_dropped(telemetry::DropReason::InternalError);
+            telemetry::metrics::metrics()
+                .events_dropped(telemetry::DropReason::InternalError, events.len() as u64);
         }
     })
     .await
@@ -861,7 +822,7 @@ mod tests {
         )
     }
 
-    /// `handle_event` runs inside the single async consumer task; the spool
+    /// `consume_batch` runs inside the single async consumer task; the spool
     /// journal append is synchronous disk I/O (`std::fs::write`/`sync_all`)
     /// and must not run directly on the async executor thread, or it starves
     /// every other task on a busy agent. On a `current_thread` runtime the
@@ -869,7 +830,7 @@ mod tests {
     /// happened inline it would be observed on `executor_thread`; wrapped in
     /// `spawn_blocking` it runs on a separate blocking-pool thread instead.
     #[tokio::test(flavor = "current_thread")]
-    async fn handle_event_offloads_spool_push_off_the_async_executor_thread() {
+    async fn consume_batch_offloads_spool_push_off_the_async_executor_thread() {
         let executor_thread = std::thread::current().id();
 
         let dir = std::env::temp_dir().join(format!(
@@ -883,14 +844,26 @@ mod tests {
         let spool = Spool::durable_at(dir.join("queue.journal"), 10);
         let buf: Arc<Mutex<Spool>> = Arc::new(Mutex::new(spool));
 
-        let event = dummy_event();
-        handle_event(&event, &OutputMode::Stdout, &buf).await;
+        let siem = output::siem::SiemForwarder::from_config(
+            &config::AgentConfig::default(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let batch = vec![dummy_event(), dummy_event(), dummy_event()];
+        consume_batch(
+            batch,
+            &mut detection::CheckpointTracker::default(),
+            None,
+            &OutputMode::Off,
+            &buf,
+            &siem,
+        )
+        .await;
 
         let pushed_thread = buf.lock().unwrap().last_push_thread();
         assert_eq!(
             buf.lock().unwrap().len(),
-            1,
-            "event must still land in the spool"
+            3,
+            "every event of the batch must land in the spool"
         );
         assert_ne!(
             pushed_thread,
@@ -899,5 +872,88 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A low-confidence host finding must reach the spool (and the prevention
+    /// tee) already classified as a signal: auto-response excludes signals.
+    #[tokio::test]
+    async fn consume_batch_classifies_collector_findings_before_they_are_forwarded() {
+        let spool: Arc<Mutex<Spool>> = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let siem = output::siem::SiemForwarder::from_config(
+            &config::AgentConfig::default(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let (tee_tx, mut tee_rx) = tokio::sync::mpsc::channel(4);
+        let finding = schema::AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            schema::EventClass::Detection,
+            schema::EventAction::Detected,
+            schema::Severity::High,
+            schema::EventData::Detection(Box::new(schema::DetectionData {
+                rule_id: "memory.anon_exec".into(),
+                confidence: 30,
+                ..Default::default()
+            })),
+        );
+        consume_batch(
+            vec![finding],
+            &mut detection::CheckpointTracker::default(),
+            Some(&tee_tx),
+            &OutputMode::Off,
+            &spool,
+            &siem,
+        )
+        .await;
+        let teed = tee_rx.recv().await.expect("finding is teed to prevention");
+        let schema::EventData::Detection(d) = &teed.data else {
+            panic!("detection expected")
+        };
+        assert_eq!(d.mode, Some(schema::DetectionMode::Signal));
+        assert!(teed.severity <= schema::Severity::Low);
+        assert_eq!(spool.lock().unwrap().len(), 1);
+    }
+
+    /// A rule the operator put in shadow mode (signed config) is counted but
+    /// must neither reach the spool nor local auto-response.
+    #[tokio::test]
+    async fn consume_batch_drops_findings_of_shadow_rules() {
+        detection::sensor_policy::set_rule_modes(&[detection::RuleModeOverride {
+            rule: "selfprotect.unclean_shutdown".into(),
+            mode: schema::DetectionMode::Shadow,
+        }]);
+        let spool: Arc<Mutex<Spool>> = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let siem = output::siem::SiemForwarder::from_config(
+            &config::AgentConfig::default(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let (tee_tx, mut tee_rx) = tokio::sync::mpsc::channel(4);
+        let finding = schema::AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            schema::EventClass::Detection,
+            schema::EventAction::Detected,
+            schema::Severity::High,
+            schema::EventData::Detection(Box::new(schema::DetectionData {
+                rule_id: "selfprotect.unclean_shutdown".into(),
+                confidence: 90,
+                ..Default::default()
+            })),
+        );
+        consume_batch(
+            vec![finding],
+            &mut detection::CheckpointTracker::default(),
+            Some(&tee_tx),
+            &OutputMode::Off,
+            &spool,
+            &siem,
+        )
+        .await;
+        detection::sensor_policy::set_rule_modes(&[]);
+        assert!(
+            tee_rx.try_recv().is_err(),
+            "shadow finding must not reach prevention"
+        );
+        assert_eq!(spool.lock().unwrap().len(), 0, "and must not be spooled");
     }
 }

@@ -42,7 +42,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::policy::IocRule;
@@ -86,6 +86,29 @@ pub struct OutOfBandSpec {
     pub markers: Vec<String>,
 }
 
+/// Observed process generation, carried as a canonical decimal string because
+/// Windows FILETIME values exceed what the JavaScript backend can hold in a
+/// number. The string form is what gets signed, so any other spelling fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessGeneration(pub u64);
+
+impl Serialize for ProcessGeneration {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessGeneration {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let canonical = text.bytes().all(|b| b.is_ascii_digit()) && !text.starts_with('0');
+        match text.parse::<u64>() {
+            Ok(value) if canonical => Ok(Self(value)),
+            _ => Err(serde::de::Error::custom("invalid process generation")),
+        }
+    }
+}
+
 /// Discriminated union of all response commands the backend can request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -95,7 +118,7 @@ pub enum CommandPayload {
         pid: i32,
         /// Observed generation; required on Windows. Omission preserves legacy signatures.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        process_start_time: Option<u64>,
+        process_generation: Option<ProcessGeneration>,
     },
     /// Enable full host isolation. `allowlist_ips` are the only destinations
     /// reachable in addition to the management channel.
@@ -175,13 +198,13 @@ pub enum CommandPayload {
     FreezePid {
         pid: i32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        process_start_time: Option<u64>,
+        process_generation: Option<ProcessGeneration>,
     },
     /// Resume a previously-frozen process (SIGCONT).
     ThawPid {
         pid: i32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        process_start_time: Option<u64>,
+        process_generation: Option<ProcessGeneration>,
     },
     // ── Real-Time Response (RTR) ─────────────────────────────────────────────
     /// Execute a signed remediation script. `script_b64` is base64 of the script
@@ -292,7 +315,7 @@ pub fn verify_canonical<T: Serialize>(
 impl Verifier {
     pub fn new(pubkey_path: &Path, agent_id: String, nonce_store_path: &Path) -> Result<Self> {
         let key = load_verifying_key(pubkey_path)?;
-        let nonces = Arc::new(Mutex::new(NonceStore::load(nonce_store_path)));
+        let nonces = Arc::new(Mutex::new(NonceStore::load(nonce_store_path)?));
         info!(path = %pubkey_path.display(), "Response-command verifier loaded");
         Ok(Self {
             key,
@@ -340,8 +363,15 @@ impl Verifier {
             .nonces
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if !store.try_insert(cmd.envelope.nonce, cmd.envelope.expires_at) {
-            return Verdict::Rejected(format!("replay: nonce {} already seen", cmd.envelope.nonce));
+        match store.try_insert(cmd.envelope.nonce, cmd.envelope.expires_at) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Verdict::Rejected(format!(
+                    "replay: nonce {} already seen",
+                    cmd.envelope.nonce
+                ))
+            }
+            Err(e) => return Verdict::Rejected(format!("cannot persist replay protection: {e:#}")),
         }
         drop(store);
 
@@ -355,7 +385,7 @@ impl Verifier {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NonceRecord {
     nonce: Uuid,
     expires_at: DateTime<Utc>,
@@ -368,75 +398,45 @@ struct NonceStore {
 }
 
 impl NonceStore {
-    fn load(path: &Path) -> Self {
-        let records: Vec<NonceRecord> = std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+    fn load(path: &Path) -> Result<Self> {
+        let records: Vec<NonceRecord> = match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("invalid command nonce store")?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e).context("cannot read command nonce store"),
+        };
         let seen = records.iter().map(|r| r.nonce).collect();
-        Self {
+        Ok(Self {
             path: path.to_path_buf(),
             seen,
             records,
-        }
+        })
     }
 
-    fn try_insert(&mut self, nonce: Uuid, expires_at: DateTime<Utc>) -> bool {
+    fn try_insert(&mut self, nonce: Uuid, expires_at: DateTime<Utc>) -> Result<bool> {
+        anyhow::ensure!(
+            self.path.parent().is_some_and(Path::is_dir),
+            "command replay state directory is unavailable"
+        );
         if self.seen.contains(&nonce) {
-            return false;
+            return Ok(false);
         }
         let now = Utc::now();
-        self.records.retain(|r| r.expires_at > now);
-        self.seen.clear();
-        for r in &self.records {
-            self.seen.insert(r.nonce);
-        }
+        let mut records: Vec<_> = self
+            .records
+            .iter()
+            .filter(|r| r.expires_at > now)
+            .cloned()
+            .collect();
+        records.push(NonceRecord { nonce, expires_at });
 
-        self.records.push(NonceRecord { nonce, expires_at });
-        self.seen.insert(nonce);
-
-        if let Ok(bytes) = serde_json::to_vec(&self.records) {
-            if let Err(e) = atomic_write(&self.path, &bytes) {
-                warn!(error = %e, "cannot persist nonce store");
-            }
-        }
-        true
+        // No command may execute before its nonce is durable. Stage changes so
+        // a failed write does not consume the nonce and prevent a safe retry.
+        let bytes = serde_json::to_vec(&records)?;
+        crate::paths::write_atomic(&self.path, &bytes, 0o600)?;
+        self.seen = records.iter().map(|r| r.nonce).collect();
+        self.records = records;
+        Ok(true)
     }
-}
-
-/// Write a file atomically — write to a sibling temp file, fsync, rename.
-///
-/// The temp file is created owner-only (`0600`) before any bytes are written so
-/// the nonce store is never momentarily world-readable: a local attacker must
-/// not be able to learn which command nonces have been processed.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = create_owner_only(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
-}
-
-#[cfg(unix)]
-fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::create(path)
 }
 
 #[cfg(test)]
@@ -496,7 +496,7 @@ mod cross_lang_tests {
             );
             let observed = legacy.replace(
                 "\"pid\":1234",
-                "\"pid\":1234,\"process_start_time\":123456789",
+                "\"pid\":1234,\"process_generation\":\"134383339161621469\"",
             );
             for wire in [&legacy, &observed] {
                 let envelope: CommandEnvelope = serde_json::from_str(wire).unwrap();
@@ -505,12 +505,51 @@ mod cross_lang_tests {
                     .encode(key.sign(wire.as_bytes()).to_bytes());
                 assert!(verify_canonical(&key.verifying_key(), &envelope, &signature).is_ok());
                 if wire == &observed {
-                    let tampered: CommandEnvelope =
-                        serde_json::from_str(&wire.replace("123456789", "123456790")).unwrap();
+                    let tampered: CommandEnvelope = serde_json::from_str(
+                        &wire.replace("134383339161621469", "134383339161621470"),
+                    )
+                    .unwrap();
                     assert!(verify_canonical(&key.verifying_key(), &tampered, &signature).is_err());
                 }
             }
         }
+    }
+
+    #[test]
+    fn process_generation_keeps_full_filetime_precision() {
+        let parsed: ProcessGeneration = serde_json::from_str("\"134383339161621469\"").unwrap();
+        assert_eq!(parsed.0, 134_383_339_161_621_469);
+    }
+
+    #[test]
+    fn process_generation_rejects_every_non_canonical_form() {
+        for wire in [
+            "134383339161621469",
+            "\"\"",
+            "\"0\"",
+            "\"0123\"",
+            "\"+123\"",
+            "\"-1\"",
+            "\" 123\"",
+            "\"1e17\"",
+            "\"18446744073709551616\"",
+        ] {
+            assert!(
+                serde_json::from_str::<ProcessGeneration>(wire).is_err(),
+                "{wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_numeric_generation_field_cannot_verify() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[44; 32]);
+        let wire = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"22222222-2222-2222-2222-222222222222","payload":{"kind":"kill_pid","pid":1234,"process_start_time":123456789}}"#;
+        let envelope: CommandEnvelope = serde_json::from_str(wire).unwrap();
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(key.sign(wire.as_bytes()).to_bytes());
+        assert!(verify_canonical(&key.verifying_key(), &envelope, &signature).is_err());
     }
 
     fn temp_path(suffix: &str) -> std::path::PathBuf {
@@ -527,6 +566,53 @@ mod cross_lang_tests {
         std::fs::write(&pub_path, hex::decode(PUB_HEX).unwrap()).unwrap();
         let v = Verifier::new(&pub_path, "agent-test".into(), &nonce_path).unwrap();
         (v, pub_path, nonce_path)
+    }
+
+    #[test]
+    fn replay_state_rejects_corrupt_or_unreadable_nonce_store() {
+        let (_, p, n) = verifier();
+        std::fs::write(&n, b"not json").unwrap();
+        assert!(Verifier::new(&p, "agent-test".into(), &n).is_err());
+        std::fs::remove_file(&n).unwrap();
+        std::fs::create_dir(&n).unwrap();
+        assert!(Verifier::new(&p, "agent-test".into(), &n).is_err());
+        std::fs::remove_dir(n).unwrap();
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn replay_state_rejects_failed_nonce_save_and_allows_retry_after_repair() {
+        let (v, p, n) = verifier();
+        let cmd: SignedCommand =
+            serde_json::from_str(&format!(r#"{{"envelope":{ENV1},"signature":"{SIG1}"}}"#))
+                .unwrap();
+        std::fs::create_dir(&n).unwrap();
+        assert!(
+            matches!(v.verify(&cmd), Verdict::Rejected(_)),
+            "unsaved nonce accepted"
+        );
+        std::fs::remove_dir(&n).unwrap();
+        assert!(
+            matches!(v.verify(&cmd), Verdict::Ok(_)),
+            "failed save consumed nonce"
+        );
+        let restarted = Verifier::new(&p, "agent-test".into(), &n).unwrap();
+        assert!(
+            matches!(restarted.verify(&cmd), Verdict::Rejected(_)),
+            "replay accepted after restart"
+        );
+        std::fs::remove_file(n).unwrap();
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn replay_state_does_not_create_missing_nonce_parent() {
+        let parent = temp_path("absent-state");
+        let mut store = NonceStore::load(&parent.join("nonces.json")).unwrap();
+        assert!(store
+            .try_insert(Uuid::new_v4(), Utc::now() + chrono::Duration::hours(1))
+            .is_err());
+        assert!(!parent.exists());
     }
 
     #[test]
@@ -612,6 +698,27 @@ mod cross_lang_tests {
     const SIG8: &str =
         "6ysMGbqRLHq5NmtBrKiWLOJjIyyFxM/2pFsk3HfhopTLRdd4Gh395DkZydPWzbuQ3FkPG22QJjCO8ee0JpxaAg==";
 
+    // Generated by the TS signer (seed 0x01..=0x20): exact bytes for the string
+    // process generation and for quarantine / restore with a Windows path.
+    #[test]
+    fn accepts_ts_signed_generation_and_quarantine_vectors() {
+        for (env, sig) in [
+            (r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"44444440-4444-4444-4444-444444444444","payload":{"kind":"kill_pid","pid":4242,"process_generation":"134383339161621469"}}"#, "Tt3uap4RdA19MrKGp0jebsQHPSQ9F6cXrtIGDpJ7jGGRUjZI3HhGm/PDWOQs43Qocjk5BzlLt0P5a8dLDCplDw=="),
+            (r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"44444441-4444-4444-4444-444444444444","payload":{"kind":"quarantine_file","path":"C:\\Users\\a\\evil file.exe"}}"#, "rY1JzXduGFtfphWCpXbp80Ewix0E9R6l5R63UzLft0PFwWk6Bie2AMheF3yYNLb3h0raieJ2U8wRX5FMIgXiBA=="),
+            (r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"44444442-4444-4444-4444-444444444444","payload":{"kind":"restore_file","quarantine_id":"22222222-2222-4222-8222-222222222222"}}"#, "j1sRd2qnY2RyLaHeN/QdVTtoe5MCTPTRaIUHie96y8dZzypZNPzz+3dhrsbsyfrUIX0QfQVwlp/pa0a39GpsBA=="),
+        ] {
+            let (v, p, n) = verifier();
+            let wire = format!(r#"{{"envelope":{env},"signature":"{sig}"}}"#);
+            let cmd: SignedCommand = serde_json::from_str(&wire).unwrap();
+            match v.verify(&cmd) {
+                Verdict::Ok(_) => {}
+                Verdict::Rejected(why) => panic!("vector rejected: {why}: {env}"),
+            }
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(n);
+        }
+    }
+
     #[test]
     fn verifies_after_nonce_store_lock_poisoned() {
         // Poison the nonce-store mutex by panicking while holding the guard,
@@ -637,6 +744,26 @@ mod cross_lang_tests {
         }
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(n);
+    }
+
+    #[test]
+    fn corrupt_nonce_store_refuses_commands_issued_before_the_loss() {
+        let pub_path = temp_path("pub");
+        let nonce_path = temp_path("nonces.json");
+        std::fs::write(&pub_path, hex::decode(PUB_HEX).unwrap()).unwrap();
+        std::fs::write(&nonce_path, b"{not json").unwrap();
+        assert!(Verifier::new(&pub_path, "agent-test".into(), &nonce_path).is_err());
+        let cmd: SignedCommand =
+            serde_json::from_str(&format!(r#"{{"envelope":{ENV1},"signature":"{SIG1}"}}"#))
+                .unwrap();
+        // A missing store is a first start, not a loss.
+        let _ = std::fs::remove_file(&nonce_path);
+        let v = Verifier::new(&pub_path, "agent-test".into(), &nonce_path).unwrap();
+        assert!(matches!(v.verify(&cmd), Verdict::Ok(_)));
+        // …and the nonce is now recorded, so a second delivery is a replay.
+        assert!(matches!(v.verify(&cmd), Verdict::Rejected(_)));
+        let _ = std::fs::remove_file(pub_path);
+        let _ = std::fs::remove_file(nonce_path);
     }
 
     #[test]

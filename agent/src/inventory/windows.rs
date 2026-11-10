@@ -32,15 +32,29 @@ pub fn gather_with_flags(
                     version: registry::string(&path, "DisplayVersion", value_view)
                         .unwrap_or_default(),
                     architecture: Some(arch.into()),
+                    // Only what Windows Installer itself registered: other
+                    // installers also use GUID-shaped key names.
+                    product_code: (registry::dword(&path, "WindowsInstaller", value_view)
+                        == Some(1))
+                    .then(|| crate::prevention::software::msi_product_code(&key))
+                    .flatten(),
                 });
             }
         }
     }
     packages.sort_by(|a, b| {
-        (&a.name, &a.version, &a.architecture).cmp(&(&b.name, &b.version, &b.architecture))
+        (&a.name, &a.version, &a.architecture, &a.product_code).cmp(&(
+            &b.name,
+            &b.version,
+            &b.architecture,
+            &b.product_code,
+        ))
     });
     packages.dedup_by(|a, b| {
-        a.name == b.name && a.version == b.version && a.architecture == b.architecture
+        a.name == b.name
+            && a.version == b.version
+            && a.architecture == b.architecture
+            && a.product_code == b.product_code
     });
     let software = SoftwareInventory {
         source: "windows_registry".into(),

@@ -26,13 +26,24 @@ fn log_file() -> PathBuf {
 pub enum OutputMode {
     Stdout,
     File,
+    /// No local mirror. Events still go to the spool and the backend; nothing
+    /// is serialised for local output.
+    Off,
 }
 
 impl OutputMode {
+    /// `TRAPD_OUTPUT=file|stdout|off`. Unset: stdout when attached to a
+    /// terminal (interactive runs), otherwise off. A service must not pay for
+    /// converting every event to OCSF just to write it into a journal or log
+    /// nobody reads.
     pub fn from_env() -> Self {
+        use std::io::IsTerminal;
         match env::var("TRAPD_OUTPUT").as_deref() {
             Ok("file") => OutputMode::File,
-            _ => OutputMode::Stdout,
+            Ok("stdout") => OutputMode::Stdout,
+            Ok("off") => OutputMode::Off,
+            _ if std::io::stdout().is_terminal() => OutputMode::Stdout,
+            _ => OutputMode::Off,
         }
     }
 }
@@ -44,13 +55,33 @@ fn serialize_event(event: &AgentEvent) -> Result<String> {
     )?)?)
 }
 
-pub async fn write_event(event: &AgentEvent, mode: &OutputMode) -> Result<()> {
-    let line = serialize_event(event)?;
+/// Write a batch of events to the local output with one serialisation pass
+/// and one write. An event that cannot be serialised is skipped (and
+/// reported) instead of failing the batch.
+pub async fn write_events(events: &[AgentEvent], mode: &OutputMode) -> Result<()> {
+    if matches!(mode, OutputMode::Off) || events.is_empty() {
+        return Ok(());
+    }
+    let mut payload = String::with_capacity(events.len() * 1024);
+    for event in events {
+        match serialize_event(event) {
+            Ok(line) => {
+                payload.push_str(&line);
+                payload.push('\n');
+            }
+            Err(err) => {
+                tracing::error!(event_id = %event.event_id, "event not serialisable for local output: {err}")
+            }
+        }
+    }
+    if payload.is_empty() {
+        return Ok(());
+    }
     match mode {
+        OutputMode::Off => {}
         OutputMode::Stdout => {
             let mut out = tokio::io::stdout();
-            out.write_all(line.as_bytes()).await?;
-            out.write_all(b"\n").await?;
+            out.write_all(payload.as_bytes()).await?;
             out.flush().await?;
         }
         OutputMode::File => {
@@ -79,8 +110,7 @@ pub async fn write_event(event: &AgentEvent, mode: &OutputMode) -> Result<()> {
                 rotate_if_needed(&log_file).await?;
                 let mut file =
                     tokio::fs::File::from_std(secure_log_file(&directory, "events.ndjson")?);
-                file.write_all(line.as_bytes()).await?;
-                file.write_all(b"\n").await?;
+                file.write_all(payload.as_bytes()).await?;
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -92,8 +122,7 @@ pub async fn write_event(event: &AgentEvent, mode: &OutputMode) -> Result<()> {
                     .append(true)
                     .open(&log_file)
                     .await?;
-                file.write_all(line.as_bytes()).await?;
-                file.write_all(b"\n").await?;
+                file.write_all(payload.as_bytes()).await?;
             }
         }
     }

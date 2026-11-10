@@ -97,6 +97,11 @@ jobs:
           name: trapd-windows-release
           path: .
 
+      - name: Check standalone bootstrap verification
+        run: |
+          python3 deploy/embed-release-verifier.py --check
+          python3 deploy/test-release-verification.py
+
       - name: Stage release assets
         run: |
           cp target/release/trapd-agent trapd-agent-linux-x86_64
@@ -143,8 +148,8 @@ jobs:
 
       - name: Generate SHA256 checksums
         run: |
-          # Per-artifact checksum files consumed by install.sh / trapd-update,
-          # plus an aggregate SHA256SUMS for manual `sha256sum --check`. The
+          # Checksums are informational; installers require signed statements.
+          # Also publish SHA256SUMS for manual `sha256sum --check`. The
           # SBOMs are covered too so their integrity can be verified alongside
           # the binaries.
           sha256sum trapd-agent-linux-x86_64       > trapd-agent-linux-x86_64.sha256
@@ -179,10 +184,11 @@ jobs:
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
+          # Hard failure: an unsigned release cannot be self-updated and would
+          # silently fork the fleet onto an unverifiable build.
           if [ -z "${RELEASE_SIGNING_KEY}" ]; then
-            echo "::warning::RELEASE_SIGNING_KEY not set - release is NOT signed and will not be offered for self-update"
-            : > release-statements.ndjson
-            exit 0
+            echo "::error::RELEASE_SIGNING_KEY is not set - refusing to publish an unsigned release"
+            exit 1
           fi
           version="${GITHUB_REF_NAME#v}"
           : > release-statements.ndjson
@@ -193,12 +199,20 @@ jobs:
             --tag "${GITHUB_REF_NAME}" \
             --asset-name trapd-agent-linux-x86_64 --file trapd-agent-linux-x86_64 \
             --ebpf-asset-name trapd-agent-exec --ebpf-file trapd-agent-exec \
-            >> release-statements.ndjson
+            > release-linux.json
+          cat release-linux.json >> release-statements.ndjson
           cargo run --release -q -p xtask -- sign-release \
             --version "${version}" --os windows --arch x86_64 \
             --tag "${GITHUB_REF_NAME}" \
             --asset-name trapd-agent-windows-x86_64.exe --file trapd-agent-windows-x86_64.exe \
             >> release-statements.ndjson
+          # Authenticate the legacy updater's self-refresh with the SAME exact
+          # SignedBlob format/key. Keep it out of backend agent rollout records.
+          BINARY_SIGNING_KEY= cargo run --release -q -p xtask -- sign-release \
+            --version "${version}" --os linux --arch x86_64 \
+            --tag "${GITHUB_REF_NAME}" \
+            --asset-name trapd-update.sh --file trapd-update.sh \
+            > release-updater.json
           wc -l release-statements.ndjson
 
       - name: Create GitHub Release
@@ -223,6 +237,8 @@ jobs:
             sbom-trapd-agent-ebpf.cdx.json
             SHA256SUMS
             release-statements.ndjson
+            release-linux.json
+            release-updater.json
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 

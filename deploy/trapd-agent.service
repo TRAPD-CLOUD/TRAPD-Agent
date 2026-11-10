@@ -59,7 +59,7 @@ NoNewPrivileges=true
 #   CAP_DAC_READ_SEARCH — read root-owned/0640 logs (/var/log/auth.log) and hash
 #                         files under /home, /root for FIM (read-only)
 #   CAP_KILL       — signal user-owned processes for kill/freeze/thaw responses
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE CAP_DAC_READ_SEARCH CAP_KILL
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE CAP_DAC_READ_SEARCH CAP_KILL CAP_CHOWN CAP_FOWNER
 
 # ── Memory safety ─────────────────────────────────────────────────────────────
 # Deny mapping of memory regions that are simultaneously writable and executable.

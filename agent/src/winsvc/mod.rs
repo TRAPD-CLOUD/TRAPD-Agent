@@ -57,36 +57,17 @@ pub fn entry() -> Result<()> {
         Some("cleanup") => {
             crate::prevention::winfirewall::cleanup()
                 .context("remove containment firewall rules")?;
-            crate::collectors::windows::honeytokens::uninstall(&crate::config::load_persisted());
+            crate::collectors::windows::honeytokens::uninstall();
             Ok(())
         }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("telemetry") => {
             print!("{}", crate::telemetry::diagnostics::run());
             Ok(())
         }
-        // The rule catalog (base / max severity, mode, dedup window per rule) as
-        // JSON — the file the backend seeds its catalog from.
-        Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("rule-catalog") => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&crate::detection::catalog::to_json())?
-            );
-            Ok(())
-        }
-        // Evaluate recorded telemetry with a fresh detection engine on its
-        // original timeline and report findings per rule. Offline and
-        // side-effect free, exactly like the Linux verb.
-        Some("replay") => {
-            let args: Vec<String> = std::env::args().collect();
-            std::process::exit(crate::detection::replay::run_cli(
-                &args[2..],
-                &crate::detection_host::engine("replay".into(), "replay".into()),
-            ));
-        }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("config") => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&crate::config::load_persisted())?
+                serde_json::to_string_pretty(&crate::config::load_persisted()?)?
             );
             Ok(())
         }
@@ -269,7 +250,7 @@ fn uninstall() -> Result<()> {
     //    registry decoys (the Linux agent revokes these over the signed command
     //    channel, so this local cleanup is Windows-only).
     crate::paths::init_state_dir();
-    crate::collectors::windows::honeytokens::uninstall(&crate::config::load_persisted());
+    crate::collectors::windows::honeytokens::uninstall();
     println!("Honeytoken decoy files + registry decoys removed");
 
     // 3b. Revert the audit settings the installer turned on for command lines

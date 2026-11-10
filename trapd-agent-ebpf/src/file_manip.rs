@@ -137,6 +137,12 @@ pub fn sys_enter_fchownat(ctx: TracePointContext) -> u32 {
 #[inline(always)]
 fn try_unlink(ctx: &TracePointContext) -> Result<(), i64> {
     let path_uptr: u64 = unsafe { ctx.read_at(24).map_err(|_| -1i64)? };
+    unlink_enter(path_uptr)
+}
+
+/// Shared with the raw `sys_enter` dispatcher (unlink/unlinkat).
+#[inline(always)]
+pub(crate) fn unlink_enter(path_uptr: u64) -> Result<(), i64> {
     if path_uptr == 0 {
         return Ok(());
     }
@@ -175,6 +181,12 @@ fn try_unlink(ctx: &TracePointContext) -> Result<(), i64> {
 fn try_rename(ctx: &TracePointContext) -> Result<(), i64> {
     let old_uptr: u64 = unsafe { ctx.read_at(24).map_err(|_| -1i64)? };
     let new_uptr: u64 = unsafe { ctx.read_at(40).map_err(|_| -1i64)? };
+    rename_enter(old_uptr, new_uptr)
+}
+
+/// Shared with the raw `sys_enter` dispatcher (rename/renameat/renameat2).
+#[inline(always)]
+pub(crate) fn rename_enter(old_uptr: u64, new_uptr: u64) -> Result<(), i64> {
     if old_uptr == 0 || new_uptr == 0 {
         return Ok(());
     }
@@ -219,10 +231,16 @@ fn try_rename(ctx: &TracePointContext) -> Result<(), i64> {
 #[inline(always)]
 fn try_chmod(ctx: &TracePointContext) -> Result<(), i64> {
     let path_uptr: u64 = unsafe { ctx.read_at(24).map_err(|_| -1i64)? };
+    let mode: u64 = unsafe { ctx.read_at(32).map_err(|_| -1i64)? };
+    chmod_enter(path_uptr, mode)
+}
+
+/// Shared with the raw `sys_enter` dispatcher (chmod/fchmodat/fchmodat2).
+#[inline(always)]
+pub(crate) fn chmod_enter(path_uptr: u64, mode: u64) -> Result<(), i64> {
     if path_uptr == 0 {
         return Ok(());
     }
-    let mode: u64 = unsafe { ctx.read_at(32).map_err(|_| -1i64)? };
 
     let (pid, uid, gid, comm) = current_task_info();
 
@@ -254,11 +272,17 @@ fn try_chmod(ctx: &TracePointContext) -> Result<(), i64> {
 #[inline(always)]
 fn try_chown(ctx: &TracePointContext) -> Result<(), i64> {
     let path_uptr: u64 = unsafe { ctx.read_at(24).map_err(|_| -1i64)? };
+    let new_uid: u64 = unsafe { ctx.read_at(32).map_err(|_| -1i64)? };
+    let new_gid: u64 = unsafe { ctx.read_at(40).map_err(|_| -1i64)? };
+    chown_enter(path_uptr, new_uid, new_gid)
+}
+
+/// Shared with the raw `sys_enter` dispatcher (chown/lchown/fchownat).
+#[inline(always)]
+pub(crate) fn chown_enter(path_uptr: u64, new_uid: u64, new_gid: u64) -> Result<(), i64> {
     if path_uptr == 0 {
         return Ok(());
     }
-    let new_uid: u64 = unsafe { ctx.read_at(32).map_err(|_| -1i64)? };
-    let new_gid: u64 = unsafe { ctx.read_at(40).map_err(|_| -1i64)? };
 
     let (pid, uid, gid, comm) = current_task_info();
 

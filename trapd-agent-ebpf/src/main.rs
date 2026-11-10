@@ -15,6 +15,7 @@ mod module_load;
 mod namespace;
 mod network;
 mod process_block;
+mod raw_syscalls;
 mod ptrace;
 mod setuid;
 mod shm;

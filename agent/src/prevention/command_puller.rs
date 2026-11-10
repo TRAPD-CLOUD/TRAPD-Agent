@@ -13,6 +13,10 @@
 //! through `mpsc::Sender<CommandEnvelope>` to the `engine::Engine` which
 //! actually executes them.  Rejected commands emit a `CommandRejected`
 //! audit event but never crash the loop.
+//!
+//! A batch is decoded one command at a time. A command this agent cannot
+//! decode, such as a kind added by a newer backend, is rejected on its own and
+//! never holds back an isolation or release queued next to it.
 
 use std::sync::Arc;
 
@@ -58,6 +62,41 @@ fn next_pause(outcome: PollOutcome, took: Duration, interval: Duration) -> Durat
         // Never retry a failing backend sooner than the normal interval.
         PollOutcome::Failed => interval,
     }
+}
+
+/// One element of a polled batch.
+#[derive(Debug)]
+enum Decoded {
+    Command(Box<SignedCommand>),
+    /// Not a command this agent understands. `command_id` is set when the
+    /// element still carries a well-formed one.
+    Undecodable {
+        command_id: Option<String>,
+        reason: String,
+    },
+}
+
+/// Decode a polled batch element by element. Only a body that is not a JSON
+/// array fails as a whole.
+fn decode_batch(body: &[u8]) -> Result<Vec<Decoded>, serde_json::Error> {
+    let items: Vec<serde_json::Value> = serde_json::from_slice(body)?;
+    Ok(items
+        .into_iter()
+        .map(|item| {
+            let command_id = item
+                .pointer("/envelope/command_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .map(|id| id.to_string());
+            match serde_json::from_value::<SignedCommand>(item) {
+                Ok(command) => Decoded::Command(Box::new(command)),
+                Err(error) => Decoded::Undecodable {
+                    command_id,
+                    reason: error.to_string(),
+                },
+            }
+        })
+        .collect())
 }
 
 pub struct CommandPuller {
@@ -161,7 +200,14 @@ impl CommandPuller {
             return PollOutcome::Failed;
         }
 
-        let commands: Vec<SignedCommand> = match resp.json().await {
+        let body = match resp.bytes().await {
+            Ok(body) => body,
+            Err(e) => {
+                warn!("command poll body failed: {e}");
+                return PollOutcome::Failed;
+            }
+        };
+        let commands = match decode_batch(&body) {
             Ok(v) => v,
             Err(e) => {
                 warn!("malformed command payload: {e}");
@@ -172,7 +218,25 @@ impl CommandPuller {
             return PollOutcome::Empty;
         }
 
-        for cmd in commands {
+        for decoded in commands {
+            let cmd = match decoded {
+                Decoded::Command(cmd) => *cmd,
+                Decoded::Undecodable { command_id, reason } => {
+                    warn!(command_id = ?command_id, "undecodable command skipped: {reason}");
+                    self.audit.emit(
+                        crate::schema::EventAction::CommandRejected,
+                        crate::schema::Severity::Medium,
+                        "command_rejected",
+                        command_id.clone().unwrap_or_else(|| "<unknown>".into()),
+                        false,
+                        format!("command could not be decoded by this agent version: {reason}"),
+                        None,
+                        command_id,
+                        serde_json::Value::Null,
+                    );
+                    continue;
+                }
+            };
             match self.verifier.verify(&cmd) {
                 Verdict::Ok(envelope) => {
                     debug!(command_id = %envelope.command_id, "command verified");
@@ -243,6 +307,66 @@ mod tests {
             next_pause(PollOutcome::Failed, Duration::from_secs(40), INTERVAL),
             INTERVAL
         );
+    }
+
+    fn command(kind: &str, id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "envelope": {
+                "command_id": id,
+                "issued_at": "2026-11-10T08:00:00Z",
+                "expires_at": "2026-11-10T08:05:00Z",
+                "agent_id": "agent_1",
+                "nonce": "7f0c3a1e-5a47-4e0e-9a7e-0d2f6c1b8a11",
+                "payload": { "kind": kind },
+            },
+            "signature": "AA==",
+        })
+    }
+
+    const RELEASE_ID: &str = "0b6f2f0a-3c1d-4b7e-8f55-2a9d6e4c1b70";
+    const UNKNOWN_ID: &str = "c2a9d3b4-6e1f-4a58-9b0c-7d1e2f3a4b5c";
+
+    #[test]
+    fn an_unknown_command_does_not_hold_back_its_neighbours() {
+        let body = serde_json::to_vec(&serde_json::json!([
+            command("kind_from_a_newer_backend", UNKNOWN_ID),
+            command("deisolate_network", RELEASE_ID),
+        ]))
+        .unwrap();
+        let decoded = decode_batch(&body).unwrap();
+        assert_eq!(decoded.len(), 2);
+        match &decoded[0] {
+            Decoded::Undecodable { command_id, .. } => {
+                assert_eq!(command_id.as_deref(), Some(UNKNOWN_ID));
+            }
+            other => panic!("expected an undecodable command, got {other:?}"),
+        }
+        match &decoded[1] {
+            Decoded::Command(cmd) => {
+                assert_eq!(cmd.envelope.command_id.to_string(), RELEASE_ID);
+            }
+            other => panic!("expected the release command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_element_is_reported_without_an_invented_id() {
+        let body = br#"[{"envelope": {"command_id": "<script>"}}, 7, null]"#;
+        let decoded = decode_batch(body).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for item in decoded {
+            match item {
+                Decoded::Undecodable { command_id, .. } => assert_eq!(command_id, None),
+                other => panic!("expected an undecodable command, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_that_is_not_a_list_fails_as_a_whole() {
+        assert!(decode_batch(br#"{"error":"nope"}"#).is_err());
+        assert!(decode_batch(b"<html>").is_err());
+        assert!(decode_batch(b"[]").unwrap().is_empty());
     }
 
     #[test]

@@ -209,6 +209,10 @@ pub struct SoftwarePackage {
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub architecture: Option<String>,
+    /// Windows Installer product code, upper case without braces. Present only
+    /// for machine-wide MSI products; it is the name a removal command takes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

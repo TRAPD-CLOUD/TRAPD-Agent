@@ -265,6 +265,7 @@ impl Collector for ProcessCollector {
                         start_time,
                         current.get(&ppid).and_then(|(_, start)| *start),
                     ),
+                    parent_exe: None,
                     enrichment: notes.finish(0),
                 };
                 crate::deception::activity::record_exec(&data.username, &data.exe);

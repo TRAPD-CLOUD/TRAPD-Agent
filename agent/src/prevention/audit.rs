@@ -15,6 +15,8 @@ pub struct AuditEmitter {
     tx: Sender<AgentEvent>,
     agent_id: String,
     hostname: String,
+    #[cfg(windows)]
+    user_notifications: Option<std::sync::Arc<std::sync::RwLock<crate::config::AgentConfig>>>,
 }
 
 impl AuditEmitter {
@@ -23,7 +25,20 @@ impl AuditEmitter {
             tx,
             agent_id,
             hostname,
+            #[cfg(windows)]
+            user_notifications: None,
         }
+    }
+
+    /// Follow the signed config's user-notification setting. Without this call
+    /// the emitter never notifies.
+    #[cfg(windows)]
+    pub fn with_user_notifications(
+        mut self,
+        config: std::sync::Arc<std::sync::RwLock<crate::config::AgentConfig>>,
+    ) -> Self {
+        self.user_notifications = Some(config);
+        self
     }
 
     /// Emit one prevention event.  Best-effort — if the pipeline is full or
@@ -42,6 +57,15 @@ impl AuditEmitter {
         command_id: Option<String>,
         details: Value,
     ) {
+        #[cfg(windows)]
+        if self.user_notifications.as_ref().is_some_and(|config| {
+            config
+                .read()
+                .map(|c| c.user_response_notifications_enabled)
+                .unwrap_or(false)
+        }) {
+            super::usernotify::notify(&action, kind, success, &details);
+        }
         let event = AgentEvent::new(
             self.agent_id.clone(),
             self.hostname.clone(),

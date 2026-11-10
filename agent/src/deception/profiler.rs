@@ -658,6 +658,7 @@ mod tests {
                 name: n.to_string(),
                 version: "1".into(),
                 architecture: None,
+                product_code: None,
             })
             .collect::<Vec<_>>();
         SoftwareInventory {

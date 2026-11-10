@@ -294,6 +294,7 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
             // reusing its PID.
             process_start_time: Some(stat.starttime),
             parent_start_time: None,
+            parent_exe: None,
             enrichment: notes.finish(if kthread { 0 } else { 2 }),
         };
         out.insert(stat.pid, data);

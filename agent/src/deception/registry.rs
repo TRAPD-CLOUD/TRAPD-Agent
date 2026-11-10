@@ -165,6 +165,32 @@ impl HoneytokenStore {
         Self::load_from(registry_path())
     }
 
+    /// Load the register, distinguishing "no register yet" (an empty one)
+    /// from a register that exists but cannot be read or parsed (an error).
+    /// Callers that act on the register's contents — the kernel arming
+    /// reconciler — must not treat a transient read failure as "no tokens",
+    /// which would disarm every honeytoken until the next successful read.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn try_load() -> Result<Self> {
+        Self::try_load_from(registry_path())
+    }
+
+    pub fn try_load_from(path: PathBuf) -> Result<Self> {
+        let registry = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse honeytoken register {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HoneytokenRegistry::default(),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("read honeytoken register {}", path.display()))
+            }
+        };
+        Ok(Self {
+            path,
+            inner: Mutex::new(registry),
+        })
+    }
+
     pub fn load_from(path: PathBuf) -> Self {
         let registry = std::fs::read(&path)
             .ok()
@@ -294,6 +320,24 @@ impl Drop for HoneytokenStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_load_tells_a_missing_register_from_an_unreadable_one() {
+        let dir = std::env::temp_dir().join(format!("trapd-htreg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("honeytokens.json");
+        // No register yet: empty, not an error.
+        assert!(HoneytokenStore::try_load_from(path.clone())
+            .unwrap()
+            .list()
+            .is_empty());
+        // A corrupt register is an error, never an empty token set.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(HoneytokenStore::try_load_from(path.clone()).is_err());
+        // The tolerant loader still starts empty so the agent keeps running.
+        assert!(HoneytokenStore::load_from(path.clone()).list().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn tmp_registry() -> HoneytokenStore {
         let nanos = std::time::SystemTime::now()

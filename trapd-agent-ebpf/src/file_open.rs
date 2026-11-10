@@ -363,13 +363,21 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
 
 #[inline(always)]
 fn try_file_open(ctx: &TracePointContext) -> Result<(), i64> {
+    let filename_uptr: u64 = unsafe { ctx.read_at(24).map_err(|_| -1i64)? };
+    let flags: u64 = unsafe { ctx.read_at(32).map_err(|_| -1i64)? };
+    open_enter(filename_uptr, flags)
+}
+
+/// Shared by `sys_enter_openat` and the raw `sys_enter` dispatcher (which also
+/// routes open/openat2/creat here): honeytoken fd stash plus write-open
+/// telemetry.
+#[inline(always)]
+pub(crate) fn open_enter(filename_uptr: u64, flags: u64) -> Result<(), i64> {
     let _ = HT_INODE_PENDING.remove(&bpf_get_current_pid_tgid());
     let _ = HT_OPEN_PENDING.remove(&bpf_get_current_pid_tgid());
-    let filename_uptr: u64 = unsafe { ctx.read_at(24).map_err(|_| -1i64)? };
     if filename_uptr == 0 {
         return Ok(());
     }
-    let flags: u64 = unsafe { ctx.read_at(32).map_err(|_| -1i64)? };
 
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let uid_gid = bpf_get_current_uid_gid();

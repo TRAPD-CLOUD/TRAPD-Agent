@@ -34,6 +34,7 @@ use crate::schema::{
 
 use super::audit::AuditEmitter;
 use super::commands::{CommandEnvelope, CommandPayload};
+use super::isolation_state;
 use super::lsm_loader::LsmHandle;
 use super::network::{self, Backend};
 use super::policy::{IocRule, Match, PolicyHandle, PolicyStore, RuleAction};
@@ -416,7 +417,7 @@ impl Engine {
             isolated = self
                 .isolation_allowlist(&[])
                 .await
-                .and_then(|allow| network::isolate(self.cfg.net_backend, &allow))
+                .and_then(|allow| self.apply_isolation(Vec::new(), allow).map(|_| ()))
                 .is_ok();
             actions.push(if isolated {
                 "isolate"
@@ -637,7 +638,7 @@ impl Engine {
         if matches!(decision.action, AutoAction::Quarantine) {
             if let Some(path) = &targets.file_path {
                 quarantined = response::validated_quarantine_path(path)
-                    .is_some_and(|path| quarantine::quarantine_automatic(Path::new(&path)).is_ok());
+                    .is_some_and(|path| quarantine::quarantine(Path::new(&path)).is_ok());
                 actions.push(if quarantined {
                     "quarantine"
                 } else {
@@ -650,7 +651,7 @@ impl Engine {
             isolated = self
                 .isolation_allowlist(&[])
                 .await
-                .and_then(|allow| network::isolate(self.cfg.net_backend, &allow))
+                .and_then(|allow| self.apply_isolation(Vec::new(), allow).map(|_| ()))
                 .is_ok();
             actions.push(if isolated {
                 "isolate"
@@ -948,9 +949,9 @@ impl Engine {
         match &env.payload {
             CommandPayload::KillPid {
                 pid,
-                process_start_time,
+                process_generation,
             } => {
-                self.cmd_kill_pid(*pid, *process_start_time, &cmd_id);
+                self.cmd_kill_pid(*pid, process_generation.map(|g| g.0), &cmd_id);
             }
             CommandPayload::IsolateNetwork { allowlist_ips } => {
                 self.cmd_isolate(allowlist_ips.clone(), &cmd_id).await;
@@ -974,17 +975,19 @@ impl Engine {
                 self.cmd_update_policy(rules.clone(), &cmd_id).await;
             }
             CommandPayload::InstallPackage { name } => {
-                self.cmd_package(super::software::Operation::Install(name), &cmd_id);
+                self.cmd_package(super::software::Operation::Install(name), &cmd_id)
+                    .await;
             }
             CommandPayload::RemovePackage { name } => {
-                self.cmd_package(super::software::Operation::Remove(name), &cmd_id);
+                self.cmd_package(super::software::Operation::Remove(name), &cmd_id)
+                    .await;
             }
             CommandPayload::UpgradePackage { name } => {
                 let op = match name {
                     Some(n) => super::software::Operation::Upgrade(n),
                     None => super::software::Operation::UpgradeAll,
                 };
-                self.cmd_package(op, &cmd_id);
+                self.cmd_package(op, &cmd_id).await;
             }
             CommandPayload::DeployHoneytoken {
                 path,
@@ -1013,15 +1016,15 @@ impl Engine {
             }
             CommandPayload::FreezePid {
                 pid,
-                process_start_time,
+                process_generation,
             } => {
-                self.cmd_freeze_pid(*pid, *process_start_time, &cmd_id);
+                self.cmd_freeze_pid(*pid, process_generation.map(|g| g.0), &cmd_id);
             }
             CommandPayload::ThawPid {
                 pid,
-                process_start_time,
+                process_generation,
             } => {
-                self.cmd_thaw_pid(*pid, *process_start_time, &cmd_id);
+                self.cmd_thaw_pid(*pid, process_generation.map(|g| g.0), &cmd_id);
             }
             CommandPayload::RunScript {
                 interpreter,
@@ -1097,37 +1100,15 @@ impl Engine {
         let script_args = response_rtr::script_args(&prog, &script);
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 300));
 
-        // `kill_on_drop`: the timeout below drops this future, and the script
-        // must stop with it rather than keep running unobserved after the
-        // result was reported as timed out.
-        let run = tokio::process::Command::new(&prog)
-            .args(&script_args)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
-
-        let (success, code, stdout, stderr, note) = match tokio::time::timeout(timeout, run).await {
-            Ok(Ok(out)) => (
-                out.status.success(),
-                out.status.code(),
-                out.stdout,
-                out.stderr,
-                String::new(),
-            ),
-            Ok(Err(e)) => (
-                false,
-                None,
-                Vec::new(),
-                Vec::new(),
-                format!("spawn failed: {e}"),
-            ),
-            Err(_) => (false, None, Vec::new(), Vec::new(), "timed out".to_string()),
-        };
-
         let max = max_bytes as usize;
-        let out_art = response_rtr::cap_and_encode(&stdout, max);
-        let err_art =
-            response_rtr::cap_and_encode(&stderr, max.saturating_sub(out_art.b64.len()).max(1));
+        let run = response_rtr::run_script_bounded(&prog, &script_args, timeout, max).await;
+        let (success, code, note) = (run.success, run.code, run.note);
+        let out_art = response_rtr::encode_prefix(&run.stdout, run.stdout_total);
+        let err_cap = max.saturating_sub(out_art.b64.len()).max(1);
+        let err_art = response_rtr::encode_prefix(
+            &run.stderr[..run.stderr.len().min(err_cap)],
+            run.stderr_total,
+        );
 
         self.audit.emit(
             EventAction::CommandAccepted,
@@ -1171,9 +1152,8 @@ impl Engine {
             return self.rtr_refuse("rtr_collect_file", path.to_string(), cmd_id);
         }
         let cap = max_bytes.unwrap_or(default_max).min(default_max) as usize;
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let art = response_rtr::cap_and_encode(&bytes, cap);
+        match response_rtr::collect_file(path, cap) {
+            Ok(art) => {
                 self.audit.emit(
                     EventAction::CommandAccepted,
                     Severity::Info,
@@ -1682,8 +1662,8 @@ impl Engine {
     }
 
     /// Run a software-management operation and audit the outcome.  Package work
-    /// shells out to the package manager (via an argv, no shell).
-    fn cmd_package(&self, op: super::software::Operation<'_>, cmd_id: &str) {
+    /// starts the package manager with an argv (no shell) and a deadline.
+    async fn cmd_package(&self, op: super::software::Operation<'_>, cmd_id: &str) {
         use super::software::Operation;
         use crate::schema::{EventAction, Severity};
 
@@ -1706,7 +1686,7 @@ impl Engine {
             ),
         };
 
-        let result = super::software::execute(op);
+        let result = super::software::execute(op).await;
         let severity = if result.success {
             Severity::Info
         } else {
@@ -1753,14 +1733,23 @@ impl Engine {
     }
 
     async fn cmd_isolate(&self, mut allow: Vec<std::net::IpAddr>, cmd_id: &str) {
+        let requested = allow.clone();
         let res = self.isolation_allowlist(&allow).await.and_then(|current| {
             allow = current;
-            network::isolate(self.cfg.net_backend, &allow)
+            self.apply_isolation(requested, allow.clone())
         });
         let (success, reason) = match res {
-            Ok(_) => (
+            Ok(persisted) => (
                 true,
-                format!("host isolated; allowlist size = {}", allow.len()),
+                format!(
+                    "host isolated; allowlist size = {}{}",
+                    allow.len(),
+                    if persisted {
+                        ""
+                    } else {
+                        "; WARNING: isolation will not survive a reboot"
+                    }
+                ),
             ),
             Err(e) => (false, format!("isolate failed: {e:#}")),
         };
@@ -1777,8 +1766,92 @@ impl Engine {
         );
     }
 
+    /// The only way host isolation is applied, so it is always recorded.
+    fn apply_isolation(
+        &self,
+        requested: Vec<std::net::IpAddr>,
+        resolved: Vec<std::net::IpAddr>,
+    ) -> anyhow::Result<bool> {
+        let backend = self.cfg.net_backend;
+        isolation_state::isolate(
+            &isolation_state::path(),
+            &isolation_state::IsolationState {
+                requested,
+                resolved,
+            },
+            || network::holds_isolation(backend),
+            |ips| network::isolate(backend, ips),
+            || network::deisolate(backend),
+        )
+    }
+
+    /// Re-apply recorded isolation after a restart. Linux rules do not survive a
+    /// reboot; Windows firewall rules do, so there is nothing to do there.
+    #[cfg(not(windows))]
+    pub async fn restore_isolation(&self) {
+        let path = isolation_state::path();
+        let recorded = match isolation_state::load(&path) {
+            Ok(Some(recorded)) => recorded,
+            Ok(None) => return,
+            Err(error) => {
+                self.audit_isolation_restore(
+                    false,
+                    format!("isolation state unreadable: {error:#}"),
+                );
+                return;
+            }
+        };
+        // The last known list first: containment must not wait for DNS.
+        const ATTEMPTS: u32 = 6;
+        let mut failure = None;
+        for attempt in 1..=ATTEMPTS {
+            let backend = self.cfg.net_backend;
+            let applied = network::ensure_chains(backend)
+                .and_then(|()| network::isolate(backend, &recorded.resolved));
+            match applied {
+                Ok(()) => {
+                    failure = None;
+                    break;
+                }
+                Err(error) => failure = Some(format!("{error:#}")),
+            }
+            if attempt < ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        }
+        if let Some(error) = failure {
+            self.audit_isolation_restore(false, format!("isolation not restored: {error}"));
+            return;
+        }
+        if let Ok(current) = self.isolation_allowlist(&recorded.requested).await {
+            if current != recorded.resolved {
+                if let Err(error) = self.apply_isolation(recorded.requested.clone(), current) {
+                    warn!(error = %format!("{error:#}"), "could not refresh the isolation allowlist");
+                }
+            }
+        }
+        self.audit_isolation_restore(true, "host isolation restored after restart".into());
+    }
+
+    #[cfg(not(windows))]
+    fn audit_isolation_restore(&self, success: bool, reason: String) {
+        self.audit.emit(
+            crate::schema::EventAction::NetworkIsolated,
+            crate::schema::Severity::Critical,
+            "network_isolate",
+            "host",
+            success,
+            reason,
+            None,
+            None,
+            serde_json::Value::Null,
+        );
+    }
+
     fn cmd_deisolate(&self, cmd_id: &str) {
-        let res = network::deisolate(self.cfg.net_backend);
+        let backend = self.cfg.net_backend;
+        let res =
+            isolation_state::release(&isolation_state::path(), || network::deisolate(backend));
         let (success, reason) = match res {
             Ok(_) => (true, "host isolation lifted".to_string()),
             Err(e) => (false, format!("deisolate failed: {e:#}")),
@@ -2575,22 +2648,69 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_operator_quarantine_of_a_protected_file_reports_failure_for_its_command() {
+        let (engine, mut rx) = test_engine();
+        engine.cmd_quarantine("/etc/passwd", "cmd-1");
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(event.action, EventAction::FileQuarantined));
+        let EventData::Prevention(audit) = event.data else {
+            panic!("audit")
+        };
+        assert!(!audit.success);
+        assert_eq!(audit.command_id.as_deref(), Some("cmd-1"));
+        assert!(std::path::Path::new("/etc/passwd").exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_isolation_and_release_report_failure_for_their_command() {
+        let (engine, mut rx) = test_engine();
+        engine.cmd_isolate(vec![], "cmd-2").await;
+        engine.cmd_deisolate("cmd-3");
+        for (action, id) in [("isolate", "cmd-2"), ("release", "cmd-3")] {
+            let EventData::Prevention(audit) = rx.try_recv().unwrap().data else {
+                panic!("audit")
+            };
+            assert!(!audit.success, "{action}");
+            assert_eq!(audit.command_id.as_deref(), Some(id));
+        }
+    }
+
     #[cfg(any(target_os = "linux", windows))]
     fn process_command(
         kind: &str,
         pid: i32,
         generation: Option<u64>,
     ) -> crate::prevention::commands::CommandEnvelope {
-        let mut payload = serde_json::json!({ "kind": kind, "pid": pid });
-        if let Some(start) = generation {
-            payload["process_start_time"] = serde_json::json!(start);
-        }
-        serde_json::from_value(serde_json::json!({
-            "command_id": uuid::Uuid::new_v4(), "issued_at": chrono::Utc::now(),
-            "expires_at": chrono::Utc::now() + chrono::Duration::minutes(1),
-            "agent_id": "test-agent", "nonce": uuid::Uuid::new_v4(), "payload": payload,
-        }))
-        .unwrap()
+        use crate::prevention::commands::{CommandPayload, ProcessGeneration};
+        let mut envelope: crate::prevention::commands::CommandEnvelope =
+            serde_json::from_value(serde_json::json!({
+                "command_id": uuid::Uuid::new_v4(), "issued_at": chrono::Utc::now(),
+                "expires_at": chrono::Utc::now() + chrono::Duration::minutes(1),
+                "agent_id": "test-agent", "nonce": uuid::Uuid::new_v4(),
+                "payload": { "kind": kind, "pid": pid },
+            }))
+            .unwrap();
+        // Built directly so a value the wire format refuses (0) still reaches
+        // the engine, whose own check must reject it as well.
+        let process_generation = generation.map(ProcessGeneration);
+        envelope.payload = match kind {
+            "kill_pid" => CommandPayload::KillPid {
+                pid,
+                process_generation,
+            },
+            "freeze_pid" => CommandPayload::FreezePid {
+                pid,
+                process_generation,
+            },
+            "thaw_pid" => CommandPayload::ThawPid {
+                pid,
+                process_generation,
+            },
+            other => panic!("unexpected process command {other}"),
+        };
+        envelope
     }
 
     #[cfg(any(target_os = "linux", windows))]

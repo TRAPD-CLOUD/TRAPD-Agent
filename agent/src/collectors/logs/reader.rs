@@ -472,47 +472,130 @@ fn hunt_inode(dir: Option<&Path>, ident: (u64, u64)) -> Option<PathBuf> {
     None
 }
 
+/// Entries inspected per directory while expanding one glob component. A bound,
+/// not an expectation: log directories hold dozens of entries.
+const MAX_GLOB_DIR_ENTRIES: usize = 50_000;
+
+#[cfg(test)]
+thread_local! {
+    /// Directories listed by [`component_expand`] on this thread (test probe).
+    static LISTED_DIRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Expand a path that may contain glob characters. Non-glob paths are
 /// returned as-is (even if they do not exist yet — the tailer waits).
+///
+/// Patterns are resolved one component at a time: only the directories whose
+/// names match a glob component are listed. Walking from the literal prefix
+/// instead is catastrophic when the first glob sits directly under a root
+/// (`C:\nginx*\logs\access.log` walked all of `C:\`, WinSxS included, every
+/// 15 s on every Windows host). `**` keeps the recursive walk.
 pub fn expand_paths(pattern: &str, exclude: &[String]) -> Vec<PathBuf> {
     if !is_glob(pattern) {
         return vec![PathBuf::from(pattern)];
     }
-    let Ok(glob) = globset::Glob::new(pattern) else {
-        return vec![PathBuf::from(pattern)];
+    let mut out = if pattern.contains("**") {
+        walk_expand(pattern)
+    } else {
+        component_expand(pattern)
     };
-    let matcher = glob.compile_matcher();
     let mut excl = globset::GlobSetBuilder::new();
     for e in exclude {
         if let Ok(g) = globset::Glob::new(e) {
             excl.add(g);
         }
     }
-    let excl = excl.build().ok();
-    let (root, depth) = walk_root(pattern);
-    let mut out = Vec::new();
-    let walker = walkdir::WalkDir::new(&root)
-        .max_depth(depth)
-        .follow_links(true);
-    for ent in walker.into_iter().filter_map(|e| e.ok()) {
-        if !ent.file_type().is_file() {
-            continue;
-        }
-        let path = ent.path();
-        if !matcher.is_match(path) {
-            continue;
-        }
-        if let Some(set) = &excl {
-            if let Some(name) = path.file_name() {
-                if set.is_match(name) {
-                    continue;
-                }
-            }
-        }
-        out.push(path.to_path_buf());
+    if let Ok(set) = excl.build() {
+        out.retain(|path| {
+            path.file_name()
+                .map(|name| !set.is_match(name))
+                .unwrap_or(true)
+        });
     }
     out.sort();
     out
+}
+
+/// Resolve `pattern` component by component. Files only; symlinks are
+/// followed as before.
+fn component_expand(pattern: &str) -> Vec<PathBuf> {
+    use std::path::Component;
+    let comps: Vec<Component> = Path::new(pattern).components().collect();
+    let Some(first_glob) = comps
+        .iter()
+        .position(|c| is_glob(&c.as_os_str().to_string_lossy()))
+    else {
+        return Vec::new();
+    };
+    let mut base = PathBuf::new();
+    for c in &comps[..first_glob] {
+        base.push(c);
+    }
+    if base.as_os_str().is_empty() {
+        base = PathBuf::from(".");
+    }
+    let last = comps.len() - 1;
+    let mut frontier = vec![base];
+    for (i, comp) in comps.iter().enumerate().skip(first_glob) {
+        let segment = comp.as_os_str().to_string_lossy();
+        let wanted = |p: &Path| if i == last { p.is_file() } else { p.is_dir() };
+        let mut next = Vec::new();
+        if is_glob(&segment) {
+            let Ok(glob) = globset::GlobBuilder::new(&segment)
+                .literal_separator(true)
+                .case_insensitive(cfg!(windows))
+                .build()
+            else {
+                return Vec::new();
+            };
+            let matcher = glob.compile_matcher();
+            for dir in &frontier {
+                #[cfg(test)]
+                LISTED_DIRS.with(|n| n.set(n.get() + 1));
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    continue;
+                };
+                for entry in entries.flatten().take(MAX_GLOB_DIR_ENTRIES) {
+                    if !matcher.is_match(Path::new(&entry.file_name())) {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if wanted(&path) {
+                        next.push(path);
+                    }
+                }
+            }
+        } else {
+            for dir in &frontier {
+                let path = dir.join(comp.as_os_str());
+                if wanted(&path) {
+                    next.push(path);
+                }
+            }
+        }
+        if next.is_empty() {
+            return Vec::new();
+        }
+        frontier = next;
+    }
+    frontier
+}
+
+/// Recursive expansion for `**` patterns, bounded by the pattern's depth.
+fn walk_expand(pattern: &str) -> Vec<PathBuf> {
+    let Ok(glob) = globset::Glob::new(pattern) else {
+        return vec![PathBuf::from(pattern)];
+    };
+    let matcher = glob.compile_matcher();
+    let (root, depth) = walk_root(pattern);
+    walkdir::WalkDir::new(&root)
+        .max_depth(depth)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|ent| ent.file_type().is_file() && matcher.is_match(ent.path()))
+        .map(|ent| ent.path().to_path_buf())
+        .collect()
 }
 
 fn is_glob(p: &str) -> bool {
@@ -878,6 +961,123 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert!(got[0].ends_with("a.log"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "x\n").unwrap();
+    }
+
+    #[test]
+    fn a_glob_directly_under_a_root_resolves_only_matching_directories() {
+        let root = tmpdir();
+        touch(&root.join("nginx-1.25/logs/access.log"));
+        touch(&root.join("nginx-2/logs/access.log"));
+        touch(&root.join("other/logs/access.log"));
+        touch(&root.join("nginx-old/logs/error.log"));
+        std::fs::write(root.join("nginx-file"), "x").unwrap();
+        let pat = root
+            .join("nginx*/logs/access.log")
+            .to_string_lossy()
+            .into_owned();
+        let got = expand_paths(&pat, &[]);
+        let names: Vec<_> = got
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["nginx-1.25/logs/access.log", "nginx-2/logs/access.log"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Regression: `C:\nginx*\logs\access.log` walked the whole drive (WinSxS
+    /// has ~19k directories) every 15 s. Resolving must list the root once and
+    /// never look inside directories that do not match.
+    #[test]
+    fn unrelated_directories_are_never_listed() {
+        let root = tmpdir();
+        for i in 0..300 {
+            touch(&root.join(format!("decoy-{i}/a/b/c.log")));
+        }
+        touch(&root.join("nginx1/logs/access.log"));
+        LISTED_DIRS.with(|n| n.set(0));
+        let pat = root
+            .join("nginx*/logs/access.log")
+            .to_string_lossy()
+            .into_owned();
+        let got = expand_paths(&pat, &[]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            LISTED_DIRS.with(|n| n.get()),
+            1,
+            "only the root may be listed, not the 300 decoy trees"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_glob_in_the_middle_and_at_the_end_expands_in_order() {
+        let root = tmpdir();
+        touch(&root.join("PostgreSQL/16/data/log/a.log"));
+        touch(&root.join("PostgreSQL/15/data/log/b.log"));
+        touch(&root.join("PostgreSQL/15/data/log/b.log.gz"));
+        touch(&root.join("PostgreSQL/15/data/other/c.log"));
+        let pat = root
+            .join("PostgreSQL/*/data/log/*.log")
+            .to_string_lossy()
+            .into_owned();
+        let got = expand_paths(&pat, &[]);
+        assert_eq!(got.len(), 2);
+        assert!(got[0].ends_with("b.log") && got[1].ends_with("a.log"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_literal_prefix_or_no_match_yields_nothing() {
+        let root = tmpdir();
+        touch(&root.join("apache/logs/access.log"));
+        let miss = root.join("nope/*/x.log").to_string_lossy().into_owned();
+        assert!(expand_paths(&miss, &[]).is_empty());
+        let nomatch = root
+            .join("apache*/logs/error.log")
+            .to_string_lossy()
+            .into_owned();
+        assert!(expand_paths(&nomatch, &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recursive_double_star_patterns_still_walk() {
+        let root = tmpdir();
+        // Unchanged behaviour: the walk is bounded by the pattern's own depth
+        // (`**/*.log` reaches two levels), so the file sits one level down.
+        touch(&root.join("a/found.log"));
+        touch(&root.join("a/skip.txt"));
+        let pat = root.join("**/*.log").to_string_lossy().into_owned();
+        let got = expand_paths(&pat, &[]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].ends_with("found.log"), "{got:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_names_match_case_insensitively() {
+        let root = tmpdir();
+        touch(&root.join("Apache24/logs/access.log"));
+        let pat = root
+            .join("apache*/logs/access.log")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(expand_paths(&pat, &[]).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

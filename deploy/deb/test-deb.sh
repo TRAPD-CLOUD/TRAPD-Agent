@@ -103,6 +103,25 @@ else
     mkdir -p "$TMP/work"
     cp "$DEB1" "$TMP/work/v1.deb"; cp "$DEB2" "$TMP/work/v2.deb"; cp "$HERE/test-in-container.sh" "$TMP/work/"
     cp "$HERE/../install.sh" "$TMP/work/install.sh"
+    # Reuse the real Ed25519 fixture builder used by the standalone verifier tests.
+    python3 - "$HERE/../test-release-verification.py" "$TMP/work" <<'PYFIXTURE'
+import importlib.util
+import pathlib
+import shutil
+import sys
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("release_tests", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+fixture = module.ReleaseVerification()
+fixture.setUp()
+try:
+    work = pathlib.Path(sys.argv[2])
+    shutil.copytree(fixture.assets, work / "assets")
+    shutil.copyfile(fixture.trust, work / "release_signing.pub")
+finally:
+    fixture.doCleanups()
+PYFIXTURE
     for image in ${IMAGES:-ubuntu:24.04 debian:12}; do
         echo "-- $image"
         if ! docker image inspect "$image" >/dev/null 2>&1 && ! docker pull -q "$image" >/dev/null 2>&1; then

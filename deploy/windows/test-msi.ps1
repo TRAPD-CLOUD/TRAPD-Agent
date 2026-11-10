@@ -177,7 +177,7 @@ try {
     Start-Sleep -Seconds 6
     $marker = Join-Path $watch 'sample.txt'
     'initial content' | Set-Content $marker
-    $child = Start-Process "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c ping -n 18 127.0.0.1 > nul & rem TRAPD_MSI_SIGMA_SMOKE' -PassThru
+    $child = Start-Process "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c ping -n 18 127.0.0.1 > nul & rem TRAPD_MSI_PROCESS_SMOKE' -PassThru
     # Keep an ordinary TCP flow alive for more than one sensor interval.
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     $listener.Start()
@@ -185,8 +185,7 @@ try {
     $client.Connect('127.0.0.1', $listener.LocalEndpoint.Port)
     $peer = $listener.AcceptTcpClient()
     [Diagnostics.EventLog]::WriteEntry($eventSource, 'TRAPD_MSI_EVENTLOG_SMOKE', [Diagnostics.EventLogEntryType]::Information, 100)
-    Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'process' -and $_.data.cmdline -like '*TRAPD_MSI_SIGMA_SMOKE*' }).Count -gt 0 } 'No process telemetry.'
-    Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'detection' -and $_.data.title -eq 'TRAPD MSI Sigma smoke' }).Count -gt 0 } 'Windows Sigma rule did not fire.'
+    Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'process' -and $_.data.cmdline -like '*TRAPD_MSI_PROCESS_SMOKE*' }).Count -gt 0 } 'No process telemetry.'
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'network' -and $_.data.dst_port -eq $listener.LocalEndpoint.Port }).Count -gt 0 } 'No native TCP telemetry.'
     $client.Dispose(); $peer.Dispose(); $listener.Stop()
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'filesystem' -and $_.data.path -eq $marker }).Count -gt 0 } 'No file-change telemetry.'
