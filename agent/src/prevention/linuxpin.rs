@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -154,6 +154,7 @@ pub fn place_new(source: &Path, target: &Path) -> Result<()> {
 
 fn copy_new(source: &Path, directory: &OwnedFd, name: &CString) -> Result<()> {
     let mut input = File::open(source).context("open quarantined file")?;
+    let metadata = input.metadata().context("stat quarantined file")?;
     // SAFETY: valid directory descriptor and NUL-terminated name.
     let raw = unsafe {
         libc::openat(
@@ -178,6 +179,11 @@ fn copy_new(source: &Path, directory: &OwnedFd, name: &CString) -> Result<()> {
             .write_all(&buffer[..count])
             .context("write restore target")?;
     }
+    // Through the descriptor, so nothing swapped into the path can be affected.
+    // Owner first: chown clears setuid and setgid bits.
+    // SAFETY: valid descriptor; numeric ids.
+    let _ = unsafe { libc::fchown(output.as_raw_fd(), metadata.uid(), metadata.gid()) };
+    let _ = output.set_permissions(metadata.permissions());
     output.sync_all().context("sync restore target")?;
     std::fs::remove_file(source).context("remove quarantined copy")
 }
@@ -185,6 +191,29 @@ fn copy_new(source: &Path, directory: &OwnedFd, name: &CString) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copied_restore_carries_the_vault_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("trapd-copy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("stored");
+        std::fs::write(&source, b"payload").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let directory = open_directory(&root).unwrap();
+        copy_new(
+            &source,
+            &directory,
+            &c_bytes(OsStr::new("restored")).unwrap(),
+        )
+        .unwrap();
+        let restored = std::fs::symlink_metadata(root.join("restored")).unwrap();
+        assert_eq!(restored.permissions().mode() & 0o7777, 0o640);
+        assert!(!source.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 

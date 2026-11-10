@@ -220,8 +220,14 @@ pub fn restore(quarantine_id: &Uuid) -> Result<QuarantineRecord> {
     let stored = Path::new(&record.stored_path);
     let original = Path::new(&record.original_path);
 
-    place_restored(stored, original, &record.sha256)?;
+    place_restored(
+        stored,
+        original,
+        &record.sha256,
+        (record.mode, record.uid, record.gid),
+    )?;
 
+    #[cfg(windows)]
     if let Err(error) = restore_attributes(original, &record) {
         // Preserve the indexed stored location when original security cannot be
         // restored. The index has not yet been removed on disk.
@@ -251,7 +257,16 @@ fn same_directory(a: &str, b: &str) -> bool {
 
 /// Put a quarantined file back only if it is still the file that was taken and
 /// nothing has appeared in its place. On failure it stays locked in quarantine.
-fn place_restored(stored: &Path, original: &Path, sha256: &str) -> Result<()> {
+/// Linux sets `attributes` (mode, uid, gid) while the file is still in the
+/// root-only vault: done after the move, by path, a user who owns the restore
+/// directory could swap in a symlink and have root chown its target.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn place_restored(
+    stored: &Path,
+    original: &Path,
+    sha256: &str,
+    attributes: (u32, u32, u32),
+) -> Result<()> {
     if original.symlink_metadata().is_ok() {
         bail!("restore target already exists: {}", original.display());
     }
@@ -269,6 +284,10 @@ fn place_restored(stored: &Path, original: &Path, sha256: &str) -> Result<()> {
         }
         #[cfg(target_os = "linux")]
         {
+            let (mode, uid, gid) = attributes;
+            // Owner first: chown clears setuid and setgid bits.
+            let _ = chown(stored, uid, gid);
+            let _ = set_mode(stored, mode);
             super::linuxpin::place_new(stored, original)
         }
         #[cfg(not(target_os = "linux"))]
@@ -277,6 +296,13 @@ fn place_restored(stored: &Path, original: &Path, sha256: &str) -> Result<()> {
         }
     })();
     if placed.is_err() {
+        // The file stays in the vault: take back the ownership handed out above.
+        #[cfg(target_os = "linux")]
+        let _ = chown(
+            stored,
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        );
         let _ = lock_down(stored);
     }
     placed
@@ -323,6 +349,7 @@ fn move_into_quarantine(src: &Path, dst: &Path, original_security: &Option<Strin
     result
 }
 
+#[cfg(not(target_os = "linux"))]
 fn move_or_copy(src: &Path, dst: &Path) -> Result<()> {
     let mut attempts = 0;
     loop {
@@ -350,6 +377,7 @@ fn move_or_copy(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// `EXDEV` on Unix, `ERROR_NOT_SAME_DEVICE` on Windows.
+#[cfg(any(not(target_os = "linux"), test))]
 fn cross_device_code() -> i32 {
     if cfg!(windows) {
         17
@@ -359,6 +387,7 @@ fn cross_device_code() -> i32 {
 }
 
 /// `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION`.
+#[cfg(any(not(target_os = "linux"), test))]
 fn is_transient_lock(e: &std::io::Error) -> bool {
     cfg!(windows) && matches!(e.raw_os_error(), Some(32) | Some(33))
 }
@@ -380,11 +409,6 @@ fn set_mode(_p: &Path, _m: u32) -> std::io::Result<()> {
 fn chown(p: &Path, uid: u32, gid: u32) -> Result<()> {
     use nix::unistd::{chown as nix_chown, Gid, Uid};
     nix_chown(p, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).context("chown failed")
-}
-
-#[cfg(not(target_os = "linux"))]
-fn chown(_p: &Path, _u: u32, _g: u32) -> Result<()> {
-    Ok(())
 }
 
 /// Make the stored payload unusable and tamper-resistant: `chmod 000` +
@@ -434,24 +458,17 @@ fn capture_security(path: &Path) -> Result<Option<String>> {
     }
 }
 
+#[cfg(windows)]
 fn restore_attributes(original: &Path, record: &QuarantineRecord) -> Result<()> {
-    #[cfg(not(windows))]
-    {
-        let _ = set_mode(original, record.mode);
-        let _ = chown(original, record.uid, record.gid);
-    }
-    #[cfg(windows)]
-    {
-        match &record.security_descriptor {
-            Some(sddl) => {
-                crate::winacl::set_file_security(original, sddl)
-                    .context("restore original owner and DACL")?;
-            }
-            None => warn!(
-                path = %original.display(),
-                "no original DACL recorded; the restored file keeps its destination ACL"
-            ),
+    match &record.security_descriptor {
+        Some(sddl) => {
+            crate::winacl::set_file_security(original, sddl)
+                .context("restore original owner and DACL")?;
         }
+        None => warn!(
+            path = %original.display(),
+            "no original DACL recorded; the restored file keeps its destination ACL"
+        ),
     }
     Ok(())
 }
@@ -506,10 +523,30 @@ mod restore_tests {
         (root, stored, original, sha)
     }
 
+    fn attributes(mode: u32) -> (u32, u32, u32) {
+        (
+            mode,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+    }
+
+    #[test]
+    fn the_recorded_mode_arrives_with_the_file_and_is_not_set_through_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, stored, original, sha) = setup(b"payload");
+        place_restored(&stored, &original, &sha, attributes(0o640)).unwrap();
+        let mode = fs::symlink_metadata(&original)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o640);
+    }
+
     #[test]
     fn an_intact_file_returns_to_its_place() {
         let (_root, stored, original, sha) = setup(b"payload");
-        place_restored(&stored, &original, &sha).unwrap();
+        place_restored(&stored, &original, &sha, attributes(0o644)).unwrap();
         assert_eq!(fs::read(&original).unwrap(), b"payload");
         assert!(!stored.exists());
     }
@@ -518,7 +555,7 @@ mod restore_tests {
     fn a_missing_parent_directory_is_recreated() {
         let (root, stored, _, sha) = setup(b"payload");
         let nested = root.join("gone/again/file");
-        place_restored(&stored, &nested, &sha).unwrap();
+        place_restored(&stored, &nested, &sha, attributes(0o644)).unwrap();
         assert_eq!(fs::read(nested).unwrap(), b"payload");
     }
 
@@ -526,7 +563,7 @@ mod restore_tests {
     fn an_occupied_target_is_left_untouched() {
         let (_root, stored, original, sha) = setup(b"payload");
         fs::write(&original, b"newer").unwrap();
-        assert!(place_restored(&stored, &original, &sha).is_err());
+        assert!(place_restored(&stored, &original, &sha, attributes(0o644)).is_err());
         assert_eq!(fs::read(&original).unwrap(), b"newer");
         assert!(stored.exists());
     }
@@ -535,14 +572,14 @@ mod restore_tests {
     fn a_dangling_symlink_counts_as_occupied() {
         let (root, stored, original, sha) = setup(b"payload");
         std::os::unix::fs::symlink(root.join("nowhere"), &original).unwrap();
-        assert!(place_restored(&stored, &original, &sha).is_err());
+        assert!(place_restored(&stored, &original, &sha, attributes(0o644)).is_err());
         assert!(!root.join("nowhere").exists());
     }
 
     #[test]
     fn a_tampered_file_is_not_restored() {
         let (_root, stored, original, _) = setup(b"payload");
-        assert!(place_restored(&stored, &original, "00").is_err());
+        assert!(place_restored(&stored, &original, "00", attributes(0o644)).is_err());
         assert!(!original.exists());
         assert!(stored.exists());
     }
@@ -552,7 +589,9 @@ mod restore_tests {
         let (root, stored, _, sha) = setup(b"payload");
         fs::create_dir(root.join("real")).unwrap();
         std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
-        assert!(place_restored(&stored, &root.join("alias/file"), &sha).is_err());
+        assert!(
+            place_restored(&stored, &root.join("alias/file"), &sha, attributes(0o644)).is_err()
+        );
         assert!(!root.join("real/file").exists());
         assert!(stored.exists());
     }
