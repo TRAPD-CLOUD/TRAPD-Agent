@@ -29,7 +29,8 @@ p=Path(sys.argv[1]);(p/'state').mkdir();(p/'logs').mkdir()
 (p/'decoy.txt').write_bytes(b'fixture-decoy-only\n');os.chmod(p/'decoy.txt',0o600)
 conf={key:False for key in ['prevention_enabled','memory_scan_enabled','fim_enabled','inventory_enabled','vuln_scan_enabled','cis_benchmark_enabled']}
 conf.update(fs_watch_paths=[],honeytoken_detection_enabled=True)
-(p/'state/agent_config.json').write_text(json.dumps(conf))
+# Model a previously accepted policy with its atomic anti-replay state.
+(p/'state/config_issued_at.json').write_text(json.dumps({'issued_at':'2026-10-07T00:00:00Z','config':conf}))
 tokens=[]
 for prefix,name,mode in [('11111111','decoy.txt',384),('22222222','decoy-exec',448),('33333333','decoy-invalid',448)]:
  data=(p/name).read_bytes();os.chmod(p/name,mode)
@@ -40,7 +41,11 @@ PY
 mounts=()
 if [[ "$mode" == fallback ]]; then mounts=(-v "$dir/no-btf:/sys/kernel/btf/vmlinux:ro"); fi
 docker run --rm --name "$container" --privileged --pid host --network none -e MODE="$mode" \
-  -v "$dir:/test" "${mounts[@]}" "$image" bash /test/run.sh > "$dir/actions.log" 2>&1
+  -v "$dir:/test" "${mounts[@]}" "$image" bash /test/run.sh > "$dir/actions.log" 2>&1 || {
+  cat "$dir/actions.log"
+  [[ ! -f "$dir/agent.log" ]] || tail -60 "$dir/agent.log"
+  exit 1
+}
 # On failure: everything needed to tell a sensor that did not fire from one
 # whose event was lost or folded later, without rerunning on that kernel.
 diagnose() {

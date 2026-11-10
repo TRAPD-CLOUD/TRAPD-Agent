@@ -52,7 +52,7 @@ pub fn entry() -> Result<()> {
         Some("cleanup") => {
             crate::prevention::winfirewall::cleanup()
                 .context("remove containment firewall rules")?;
-            crate::collectors::windows::honeytokens::uninstall(&crate::config::load_persisted());
+            crate::collectors::windows::honeytokens::uninstall();
             Ok(())
         }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("telemetry") => {
@@ -62,7 +62,7 @@ pub fn entry() -> Result<()> {
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("config") => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&crate::config::load_persisted())?
+                serde_json::to_string_pretty(&crate::config::load_persisted()?)?
             );
             Ok(())
         }
@@ -245,7 +245,7 @@ fn uninstall() -> Result<()> {
     //    registry decoys (the Linux agent revokes these over the signed command
     //    channel, so this local cleanup is Windows-only).
     crate::paths::init_state_dir();
-    crate::collectors::windows::honeytokens::uninstall(&crate::config::load_persisted());
+    crate::collectors::windows::honeytokens::uninstall();
     println!("Honeytoken decoy files + registry decoys removed");
 
     // 4. Remove the binary. Windows cannot delete a running executable, so

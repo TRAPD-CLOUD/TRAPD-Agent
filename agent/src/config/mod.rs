@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
@@ -504,14 +504,13 @@ pub struct ConfigVerifier {
 
 impl ConfigVerifier {
     /// Load the Ed25519 verifying key (raw 32 bytes) and the persisted
-    /// `issued_at` high-water mark. Fails only when the key cannot be read or is
-    /// malformed — the caller then keeps its last-known-good config rather than
-    /// trusting an unauthenticatable channel.
+    /// `issued_at` high-water mark. An unreadable or malformed key or existing
+    /// watermark fails closed; the caller keeps its last-known-good config.
     pub fn new(pubkey_path: &Path, agent_id: String, watermark_path: &Path) -> Result<Self> {
         // Reuse the response-command key loader so both channels trust the exact
         // same raw 32-byte key provisioned at `<config>/command_signing.pub`.
         let key = load_verifying_key(pubkey_path)?;
-        let watermark = IssuedAtStore::load(watermark_path);
+        let watermark = IssuedAtStore::load(watermark_path)?;
         info!(path = %pubkey_path.display(), "Signed-config verifier loaded");
         Ok(Self {
             key,
@@ -551,7 +550,9 @@ impl ConfigVerifier {
                 ));
             }
         }
-        self.watermark.advance(issued_at);
+        self.watermark
+            .advance(issued_at, &signed.envelope.config)
+            .map_err(|e| format!("cannot persist config replay protection: {e:#}"))?;
 
         debug!(%issued_at, "signed config verified");
         Ok(signed.envelope.config.clone())
@@ -561,6 +562,9 @@ impl ConfigVerifier {
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct IssuedAtRecord {
     issued_at: DateTime<Utc>,
+    // Optional only for migration from the original timestamp-only record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config: Option<AgentConfig>,
 }
 
 /// Persisted high-water mark of the most recent `issued_at` accepted, so a
@@ -571,29 +575,38 @@ struct IssuedAtStore {
 }
 
 impl IssuedAtStore {
-    fn load(path: &Path) -> Self {
-        let last = std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<IssuedAtRecord>(&b).ok())
-            .map(|r| r.issued_at);
-        Self {
+    fn load(path: &Path) -> Result<Self> {
+        let last = match std::fs::read(path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice::<IssuedAtRecord>(&bytes)
+                    .context("invalid config issued_at high-water mark")?
+                    .issued_at,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).context("cannot read config issued_at high-water mark"),
+        };
+        Ok(Self {
             path: path.to_path_buf(),
             last,
-        }
+        })
     }
 
     fn last(&self) -> Option<DateTime<Utc>> {
         self.last
     }
 
-    fn advance(&mut self, issued_at: DateTime<Utc>) {
+    fn advance(&mut self, issued_at: DateTime<Utc>, config: &AgentConfig) -> Result<()> {
+        anyhow::ensure!(
+            self.path.parent().is_some_and(Path::is_dir),
+            "config replay state directory is unavailable"
+        );
+        let bytes = serde_json::to_vec(&IssuedAtRecord {
+            issued_at,
+            config: Some(config.clone()),
+        })?;
+        crate::paths::write_atomic(&self.path, &bytes, 0o600)?;
         self.last = Some(issued_at);
-        let rec = IssuedAtRecord { issued_at };
-        if let Ok(bytes) = serde_json::to_vec(&rec) {
-            if let Err(e) = crate::paths::write_atomic(&self.path, &bytes, 0o600) {
-                warn!(error = %e, "cannot persist config issued_at high-water mark");
-            }
-        }
+        Ok(())
     }
 }
 
@@ -608,31 +621,45 @@ fn persisted_config_path() -> PathBuf {
     crate::paths::state_dir().join("agent_config.json")
 }
 
-/// Load the last verified config from disk, falling back to defaults. Loading
-/// the persisted config (rather than starting from defaults) is what makes the
-/// strictly-monotonic `issued_at` rule safe across restarts: the backend
-/// re-serves the *current* config with the same `issued_at` the agent already
-/// accepted, which the verifier correctly refuses as a replay — but because the
-/// agent already holds that config from disk, refusing the re-delivery does not
-/// strand it on compiled defaults.
-pub fn load_persisted() -> AgentConfig {
-    match std::fs::read(persisted_config_path()) {
-        Ok(bytes) => match serde_json::from_slice::<AgentConfig>(&bytes) {
-            Ok(cfg) => {
-                info!("Loaded last-known-good config from disk");
-                cfg
+/// Load the last accepted config and its replay state. The atomic watermark
+/// snapshot is authoritative; the separate cache is only a legacy fallback.
+/// Existing corrupt/unreadable state is an error, never permission to reset
+/// security policy to defaults. Only a fresh installation starts with defaults.
+pub fn load_persisted() -> Result<AgentConfig> {
+    load_persisted_from(&config_watermark_path(), &persisted_config_path())
+}
+
+fn load_persisted_from(watermark_path: &Path, cache_path: &Path) -> Result<AgentConfig> {
+    let has_watermark = match std::fs::read(watermark_path) {
+        Ok(bytes) => {
+            let record: IssuedAtRecord =
+                serde_json::from_slice(&bytes).context("invalid config replay state at startup")?;
+            if let Some(cfg) = record.config {
+                info!("Loaded last-known-good config from atomic replay state");
+                return Ok(cfg);
             }
-            Err(e) => {
-                warn!(error = %e, "persisted config is unreadable — using defaults");
-                AgentConfig::default()
-            }
-        },
-        Err(_) => AgentConfig::default(),
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e).context("cannot read config replay state at startup"),
+    };
+    match std::fs::read(cache_path) {
+        Ok(bytes) => {
+            anyhow::ensure!(
+                has_watermark,
+                "existing configuration has no replay watermark; refusing policy reset"
+            );
+            serde_json::from_slice(&bytes).context("invalid last-known-good config")
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !has_watermark => {
+            Ok(AgentConfig::default())
+        }
+        Err(e) => Err(e).context("cannot load last-known-good config; refusing policy reset"),
     }
 }
 
 /// Persist the accepted config to disk (`0600`, atomic). Best-effort: a failure
-/// here only costs us the last-known-good cache on the next restart.
+/// cannot lose the accepted policy: the watermark already contains its snapshot.
 fn persist_config(cfg: &AgentConfig) {
     match serde_json::to_vec(cfg) {
         Ok(bytes) => {
@@ -1079,6 +1106,108 @@ mod signed_config_tests {
         assert!(!serde_json::to_string(&config)
             .unwrap()
             .contains("user_response_notifications_enabled"));
+    }
+
+    #[test]
+    fn replay_state_rejects_corrupt_or_unreadable_watermark() {
+        let key = signing_key();
+        let (_, p, w) = verifier(&key, "agent-1");
+        std::fs::write(&w, b"not json").unwrap();
+        assert!(ConfigVerifier::new(&p, "agent-1".into(), &w).is_err());
+        std::fs::remove_file(&w).unwrap();
+        std::fs::create_dir(&w).unwrap();
+        assert!(ConfigVerifier::new(&p, "agent-1".into(), &w).is_err());
+        std::fs::remove_dir(&w).unwrap();
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn replay_state_rejects_failed_watermark_save_and_allows_retry_after_repair() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let signed = make_signed(&key, "agent-1", Utc::now());
+        std::fs::create_dir(&w).unwrap();
+        assert!(v.verify(&signed).is_err(), "unsaved watermark accepted");
+        std::fs::remove_dir(&w).unwrap();
+        assert!(v.verify(&signed).is_ok(), "failed save advanced watermark");
+        let mut restarted = ConfigVerifier::new(&p, "agent-1".into(), &w).unwrap();
+        assert!(
+            restarted.verify(&signed).is_err(),
+            "replay accepted after restart"
+        );
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn replay_state_watermark_keeps_accepted_config_for_restart() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let mut signed = make_signed(&key, "agent-1", Utc::now());
+        signed.envelope.config.poll_interval_secs = 321;
+        signed.signature = base64::engine::general_purpose::STANDARD.encode(
+            key.sign(&serde_json::to_vec(&signed.envelope).unwrap())
+                .to_bytes(),
+        );
+        assert!(v.verify(&signed).is_ok());
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&w).unwrap()).unwrap();
+        assert_eq!(
+            record["config"]["poll_interval_secs"], 321,
+            "accepted configuration must commit atomically with its watermark"
+        );
+        let cache = tmp("legacy-cache.json");
+        // Snapshot wins both when the old cache is absent and when it is stale.
+        assert_eq!(
+            load_persisted_from(&w, &cache).unwrap().poll_interval_secs,
+            321
+        );
+        std::fs::write(&cache, b"{}").unwrap();
+        assert_eq!(
+            load_persisted_from(&w, &cache).unwrap().poll_interval_secs,
+            321
+        );
+        std::fs::remove_file(cache).unwrap();
+        cleanup(p, w);
+    }
+
+    #[test]
+    fn replay_state_startup_migrates_legacy_cache_but_rejects_missing_or_corrupt_state() {
+        let w = tmp("watermark.json");
+        let cache = tmp("cache.json");
+        assert!(load_persisted_from(&w, &cache).is_ok());
+        std::fs::write(&w, br#"{"issued_at":"2020-01-01T00:00:00Z"}"#).unwrap();
+        assert!(load_persisted_from(&w, &cache).is_err());
+        std::fs::write(&cache, br#"{"poll_interval_secs":123}"#).unwrap();
+        assert_eq!(
+            load_persisted_from(&w, &cache).unwrap().poll_interval_secs,
+            123
+        );
+        std::fs::write(&w, b"broken").unwrap();
+        assert!(load_persisted_from(&w, &cache).is_err());
+        std::fs::remove_file(&w).unwrap();
+        std::fs::write(&cache, b"broken").unwrap();
+        assert!(load_persisted_from(&w, &cache).is_err());
+        cleanup(cache, w);
+    }
+
+    #[test]
+    fn replay_state_startup_rejects_cache_without_watermark() {
+        let w = tmp("missing-watermark.json");
+        let cache = tmp("orphan-cache.json");
+        std::fs::write(&cache, b"{}").unwrap();
+        assert!(
+            load_persisted_from(&w, &cache).is_err(),
+            "existing policy without its replay watermark must not reset protection"
+        );
+        cleanup(cache, w);
+    }
+
+    #[test]
+    fn replay_state_does_not_create_missing_watermark_parent() {
+        let parent = tmp("absent-state");
+        let mut store = IssuedAtStore::load(&parent.join("watermark.json")).unwrap();
+        assert!(store.advance(Utc::now(), &AgentConfig::default()).is_err());
+        assert!(!parent.exists());
     }
 
     #[test]

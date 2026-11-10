@@ -1840,8 +1840,8 @@ mod registry {
 
 /// Remove every honeytoken artifact this agent recorded as its own: the decoy
 /// files (including ones that left the config) and legacy registry values.
-pub fn uninstall(cfg: &AgentConfig) {
-    let _ = cfg; // Cleanup follows persisted ownership, including removed config paths.
+pub fn uninstall() {
+    // Cleanup follows persisted ownership, including removed config paths.
     let Ok(mut register) = deployments().lock() else {
         return;
     };
