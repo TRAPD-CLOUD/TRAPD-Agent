@@ -361,7 +361,7 @@ NoNewPrivileges=true
 # CAP_DAC_READ_SEARCH lets the (root) agent read root-owned/0640 logs such as
 # /var/log/auth.log and hash files under /home, /root for FIM (read-only).
 # CAP_KILL permits response signals to processes owned by other users.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE CAP_DAC_READ_SEARCH CAP_KILL
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_IPC_LOCK CAP_LINUX_IMMUTABLE CAP_DAC_READ_SEARCH CAP_KILL CAP_CHOWN CAP_FOWNER
 MemoryDenyWriteExecute=true
 LockPersonality=true
 RestrictRealtime=true

@@ -113,6 +113,52 @@ fn open_stored(dir: &File, name: &CStr) -> Result<File> {
         Err(error) => Err(error.into()),
     }
 }
+// Linux's on-disk POSIX ACL xattr is retained verbatim; no pathname lookup.
+fn access_acl(file: &File) -> Result<Option<Vec<u8>>> {
+    let mut bytes = vec![0u8; 65536];
+    let len = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"system.posix_acl_access".as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    };
+    if len < 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+            return Ok(None);
+        }
+        return Err(error).context("read original access ACL");
+    }
+    bytes.truncate(len as usize);
+    Ok(Some(bytes))
+}
+fn apply_acl(file: &File, acl: Option<&[u8]>) -> Result<()> {
+    let result = match acl {
+        Some(bytes) => unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                0,
+            )
+        },
+        None => unsafe {
+            libc::fremovexattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr())
+        },
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if acl.is_none() && matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+            return Ok(());
+        }
+        return Err(error).context("restore access ACL");
+    }
+    Ok(())
+}
+
 fn same(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
 }
@@ -307,6 +353,7 @@ fn quarantine_with_commit(
     let mut source = Captured::new(path)?;
     // Rename updates ctime; capture the metadata of the held object now.
     let meta = regular(&source.file)?;
+    let acl = access_acl(&source.file)?;
     let id = Uuid::new_v4();
     let stored = vault.join(format!("{id}.bin"));
     let mut prepared = Prepared::new(&mut source.file, &meta, &stored, 0, None)?;
@@ -320,6 +367,7 @@ fn quarantine_with_commit(
         uid: meta.uid(),
         gid: meta.gid(),
         security_descriptor: None,
+        access_acl: acl,
         quarantined_at: chrono::Utc::now(),
     };
     prepared.publish()?;
@@ -380,6 +428,9 @@ pub(super) fn restore_record(
     if prepared.sha != record.sha256 {
         bail!("quarantine content no longer matches its record");
     }
+    // Override any inherited default ACL before making the file reachable.
+    apply_acl(&prepared.file, record.access_acl.as_deref())?;
+    prepared.file.sync_all()?;
     prepared.publish()?;
     // Preserve both the stored object and its index on failure. The caller can
     // resolve the occupied restore destination and retry without losing bytes.
@@ -454,6 +505,94 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn sample_acl() -> Vec<u8> {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        // owner rw-, named user r--, owning group ---, mask r--, others ---.
+        for (tag, perm, id) in [
+            (1u16, 6u16, u32::MAX),
+            (2, 4, 12345),
+            (4, 0, u32::MAX),
+            (16, 4, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(perm.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        acl
+    }
+
+    #[test]
+    fn access_acl_survives_quarantine_without_exposing_the_vault() {
+        let dir = Sandbox::new();
+        fs::write(dir.path("payload"), b"sample").unwrap();
+        let acl = sample_acl();
+        apply_acl(&File::open(dir.path("payload")).unwrap(), Some(&acl)).unwrap();
+        let record = quarantine_at(
+            &dir.path("payload"),
+            &dir.path("vault"),
+            &dir.path("index.json"),
+        )
+        .unwrap();
+        assert_eq!(record.access_acl.as_deref(), Some(acl.as_slice()));
+        assert_eq!(fs::metadata(&record.stored_path).unwrap().mode() & 0o777, 0);
+        restore_at(&record.id, &dir.path("index.json")).unwrap();
+        assert_eq!(
+            access_acl(&File::open(dir.path("payload")).unwrap()).unwrap(),
+            Some(acl)
+        );
+        assert_eq!(
+            fs::metadata(dir.path("payload")).unwrap().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn restore_removes_inherited_acl_when_original_had_none() {
+        let dir = Sandbox::new();
+        let record = dir.quarantine();
+        let mut acl = sample_acl();
+        acl[6] = 7; // Directory owner needs search permission in inherited staging directories.
+        let parent = File::open(&dir.0).unwrap();
+        cvt(unsafe {
+            libc::fsetxattr(
+                parent.as_raw_fd(),
+                c"system.posix_acl_default".as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        })
+        .unwrap();
+        restore_at(&record.id, &dir.path("index.json")).unwrap();
+        assert!(access_acl(&File::open(dir.path("payload")).unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    #[ignore = "runs as root with only CHOWN and FOWNER in native service-capability acceptance"]
+    fn ownership_roundtrip_under_service_capabilities() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let dir = Sandbox::new();
+        fs::write(dir.path("payload"), b"sample").unwrap();
+        let file = File::open(dir.path("payload")).unwrap();
+        cvt(unsafe { libc::fchmod(file.as_raw_fd(), 0o644) }).unwrap();
+        cvt(unsafe { libc::fchown(file.as_raw_fd(), 12345, 12346) }).unwrap();
+        let record = quarantine_at(
+            &dir.path("payload"),
+            &dir.path("vault"),
+            &dir.path("index.json"),
+        )
+        .unwrap();
+        restore_at(&record.id, &dir.path("index.json")).unwrap();
+        let meta = fs::metadata(dir.path("payload")).unwrap();
+        assert_eq!(
+            (meta.uid(), meta.gid(), meta.mode() & 0o777),
+            (12345, 12346, 0o644)
+        );
     }
 
     #[test]

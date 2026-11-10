@@ -25,6 +25,8 @@ jobs:
       - run: cargo build --release --manifest-path agent/Cargo.toml
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Quarantine restore with service capabilities
+        run: bash agent/tests/native_linux_quarantine.sh
       # The optional YARA feature compiles a vendored libyara (needs libcrypto
       # headers for its hash module); build and test it so it cannot rot.
       - name: YARA feature (file + process-memory scanning)

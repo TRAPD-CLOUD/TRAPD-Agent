@@ -59,6 +59,9 @@ pub struct QuarantineRecord {
     /// Older records contain only a DACL and remain compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_descriptor: Option<String>,
+    /// Linux access ACL, stored separately from the mode-000 vault inode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_acl: Option<Vec<u8>>,
     pub quarantined_at: DateTime<Utc>,
 }
 
@@ -199,6 +202,7 @@ fn quarantine_inner(
         uid,
         gid,
         security_descriptor: original_security,
+        access_acl: None,
         quarantined_at: chrono::Utc::now(),
     };
 
@@ -886,6 +890,7 @@ fn place_restored(
         uid: attributes.1,
         gid: attributes.2,
         security_descriptor: None,
+        access_acl: None,
         quarantined_at: chrono::Utc::now(),
     };
     linux::restore_record(&record, || Ok(()))

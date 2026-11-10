@@ -47,10 +47,9 @@ Publish the new signed release assets before distributing the new installer.
 
 ## Verification
 
-- Full Linux workspace suite: 1,228 tests passed, 11 intentionally ignored.
+- Full Linux workspace suite: 1,230 tests passed, 12 intentionally ignored.
 - Linux workspace Clippy, all targets, warnings denied: passed.
-- Linux optimized release build passed on the original 0.7.2 baseline; the PR
-  is rebased onto 0.7.4 and its release build is also covered by CI.
+- Linux optimized release build passed locally and in CI on the 0.7.4 baseline.
 - Sixteen executable bootstrap tests: passed, including authentic statements
   from the Rust release signer, forged checksums, bad/missing signatures/keys,
   wrong platform/version, downgrade and unsafe trust-directory refusal.
@@ -71,3 +70,14 @@ Rebased onto `b104656` (0.7.4). The existing `prevention/linuxpin.rs` now owns
 the secure Linux transactions; protected OS/agent path checks and newer Windows
 response behavior are retained. Strict nonce-store loading supersedes the old
 in-memory corruption cutoff, so corrupt state rejects verifier construction.
+
+## PR review follow-up
+
+POSIX access ACLs are retained in the quarantine index separately from the
+mode-000 vault object and restored through the held destination descriptor before
+publication. A destination default ACL cannot add access absent from the original.
+The base Linux units include CAP_CHOWN and CAP_FOWNER so restoration can preserve
+non-root ownership; a network-isolated container test runs the real transaction
+with only those two capabilities. ACL round-trip and inherited-ACL tests cover the
+permission boundary. Debian/Ubuntu package fixtures use authentic Ed25519 releases;
+native honeytoken fixtures include the atomic config replay state.
