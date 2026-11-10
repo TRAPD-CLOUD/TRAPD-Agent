@@ -471,6 +471,7 @@ mod tests {
             name: name.into(),
             version: ver.into(),
             architecture: Some("amd64".into()),
+            product_code: None,
         }
     }
 

@@ -974,17 +974,19 @@ impl Engine {
                 self.cmd_update_policy(rules.clone(), &cmd_id).await;
             }
             CommandPayload::InstallPackage { name } => {
-                self.cmd_package(super::software::Operation::Install(name), &cmd_id);
+                self.cmd_package(super::software::Operation::Install(name), &cmd_id)
+                    .await;
             }
             CommandPayload::RemovePackage { name } => {
-                self.cmd_package(super::software::Operation::Remove(name), &cmd_id);
+                self.cmd_package(super::software::Operation::Remove(name), &cmd_id)
+                    .await;
             }
             CommandPayload::UpgradePackage { name } => {
                 let op = match name {
                     Some(n) => super::software::Operation::Upgrade(n),
                     None => super::software::Operation::UpgradeAll,
                 };
-                self.cmd_package(op, &cmd_id);
+                self.cmd_package(op, &cmd_id).await;
             }
             CommandPayload::DeployHoneytoken {
                 path,
@@ -1659,8 +1661,8 @@ impl Engine {
     }
 
     /// Run a software-management operation and audit the outcome.  Package work
-    /// shells out to the package manager (via an argv, no shell).
-    fn cmd_package(&self, op: super::software::Operation<'_>, cmd_id: &str) {
+    /// starts the package manager with an argv (no shell) and a deadline.
+    async fn cmd_package(&self, op: super::software::Operation<'_>, cmd_id: &str) {
         use super::software::Operation;
         use crate::schema::{EventAction, Severity};
 
@@ -1683,7 +1685,7 @@ impl Engine {
             ),
         };
 
-        let result = super::software::execute(op);
+        let result = super::software::execute(op).await;
         let severity = if result.success {
             Severity::Info
         } else {

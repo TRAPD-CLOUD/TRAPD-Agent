@@ -143,10 +143,20 @@ pub async fn run_script_bounded(
     timeout: std::time::Duration,
     cap: usize,
 ) -> ScriptRun {
-    use std::process::Stdio;
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::null())
+    cmd.args(args);
+    run_bounded(cmd, timeout, cap).await
+}
+
+/// Run a prepared command with bounded output and a hard deadline. See
+/// [`run_script_bounded`]; this form lets the caller fix the environment.
+pub async fn run_bounded(
+    mut cmd: tokio::process::Command,
+    timeout: std::time::Duration,
+    cap: usize,
+) -> ScriptRun {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
