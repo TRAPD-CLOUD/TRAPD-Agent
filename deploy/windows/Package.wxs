@@ -124,7 +124,13 @@
     <!-- MSI owns service registration. Remove persistent containment and
          decoys after StopServices, before DeleteServices; upgrades preserve both. -->
     <CustomAction Id="CleanupDecoys" FileRef="AgentExe" ExeCommand="cleanup" Execute="deferred" Impersonate="no" Return="check" />
+    <!-- Reset the binary integrity record explicitly. RemoveFile on the component
+         did not fire during a real 0.7.4 -> 0.7.5 upgrade (issue #153), and the
+         agent then refused its own replacement. Runs on install and upgrade
+         (not on removal), after the new files exist and before StartServices. -->
+    <CustomAction Id="ResetBinaryBaselineAction" FileRef="AgentExe" ExeCommand="reset-baseline" Execute="deferred" Impersonate="no" Return="check" />
     <InstallExecuteSequence>
+      <Custom Action="ResetBinaryBaselineAction" After="InstallFiles" Condition="NOT REMOVE" />
       <Custom Action="CleanupDecoys" Before="DeleteServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
     <Feature Id="Agent" Title="TRAPD Agent" Level="1">
