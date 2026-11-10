@@ -17,11 +17,11 @@ use crate::collectors::system::SystemCollector;
 use crate::collectors::windows::honeytokens::HoneytokenCollector;
 
 use crate::collectors::windows::users::UserSessionCollector;
-use crate::collectors::Collector;
 use crate::config::{self, AgentConfig, ConfigPuller};
 use crate::heartbeat::Heartbeat;
 use crate::output::OutputMode;
 use crate::pipeline::{self, create_pipeline, Spool};
+use crate::telemetry::rotating_log::{self, RotatingFile};
 use crate::transport::Transport;
 use crate::{env_truthy, load_or_create_device_id, paths};
 
@@ -38,14 +38,16 @@ pub fn init_tracing_stderr() {
 }
 
 /// A service has no console, so logs go to `<log_dir>\agent.log` (the NDJSON
-/// event log is a separate file, written by [`crate::output`]).
+/// event log is a separate file, written by [`crate::output`]). The file is
+/// size-rotated so a long-running service cannot fill the disk.
 pub fn init_tracing_file() {
     let path = paths::log_dir().join("agent.log");
     let _ = std::fs::create_dir_all(paths::log_dir());
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path);
+    let file = RotatingFile::open(
+        &path,
+        rotating_log::DEFAULT_MAX_BYTES,
+        rotating_log::DEFAULT_KEEP,
+    );
     match file {
         Ok(f) => {
             let writer = SharedFile(Arc::new(Mutex::new(f)));
@@ -59,13 +61,14 @@ pub fn init_tracing_file() {
                 .init();
         }
         // Nowhere to log *that* logging failed; fall back to (invisible)
-        // stderr so `tracing` macros stay safe to call.
+        // stderr so `tracing` macros stay safe to call. Fatal service errors
+        // still reach the Application event log.
         Err(_) => init_tracing_stderr(),
     }
 }
 
 #[derive(Clone)]
-struct SharedFile(Arc<Mutex<std::fs::File>>);
+struct SharedFile(Arc<Mutex<RotatingFile>>);
 
 impl std::io::Write for SharedFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -88,6 +91,17 @@ impl std::io::Write for SharedFile {
 /// process environment. On Linux systemd's `EnvironmentFile=` does this before
 /// the agent starts; the SCM has no equivalent, so the agent reads the same
 /// file format itself. Existing process/machine environment wins.
+/// Apply `agent.env` and the MSI registry configuration to the process
+/// environment.
+///
+/// `std::env::set_var` is not thread-safe against concurrent environment
+/// reads. Call this exactly once, on the entry thread, **before** the Tokio
+/// runtime (and any other thread that reads the environment) exists.
+pub fn load_config_env() {
+    load_env_file();
+    load_msi_config();
+}
+
 fn load_env_file() {
     let path = paths::config_dir().join("agent.env");
     let Ok(contents) = std::fs::read_to_string(&path) else {
@@ -107,6 +121,62 @@ fn load_env_file() {
         }
     }
     info!(path = %path.display(), "loaded agent.env");
+}
+
+/// Drop `TRAPD_ENROLL_TOKEN=` lines from `agent.env` content. Returns the
+/// scrubbed text, or `None` when there was nothing to remove.
+fn scrub_enroll_token(contents: &str) -> Option<String> {
+    let is_token = |line: &str| {
+        line.trim()
+            .split_once('=')
+            .is_some_and(|(k, _)| k.trim() == "TRAPD_ENROLL_TOKEN")
+    };
+    if !contents.lines().any(is_token) {
+        return None;
+    }
+    let mut out: String = contents
+        .lines()
+        .filter(|l| !is_token(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push('\n');
+    Some(out)
+}
+
+/// A one-time token left in `agent.env` is a standing secret once credentials
+/// exist. Rewrite the file without it (temp file + rename in the same, private
+/// directory).
+fn purge_env_file_enroll_token() {
+    let path = paths::config_dir().join("agent.env");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Some(scrubbed) = scrub_enroll_token(&contents) else {
+        return;
+    };
+    let tmp = path.with_extension("env.tmp");
+    let result = std::fs::write(&tmp, scrubbed).and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&tmp);
+        warn!(%error, "could not remove the enrollment token from agent.env");
+    }
+}
+
+/// Remove the MSI-staged enrollment token from HKLM once it is no longer
+/// needed (credentials exist). A token left there is a standing secret and the
+/// registry value would also be re-read on every start.
+fn purge_staged_enroll_token() {
+    use crate::collectors::windows::registry;
+    use windows_sys::Win32::System::Registry::KEY_WOW64_64KEY;
+    purge_env_file_enroll_token();
+    if let Err(status) =
+        registry::delete_value("SOFTWARE\\TRAPD\\Agent", "EnrollToken", KEY_WOW64_64KEY)
+    {
+        warn!(
+            status,
+            "could not delete the staged enrollment token from the registry"
+        );
+    }
 }
 
 fn load_msi_config() {
@@ -155,10 +225,16 @@ async fn reconcile_pending_firewall_expiry() -> Vec<crate::prevention::winfirewa
 
 /// Run the agent until `stop` fires (SCM stop/shutdown or Ctrl-C in console
 /// mode) or the event pipeline closes.
-pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Result<()> {
-    load_env_file();
-    load_msi_config();
+///
+/// `on_ready` runs once start-up is past the self-integrity check (the point
+/// where the service may report `SERVICE_RUNNING`). Environment configuration
+/// must already be loaded via [`load_config_env`].
+pub async fn run_agent(
+    mut stop: tokio::sync::mpsc::UnboundedReceiver<()>,
+    on_ready: impl FnOnce(),
+) -> Result<()> {
     paths::init_state_dir();
+    crate::selfprotect::process_mitigation::apply();
     // Include startup recovery and pending enrollment in this process run.
     crate::heartbeat::lifecycle::begin_process();
 
@@ -178,6 +254,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         }
         return Err(e);
     }
+    on_ready();
 
     // Expired rules may be what prevents enrollment reaching the backend.
     // Recover before ANY backend request, including pending pairing.
@@ -224,7 +301,9 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
             loop {
                 tokio::select! {
                     creds = &mut enrollment => {
-                        break creds.context("Failed to obtain agent credentials")?;
+                        let creds = creds.context("Failed to obtain agent credentials")?;
+                        purge_staged_enroll_token();
+                        break creds;
                     }
                     _ = expiry_tick.tick() => { startup_expired.extend(reconcile_pending_firewall_expiry().await); },
                     _ = stop.recv() => {
@@ -337,32 +416,49 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         }));
     }
 
-    macro_rules! spawn_collector {
-        ($collector:expr) => {{
-            let mut c = $collector;
+    // Every collector runs under the generic supervisor: an error exit is
+    // counted, shown in coverage and followed by a capped exponential-backoff
+    // restart. `spawn_collector_once!` only observes (SensorSupervisor owns its
+    // restart logic).
+    macro_rules! spawn_supervised {
+        ($collector:expr, $restart:expr) => {{
+            let c = $collector;
             let tx2 = tx.clone();
             let aid = agent_id.clone();
             let host = hostname.clone();
-            let cname = c.name();
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = c.run(tx2, aid, host).await {
-                    crate::telemetry::metrics::metrics().collector_failed();
-                    if cname == "WindowsProcessCollector" {
-                        crate::telemetry::metrics::metrics()
-                            .set_collector_mode(crate::telemetry::metrics::CollectorMode::Failed);
-                    }
-                    error!("{cname} exited with error: {e:#}");
-                }
-            }));
+            handles.push(tokio::spawn(crate::collectors::supervisor::supervise(
+                c,
+                tx2,
+                aid,
+                host,
+                crate::collectors::supervisor::RestartPolicy::default(),
+                $restart,
+            )));
         }};
+    }
+    macro_rules! spawn_collector {
+        ($collector:expr) => {
+            spawn_supervised!($collector, true)
+        };
+    }
+    macro_rules! spawn_collector_once {
+        ($collector:expr) => {
+            spawn_supervised!($collector, false)
+        };
     }
 
     spawn_collector!(SystemCollector::new());
-    spawn_collector!(
+    spawn_collector_once!(
         crate::collectors::windows::sensor_supervisor::SensorSupervisor::new(Arc::clone(
             &agent_config
         ))
     );
+    // Runtime self-protection: periodic binary recheck and a health watchdog
+    // over the liveness beats (consumer, event log, ETW).
+    spawn_collector!(crate::selfprotect::runtime_guard::BinaryIntegrityMonitor);
+    handles.push(tokio::spawn(
+        crate::selfprotect::runtime_guard::run_health_watchdog(),
+    ));
     spawn_collector!(UserSessionCollector::new());
     spawn_collector!(
         crate::collectors::windows::eventlog::EventLogCollector::new(
@@ -418,11 +514,15 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     let mode = output_mode;
     let prev_tx = prev_event_tx.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    crate::telemetry::liveness::expect("pipeline_consumer", std::time::Duration::from_secs(180));
     let mut consumer = tokio::spawn(async move {
         let mut checkpoints = crate::detection::CheckpointTracker::default();
         let mut shutting_down = false;
         let mut batch = Vec::with_capacity(crate::pipeline::MAX_BATCH);
         loop {
+            // Idle wake-ups come from `flush_tick` (30 s), so a missing beat
+            // means the consumer is stuck inside event handling.
+            crate::telemetry::liveness::beat("pipeline_consumer");
             tokio::select! {
                 _ = &mut shutdown_rx, if !shutting_down => {
                     rx.close();
@@ -544,4 +644,22 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
     crate::heartbeat::lifecycle::mark_clean_shutdown();
     info!("Shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scrub_enroll_token;
+
+    #[test]
+    fn enroll_token_line_is_removed_and_the_rest_kept() {
+        let input = "# c\nRUST_LOG=info\n TRAPD_ENROLL_TOKEN = abc\nTRAPD_BACKEND_URL=https://x\n";
+        let out = scrub_enroll_token(input).unwrap();
+        assert_eq!(out, "# c\nRUST_LOG=info\nTRAPD_BACKEND_URL=https://x\n");
+        assert!(!out.contains("abc"));
+    }
+
+    #[test]
+    fn nothing_to_scrub_returns_none() {
+        assert!(scrub_enroll_token("RUST_LOG=info\n# TRAPD_ENROLL_TOKEN=x\n").is_none());
+    }
 }

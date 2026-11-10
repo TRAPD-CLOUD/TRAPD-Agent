@@ -40,12 +40,11 @@ use crate::collectors::etw_map::{self, DeviceMap, EtwRecord, EtwValue, ProcessEn
 use crate::collectors::Collector;
 use crate::schema::{AgentEvent, EventAction, EventClass, EventData, Severity};
 use crate::telemetry::coverage;
+use crate::telemetry::image_hash::{self, HashOutcome};
 
 const SESSION_NAME: &str = "TRAPD-Agent";
 /// Cap on a single property's decoded size (defensive).
 const MAX_PROP_BYTES: usize = 64 * 1024;
-const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_HASH_CACHE: usize = 4096;
 
 /// Shared sink the C callback writes decoded records into, drained by the async
 /// side. A plain channel keeps the `unsafe extern "system"` callback tiny.
@@ -116,30 +115,41 @@ impl Collector for EtwCollector {
             .set_collector_mode(crate::telemetry::metrics::CollectorMode::WindowsEtw);
 
         let mut state = DecodeState::new();
-        // Callback handoff is bounded; native waits and enrichment never block Tokio.
+        // The loop below wakes at least once a second, so a long silence means
+        // it is blocked (full pipeline or a hung decode).
+        crate::telemetry::liveness::expect(self.name(), std::time::Duration::from_secs(120));
+        // Records are decoded in batches: one blocking task per batch instead of
+        // one per record, with the decode state moved in and out once. Order is
+        // preserved (a batch is decoded sequentially, batches are sequential).
+        let mut batch: Vec<EtwRecord> = Vec::with_capacity(DECODE_BATCH);
         loop {
-            let rec = tokio::select! {
-                record = rec_rx.recv() => match record { Some(r) => r, None => break },
+            crate::telemetry::liveness::beat("WindowsEtwCollector");
+            batch.clear();
+            tokio::select! {
+                n = rec_rx.recv_many(&mut batch, DECODE_BATCH) => if n == 0 { break },
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                     if trace_thread.is_finished() { break; }
                     continue;
                 }
                 _ = tx.closed() => return Ok(()),
-            };
+            }
             let aid = agent_id.clone();
             let host = hostname.clone();
-            let (next_state, events) = tokio::task::spawn_blocking(move || {
-                let events = state.map(&rec, &aid, &host);
-                (state, events)
+            let records = std::mem::take(&mut batch);
+            let (next_state, recycled, events) = tokio::task::spawn_blocking(move || {
+                let events = map_batch(&mut state, &records, &aid, &host);
+                (state, records, events)
             })
             .await?;
             state = next_state;
+            batch = recycled;
             for event in events {
                 if tx.send(event).await.is_err() {
                     return Ok(());
                 }
             }
         }
+        crate::telemetry::liveness::forget("WindowsEtwCollector");
         // The session stopped: either we are shutting down, or something (a
         // tampering actor stopping the logger, a provider reset) killed it.
         coverage::update(|c| c.etw_session = Some(false));
@@ -168,6 +178,22 @@ impl Collector for EtwCollector {
             .await;
         Err(anyhow!("ETW session ended"))
     }
+}
+
+/// Records decoded per blocking task.
+const DECODE_BATCH: usize = 256;
+
+/// Decode `records` in order with one shared state.
+fn map_batch(
+    state: &mut DecodeState,
+    records: &[EtwRecord],
+    agent_id: &str,
+    hostname: &str,
+) -> Vec<AgentEvent> {
+    records
+        .iter()
+        .flat_map(|rec| state.map(rec, agent_id, hostname))
+        .collect()
 }
 
 /// Owns the controller + consumer handles and the enabled providers.
@@ -559,7 +585,6 @@ fn guid_to_u128(g: &GUID) -> u128 {
 /// handle keeps the exited process object alive in the kernel.
 struct DecodeState {
     devices: DeviceMap,
-    hash_cache: HashMap<String, (u64, Option<std::time::SystemTime>, String)>,
     /// pid → image path, so a network/DNS event can name its process.
     proc_images: HashMap<i32, (String, u64)>,
 }
@@ -568,7 +593,6 @@ impl DecodeState {
     fn new() -> Self {
         Self {
             devices: device_map(),
-            hash_cache: HashMap::new(),
             proc_images: HashMap::new(),
         }
     }
@@ -811,35 +835,19 @@ impl DecodeState {
             (!c.is_empty()).then_some(c)
         };
         let username = crate::telemetry::identity::windows_process_account(pid);
-        let exe_sha256 = exe.as_deref().and_then(|e| self.exe_sha256(e));
+        // Runs inside `spawn_blocking` (see the decode loop), so the streaming
+        // hash never occupies an async worker.
+        let hash = exe
+            .as_deref()
+            .map(|e| image_hash::hash_image(std::path::Path::new(e)))
+            .unwrap_or(HashOutcome::NoPath);
         ProcessEnrichment {
             exe,
             cmdline,
             username,
-            exe_sha256,
+            exe_sha256: hash.digest().map(str::to_owned),
+            exe_sha256_error: hash.failure(),
         }
-    }
-
-    fn exe_sha256(&mut self, path: &str) -> Option<String> {
-        let meta = std::fs::metadata(path).ok()?;
-        if !meta.is_file() || meta.len() > MAX_HASH_BYTES {
-            return None;
-        }
-        let modified = meta.modified().ok();
-        if let Some((len, mtime, hash)) = self.hash_cache.get(path) {
-            if modified.is_some() && *len == meta.len() && *mtime == modified {
-                return Some(hash.clone());
-            }
-        }
-        let digest =
-            crate::paths::bounded_regular_sha256_label(std::path::Path::new(path), MAX_HASH_BYTES)
-                .ok()?;
-        if self.hash_cache.len() >= MAX_HASH_CACHE {
-            self.hash_cache.clear();
-        }
-        self.hash_cache
-            .insert(path.to_string(), (meta.len(), modified, digest.clone()));
-        Some(digest)
     }
 }
 
@@ -868,6 +876,14 @@ pub(super) fn device_map() -> DeviceMap {
 #[cfg(test)]
 mod native_tests {
     use super::*;
+
+    #[test]
+    fn batch_of_unrelated_records_decodes_to_nothing() {
+        let mut state = DecodeState::new();
+        let records = vec![EtwRecord::default(), EtwRecord::default()];
+        assert!(map_batch(&mut state, &records, "agent", "host").is_empty());
+        assert!(map_batch(&mut state, &[], "agent", "host").is_empty());
+    }
 
     #[test]
     fn tdh_filetime_preserves_create_time_generation() {

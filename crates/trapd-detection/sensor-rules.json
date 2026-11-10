@@ -99,6 +99,15 @@
   "technique": "T1562.002"
  },
  {
+  "id": "selfprotect.binary_modified",
+  "base": "high",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.001"
+ },
+ {
   "id": "rootkit.",
   "base": "medium",
   "max": "critical",

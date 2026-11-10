@@ -1,0 +1,51 @@
+# Manual, opt-in acceptance of an already-built MSI on a real Windows VM.
+#
+# Not part of push/PR CI: the "Windows MSI" job in ci.yml already runs
+# deploy/windows/test-msi.ps1 on a GitHub-hosted runner. This one is for a
+# self-hosted, disposable VM (e.g. a different Windows build, Defender and
+# third-party firewall installed, BFE stopped) where the hosted runner is not
+# representative. The VM must be reverted to a clean snapshot after each run:
+# the script installs, upgrades and uninstalls the service on the host.
+# NOTE: test-msi.ps1 expects the generic MSI; if the repository variables for
+# the hosted flavour are set, the release artifact is the hosted one and the
+# "no backend contact" assertion will not hold.
+name: Windows VM smoke test
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Run of the CI workflow whose "trapd-windows-release" artifact to test
+        required: true
+      runner_label:
+        description: Label of the self-hosted Windows runner
+        required: true
+        default: windows-vm
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, windows, "${{ inputs.runner_label }}"]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: trapd-windows-release
+          path: dist
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+      # test-msi.ps1 additionally needs python + cryptography (pinned as in
+      # windows-package.yml) to sign test configuration.
+      - name: Install acceptance dependency
+        run: python -m pip install cryptography==44.0.3
+      - name: Install MSI and verify telemetry and lifecycle
+        run: ./deploy/windows/test-msi.ps1 -Msi dist/trapd-agent-windows-x86_64.msi -AgentExe dist/trapd-agent-windows-x86_64.exe
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-vm-smoke-results
+          path: msi-test-results/

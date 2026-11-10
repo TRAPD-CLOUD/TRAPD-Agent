@@ -131,6 +131,9 @@ pub struct ProcessEnrichment {
     pub cmdline: Option<String>,
     pub username: Option<String>,
     pub exe_sha256: Option<String>,
+    /// Why `exe_sha256` is absent although an image path was known
+    /// (oversize / unreadable); recorded in the event's enrichment errors.
+    pub exe_sha256_error: Option<crate::telemetry::EnrichmentError>,
 }
 
 impl ProcessEnrichment {
@@ -141,11 +144,19 @@ impl ProcessEnrichment {
         fn pick(a: Option<String>, b: Option<String>) -> Option<String> {
             a.filter(|v| !v.is_empty()).or(b.filter(|v| !v.is_empty()))
         }
+        let exe_sha256 = pick(self.exe_sha256, fallback.exe_sha256);
+        // A failure only matters while no hash was obtained from either side.
+        let exe_sha256_error = if exe_sha256.is_some() {
+            None
+        } else {
+            self.exe_sha256_error.or(fallback.exe_sha256_error)
+        };
         ProcessEnrichment {
             exe: pick(self.exe, fallback.exe),
             cmdline: pick(self.cmdline, fallback.cmdline),
             username: pick(self.username, fallback.username),
-            exe_sha256: pick(self.exe_sha256, fallback.exe_sha256),
+            exe_sha256,
+            exe_sha256_error,
         }
     }
 }
@@ -189,6 +200,9 @@ pub fn process_start(
         // is still recorded (Security 4688 can still supply the command line
         // to detection).
         notes.fail("cmdline", crate::telemetry::EnrichmentError::IoError);
+    }
+    if let Some(cause) = enrich.exe_sha256_error {
+        notes.fail("exe_sha256", cause);
     }
     let username = enrich.username.unwrap_or_else(|| "unknown".into());
     if username == "unknown" {
@@ -588,6 +602,23 @@ mod tests {
         assert!(p.cmdline.is_empty());
         assert_eq!(p.username, "unknown");
 
+        // An image that could not be hashed is recorded, not silently omitted.
+        let p = process_start(
+            &r,
+            &devices(),
+            ProcessEnrichment {
+                cmdline: Some("x".into()),
+                exe_sha256_error: Some(crate::telemetry::EnrichmentError::Unsupported),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(p.exe_sha256.is_none());
+        assert_eq!(
+            p.enrichment.enrichment_errors["exe_sha256"],
+            crate::telemetry::EnrichmentError::Unsupported
+        );
+
         // Aliases of older builds.
         let old = rec(
             KERNEL_PROCESS,
@@ -848,6 +879,7 @@ mod tests {
             cmdline: Some("stale".into()),
             username: Some("CORP\\anna".into()),
             exe_sha256: Some("sha256:ab".into()),
+            ..Default::default()
         };
         let m = early.prefer_over(late);
         assert_eq!(m.cmdline.as_deref(), Some("reg add HKCU\\x"));

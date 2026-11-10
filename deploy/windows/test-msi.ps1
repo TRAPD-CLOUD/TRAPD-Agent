@@ -147,6 +147,12 @@ try {
             if ($rule.AccessControlType -eq 'Allow' -and $sid -notin @('S-1-5-18', 'S-1-5-32-544')) { throw "Unexpected secret ACL on $item : $sid" }
         }
     }
+    # The one-time token must be gone from the registry once enrollment succeeded.
+    if ($null -ne (Get-ItemProperty 'HKLM:\SOFTWARE\TRAPD\Agent' -Name EnrollToken -ErrorAction SilentlyContinue)) { throw 'Enrollment token survived enrollment in the registry.' }
+    # Hardened service DACL: administrators may start/stop but not rewrite the DACL or owner.
+    $serviceSd = (& "$env:SystemRoot\System32\sc.exe" sdshow trapd-agent) -join ''
+    if ($serviceSd -notmatch '\(A;;[A-Z]+;;;BA\)') { throw "Service DACL has no Administrators entry: $serviceSd" }
+    if ($serviceSd -match '\(A;;[A-Z]*(WD|WO)[A-Z]*;;;BA\)') { throw "Administrators can change the service DACL: $serviceSd" }
     # Allow configuration reload to re-arm the file watcher before triggering it.
     Start-Sleep -Seconds 6
     $marker = Join-Path $watch 'sample.txt'
