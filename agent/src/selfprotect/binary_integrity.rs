@@ -311,6 +311,34 @@ fn check_baseline(exe: &Path, hash_file: &Path, hash_str: &str, signed: bool) ->
     Ok(())
 }
 
+/// Installer step (`trapd-agent reset-baseline`): forget the recorded digest and
+/// the signature that belongs to it, so the next start records the new binary.
+///
+/// The MSI already declares `RemoveFile` for both files, but a field upgrade
+/// (0.7.4 -> 0.7.5, issue #153) left the old baseline in place and the service
+/// crash-looped. A deferred custom action does not depend on how Windows
+/// Installer decides a component's state, so the reset no longer relies on it.
+/// The release trust anchor (`release_signing.pub`) is never touched. Deleting
+/// these files needs the rights the elevated installer has; it grants nothing
+/// an administrator did not already have.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn reset_baseline() -> Result<()> {
+    reset_baseline_in(paths::config_dir())
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn reset_baseline_in(config_dir: &Path) -> Result<()> {
+    for name in ["binary.sha256", "binary.sig"] {
+        let path = config_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(path = %path.display(), "removed integrity record"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
+        }
+    }
+    Ok(())
+}
+
 fn write_baseline(hash_file: &Path, hash_str: &str) -> Result<()> {
     // Shared atomic writer (temp sibling, then rename) at mode 0600: a crash
     // mid-write can never leave a half-written baseline that would trigger a
@@ -614,5 +642,26 @@ mod tests {
         assert_eq!(backoff(1_000_000), Duration::from_secs(15 * 60));
         fx.run(b"old", None).unwrap();
         assert!(!fx.guard().exists());
+    }
+
+    #[test]
+    fn reset_removes_baseline_and_signature_but_keeps_the_trust_anchor() {
+        let fx = Fx::new();
+        let config = fx.root.join("config");
+        for name in [
+            "binary.sha256",
+            "binary.sig",
+            "release_signing.pub",
+            "agent.env",
+        ] {
+            std::fs::write(config.join(name), b"x").unwrap();
+        }
+        reset_baseline_in(&config).unwrap();
+        assert!(!config.join("binary.sha256").exists());
+        assert!(!config.join("binary.sig").exists());
+        assert!(config.join("release_signing.pub").exists());
+        assert!(config.join("agent.env").exists());
+        // Nothing to remove is not an error: the installer also runs on a first install.
+        reset_baseline_in(&config).unwrap();
     }
 }

@@ -63,6 +63,9 @@ pub fn entry() -> Result<()> {
             crate::paths::init_state_dir();
             crate::update::run_apply_helper()
         }
+        // Run by the MSI after the new files are in place and before the service
+        // starts: the replaced binary must record a fresh baseline.
+        Some("reset-baseline") => crate::selfprotect::binary_integrity::reset_baseline(),
         // MSI custom actions: installer-owned, reversible audit settings so that
         // 4688 carries command lines (field test F3).
         Some("audit-baseline") => {

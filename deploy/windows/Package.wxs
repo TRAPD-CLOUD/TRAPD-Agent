@@ -159,13 +159,19 @@
          MpsSvc) or delete the TRAPD rule group manually, then repeat the
          removal; the cause is in C:\ProgramData\TRAPD\logs\agent.log. -->
     <CustomAction Id="CleanupDecoys" FileRef="AgentExe" ExeCommand="cleanup" Execute="deferred" Impersonate="no" Return="check" />
+    <!-- Reset the binary integrity record explicitly. RemoveFile on the component
+         did not fire during a real 0.7.4 -> 0.7.5 upgrade (issue #153), and the
+         agent then refused its own replacement. Runs on install and upgrade
+         (not on removal), after the new files exist and before StartServices. -->
+    <CustomAction Id="ResetBinaryBaselineAction" FileRef="AgentExe" ExeCommand="reset-baseline" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="ApplyAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline apply" Execute="deferred" Impersonate="no" Return="ignore" />
     <!-- A failed install transaction must not leave audit policy changed: the
          rollback action undoes only what ApplyAuditBaseline added in this run. -->
     <CustomAction Id="RollbackAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline rollback" Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="RestoreAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline restore" Execute="deferred" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
-      <Custom Action="RollbackAuditBaseline" After="InstallFiles" Condition="AUDITBASELINE&lt;&gt;&quot;0&quot; AND NOT REMOVE" />
+      <Custom Action="ResetBinaryBaselineAction" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="RollbackAuditBaseline" After="ResetBinaryBaselineAction" Condition="AUDITBASELINE&lt;&gt;&quot;0&quot; AND NOT REMOVE" />
       <Custom Action="ApplyAuditBaseline" After="RollbackAuditBaseline" Condition="AUDITBASELINE&lt;&gt;&quot;0&quot; AND NOT REMOVE" />
       <Custom Action="RestoreAuditBaseline" Before="DeleteServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="CleanupDecoys" Before="DeleteServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
