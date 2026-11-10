@@ -74,19 +74,6 @@ impl QuarantineIndex {
 }
 
 /// Quarantine a file.  Returns the record (also persisted to the index).
-pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
-    #[cfg(windows)]
-    {
-        // An explicitly signed operator target may use aliases. Resolve them
-        // before pinning; automatic-only OS exclusions do not apply here.
-        let resolved = fs::canonicalize(path).context("resolve signed quarantine target")?;
-        let mut source = super::winquarantine::Source::pin(&resolved)?;
-        quarantine_inner(&resolved, Some(&mut source))
-    }
-    #[cfg(not(windows))]
-    quarantine_inner(path)
-}
-
 /// Windows copies a fresh object to revoke even previously granted source
 /// handles. Bound primary + alternate data streams before hashing/copying so
 /// sparse or enormous files cannot exhaust the state volume or stall collection.
@@ -105,22 +92,24 @@ pub(super) fn checked_windows_copy_size(sizes: impl IntoIterator<Item = u64>) ->
     Ok(total)
 }
 
-/// Automatic targets are untrusted. Windows retains all source/parent handles
-/// through validation and copying so a junction or leaf replacement cannot
-/// redirect privileged file operations after canonicalization.
-pub fn quarantine_automatic(path: &Path) -> Result<QuarantineRecord> {
+/// Every target is untrusted, whether a detection or a signed operator command
+/// named it: OS and agent locations are refused on both paths. Windows retains
+/// all source/parent handles through validation and copying so a junction or
+/// leaf replacement cannot redirect privileged file operations.
+pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
+    let text = path.to_str().context("quarantine target is not Unicode")?;
     #[cfg(windows)]
     {
         let mut source = super::winquarantine::Source::pin(path)?;
-        let validated = super::response::validated_quarantine_path(
-            path.to_str().context("quarantine target is not Unicode")?,
-        )
-        .context("automatic quarantine target is protected or invalid")?;
+        let validated = super::response::validated_quarantine_path(text)
+            .context("quarantine target is protected or invalid")?;
         quarantine_inner(Path::new(&validated), Some(&mut source))
     }
     #[cfg(not(windows))]
     {
-        quarantine_inner(path)
+        let validated = super::response::validated_quarantine_path(text)
+            .context("quarantine target is protected or invalid")?;
+        quarantine_inner(Path::new(&validated))
     }
 }
 
@@ -131,6 +120,11 @@ fn quarantine_inner(
     if !path.exists() {
         bail!("quarantine target does not exist: {}", path.display());
     }
+    #[cfg(target_os = "linux")]
+    let pinned = super::linuxpin::PinnedFile::pin(path)?;
+    #[cfg(target_os = "linux")]
+    let meta = pinned.file.metadata().context("stat target")?;
+    #[cfg(not(target_os = "linux"))]
     let meta = fs::metadata(path).context("stat target")?;
     if !meta.is_file() {
         bail!("not a regular file: {}", path.display());
@@ -143,6 +137,9 @@ fn quarantine_inner(
     #[cfg(not(unix))]
     let (mode, uid, gid) = (0u32, 0u32, 0u32);
 
+    #[cfg(target_os = "linux")]
+    let sha = sha256_read(&pinned.file)?;
+    #[cfg(not(target_os = "linux"))]
     let sha = sha256_of(path)?;
     let original_security = capture_security(path)?;
 
@@ -168,7 +165,9 @@ fn quarantine_inner(
     } else {
         move_into_quarantine(path, &stored, &original_security)?;
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    pinned.move_to(&stored).and_then(|()| lock_down(&stored))?;
+    #[cfg(not(any(windows, target_os = "linux")))]
     move_into_quarantine(path, &stored, &original_security)?;
 
     let record = QuarantineRecord {
@@ -221,14 +220,14 @@ pub fn restore(quarantine_id: &Uuid) -> Result<QuarantineRecord> {
     let stored = Path::new(&record.stored_path);
     let original = Path::new(&record.original_path);
 
-    unlock(stored);
+    place_restored(
+        stored,
+        original,
+        &record.sha256,
+        (record.mode, record.uid, record.gid),
+    )?;
 
-    if let Some(parent) = original.parent() {
-        fs::create_dir_all(parent).ok();
-    }
-
-    move_or_copy(stored, original)?;
-
+    #[cfg(windows)]
     if let Err(error) = restore_attributes(original, &record) {
         // Preserve the indexed stored location when original security cannot be
         // restored. The index has not yet been removed on disk.
@@ -245,8 +244,75 @@ pub fn restore(quarantine_id: &Uuid) -> Result<QuarantineRecord> {
     Ok(record)
 }
 
+/// Compare resolved paths, ignoring the Windows verbatim prefix that records
+/// written by earlier agent versions may carry.
+fn same_directory(a: &str, b: &str) -> bool {
+    let plain = |path: &'_ str| {
+        path.strip_prefix(r"\\?\")
+            .map(str::to_owned)
+            .unwrap_or_else(|| path.to_owned())
+    };
+    plain(a) == plain(b)
+}
+
+/// Put a quarantined file back only if it is still the file that was taken and
+/// nothing has appeared in its place. On failure it stays locked in quarantine.
+/// Linux sets `attributes` (mode, uid, gid) while the file is still in the
+/// root-only vault: done after the move, by path, a user who owns the restore
+/// directory could swap in a symlink and have root chown its target.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn place_restored(
+    stored: &Path,
+    original: &Path,
+    sha256: &str,
+    attributes: (u32, u32, u32),
+) -> Result<()> {
+    if original.symlink_metadata().is_ok() {
+        bail!("restore target already exists: {}", original.display());
+    }
+    unlock(stored);
+    let placed = (|| {
+        if sha256_of(stored)? != sha256 {
+            bail!("quarantined file failed its integrity check");
+        }
+        let parent = original.parent().context("restore target has no parent")?;
+        fs::create_dir_all(parent).context("create restore directory")?;
+        let resolved = fs::canonicalize(parent).context("resolve restore directory")?;
+        let (resolved, expected) = (resolved.to_string_lossy(), parent.to_string_lossy());
+        if !same_directory(&resolved, &expected) {
+            bail!("restore directory was redirected: {expected}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let (mode, uid, gid) = attributes;
+            // Owner first: chown clears setuid and setgid bits.
+            let _ = chown(stored, uid, gid);
+            let _ = set_mode(stored, mode);
+            super::linuxpin::place_new(stored, original)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            move_or_copy(stored, original)
+        }
+    })();
+    if placed.is_err() {
+        // The file stays in the vault: take back the ownership handed out above.
+        #[cfg(target_os = "linux")]
+        let _ = chown(
+            stored,
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        );
+        let _ = lock_down(stored);
+    }
+    placed
+}
+
 fn sha256_of(path: &Path) -> Result<String> {
-    let mut f = fs::File::open(path).context("open for hashing")?;
+    sha256_read(fs::File::open(path).context("open for hashing")?)
+}
+
+fn sha256_read(mut f: impl Read) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65_536];
     loop {
@@ -262,6 +328,7 @@ fn sha256_of(path: &Path) -> Result<String> {
 /// Protect the Windows source before publishing a predictable stored path. A
 /// same-volume rename preserves that owner/DACL; cross-volume copies receive
 /// the protected directory ACL and are explicitly assigned SYSTEM ownership.
+#[cfg(not(target_os = "linux"))]
 fn move_into_quarantine(src: &Path, dst: &Path, original_security: &Option<String>) -> Result<()> {
     #[cfg(windows)]
     lock_down(src)?;
@@ -282,6 +349,7 @@ fn move_into_quarantine(src: &Path, dst: &Path, original_security: &Option<Strin
     result
 }
 
+#[cfg(not(target_os = "linux"))]
 fn move_or_copy(src: &Path, dst: &Path) -> Result<()> {
     let mut attempts = 0;
     loop {
@@ -309,6 +377,7 @@ fn move_or_copy(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// `EXDEV` on Unix, `ERROR_NOT_SAME_DEVICE` on Windows.
+#[cfg(any(not(target_os = "linux"), test))]
 fn cross_device_code() -> i32 {
     if cfg!(windows) {
         17
@@ -318,6 +387,7 @@ fn cross_device_code() -> i32 {
 }
 
 /// `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION`.
+#[cfg(any(not(target_os = "linux"), test))]
 fn is_transient_lock(e: &std::io::Error) -> bool {
     cfg!(windows) && matches!(e.raw_os_error(), Some(32) | Some(33))
 }
@@ -339,11 +409,6 @@ fn set_mode(_p: &Path, _m: u32) -> std::io::Result<()> {
 fn chown(p: &Path, uid: u32, gid: u32) -> Result<()> {
     use nix::unistd::{chown as nix_chown, Gid, Uid};
     nix_chown(p, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).context("chown failed")
-}
-
-#[cfg(not(target_os = "linux"))]
-fn chown(_p: &Path, _u: u32, _g: u32) -> Result<()> {
-    Ok(())
 }
 
 /// Make the stored payload unusable and tamper-resistant: `chmod 000` +
@@ -393,24 +458,17 @@ fn capture_security(path: &Path) -> Result<Option<String>> {
     }
 }
 
+#[cfg(windows)]
 fn restore_attributes(original: &Path, record: &QuarantineRecord) -> Result<()> {
-    #[cfg(not(windows))]
-    {
-        let _ = set_mode(original, record.mode);
-        let _ = chown(original, record.uid, record.gid);
-    }
-    #[cfg(windows)]
-    {
-        match &record.security_descriptor {
-            Some(sddl) => {
-                crate::winacl::set_file_security(original, sddl)
-                    .context("restore original owner and DACL")?;
-            }
-            None => warn!(
-                path = %original.display(),
-                "no original DACL recorded; the restored file keeps its destination ACL"
-            ),
+    match &record.security_descriptor {
+        Some(sddl) => {
+            crate::winacl::set_file_security(original, sddl)
+                .context("restore original owner and DACL")?;
         }
+        None => warn!(
+            path = %original.display(),
+            "no original DACL recorded; the restored file keeps its destination ACL"
+        ),
     }
     Ok(())
 }
@@ -446,6 +504,110 @@ fn chattr_bin() -> &'static str {
         .copied()
         .find(|p| Path::new(p).exists())
         .unwrap_or("/usr/bin/chattr")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod restore_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn setup(content: &[u8]) -> (PathBuf, PathBuf, PathBuf, String) {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("trapd-restore-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let stored = root.join("stored.bin");
+        fs::write(&stored, content).unwrap();
+        let sha = sha256_of(&stored).unwrap();
+        let original = root.join("original");
+        (root, stored, original, sha)
+    }
+
+    fn attributes(mode: u32) -> (u32, u32, u32) {
+        (
+            mode,
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+    }
+
+    #[test]
+    fn the_recorded_mode_arrives_with_the_file_and_is_not_set_through_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, stored, original, sha) = setup(b"payload");
+        place_restored(&stored, &original, &sha, attributes(0o640)).unwrap();
+        let mode = fs::symlink_metadata(&original)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o640);
+    }
+
+    #[test]
+    fn an_intact_file_returns_to_its_place() {
+        let (_root, stored, original, sha) = setup(b"payload");
+        place_restored(&stored, &original, &sha, attributes(0o644)).unwrap();
+        assert_eq!(fs::read(&original).unwrap(), b"payload");
+        assert!(!stored.exists());
+    }
+
+    #[test]
+    fn a_missing_parent_directory_is_recreated() {
+        let (root, stored, _, sha) = setup(b"payload");
+        let nested = root.join("gone/again/file");
+        place_restored(&stored, &nested, &sha, attributes(0o644)).unwrap();
+        assert_eq!(fs::read(nested).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn an_occupied_target_is_left_untouched() {
+        let (_root, stored, original, sha) = setup(b"payload");
+        fs::write(&original, b"newer").unwrap();
+        assert!(place_restored(&stored, &original, &sha, attributes(0o644)).is_err());
+        assert_eq!(fs::read(&original).unwrap(), b"newer");
+        assert!(stored.exists());
+    }
+
+    #[test]
+    fn a_dangling_symlink_counts_as_occupied() {
+        let (root, stored, original, sha) = setup(b"payload");
+        std::os::unix::fs::symlink(root.join("nowhere"), &original).unwrap();
+        assert!(place_restored(&stored, &original, &sha, attributes(0o644)).is_err());
+        assert!(!root.join("nowhere").exists());
+    }
+
+    #[test]
+    fn a_tampered_file_is_not_restored() {
+        let (_root, stored, original, _) = setup(b"payload");
+        assert!(place_restored(&stored, &original, "00", attributes(0o644)).is_err());
+        assert!(!original.exists());
+        assert!(stored.exists());
+    }
+
+    #[test]
+    fn a_redirected_directory_is_refused() {
+        let (root, stored, _, sha) = setup(b"payload");
+        fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        assert!(
+            place_restored(&stored, &root.join("alias/file"), &sha, attributes(0o644)).is_err()
+        );
+        assert!(!root.join("real/file").exists());
+        assert!(stored.exists());
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::same_directory;
+
+    #[test]
+    fn the_verbatim_prefix_is_ignored_on_either_side() {
+        assert!(same_directory(r"\\?\C:\Users\a", r"C:\Users\a"));
+        assert!(same_directory(r"C:\Users\a", r"\\?\C:\Users\a"));
+        assert!(same_directory(r"\\?\C:\Users\a", r"\\?\C:\Users\a"));
+        assert!(!same_directory(r"\\?\C:\Windows", r"C:\Users\a"));
+    }
 }
 
 #[cfg(test)]

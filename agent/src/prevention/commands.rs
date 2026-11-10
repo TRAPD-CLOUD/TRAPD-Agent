@@ -86,6 +86,29 @@ pub struct OutOfBandSpec {
     pub markers: Vec<String>,
 }
 
+/// Observed process generation, carried as a canonical decimal string because
+/// Windows FILETIME values exceed what the JavaScript backend can hold in a
+/// number. The string form is what gets signed, so any other spelling fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessGeneration(pub u64);
+
+impl Serialize for ProcessGeneration {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessGeneration {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let canonical = text.bytes().all(|b| b.is_ascii_digit()) && !text.starts_with('0');
+        match text.parse::<u64>() {
+            Ok(value) if canonical => Ok(Self(value)),
+            _ => Err(serde::de::Error::custom("invalid process generation")),
+        }
+    }
+}
+
 /// Discriminated union of all response commands the backend can request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -95,7 +118,7 @@ pub enum CommandPayload {
         pid: i32,
         /// Observed generation; required on Windows. Omission preserves legacy signatures.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        process_start_time: Option<u64>,
+        process_generation: Option<ProcessGeneration>,
     },
     /// Enable full host isolation. `allowlist_ips` are the only destinations
     /// reachable in addition to the management channel.
@@ -175,13 +198,13 @@ pub enum CommandPayload {
     FreezePid {
         pid: i32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        process_start_time: Option<u64>,
+        process_generation: Option<ProcessGeneration>,
     },
     /// Resume a previously-frozen process (SIGCONT).
     ThawPid {
         pid: i32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        process_start_time: Option<u64>,
+        process_generation: Option<ProcessGeneration>,
     },
     // ── Real-Time Response (RTR) ─────────────────────────────────────────────
     /// Execute a signed remediation script. `script_b64` is base64 of the script
@@ -536,7 +559,7 @@ mod cross_lang_tests {
             );
             let observed = legacy.replace(
                 "\"pid\":1234",
-                "\"pid\":1234,\"process_start_time\":123456789",
+                "\"pid\":1234,\"process_generation\":\"134383339161621469\"",
             );
             for wire in [&legacy, &observed] {
                 let envelope: CommandEnvelope = serde_json::from_str(wire).unwrap();
@@ -545,12 +568,51 @@ mod cross_lang_tests {
                     .encode(key.sign(wire.as_bytes()).to_bytes());
                 assert!(verify_canonical(&key.verifying_key(), &envelope, &signature).is_ok());
                 if wire == &observed {
-                    let tampered: CommandEnvelope =
-                        serde_json::from_str(&wire.replace("123456789", "123456790")).unwrap();
+                    let tampered: CommandEnvelope = serde_json::from_str(
+                        &wire.replace("134383339161621469", "134383339161621470"),
+                    )
+                    .unwrap();
                     assert!(verify_canonical(&key.verifying_key(), &tampered, &signature).is_err());
                 }
             }
         }
+    }
+
+    #[test]
+    fn process_generation_keeps_full_filetime_precision() {
+        let parsed: ProcessGeneration = serde_json::from_str("\"134383339161621469\"").unwrap();
+        assert_eq!(parsed.0, 134_383_339_161_621_469);
+    }
+
+    #[test]
+    fn process_generation_rejects_every_non_canonical_form() {
+        for wire in [
+            "134383339161621469",
+            "\"\"",
+            "\"0\"",
+            "\"0123\"",
+            "\"+123\"",
+            "\"-1\"",
+            "\" 123\"",
+            "\"1e17\"",
+            "\"18446744073709551616\"",
+        ] {
+            assert!(
+                serde_json::from_str::<ProcessGeneration>(wire).is_err(),
+                "{wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_numeric_generation_field_cannot_verify() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[44; 32]);
+        let wire = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"22222222-2222-2222-2222-222222222222","payload":{"kind":"kill_pid","pid":1234,"process_start_time":123456789}}"#;
+        let envelope: CommandEnvelope = serde_json::from_str(wire).unwrap();
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(key.sign(wire.as_bytes()).to_bytes());
+        assert!(verify_canonical(&key.verifying_key(), &envelope, &signature).is_err());
     }
 
     fn temp_path(suffix: &str) -> std::path::PathBuf {
@@ -651,6 +713,27 @@ mod cross_lang_tests {
     const ENV8: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"99999999-9999-9999-9999-999999999999","payload":{"kind":"kill_pid","pid":4242}}"#;
     const SIG8: &str =
         "6ysMGbqRLHq5NmtBrKiWLOJjIyyFxM/2pFsk3HfhopTLRdd4Gh395DkZydPWzbuQ3FkPG22QJjCO8ee0JpxaAg==";
+
+    // Generated by the TS signer (seed 0x01..=0x20): exact bytes for the string
+    // process generation and for quarantine / restore with a Windows path.
+    #[test]
+    fn accepts_ts_signed_generation_and_quarantine_vectors() {
+        for (env, sig) in [
+            (r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"44444440-4444-4444-4444-444444444444","payload":{"kind":"kill_pid","pid":4242,"process_generation":"134383339161621469"}}"#, "Tt3uap4RdA19MrKGp0jebsQHPSQ9F6cXrtIGDpJ7jGGRUjZI3HhGm/PDWOQs43Qocjk5BzlLt0P5a8dLDCplDw=="),
+            (r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"44444441-4444-4444-4444-444444444444","payload":{"kind":"quarantine_file","path":"C:\\Users\\a\\evil file.exe"}}"#, "rY1JzXduGFtfphWCpXbp80Ewix0E9R6l5R63UzLft0PFwWk6Bie2AMheF3yYNLb3h0raieJ2U8wRX5FMIgXiBA=="),
+            (r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"44444442-4444-4444-4444-444444444444","payload":{"kind":"restore_file","quarantine_id":"22222222-2222-4222-8222-222222222222"}}"#, "j1sRd2qnY2RyLaHeN/QdVTtoe5MCTPTRaIUHie96y8dZzypZNPzz+3dhrsbsyfrUIX0QfQVwlp/pa0a39GpsBA=="),
+        ] {
+            let (v, p, n) = verifier();
+            let wire = format!(r#"{{"envelope":{env},"signature":"{sig}"}}"#);
+            let cmd: SignedCommand = serde_json::from_str(&wire).unwrap();
+            match v.verify(&cmd) {
+                Verdict::Ok(_) => {}
+                Verdict::Rejected(why) => panic!("vector rejected: {why}: {env}"),
+            }
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(n);
+        }
+    }
 
     #[test]
     fn verifies_after_nonce_store_lock_poisoned() {

@@ -313,6 +313,43 @@ pub fn isolate(backend: Backend, allowlist_ips: &[IpAddr]) -> Result<()> {
     }
 }
 
+fn lists_a_drop_rule(listing: &[u8]) -> bool {
+    String::from_utf8_lossy(listing)
+        .split_whitespace()
+        .any(|word| word.eq_ignore_ascii_case("drop"))
+}
+
+/// Whether isolation rules are in place right now, for callers that must not
+/// lift containment they did not apply. Windows always answers yes: its rule
+/// installation rolls itself back, so nothing may be lifted on top of that.
+pub fn holds_isolation(backend: Backend) -> Result<bool> {
+    match backend {
+        Backend::Nft => {
+            let listing = run_output(
+                "nft",
+                &["list", "chain", NFT_FAMILY, NFT_TABLE, NFT_ISOLATE],
+            );
+            anyhow::ensure!(listing.ok(), "cannot inspect the isolation chain");
+            Ok(lists_a_drop_rule(&listing.stdout))
+        }
+        Backend::Iptables => {
+            const ISOLATE_CHAIN: &str = "TRAPD_ISOLATE";
+            for tool in ["iptables", "ip6tables"] {
+                ensure_iptables_chain(tool, ISOLATE_CHAIN)?;
+                let listing = run_output(tool, &["-S", ISOLATE_CHAIN]);
+                anyhow::ensure!(listing.ok(), "cannot inspect the isolation chain");
+                if lists_a_drop_rule(&listing.stdout) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        #[cfg(windows)]
+        Backend::WindowsFirewall => Ok(true),
+        Backend::None => Ok(false),
+    }
+}
+
 pub fn deisolate(backend: Backend) -> Result<()> {
     match backend {
         Backend::Nft => {
@@ -444,6 +481,20 @@ fn run_output(bin: &str, args: &[&str]) -> CapturedOutput {
 pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn a_drop_rule_is_recognised_in_both_firewall_listings() {
+        assert!(lists_a_drop_rule(
+            b"table inet trapd {\n chain isolate {\n oif \"lo\" accept\n counter packets 0 bytes 0 drop\n }\n}"
+        ));
+        assert!(lists_a_drop_rule(
+            b"-N TRAPD_ISOLATE\n-A TRAPD_ISOLATE -j DROP\n"
+        ));
+        assert!(!lists_a_drop_rule(
+            b"table inet trapd {\n chain isolate {\n }\n}"
+        ));
+        assert!(!lists_a_drop_rule(b"-N TRAPD_ISOLATE\n"));
+    }
     #[derive(Default)]
     struct Firewall {
         calls: Vec<(String, Vec<String>)>,
