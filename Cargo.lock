@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "trapd-agent"
-version = "0.7.5"
+version = "0.7.6"
 dependencies = [
  "anyhow",
  "async-trait",
