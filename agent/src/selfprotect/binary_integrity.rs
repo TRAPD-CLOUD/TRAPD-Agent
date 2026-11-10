@@ -281,10 +281,12 @@ fn check_baseline(exe: &Path, hash_file: &Path, hash_str: &str, signed: bool) ->
 /// The release trust anchor (`release_signing.pub`) is never touched. Deleting
 /// these files needs the rights the elevated installer has; it grants nothing
 /// an administrator did not already have.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn reset_baseline() -> Result<()> {
     reset_baseline_in(paths::config_dir())
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn reset_baseline_in(config_dir: &Path) -> Result<()> {
     for name in ["binary.sha256", "binary.sig"] {
         let path = config_dir.join(name);
