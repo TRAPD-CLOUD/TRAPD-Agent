@@ -63,6 +63,11 @@ pub fn entry() -> Result<()> {
             crate::paths::init_state_dir();
             crate::update::run_apply_helper()
         }
+        // MSI custom actions: installer-owned, reversible audit settings so that
+        // 4688 carries command lines (field test F3).
+        Some("audit-baseline") => {
+            crate::audit_baseline::run_cli(std::env::args().nth(2).as_deref())
+        }
         // Invoked by the MSI (`CleanupDecoys`, Return="check") before the
         // service and binary are removed. Decoy removal is best-effort and
         // runs first so a firewall failure cannot skip it; leftover
@@ -421,6 +426,14 @@ fn uninstall() -> Result<()> {
     crate::paths::init_state_dir();
     crate::collectors::windows::honeytokens::uninstall();
     println!("Honeytoken decoy files + registry decoys removed");
+
+    // 3b. Revert the audit settings the installer turned on for command lines
+    //     (only those; see `audit_baseline`). The service is already gone, so a
+    //     failure is a warning, not a reason to abort.
+    match crate::audit_baseline::run_cli(Some("restore")) {
+        Ok(()) => println!("Audit baseline restored"),
+        Err(e) => eprintln!("warning: could not restore the audit baseline: {e:#}"),
+    }
 
     // 4. Remove the binary. Windows cannot delete a running executable, so
     //    hand the deletion to a detached cmd.exe that waits for this process
