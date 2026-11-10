@@ -72,7 +72,56 @@ fn render(event: EVT_HANDLE) -> Result<String> {
     Ok(String::from_utf16(&data[..length])?)
 }
 
+/// Events requested from one `EvtNext` call.
+const EVT_BATCH: usize = 64;
+/// Events fetched and rendered by one blocking read.
+const READ_LIMIT: usize = 512;
+/// Events drained per channel in one tick before yielding to the other
+/// channels and persisting the cursor. A backlog continues on the next pass
+/// without waiting for the timer.
+const MAX_PER_TICK: usize = 8192;
+
+/// Result of one bounded read of a channel.
+struct Batch {
+    records: Vec<String>,
+    /// The query reported no more items (`ERROR_NO_MORE_ITEMS`).
+    exhausted: bool,
+}
+
+/// What a channel does after one batch.
+#[derive(Debug, PartialEq, Eq)]
+enum Drain {
+    /// Read the channel again within this tick.
+    Again,
+    /// Channel is empty for now; wait for the next tick.
+    Done,
+    /// Per-tick cap reached with data left; continue without waiting.
+    Backlog,
+}
+
+fn after_batch(batch_len: usize, exhausted: bool, drained: usize) -> Drain {
+    if exhausted || batch_len == 0 {
+        Drain::Done
+    } else if drained >= MAX_PER_TICK {
+        Drain::Backlog
+    } else {
+        Drain::Again
+    }
+}
+
+/// A cleared log restarts record numbering: the newest record is older than
+/// the persisted high-water mark.
+fn log_was_cleared(newest_record: u64, cursor: u64) -> bool {
+    newest_record < cursor
+}
+
 fn read(channel: &str, cursor: Option<u64>) -> Result<Vec<String>> {
+    read_batch(channel, cursor, READ_LIMIT).map(|b| b.records)
+}
+
+/// Read at most `limit` events after `cursor` (or the single newest event when
+/// there is no cursor yet), fetching them from the log in `EVT_BATCH` chunks.
+fn read_batch(channel: &str, cursor: Option<u64>, limit: usize) -> Result<Batch> {
     let channel: Vec<u16> = channel.encode_utf16().chain(Some(0)).collect();
     let query = cursor
         .map(|id| format!("*[System[EventRecordID > {id}]]"))
@@ -95,22 +144,55 @@ fn read(channel: &str, cursor: Option<u64>) -> Result<Vec<String>> {
     if query.0 == 0 {
         bail!("EvtQuery failed: {}", unsafe { GetLastError() });
     }
-    let mut out = Vec::new();
-    for _ in 0..if cursor.is_some() { 128 } else { 1 } {
-        let mut event = 0;
-        let mut returned = 0;
-        let ok = unsafe { EvtNext(query.0, 1, &mut event, 0, 0, &mut returned) };
+    let limit = if cursor.is_some() { limit } else { 1 };
+    let mut out = Vec::with_capacity(limit.min(EVT_BATCH));
+    let mut exhausted = false;
+    while out.len() < limit {
+        let want = (limit - out.len()).min(EVT_BATCH);
+        let mut events: [EVT_HANDLE; EVT_BATCH] = [0; EVT_BATCH];
+        let mut returned = 0u32;
+        // SAFETY: `events` has room for `want` handles; EvtNext writes at most
+        // `want` of them and reports the count in `returned`.
+        let ok = unsafe {
+            EvtNext(
+                query.0,
+                want as u32,
+                events.as_mut_ptr(),
+                0,
+                0,
+                &mut returned,
+            )
+        };
         if ok == 0 {
             let error = unsafe { GetLastError() };
             if error == 259 {
+                exhausted = true;
                 break;
             }
             bail!("EvtNext failed: {error}");
         }
-        let event = Handle(event);
-        out.push(render(event.0)?);
+        // Own every returned handle first so none leaks on a render failure.
+        let handles: Vec<Handle> = events[..returned as usize]
+            .iter()
+            .map(|h| Handle(*h))
+            .collect();
+        for event in &handles {
+            match render(event.0) {
+                Ok(xml) => out.push(xml),
+                // One unrenderable record must not wedge the channel.
+                Err(e) => {
+                    tracing::warn!(error = %e, "skipping unrenderable event-log record");
+                    // The cursor moves past this record, so the loss must be counted.
+                    crate::telemetry::metrics::metrics()
+                        .event_dropped(crate::telemetry::DropReason::InternalError);
+                }
+            }
+        }
     }
-    Ok(out)
+    Ok(Batch {
+        records: out,
+        exhausted,
+    })
 }
 
 fn parse(xml: &str, channel: &str) -> Result<(u64, LogEventData, Option<UserLogonData>)> {
@@ -533,8 +615,15 @@ impl Collector for EventLogCollector {
         let devices = super::etw::device_map();
         let mut unavailable = HashSet::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        // A channel hit the per-tick cap: read again without waiting.
+        let mut backlog = false;
+        crate::telemetry::liveness::expect(self.name(), std::time::Duration::from_secs(120));
         loop {
-            ticker.tick().await;
+            crate::telemetry::liveness::beat("WindowsEventLogCollector");
+            if !backlog {
+                ticker.tick().await;
+            }
+            backlog = false;
             if !self.config.read().map(|c| c.logs_enabled).unwrap_or(true) {
                 crate::telemetry::coverage::update(|c| {
                     c.set_eventlog_active("Security", false);
@@ -580,137 +669,139 @@ impl Collector for EventLogCollector {
                 windows_native::WMI_CHANNEL,
                 windows_native::POWERSHELL_CHANNEL,
             ] {
-                let cursor = cursors.get(channel).copied();
-                let records = match tokio::task::spawn_blocking(move || read(channel, cursor))
+                let mut drained = 0usize;
+                loop {
+                    // A long drain must not look like a stall.
+                    crate::telemetry::liveness::beat("WindowsEventLogCollector");
+                    let cursor = cursors.get(channel).copied();
+                    let batch = match tokio::task::spawn_blocking(move || {
+                        read_batch(channel, cursor, READ_LIMIT)
+                    })
                     .await?
-                {
-                    Ok(records) => records,
-                    Err(e) => {
-                        crate::telemetry::coverage::update(|c| {
-                            c.set_eventlog_active(channel, false)
-                        });
-                        if unavailable.insert(channel) {
-                            tracing::warn!(channel, error = %e, "Windows event log unavailable; native coverage for this channel is absent");
-                        }
-                        continue;
-                    }
-                };
-                crate::telemetry::coverage::update(|c| c.set_eventlog_active(channel, true));
-                if unavailable.remove(channel) {
-                    tracing::info!(channel, "Windows event log available again");
-                }
-                if records.is_empty() && cursor.is_none() {
-                    cursors.insert(channel.into(), 0);
-                }
-                // A cleared log can restart record numbering. Rebase visibly
-                // instead of waiting forever for the previous high-water mark.
-                if records.is_empty() && cursor.is_some() {
-                    if let Ok(latest) =
-                        tokio::task::spawn_blocking(move || read(channel, None)).await?
                     {
-                        if let Some(xml) = latest.first() {
-                            if let Ok((id, _, _)) = parse(xml, channel) {
-                                if id < cursor.unwrap_or(0) {
-                                    tracing::warn!(
-                                        channel,
-                                        "Windows event log was cleared; resetting cursor"
-                                    );
-                                    crate::telemetry::metrics::metrics()
-                                        .event_dropped(crate::telemetry::DropReason::InternalError);
-                                    cursors.insert(channel.into(), 0);
-                                    pending_auth.remove(channel);
-                                    pending_native.clear(channel);
+                        Ok(batch) => batch,
+                        Err(e) => {
+                            crate::telemetry::coverage::update(|c| {
+                                c.set_eventlog_active(channel, false)
+                            });
+                            if unavailable.insert(channel) {
+                                tracing::warn!(channel, error = %e, "Windows event log unavailable; native coverage for this channel is absent");
+                            }
+                            break;
+                        }
+                    };
+                    let Batch { records, exhausted } = batch;
+                    let batch_len = records.len();
+                    crate::telemetry::coverage::update(|c| c.set_eventlog_active(channel, true));
+                    if unavailable.remove(channel) {
+                        tracing::info!(channel, "Windows event log available again");
+                    }
+                    if records.is_empty() && cursor.is_none() {
+                        cursors.insert(channel.into(), 0);
+                    }
+                    // A cleared log can restart record numbering. Rebase visibly
+                    // instead of waiting forever for the previous high-water mark.
+                    if records.is_empty() && cursor.is_some() {
+                        if let Ok(latest) =
+                            tokio::task::spawn_blocking(move || read(channel, None)).await?
+                        {
+                            if let Some(xml) = latest.first() {
+                                if let Ok((id, _, _)) = parse(xml, channel) {
+                                    if log_was_cleared(id, cursor.unwrap_or(0)) {
+                                        tracing::warn!(
+                                            channel,
+                                            "Windows event log was cleared; resetting cursor"
+                                        );
+                                        crate::telemetry::metrics::metrics().event_dropped(
+                                            crate::telemetry::DropReason::InternalError,
+                                        );
+                                        cursors.insert(channel.into(), 0);
+                                        pending_auth.remove(channel);
+                                        pending_native.clear(channel);
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                for xml in records {
-                    let (record, data, auth) = match parse(&xml, channel) {
-                        Ok(record) => record,
-                        Err(error) => {
-                            tracing::warn!(channel, %error, "Skipping malformed Windows event record");
-                            crate::telemetry::metrics::metrics()
-                                .event_dropped(crate::telemetry::DropReason::InternalError);
-                            // Native XML may have valid System identity but bad data.
-                            // Advance past that record to avoid a poison-record retry loop.
-                            if let Ok(doc) = roxmltree::Document::parse(&xml) {
-                                if let Some(id) = doc
-                                    .root_element()
-                                    .children()
-                                    .find(|n| n.has_tag_name("System"))
-                                    .and_then(|n| {
-                                        n.children().find(|n| n.has_tag_name("EventRecordID"))
-                                    })
-                                    .and_then(|n| n.text())
-                                    .and_then(|t| t.parse::<u64>().ok())
-                                {
-                                    cursors.insert(channel.into(), id);
-                                    pending_auth.remove(channel);
-                                    pending_native.clear(channel);
+                    let mut retry = false;
+                    for xml in records {
+                        let (record, data, auth) = match parse(&xml, channel) {
+                            Ok(record) => record,
+                            Err(error) => {
+                                tracing::warn!(channel, %error, "Skipping malformed Windows event record");
+                                crate::telemetry::metrics::metrics()
+                                    .event_dropped(crate::telemetry::DropReason::InternalError);
+                                // Native XML may have valid System identity but bad data.
+                                // Advance past that record to avoid a poison-record retry loop.
+                                if let Ok(doc) = roxmltree::Document::parse(&xml) {
+                                    if let Some(id) = doc
+                                        .root_element()
+                                        .children()
+                                        .find(|n| n.has_tag_name("System"))
+                                        .and_then(|n| {
+                                            n.children().find(|n| n.has_tag_name("EventRecordID"))
+                                        })
+                                        .and_then(|n| n.text())
+                                        .and_then(|t| t.parse::<u64>().ok())
+                                    {
+                                        cursors.insert(channel.into(), id);
+                                        pending_auth.remove(channel);
+                                        pending_native.clear(channel);
+                                    }
+                                }
+                                continue;
+                            }
+                        };
+                        // Script blocks leave the host only with the operator's opt-in.
+                        // Like the other channels, the first start tails from the
+                        // newest record without replaying history.
+                        if channel == windows_native::POWERSHELL_CHANNEL {
+                            if cursor.is_some() {
+                                for ev in script_block_events(
+                                    &data,
+                                    &agent_id,
+                                    &hostname,
+                                    capture_script_blocks,
+                                ) {
+                                    if tx.send(ev).await.is_err() {
+                                        return Ok(());
+                                    }
                                 }
                             }
+                            cursors.insert(channel.into(), record);
                             continue;
                         }
-                    };
-                    // Script blocks leave the host only with the operator's opt-in.
-                    // Like the other channels, the first start tails from the
-                    // newest record without replaying history.
-                    if channel == windows_native::POWERSHELL_CHANNEL {
-                        if cursor.is_some() {
-                            for ev in script_block_events(
-                                &data,
+                        // WMI-Activity is mostly noise and query text: keep only the
+                        // subscription-registered event, advance past the rest.
+                        if channel == windows_native::WMI_CHANNEL
+                            && data.fields.get("EventID").and_then(|v| v.as_u64())
+                                != Some(windows_native::WMI_SUBSCRIPTION_EVENT)
+                        {
+                            cursors.insert(channel.into(), record);
+                            continue;
+                        }
+                        let first_attempt = if cursor.is_some() {
+                            match pending_native.prepare(
+                                channel,
+                                record,
+                                data.clone(),
                                 &agent_id,
                                 &hostname,
-                                capture_script_blocks,
                             ) {
-                                if tx.send(ev).await.is_err() {
-                                    return Ok(());
+                                Ok(first) => first,
+                                Err(error) => {
+                                    tracing::warn!(channel, %error, "native source batch could not be prepared; retaining source cursor for retry");
+                                    retry = true;
+                                    break;
                                 }
                             }
-                        }
-                        cursors.insert(channel.into(), record);
-                        continue;
-                    }
-                    // WMI-Activity is mostly noise and query text: keep only the
-                    // subscription-registered event, advance past the rest.
-                    if channel == windows_native::WMI_CHANNEL
-                        && data.fields.get("EventID").and_then(|v| v.as_u64())
-                            != Some(windows_native::WMI_SUBSCRIPTION_EVENT)
-                    {
-                        cursors.insert(channel.into(), record);
-                        continue;
-                    }
-                    let first_attempt = if cursor.is_some() {
-                        match pending_native.prepare(
-                            channel,
-                            record,
-                            data.clone(),
-                            &agent_id,
-                            &hostname,
-                        ) {
-                            Ok(first) => first,
-                            Err(error) => {
-                                tracing::warn!(channel, %error, "native source batch could not be prepared; retaining source cursor for retry");
-                                break;
-                            }
-                        }
-                    } else {
-                        false
-                    };
-                    if channel == "System"
-                        && first_attempt
-                        && data.proc.as_deref() == Some("Microsoft-Windows-Eventlog")
-                    {
-                        if let Some(ev) = audit_tamper_event(channel, &data, &agent_id, &hostname) {
-                            if tx.send(ev).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    if channel == "Security" {
-                        capture_logon_type(&data.fields, &mut logon_types);
-                        if first_attempt {
+                        } else {
+                            false
+                        };
+                        if channel == "System"
+                            && first_attempt
+                            && data.proc.as_deref() == Some("Microsoft-Windows-Eventlog")
+                        {
                             if let Some(ev) =
                                 audit_tamper_event(channel, &data, &agent_id, &hostname)
                             {
@@ -719,77 +810,106 @@ impl Collector for EventLogCollector {
                                 }
                             }
                         }
-                        if first_attempt {
-                            if let Some(hit) = decoy_access(
-                                &data.fields,
-                                &logon_types,
-                                data.log_timestamp,
-                                &devices,
-                            ) {
-                                let outcome = crate::detection::honeytoken_policy::assess(
-                                    &hit,
-                                    Severity::Critical,
-                                );
-                                let mut ev = AgentEvent::new(
-                                    agent_id.clone(),
-                                    hostname.clone(),
-                                    EventClass::Detection,
-                                    EventAction::HoneytokenAccess,
-                                    outcome.severity,
-                                    EventData::HoneytokenAccess(Box::new(hit)),
-                                );
-                                if let Some(time) = data.log_timestamp {
-                                    ev.timestamp = time;
+                        if channel == "Security" {
+                            capture_logon_type(&data.fields, &mut logon_types);
+                            if first_attempt {
+                                if let Some(ev) =
+                                    audit_tamper_event(channel, &data, &agent_id, &hostname)
+                                {
+                                    if tx.send(ev).await.is_err() {
+                                        return Ok(());
+                                    }
                                 }
-                                if tx.send(ev).await.is_err() {
-                                    return Ok(());
+                            }
+                            if first_attempt {
+                                if let Some(hit) = decoy_access(
+                                    &data.fields,
+                                    &logon_types,
+                                    data.log_timestamp,
+                                    &devices,
+                                ) {
+                                    let outcome = crate::detection::honeytoken_policy::assess(
+                                        &hit,
+                                        Severity::Critical,
+                                    );
+                                    let mut ev = AgentEvent::new(
+                                        agent_id.clone(),
+                                        hostname.clone(),
+                                        EventClass::Detection,
+                                        EventAction::HoneytokenAccess,
+                                        outcome.severity,
+                                        EventData::HoneytokenAccess(Box::new(hit)),
+                                    );
+                                    if let Some(time) = data.log_timestamp {
+                                        ev.timestamp = time;
+                                    }
+                                    if tx.send(ev).await.is_err() {
+                                        return Ok(());
+                                    }
                                 }
                             }
                         }
-                    }
-                    // First start tails from the newest record, avoiding a full
-                    // historical replay. Subsequent starts resume the cursor.
-                    if cursor.is_some() {
-                        // Construct before moving the raw data, and enqueue first:
-                        // a durable raw source receipt fsyncs the preceding logon
-                        // record before this channel's cursor advances.
-                        if !enqueue_auth_once(
-                            &tx,
-                            &mut pending_auth,
-                            channel,
-                            record,
-                            auth.and_then(|auth| auth_event(&data, auth, &agent_id, &hostname)),
-                        )
-                        .await
-                        {
-                            return Ok(());
-                        }
-                        if pending_native
-                            .emit(
+                        // First start tails from the newest record, avoiding a full
+                        // historical replay. Subsequent starts resume the cursor.
+                        if cursor.is_some() {
+                            // Construct before moving the raw data, and enqueue first:
+                            // a durable raw source receipt fsyncs the preceding logon
+                            // record before this channel's cursor advances.
+                            if !enqueue_auth_once(
                                 &tx,
+                                &mut pending_auth,
                                 channel,
                                 record,
-                                data,
-                                &agent_id,
-                                &hostname,
-                                self.durable_handoff,
+                                auth.and_then(|auth| auth_event(&data, auth, &agent_id, &hostname)),
                             )
                             .await
-                            .is_err()
-                        {
-                            if tx.is_closed() {
+                            {
                                 return Ok(());
                             }
-                            tracing::warn!(channel, "native source record not durably journaled; retaining source cursor for retry");
+                            if pending_native
+                                .emit(
+                                    &tx,
+                                    channel,
+                                    record,
+                                    data,
+                                    &agent_id,
+                                    &hostname,
+                                    self.durable_handoff,
+                                )
+                                .await
+                                .is_err()
+                            {
+                                if tx.is_closed() {
+                                    return Ok(());
+                                }
+                                tracing::warn!(channel, "native source record not durably journaled; retaining source cursor for retry");
+                                retry = true;
+                                break;
+                            }
+                        }
+                        pending_auth.remove(channel);
+                        pending_native.clear(channel);
+                        cursors.insert(channel.into(), record);
+                    }
+                    if retry {
+                        break;
+                    }
+                    drained += batch_len;
+                    // The first start only records the newest id (one read).
+                    if cursor.is_none() {
+                        break;
+                    }
+                    match after_batch(batch_len, exhausted, drained) {
+                        Drain::Again => {}
+                        Drain::Done => break,
+                        Drain::Backlog => {
+                            backlog = true;
                             break;
                         }
                     }
-                    pending_auth.remove(channel);
-                    pending_native.clear(channel);
-                    cursors.insert(channel.into(), record);
                 }
+                crate::paths::write_atomic(&path, &serde_json::to_vec(&cursors)?, 0o600)?;
             }
-            crate::paths::write_atomic(&path, &serde_json::to_vec(&cursors)?, 0o600)?;
         }
     }
 }
@@ -839,6 +959,21 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn drain_continues_until_exhausted_or_capped() {
+        assert_eq!(after_batch(512, false, 512), Drain::Again);
+        assert_eq!(after_batch(37, true, 549), Drain::Done);
+        assert_eq!(after_batch(0, false, 512), Drain::Done);
+        assert_eq!(after_batch(512, false, MAX_PER_TICK), Drain::Backlog);
+        // Exhaustion wins over the cap: nothing is left to continue with.
+        assert_eq!(after_batch(10, true, MAX_PER_TICK), Drain::Done);
+    }
+    #[test]
+    fn rotated_log_is_detected_by_a_lower_newest_record() {
+        assert!(log_was_cleared(5, 1000));
+        assert!(!log_was_cleared(1000, 1000));
+        assert!(!log_was_cleared(1001, 1000));
+    }
     #[test]
     fn native_xml_preserves_unicode_auth_identity_and_record_id() {
         let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>4625</EventID><EventRecordID>123</EventRecordID><Level>0</Level><Computer>host</Computer></System><EventData><Data Name="TargetUserName">Jörg &amp; Co</Data><Data Name="IpAddress">10.0.0.1</Data><Data Name="IpPort">445</Data></EventData></Event>"#;

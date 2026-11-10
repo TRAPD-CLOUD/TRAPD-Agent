@@ -74,6 +74,17 @@ pub struct Coverage {
     /// kernel built without loadable modules.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub ebpf_telemetry_programs: BTreeMap<String, bool>,
+    /// Collectors that exited with an error and are being restarted (or are
+    /// waiting out their backoff). Their telemetry is missing meanwhile.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_collectors: Vec<String>,
+    /// Components whose liveness beat stopped (see `telemetry::liveness`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stalled_components: Vec<String>,
+    /// The running binary still matches its recorded baseline. `Some(false)`
+    /// means the file on disk changed while the agent was running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_integrity: Option<bool>,
 }
 
 impl Coverage {
@@ -121,6 +132,33 @@ fn state() -> &'static Mutex<Coverage> {
 pub fn update(f: impl FnOnce(&mut Coverage)) {
     if let Ok(mut c) = state().lock() {
         f(&mut c);
+    }
+}
+
+/// A collector exited with an error (`failed = true`) or is running again.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn set_collector_failed(name: &str, failed: bool) {
+    update(|c| set_member(&mut c.failed_collectors, name, failed));
+}
+
+/// Replace the set of stalled components.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn set_stalled_components(mut names: Vec<String>) {
+    names.sort();
+    names.dedup();
+    update(|c| c.stalled_components = names);
+}
+
+fn set_member(list: &mut Vec<String>, name: &str, present: bool) {
+    match (list.iter().position(|n| n == name), present) {
+        (None, true) => {
+            list.push(name.to_string());
+            list.sort();
+        }
+        (Some(i), false) => {
+            list.remove(i);
+        }
+        _ => {}
     }
 }
 
@@ -211,6 +249,26 @@ mod tests {
         shadow_hit("lolbin.mshta_remote");
         let again = take_shadow_hits();
         assert_eq!(again.get("lolbin.mshta_remote"), Some(&2));
+    }
+
+    #[test]
+    fn failed_collector_set_is_sorted_and_idempotent() {
+        let mut list = Vec::new();
+        set_member(&mut list, "b", true);
+        set_member(&mut list, "a", true);
+        set_member(&mut list, "a", true);
+        assert_eq!(list, ["a", "b"]);
+        set_member(&mut list, "a", false);
+        set_member(&mut list, "zz", false);
+        assert_eq!(list, ["b"]);
+        let c = Coverage {
+            failed_collectors: list,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&c).unwrap(),
+            serde_json::json!({"failed_collectors": ["b"]})
+        );
     }
 
     #[test]
