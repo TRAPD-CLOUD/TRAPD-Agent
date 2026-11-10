@@ -179,10 +179,11 @@ jobs:
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
+          # Hard failure: an unsigned release cannot be self-updated and would
+          # silently fork the fleet onto an unverifiable build.
           if [ -z "${RELEASE_SIGNING_KEY}" ]; then
-            echo "::warning::RELEASE_SIGNING_KEY not set - release is NOT signed and will not be offered for self-update"
-            : > release-statements.ndjson
-            exit 0
+            echo "::error::RELEASE_SIGNING_KEY is not set - refusing to publish an unsigned release"
+            exit 1
           fi
           version="${GITHUB_REF_NAME#v}"
           : > release-statements.ndjson
