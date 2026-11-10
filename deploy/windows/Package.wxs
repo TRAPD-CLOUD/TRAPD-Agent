@@ -32,6 +32,18 @@
                           Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" Vital="yes">
             <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
                                 ThirdFailureActionType="restart" ResetPeriodInDays="1" RestartServiceDelayInSeconds="10" />
+            <!-- Hardened service DACL: SYSTEM full control; Administrators can query,
+                 start, stop and delete (MSI maintenance, Stop-Service) but cannot
+                 rewrite the DACL or take ownership; interactive and service
+                 accounts may only query. -->
+            <PermissionEx Sddl="D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)" />
+
+            <!-- Only EventLog: the Security/System channels the sensors read.
+                 Deliberately NOT BFE: hosts with a third-party firewall
+                 commonly run with BFE stopped or disabled, and a hard
+                 dependency would then keep the whole agent from starting.
+                 Firewall containment reports its own error instead. -->
+            <ServiceDependency Id="EventLog" />
           </ServiceInstall>
           <ServiceControl Id="ManageService" Name="trapd-agent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
           <!-- MSI authorizes replacement, not the executable's claimed
@@ -109,20 +121,37 @@
         </Directory>
       </Directory>
     </StandardDirectory>
+    <!-- Every component writing into HKLM\SOFTWARE\TRAPD\Agent carries the same
+         SYSTEM/Administrators-only descriptor: MSI applies the descriptor of the
+         value that creates the key, so relying on "Installed" alone left the
+         BackendUrl/EnrollToken values exposed depending on write order. The agent
+         deletes EnrollToken after a successful enrollment. -->
     <Component Id="RegistryConfig" Directory="INSTALLFOLDER" Guid="9625220B-260F-4E51-BFBE-476EF6BE1543" Permanent="yes" Bitness="always64">
       <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="Installed" Type="integer" Value="1" KeyPath="yes">
         <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
       </RegistryValue>
     </Component>
     <Component Id="BackendConfig" Directory="INSTALLFOLDER" Guid="0C71EE73-B218-46C4-AE14-839BED9F71FC" Permanent="yes" Bitness="always64" Condition="BACKENDURL">
-      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="string" Value="[BACKENDURL]" KeyPath="yes" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="string" Value="[BACKENDURL]" KeyPath="yes">
+        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
+      </RegistryValue>
     </Component>
     <Component Id="EnrollmentConfig" Directory="INSTALLFOLDER" Guid="91605497-3A06-4D6A-90AA-C6857E11B074" Permanent="yes" Bitness="always64" Condition="ENROLLTOKEN">
-      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="string" Value="[ENROLLTOKEN]" KeyPath="yes" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="string" Value="[ENROLLTOKEN]" KeyPath="yes">
+        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
+      </RegistryValue>
     </Component>
 
     <!-- MSI owns service registration. Remove persistent containment and
          decoys after StopServices, before DeleteServices; upgrades preserve both. -->
+    <!-- Return="check" is deliberate and narrow. `trapd-agent.exe cleanup`
+         removes decoys best-effort (failures are logged, never fatal) and
+         exits non-zero ONLY when TRAPD containment firewall rules could not
+         be removed: leaving them would keep the host isolated with no agent
+         left to lift them, so the uninstall must not proceed silently.
+         Recovery if it fails: restore the Windows Firewall services (BFE,
+         MpsSvc) or delete the TRAPD rule group manually, then repeat the
+         removal; the cause is in C:\ProgramData\TRAPD\logs\agent.log. -->
     <CustomAction Id="CleanupDecoys" FileRef="AgentExe" ExeCommand="cleanup" Execute="deferred" Impersonate="no" Return="check" />
     <InstallExecuteSequence>
       <Custom Action="CleanupDecoys" Before="DeleteServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />

@@ -210,6 +210,46 @@ fn violation(guard: &Path, hash_str: &str, message: String) -> anyhow::Error {
     anyhow::Error::new(IntegrityViolation { message, hold })
 }
 
+/// Outcome of a read-only recheck while the agent is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum Drift {
+    Unchanged,
+    /// No baseline to compare against (never written or removed by an update).
+    NoBaseline,
+    /// The file at the executable's path no longer matches the baseline.
+    Modified {
+        expected: String,
+        current: String,
+    },
+}
+
+/// Re-hash the executable path and compare with the recorded baseline without
+/// ever writing it. Blocking: call from `spawn_blocking`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn recheck() -> Result<Drift> {
+    let exe = exe_path()?;
+    let (hash_hex, _) = sha256_of_file(&exe)?;
+    compare_to_baseline(&hash_store_path(), &baseline_line(&hash_hex))
+}
+
+fn compare_to_baseline(hash_file: &Path, current: &str) -> Result<Drift> {
+    let stored = match std::fs::read_to_string(hash_file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Drift::NoBaseline),
+        Err(e) => return Err(e).with_context(|| format!("read baseline {}", hash_file.display())),
+    };
+    let stored = stored.trim();
+    Ok(if stored == current {
+        Drift::Unchanged
+    } else {
+        Drift::Modified {
+            expected: stored.to_string(),
+            current: current.to_string(),
+        }
+    })
+}
+
 fn check_baseline(exe: &Path, hash_file: &Path, hash_str: &str, signed: bool) -> Result<()> {
     if hash_file.exists() {
         let stored = std::fs::read_to_string(hash_file).with_context(|| {
@@ -418,6 +458,34 @@ mod tests {
             std::fs::read_to_string(fx.baseline()).unwrap(),
             line(b"trusted v0.6.9")
         );
+    }
+
+    #[test]
+    fn recheck_reports_drift_without_touching_the_baseline() {
+        let root = std::env::temp_dir().join(format!("trapd-integrity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let baseline = root.join("binary.sha256");
+        let good = baseline_line(&hex::encode(Sha256::digest(b"good")));
+        let bad = baseline_line(&hex::encode(Sha256::digest(b"bad")));
+        assert_eq!(
+            compare_to_baseline(&baseline, &good).unwrap(),
+            Drift::NoBaseline
+        );
+        assert!(!baseline.exists());
+        std::fs::write(&baseline, &good).unwrap();
+        assert_eq!(
+            compare_to_baseline(&baseline, &good).unwrap(),
+            Drift::Unchanged
+        );
+        assert_eq!(
+            compare_to_baseline(&baseline, &bad).unwrap(),
+            Drift::Modified {
+                expected: good.clone(),
+                current: bad
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&baseline).unwrap(), good);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

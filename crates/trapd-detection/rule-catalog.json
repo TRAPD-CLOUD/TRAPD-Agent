@@ -1847,6 +1847,19 @@
       "tactic": "TA0005 Defense Evasion",
       "technique": "T1562.002",
       "window_s": 3600
+    },
+    {
+      "base": "high",
+      "base_from_event": false,
+      "container_bump": false,
+      "dedup": "subject",
+      "id": "selfprotect.binary_modified",
+      "max": "critical",
+      "mode": "alert",
+      "root_bump": false,
+      "tactic": "TA0005 Defense Evasion",
+      "technique": "T1562.001",
+      "window_s": 3600
     }
   ]
 }

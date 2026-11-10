@@ -40,6 +40,10 @@ pub mod registry_watch;
 // Windows memory classification rules (pure; the scanner does the I/O).
 pub mod win_mem_rules;
 
+// Restart-with-backoff wrapper for collectors; used by the Windows runtime.
+#[cfg(any(target_os = "windows", test))]
+pub mod supervisor;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 

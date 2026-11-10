@@ -8,20 +8,18 @@
 //! agent emits, so the shared detection engine (Sigma rules, IOC hash/path
 //! matching, behavioural analytics) inspects Windows processes unchanged.
 //!
-//! The executable image is SHA256-hashed at collection time (size-capped,
-//! cached per path+mtime) to anchor IOC and reputation matching. Polling can
+//! The executable image is SHA256-hashed at collection time (streamed off the
+//! async worker via [`crate::telemetry::image_hash`], size-capped, cached per
+//! path+mtime) to anchor IOC and reputation matching. Polling can
 //! miss processes shorter than one interval — the same known trade-off as the
 //! Linux fallback path without eBPF; an ETW-based collector can replace this
 //! later without touching the schema.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind};
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
@@ -32,19 +30,12 @@ use crate::schema::{
     AgentEvent, EventAction, EventClass, EventData, ProcessCreateData, ProcessTerminateData,
     Severity,
 };
+use crate::telemetry::image_hash::{self, HashOutcome};
 use crate::telemetry::limits::{truncate_str, MAX_CMDLINE_BYTES};
 use crate::telemetry::{Enrichment, EnrichmentError};
 
 /// Poll cadence — matches the Linux polling collector.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
-
-/// Images larger than this are not hashed (hashing a multi-GB installer on
-/// every spawn would stall the collector); the event simply omits the digest.
-const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Upper bound on the exe-hash cache before it is reset (paths churn slowly,
-/// so this is rarely hit; the bound only guards against pathological hosts).
-const MAX_HASH_CACHE: usize = 4096;
 
 fn refresh_kind() -> ProcessRefreshKind {
     // sysinfo's default refresh omits command lines and account identities.
@@ -56,13 +47,18 @@ fn refresh_kind() -> ProcessRefreshKind {
         .with_user(UpdateKind::OnlyIfNotSet)
 }
 
+/// Hash on the blocking pool: a large image must not stall a Tokio worker.
+async fn hash_image_off_worker(exe: PathBuf) -> HashOutcome {
+    tokio::task::spawn_blocking(move || image_hash::hash_image(&exe))
+        .await
+        .unwrap_or(HashOutcome::Unreadable(EnrichmentError::IoError))
+}
+
 pub struct ProcessCollector {
     sys: System,
     initialized: bool,
     /// pid → name of every process seen in the previous poll.
     known: HashMap<i32, (String, Option<u64>)>,
-    /// exe path → (len, mtime, sha256) so an unchanged image is hashed once.
-    hash_cache: HashMap<PathBuf, (u64, Option<SystemTime>, String)>,
 }
 
 impl ProcessCollector {
@@ -71,41 +67,7 @@ impl ProcessCollector {
             sys: System::new(),
             initialized: false,
             known: HashMap::new(),
-            hash_cache: HashMap::new(),
         }
-    }
-
-    /// SHA256 of the executable image, size-capped and cached per path+mtime.
-    fn exe_sha256(&mut self, path: &Path) -> Option<String> {
-        if path.as_os_str().is_empty() {
-            return None;
-        }
-        let meta = std::fs::metadata(path).ok()?;
-        if !meta.is_file() || meta.len() > MAX_HASH_BYTES {
-            return None;
-        }
-        let key = (meta.len(), meta.modified().ok());
-        if let Some((len, mtime, hash)) = self.hash_cache.get(path) {
-            if (*len, *mtime) == key {
-                return Some(hash.clone());
-            }
-        }
-        let mut bytes = Vec::new();
-        std::fs::File::open(path)
-            .ok()?
-            .take(MAX_HASH_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() as u64 > MAX_HASH_BYTES {
-            return None;
-        }
-        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
-        if self.hash_cache.len() >= MAX_HASH_CACHE {
-            self.hash_cache.clear();
-        }
-        self.hash_cache
-            .insert(path.to_path_buf(), (key.0, key.1, digest.clone()));
-        Some(digest)
     }
 
     fn username_of(&self, pid: Pid) -> String {
@@ -229,12 +191,18 @@ impl Collector for ProcessCollector {
                 // Everything above borrows `self.sys` through `proc_`; the two
                 // calls below need `&mut self`, so the borrow has to end first.
                 let username = self.username_of(spid);
-                let exe_sha256 = self.exe_sha256(&exe);
+                let hash = hash_image_off_worker(exe.clone()).await;
+                let exe_sha256 = hash.digest().map(str::to_owned);
                 // sysinfo does not expose the native error for these missing
                 // fields. Record unresolved data without inventing a cause
                 // such as permission_denied or treating it as complete.
                 if exe.as_os_str().is_empty() {
                     notes.fail("exe", EnrichmentError::IoError);
+                }
+                if let Some(cause) = hash.failure() {
+                    // Oversize / unreadable image: say so instead of silently
+                    // omitting the digest.
+                    notes.fail("exe_sha256", cause);
                 }
                 if cmdline.is_empty() {
                     notes.fail("cmdline", EnrichmentError::IoError);

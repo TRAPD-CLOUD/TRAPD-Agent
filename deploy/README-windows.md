@@ -61,21 +61,30 @@ TRAPD_OUTPUT=file
 RUST_LOG=info
 ```
 
-For managed deployments, `BACKENDURL` and `ENROLLTOKEN` MSI properties can be
-used instead of the corresponding `agent.env` entries. The MSI stores them in
-a protected 64-bit `HKLM\SOFTWARE\TRAPD\Agent` key. Environment variables
-and then `agent.env` take precedence. `ENROLLTOKEN` is a hidden MSI property;
-pre-provision `agent.env` when avoiding a token in process command lines matters.
+Prefer device pairing (no token). For managed deployments, `BACKENDURL` and
+`ENROLLTOKEN` MSI properties can be used instead of the corresponding `agent.env`
+entries. The MSI stores them in a 64-bit `HKLM\SOFTWARE\TRAPD\Agent` key that is
+restricted to SYSTEM and Administrators. Environment variables and then
+`agent.env` take precedence. Do not pass `ENROLLTOKEN=` to `msiexec` directly: a
+command line is visible to every local user and to process telemetry. Use
+`install.ps1 -EnrollTokenFile <file>` (or `-EnrollToken`), which stages the
+token in the protected registry key instead of the command line. The agent
+deletes the registry `EnrollToken` value as soon as enrollment succeeded (or
+persisted credentials exist), so the one-time token does not stay on disk.
 TLS pinning fails closed unless `TRAPD_TLS_ALLOW_SYSTEM_ROOTS=1` is explicitly
 configured. First enrollment needs a reachable backend and a valid token.
 
 An optional `trapd-agent-windows-install.ps1` release selector downloads the MSI
 and its checksum, with `-Channel stable` (default) or `-Channel beta`. It invokes
-Windows Installer; it does not replace service binaries independently. SHA256
-checks integrity. The MSI is Authenticode-signed only when SignPath is configured
-(see "Signing" below); the unsigned executable inside it and the offline-key
-manifest signing are separate. Without a signature, the checksum alone provides
-no independent release authenticity, and SmartScreen warns on download.
+Windows Installer; it does not replace service binaries independently. The
+SHA256 file comes from the same release, so it proves integrity only. The script
+therefore also requires a valid Authenticode signature (`Get-AuthenticodeSignature`
+status `Valid`) and fails closed unless the signer matches `-ExpectedThumbprint`
+(or env `TRAPD_SIGNER_THUMBPRINT`) and/or `-ExpectedPublisher` (or
+`TRAPD_SIGNER_SUBJECT`, the certificate's simple name). One of them is mandatory;
+`-AllowUnsigned` is an explicit, warned opt-out for self-built packages.
+Release builds are signed (see "Signing" below); SmartScreen still warns on a
+download until the publisher has reputation.
 
 ## Collected data and platform coverage
 
@@ -147,6 +156,62 @@ logs and enrollment registry settings are retained after uninstall for a later
 reinstall. MSI removal stops/removes the service, removes the executable and
 revokes planted decoys. Use MSI removal for an MSI-managed installation.
 
+If MSI removal fails in the `CleanupDecoys` step, the cause is in
+`C:\ProgramData\TRAPD\logs\agent.log`. Decoy removal there is best effort; the
+step fails only when TRAPD containment firewall rules cannot be removed
+(leftover rules would keep the host isolated once the agent is gone). Restore
+the Windows Firewall services (`BFE`, `MpsSvc`) or delete the TRAPD rule group
+manually, then repeat the removal.
+
+### Developer-only `install` / `uninstall` verbs
+
+`trapd-agent.exe install` / `uninstall` register and delete the service
+directly. They bypass the MSI (no recovery actions, no directory ACLs, and
+`uninstall` deletes the binary behind Windows Installer's back), so they are
+for development builds only and **refuse to run on a machine the MSI manages**
+(`HKLM\SOFTWARE\TRAPD\Agent`, `Installed=1`). That marker survives MSI removal
+by design (configuration is retained), so a developer machine that once had the
+MSI must set `TRAPD_ALLOW_DEV_INSTALL=1` to use the verbs. Never use them on a
+production host. The registered service path is quoted by the service API
+whenever it contains spaces, so it is not an unquoted-service-path
+(CWE-428) risk.
+
+### Logs and the Windows Event Log
+
+`C:\ProgramData\TRAPD\logs\agent.log` rotates at 10 MiB and keeps three
+generations (`agent.log.1` to `agent.log.3`). If the file cannot be opened,
+logging falls back to stderr (invisible for a service). Service start, stop and
+fatal start-up errors are also written to the **Application** event log under
+the source `TRAPD Agent` (event ids 1 started, 2 stopped, 3 fatal). The service
+registers that source itself at start-up (the MSI is not involved); the key
+`HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\TRAPD Agent`
+remains after removal, which is harmless. Messages are short summaries on
+purpose, because the Application log is readable by standard users; details stay
+in `agent.log`.
+
+### Service status
+
+The service reports `START_PENDING` (with checkpoints and a wait hint) while it
+initialises and `RUNNING` only after the binary-integrity check has passed, so a
+tampered binary never appears as running. Waiting for pairing/enrollment happens
+in `RUNNING` and still honours stop. On stop it reports `STOP_PENDING`; if
+background tasks (Event Log reads, firewall calls) do not finish within 10 s
+they are abandoned so the stop cannot hang.
+
+### Self-update and the MSI version
+
+A signed self-update (when a release key is provisioned) replaces
+`trapd-agent.exe` without changing what Windows Installer recorded: *Apps &
+features* keeps showing the version of the MSI that was installed, while
+`trapd-agent.exe --version`, the heartbeat and the Event Log entry show the
+running version. Editing Windows Installer's own uninstall entry is deliberately
+not done (it is owned by the MSI and rewritten on repair). Consequences: use the
+reported agent version for inventory; a *repair* or reinstall of an older MSI
+puts that MSI's binary back (and resets the integrity baseline), and a newer MSI
+upgrades normally. The update helper only runs from a staging directory that is
+private to SYSTEM and Administrators and launches a copy whose hash it has
+re-verified while holding it write-locked.
+
 ## Build and verification
 
 On Windows, install WiX 4.0.6 and its utility extension, then build:
@@ -179,22 +244,42 @@ for that acceptance job before publishing the MSI. Test logs are uploaded as CI
 artifacts. Running this test requires an isolated Windows machine with admin
 rights; it installs a service and generates synthetic security telemetry.
 
-## Signing (SignPath, optional)
+## Self-protection
 
-The workflow signs the final MSI through the SignPath GitHub action when
-`secrets.SIGNPATH_API_TOKEN` and the repository variables
+- Process death: SCM recovery actions restart the service (configured by the MSI).
+- Service DACL: SYSTEM full control; Administrators may query, start, stop and
+  delete the service but cannot change its DACL or owner.
+- Process mitigation policies (best effort, logged on failure): legacy extension
+  points disabled, no images from remote shares or low-integrity locations.
+- While running, the agent re-hashes its executable every 15 minutes and raises
+  `selfprotect.binary_modified` (Critical) when it no longer matches the
+  baseline; coverage reports `binary_integrity`. It does not stop itself: the
+  next start fails closed.
+- Collectors that exit with an error are restarted with exponential backoff
+  (5 s up to 5 min) and listed in coverage `failed_collectors`; a wedged
+  pipeline consumer, event-log or ETW loop (no progress for 2-3 minutes) is
+  listed in coverage `stalled_components`.
+
+## Signing (SignPath, required for releases)
+
+The workflow signs the final MSI through the SignPath GitHub action. Release
+builds (`release.yml`, tag `v*`) pass `require_signing: true`, so the job fails
+unless `secrets.SIGNPATH_API_TOKEN` and the repository variables
 `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG` and `SIGNPATH_SIGNING_POLICY_SLUG`
-are set (`SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` is optional). Otherwise it logs a
-notice and ships the unsigned MSI. The signed package replaces the unsigned one
-before the checksum is taken, and the job fails if the signature is not valid.
-The calling workflow must pass the secret (`secrets: inherit`) and grant the job
-`actions: read` for the SignPath action. SignPath's artifact configuration must
-sign `*.msi` inside the uploaded `unsigned-msi` artifact.
+are configured (`SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` is optional). CI and PR
+builds (`ci.yml`) leave it unset and ship an unsigned MSI with a notice. The signed
+package replaces the unsigned one before the checksum is taken, and the job fails
+if the signature is not valid. The calling workflow must pass the secret
+(`secrets: inherit`) and grant the job `actions: read` for the SignPath action.
+SignPath's artifact configuration must sign `*.msi` inside the uploaded
+`unsigned-msi` artifact. Publish the signing certificate's thumbprint or
+subject so users can pass it to `install.ps1`.
 
 Not covered yet: the `trapd-agent.exe` inside the MSI and the standalone
 `trapd-agent-windows-x86_64.exe` asset are unsigned (signing the executable
 changes its hash, which the signed release statement covers, so it has to happen
-before that statement is created), and there is no signed self-update on Windows;
+before that statement is created). Signed self-update is available once the
+release and command keys are provisioned (see `stage-trust.ps1`); otherwise
 updates ship as a new MSI.
 
 Packaging references: [WiX services](https://docs.firegiant.com/wix/schema/wxs/serviceinstall/),
