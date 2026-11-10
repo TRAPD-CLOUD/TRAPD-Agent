@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
             paths::init_state_dir();
-            collectors::windows::honeytokens::uninstall(&config::load_persisted());
+            collectors::windows::honeytokens::uninstall();
             crate::deception::activity::ActivityStore::purge(&crate::deception::activity::state_path());
             info!("Uninstall cleanup complete (honeytoken files + registry decoys + activity profile removed)");
         }
@@ -261,7 +261,7 @@ async fn main() -> Result<()> {
     // Start from the last verified config on disk (defaults on first run), so a
     // restart keeps the real configuration even though the signed-config channel
     // re-serves it with an already-accepted (and thus replay-rejected) issued_at.
-    let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()));
+    let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()?));
     // Backend outbox. Online it is disk-backed (survives crash/restart, replays
     // on the next run); offline it is purely in-memory (the NDJSON output is the
     // system of record).

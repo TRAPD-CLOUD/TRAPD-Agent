@@ -346,13 +346,19 @@ The agent auto-detects its mode so a bare `trapd-agent` run "just works":
 
 ## Installation
 
+Download the installer through a trusted channel, inspect it, and supply the
+independently provisioned release public key:
+
 ```sh
-curl -sSL https://raw.githubusercontent.com/trapd-cloud/trapd-agent/main/deploy/install.sh | sudo bash
+less install.sh
+sudo TRAPD_RELEASE_PUBKEY_B64='<independently obtained public key>' bash install.sh
 ```
 
-The installer fetches the latest release binary from GitHub, installs it to
-`/usr/local/bin/trapd-agent`, registers a hardened systemd service, and sets up a
-daily auto-update timer.
+The installer requires Python 3.9+ and OpenSSL 3+. It verifies signed release
+statements for the agent, eBPF object and updater before installing them, then
+enables the signed agent update path and disables the legacy daily timer. There
+is no checksum-only fallback. See [Linux installation and migration](deploy/README-linux-install.md)
+for enrollment, trust provisioning and migration of existing hosts.
 
 The systemd unit (`deploy/trapd-agent.service`) runs the agent locked down with
 `ProtectSystem=strict`, `ProtectHome=true`, `NoNewPrivileges=true`,

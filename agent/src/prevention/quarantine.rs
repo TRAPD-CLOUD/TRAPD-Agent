@@ -1,6 +1,11 @@
 //! File quarantine + restore.
 //!
-//! Quarantine flow:
+//! Linux uses descriptor-pinned transactions in `quarantine_linux.rs`: it
+//! captures the source in private staging, copies to a fresh mode-000 vault
+//! inode and commits the index before removing the original. Restore verifies
+//! the digest and publishes without replacing an existing destination.
+//!
+//! Windows quarantine flow:
 //!   1. Hash the file (SHA256) → become its on-disk identifier.
 //!   2. Stat original to capture mode/uid/gid/path.
 //!   3. Move into `/var/lib/trapd/quarantine/<sha256>.bin` (same filesystem
@@ -13,20 +18,32 @@
 //!
 //! Restore reverses every step.  Both write to the index atomically.
 
+#[cfg(any(test, not(target_os = "linux")))]
 use std::fs;
+#[cfg(not(target_os = "linux"))]
 use std::io::Read;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(test, not(target_os = "linux")))]
+use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Context, Result};
+#[cfg(not(target_os = "linux"))]
+use anyhow::anyhow;
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "linux"))]
 use sha2::{Digest, Sha256};
+#[cfg(not(target_os = "linux"))]
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::{quarantine_dir, quarantine_index};
+
+#[cfg(target_os = "linux")]
+#[path = "quarantine_linux.rs"]
+mod linux;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuarantineRecord {
@@ -51,6 +68,7 @@ pub struct QuarantineIndex {
     pub records: Vec<QuarantineRecord>,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl QuarantineIndex {
     pub fn load() -> Self {
         let index = quarantine_index();
@@ -74,6 +92,12 @@ impl QuarantineIndex {
 }
 
 /// Quarantine a file.  Returns the record (also persisted to the index).
+#[cfg(target_os = "linux")]
+pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
+    linux::quarantine(path)
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
     #[cfg(windows)]
     {
@@ -108,6 +132,12 @@ pub(super) fn checked_windows_copy_size(sizes: impl IntoIterator<Item = u64>) ->
 /// Automatic targets are untrusted. Windows retains all source/parent handles
 /// through validation and copying so a junction or leaf replacement cannot
 /// redirect privileged file operations after canonicalization.
+#[cfg(target_os = "linux")]
+pub fn quarantine_automatic(path: &Path) -> Result<QuarantineRecord> {
+    linux::quarantine(path)
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn quarantine_automatic(path: &Path) -> Result<QuarantineRecord> {
     #[cfg(windows)]
     {
@@ -124,6 +154,7 @@ pub fn quarantine_automatic(path: &Path) -> Result<QuarantineRecord> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn quarantine_inner(
     path: &Path,
     #[cfg(windows)] native: Option<&mut super::winquarantine::Source>,
@@ -209,6 +240,12 @@ fn quarantine_inner(
 }
 
 /// Reverse quarantine.  Identified by the `QuarantineRecord::id`.
+#[cfg(target_os = "linux")]
+pub fn restore(quarantine_id: &Uuid) -> Result<QuarantineRecord> {
+    linux::restore(quarantine_id)
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn restore(quarantine_id: &Uuid) -> Result<QuarantineRecord> {
     let mut idx = QuarantineIndex::load();
     let pos = idx
@@ -245,6 +282,7 @@ pub fn restore(quarantine_id: &Uuid) -> Result<QuarantineRecord> {
     Ok(record)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn sha256_of(path: &Path) -> Result<String> {
     let mut f = fs::File::open(path).context("open for hashing")?;
     let mut hasher = Sha256::new();
@@ -262,6 +300,7 @@ fn sha256_of(path: &Path) -> Result<String> {
 /// Protect the Windows source before publishing a predictable stored path. A
 /// same-volume rename preserves that owner/DACL; cross-volume copies receive
 /// the protected directory ACL and are explicitly assigned SYSTEM ownership.
+#[cfg(not(target_os = "linux"))]
 fn move_into_quarantine(src: &Path, dst: &Path, original_security: &Option<String>) -> Result<()> {
     #[cfg(windows)]
     lock_down(src)?;
@@ -282,6 +321,7 @@ fn move_into_quarantine(src: &Path, dst: &Path, original_security: &Option<Strin
     result
 }
 
+#[cfg(not(target_os = "linux"))]
 fn move_or_copy(src: &Path, dst: &Path) -> Result<()> {
     let mut attempts = 0;
     loop {
@@ -309,6 +349,7 @@ fn move_or_copy(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// `EXDEV` on Unix, `ERROR_NOT_SAME_DEVICE` on Windows.
+#[cfg(any(test, not(target_os = "linux")))]
 fn cross_device_code() -> i32 {
     if cfg!(windows) {
         17
@@ -318,27 +359,14 @@ fn cross_device_code() -> i32 {
 }
 
 /// `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION`.
+#[cfg(any(test, not(target_os = "linux")))]
 fn is_transient_lock(e: &std::io::Error) -> bool {
     cfg!(windows) && matches!(e.raw_os_error(), Some(32) | Some(33))
-}
-
-#[cfg(target_os = "linux")]
-fn set_mode(p: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(p)?.permissions();
-    perms.set_mode(mode);
-    fs::set_permissions(p, perms)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn set_mode(_p: &Path, _m: u32) -> std::io::Result<()> {
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn chown(p: &Path, uid: u32, gid: u32) -> Result<()> {
-    use nix::unistd::{chown as nix_chown, Gid, Uid};
-    nix_chown(p, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).context("chown failed")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -348,6 +376,7 @@ fn chown(_p: &Path, _u: u32, _g: u32) -> Result<()> {
 
 /// Make the stored payload unusable and tamper-resistant: `chmod 000` +
 /// `chattr +i` on Linux, a SYSTEM/Administrators-only DACL on Windows.
+#[cfg(not(target_os = "linux"))]
 fn lock_down(stored: &Path) -> Result<()> {
     #[cfg(not(windows))]
     {
@@ -366,6 +395,7 @@ fn lock_down(stored: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn unlock(stored: &Path) {
     #[cfg(not(windows))]
     {
@@ -379,6 +409,7 @@ fn unlock(stored: &Path) {
 }
 
 /// Original ACL of `path` (Windows); Unix keeps mode/uid/gid instead.
+#[cfg(not(target_os = "linux"))]
 fn capture_security(path: &Path) -> Result<Option<String>> {
     #[cfg(windows)]
     {
@@ -393,6 +424,7 @@ fn capture_security(path: &Path) -> Result<Option<String>> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn restore_attributes(original: &Path, record: &QuarantineRecord) -> Result<()> {
     #[cfg(not(windows))]
     {
@@ -417,6 +449,7 @@ fn restore_attributes(original: &Path, record: &QuarantineRecord) -> Result<()> 
 
 /// Toggle the ext-family `i` (immutable) attribute via `chattr(1)`.
 #[cfg_attr(windows, allow(dead_code))]
+#[cfg(not(target_os = "linux"))]
 fn chattr_immutable(p: &Path, set: bool) -> Result<()> {
     let flag = if set { "+i" } else { "-i" };
     // Resolve chattr by absolute path rather than via $PATH: a tampered $PATH
@@ -439,6 +472,7 @@ fn chattr_immutable(p: &Path, set: bool) -> Result<()> {
 
 /// First existing well-known absolute path to `chattr`, defaulting to the most
 /// common location so a clear "not found" error surfaces if it is truly absent.
+#[cfg(not(target_os = "linux"))]
 fn chattr_bin() -> &'static str {
     const CANDIDATES: &[&str] = &["/usr/bin/chattr", "/bin/chattr", "/usr/sbin/chattr"];
     CANDIDATES
@@ -618,3 +652,91 @@ mod windows_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_security_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    fn sandbox() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("trapd-quarantine-security-{}", Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn quarantine_rejects_symlink_without_changing_referent() {
+        let dir = sandbox();
+        let victim = dir.join("victim");
+        fs::write(&victim, b"unrelated").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.join("link");
+        symlink(&victim, &link).unwrap();
+        let result = move_into_quarantine(&link, &dir.join("stored"), &None);
+        assert!(result.is_err(), "a symlink must never be quarantined");
+        assert_eq!(fs::metadata(&victim).unwrap().mode() & 0o777, 0o640);
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restore_move_never_clobbers_existing_file() {
+        let dir = sandbox();
+        let stored = dir.join("stored");
+        let destination = dir.join("destination");
+        fs::write(&stored, b"quarantined").unwrap();
+        fs::write(&destination, b"replacement").unwrap();
+        assert!(move_or_copy(&stored, &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+        assert_eq!(fs::read(&stored).unwrap(), b"quarantined");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restore_move_rejects_redirected_parent() {
+        let dir = sandbox();
+        let destination_dir = dir.join("destination");
+        fs::create_dir(&destination_dir).unwrap();
+        let alias = dir.join("alias");
+        symlink(&destination_dir, &alias).unwrap();
+        let stored = dir.join("stored");
+        fs::write(&stored, b"quarantined").unwrap();
+        assert!(move_or_copy(&stored, &alias.join("payload")).is_err());
+        assert!(!destination_dir.join("payload").exists());
+        assert_eq!(fs::read(&stored).unwrap(), b"quarantined");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quarantine_does_not_chmod_hardlinked_file() {
+        let dir = sandbox();
+        let original = dir.join("original");
+        let alias = dir.join("alias");
+        let stored = dir.join("stored");
+        fs::write(&original, b"payload").unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+        let result = move_into_quarantine(&alias, &stored, &None);
+        assert_eq!(fs::metadata(&original).unwrap().mode() & 0o777, 0o640);
+        if result.is_ok() {
+            assert_ne!(
+                fs::metadata(&original).unwrap().ino(),
+                fs::metadata(&stored).unwrap().ino()
+            );
+            unlock(&stored);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn move_or_copy(src: &Path, dst: &Path) -> Result<()> {
+    linux::test_move(src, dst, false)
+}
+#[cfg(all(test, target_os = "linux"))]
+fn move_into_quarantine(src: &Path, dst: &Path, _: &Option<String>) -> Result<()> {
+    linux::test_move(src, dst, true)
+}
+#[cfg(all(test, target_os = "linux"))]
+fn unlock(_: &Path) {}
