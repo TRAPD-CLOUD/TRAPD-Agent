@@ -85,27 +85,62 @@ pub trait Host {
 /// Turn on whatever is missing. Safe to repeat (upgrade, repair): ownership
 /// recorded by an earlier run is kept while the setting is still on.
 pub fn apply(host: &mut dyn Host, prior: Receipt) -> Result<Receipt> {
-    let mut receipt = Receipt::default();
+    apply_recording(host, prior, &mut |_| Ok(()))
+}
+
+/// [`apply`] with a write-ahead receipt: before each machine change the receipt
+/// that includes it is handed to `persist`, and the change is only made once
+/// that succeeded. A change that then fails is taken back out of the receipt.
+/// So a failure half-way, or a receipt that cannot be written, never leaves a
+/// policy change that uninstall cannot find and revert.
+pub fn apply_recording(
+    host: &mut dyn Host,
+    prior: Receipt,
+    persist: &mut dyn FnMut(&Receipt) -> Result<()>,
+) -> Result<Receipt> {
+    // Ownership from earlier runs stays until a setting is seen on without it.
+    let mut receipt = prior;
 
     for audit in AUDITS {
         if host.audit_success(audit)? {
-            receipt.set_owned(audit, prior.owns(audit));
-        } else {
-            host.set_audit_success(audit, true)?;
-            receipt.set_owned(audit, true);
+            continue;
+        }
+        let before = receipt;
+        receipt.set_owned(audit, true);
+        persist(&receipt)?;
+        if let Err(e) = host.set_audit_success(audit, true) {
+            receipt = before;
+            let _ = persist(&receipt);
+            return Err(e);
         }
     }
 
     let current = host.cmdline()?;
-    if current == Some(1) {
-        receipt.set_cmdline = prior.set_cmdline;
-        receipt.prev_cmdline = prior.prev_cmdline;
-    } else {
-        host.set_cmdline(Some(1))?;
+    if current != Some(1) {
+        let before = receipt;
         receipt.set_cmdline = true;
         receipt.prev_cmdline = current;
+        persist(&receipt)?;
+        if let Err(e) = host.set_cmdline(Some(1)) {
+            receipt = before;
+            let _ = persist(&receipt);
+            return Err(e);
+        }
     }
     Ok(receipt)
+}
+
+/// Undo what one `apply` added on top of `prior`: only the settings `current`
+/// owns that `prior` did not. Used when the install transaction rolls back, so
+/// ownership inherited from an earlier install stays in place.
+pub fn rollback(host: &mut dyn Host, prior: Receipt, current: Receipt) -> Result<()> {
+    let added = Receipt {
+        set_process_audit: current.set_process_audit && !prior.set_process_audit,
+        set_file_audit: current.set_file_audit && !prior.set_file_audit,
+        set_cmdline: current.set_cmdline && !prior.set_cmdline,
+        prev_cmdline: current.prev_cmdline,
+    };
+    restore(host, added)
 }
 
 /// Undo exactly what [`apply`] did, and only while the setting is still as we
@@ -142,8 +177,9 @@ pub use windows_host::run_cli;
 
 #[cfg(windows)]
 mod windows_host {
-    use super::{apply, restore, Host, Receipt};
+    use super::{apply_recording, restore, rollback, Host, Receipt};
     use anyhow::{anyhow, bail, Context, Result};
+    use serde::{Deserialize, Serialize};
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -234,6 +270,16 @@ mod windows_host {
         crate::paths::state_dir().join("audit_baseline.json")
     }
 
+    /// The receipt as it was before the current install transaction touched it.
+    fn snapshot_path() -> PathBuf {
+        crate::paths::state_dir().join("audit_baseline.rollback.json")
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Snapshot {
+        prior: Option<Receipt>,
+    }
+
     fn load_receipt() -> Receipt {
         std::fs::read(receipt_path())
             .ok()
@@ -241,24 +287,63 @@ mod windows_host {
             .unwrap_or_default()
     }
 
-    /// `trapd-agent.exe audit-baseline apply|restore`
+    fn write_receipt(receipt: &Receipt) -> Result<()> {
+        crate::paths::write_atomic(&receipt_path(), &serde_json::to_vec(receipt)?, 0o600)
+            .context("record audit baseline receipt")
+    }
+
+    fn remove(path: PathBuf) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// `trapd-agent.exe audit-baseline apply|restore|rollback`
     pub fn run_cli(verb: Option<&str>) -> Result<()> {
         crate::paths::init_state_dir();
         let mut host = WindowsHost;
         match verb {
             Some("apply") => {
-                let receipt = apply(&mut host, load_receipt())?;
-                std::fs::write(receipt_path(), serde_json::to_vec(&receipt)?)
-                    .context("record audit baseline receipt")
+                let prior = load_receipt();
+                let had_receipt = receipt_path().exists();
+                // Kept so a failed install transaction can put things back.
+                crate::paths::write_atomic(
+                    &snapshot_path(),
+                    &serde_json::to_vec(&Snapshot {
+                        prior: had_receipt.then_some(prior),
+                    })?,
+                    0o600,
+                )
+                .context("record audit baseline rollback snapshot")?;
+                apply_recording(&mut host, prior, &mut write_receipt).map(|_| ())
+            }
+            Some("rollback") => {
+                // Runs only if the install transaction failed after `apply`.
+                let Some(snapshot) = std::fs::read(snapshot_path())
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Snapshot>(&b).ok())
+                else {
+                    return Ok(());
+                };
+                let result = rollback(
+                    &mut host,
+                    snapshot.prior.unwrap_or_default(),
+                    load_receipt(),
+                );
+                match snapshot.prior {
+                    Some(prior) => write_receipt(&prior)?,
+                    None => remove(receipt_path())?,
+                }
+                remove(snapshot_path())?;
+                result
             }
             Some("restore") => {
                 restore(&mut host, load_receipt())?;
-                match std::fs::remove_file(receipt_path()) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-                    _ => Ok(()),
-                }
+                remove(snapshot_path())?;
+                remove(receipt_path())
             }
-            _ => bail!("usage: trapd-agent.exe audit-baseline apply|restore"),
+            _ => bail!("usage: trapd-agent.exe audit-baseline apply|restore|rollback"),
         }
     }
 }
@@ -442,5 +527,60 @@ mod tests {
         let old = r#"{"set_audit_success":true,"set_cmdline":true,"prev_cmdline":null}"#;
         let receipt: Receipt = serde_json::from_str(old).unwrap();
         assert!(receipt.set_process_audit && !receipt.set_file_audit && receipt.set_cmdline);
+    }
+
+    #[test]
+    fn a_partial_apply_keeps_ownership_of_what_it_already_changed() {
+        let mut host = Fake {
+            fail_on: Some(Audit::FileSystem),
+            ..Default::default()
+        };
+        let mut saved = Vec::new();
+        let result = apply_recording(&mut host, Receipt::default(), &mut |r| {
+            saved.push(*r);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(host.process_audit, "the first change was made");
+        let last = saved.last().unwrap();
+        assert!(last.set_process_audit, "and is still recorded");
+        assert!(!last.set_file_audit, "the failed one is not claimed");
+        assert!(!last.set_cmdline);
+    }
+
+    #[test]
+    fn a_receipt_that_cannot_be_written_stops_before_any_change() {
+        let mut host = Fake::default();
+        let result = apply_recording(&mut host, Receipt::default(), &mut |_| {
+            Err(anyhow!("disk full"))
+        });
+        assert!(result.is_err());
+        assert!(host.writes.is_empty(), "no untracked policy change");
+    }
+
+    #[test]
+    fn rollback_reverts_only_what_this_transaction_added() {
+        // An earlier install already owns the process audit; this run adds the rest.
+        let mut host = Fake {
+            process_audit: true,
+            ..Default::default()
+        };
+        let prior = Receipt {
+            set_process_audit: true,
+            ..Default::default()
+        };
+        let current = apply(&mut host, prior).unwrap();
+        assert!(host.file_audit && host.cmdline == Some(1));
+        rollback(&mut host, prior, current).unwrap();
+        assert!(host.process_audit, "inherited ownership is preserved");
+        assert!(!host.file_audit && host.cmdline.is_none());
+    }
+
+    #[test]
+    fn rollback_of_a_fresh_install_returns_the_host_to_its_original_state() {
+        let mut host = Fake::default();
+        let current = apply(&mut host, Receipt::default()).unwrap();
+        rollback(&mut host, Receipt::default(), current).unwrap();
+        assert!(!host.process_audit && !host.file_audit && host.cmdline.is_none());
     }
 }
