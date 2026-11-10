@@ -129,7 +129,10 @@ pub fn quarantine(path: &Path) -> Result<QuarantineRecord> {
             .context("quarantine target is protected or invalid")?;
         #[cfg(target_os = "linux")]
         {
-            linux::quarantine(Path::new(&validated))
+            // Validate protected locations, but capture the supplied name with
+            // no-follow resolution: canonicalization must not hide a symlink.
+            let _ = validated;
+            linux::quarantine(path)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -798,7 +801,7 @@ mod linux_security_tests {
         fs::set_permissions(&victim, fs::Permissions::from_mode(0o640)).unwrap();
         let link = dir.join("link");
         symlink(&victim, &link).unwrap();
-        let result = move_into_quarantine(&link, &dir.join("stored"), &None);
+        let result = quarantine(&link);
         assert!(result.is_err(), "a symlink must never be quarantined");
         assert_eq!(fs::metadata(&victim).unwrap().mode() & 0o777, 0o640);
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());

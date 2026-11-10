@@ -47,9 +47,10 @@ Publish the new signed release assets before distributing the new installer.
 
 ## Verification
 
-- Full Linux workspace suite: 1,177 tests passed, 11 intentionally ignored.
+- Full Linux workspace suite: 1,228 tests passed, 11 intentionally ignored.
 - Linux workspace Clippy, all targets, warnings denied: passed.
-- Linux optimized release build: passed; version smoke check: `trapd-agent v0.7.2`.
+- Linux optimized release build passed on the original 0.7.2 baseline; the PR
+  is rebased onto 0.7.4 and its release build is also covered by CI.
 - Sixteen executable bootstrap tests: passed, including authentic statements
   from the Rust release signer, forged checksums, bad/missing signatures/keys,
   wrong platform/version, downgrade and unsafe trust-directory refusal.
@@ -63,3 +64,10 @@ Publish the new signed release assets before distributing the new installer.
 
 The tests exercise controlled filesystem failures and adversarial paths, not an
 actual power-loss event. No host installation, fleet rollout or release was run.
+
+## Integration onto current main
+
+Rebased onto `b104656` (0.7.4). The existing `prevention/linuxpin.rs` now owns
+the secure Linux transactions; protected OS/agent path checks and newer Windows
+response behavior are retained. Strict nonce-store loading supersedes the old
+in-memory corruption cutoff, so corrupt state rejects verifier construction.
