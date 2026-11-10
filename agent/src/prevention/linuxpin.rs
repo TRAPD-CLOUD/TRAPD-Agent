@@ -169,6 +169,17 @@ fn copy_new(source: &Path, directory: &OwnedFd, name: &CString) -> Result<()> {
     }
     // SAFETY: successful openat returned a descriptor nothing else owns.
     let mut output = unsafe { File::from_raw_fd(raw) };
+    let copied = fill(&mut input, &mut output, &metadata)
+        .and_then(|()| std::fs::remove_file(source).context("remove quarantined copy"));
+    if copied.is_err() {
+        // The file stays in quarantine. A partial target left behind would
+        // count as occupied and block every later restore.
+        remove_created(directory, name, &output);
+    }
+    copied
+}
+
+fn fill(input: &mut File, output: &mut File, metadata: &std::fs::Metadata) -> Result<()> {
     let mut buffer = [0u8; 65_536];
     loop {
         let count = input.read(&mut buffer).context("read quarantined file")?;
@@ -184,8 +195,30 @@ fn copy_new(source: &Path, directory: &OwnedFd, name: &CString) -> Result<()> {
     // SAFETY: valid descriptor; numeric ids.
     let _ = unsafe { libc::fchown(output.as_raw_fd(), metadata.uid(), metadata.gid()) };
     let _ = output.set_permissions(metadata.permissions());
-    output.sync_all().context("sync restore target")?;
-    std::fs::remove_file(source).context("remove quarantined copy")
+    output.sync_all().context("sync restore target")
+}
+
+/// Remove `name` only while it is still the file this restore created, so a
+/// file someone else put there in the meantime is left alone.
+fn remove_created(directory: &OwnedFd, name: &CString, created: &File) {
+    let Ok(ours) = created.metadata() else {
+        return;
+    };
+    // SAFETY: all-zero is a valid `stat`; it is only read after fstatat fills it.
+    let mut found: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: valid directory descriptor, NUL-terminated name, writable buffer.
+    let status = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            &mut found,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status == 0 && found.st_dev == ours.dev() && found.st_ino == ours.ino() {
+        // SAFETY: valid directory descriptor and NUL-terminated name.
+        unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    }
 }
 
 #[cfg(test)]
@@ -212,6 +245,48 @@ mod tests {
         let restored = std::fs::symlink_metadata(root.join("restored")).unwrap();
         assert_eq!(restored.permissions().mode() & 0o7777, 0o640);
         assert!(!source.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("trapd-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_no_partial_target_behind() {
+        let root = scratch("partial");
+        // A directory opens for reading but every read fails, after the target
+        // has been created.
+        let source = root.join("stored");
+        std::fs::create_dir(&source).unwrap();
+        let directory = open_directory(&root).unwrap();
+        let name = c_bytes(OsStr::new("restored")).unwrap();
+        assert!(copy_new(&source, &directory, &name).is_err());
+        assert!(std::fs::symlink_metadata(root.join("restored")).is_err());
+        assert!(source.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_spares_a_file_that_replaced_the_created_one() {
+        let root = scratch("replaced");
+        let created = File::create(root.join("restored")).unwrap();
+        std::fs::remove_file(root.join("restored")).unwrap();
+        std::fs::write(root.join("restored"), b"someone else").unwrap();
+        let directory = open_directory(&root).unwrap();
+        remove_created(
+            &directory,
+            &c_bytes(OsStr::new("restored")).unwrap(),
+            &created,
+        );
+        assert_eq!(
+            std::fs::read(root.join("restored")).unwrap(),
+            b"someone else"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     use std::os::unix::fs::symlink;
