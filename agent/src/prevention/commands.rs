@@ -42,7 +42,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::policy::IocRule;
@@ -315,7 +315,7 @@ pub fn verify_canonical<T: Serialize>(
 impl Verifier {
     pub fn new(pubkey_path: &Path, agent_id: String, nonce_store_path: &Path) -> Result<Self> {
         let key = load_verifying_key(pubkey_path)?;
-        let nonces = Arc::new(Mutex::new(NonceStore::load(nonce_store_path)));
+        let nonces = Arc::new(Mutex::new(NonceStore::load(nonce_store_path)?));
         info!(path = %pubkey_path.display(), "Response-command verifier loaded");
         Ok(Self {
             key,
@@ -363,15 +363,15 @@ impl Verifier {
             .nonces
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if !store.try_insert(
-            cmd.envelope.nonce,
-            cmd.envelope.issued_at,
-            cmd.envelope.expires_at,
-        ) {
-            return Verdict::Rejected(format!(
-                "replay: nonce {} already seen, or issued before the nonce store was lost",
-                cmd.envelope.nonce
-            ));
+        match store.try_insert(cmd.envelope.nonce, cmd.envelope.expires_at) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Verdict::Rejected(format!(
+                    "replay: nonce {} already seen",
+                    cmd.envelope.nonce
+                ))
+            }
+            Err(e) => return Verdict::Rejected(format!("cannot persist replay protection: {e:#}")),
         }
         drop(store);
 
@@ -385,7 +385,7 @@ impl Verifier {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NonceRecord {
     nonce: Uuid,
     expires_at: DateTime<Utc>,
@@ -395,111 +395,48 @@ struct NonceStore {
     path: std::path::PathBuf,
     seen: HashSet<Uuid>,
     records: Vec<NonceRecord>,
-    /// Commands issued before this instant are refused. Set when the store
-    /// on disk could not be read: the nonces it held are unknown, so any
-    /// still-valid command issued before the loss might be a replay.
-    replay_floor: Option<DateTime<Utc>>,
 }
 
 impl NonceStore {
-    fn load(path: &Path) -> Self {
-        let (records, replay_floor) = match std::fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice::<Vec<NonceRecord>>(&bytes) {
-                Ok(records) => (records, None),
-                Err(e) => {
-                    // Fail closed: an unreadable store must not reopen the
-                    // replay window for every command it recorded.
-                    tracing::error!(
-                        path = %path.display(),
-                        error = %e,
-                        "command nonce store is corrupt; refusing commands issued before now"
-                    );
-                    (Vec::new(), Some(Utc::now()))
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
-            Err(e) => {
-                tracing::error!(
-                    path = %path.display(),
-                    error = %e,
-                    "command nonce store is unreadable; refusing commands issued before now"
-                );
-                (Vec::new(), Some(Utc::now()))
-            }
+    fn load(path: &Path) -> Result<Self> {
+        let records: Vec<NonceRecord> = match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("invalid command nonce store")?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e).context("cannot read command nonce store"),
         };
         let seen = records.iter().map(|r| r.nonce).collect();
-        Self {
+        Ok(Self {
             path: path.to_path_buf(),
             seen,
             records,
-            replay_floor,
-        }
+        })
     }
 
-    fn try_insert(
-        &mut self,
-        nonce: Uuid,
-        issued_at: DateTime<Utc>,
-        expires_at: DateTime<Utc>,
-    ) -> bool {
+    fn try_insert(&mut self, nonce: Uuid, expires_at: DateTime<Utc>) -> Result<bool> {
+        anyhow::ensure!(
+            self.path.parent().is_some_and(Path::is_dir),
+            "command replay state directory is unavailable"
+        );
         if self.seen.contains(&nonce) {
-            return false;
-        }
-        if self.replay_floor.is_some_and(|floor| issued_at < floor) {
-            return false;
+            return Ok(false);
         }
         let now = Utc::now();
-        self.records.retain(|r| r.expires_at > now);
-        self.seen.clear();
-        for r in &self.records {
-            self.seen.insert(r.nonce);
-        }
+        let mut records: Vec<_> = self
+            .records
+            .iter()
+            .filter(|r| r.expires_at > now)
+            .cloned()
+            .collect();
+        records.push(NonceRecord { nonce, expires_at });
 
-        self.records.push(NonceRecord { nonce, expires_at });
-        self.seen.insert(nonce);
-
-        if let Ok(bytes) = serde_json::to_vec(&self.records) {
-            if let Err(e) = atomic_write(&self.path, &bytes) {
-                warn!(error = %e, "cannot persist nonce store");
-            }
-        }
-        true
+        // No command may execute before its nonce is durable. Stage changes so
+        // a failed write does not consume the nonce and prevent a safe retry.
+        let bytes = serde_json::to_vec(&records)?;
+        crate::paths::write_atomic(&self.path, &bytes, 0o600)?;
+        self.seen = records.iter().map(|r| r.nonce).collect();
+        self.records = records;
+        Ok(true)
     }
-}
-
-/// Write a file atomically — write to a sibling temp file, fsync, rename.
-///
-/// The temp file is created owner-only (`0600`) before any bytes are written so
-/// the nonce store is never momentarily world-readable: a local attacker must
-/// not be able to learn which command nonces have been processed.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = create_owner_only(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
-}
-
-#[cfg(unix)]
-fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::create(path)
 }
 
 #[cfg(test)]
@@ -629,6 +566,53 @@ mod cross_lang_tests {
         std::fs::write(&pub_path, hex::decode(PUB_HEX).unwrap()).unwrap();
         let v = Verifier::new(&pub_path, "agent-test".into(), &nonce_path).unwrap();
         (v, pub_path, nonce_path)
+    }
+
+    #[test]
+    fn replay_state_rejects_corrupt_or_unreadable_nonce_store() {
+        let (_, p, n) = verifier();
+        std::fs::write(&n, b"not json").unwrap();
+        assert!(Verifier::new(&p, "agent-test".into(), &n).is_err());
+        std::fs::remove_file(&n).unwrap();
+        std::fs::create_dir(&n).unwrap();
+        assert!(Verifier::new(&p, "agent-test".into(), &n).is_err());
+        std::fs::remove_dir(n).unwrap();
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn replay_state_rejects_failed_nonce_save_and_allows_retry_after_repair() {
+        let (v, p, n) = verifier();
+        let cmd: SignedCommand =
+            serde_json::from_str(&format!(r#"{{"envelope":{ENV1},"signature":"{SIG1}"}}"#))
+                .unwrap();
+        std::fs::create_dir(&n).unwrap();
+        assert!(
+            matches!(v.verify(&cmd), Verdict::Rejected(_)),
+            "unsaved nonce accepted"
+        );
+        std::fs::remove_dir(&n).unwrap();
+        assert!(
+            matches!(v.verify(&cmd), Verdict::Ok(_)),
+            "failed save consumed nonce"
+        );
+        let restarted = Verifier::new(&p, "agent-test".into(), &n).unwrap();
+        assert!(
+            matches!(restarted.verify(&cmd), Verdict::Rejected(_)),
+            "replay accepted after restart"
+        );
+        std::fs::remove_file(n).unwrap();
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn replay_state_does_not_create_missing_nonce_parent() {
+        let parent = temp_path("absent-state");
+        let mut store = NonceStore::load(&parent.join("nonces.json")).unwrap();
+        assert!(store
+            .try_insert(Uuid::new_v4(), Utc::now() + chrono::Duration::hours(1))
+            .is_err());
+        assert!(!parent.exists());
     }
 
     #[test]
@@ -768,14 +752,10 @@ mod cross_lang_tests {
         let nonce_path = temp_path("nonces.json");
         std::fs::write(&pub_path, hex::decode(PUB_HEX).unwrap()).unwrap();
         std::fs::write(&nonce_path, b"{not json").unwrap();
-        let v = Verifier::new(&pub_path, "agent-test".into(), &nonce_path).unwrap();
+        assert!(Verifier::new(&pub_path, "agent-test".into(), &nonce_path).is_err());
         let cmd: SignedCommand =
             serde_json::from_str(&format!(r#"{{"envelope":{ENV1},"signature":"{SIG1}"}}"#))
                 .unwrap();
-        match v.verify(&cmd) {
-            Verdict::Rejected(why) => assert!(why.contains("replay"), "{why}"),
-            Verdict::Ok(_) => panic!("command issued before the store loss was accepted"),
-        }
         // A missing store is a first start, not a loss.
         let _ = std::fs::remove_file(&nonce_path);
         let v = Verifier::new(&pub_path, "agent-test".into(), &nonce_path).unwrap();

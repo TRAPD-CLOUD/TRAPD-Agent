@@ -194,30 +194,40 @@ fn dir_from_env(env: &str, default: PathBuf) -> PathBuf {
     std::env::var(env).map(PathBuf::from).unwrap_or(default)
 }
 
-/// Resolve the state directory, preferring the canonical location and falling
-/// back to a writable alternative so the agent never fails to start merely
-/// because it cannot persist its identity.
+/// Preserve an explicit or existing state location even when it is unavailable.
+/// Falling back then would silently discard identity and replay protection.
+/// Developer fallbacks are only considered for locations that do not exist.
 fn resolve_state_dir() -> PathBuf {
+    resolve_state_dir_from(
+        std::env::var("TRAPD_STATE_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from),
+        default_state_dir(),
+        xdg_fallbacks(),
+        std::env::temp_dir().join(format!("trapd-{}", current_uid())),
+    )
+}
+
+fn resolve_state_dir_from(
+    explicit: Option<PathBuf>,
+    canonical: PathBuf,
+    fallbacks: Vec<PathBuf>,
+    tmp: PathBuf,
+) -> PathBuf {
     // 1. Explicit override always wins (set by the systemd unit).
-    if let Ok(dir) = std::env::var("TRAPD_STATE_DIR") {
-        if !dir.trim().is_empty() {
-            let p = PathBuf::from(dir);
-            if ensure_writable(&p) {
-                return p;
-            }
-            warn!(dir = %p.display(), "TRAPD_STATE_DIR is not writable — falling back");
-        }
+    if let Some(p) = explicit {
+        return p;
     }
 
     // 2. Canonical system location.
-    let canonical = default_state_dir();
-    if ensure_writable(&canonical) {
+    if existing_or_inaccessible(&canonical) || ensure_writable(&canonical) {
         return canonical;
     }
 
     // 3. XDG state home / $HOME (developer / non-root execution).
-    for candidate in xdg_fallbacks() {
-        if ensure_writable(&candidate) {
+    for candidate in fallbacks {
+        if existing_or_inaccessible(&candidate) || ensure_writable(&candidate) {
             warn!(
                 dir = %candidate.display(),
                 canonical = %canonical.display(),
@@ -229,10 +239,13 @@ fn resolve_state_dir() -> PathBuf {
 
     // 4. Last resort: a per-uid temp directory.  Identity will not survive a
     //    reboot, but the agent still runs.
-    let tmp = std::env::temp_dir().join(format!("trapd-{}", current_uid()));
     let _ = std::fs::create_dir_all(&tmp);
     warn!(dir = %tmp.display(), "using ephemeral state dir — identity will not persist across reboots");
     tmp
+}
+
+fn existing_or_inaccessible(path: &Path) -> bool {
+    !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn xdg_fallbacks() -> Vec<PathBuf> {
@@ -349,8 +362,8 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
         f.sync_all()
             .with_context(|| format!("fsync temp {}", tmp.display()))?;
         drop(f);
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+        durable_replace(&tmp, path)
+            .with_context(|| format!("durable rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     })();
 
@@ -358,6 +371,48 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     write_result
+}
+
+// On Unix, syncing file contents does not persist the renamed directory entry.
+#[cfg(not(windows))]
+fn durable_replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)?;
+    std::fs::File::open(path.parent().unwrap())?.sync_all()
+}
+
+// Windows has no portable directory fsync. Request a write-through replacement
+// explicitly; std::fs::rename only supplies MOVEFILE_REPLACE_EXISTING.
+#[cfg(windows)]
+fn durable_replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let wide = |p: &Path| -> std::io::Result<Vec<u16>> {
+        let mut value: Vec<u16> = p.as_os_str().encode_wide().collect();
+        if value.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains NUL",
+            ));
+        }
+        value.push(0);
+        Ok(value)
+    };
+    let source = wide(tmp)?;
+    let destination = wide(path)?;
+    // SAFETY: Both paths are live, NUL-terminated UTF-16 buffers.
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Create `path` fresh, atomically restricted to `mode` from the moment it
@@ -425,6 +480,38 @@ mod tests {
         assert_eq!(label.len(), 71);
         assert!(label[7..].bytes().all(|b| b.is_ascii_hexdigit()));
         assert!(bounded_regular_sha256_label(&file, 2).is_err());
+    }
+
+    #[test]
+    fn replay_state_resolution_never_changes_explicit_or_existing_location() {
+        let root = scratch_dir("stable_state");
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let fallback = root.join("fallback");
+        assert_eq!(
+            resolve_state_dir_from(
+                Some(blocked.clone()),
+                root.join("canonical"),
+                vec![fallback.clone()],
+                root.join("tmp")
+            ),
+            blocked
+        );
+        assert_eq!(
+            resolve_state_dir_from(
+                None,
+                blocked.clone(),
+                vec![fallback.clone()],
+                root.join("tmp")
+            ),
+            blocked
+        );
+        let inaccessible = blocked.join("state");
+        assert_eq!(
+            resolve_state_dir_from(None, inaccessible.clone(), vec![fallback], root.join("tmp")),
+            inaccessible
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The whole point of the fix: the temp file must come into existence

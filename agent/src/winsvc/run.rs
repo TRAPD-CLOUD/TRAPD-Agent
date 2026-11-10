@@ -252,7 +252,7 @@ pub async fn run_agent(mut stop: tokio::sync::mpsc::UnboundedReceiver<()>) -> Re
         "TRAPD Agent started (windows)"
     );
 
-    let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()));
+    let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()?));
     let spool = if offline {
         Spool::in_memory(pipeline::SPOOL_MAX_MEMORY)
     } else {

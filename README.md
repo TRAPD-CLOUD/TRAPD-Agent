@@ -229,15 +229,19 @@ baseline at startup. Changes under `/etc/trapd` produce tamper events.
 
 ## Installation
 
-The installer fetches the latest release, installs `trapd-agent` and the
-`trapd-update` script, and registers the systemd service and a daily update timer
-(03:00). Review the script before you run it:
+Download the installer through a trusted channel, inspect it, and supply the
+independently provisioned release public key:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/trapd-cloud/trapd-agent/main/deploy/install.sh
 less install.sh
-sudo bash install.sh
+sudo TRAPD_RELEASE_PUBKEY_B64='<independently obtained public key>' bash install.sh
 ```
+
+The installer requires Python 3.9+ and OpenSSL 3+. It verifies signed release
+statements for the agent, eBPF object and updater before installing them, then
+enables the signed agent update path and disables the legacy daily timer. There
+is no checksum-only fallback. See [Linux installation and migration](deploy/README-linux-install.md)
+for enrollment, trust provisioning and migration of existing hosts.
 
 Then provide the configuration (see [Configuration](#configuration)). An online
 agent needs `ca.crt` in `/etc/trapd`:

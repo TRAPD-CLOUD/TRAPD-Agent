@@ -13,6 +13,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: REQUIRE_DOCKER=1 deploy/deb/test-deb.sh
       - run: deploy/test-deception-dropin.sh
+      - run: python3 deploy/embed-release-verifier.py --check
+      - run: python3 deploy/test-release-verification.py
 
   build:
     runs-on: ubuntu-latest
@@ -34,6 +36,10 @@ jobs:
         run: |
           python3 -m pip install -r scripts/ocsf/requirements.txt
           scripts/ocsf_validate.sh
+      - name: Verify bootstrap compatibility with the Rust release signer
+        run: |
+          cargo build --locked -p xtask
+          TRAPD_TEST_XTASK="$PWD/target/debug/xtask" python3 deploy/test-release-verification.py ReleaseVerification.test_rust_release_signer_output_is_accepted_by_bootstrap
 
       # Telemetry-pipeline acceptance gate. The unit and integration suites
       # above already cover the loss-transparency contract (stable event ids,

@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
         #[cfg(target_os = "windows")]
         {
             paths::init_state_dir();
-            collectors::windows::honeytokens::uninstall(&config::load_persisted());
+            collectors::windows::honeytokens::uninstall();
             crate::deception::activity::ActivityStore::purge(
                 &crate::deception::activity::state_path(),
             );
@@ -259,7 +259,7 @@ async fn main() -> Result<()> {
     // Start from the last verified config on disk (defaults on first run), so a
     // restart keeps the real configuration even though the signed-config channel
     // re-serves it with an already-accepted (and thus replay-rejected) issued_at.
-    let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()));
+    let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()?));
     if let Ok(cfg) = agent_config.read() {
         detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
         detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
