@@ -16,6 +16,22 @@ jobs:
       - run: python3 deploy/embed-release-verifier.py --check
       - run: python3 deploy/test-release-verification.py
 
+  # RustSec advisory scan of Cargo.lock. cargo-audit (not cargo-deny): we only
+  # need the advisory check, it needs no config file, and a prebuilt binary
+  # installs in seconds. Non-flaky: advisory-db is fetched fresh, but only
+  # *vulnerabilities* fail the job; warnings (unmaintained/yanked) are shown
+  # without blocking, so an upstream advisory on a transitive crate does not
+  # silently turn every unrelated PR red.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
+      - run: cargo audit --file Cargo.lock
+
   build:
     runs-on: ubuntu-latest
     steps:

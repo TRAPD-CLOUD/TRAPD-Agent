@@ -876,12 +876,10 @@ mod signed_config_tests {
     use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
 
+    /// Unique per call. A clock-based name collides between parallel tests on
+    /// Windows, where the system clock ticks far more coarsely than on Linux.
     fn tmp(suffix: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("trapd_cfg_{nanos}_{suffix}"))
+        std::env::temp_dir().join(format!("trapd_cfg_{}_{suffix}", uuid::Uuid::new_v4()))
     }
 
     fn signing_key() -> SigningKey {

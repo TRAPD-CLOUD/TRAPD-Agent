@@ -1,27 +1,35 @@
 //! Windows entry point: CLI verbs + Service Control Manager integration.
 //!
 //! ```text
-//! trapd-agent.exe install     register as a Windows Service (auto-start) and start it
-//! trapd-agent.exe uninstall   stop the service, delete it, remove the binary
+//! trapd-agent.exe install     DEV ONLY: register as a Windows Service and start it
+//! trapd-agent.exe uninstall   DEV ONLY: stop + delete the service, remove the binary
 //! trapd-agent.exe run         run in the foreground (console / debugging)
 //! trapd-agent.exe             service entry (started by the SCM); falls back
 //!                             to console mode when launched interactively
 //! ```
 //!
+//! `install` / `uninstall` bypass the MSI (no failure actions, no directory
+//! ACLs) and are refused on an MSI-managed machine; see `refuse_if_msi_managed`.
+//! Production installs, upgrades and removal go through the MSI.
+//!
 //! The actual agent runtime (enrollment, heartbeat, collectors, transport)
 //! lives in [`run`], built from the same shared modules as the Linux agent.
 
+mod evtlog;
 mod run;
 
 use std::ffi::OsString;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceDependency, ServiceErrorControl,
+    ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service_control_handler::{
+    self, ServiceControlHandlerResult, ServiceStatusHandle,
+};
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -40,8 +48,14 @@ pub fn entry() -> Result<()> {
             println!("trapd-agent v{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some("install") => install(),
-        Some("uninstall") => uninstall(),
+        Some("install") => {
+            refuse_if_msi_managed("install")?;
+            install()
+        }
+        Some("uninstall") => {
+            refuse_if_msi_managed("uninstall")?;
+            uninstall()
+        }
         // Started by the service (from a copy of itself) after it staged a
         // verified update; see `update::windows`.
         Some("--apply-update") => {
@@ -54,11 +68,18 @@ pub fn entry() -> Result<()> {
         Some("audit-baseline") => {
             crate::audit_baseline::run_cli(std::env::args().nth(2).as_deref())
         }
+        // Invoked by the MSI (`CleanupDecoys`, Return="check") before the
+        // service and binary are removed. Decoy removal is best-effort and
+        // runs first so a firewall failure cannot skip it; leftover
+        // containment rules can keep the host isolated with no agent left to
+        // lift them, so only that failure is returned (non-zero exit) and
+        // blocks the uninstall, with the cause in agent.log.
         Some("cleanup") => {
-            crate::prevention::winfirewall::cleanup()
-                .context("remove containment firewall rules")?;
+            run::init_tracing_file();
             crate::collectors::windows::honeytokens::uninstall();
-            Ok(())
+            crate::prevention::winfirewall::cleanup()
+                .inspect_err(|e| tracing::error!("firewall cleanup failed: {e:#}"))
+                .context("remove containment firewall rules")
         }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("telemetry") => {
             print!("{}", crate::telemetry::diagnostics::run());
@@ -89,17 +110,27 @@ pub fn entry() -> Result<()> {
 
 // ── Console mode ──────────────────────────────────────────────────────────────
 
+/// How long the runtime may take to drop its blocking tasks (Event Log
+/// reads, firewall COM calls) on shutdown before they are abandoned. Dropping
+/// a runtime waits for `spawn_blocking` tasks indefinitely, which would leave
+/// the service in STOP_PENDING until the SCM kills it.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn run_console() -> Result<()> {
     run::init_tracing_stderr();
+    // Single-threaded here: no runtime exists yet (see `load_config_env`).
+    run::load_config_env();
     let rt = tokio::runtime::Runtime::new().context("build tokio runtime")?;
-    rt.block_on(async {
+    let result = rt.block_on(async {
         let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             let _ = stop_tx.send(());
         });
-        run::run_agent(stop_rx).await
-    })
+        run::run_agent(stop_rx, || {}).await
+    });
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
 }
 
 // ── Service mode ──────────────────────────────────────────────────────────────
@@ -112,15 +143,115 @@ fn service_main(_args: Vec<OsString>) {
     run::init_tracing_file();
     if let Err(e) = run_service() {
         tracing::error!("service failed: {e:#}");
+        // Top-level message only: the Application log is world-readable.
+        evtlog::notify(
+            evtlog::Event::Fatal,
+            &format!("TRAPD Agent service failed: {e}. See agent.log for details."),
+        );
     }
 }
 
-fn run_service() -> Result<()> {
-    let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
+/// Lifecycle phase reported to the SCM.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// Initialising, up to and including the self-integrity check.
+    Starting,
+    Running,
+    Stopping,
+    /// Terminates the reporter thread; the caller reports `Stopped` itself.
+    Done,
+}
 
+/// Wait hint for pending states; the reporter bumps the checkpoint well inside it.
+const PENDING_WAIT_HINT: Duration = Duration::from_secs(30);
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The SCM status for a phase. Pending states accept no controls and carry a
+/// checkpoint + wait hint; `Running` accepts stop/shutdown.
+fn status_for(phase: Phase, checkpoint: u32, exit: ServiceExitCode) -> ServiceStatus {
+    let (state, accepted, hint) = match phase {
+        Phase::Starting => (
+            ServiceState::StartPending,
+            ServiceControlAccept::empty(),
+            PENDING_WAIT_HINT,
+        ),
+        Phase::Running => (
+            ServiceState::Running,
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            Duration::default(),
+        ),
+        Phase::Stopping => (
+            ServiceState::StopPending,
+            ServiceControlAccept::empty(),
+            PENDING_WAIT_HINT,
+        ),
+        Phase::Done => (
+            ServiceState::Stopped,
+            ServiceControlAccept::empty(),
+            Duration::default(),
+        ),
+    };
+    let pending = matches!(phase, Phase::Starting | Phase::Stopping);
+    ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: state,
+        controls_accepted: accepted,
+        exit_code: exit,
+        checkpoint: if pending { checkpoint } else { 0 },
+        wait_hint: hint,
+        process_id: None,
+    }
+}
+
+fn report_status(handle: &ServiceStatusHandle, status: ServiceStatus) {
+    let state = status.current_state;
+    if let Err(e) = handle.set_service_status(status) {
+        tracing::warn!(error = %e, ?state, "could not report service status to the SCM");
+    }
+}
+
+/// Drive SCM status from phase changes and keep pending states alive with
+/// increasing checkpoints until the phase changes.
+fn spawn_status_reporter(
+    handle: ServiceStatusHandle,
+    phases: mpsc::Receiver<Phase>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let ok = ServiceExitCode::Win32(0);
+        let mut phase = Phase::Starting;
+        let mut checkpoint = 1u32;
+        report_status(&handle, status_for(phase, checkpoint, ok));
+        loop {
+            match phases.recv_timeout(CHECKPOINT_INTERVAL) {
+                Ok(Phase::Done) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Ok(next) => {
+                    // Never leave Stopping once entered (a late Running must not win).
+                    if phase == Phase::Stopping && next != Phase::Stopping {
+                        continue;
+                    }
+                    phase = next;
+                    checkpoint = 1;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => checkpoint += 1,
+            }
+            report_status(&handle, status_for(phase, checkpoint, ok));
+        }
+    })
+}
+
+fn run_service() -> Result<()> {
+    // Still single-threaded: configure the environment before the control
+    // handler thread and the Tokio runtime exist.
+    run::load_config_env();
+
+    let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (phase_tx, phase_rx) = mpsc::channel::<Phase>();
+
+    let handler_phase_tx = phase_tx.clone();
     let event_handler = move |control| -> ServiceControlHandlerResult {
         match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {
+                let _ = handler_phase_tx.send(Phase::Stopping);
                 let _ = stop_tx.send(());
                 ServiceControlHandlerResult::NoError
             }
@@ -131,6 +262,8 @@ fn run_service() -> Result<()> {
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
         .context("register service control handler")?;
+    // START_PENDING immediately, then checkpoints until the agent is ready.
+    let reporter = spawn_status_reporter(status_handle, phase_rx);
 
     // Startup failures are reported as SERVICE_STOPPED with a nonzero exit
     // code. Include those failures in the MSI-provisioned recovery policy.
@@ -141,33 +274,70 @@ fn run_service() -> Result<()> {
         tracing::warn!(error = %e, "could not enable service recovery for startup failures");
     }
 
-    let set_state = |state: ServiceState, exit: ServiceExitCode| {
-        status_handle.set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: state,
-            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-            exit_code: exit,
-            checkpoint: 0,
-            wait_hint: Duration::from_secs(10),
-            process_id: None,
-        })
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = phase_tx.send(Phase::Done);
+            let _ = reporter.join();
+            report_status(
+                &status_handle,
+                status_for(Phase::Done, 0, ServiceExitCode::ServiceSpecific(1)),
+            );
+            return Err(e).context("build tokio runtime");
+        }
     };
+    let ready_tx = phase_tx.clone();
+    let result = rt.block_on(run::run_agent(stop_rx, move || {
+        // Past the integrity check: only now is the service Running.
+        let _ = ready_tx.send(Phase::Running);
+        evtlog::notify(
+            evtlog::Event::Started,
+            &format!("TRAPD Agent v{} started.", env!("CARGO_PKG_VERSION")),
+        );
+    }));
 
-    set_state(ServiceState::Running, ServiceExitCode::Win32(0))
-        .context("report SERVICE_RUNNING")?;
+    // Stopping (stop request, or the agent ended on its own): keep the SCM
+    // informed while blocking tasks wind down, but never wait for them forever.
+    let _ = phase_tx.send(Phase::Stopping);
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
-    let rt = tokio::runtime::Runtime::new().context("build tokio runtime")?;
-    let result = rt.block_on(run::run_agent(stop_rx));
-
+    if result.is_ok() {
+        evtlog::notify(evtlog::Event::Stopped, "TRAPD Agent stopped.");
+    }
     let exit = match &result {
         Ok(()) => ServiceExitCode::Win32(0),
         Err(_) => ServiceExitCode::ServiceSpecific(1),
     };
-    let _ = set_state(ServiceState::Stopped, exit);
+    let _ = phase_tx.send(Phase::Done);
+    let _ = reporter.join();
+    report_status(&status_handle, status_for(Phase::Done, 0, exit));
     result
 }
 
 // ── install / uninstall ───────────────────────────────────────────────────────
+
+/// `install`/`uninstall` register the service with plain defaults: no failure
+/// actions, no directory ACLs, and `uninstall` deletes the binary behind the
+/// installer's back. They exist for developer machines only, so they refuse to
+/// touch a machine the MSI manages (`HKLM\SOFTWARE\TRAPD\Agent`, `Installed=1`).
+/// That marker is `Permanent` (configuration survives removal), so a dev box
+/// that once had the MSI must set `TRAPD_ALLOW_DEV_INSTALL=1` explicitly.
+fn refuse_if_msi_managed(verb: &str) -> Result<()> {
+    use windows_sys::Win32::System::Registry::RRF_SUBKEY_WOW6464KEY;
+    let managed = crate::collectors::windows::registry::dword(
+        "SOFTWARE\\TRAPD\\Agent",
+        "Installed",
+        RRF_SUBKEY_WOW6464KEY,
+    ) == Some(1);
+    if managed && !crate::env_truthy("TRAPD_ALLOW_DEV_INSTALL") {
+        bail!(
+            "`{verb}` is for development builds only and is disabled because this machine is \
+             managed by the TRAPD MSI. Use `msiexec /i` / `msiexec /x` (or set \
+             TRAPD_ALLOW_DEV_INSTALL=1 on a development machine to override)."
+        );
+    }
+    Ok(())
+}
 
 fn install() -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable path")?;
@@ -186,9 +356,13 @@ fn install() -> Result<()> {
         // `WantedBy=multi-user.target` posture of the Linux unit.
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
+        // The windows-service crate quotes this path when it contains
+        // whitespace (CWE-428 unquoted service path); no manual quoting here.
         executable_path: exe.clone(),
         launch_arguments: vec![],
-        dependencies: vec![],
+        // EventLog only (matches the MSI). Not BFE: with a third-party firewall
+        // BFE may be disabled, and the agent must still start.
+        dependencies: vec![ServiceDependency::Service(OsString::from("EventLog"))],
         // None = LocalSystem, the standard identity for an endpoint sensor.
         account_name: None,
         account_password: None,
