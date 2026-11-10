@@ -127,6 +127,40 @@ impl Message {
     }
 }
 
+/// Square logo shown beside the toast text. 192 px is 400 % of the 48 px
+/// `appLogoOverride` slot, so Windows only ever scales it down.
+#[cfg_attr(not(windows), allow(dead_code))]
+const LOGO_PNG: &[u8] = include_bytes!("../../assets/toast-logo.png");
+
+/// `file:///` URI for a local path: backslashes become slashes and every byte
+/// outside the unreserved set is percent-encoded, so the result has no
+/// characters that matter to XML or to the URI parser.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn file_uri(path: &str) -> String {
+    let mut uri = String::from("file:///");
+    for byte in path.replace('\\', "/").bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                uri.push(byte as char)
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
+}
+
+/// Adds the logo to a fixed toast. The message text stays untouched; only a
+/// percent-encoded URI is inserted.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn with_logo(xml: &str, logo_uri: &str) -> String {
+    const BINDING: &str = "<binding template=\"ToastGeneric\">";
+    xml.replacen(
+        BINDING,
+        &format!("{BINDING}<image placement=\"appLogoOverride\" src=\"{logo_uri}\"/>"),
+        1,
+    )
+}
+
 /// Keeps a burst of automatic responses from flooding the user.
 #[derive(Default)]
 struct RateLimiter {
@@ -332,11 +366,33 @@ mod windows_impl {
         .ok()
         .context("initialise COM")?;
         let document = XmlDocument::new()?;
-        document.LoadXml(&HSTRING::from(message.toast_xml()))?;
+        // Without a logo the toast is still shown, only plainer.
+        let xml = match write_logo() {
+            Ok(uri) => with_logo(message.toast_xml(), &uri),
+            Err(error) => {
+                debug!(error = %format!("{error:#}"), "toast logo not available");
+                message.toast_xml().to_string()
+            }
+        };
+        document.LoadXml(&HSTRING::from(xml))?;
         let toast = ToastNotification::CreateToastNotification(&document)?;
         ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?
             .Show(&toast)?;
         Ok(())
+    }
+
+    /// Keeps the logo in the user's own profile, where the user session can read
+    /// it. The bytes are compiled in, so the file always matches this build.
+    fn write_logo() -> Result<String> {
+        let base = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
+        let directory = Path::new(&base).join("TRAPD");
+        std::fs::create_dir_all(&directory).context("create logo directory")?;
+        let path = directory.join("toast-logo.png");
+        let current = std::fs::read(&path).ok();
+        if current.as_deref() != Some(LOGO_PNG) {
+            std::fs::write(&path, LOGO_PNG).context("write logo")?;
+        }
+        Ok(file_uri(&path.to_string_lossy()))
     }
 
     /// Windows attributes the toast through this per-user registration.
@@ -506,5 +562,39 @@ mod tests {
         let later = start + SAME_MESSAGE_INTERVAL * MAX_PER_WINDOW as u32;
         assert!(!limiter.allow(Message::FileQuarantined, later));
         assert!(limiter.allow(Message::FileQuarantined, start + WINDOW));
+    }
+
+    #[test]
+    fn logo_is_inserted_once_and_text_is_untouched() {
+        for message in ALL {
+            let plain = message.toast_xml();
+            let with = with_logo(plain, "file:///C:/x/logo.png");
+            assert_eq!(with.matches("<image ").count(), 1);
+            assert!(with.contains("placement=\"appLogoOverride\""));
+            assert_eq!(
+                with.replace(
+                    "<image placement=\"appLogoOverride\" src=\"file:///C:/x/logo.png\"/>",
+                    ""
+                ),
+                plain
+            );
+        }
+    }
+
+    #[test]
+    fn file_uri_encodes_everything_xml_or_uris_care_about() {
+        assert_eq!(
+            file_uri(r"C:\Users\A & B's\AppData\Local\TRAPD\toast-logo.png"),
+            "file:///C:/Users/A%20%26%20B%27s/AppData/Local/TRAPD/toast-logo.png"
+        );
+        let uri = file_uri("\"><x/>\u{e4}");
+        assert!(!uri.contains(['"', '<', '>', '&', '\'', ' ']));
+    }
+
+    #[test]
+    fn bundled_logo_is_a_png_within_the_documented_size() {
+        assert_eq!(&LOGO_PNG[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&LOGO_PNG[16..24], &[0, 0, 0, 192, 0, 0, 0, 192]);
+        assert!(LOGO_PNG.len() < 200 * 1024);
     }
 }
