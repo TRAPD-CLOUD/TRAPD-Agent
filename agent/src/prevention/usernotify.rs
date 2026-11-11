@@ -392,9 +392,11 @@ mod windows_impl {
         let result = set_string(key, "DisplayName", "TRAPD")
             .context("register notification display name")
             .and_then(|()| match icon_path {
-                Some(path) => {
-                    set_string(key, "IconUri", path).context("register notification icon")
-                }
+                // The logo is a black glyph on transparent ground; a white tile
+                // keeps it visible on the dark toast header.
+                Some(path) => set_string(key, "IconUri", path)
+                    .and_then(|()| set_string(key, "IconBackgroundColor", "FFFFFFFF"))
+                    .context("register notification icon"),
                 None => Ok(()),
             });
         // SAFETY: key opened above and not used again.
