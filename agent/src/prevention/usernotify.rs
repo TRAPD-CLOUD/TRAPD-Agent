@@ -127,39 +127,12 @@ impl Message {
     }
 }
 
-/// Square logo shown beside the toast text. 192 px is 400 % of the 48 px
-/// `appLogoOverride` slot, so Windows only ever scales it down.
+/// Square logo Windows shows as the small icon next to the app name in the
+/// toast header. It is registered as `IconUri` of the app id; the toast itself
+/// carries no image, so the message stays fixed text. Windows scales the 192 px
+/// source down, so it stays sharp on high-DPI displays.
 #[cfg_attr(not(windows), allow(dead_code))]
 const LOGO_PNG: &[u8] = include_bytes!("../../assets/toast-logo.png");
-
-/// `file:///` URI for a local path: backslashes become slashes and every byte
-/// outside the unreserved set is percent-encoded, so the result has no
-/// characters that matter to XML or to the URI parser.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn file_uri(path: &str) -> String {
-    let mut uri = String::from("file:///");
-    for byte in path.replace('\\', "/").bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
-                uri.push(byte as char)
-            }
-            _ => uri.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    uri
-}
-
-/// Adds the logo to a fixed toast. The message text stays untouched; only a
-/// percent-encoded URI is inserted.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn with_logo(xml: &str, logo_uri: &str) -> String {
-    const BINDING: &str = "<binding template=\"ToastGeneric\">";
-    xml.replacen(
-        BINDING,
-        &format!("{BINDING}<image placement=\"appLogoOverride\" src=\"{logo_uri}\"/>"),
-        1,
-    )
-}
 
 /// Keeps a burst of automatic responses from flooding the user.
 #[derive(Default)]
@@ -354,7 +327,11 @@ mod windows_impl {
         let message = id
             .and_then(Message::parse)
             .context("unknown notification id")?;
-        register_app_id()?;
+        // Without a logo the toast is still shown, only without the header icon.
+        let icon = write_logo()
+            .map_err(|error| debug!(error = %format!("{error:#}"), "toast logo not available"))
+            .ok();
+        register_app_id(icon.as_deref())?;
         // SAFETY: first COM call on this thread; never uninitialised because
         // the process exits right after showing the toast.
         unsafe {
@@ -366,15 +343,7 @@ mod windows_impl {
         .ok()
         .context("initialise COM")?;
         let document = XmlDocument::new()?;
-        // Without a logo the toast is still shown, only plainer.
-        let xml = match write_logo() {
-            Ok(uri) => with_logo(message.toast_xml(), &uri),
-            Err(error) => {
-                debug!(error = %format!("{error:#}"), "toast logo not available");
-                message.toast_xml().to_string()
-            }
-        };
-        document.LoadXml(&HSTRING::from(xml))?;
+        document.LoadXml(&HSTRING::from(message.toast_xml()))?;
         let toast = ToastNotification::CreateToastNotification(&document)?;
         ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?
             .Show(&toast)?;
@@ -382,7 +351,8 @@ mod windows_impl {
     }
 
     /// Keeps the logo in the user's own profile, where the user session can read
-    /// it. The bytes are compiled in, so the file always matches this build.
+    /// it, and returns its path. The bytes are compiled in, so the file always
+    /// matches this build.
     fn write_logo() -> Result<String> {
         let base = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
         let directory = Path::new(&base).join("TRAPD");
@@ -392,16 +362,15 @@ mod windows_impl {
         if current.as_deref() != Some(LOGO_PNG) {
             std::fs::write(&path, LOGO_PNG).context("write logo")?;
         }
-        Ok(file_uri(&path.to_string_lossy()))
+        Ok(path.to_string_lossy().into_owned())
     }
 
-    /// Windows attributes the toast through this per-user registration.
-    fn register_app_id() -> Result<()> {
+    /// Windows attributes the toast through this per-user registration: the
+    /// display name and, when available, the small header icon.
+    fn register_app_id(icon_path: Option<&str>) -> Result<()> {
         let key_path = wide(std::ffi::OsStr::new(&format!(
             "SOFTWARE\\Classes\\AppUserModelId\\{APP_ID}"
         )));
-        let name = wide(std::ffi::OsStr::new("DisplayName"));
-        let value = wide(std::ffi::OsStr::new("TRAPD"));
         let mut key: HKEY = std::ptr::null_mut();
         // SAFETY: NUL-terminated strings and valid out-pointer.
         let status = unsafe {
@@ -420,21 +389,37 @@ mod windows_impl {
         if status != 0 {
             bail!("register notification app id failed: {status}");
         }
-        // SAFETY: key opened above; value is a NUL-terminated UTF-16 buffer.
+        let result = set_string(key, "DisplayName", "TRAPD")
+            .context("register notification display name")
+            .and_then(|()| match icon_path {
+                // The logo is a black glyph on transparent ground; a white tile
+                // keeps it visible on the dark toast header.
+                Some(path) => set_string(key, "IconUri", path)
+                    .and_then(|()| set_string(key, "IconBackgroundColor", "FFFFFFFF"))
+                    .context("register notification icon"),
+                None => Ok(()),
+            });
+        // SAFETY: key opened above and not used again.
+        unsafe { RegCloseKey(key) };
+        result
+    }
+
+    fn set_string(key: HKEY, name: &str, value: &str) -> Result<()> {
+        let name = wide(std::ffi::OsStr::new(name));
+        let value = wide(std::ffi::OsStr::new(value));
+        // SAFETY: `key` is open; both buffers are NUL-terminated UTF-16.
         let status = unsafe {
-            let status = RegSetValueExW(
+            RegSetValueExW(
                 key,
                 name.as_ptr(),
                 0,
                 REG_SZ,
                 value.as_ptr().cast(),
                 (value.len() * 2) as u32,
-            );
-            RegCloseKey(key);
-            status
+            )
         };
         if status != 0 {
-            bail!("register notification display name failed: {status}");
+            bail!("RegSetValueExW failed: {status}");
         }
         Ok(())
     }
@@ -565,30 +550,12 @@ mod tests {
     }
 
     #[test]
-    fn logo_is_inserted_once_and_text_is_untouched() {
+    fn toasts_carry_no_inline_image() {
+        // The logo is the app-id icon in the header; a large inline image would
+        // reintroduce the oversized logo next to the text.
         for message in ALL {
-            let plain = message.toast_xml();
-            let with = with_logo(plain, "file:///C:/x/logo.png");
-            assert_eq!(with.matches("<image ").count(), 1);
-            assert!(with.contains("placement=\"appLogoOverride\""));
-            assert_eq!(
-                with.replace(
-                    "<image placement=\"appLogoOverride\" src=\"file:///C:/x/logo.png\"/>",
-                    ""
-                ),
-                plain
-            );
+            assert!(!message.toast_xml().contains("<image"), "{message:?}");
         }
-    }
-
-    #[test]
-    fn file_uri_encodes_everything_xml_or_uris_care_about() {
-        assert_eq!(
-            file_uri(r"C:\Users\A & B's\AppData\Local\TRAPD\toast-logo.png"),
-            "file:///C:/Users/A%20%26%20B%27s/AppData/Local/TRAPD/toast-logo.png"
-        );
-        let uri = file_uri("\"><x/>\u{e4}");
-        assert!(!uri.contains(['"', '<', '>', '&', '\'', ' ']));
     }
 
     #[test]
