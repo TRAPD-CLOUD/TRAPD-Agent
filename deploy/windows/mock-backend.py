@@ -119,6 +119,9 @@ class Handler(BaseHTTPRequestHandler):
                 stream.write(json.dumps({'path': self.path, 'body': body, 'status': status}) + '\n')
         if self.path.endswith('/enroll'):
             self.reply(status, {'agent_id': 'windows-smoke', 'agent_secret': 'test-agent-secret', 'project_id': 'msi-test'})
+        elif status == 200 and self.path.endswith('/ingest/events'):
+            # The agent only acknowledges a batch on a JSON object receipt.
+            self.reply(status, {'errors': 0, 'request_id': 'mock'})
         else:
             self.reply(status)
 
