@@ -23,6 +23,14 @@
 //! A `process.terminate` for a held process is queued behind it, so a consumer
 //! never sees a stop before its start.
 //!
+//! Identity follows the process-identity rule (AGENTS.md): two reports are the
+//! same process only with evidence of the same generation. Sensor reports carry
+//! the creation FILETIME and must agree on it. An audit record has none, but
+//! Windows writes 4688 / Sysmon 1 at process creation, so its record time must
+//! lie within [`CREATION_TOLERANCE`] of the sensor's creation time, and pid,
+//! parent and image must agree. Without that evidence, or when more than one
+//! candidate fits, the reports stay separate events.
+//!
 //! The stage is pure and clock-injected so it can be tested without a runtime.
 
 use std::collections::VecDeque;
@@ -34,6 +42,9 @@ use crate::telemetry::enrichment::EnrichmentStatus;
 /// How long a create without a command line waits for the audit record. Must
 /// exceed the event-log poll interval (5 s) plus read latency.
 pub const MERGE_GRACE: Duration = Duration::from_secs(8);
+/// How far an audit record's time may lie from the sensor's creation time and
+/// still describe the same process generation.
+const CREATION_TOLERANCE_MS: i64 = 2_000;
 /// How long a forwarded create still suppresses a second report of itself.
 const SEEN_TTL: Duration = Duration::from_secs(60);
 /// Bound on remembered forwarded creates; the oldest are forgotten first.
@@ -49,11 +60,20 @@ struct Held {
     trailing: Vec<AgentEvent>,
 }
 
-struct Seen {
+/// What identifies one report of a process start.
+#[derive(Clone)]
+struct Ident {
     pid: i32,
     ppid: i32,
     exe: String,
+    /// Creation FILETIME from a sensor; `None` for an audit record.
     start: Option<u64>,
+    /// Creation time in Unix ms: from `start`, or the audit record's time.
+    created_ms: Option<i64>,
+}
+
+struct Seen {
+    ident: Ident,
     at: Instant,
 }
 
@@ -77,30 +97,50 @@ fn create_mut(event: &mut AgentEvent) -> Option<&mut ProcessCreateData> {
     }
 }
 
-/// Do two reports describe the same process start? Creation time decides when
-/// both have it; otherwise pid, parent and image must agree (a missing parent
-/// or image is no evidence against).
-fn same_process(
-    pid: i32,
-    ppid: i32,
-    exe: &str,
-    start: Option<u64>,
-    other: &ProcessCreateData,
-) -> bool {
-    if pid != other.pid {
-        return false;
-    }
-    if let (Some(a), Some(b)) = (start, other.process_start_time) {
-        return a == b;
-    }
-    if ppid != 0 && other.ppid != 0 && ppid != other.ppid {
-        return false;
-    }
-    exe.is_empty() || other.exe.is_empty() || exe.eq_ignore_ascii_case(&other.exe)
+/// FILETIME (100 ns ticks since 1601) to Unix milliseconds.
+fn filetime_ms(ticks: u64) -> Option<i64> {
+    let ticks = i64::try_from(ticks).ok()?;
+    ticks
+        .checked_sub(116_444_736_000_000_000)
+        .map(|unix| unix.div_euclid(10_000))
 }
 
-fn identity_matches(s: &Seen, d: &ProcessCreateData) -> bool {
-    same_process(s.pid, s.ppid, &s.exe, s.start, d)
+fn ident_of(event: &AgentEvent) -> Option<Ident> {
+    let d = create_of(event)?;
+    let created_ms = match d.process_start_time {
+        Some(ft) => filetime_ms(ft),
+        // The record time of 4688 / Sysmon 1 is the creation time.
+        None => Some(event.timestamp.timestamp_millis()),
+    };
+    Some(Ident {
+        pid: d.pid,
+        ppid: d.ppid,
+        exe: d.exe.clone(),
+        start: d.process_start_time,
+        created_ms,
+    })
+}
+
+/// Is there evidence that two reports describe the same process generation?
+/// Unknown counts as "no" (AGENTS.md, process identity).
+fn same_process(a: &Ident, b: &Ident) -> bool {
+    if a.pid != b.pid {
+        return false;
+    }
+    if let (Some(x), Some(y)) = (a.start, b.start) {
+        return x == y;
+    }
+    let close = matches!(
+        (a.created_ms, b.created_ms),
+        (Some(x), Some(y)) if (x - y).abs() <= CREATION_TOLERANCE_MS
+    );
+    if !close {
+        return false;
+    }
+    if a.ppid != 0 && b.ppid != 0 && a.ppid != b.ppid {
+        return false;
+    }
+    a.exe.is_empty() || b.exe.is_empty() || a.exe.eq_ignore_ascii_case(&b.exe)
 }
 
 /// Fill what `held` lacks from `extra`; never overwrite a value it has.
@@ -203,24 +243,18 @@ impl ProcessCreateMerger {
     }
 
     fn release(&mut self, held: Held, now: Instant, out: &mut Vec<AgentEvent>) {
-        if let Some(d) = create_of(&held.event) {
-            self.remember(d, now);
+        if let Some(ident) = ident_of(&held.event) {
+            self.remember(ident, now);
         }
         out.push(held.event);
         out.extend(held.trailing);
     }
 
-    fn remember(&mut self, d: &ProcessCreateData, now: Instant) {
+    fn remember(&mut self, ident: Ident, now: Instant) {
         if self.seen.len() >= SEEN_CAP {
             self.seen.pop_front();
         }
-        self.seen.push_back(Seen {
-            pid: d.pid,
-            ppid: d.ppid,
-            exe: d.exe.clone(),
-            start: d.process_start_time,
-            at: now,
-        });
+        self.seen.push_back(Seen { ident, at: now });
     }
 
     fn forget_old(&mut self, now: Instant) {
@@ -233,46 +267,50 @@ impl ProcessCreateMerger {
         }
     }
 
-    fn on_create(&mut self, mut event: AgentEvent, now: Instant, out: &mut Vec<AgentEvent>) {
-        let Some(d) = create_of(&event) else {
+    fn on_create(&mut self, event: AgentEvent, now: Instant, out: &mut Vec<AgentEvent>) {
+        let (Some(d), Some(ident)) = (create_of(&event), ident_of(&event)) else {
             out.push(event);
             return;
         };
         let precise = d.process_start_time.is_some();
+        let extra = d.clone();
 
-        // A second report of a process we already hold.
-        if let Some(pos) = self.held.iter().position(|h| {
-            create_of(&h.event)
-                .is_some_and(|held| same_process(d.pid, d.ppid, &d.exe, d.process_start_time, held))
-        }) {
-            if precise {
-                // Same sensor reporting twice: keep the first, fill gaps.
-                let extra = d.clone();
-                if let Some(held) = create_mut(&mut self.held[pos].event) {
-                    complete_from(held, &extra);
-                }
-                if create_of(&self.held[pos].event).is_some_and(|h| !h.cmdline.is_empty()) {
-                    let held = self.held.remove(pos);
-                    self.release(held, now, out);
-                }
-            } else {
-                // The audit record: complete the held create and release it.
-                let extra = d.clone();
-                let mut held = self.held.remove(pos);
-                if let Some(h) = create_mut(&mut held.event) {
-                    complete_from(h, &extra);
-                }
+        // A second report of a process we hold. Merge only into the single
+        // candidate with generation evidence; two fitting candidates are
+        // ambiguous and the report stays its own event.
+        let candidates: Vec<usize> = self
+            .held
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| ident_of(&h.event).is_some_and(|held| same_process(&ident, &held)))
+            .map(|(i, _)| i)
+            .collect();
+        if let [pos] = candidates[..] {
+            if let Some(held) = create_mut(&mut self.held[pos].event) {
+                complete_from(held, &extra);
+            }
+            // Released once it has a command line; otherwise it keeps waiting
+            // until its own deadline (a Security 4688 without command line may
+            // be followed by a Sysmon 1 that has one).
+            if create_of(&self.held[pos].event).is_some_and(|h| !h.cmdline.is_empty()) {
+                let held = self.held.remove(pos);
                 self.release(held, now, out);
             }
             return;
         }
-
-        // A second report of a process already forwarded.
-        if self.seen.iter().any(|s| identity_matches(s, d)) {
-            return;
+        if candidates.is_empty() {
+            // A second report of a process already forwarded.
+            let seen = self
+                .seen
+                .iter()
+                .filter(|s| same_process(&s.ident, &ident))
+                .count();
+            if seen == 1 {
+                return;
+            }
         }
 
-        if precise && d.cmdline.is_empty() {
+        if precise && extra.cmdline.is_empty() && candidates.is_empty() {
             if self.held.len() >= HELD_CAP {
                 let oldest = self.held.remove(0);
                 self.release(oldest, now, out);
@@ -284,10 +322,7 @@ impl ProcessCreateMerger {
             });
             return;
         }
-        if let Some(d) = create_mut(&mut event) {
-            let snapshot = d.clone();
-            self.remember(&snapshot, now);
-        }
+        self.remember(ident, now);
         out.push(event);
     }
 }
@@ -338,8 +373,19 @@ mod tests {
         )
     }
 
-    /// What Security 4688 / Sysmon 1 normalise to.
+    /// When the process of `precise(pid, …)` was created.
+    fn created(pid: i32) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_millis(filetime_ms(START + pid as u64).unwrap()).unwrap()
+    }
+
+    /// What Security 4688 / Sysmon 1 normalise to, logged at creation.
     fn audit(pid: i32, cmdline: &str) -> AgentEvent {
+        let mut event = audit_at(pid, cmdline);
+        event.timestamp = created(pid);
+        event
+    }
+
+    fn audit_at(pid: i32, cmdline: &str) -> AgentEvent {
         wrap(
             EventData::ProcessCreate(ProcessCreateData {
                 pid,
@@ -498,6 +544,64 @@ mod tests {
         let out = m.process(batch, t0);
         assert_eq!(creates(&out).len(), 5);
         assert_eq!(m.held.len(), HELD_CAP);
+    }
+
+    #[test]
+    fn audit_record_from_another_time_is_not_merged() {
+        // Same pid, parent and image, but logged 30 s after the held
+        // generation was created: a recycled pid, not this process.
+        let t0 = Instant::now();
+        let mut m = ProcessCreateMerger::new();
+        assert!(m.process(vec![precise(7, "")], t0).is_empty());
+        let mut late = audit_at(7, "certutil -decode a b");
+        late.timestamp = created(7) + chrono::Duration::seconds(30);
+        let out = m.process(vec![late], t0);
+        assert_eq!(creates(&out).len(), 1);
+        let held = m.flush_all(t0);
+        assert!(creates(&held)[0].cmdline.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_audit_record_stays_separate() {
+        // Two held generations of the same pid/parent/image created within the
+        // tolerance: the audit record cannot say which one it belongs to.
+        let t0 = Instant::now();
+        let mut m = ProcessCreateMerger::new();
+        let a = precise(7, "");
+        let mut b = precise(7, "");
+        create_mut(&mut b).unwrap().process_start_time = Some(START + 7 + 5_000_000);
+        assert!(m.process(vec![a, b], t0).is_empty());
+        let out = m.process(vec![audit(7, "certutil x")], t0);
+        assert_eq!(creates(&out).len(), 1);
+        let held = m.flush_all(t0);
+        assert_eq!(creates(&held).len(), 2);
+        assert!(creates(&held).iter().all(|c| c.cmdline.is_empty()));
+    }
+
+    #[test]
+    fn empty_security_record_keeps_the_create_waiting_for_sysmon() {
+        let t0 = Instant::now();
+        let mut m = ProcessCreateMerger::new();
+        assert!(m.process(vec![precise(7, "")], t0).is_empty());
+        // 4688 without command-line auditing: username only, still held.
+        assert!(m.process(vec![audit(7, "")], t0).is_empty());
+        assert!(m.next_deadline().is_some());
+        let out = m.process(vec![audit(7, "certutil -urlcache x")], t0);
+        let c = creates(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].cmdline, "certutil -urlcache x");
+        assert_eq!(c[0].username, r"DOM\alice");
+    }
+
+    #[test]
+    fn forwarded_audit_record_does_not_hide_a_later_generation() {
+        let t0 = Instant::now();
+        let mut m = ProcessCreateMerger::new();
+        assert_eq!(creates(&m.process(vec![audit(9, "x")], t0)).len(), 1);
+        // pid 9 reused 20 s later, sensor report with its own creation time.
+        let mut later = precise(9, "y");
+        create_mut(&mut later).unwrap().process_start_time = Some(START + 9 + 200_000_000);
+        assert_eq!(creates(&m.process(vec![later], t0)).len(), 1);
     }
 
     #[test]
