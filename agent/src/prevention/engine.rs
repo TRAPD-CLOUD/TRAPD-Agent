@@ -345,8 +345,12 @@ impl Engine {
                     // (ETW, or the poller) reports creation. The Linux poller
                     // also emits `ProcessCreate`, but there eBPF already
                     // enforces `ProcessExec`, so only Windows acts on it.
+                    // The start-up baseline (`Snapshot`) describes processes that
+                    // already ran; it must never trigger exec enforcement.
                     #[cfg(windows)]
-                    EventData::ProcessCreate(create) => {
+                    EventData::ProcessCreate(create)
+                        if !matches!(event.action, crate::schema::EventAction::Snapshot) =>
+                    {
                         let exec = process::exec_from_create(create);
                         let _ = process::enforce_exec(&exec, &self.policy, &self.audit);
                     }

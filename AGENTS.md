@@ -370,6 +370,13 @@ Legacy commands still decode and verify, and Linux retains legacy omission.
 Command producers must preserve the observed u64 exactly when signing, rather
 than rounding it through a floating-point representation.
 
+At start both process collectors emit the already-running processes once as
+`process` / `snapshot` events with a `ProcessCreateData` payload (cap 4096,
+64 events per 50 ms, overflow counted as `rate_limit_applied` /
+`userspace_channel_full`, no start time = not emitted). `parent_start_time` is
+set only when the parent's start time is provably older than the child's. The
+backend must treat `snapshot` as lineage only, not as a process creation.
+
 Linux honeytoken kernel events append their original `bpf_ktime_get_ns` timestamp.
 Older kernel objects still decode as access telemetry but lack an identity that
 can authorize automatic process control. Attribution requires the end of the

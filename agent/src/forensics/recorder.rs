@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{AgentEvent, EventData};
+use crate::schema::{AgentEvent, EventAction, EventData};
 
 /// Default capacity of the per-pid event ring.
 pub const DEFAULT_CAPACITY: usize = 512;
@@ -82,6 +82,11 @@ impl FlightRecorder {
             }
         }
 
+        // The start-up process baseline is lineage for the backend, not session
+        // history; thousands of entries would evict the real recent events.
+        if matches!(event.action, EventAction::Snapshot) {
+            return;
+        }
         let Some((pid, summary)) = extract(&event.data) else {
             return;
         };
@@ -267,6 +272,24 @@ mod tests {
         assert_eq!(hist.len(), 2);
         assert!(hist[0].summary.contains("/b"), "oldest (/a) was evicted");
         assert!(hist[1].summary.contains("/c"));
+    }
+
+    #[test]
+    fn startup_process_baseline_does_not_enter_the_history_ring() {
+        let r = FlightRecorder::new(10);
+        let mut ev = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Process,
+            EventAction::Snapshot,
+            Severity::Info,
+            EventData::ProcessCreate(Default::default()),
+        );
+        if let EventData::ProcessCreate(d) = &mut ev.data {
+            d.pid = 7;
+        }
+        r.record(&ev);
+        assert!(r.history_for(&[7], 10).is_empty());
     }
 
     #[test]
