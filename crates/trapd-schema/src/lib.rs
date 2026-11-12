@@ -826,6 +826,10 @@ pub struct ModuleLoadData {
     /// Windows: image of the process that loaded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_exe: Option<String>,
+    /// Start time of the loading process (`/proc/<pid>/stat` field 22), so the
+    /// load stays attributable after PID reuse. Linux user-space `.so` loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

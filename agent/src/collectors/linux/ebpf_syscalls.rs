@@ -1714,6 +1714,7 @@ impl Collector for EbpfSyscallCollector {
                                                taints:   ev.taints,
                                                path: None,
                                                process_exe: None,
+                                               process_start_time: None,
                                            }),
                                        );
                                        if tx.send(event).await.is_err() { return Ok(()); }
