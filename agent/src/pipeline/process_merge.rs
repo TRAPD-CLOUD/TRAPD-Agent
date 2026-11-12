@@ -31,6 +31,17 @@
 //! parent and image must agree. Without that evidence, or when more than one
 //! candidate fits, the reports stay separate events.
 //!
+//! Without ETW the 3 s poller is the sensor: it has the creation FILETIME and
+//! image digest but misses processes shorter than its interval, while 4688
+//! sees every process but has neither. Either may arrive first (the poller
+//! up to 3 s after creation, the event-log poll up to 5 s). With
+//! [`ProcessCreateMerger::set_audit_hold`] enabled, an audit create with no
+//! sensor counterpart yet is held for [`AUDIT_GRACE`]: a sensor report that
+//! arrives meanwhile becomes the event (start time, digest) and takes the
+//! audit record's missing fields; otherwise the audit create goes out as it
+//! is, without start time. A held audit create never suppresses a live report
+//! that arrives after its release.
+//!
 //! The stage is pure and clock-injected so it can be tested without a runtime.
 
 use std::collections::VecDeque;
@@ -42,6 +53,9 @@ use crate::telemetry::enrichment::EnrichmentStatus;
 /// How long a create without a command line waits for the audit record. Must
 /// exceed the event-log poll interval (5 s) plus read latency.
 pub const MERGE_GRACE: Duration = Duration::from_secs(8);
+/// How long an audit create waits for the poller to report the same process.
+/// Must exceed the poll interval (3 s) plus sampling and hashing latency.
+pub const AUDIT_GRACE: Duration = Duration::from_secs(5);
 /// How far an audit record's time may lie from the sensor's creation time and
 /// still describe the same process generation.
 const CREATION_TOLERANCE_MS: i64 = 2_000;
@@ -81,6 +95,8 @@ struct Seen {
 pub struct ProcessCreateMerger {
     held: Vec<Held>,
     seen: VecDeque<Seen>,
+    /// Hold audit creates for the poller (no ETW process provider).
+    audit_hold: bool,
 }
 
 fn create_of(event: &AgentEvent) -> Option<&ProcessCreateData> {
@@ -188,6 +204,12 @@ impl ProcessCreateMerger {
         Self::default()
     }
 
+    /// Hold audit creates until the poller can report the same process. Turn
+    /// this on while the poller is the live process sensor.
+    pub fn set_audit_hold(&mut self, on: bool) {
+        self.audit_hold = on;
+    }
+
     /// When the next held create must be released, if any.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.held.iter().map(|h| h.deadline).min()
@@ -287,13 +309,41 @@ impl ProcessCreateMerger {
             .map(|(i, _)| i)
             .collect();
         if let [pos] = candidates[..] {
+            let held_is_audit =
+                create_of(&self.held[pos].event).is_some_and(|h| h.process_start_time.is_none());
+            if precise && held_is_audit {
+                // The sensor report is the better base: it alone carries the
+                // creation time and image digest. The audit record only
+                // fills what the sensor could not read.
+                let audit = self.held.remove(pos);
+                let audit_data = create_of(&audit.event).cloned().unwrap_or_default();
+                let mut event = event;
+                if let Some(base) = create_mut(&mut event) {
+                    complete_from(base, &audit_data);
+                }
+                let has_cmdline = create_of(&event).is_some_and(|c| !c.cmdline.is_empty());
+                let merged = Held {
+                    event,
+                    deadline: now + MERGE_GRACE,
+                    trailing: audit.trailing,
+                };
+                if has_cmdline {
+                    self.release(merged, now, out);
+                } else {
+                    self.held.push(merged);
+                }
+                return;
+            }
             if let Some(held) = create_mut(&mut self.held[pos].event) {
                 complete_from(held, &extra);
             }
-            // Released once it has a command line; otherwise it keeps waiting
-            // until its own deadline (a Security 4688 without command line may
-            // be followed by a Sysmon 1 that has one).
-            if create_of(&self.held[pos].event).is_some_and(|h| !h.cmdline.is_empty()) {
+            // A sensor create is released once it has a command line;
+            // otherwise it keeps waiting until its own deadline (a Security
+            // 4688 without command line may be followed by a Sysmon 1 that
+            // has one). A held audit create waits for the poller instead.
+            if !held_is_audit
+                && create_of(&self.held[pos].event).is_some_and(|h| !h.cmdline.is_empty())
+            {
                 let held = self.held.remove(pos);
                 self.release(held, now, out);
             }
@@ -319,14 +369,16 @@ impl ProcessCreateMerger {
             }
         }
 
-        if precise && extra.cmdline.is_empty() && candidates.is_empty() {
+        let wait_for_cmdline = precise && extra.cmdline.is_empty();
+        let wait_for_poller = !precise && self.audit_hold;
+        if (wait_for_cmdline || wait_for_poller) && candidates.is_empty() {
             if self.held.len() >= HELD_CAP {
                 let oldest = self.held.remove(0);
                 self.release(oldest, now, out);
             }
             self.held.push(Held {
                 event,
-                deadline: now + MERGE_GRACE,
+                deadline: now + if precise { MERGE_GRACE } else { AUDIT_GRACE },
                 trailing: Vec::new(),
             });
             return;
@@ -663,5 +715,170 @@ mod tests {
             EventAction::Terminate,
         );
         assert_eq!(m.process(vec![other], t0).len(), 1);
+    }
+
+    // --- No ETW: the poller and Security 4688 report the same processes. ---
+
+    fn polling_merger() -> ProcessCreateMerger {
+        let mut m = ProcessCreateMerger::new();
+        m.set_audit_hold(true);
+        m
+    }
+
+    /// What the poller produces: start time and digest, command line as read.
+    fn polled(pid: i32, cmdline: &str) -> AgentEvent {
+        let mut event = precise(pid, cmdline);
+        create_mut(&mut event).unwrap().exe_sha256 = Some("ab".repeat(32));
+        event
+    }
+
+    #[test]
+    fn audit_first_then_poller_yields_one_event_with_everything() {
+        let t0 = Instant::now();
+        let mut m = polling_merger();
+        assert!(m
+            .process(vec![audit(7, "certutil -urlcache x")], t0)
+            .is_empty());
+        assert_eq!(m.next_deadline(), Some(t0 + AUDIT_GRACE));
+        // The poller sees it empty-handed: 4688 completes it.
+        let out = m.process(vec![polled(7, "")], t0 + Duration::from_secs(2));
+        let c = creates(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].process_start_time, Some(START + 7));
+        assert_eq!(c[0].exe_sha256.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(c[0].cmdline, "certutil -urlcache x");
+        assert_eq!(c[0].username, r"DOM\alice");
+        assert!(c[0].enrichment.enrichment_errors.is_empty());
+        assert!(m.next_deadline().is_none());
+        // Nothing is left to be released later.
+        assert!(m.flush_all(t0 + AUDIT_GRACE).is_empty());
+    }
+
+    #[test]
+    fn audit_first_then_poller_with_command_line_keeps_the_sensor_values() {
+        let t0 = Instant::now();
+        let mut m = polling_merger();
+        assert!(m.process(vec![audit(7, "from 4688")], t0).is_empty());
+        let out = m.process(vec![polled(7, "from poller")], t0);
+        let c = creates(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].cmdline, "from poller");
+        assert_eq!(c[0].process_start_time, Some(START + 7));
+        assert!(c[0].exe_sha256.is_some());
+    }
+
+    #[test]
+    fn poller_first_then_audit_yields_one_event() {
+        let t0 = Instant::now();
+        let mut m = polling_merger();
+        let out = m.process(vec![polled(7, "certutil x")], t0);
+        assert_eq!(creates(&out).len(), 1);
+        assert!(m.process(vec![audit(7, "certutil x")], t0).is_empty());
+        assert!(m.flush_all(t0 + AUDIT_GRACE).is_empty());
+    }
+
+    #[test]
+    fn poller_without_command_line_is_completed_by_a_later_audit_record() {
+        let t0 = Instant::now();
+        let mut m = polling_merger();
+        assert!(m.process(vec![polled(7, "")], t0).is_empty());
+        let out = m.process(vec![audit(7, "certutil x")], t0 + Duration::from_secs(4));
+        let c = creates(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].cmdline, "certutil x");
+        assert!(c[0].exe_sha256.is_some());
+    }
+
+    #[test]
+    fn short_lived_process_seen_only_by_4688_is_forwarded_without_start_time() {
+        let t0 = Instant::now();
+        let mut m = polling_merger();
+        assert!(m.process(vec![audit(7, "mshta x")], t0).is_empty());
+        assert!(m
+            .flush_due(t0 + AUDIT_GRACE - Duration::from_millis(1))
+            .is_empty());
+        let out = m.flush_due(t0 + AUDIT_GRACE);
+        let c = creates(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].cmdline, "mshta x");
+        assert_eq!(c[0].process_start_time, None);
+        assert!(c[0].exe_sha256.is_none());
+    }
+
+    #[test]
+    fn poller_only_create_is_forwarded() {
+        let t0 = Instant::now();
+        let mut m = polling_merger();
+        let out = m.process(vec![polled(7, "notepad")], t0);
+        let c = creates(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].process_start_time, Some(START + 7));
+        assert!(m.next_deadline().is_none());
+    }
+
+    #[test]
+    fn audit_creates_are_not_held_while_etw_is_the_sensor() {
+        let t0 = Instant::now();
+        let mut m = ProcessCreateMerger::new();
+        assert_eq!(creates(&m.process(vec![audit(7, "x")], t0)).len(), 1);
+    }
+
+    #[test]
+    fn recycled_pid_within_tolerance_with_another_start_time_is_not_merged() {
+        let t0 = Instant::now();
+        let mut m = polling_merger();
+        // Generation A was seen by the poller; generation B of the same pid
+        // started 1 s later (inside the tolerance) with another FILETIME.
+        assert_eq!(creates(&m.process(vec![polled(7, "a")], t0)).len(), 1);
+        let mut b = polled(7, "b");
+        create_mut(&mut b).unwrap().process_start_time = Some(START + 7 + 10_000_000);
+        let out = m.process(vec![b], t0);
+        let c = creates(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].cmdline, "b");
+        // Held audit record fitting both generations merges with neither.
+        let mut m = polling_merger();
+        let mut b = polled(7, "b");
+        create_mut(&mut b).unwrap().process_start_time = Some(START + 7 + 10_000_000);
+        assert_eq!(creates(&m.process(vec![polled(7, "a"), b], t0)).len(), 2);
+        assert!(m.process(vec![audit(7, "x")], t0).is_empty());
+        let out = m.flush_all(t0);
+        let c = creates(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].process_start_time, None);
+    }
+
+    #[test]
+    fn sysmon_record_completes_a_held_audit_record_without_releasing_it() {
+        let t0 = Instant::now();
+        let mut m = polling_merger();
+        assert!(m.process(vec![audit(7, "")], t0).is_empty());
+        assert!(m.process(vec![audit(7, "certutil x")], t0).is_empty());
+        let out = m.process(vec![polled(7, "")], t0);
+        let c = creates(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].cmdline, "certutil x");
+        assert_eq!(c[0].process_start_time, Some(START + 7));
+    }
+
+    #[test]
+    fn terminate_waits_behind_a_held_audit_create() {
+        let t0 = Instant::now();
+        let mut m = polling_merger();
+        assert!(m.process(vec![audit(7, "x"), stop(7)], t0).is_empty());
+        let out = m.process(vec![polled(7, "x")], t0);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0].data, EventData::ProcessCreate(_)));
+        assert!(matches!(out[1].data, EventData::ProcessTerminate(_)));
+    }
+
+    #[test]
+    fn late_poller_report_after_the_grace_is_not_suppressed_by_the_audit_create() {
+        let t0 = Instant::now();
+        let mut m = polling_merger();
+        assert!(m.process(vec![audit(7, "x")], t0).is_empty());
+        assert_eq!(creates(&m.flush_due(t0 + AUDIT_GRACE)).len(), 1);
+        let out = m.process(vec![polled(7, "x")], t0 + AUDIT_GRACE);
+        assert_eq!(creates(&out).len(), 1);
     }
 }
