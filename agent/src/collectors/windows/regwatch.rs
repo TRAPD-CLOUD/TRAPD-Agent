@@ -10,10 +10,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc::Sender;
-use tokio::time::{interval, Duration, MissedTickBehavior};
+use tokio::time::{interval, sleep_until, Duration, Instant as TokioInstant, MissedTickBehavior};
 use tracing::{info, warn};
 
 use super::registry::{self, Hive};
+use crate::collectors::registry_notify::WakeScheduler;
 use crate::collectors::registry_watch::{
     encode_baseline, load_baseline, plan_events, retain_unavailable, snapshot_with_preferred_users,
     stable_event_id, PendingRegistryPoll, RegRoot, RegistryReader, Snapshot, StormGate, SPECS,
@@ -98,11 +99,29 @@ impl Collector for RegistryWatchCollector {
         let mut ticker = interval(POLL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut pending: Option<PendingRegistryPoll> = None;
+        // Change notifications wake the loop early; the interval stays as the
+        // safety net (hives loaded later, keys over the handle cap, failures).
+        let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let _notify = super::regnotify::spawn(wake_tx);
+        let mut scheduler = WakeScheduler::default();
         loop {
-            tokio::select! {
-                _ = tx.closed() => return Ok(()),
-                _ = ticker.tick() => {}
+            loop {
+                let due = scheduler.due_at().map(|at| {
+                    TokioInstant::now() + at.saturating_duration_since(std::time::Instant::now())
+                });
+                tokio::select! {
+                    _ = tx.closed() => return Ok(()),
+                    _ = ticker.tick() => break,
+                    Some(()) = wake_rx.recv() => scheduler.notify(std::time::Instant::now()),
+                    _ = async {
+                        match due {
+                            Some(at) => sleep_until(at).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => break,
+                }
             }
+            scheduler.mark_run(std::time::Instant::now());
             if pending.is_none() {
                 let preferred_users = previous
                     .as_ref()

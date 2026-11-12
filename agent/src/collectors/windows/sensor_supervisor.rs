@@ -5,6 +5,13 @@ use async_trait::async_trait;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::Sender;
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct SensorSupervisor {
     config: Arc<RwLock<AgentConfig>>,
 }
@@ -38,10 +45,24 @@ impl Collector for SensorSupervisor {
         let aid = agent_id.clone();
         let host = hostname.clone();
         pollers.spawn(async move { super::network::NetworkCollector.run(ntx, aid, host).await });
+        // Separate session and restart loop: losing it must not take the
+        // process/network sensors down. Aborted when this collector ends.
+        let _file_actor = super::etw::file_actor_enabled().then(|| {
+            AbortOnDrop(tokio::spawn(async move {
+                loop {
+                    let mut c = super::etw::EtwFileActorCollector;
+                    let (dead_tx, _rx) = tokio::sync::mpsc::channel::<AgentEvent>(1);
+                    if let Err(error) = c.run(dead_tx, String::new(), String::new()).await {
+                        tracing::warn!(%error, "file-actor ETW sensor unavailable; retrying");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+            }))
+        });
         loop {
             let enabled = self.config.read().map(|c| c.etw_enabled).unwrap_or(false);
             if enabled {
-                let mut etw = super::etw::EtwCollector;
+                let mut etw = super::etw::EtwCollector::new(self.config.clone());
                 let attempt = etw.run(tx.clone(), agent_id.clone(), hostname.clone());
                 tokio::pin!(attempt);
                 loop {
@@ -60,7 +81,7 @@ impl Collector for SensorSupervisor {
             }
             crate::telemetry::coverage::update(|c| {
                 c.etw_session = Some(false);
-                c.process_sensor = Some("polling".into());
+                c.process_sensor = Some(c.polling_label().into());
             });
             tokio::select! {
                 _ = tx.closed() => return Ok(()),

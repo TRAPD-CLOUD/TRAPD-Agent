@@ -236,6 +236,10 @@ mod tests {
                 comm: "cat".into(),
                 path: path.into(),
                 flags: 0,
+                exe: None,
+                process_start_time: None,
+                sensitive_class: None,
+                suppressed_repeats: None,
             }),
         )
     }

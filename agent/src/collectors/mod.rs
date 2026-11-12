@@ -37,12 +37,20 @@ pub mod logs;
 // Registry persistence watcher core (pure; the Windows collector does the reads).
 pub mod registry_watch;
 
+// Change-notification scheduling and handle bookkeeping for the registry watcher
+// (pure; the Windows collector supplies the RegNotifyChangeKeyValue backend).
+pub mod registry_notify;
+
 // Windows memory classification rules (pure; the scanner does the I/O).
 pub mod win_mem_rules;
 
 // Restart-with-backoff wrapper for collectors; used by the Windows runtime.
 #[cfg(any(target_os = "windows", test))]
 pub mod supervisor;
+
+// Device attach/detach parsing and bookkeeping shared by Linux and Windows.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+pub mod device;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

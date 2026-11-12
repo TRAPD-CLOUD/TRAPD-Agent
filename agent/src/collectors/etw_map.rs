@@ -13,26 +13,46 @@
 //! | Microsoft-Windows-Kernel-Process | `22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716` | `0x10` process, `0x40` image | 1 ProcessStart, 2 ProcessStop, 5 ImageLoad |
 //! | Microsoft-Windows-Kernel-Network | `7dd42a49-5329-4832-8dfd-43d979153a88` | `0x10` IPv4, `0x20` IPv6 | 12/28 connect, 15/31 accept |
 //! | Microsoft-Windows-DNS-Client | `1c95126e-7eea-49a9-a3fe-a378b03ddb4d` | all | 3008 query completed |
+//! | Microsoft-Windows-Kernel-File | `edd08927-9cc4-4e65-b970-c2560fb5c289` | `0x80` create | 12 Create (named pipes only) |
+//! | Microsoft-Antimalware-Scan-Interface | `2a576b87-09a7-520e-c21a-4942f0271d67` | all | 1101 scan |
+//!
+//! Driver loads are Kernel-Process event 5 whose image base lies in kernel
+//! space (no extra provider).
 //!
 //! Property names differ slightly between Windows builds (`ImageName` vs.
 //! `ImageFileName`, `ParentProcessID` vs. `ParentId`); every lookup accepts the
 //! known aliases.
 
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::schema::{
-    DnsResolutionData, NetworkConnectionData, ProcessCreateData, ProcessTerminateData,
+    DnsResolutionData, LogEventData, NetworkConnectionData, ProcessCreateData, ProcessTerminateData,
 };
 
 pub const KERNEL_PROCESS: u128 = 0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716;
 pub const KERNEL_NETWORK: u128 = 0x7dd42a49_5329_4832_8dfd_43d979153a88;
 pub const DNS_CLIENT: u128 = 0x1c95126e_7eea_49a9_a3fe_a378b03ddb4d;
+/// Microsoft-Windows-Kernel-File. The file-actor sensor reads it in its own
+/// session; the main session subscribes to creates only, for named pipes.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const KERNEL_FILE: u128 = 0xedd08927_9cc4_4e65_b970_c2560fb5c289;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const AMSI: u128 = 0x2a576b87_09a7_520e_c21a_4942f0271d67;
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x40;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const KERNEL_NETWORK_KEYWORDS: u64 = 0x10 | 0x20;
+/// Kernel-File keywords CREATE (0x80) and WRITE (0x200), from the provider
+/// manifest, for the file-actor session. Not field-verified on a Windows host
+/// yet: a wrong value only yields no events, never wrong ones.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const KERNEL_FILE_KEYWORDS: u64 = 0x80 | 0x200;
+/// Kernel-File `CREATE` keyword only, for named pipes on the main session:
+/// no reads, writes, deletes or renames.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const KERNEL_FILE_PIPE_KEYWORDS: u64 = 0x80;
 
 /// One decoded property value.
 #[derive(Debug, Clone, PartialEq)]
@@ -247,6 +267,384 @@ pub fn image_load(rec: &EtwRecord, devices: &DeviceMap) -> Option<(i32, String)>
     Some((pid, device_to_dos(&image, devices)))
 }
 
+/// First address of kernel space on x64 Windows (canonical upper half).
+const KERNEL_SPACE_START: u64 = 0xFFFF_8000_0000_0000;
+
+/// A kernel-mode image load (a driver, or the kernel itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverLoad {
+    pub path: String,
+    pub name: String,
+    pub image_size: Option<u64>,
+}
+
+/// `\SystemRoot\...` (the loader's own alias) → `<system_root>\...`.
+fn resolve_system_root(path: &str, system_root: &str) -> String {
+    const PREFIX: &str = "\\SystemRoot\\";
+    match path.get(..PREFIX.len()) {
+        Some(p) if p.eq_ignore_ascii_case(PREFIX) && !system_root.is_empty() => format!(
+            "{}\\{}",
+            system_root.trim_end_matches('\\'),
+            &path[PREFIX.len()..]
+        ),
+        _ => path.to_string(),
+    }
+}
+
+/// Kernel-Process event 5 for a kernel-mode image → driver load.
+///
+/// The image base decides: user-mode DLLs and EXEs never map into kernel
+/// space, so `ImageBase >= 0xFFFF800000000000` is definitive and independent of
+/// which pseudo-PID the provider reports (4 / 0). Without an `ImageBase`
+/// property the PID 4 + `.sys` shape is accepted as a weaker fallback.
+pub fn driver_load(rec: &EtwRecord, devices: &DeviceMap, system_root: &str) -> Option<DriverLoad> {
+    if rec.provider != KERNEL_PROCESS || rec.id != 5 {
+        return None;
+    }
+    let raw = rec.str(&["ImageName", "FileName"])?;
+    let in_kernel = match rec.int(&["ImageBase"]) {
+        Some(base) => base >= KERNEL_SPACE_START,
+        None => {
+            rec.int(&["ProcessID", "ProcessId"]) == Some(4)
+                && raw.to_ascii_lowercase().ends_with(".sys")
+        }
+    };
+    if !in_kernel {
+        return None;
+    }
+    let path = resolve_system_root(&device_to_dos(&raw, devices), system_root);
+    if path.is_empty() {
+        return None;
+    }
+    Some(DriverLoad {
+        name: basename(&path),
+        path,
+        image_size: rec.int(&["ImageSize"]).filter(|s| *s > 0),
+    })
+}
+
+/// Token bucket with an injected clock (milliseconds), so tests are
+/// deterministic. Every refusal must be counted by the caller as
+/// `DropReason::RateLimitApplied`; the gate never discards silently itself.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub struct RateGate {
+    per_sec: f64,
+    burst: f64,
+    tokens: f64,
+    last_ms: u64,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl RateGate {
+    pub fn new(per_sec: u32, burst: u32) -> Self {
+        Self {
+            per_sec: f64::from(per_sec),
+            burst: f64::from(burst.max(1)),
+            tokens: f64::from(burst.max(1)),
+            last_ms: 0,
+        }
+    }
+
+    pub fn allow(&mut self, now_ms: u64) -> bool {
+        let dt = now_ms.saturating_sub(self.last_ms) as f64 / 1000.0;
+        self.last_ms = self.last_ms.max(now_ms);
+        self.tokens = (self.tokens + dt * self.per_sec).min(self.burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Does a raw Kernel-File event payload mention `\NamedPipe\` (UTF-16LE,
+/// ASCII case-insensitive)? A cheap, layout-independent prefilter run in the ETW
+/// callback so the far more frequent ordinary file creates never reach TDH
+/// decoding or the channel.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn payload_mentions_pipe(user_data: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"\\NamedPipe\\";
+    let n = NEEDLE.len();
+    if user_data.len() < n * 2 {
+        return false;
+    }
+    (0..=user_data.len() - n * 2).any(|start| {
+        NEEDLE.iter().enumerate().all(|(i, b)| {
+            user_data[start + 2 * i].eq_ignore_ascii_case(b) && user_data[start + 2 * i + 1] == 0
+        })
+    })
+}
+
+/// Longest pipe name kept (Windows limits a pipe name to 256 characters).
+const MAX_PIPE_NAME_CHARS: usize = 256;
+
+/// Kernel-File event 12 (Create) on `\Device\NamedPipe\<name>` → (logging PID,
+/// `\\.\pipe\<name>`). Creation of a server instance and a client connect both
+/// appear here and cannot be told apart from this event; the root directory
+/// open (no name) is not a pipe and is refused.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn pipe_create(rec: &EtwRecord) -> Option<(u32, String)> {
+    if rec.provider != KERNEL_FILE || rec.id != 12 {
+        return None;
+    }
+    const PREFIX: &str = "\\Device\\NamedPipe\\";
+    let file = rec.str(&["FileName"])?;
+    let head = file.get(..PREFIX.len())?;
+    if !head.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let name: String = file[PREFIX.len()..]
+        .chars()
+        .take(MAX_PIPE_NAME_CHARS)
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    Some((rec.header_pid, format!("\\\\.\\pipe\\{name}")))
+}
+
+/// Remembers keys seen within a time window so identical repeats (a client
+/// reopening one pipe, the same script scanned again) are reported once.
+/// Bounded: it is cleared when full. Callers count a suppressed repeat as
+/// `rate_limit_applied`.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug)]
+pub struct RecentSet<K: std::hash::Hash + Eq> {
+    seen: HashMap<K, u64>,
+    window_ms: u64,
+    cap: usize,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl<K: std::hash::Hash + Eq> RecentSet<K> {
+    pub fn new(window_ms: u64, cap: usize) -> Self {
+        Self {
+            seen: HashMap::new(),
+            window_ms,
+            cap,
+        }
+    }
+
+    /// `true` when `key` was not seen within the window (and records it).
+    pub fn first_seen(&mut self, key: K, now_ms: u64) -> bool {
+        if let Some(last) = self.seen.get(&key) {
+            if now_ms.saturating_sub(*last) < self.window_ms {
+                return false;
+            }
+        }
+        if self.seen.len() >= self.cap && !self.seen.contains_key(&key) {
+            self.seen.clear();
+        }
+        self.seen.insert(key, now_ms);
+        true
+    }
+}
+
+/// Sheds the noisiest optional provider when the shared session starts losing
+/// events: process and network telemetry share its buffers, and an optional
+/// stream must not cost them. Trips once; the owner then disables the
+/// provider and reports it in coverage.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug)]
+pub struct LossGuard {
+    baseline: u64,
+    max_lost: u64,
+    tripped: bool,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl LossGuard {
+    pub fn new(baseline_lost: u64, max_lost: u64) -> Self {
+        Self {
+            baseline: baseline_lost,
+            max_lost,
+            tripped: false,
+        }
+    }
+
+    /// `true` exactly once: when losses since creation first exceed the limit.
+    pub fn observe(&mut self, total_lost: u64) -> bool {
+        if self.tripped || total_lost.saturating_sub(self.baseline) <= self.max_lost {
+            return false;
+        }
+        self.tripped = true;
+        true
+    }
+}
+
+/// Most decoded script text kept per AMSI scan.
+pub const AMSI_MAX_CONTENT_BYTES: usize = 32 * 1024;
+/// AMSI scan results from here up are an antimalware verdict (admin block
+/// range `0x4000..=0x4fff`, detected `>= 0x8000`).
+const AMSI_RESULT_FLAGGED_MIN: u32 = 0x4000;
+
+fn amsi_verdict(result: u32) -> &'static str {
+    match result {
+        0 => "clean",
+        1..=0x3fff => "not_detected",
+        0x4000..=0x7fff => "blocked_by_admin",
+        _ => "detected",
+    }
+}
+
+/// AMSI content bytes → text, or `None` when they are not script text
+/// (a .NET assembly, a binary blob). PowerShell and the script hosts hand over
+/// UTF-16LE; anything else is read as UTF-8. Nothing binary is shipped.
+pub fn decode_amsi_text(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() || bytes.starts_with(b"MZ") {
+        return None;
+    }
+    let odd_zero = bytes.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+    let utf16 =
+        bytes.len() >= 2 && bytes.len().is_multiple_of(2) && odd_zero * 2 >= bytes.len() / 2;
+    let text = if utf16 {
+        let mut units = Vec::with_capacity(bytes.len() / 2);
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            units.push(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+            i += 2;
+        }
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    let text = text.trim_start_matches('\u{feff}').trim_end_matches('\0');
+    let total = text.chars().count();
+    let junk = text
+        .chars()
+        .filter(|c| *c == '\u{fffd}' || (c.is_control() && !matches!(c, '\t' | '\n' | '\r')))
+        .count();
+    (total > 0 && junk * 10 <= total).then(|| text.to_string())
+}
+
+/// One AMSI scan, ready to ship as a log event.
+#[derive(Debug, Clone)]
+pub struct AmsiScan {
+    /// `sha256:<hex>` of the scanned bytes, when they were read.
+    pub content_sha256: Option<String>,
+    pub data: LogEventData,
+}
+
+/// Microsoft-Antimalware-Scan-Interface event 1101 → log record.
+///
+/// Script text can hold credentials, so `capture` is the operator's
+/// `script_block_capture_enabled` opt-in. Without it no content is decoded
+/// (the ETW layer does not even read the property) and only scans that
+/// received an antimalware verdict are reported, as metadata without text.
+/// With it, text is kept up to [`AMSI_MAX_CONTENT_BYTES`] with explicit
+/// `content_truncated` / `content_omitted` markers.
+pub fn amsi_scan(rec: &EtwRecord, capture: bool) -> Option<AmsiScan> {
+    use sha2::{Digest, Sha256};
+    if rec.provider != AMSI || rec.id != 1101 {
+        return None;
+    }
+    let scan_result = rec
+        .int(&["scanResult", "ScanResult"])
+        .and_then(|r| u32::try_from(r).ok())
+        .unwrap_or(0);
+    let flagged = scan_result >= AMSI_RESULT_FLAGGED_MIN;
+    let content_size = rec.int(&["contentsize", "ContentSize"]).unwrap_or(0);
+    if !flagged && (!capture || content_size == 0) {
+        return None;
+    }
+    let app_name = rec
+        .str(&["appname", "AppName"])
+        .unwrap_or_default()
+        .chars()
+        .take(512)
+        .collect::<String>();
+    let content_name = rec
+        .str(&["contentname", "ContentName"])
+        .unwrap_or_default()
+        .chars()
+        .take(1024)
+        .collect::<String>();
+    let bytes = if capture {
+        rec.raw(&["content", "Content"])
+    } else {
+        None
+    };
+    let content_sha256 = bytes
+        .as_ref()
+        .map(|b| format!("sha256:{}", hex::encode(Sha256::digest(b))));
+    let verdict = amsi_verdict(scan_result);
+    let mut text = String::new();
+    let mut truncation = None;
+    let mut omitted = None;
+    match (capture, bytes.as_deref()) {
+        (false, _) => omitted = Some("capture_disabled"),
+        (true, Some(b)) => match decode_amsi_text(b) {
+            Some(t) => {
+                let (kept, tr) = crate::telemetry::limits::truncate_str(&t, AMSI_MAX_CONTENT_BYTES);
+                text = kept;
+                truncation = tr;
+            }
+            None => omitted = Some("binary"),
+        },
+        // The property reader refuses values above its size cap.
+        (true, None) => {
+            omitted = Some(if content_size > 64 * 1024 {
+                "oversize"
+            } else {
+                "unavailable"
+            })
+        }
+    }
+    let mut fields = serde_json::Map::new();
+    fields.insert("EventID".into(), 1101.into());
+    fields.insert("app_name".into(), app_name.clone().into());
+    fields.insert("content_name".into(), content_name.into());
+    fields.insert("scan_result".into(), scan_result.into());
+    fields.insert("scan_verdict".into(), verdict.into());
+    if let Some(status) = rec.int(&["scanStatus", "ScanStatus"]) {
+        fields.insert("scan_status".into(), status.into());
+    }
+    fields.insert("content_size".into(), content_size.into());
+    if let Some(orig) = rec.int(&["originalsize", "OriginalSize"]) {
+        fields.insert("original_size".into(), orig.into());
+    }
+    if let Some(h) = &content_sha256 {
+        fields.insert("content_sha256".into(), h.clone().into());
+    }
+    fields.insert("content_captured".into(), (!text.is_empty()).into());
+    if let Some(reason) = omitted {
+        fields.insert("content_omitted".into(), reason.into());
+    }
+    fields.insert("content_truncated".into(), truncation.is_some().into());
+    let message = if text.is_empty() {
+        format!("AMSI scan {verdict}: {app_name}")
+    } else {
+        text
+    };
+    Some(AmsiScan {
+        content_sha256,
+        data: LogEventData {
+            source: "amsi".into(),
+            source_type: "windows_etw".into(),
+            source_path: "Microsoft-Antimalware-Scan-Interface".into(),
+            parser: "etw_amsi".into(),
+            message,
+            category: "application".into(),
+            log_timestamp: None,
+            facility: None,
+            log_severity: Some(if flagged { "warning" } else { "info" }.into()),
+            proc: Some(app_name).filter(|a| !a.is_empty()),
+            pid: i32::try_from(rec.header_pid).ok().filter(|p| *p > 0),
+            uid: None,
+            username: None,
+            log_host: None,
+            fields,
+            mitre_tactic: None,
+            mitre_technique: None,
+            offset: None,
+            inode: None,
+            truncated_fields: truncation.map(|t| [("message".to_string(), t)].into()),
+        },
+    })
+}
+
 /// A DLL load worth reporting: a process that runs from a protected location
 /// loaded a `.dll` from a folder an unprivileged user can write to (the DLL
 /// search-order hijack / side-loading shape). This is a volume filter, not a
@@ -443,15 +841,279 @@ pub fn dns_query(rec: &EtwRecord) -> Option<(u32, DnsResolutionData)> {
             qtype,
             resolved_ips: ips,
             cnames,
+            // The provider delivers neither client address nor transaction id;
+            // the server comes from `dns_server_hint`, never from here.
             server_addr: String::new(),
             client_addr: String::new(),
             transaction_id: 0,
             rcode: rcode(status).to_string(),
+            query_status: u32::try_from(status).ok(),
             pid: None,
             process: None,
             process_start_time: None,
         },
     ))
+}
+
+/// DNS-Client events that name the server a query was sent to (3009 network
+/// query initiated, 3010 query sent, 3011 response received) →
+/// `(lower-case query name, query type, server address)`. Only a value that
+/// parses as an IP address is accepted.
+pub fn dns_server_hint(rec: &EtwRecord) -> Option<(String, u64, String)> {
+    if rec.provider != DNS_CLIENT || !matches!(rec.id, 3009..=3011) {
+        return None;
+    }
+    let qname = rec
+        .str(&["QueryName"])?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if qname.is_empty() {
+        return None;
+    }
+    let server = rec.str(&["DnsServerIpAddress", "DnsServerAddress"])?;
+    let server = server.trim().trim_matches(|c| c == '[' || c == ']');
+    let ip: IpAddr = server.parse().ok()?;
+    Some((qname, rec.int(&["QueryType"]).unwrap_or(0), ip.to_string()))
+}
+
+/// How long a server hint may precede the completion event it belongs to.
+const DNS_HINT_TTL_TICKS: i64 = 30 * 10_000_000;
+const DNS_HINT_MAX: usize = 1024;
+
+/// Bounded `(name, type)` → server memory joining the "query sent" events to
+/// the completion event. A hint only decorates an event that is emitted
+/// anyway, so overflowing it loses a field, not an event.
+#[derive(Default)]
+pub struct DnsServerHints {
+    map: HashMap<(String, u64), (String, i64)>,
+    order: VecDeque<(String, u64)>,
+}
+
+impl DnsServerHints {
+    pub fn note(&mut self, rec: &EtwRecord) {
+        let Some((name, qtype, server)) = dns_server_hint(rec) else {
+            return;
+        };
+        let key = (name, qtype);
+        if self
+            .map
+            .insert(key.clone(), (server, rec.timestamp))
+            .is_none()
+        {
+            self.order.push_back(key);
+        }
+        while self.map.len() > DNS_HINT_MAX {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.map.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Server for a completion event, when one was seen shortly before it.
+    pub fn take(&mut self, qname: &str, qtype: u64, completed: i64) -> Option<String> {
+        let (server, at) = self.map.remove(&(qname.to_ascii_lowercase(), qtype))?;
+        (completed >= at && completed - at <= DNS_HINT_TTL_TICKS).then_some(server)
+    }
+}
+
+/// Process that issued a file create/overwrite or write (Kernel-File).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTouch {
+    pub pid: i32,
+    pub path: String,
+}
+
+const FILE_OBJECTS_MAX: usize = 8192;
+const TOUCH_INTERVAL_TICKS: i64 = 10_000_000;
+/// `FILE_DIRECTORY_FILE` in `CreateOptions`.
+const FILE_DIRECTORY_FILE: u64 = 0x1;
+
+/// FileObject → path for open handles, filled by Create and read by Write
+/// (a Write event carries no name). Bounded; cleared when full, so at worst
+/// writes to files opened before the clear are not attributed.
+#[derive(Default)]
+pub struct FileObjects {
+    /// FileObject → (path, FILETIME of the last touch reported).
+    paths: HashMap<u64, (String, Option<i64>)>,
+    /// Times the table was cleared at its bound (attribution lost, no event).
+    pub overflows: u64,
+}
+
+impl FileObjects {
+    /// Kernel-File Create (12) / Cleanup (13) / Close (14) / Write (16) → the
+    /// touch it proves. A create counts only when its disposition creates or
+    /// truncates (`FILE_SUPERSEDE`, `FILE_CREATE`, `FILE_OVERWRITE`,
+    /// `FILE_OVERWRITE_IF`); opening an existing file proves nothing.
+    /// `header_pid` is the issuing process of the operation.
+    pub fn observe(&mut self, rec: &EtwRecord, devices: &DeviceMap) -> Option<FileTouch> {
+        if rec.provider != KERNEL_FILE {
+            return None;
+        }
+        let object = rec.int(&["FileObject"])?;
+        let pid = i32::try_from(rec.header_pid).ok().filter(|p| *p > 0)?;
+        match rec.id {
+            12 => {
+                let name = rec.str(&["FileName"]).filter(|n| !n.is_empty())?;
+                let options = rec.int(&["CreateOptions"]).unwrap_or(0);
+                if options & FILE_DIRECTORY_FILE != 0 {
+                    return None;
+                }
+                let path = device_to_dos(&name, devices);
+                if self.paths.len() >= FILE_OBJECTS_MAX {
+                    self.paths.clear();
+                    self.overflows += 1;
+                }
+                let creates = matches!((options >> 24) & 0xff, 0 | 2 | 4 | 5);
+                self.paths
+                    .insert(object, (path.clone(), creates.then_some(rec.timestamp)));
+                creates.then_some(FileTouch { pid, path })
+            }
+            13 | 14 => {
+                self.paths.remove(&object);
+                None
+            }
+            // One report per open file per second: a bulk write is one
+            // attribution, not thousands of identity look-ups.
+            16 => {
+                let (path, last) = self.paths.get_mut(&object)?;
+                if last.is_some_and(|t| rec.timestamp.saturating_sub(t) < TOUCH_INTERVAL_TICKS) {
+                    return None;
+                }
+                *last = Some(rec.timestamp);
+                Some(FileTouch {
+                    pid,
+                    path: path.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Network flows tracked for byte accounting.
+const FLOWS_MAX: usize = 8192;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FlowKey {
+    pid: i32,
+    /// The two endpoints in a fixed order: the provider does not use one
+    /// orientation for every event of an accepted connection.
+    ends: ((String, u16), (String, u16)),
+}
+
+struct Flow {
+    data: NetworkConnectionData,
+    first_ts: i64,
+    sent: u64,
+    recv: u64,
+}
+
+/// Per-connection byte totals from Kernel-Network send/receive events, emitted
+/// as one `closed` record when the connection ends. Bounded by [`FLOWS_MAX`];
+/// the oldest flow is flushed as an `open` snapshot instead of dropped.
+/// Only TCP flows whose connect/accept was observed are tracked, so a
+/// connection that predates the session reports no bytes rather than wrong
+/// ones.
+#[derive(Default)]
+pub struct NetFlows {
+    flows: HashMap<FlowKey, Flow>,
+    order: VecDeque<FlowKey>,
+    /// Traffic for connections never seen opening (no totals emitted).
+    pub untracked: u64,
+}
+
+fn flow_key(pid: i32, a: (String, u16), b: (String, u16)) -> FlowKey {
+    let ends = if a <= b { (a, b) } else { (b, a) };
+    FlowKey { pid, ends }
+}
+
+fn record_key(rec: &EtwRecord) -> Option<FlowKey> {
+    let pid = i32::try_from(rec.int(&["PID"])?).ok()?;
+    Some(flow_key(
+        pid,
+        (address(rec, "saddr")?, port(rec, "sport")?),
+        (address(rec, "daddr")?, port(rec, "dport")?),
+    ))
+}
+
+impl NetFlows {
+    /// Start tracking a flow from its connect/accept record (already mapped).
+    /// Returns the snapshot of a flow evicted to make room, if any.
+    pub fn open(&mut self, data: &NetworkConnectionData, ts: i64) -> Option<NetworkConnectionData> {
+        let pid = data.pid?;
+        let key = flow_key(
+            pid,
+            (data.src_addr.clone(), data.src_port),
+            (data.dst_addr.clone(), data.dst_port),
+        );
+        let flow = Flow {
+            data: data.clone(),
+            first_ts: ts,
+            sent: 0,
+            recv: 0,
+        };
+        let mut evicted = None;
+        if !self.flows.contains_key(&key) {
+            while self.flows.len() >= FLOWS_MAX {
+                let Some(old) = self.order.pop_front() else {
+                    break;
+                };
+                if let Some(f) = self.flows.remove(&old) {
+                    evicted = Some(f.finish("open", ts));
+                }
+            }
+            self.order.push_back(key.clone());
+        }
+        self.flows.insert(key, flow);
+        evicted
+    }
+
+    /// Fold a Kernel-Network send (10/26), receive (11/27) or disconnect
+    /// (13/29) record in. Returns the `closed` record on disconnect.
+    pub fn observe(&mut self, rec: &EtwRecord) -> Option<NetworkConnectionData> {
+        if rec.provider != KERNEL_NETWORK {
+            return None;
+        }
+        let (sending, receiving, closing) = match rec.id {
+            10 | 26 => (true, false, false),
+            11 | 27 => (false, true, false),
+            13 | 29 => (false, false, true),
+            _ => return None,
+        };
+        let key = record_key(rec)?;
+        let Some(flow) = self.flows.get_mut(&key) else {
+            self.untracked += 1;
+            return None;
+        };
+        let size = rec.int(&["size"]).unwrap_or(0);
+        if sending {
+            flow.sent = flow.sent.saturating_add(size);
+        } else if receiving {
+            flow.recv = flow.recv.saturating_add(size);
+        }
+        if !closing {
+            return None;
+        }
+        let flow = self.flows.remove(&key)?;
+        self.order.retain(|k| k != &key);
+        Some(flow.finish("closed", rec.timestamp))
+    }
+}
+
+impl Flow {
+    fn finish(self, state: &str, ts: i64) -> NetworkConnectionData {
+        let mut data = self.data;
+        data.state = state.into();
+        data.bytes_sent = Some(self.sent);
+        data.bytes_recv = Some(self.recv);
+        if ts >= self.first_ts && self.first_ts > 0 {
+            data.duration_ms = Some(((ts - self.first_ts) / 10_000) as u64);
+        }
+        data
+    }
 }
 
 #[cfg(test)]
@@ -544,6 +1206,266 @@ mod tests {
             device_to_dos("aéabc", &vec![("ab".into(), "C:".into())]),
             "aéabc"
         );
+    }
+
+    #[test]
+    fn kernel_space_image_loads_are_driver_loads() {
+        let d = devices();
+        let base = |b: u64| int(b, 8);
+        let r = rec(
+            KERNEL_PROCESS,
+            5,
+            &[
+                ("ProcessID", int(4, 4)),
+                (
+                    "ImageName",
+                    s("\\Device\\HarddiskVolume3\\Windows\\System32\\drivers\\RTCore64.sys"),
+                ),
+                ("ImageBase", base(0xFFFF_F801_2345_0000)),
+                ("ImageSize", int(0x9000, 4)),
+            ],
+        );
+        let drv = driver_load(&r, &d, "C:\\Windows").unwrap();
+        assert_eq!(drv.path, "C:\\Windows\\System32\\drivers\\RTCore64.sys");
+        assert_eq!(drv.name, "RTCore64.sys");
+        assert_eq!(drv.image_size, Some(0x9000));
+        // The pseudo-PID does not matter, the base does.
+        let r = rec(
+            KERNEL_PROCESS,
+            5,
+            &[
+                ("ProcessID", int(0, 4)),
+                ("ImageName", s("\\SystemRoot\\system32\\drivers\\x.sys")),
+                ("ImageBase", base(0xFFFF_8000_0000_0000)),
+            ],
+        );
+        assert_eq!(
+            driver_load(&r, &d, "C:\\Windows").unwrap().path,
+            "C:\\Windows\\system32\\drivers\\x.sys"
+        );
+    }
+
+    #[test]
+    fn user_mode_images_are_not_driver_loads() {
+        let d = devices();
+        let r = rec(
+            KERNEL_PROCESS,
+            5,
+            &[
+                ("ProcessID", int(4, 4)),
+                ("ImageName", s("\\Device\\HarddiskVolume3\\a.sys")),
+                ("ImageBase", int(0x7FF6_0000_0000, 8)),
+            ],
+        );
+        // A .sys name in a user-mode mapping must not pass on the name alone.
+        assert!(driver_load(&r, &d, "C:\\Windows").is_none());
+        // Wrong provider / event id.
+        let mut r2 = r.clone();
+        r2.id = 1;
+        assert!(driver_load(&r2, &d, "").is_none());
+        // Fallback only when ImageBase is absent: PID 4 and .sys.
+        let r3 = rec(
+            KERNEL_PROCESS,
+            5,
+            &[
+                ("ProcessID", int(4, 4)),
+                ("ImageName", s("\\Device\\HarddiskVolume3\\b.SYS")),
+            ],
+        );
+        assert!(driver_load(&r3, &d, "").is_some());
+        let r4 = rec(
+            KERNEL_PROCESS,
+            5,
+            &[
+                ("ProcessID", int(900, 4)),
+                ("ImageName", s("\\Device\\HarddiskVolume3\\b.dll")),
+            ],
+        );
+        assert!(driver_load(&r4, &d, "").is_none());
+    }
+
+    #[test]
+    fn rate_gate_bursts_then_refills() {
+        let mut g = RateGate::new(2, 3);
+        assert!(g.allow(0) && g.allow(0) && g.allow(0));
+        assert!(!g.allow(0), "burst exhausted");
+        assert!(!g.allow(100), "0.2 tokens only");
+        assert!(g.allow(600), "one token after 0.5 s at 2/s");
+        assert!(!g.allow(600));
+        // A clock that goes backwards neither panics nor mints tokens.
+        assert!(!g.allow(10));
+        // Never above the burst.
+        for _ in 0..3 {
+            assert!(g.allow(60_000));
+        }
+        assert!(!g.allow(60_000));
+    }
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn pipe_prefilter_finds_the_device_in_a_raw_payload() {
+        let mut payload = vec![0u8; 32];
+        payload.extend(utf16le("\\Device\\NamedPipe\\msagent_81"));
+        assert!(payload_mentions_pipe(&payload));
+        let mut lower = vec![1u8; 7];
+        lower.extend(utf16le("\\device\\namedpipe\\x"));
+        assert!(payload_mentions_pipe(&lower));
+        // An ordinary file, a short buffer, and a byte-shifted (odd) match.
+        let mut file = vec![0u8; 32];
+        file.extend(utf16le("\\Device\\HarddiskVolume3\\a.txt"));
+        assert!(!payload_mentions_pipe(&file));
+        assert!(!payload_mentions_pipe(&[0u8; 4]));
+        assert!(!payload_mentions_pipe(b"\\NamedPipe\\ascii-not-utf16"));
+    }
+
+    #[test]
+    fn pipe_create_maps_to_the_win32_pipe_path() {
+        let r = rec(
+            KERNEL_FILE,
+            12,
+            &[("FileName", s("\\Device\\NamedPipe\\MSSE-1234-server"))],
+        );
+        let mut r = r;
+        r.header_pid = 4242;
+        assert_eq!(
+            pipe_create(&r),
+            Some((4242, "\\\\.\\pipe\\MSSE-1234-server".to_string()))
+        );
+        // Not a pipe, the pipe root, another event id, another provider.
+        let other = rec(
+            KERNEL_FILE,
+            12,
+            &[("FileName", s("\\Device\\HarddiskVolume3\\x"))],
+        );
+        assert!(pipe_create(&other).is_none());
+        let root = rec(KERNEL_FILE, 12, &[("FileName", s("\\Device\\NamedPipe\\"))]);
+        assert!(pipe_create(&root).is_none());
+        let mut wrong_id = r.clone();
+        wrong_id.id = 14;
+        assert!(pipe_create(&wrong_id).is_none());
+        let mut wrong_provider = r.clone();
+        wrong_provider.provider = DNS_CLIENT;
+        assert!(pipe_create(&wrong_provider).is_none());
+        // Hostile name length is bounded.
+        let long = format!("\\Device\\NamedPipe\\{}", "a".repeat(5000));
+        let rl = rec(KERNEL_FILE, 12, &[("FileName", s(&long))]);
+        let (_, path) = pipe_create(&rl).unwrap();
+        assert_eq!(path.chars().count(), "\\\\.\\pipe\\".len() + 256);
+    }
+
+    #[test]
+    fn recent_set_reports_repeats_once_per_window_and_stays_bounded() {
+        let mut set = RecentSet::new(1000, 2);
+        assert!(set.first_seen("a", 0));
+        assert!(!set.first_seen("a", 999));
+        assert!(set.first_seen("a", 1000), "window elapsed");
+        assert!(set.first_seen("b", 1000));
+        // Full: a new key clears instead of growing.
+        assert!(set.first_seen("c", 1001));
+        assert!(set.seen.len() <= 2);
+    }
+
+    #[test]
+    fn loss_guard_trips_once_past_the_limit() {
+        let mut g = LossGuard::new(100, 50);
+        assert!(!g.observe(100));
+        assert!(!g.observe(150), "exactly at the limit is tolerated");
+        assert!(g.observe(151));
+        assert!(!g.observe(10_000), "only once");
+        assert!(
+            !LossGuard::new(500, 10).observe(400),
+            "counter reset is not a trip"
+        );
+    }
+
+    fn amsi_rec(result: u64, content: Option<Vec<u8>>, size: u64) -> EtwRecord {
+        let mut props = vec![
+            (
+                "appname",
+                s("PowerShell_C:\\Windows\\System32\\powershell.exe_10.0"),
+            ),
+            ("contentname", s("C:\\Users\\a\\x.ps1")),
+            ("scanResult", int(result, 4)),
+            ("scanStatus", int(0, 1)),
+            ("contentsize", int(size, 4)),
+        ];
+        if let Some(c) = content {
+            props.push(("content", EtwValue::Bytes(c)));
+        }
+        let mut r = rec(AMSI, 1101, &props);
+        r.header_pid = 777;
+        r
+    }
+
+    #[test]
+    fn amsi_text_decodes_utf16_utf8_and_refuses_binary() {
+        assert_eq!(
+            decode_amsi_text(&utf16le("\u{feff}iex 'a'")).as_deref(),
+            Some("iex 'a'")
+        );
+        assert_eq!(decode_amsi_text(b"echo hi").as_deref(), Some("echo hi"));
+        assert!(decode_amsi_text(b"MZ\x90\x00\x03\x00").is_none());
+        assert!(decode_amsi_text(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]).is_none());
+        assert!(decode_amsi_text(b"").is_none());
+    }
+
+    #[test]
+    fn amsi_content_is_only_captured_with_the_opt_in() {
+        let script = utf16le("Invoke-Mimikatz -DumpCreds");
+        let r = amsi_rec(1, Some(script.clone()), script.len() as u64);
+        // Off: a clean scan produces nothing at all.
+        assert!(amsi_scan(&r, false).is_none());
+        // Off, but the scan was flagged: metadata only, never the text.
+        let flagged = amsi_rec(32768, Some(script.clone()), script.len() as u64);
+        let off = amsi_scan(&flagged, false).unwrap();
+        assert!(!off.data.message.contains("Mimikatz"));
+        assert!(off.content_sha256.is_none());
+        assert_eq!(off.data.fields["content_omitted"], "capture_disabled");
+        assert_eq!(off.data.fields["content_captured"], false);
+        assert_eq!(off.data.fields["scan_verdict"], "detected");
+        assert!(!serde_json::to_string(&off.data)
+            .unwrap()
+            .contains("Mimikatz"));
+        // On: the text and its hash travel.
+        let on = amsi_scan(&r, true).unwrap();
+        assert_eq!(on.data.message, "Invoke-Mimikatz -DumpCreds");
+        assert_eq!(on.data.fields["content_captured"], true);
+        assert_eq!(on.data.fields["content_truncated"], false);
+        assert!(on.content_sha256.unwrap().starts_with("sha256:"));
+        assert_eq!(on.data.pid, Some(777));
+        assert_eq!(on.data.source_type, "windows_etw");
+        assert_eq!(on.data.fields["EventID"], 1101);
+    }
+
+    #[test]
+    fn amsi_content_is_truncated_with_markers_and_binary_is_omitted() {
+        let big = "A".repeat(AMSI_MAX_CONTENT_BYTES + 100);
+        let r = amsi_rec(0, Some(big.clone().into_bytes()), big.len() as u64);
+        let scan = amsi_scan(&r, true).unwrap();
+        assert_eq!(scan.data.message.len(), AMSI_MAX_CONTENT_BYTES);
+        assert_eq!(scan.data.fields["content_truncated"], true);
+        assert_eq!(
+            scan.data.truncated_fields.as_ref().unwrap()["message"].original_length,
+            big.len()
+        );
+        let bin = amsi_rec(0, Some(b"MZ\x90\x00\x03".to_vec()), 5);
+        let scan = amsi_scan(&bin, true).unwrap();
+        assert_eq!(scan.data.fields["content_omitted"], "binary");
+        assert!(scan.data.message.starts_with("AMSI scan clean"));
+        // The reader refused a value above its cap: say so, do not guess.
+        let huge = amsi_rec(0, None, 1_000_000);
+        assert_eq!(
+            amsi_scan(&huge, true).unwrap().data.fields["content_omitted"],
+            "oversize"
+        );
+        // Empty scans carry nothing and are skipped; wrong event ids too.
+        assert!(amsi_scan(&amsi_rec(0, None, 0), true).is_none());
+        let mut other = r.clone();
+        other.id = 1102;
+        assert!(amsi_scan(&other, true).is_none());
     }
 
     #[test]
@@ -888,5 +1810,231 @@ mod tests {
         assert_eq!(m.exe_sha256.as_deref(), Some("sha256:ab"));
         let none = ProcessEnrichment::default().prefer_over(ProcessEnrichment::default());
         assert!(none.cmdline.is_none() && none.username.is_none());
+    }
+
+    fn file_rec(id: u16, pid: u32, ts: i64, props: &[(&str, EtwValue)]) -> EtwRecord {
+        let mut r = rec(KERNEL_FILE, id, props);
+        r.header_pid = pid;
+        r.timestamp = ts;
+        r
+    }
+
+    #[test]
+    fn file_create_and_write_name_the_issuing_process() {
+        let mut t = FileObjects::default();
+        let d = devices();
+        let name = s("\\Device\\HarddiskVolume3\\Users\\a\\x.txt");
+        // FILE_OPEN (1): proves nothing yet, but remembers the object.
+        let open = file_rec(
+            12,
+            900,
+            0,
+            &[
+                ("FileObject", int(7, 8)),
+                ("FileName", name.clone()),
+                ("CreateOptions", int(1 << 24, 4)),
+            ],
+        );
+        assert!(t.observe(&open, &d).is_none());
+        let w = file_rec(16, 900, 50_000_000, &[("FileObject", int(7, 8))]);
+        let touch = t.observe(&w, &d).unwrap();
+        assert_eq!(
+            (touch.pid, touch.path.as_str()),
+            (900, "C:\\Users\\a\\x.txt")
+        );
+        // Bulk writes inside a second are one attribution.
+        let w2 = file_rec(16, 900, 50_000_100, &[("FileObject", int(7, 8))]);
+        assert!(t.observe(&w2, &d).is_none());
+        let w3 = file_rec(16, 901, 70_000_000, &[("FileObject", int(7, 8))]);
+        assert_eq!(t.observe(&w3, &d).unwrap().pid, 901);
+        // Close forgets the object; an unknown object is never attributed.
+        t.observe(&file_rec(14, 900, 0, &[("FileObject", int(7, 8))]), &d);
+        assert!(t
+            .observe(
+                &file_rec(16, 900, 99_000_000, &[("FileObject", int(7, 8))]),
+                &d
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn file_create_dispositions_and_directories() {
+        let d = devices();
+        let mut t = FileObjects::default();
+        let mk = |obj: u64, disp: u64, extra: u64| {
+            file_rec(
+                12,
+                5,
+                1,
+                &[
+                    ("FileObject", int(obj, 8)),
+                    ("FileName", s("C:\\a\\f")),
+                    ("CreateOptions", int((disp << 24) | extra, 4)),
+                ],
+            )
+        };
+        assert!(t.observe(&mk(1, 2, 0), &d).is_some(), "FILE_CREATE");
+        assert!(t.observe(&mk(2, 5, 0), &d).is_some(), "FILE_OVERWRITE_IF");
+        assert!(
+            t.observe(&mk(3, 3, 0), &d).is_none(),
+            "FILE_OPEN_IF may only open"
+        );
+        assert!(
+            t.observe(&mk(4, 2, FILE_DIRECTORY_FILE), &d).is_none(),
+            "directory"
+        );
+        let mut other = mk(5, 2, 0);
+        other.provider = KERNEL_NETWORK;
+        assert!(t.observe(&other, &d).is_none());
+        let mut nopid = mk(6, 2, 0);
+        nopid.header_pid = 0;
+        assert!(t.observe(&nopid, &d).is_none());
+    }
+
+    #[test]
+    fn file_object_table_is_bounded() {
+        let d = devices();
+        let mut t = FileObjects::default();
+        for i in 0..(FILE_OBJECTS_MAX as u64 + 1) {
+            t.observe(
+                &file_rec(
+                    12,
+                    5,
+                    1,
+                    &[
+                        ("FileObject", int(i, 8)),
+                        ("FileName", s("C:\\f")),
+                        ("CreateOptions", int(1 << 24, 4)),
+                    ],
+                ),
+                &d,
+            );
+        }
+        assert_eq!(t.overflows, 1);
+        assert!(t.paths.len() <= FILE_OBJECTS_MAX);
+    }
+
+    fn dns_hint_rec(id: u16, name: &str, server: &str, ts: i64) -> EtwRecord {
+        let mut r = rec(
+            DNS_CLIENT,
+            id,
+            &[
+                ("QueryName", s(name)),
+                ("QueryType", int(1, 2)),
+                ("DnsServerIpAddress", s(server)),
+            ],
+        );
+        r.timestamp = ts;
+        r
+    }
+
+    #[test]
+    fn dns_server_comes_only_from_a_valid_query_sent_event() {
+        let mut h = DnsServerHints::default();
+        h.note(&dns_hint_rec(3010, "Example.COM.", "10.0.0.53", 100));
+        h.note(&dns_hint_rec(3010, "bad.example", "not-an-ip", 100));
+        h.note(&dns_hint_rec(3006, "ignored.example", "10.0.0.1", 100));
+        assert_eq!(h.take("example.com", 1, 200).as_deref(), Some("10.0.0.53"));
+        assert!(h.take("example.com", 1, 200).is_none(), "consumed once");
+        assert!(h.take("bad.example", 1, 200).is_none());
+        assert!(h.take("ignored.example", 1, 200).is_none());
+        h.note(&dns_hint_rec(3011, "old.example", "[2001:db8::53]", 0));
+        assert!(
+            h.take("old.example", 1, DNS_HINT_TTL_TICKS + 1).is_none(),
+            "stale"
+        );
+        for i in 0..(DNS_HINT_MAX + 5) {
+            h.note(&dns_hint_rec(
+                3010,
+                &format!("h{i}.example"),
+                "10.0.0.53",
+                1,
+            ));
+        }
+        assert!(h.map.len() <= DNS_HINT_MAX);
+    }
+
+    #[test]
+    fn dns_completion_keeps_raw_status_and_invents_no_client_or_txid() {
+        let r = rec(
+            DNS_CLIENT,
+            3008,
+            &[
+                ("QueryName", s("x.example")),
+                ("QueryType", int(1, 2)),
+                ("QueryStatus", int(9003, 4)),
+            ],
+        );
+        let (_, d) = dns_query(&r).unwrap();
+        assert_eq!(d.query_status, Some(9003));
+        assert_eq!(
+            (
+                d.client_addr.as_str(),
+                d.server_addr.as_str(),
+                d.transaction_id
+            ),
+            ("", "", 0)
+        );
+    }
+
+    fn net_rec(id: u16, size: u64, flip: bool) -> EtwRecord {
+        let (l, r, lp, rp): ([u8; 4], [u8; 4], u16, u16) =
+            ([10, 0, 0, 5], [93, 184, 216, 34], 51000, 443);
+        let (sa, da, sp, dp) = if flip { (r, l, rp, lp) } else { (l, r, lp, rp) };
+        let mut x = rec(
+            KERNEL_NETWORK,
+            id,
+            &[
+                ("PID", int(77, 4)),
+                ("size", int(size, 4)),
+                ("saddr", EtwValue::Int(0, sa.to_vec())),
+                ("daddr", EtwValue::Int(0, da.to_vec())),
+                ("sport", EtwValue::Int(0, sp.to_be_bytes().to_vec())),
+                ("dport", EtwValue::Int(0, dp.to_be_bytes().to_vec())),
+            ],
+        );
+        x.timestamp = 1_000_000_000;
+        x
+    }
+
+    #[test]
+    fn network_bytes_aggregate_per_flow_and_emit_on_close() {
+        let mut f = NetFlows::default();
+        let connect = net_rec(12, 0, false);
+        let data = network_connection(&connect, None).unwrap();
+        assert!(f.open(&data, connect.timestamp).is_none());
+        assert!(f.observe(&net_rec(10, 100, false)).is_none());
+        assert!(
+            f.observe(&net_rec(10, 50, true)).is_none(),
+            "other orientation, same flow"
+        );
+        assert!(f.observe(&net_rec(11, 4000, false)).is_none());
+        let mut close = net_rec(13, 0, false);
+        close.timestamp += 25_000_000;
+        let c = f.observe(&close).unwrap();
+        assert_eq!((c.bytes_sent, c.bytes_recv), (Some(150), Some(4000)));
+        assert_eq!((c.state.as_str(), c.duration_ms), ("closed", Some(2500)));
+        assert_eq!((c.dst_addr.as_str(), c.dst_port), ("93.184.216.34", 443));
+        assert!(f.flows.is_empty() && f.order.is_empty());
+        // Traffic of a flow that was never seen opening reports nothing.
+        assert!(f.observe(&net_rec(10, 9, false)).is_none());
+        assert_eq!(f.untracked, 1);
+    }
+
+    #[test]
+    fn network_flow_table_is_bounded_and_flushes_evictions() {
+        let mut f = NetFlows::default();
+        let base = network_connection(&net_rec(12, 0, false), None).unwrap();
+        let mut flushed = 0;
+        for i in 0..(FLOWS_MAX as u16 + 3) {
+            let mut d = base.clone();
+            d.src_port = 1000 + i;
+            if let Some(e) = f.open(&d, 1) {
+                assert_eq!((e.state.as_str(), e.bytes_sent), ("open", Some(0)));
+                flushed += 1;
+            }
+        }
+        assert_eq!(flushed, 3);
+        assert_eq!(f.flows.len(), FLOWS_MAX);
     }
 }
