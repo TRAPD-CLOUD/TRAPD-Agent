@@ -1,5 +1,25 @@
 name: CI
-on: [push, pull_request]
+# Pushes run CI only on main; feature branches are covered by their pull request.
+# Running both doubled every PR run (including the Windows MSI job).
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
+  pull_request:
+    paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
+  workflow_dispatch:
+
+# Read-only token. actions: read lets the optional SignPath step in
+# windows-package.yml fetch the unsigned MSI artifact.
+permissions:
+  contents: read
+  actions: read
+
+# A new push to a pull request supersedes the run for the previous commit.
+# Runs on main are never cancelled, so every merged commit keeps a result.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   windows-msi:
@@ -9,6 +29,7 @@ jobs:
   # purges it in ubuntu and debian containers (needs Docker on the runner).
   deb-package:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: REQUIRE_DOCKER=1 deploy/deb/test-deb.sh
@@ -24,6 +45,7 @@ jobs:
   # silently turn every unrelated PR red.
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install cargo-audit (prebuilt)
@@ -34,6 +56,7 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -87,6 +110,7 @@ jobs:
   # Windows build is caught on every push/PR, not at tag time.
   windows:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -114,6 +138,7 @@ jobs:
   # the eBPF crate on every push/PR so such breakage is caught and blocking.
   ebpf:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

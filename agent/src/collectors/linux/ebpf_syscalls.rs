@@ -688,7 +688,7 @@ fn cstr(buf: &[u8]) -> &str {
     std::str::from_utf8(&buf[..end]).unwrap_or("")
 }
 
-fn proc_username(uid: u32) -> String {
+pub(super) fn proc_username(uid: u32) -> String {
     fs::read_to_string("/etc/passwd")
         .unwrap_or_default()
         .lines()
@@ -1350,6 +1350,20 @@ impl Collector for EbpfSyscallCollector {
             &mut coverage_guard,
         );
 
+        // Sensitive credential-file reads reuse the vfs_open inode gate; they
+        // are only meaningful when that probe is active with verified BTF.
+        let sensitive_active =
+            crate::telemetry::coverage::snapshot().ebpf_honeytoken_inode == Some(true);
+        let sensitive_tasks = super::sensitive_files::spawn(
+            &mut bpf,
+            sensitive_active,
+            self.cfg.clone(),
+            tx.clone(),
+            agent_id.clone(),
+            hostname.clone(),
+        );
+        coverage_guard.tasks.extend(sensitive_tasks);
+
         info!(
             "eBPF syscall tracer attached: 24 core tracepoints + 1 kprobe + \
              up to 6 best-effort honeytoken-coverage tracepoints"
@@ -1384,524 +1398,528 @@ impl Collector for EbpfSyscallCollector {
 
         loop {
             tokio::select! {
-                _ = tx.closed() => {
-                    return Ok(());
-                }
+                           _ = tx.closed() => {
+                               return Ok(());
+                           }
 
-                // Periodic eBPF ring-buffer drop report (issue #52). Emits an
-                // event only when new drops occurred since the last poll.
-                _ = drop_ticker.tick() => {
-                    if let Some(data) = drop_monitor.as_mut().and_then(DropMonitor::poll) {
-                        let event = AgentEvent::new(
-                            agent_id.clone(), hostname.clone(),
-                            EventClass::System, EventAction::EbpfDrops,
-                            Severity::Medium,
-                            EventData::EbpfDrops(data),
-                        );
-                        if tx.send(event).await.is_err() { return Ok(()); }
-                    }
-                }
+                           // Periodic eBPF ring-buffer drop report (issue #52). Emits an
+                           // event only when new drops occurred since the last poll.
+                           _ = drop_ticker.tick() => {
+                               if let Some(data) = drop_monitor.as_mut().and_then(DropMonitor::poll) {
+                                   let event = AgentEvent::new(
+                                       agent_id.clone(), hostname.clone(),
+                                       EventClass::System, EventAction::EbpfDrops,
+                                       Severity::Medium,
+                                       EventData::EbpfDrops(data),
+                                   );
+                                   if tx.send(event).await.is_err() { return Ok(()); }
+                               }
+                           }
 
-                Ok(mut guard) = afd_file_open.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawFileOpenEvent>(&item) } {
-                            // Self-exclusion: the agent's own file opens are pure
-                            // monitor noise and, for its telemetry sink
-                            // (`/var/log/trapd/events.ndjson`), a runaway feedback
-                            // loop — every append opens the file, which emits an
-                            // open event, which is appended to the file, which
-                            // opens it again. Drop opens by our own process; this
-                            // mirrors the honeytoken `Allowlist` self-exclusion.
-                            if ev.pid == agent_pid {
-                                continue;
-                            }
-                            // A name observed below the directory listing: the
-                            // rootkit sweep looks it up directly, which is how
-                            // a file filtered out of getdents is still found.
-                            crate::rootkit::kernel_view::kernel_view()
-                                .record_path(cstr(&ev.filename), cstr(&ev.comm), "write");
-                            let username = proc_username(ev.uid);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Filesystem, EventAction::Open,
-                                Severity::Info,
-                                EventData::FileOpen(FileOpenData {
-                                    pid: ev.pid as i32,
-                                    uid: ev.uid,
-                                    gid: ev.gid,
-                                    username,
-                                    comm: cstr(&ev.comm).to_string(),
-                                    path: cstr(&ev.filename).to_string(),
-                                    flags: ev.flags,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_file_open.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawFileOpenEvent>(&item) } {
+                                       // Self-exclusion: the agent's own file opens are pure
+                                       // monitor noise and, for its telemetry sink
+                                       // (`/var/log/trapd/events.ndjson`), a runaway feedback
+                                       // loop — every append opens the file, which emits an
+                                       // open event, which is appended to the file, which
+                                       // opens it again. Drop opens by our own process; this
+                                       // mirrors the honeytoken `Allowlist` self-exclusion.
+                                       if ev.pid == agent_pid {
+                                           continue;
+                                       }
+                                       // A name observed below the directory listing: the
+                                       // rootkit sweep looks it up directly, which is how
+                                       // a file filtered out of getdents is still found.
+                                       crate::rootkit::kernel_view::kernel_view()
+                                           .record_path(cstr(&ev.filename), cstr(&ev.comm), "write");
+                                       let username = proc_username(ev.uid);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Filesystem, EventAction::Open,
+                                           Severity::Info,
+                                           EventData::FileOpen(FileOpenData {
+                                               pid: ev.pid as i32,
+                                               uid: ev.uid,
+                                               gid: ev.gid,
+                                               username,
+                                               comm: cstr(&ev.comm).to_string(),
+                                               path: cstr(&ev.filename).to_string(),
+                                               flags: ev.flags,
+            exe: None,
+            process_start_time: None,
+            sensitive_class: None,
+            suppressed_repeats: None,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_net.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawNetEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion (own uploads to backend)
-                            // A bind seen at the syscall layer, below both
-                            // /proc/net and netlink: the rootkit sweep uses it
-                            // to spot a listener neither view admits to.
-                            if ev.op == 1 {
-                                crate::rootkit::kernel_view::kernel_view()
-                                    .record_bind(ev.pid as i32, ev.port, cstr(&ev.comm));
-                            }
-                            let username = proc_username(ev.uid);
-                            let (action, severity) = match ev.op {
-                                0 => (EventAction::Connection, Severity::Info),
-                                1 => (EventAction::Bind,       Severity::Info),
-                                _ => (EventAction::Accept,     Severity::Info),
-                            };
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Network, action,
-                                severity,
-                                EventData::NetworkSocket(NetworkSocketData {
-                                    pid:    ev.pid as i32,
-                                    uid:    ev.uid,
-                                    gid:    ev.gid,
-                                    username,
-                                    comm:   cstr(&ev.comm).to_string(),
-                                    op:     net_op_str(ev.op).to_string(),
-                                    family: family_str(ev.family).to_string(),
-                                    addr:   format_addr(ev.family, &ev.addr),
-                                    port:   ev.port,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_net.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawNetEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion (own uploads to backend)
+                                       // A bind seen at the syscall layer, below both
+                                       // /proc/net and netlink: the rootkit sweep uses it
+                                       // to spot a listener neither view admits to.
+                                       if ev.op == 1 {
+                                           crate::rootkit::kernel_view::kernel_view()
+                                               .record_bind(ev.pid as i32, ev.port, cstr(&ev.comm));
+                                       }
+                                       let username = proc_username(ev.uid);
+                                       let (action, severity) = match ev.op {
+                                           0 => (EventAction::Connection, Severity::Info),
+                                           1 => (EventAction::Bind,       Severity::Info),
+                                           _ => (EventAction::Accept,     Severity::Info),
+                                       };
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Network, action,
+                                           severity,
+                                           EventData::NetworkSocket(NetworkSocketData {
+                                               pid:    ev.pid as i32,
+                                               uid:    ev.uid,
+                                               gid:    ev.gid,
+                                               username,
+                                               comm:   cstr(&ev.comm).to_string(),
+                                               op:     net_op_str(ev.op).to_string(),
+                                               family: family_str(ev.family).to_string(),
+                                               addr:   format_addr(ev.family, &ev.addr),
+                                               port:   ev.port,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_fork.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawForkEvent>(&item) } {
-                            if ev.parent_pid == agent_pid || ev.child_pid == agent_pid { continue; } // self-exclusion
-                            crate::rootkit::kernel_view::kernel_view()
-                                .record_process(ev.child_pid as i32, cstr(&ev.child_comm));
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Process, EventAction::Fork,
-                                Severity::Info,
-                                EventData::Fork(ForkData {
-                                    parent_pid:  ev.parent_pid as i32,
-                                    child_pid:   ev.child_pid  as i32,
-                                    parent_comm: cstr(&ev.parent_comm).to_string(),
-                                    child_comm:  cstr(&ev.child_comm).to_string(),
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_fork.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawForkEvent>(&item) } {
+                                       if ev.parent_pid == agent_pid || ev.child_pid == agent_pid { continue; } // self-exclusion
+                                       crate::rootkit::kernel_view::kernel_view()
+                                           .record_process(ev.child_pid as i32, cstr(&ev.child_comm));
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Process, EventAction::Fork,
+                                           Severity::Info,
+                                           EventData::Fork(ForkData {
+                                               parent_pid:  ev.parent_pid as i32,
+                                               child_pid:   ev.child_pid  as i32,
+                                               parent_comm: cstr(&ev.parent_comm).to_string(),
+                                               child_comm:  cstr(&ev.child_comm).to_string(),
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_unlink.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawFileUnlinkEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion
-                            crate::rootkit::kernel_view::kernel_view()
-                                .record_path(cstr(&ev.path), cstr(&ev.comm), "unlink");
-                            let username = proc_username(ev.uid);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Filesystem, EventAction::Unlink,
-                                Severity::Low,
-                                EventData::FileUnlink(FileUnlinkData {
-                                    pid: ev.pid as i32,
-                                    uid: ev.uid,
-                                    gid: ev.gid,
-                                    username,
-                                    comm: cstr(&ev.comm).to_string(),
-                                    path: cstr(&ev.path).to_string(),
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_unlink.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawFileUnlinkEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion
+                                       crate::rootkit::kernel_view::kernel_view()
+                                           .record_path(cstr(&ev.path), cstr(&ev.comm), "unlink");
+                                       let username = proc_username(ev.uid);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Filesystem, EventAction::Unlink,
+                                           Severity::Low,
+                                           EventData::FileUnlink(FileUnlinkData {
+                                               pid: ev.pid as i32,
+                                               uid: ev.uid,
+                                               gid: ev.gid,
+                                               username,
+                                               comm: cstr(&ev.comm).to_string(),
+                                               path: cstr(&ev.path).to_string(),
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_rename.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawFileRenameEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion
-                            let view = crate::rootkit::kernel_view::kernel_view();
-                            view.record_path(cstr(&ev.old_path), cstr(&ev.comm), "rename");
-                            view.record_path(cstr(&ev.new_path), cstr(&ev.comm), "rename");
-                            let username = proc_username(ev.uid);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Filesystem, EventAction::Rename,
-                                Severity::Info,
-                                EventData::FileRename(FileRenameData {
-                                    pid:      ev.pid as i32,
-                                    uid:      ev.uid,
-                                    gid:      ev.gid,
-                                    username,
-                                    comm:     cstr(&ev.comm).to_string(),
-                                    old_path: cstr(&ev.old_path).to_string(),
-                                    new_path: cstr(&ev.new_path).to_string(),
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_rename.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawFileRenameEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion
+                                       let view = crate::rootkit::kernel_view::kernel_view();
+                                       view.record_path(cstr(&ev.old_path), cstr(&ev.comm), "rename");
+                                       view.record_path(cstr(&ev.new_path), cstr(&ev.comm), "rename");
+                                       let username = proc_username(ev.uid);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Filesystem, EventAction::Rename,
+                                           Severity::Info,
+                                           EventData::FileRename(FileRenameData {
+                                               pid:      ev.pid as i32,
+                                               uid:      ev.uid,
+                                               gid:      ev.gid,
+                                               username,
+                                               comm:     cstr(&ev.comm).to_string(),
+                                               old_path: cstr(&ev.old_path).to_string(),
+                                               new_path: cstr(&ev.new_path).to_string(),
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_chmod.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawFileChmodEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion
-                            let username = proc_username(ev.uid);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Filesystem, EventAction::Chmod,
-                                Severity::Info,
-                                EventData::FileChmod(FileChmodData {
-                                    pid:  ev.pid as i32,
-                                    uid:  ev.uid,
-                                    gid:  ev.gid,
-                                    username,
-                                    comm: cstr(&ev.comm).to_string(),
-                                    path: cstr(&ev.path).to_string(),
-                                    mode: ev.mode,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_chmod.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawFileChmodEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion
+                                       let username = proc_username(ev.uid);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Filesystem, EventAction::Chmod,
+                                           Severity::Info,
+                                           EventData::FileChmod(FileChmodData {
+                                               pid:  ev.pid as i32,
+                                               uid:  ev.uid,
+                                               gid:  ev.gid,
+                                               username,
+                                               comm: cstr(&ev.comm).to_string(),
+                                               path: cstr(&ev.path).to_string(),
+                                               mode: ev.mode,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_chown.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawFileChownEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion
-                            let username = proc_username(ev.uid);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Filesystem, EventAction::Chown,
-                                Severity::Info,
-                                EventData::FileChown(FileChownData {
-                                    pid:     ev.pid as i32,
-                                    uid:     ev.uid,
-                                    gid:     ev.gid,
-                                    username,
-                                    comm:    cstr(&ev.comm).to_string(),
-                                    path:    cstr(&ev.path).to_string(),
-                                    new_uid: ev.new_uid,
-                                    new_gid: ev.new_gid,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_chown.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawFileChownEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion
+                                       let username = proc_username(ev.uid);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Filesystem, EventAction::Chown,
+                                           Severity::Info,
+                                           EventData::FileChown(FileChownData {
+                                               pid:     ev.pid as i32,
+                                               uid:     ev.uid,
+                                               gid:     ev.gid,
+                                               username,
+                                               comm:    cstr(&ev.comm).to_string(),
+                                               path:    cstr(&ev.path).to_string(),
+                                               new_uid: ev.new_uid,
+                                               new_gid: ev.new_gid,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_mmap.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawMmapEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion
-                            let username = proc_username(ev.uid);
-                            let desc = mmap_description(ev.prot, ev.flags);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Memory, EventAction::Mmap,
-                                Severity::Medium,
-                                EventData::Mmap(MmapData {
-                                    pid:         ev.pid as i32,
-                                    uid:         ev.uid,
-                                    gid:         ev.gid,
-                                    username,
-                                    comm:        cstr(&ev.comm).to_string(),
-                                    addr:        ev.addr,
-                                    len:         ev.len,
-                                    prot:        ev.prot,
-                                    flags:       ev.flags,
-                                    description: desc,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_mmap.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawMmapEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion
+                                       let username = proc_username(ev.uid);
+                                       let desc = mmap_description(ev.prot, ev.flags);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Memory, EventAction::Mmap,
+                                           Severity::Medium,
+                                           EventData::Mmap(MmapData {
+                                               pid:         ev.pid as i32,
+                                               uid:         ev.uid,
+                                               gid:         ev.gid,
+                                               username,
+                                               comm:        cstr(&ev.comm).to_string(),
+                                               addr:        ev.addr,
+                                               len:         ev.len,
+                                               prot:        ev.prot,
+                                               flags:       ev.flags,
+                                               description: desc,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_ptrace.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawPtraceEvent>(&item) } {
-                            // self-exclusion for the agent AS tracer; an attacker
-                            // ptracing the agent (target_pid == us) still reports.
-                            if ev.pid == agent_pid { continue; }
-                            let username = proc_username(ev.uid);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Process, EventAction::Ptrace,
-                                Severity::High,
-                                EventData::Ptrace(PtraceData {
-                                    pid:        ev.pid as i32,
-                                    uid:        ev.uid,
-                                    gid:        ev.gid,
-                                    username,
-                                    comm:       cstr(&ev.comm).to_string(),
-                                    request:    ev.request,
-                                    target_pid: ev.target_pid as i32,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_ptrace.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawPtraceEvent>(&item) } {
+                                       // self-exclusion for the agent AS tracer; an attacker
+                                       // ptracing the agent (target_pid == us) still reports.
+                                       if ev.pid == agent_pid { continue; }
+                                       let username = proc_username(ev.uid);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Process, EventAction::Ptrace,
+                                           Severity::High,
+                                           EventData::Ptrace(PtraceData {
+                                               pid:        ev.pid as i32,
+                                               uid:        ev.uid,
+                                               gid:        ev.gid,
+                                               username,
+                                               comm:       cstr(&ev.comm).to_string(),
+                                               request:    ev.request,
+                                               target_pid: ev.target_pid as i32,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_module.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawModuleLoadEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion
-                            // Recorded so a module that removes itself from
-                            // /proc/modules and /sys/module can still be named.
-                            crate::rootkit::kernel_view::kernel_view()
-                                .record_module_load(cstr(&ev.name));
-                            let username = proc_username(ev.uid);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Kernel, EventAction::ModuleLoad,
-                                Severity::High,
-                                EventData::ModuleLoad(ModuleLoadData {
-                                    pid:      ev.pid as i32,
-                                    uid:      ev.uid,
-                                    gid:      ev.gid,
-                                    username,
-                                    name:     cstr(&ev.name).to_string(),
-                                    taints:   ev.taints,
-                                    path: None,
-                                    process_exe: None,
-                                    process_start_time: None,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_module.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawModuleLoadEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion
+                                       // Recorded so a module that removes itself from
+                                       // /proc/modules and /sys/module can still be named.
+                                       crate::rootkit::kernel_view::kernel_view()
+                                           .record_module_load(cstr(&ev.name));
+                                       let username = proc_username(ev.uid);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Kernel, EventAction::ModuleLoad,
+                                           Severity::High,
+                                           EventData::ModuleLoad(ModuleLoadData {
+                                               pid:      ev.pid as i32,
+                                               uid:      ev.uid,
+                                               gid:      ev.gid,
+                                               username,
+                                               name:     cstr(&ev.name).to_string(),
+                                               taints:   ev.taints,
+                                               path: None,
+                                               process_exe: None,
+                                               process_start_time: None,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_shm.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawShmEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion
-                            let username = proc_username(ev.uid);
-                            let (action, op_str) = if ev.op == 0 {
-                                (EventAction::Shmget, "shmget")
-                            } else {
-                                (EventAction::Shmat, "shmat")
-                            };
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Ipc, action,
-                                Severity::Low,
-                                EventData::Shm(ShmData {
-                                    pid:      ev.pid as i32,
-                                    uid:      ev.uid,
-                                    gid:      ev.gid,
-                                    username,
-                                    comm:     cstr(&ev.comm).to_string(),
-                                    op:       op_str.to_string(),
-                                    key:      ev.key,
-                                    size:     ev.size,
-                                    flags:    ev.flags,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_shm.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawShmEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion
+                                       let username = proc_username(ev.uid);
+                                       let (action, op_str) = if ev.op == 0 {
+                                           (EventAction::Shmget, "shmget")
+                                       } else {
+                                           (EventAction::Shmat, "shmat")
+                                       };
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Ipc, action,
+                                           Severity::Low,
+                                           EventData::Shm(ShmData {
+                                               pid:      ev.pid as i32,
+                                               uid:      ev.uid,
+                                               gid:      ev.gid,
+                                               username,
+                                               comm:     cstr(&ev.comm).to_string(),
+                                               op:       op_str.to_string(),
+                                               key:      ev.key,
+                                               size:     ev.size,
+                                               flags:    ev.flags,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_ns.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawNsChangeEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion
-                            let username = proc_username(ev.uid);
-                            let op_str = if ev.op == 0 { "unshare" } else { "setns" };
-                            let namespaces = ns_flags_to_string(ev.flags);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Process, EventAction::NsChange,
-                                Severity::Medium,
-                                EventData::NsChange(NsChangeData {
-                                    pid:        ev.pid as i32,
-                                    uid:        ev.uid,
-                                    gid:        ev.gid,
-                                    username,
-                                    comm:       cstr(&ev.comm).to_string(),
-                                    op:         op_str.to_string(),
-                                    namespaces,
-                                    flags:      ev.flags,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_ns.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawNsChangeEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion
+                                       let username = proc_username(ev.uid);
+                                       let op_str = if ev.op == 0 { "unshare" } else { "setns" };
+                                       let namespaces = ns_flags_to_string(ev.flags);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Process, EventAction::NsChange,
+                                           Severity::Medium,
+                                           EventData::NsChange(NsChangeData {
+                                               pid:        ev.pid as i32,
+                                               uid:        ev.uid,
+                                               gid:        ev.gid,
+                                               username,
+                                               comm:       cstr(&ev.comm).to_string(),
+                                               op:         op_str.to_string(),
+                                               namespaces,
+                                               flags:      ev.flags,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_dns.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawDnsEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion (own backend lookups)
-                            let username = proc_username(ev.uid);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Network, EventAction::DnsQuery,
-                                Severity::Info,
-                                EventData::Dns(DnsData {
-                                    pid:      ev.pid as i32,
-                                    uid:      ev.uid,
-                                    gid:      ev.gid,
-                                    username,
-                                    comm:     cstr(&ev.comm).to_string(),
-                                    dst_addr: format_addr(ev.family, &ev.dst_addr),
-                                    dst_port: ev.dst_port,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_dns.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawDnsEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion (own backend lookups)
+                                       let username = proc_username(ev.uid);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Network, EventAction::DnsQuery,
+                                           Severity::Info,
+                                           EventData::Dns(DnsData {
+                                               pid:      ev.pid as i32,
+                                               uid:      ev.uid,
+                                               gid:      ev.gid,
+                                               username,
+                                               comm:     cstr(&ev.comm).to_string(),
+                                               dst_addr: format_addr(ev.family, &ev.dst_addr),
+                                               dst_port: ev.dst_port,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_write_rate.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawWriteRateEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion (own NDJSON log writes)
-                            let username = proc_username(ev.uid);
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Filesystem, EventAction::WriteRateAnomaly,
-                                Severity::High,
-                                EventData::WriteRateAnomaly(WriteRateAnomalyData {
-                                    pid:             ev.pid as i32,
-                                    uid:             ev.uid,
-                                    gid:             ev.gid,
-                                    username,
-                                    comm:            cstr(&ev.comm).to_string(),
-                                    write_count:     ev.write_count,
-                                    burst_threshold: ev.burst_threshold,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_write_rate.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawWriteRateEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion (own NDJSON log writes)
+                                       let username = proc_username(ev.uid);
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Filesystem, EventAction::WriteRateAnomaly,
+                                           Severity::High,
+                                           EventData::WriteRateAnomaly(WriteRateAnomalyData {
+                                               pid:             ev.pid as i32,
+                                               uid:             ev.uid,
+                                               gid:             ev.gid,
+                                               username,
+                                               comm:            cstr(&ev.comm).to_string(),
+                                               write_count:     ev.write_count,
+                                               burst_threshold: ev.burst_threshold,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_kill.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawKillSignalEvent>(&item) } {
-                            let sender_comm = cstr(&ev.comm).to_string();
-                            let signal_name = match ev.signal {
-                                9  => "SIGKILL",
-                                15 => "SIGTERM",
-                                _  => "SIG?",
-                            };
-                            tracing::warn!(
-                                sender_pid  = ev.sender_pid,
-                                sender_uid  = ev.sender_uid,
-                                sender_comm = %sender_comm,
-                                target_pid  = ev.target_pid,
-                                signal      = ev.signal,
-                                signal_name = signal_name,
-                                "KILL-SHIELD: kill signal detected targeting the agent"
-                            );
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Process, EventAction::KillAttempt,
-                                Severity::Critical,
-                                EventData::KillAttempt(KillAttemptData {
-                                    sender_pid:  ev.sender_pid,
-                                    sender_uid:  ev.sender_uid,
-                                    sender_gid:  ev.sender_gid,
-                                    sender_comm,
-                                    target_pid:  ev.target_pid,
-                                    signal:      ev.signal,
-                                    signal_name: signal_name.to_string(),
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_kill.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawKillSignalEvent>(&item) } {
+                                       let sender_comm = cstr(&ev.comm).to_string();
+                                       let signal_name = match ev.signal {
+                                           9  => "SIGKILL",
+                                           15 => "SIGTERM",
+                                           _  => "SIG?",
+                                       };
+                                       tracing::warn!(
+                                           sender_pid  = ev.sender_pid,
+                                           sender_uid  = ev.sender_uid,
+                                           sender_comm = %sender_comm,
+                                           target_pid  = ev.target_pid,
+                                           signal      = ev.signal,
+                                           signal_name = signal_name,
+                                           "KILL-SHIELD: kill signal detected targeting the agent"
+                                       );
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Process, EventAction::KillAttempt,
+                                           Severity::Critical,
+                                           EventData::KillAttempt(KillAttemptData {
+                                               sender_pid:  ev.sender_pid,
+                                               sender_uid:  ev.sender_uid,
+                                               sender_gid:  ev.sender_gid,
+                                               sender_comm,
+                                               target_pid:  ev.target_pid,
+                                               signal:      ev.signal,
+                                               signal_name: signal_name.to_string(),
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_setuid.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawSetuidEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Process, EventAction::Setuid,
-                                Severity::Info,
-                                EventData::Setuid(SetuidData {
-                                    pid:     ev.pid as i32,
-                                    old_uid: ev.old_uid,
-                                    new_uid: ev.new_uid,
-                                    comm:    cstr(&ev.comm).to_string(),
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
+                           Ok(mut guard) = afd_setuid.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawSetuidEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Process, EventAction::Setuid,
+                                           Severity::Info,
+                                           EventData::Setuid(SetuidData {
+                                               pid:     ev.pid as i32,
+                                               old_uid: ev.old_uid,
+                                               new_uid: ev.new_uid,
+                                               comm:    cstr(&ev.comm).to_string(),
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
 
-                Ok(mut guard) = afd_memfd.readable_mut() => {
-                    let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
-                        if let Some(ev) = unsafe { read_raw::<RawMemfdEvent>(&item) } {
-                            if ev.pid == agent_pid { continue; } // self-exclusion
-                            let event = AgentEvent::new(
-                                agent_id.clone(), hostname.clone(),
-                                EventClass::Memory, EventAction::MemfdCreate,
-                                Severity::High,
-                                EventData::MemfdCreate(MemfdCreateData {
-                                    pid:   ev.pid as i32,
-                                    comm:  cstr(&ev.comm).to_string(),
-                                    name:  cstr(&ev.name).to_string(),
-                                    flags: ev.flags,
-                                }),
-                            );
-                            if tx.send(event).await.is_err() { return Ok(()); }
-                        }
-                    }
-                    guard.clear_ready();
-                }
-            }
+                           Ok(mut guard) = afd_memfd.readable_mut() => {
+                               let rb = guard.get_inner_mut();
+                               while let Some(item) = rb.next() {
+                                   if let Some(ev) = unsafe { read_raw::<RawMemfdEvent>(&item) } {
+                                       if ev.pid == agent_pid { continue; } // self-exclusion
+                                       let event = AgentEvent::new(
+                                           agent_id.clone(), hostname.clone(),
+                                           EventClass::Memory, EventAction::MemfdCreate,
+                                           Severity::High,
+                                           EventData::MemfdCreate(MemfdCreateData {
+                                               pid:   ev.pid as i32,
+                                               comm:  cstr(&ev.comm).to_string(),
+                                               name:  cstr(&ev.name).to_string(),
+                                               flags: ev.flags,
+                                           }),
+                                       );
+                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                   }
+                               }
+                               guard.clear_ready();
+                           }
+                       }
         }
     }
 }

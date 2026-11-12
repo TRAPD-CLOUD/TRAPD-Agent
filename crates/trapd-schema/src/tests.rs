@@ -171,6 +171,10 @@ fn test_file_open_event_roundtrip() {
             comm: "vim".to_string(),
             path: "/etc/passwd".to_string(),
             flags: 0x241,
+            exe: None,
+            process_start_time: None,
+            sensitive_class: None,
+            suppressed_repeats: None,
         }),
     );
     let json = serde_json::to_string(&event).expect("must serialize");

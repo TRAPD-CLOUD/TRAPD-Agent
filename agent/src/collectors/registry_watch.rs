@@ -3,13 +3,14 @@
 //! the actual registry reads, so everything here replays and is tested on
 //! every platform.
 //!
-//! Approach: poll-and-diff of a fixed table of persistence locations instead
-//! of `RegNotifyChangeKeyValue`. Change notification needs one handle and wait
-//! per watched key (hundreds for Services/IFEO/COM subtrees), cannot watch
-//! hives that load later (new logons) and still needs a snapshot to learn
-//! *what* changed. Polling every few seconds reuses the same read helpers,
-//! handles per-user hives uniformly and keeps the attack surface small; the
-//! cost is a few seconds of latency and no attribution of the writing process.
+//! Approach: poll-and-diff of a fixed table of persistence locations. Polling
+//! reuses the same read helpers, handles per-user hives uniformly and learns
+//! *what* changed, which a change notification alone cannot say. Latency is
+//! cut by `registry_notify.rs`: `RegNotifyChangeKeyValue` registrations on the
+//! watched keys wake the poll loop early (the snapshot interval stays as the
+//! safety net for hives that load later, keys beyond the handle cap and any
+//! notification failure). There is still no attribution of the writing
+//! process; the design for it is in `registry_notify.rs`.
 //!
 //! The first installation captures a silent baseline. The Windows collector
 //! persists it so later starts report changes made while the agent was stopped.
@@ -822,7 +823,7 @@ pub fn truncate_value(v: &str) -> String {
 
 /// Interactive-style account SIDs. Excludes `S-1-5-18/19/20` (service
 /// accounts, no Run keys of interest) and the `_Classes` companions.
-fn is_user_sid(name: &str) -> bool {
+pub(crate) fn is_user_sid(name: &str) -> bool {
     (name.starts_with("S-1-5-21-") || name.starts_with("S-1-12-1-")) && !name.ends_with("_Classes")
 }
 

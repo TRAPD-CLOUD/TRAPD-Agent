@@ -20,7 +20,7 @@ const MAX_SHADOW_RULES: usize = 512;
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct Coverage {
-    /// Process telemetry source: `etw`, `polling`, `ebpf`, `proc`.
+    /// Process telemetry source: `etw`, `polling`, `polling+eventlog_4688`, `ebpf`, `proc`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_sensor: Option<String>,
     /// ETW real-time session is running and delivering.
@@ -47,6 +47,17 @@ pub struct Coverage {
     /// Audit Registry success enabled; target-key SACLs are still required.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_registry: Option<bool>,
+    /// How registry changes are noticed: `notify` (change notifications wake
+    /// the snapshot poll) or `polling` (interval only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_sensor: Option<String>,
+    /// Keys currently held by registry change notification.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub registry_notify_keys: u64,
+    /// Keys not event-driven right now, by reason (`over_capacity`,
+    /// `key_missing`, `open_failed`, `arm_failed`, `wait_failed`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub registry_notify_fallbacks: BTreeMap<String, u64>,
     /// Collector is enabled and its last Security channel read succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_eventlog_active: Option<bool>,
@@ -69,6 +80,9 @@ pub struct Coverage {
     pub ebpf_honeytoken_programs: BTreeMap<String, bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ebpf_honeytoken_inode: Option<bool>,
+    /// Sensitive credential-file read sensor (inode gate) is armed and consuming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ebpf_sensitive_file_read: Option<bool>,
     /// Telemetry hooks (`category/name`) and whether each attached. A `false`
     /// names events this host cannot produce, e.g. `module/module_load` on a
     /// kernel built without loadable modules.
@@ -106,6 +120,21 @@ impl Coverage {
             *active = false;
         }
         self.ebpf_honeytoken_inode = Some(false);
+        if self.ebpf_sensitive_file_read.is_some() {
+            self.ebpf_sensitive_file_read = Some(false);
+        }
+    }
+
+    /// Process sensor label while the poller is live: process creates also
+    /// come from Security 4688 when that audit is on and its channel readable.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn polling_label(&self) -> &'static str {
+        if self.audit_process_creation == Some(true) && self.security_eventlog_active == Some(true)
+        {
+            "polling+eventlog_4688"
+        } else {
+            "polling"
+        }
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -234,6 +263,18 @@ mod tests {
         c.etw_session = Some(false);
         assert!(!c.etw_process_active());
         assert!(!c.etw_network_active());
+    }
+
+    #[test]
+    fn polling_label_names_4688_only_when_it_is_flowing() {
+        let mut c = Coverage::default();
+        assert_eq!(c.polling_label(), "polling");
+        c.audit_process_creation = Some(true);
+        assert_eq!(c.polling_label(), "polling");
+        c.security_eventlog_active = Some(true);
+        assert_eq!(c.polling_label(), "polling+eventlog_4688");
+        c.audit_process_creation = Some(false);
+        assert_eq!(c.polling_label(), "polling");
     }
 
     #[test]
