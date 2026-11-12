@@ -873,6 +873,7 @@ impl DecodeState {
                                     taints: 0,
                                     path: Some(dll),
                                     process_exe: Some(exe),
+                                    process_start_time: None,
                                 }),
                             );
                         }

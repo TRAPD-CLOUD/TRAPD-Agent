@@ -300,6 +300,10 @@ fn emit_contract() {
                 comm: "cat".into(),
                 path: "/tmp/fixture.txt".into(),
                 flags: 0,
+                exe: None,
+                process_start_time: None,
+                sensitive_class: None,
+                suppressed_repeats: None,
             })
             .unwrap(),
         ),

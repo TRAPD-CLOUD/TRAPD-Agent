@@ -27,6 +27,7 @@ pub mod memscan;
 pub mod network;
 pub mod process;
 pub mod registry;
+pub mod regnotify;
 pub mod regwatch;
 pub mod users;
 

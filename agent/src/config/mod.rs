@@ -388,6 +388,12 @@ pub struct AgentConfig {
     /// device. Off by default: the notice also reaches an attacker at the keyboard.
     #[serde(default, skip_serializing_if = "skip_if_false")]
     pub user_response_notifications_enabled: bool,
+    /// Linux: report opens of real credential files (`/etc/shadow`, SSH host
+    /// keys, sudoers, root's SSH private keys) as `filesystem`/`open` events.
+    /// Inode-filtered in the kernel and rate-limited per `(exe, path)`, so it is
+    /// on by default; omitted from the signed canonical form while `true`.
+    #[serde(default = "default_true", skip_serializing_if = "skip_if_true")]
+    pub sensitive_file_read_enabled: bool,
     /// Report the serial number of USB / removable devices in device events.
     /// Off by default: a serial identifies a physical device and, through it,
     /// a person. When off the serial is never read (Linux sysfs) or reported
@@ -463,6 +469,7 @@ impl Default for AgentConfig {
             adaptive_decoys: Vec::new(),
             script_block_capture_enabled: false,
             user_response_notifications_enabled: false,
+            sensitive_file_read_enabled: true,
             device_serial_capture_enabled: false,
         }
     }
@@ -923,6 +930,21 @@ mod signed_config_tests {
     }
 
     #[test]
+    fn sensitive_file_read_defaults_on_and_keeps_canonical_form() {
+        let cfg = AgentConfig::default();
+        assert!(cfg.sensitive_file_read_enabled);
+        // Omitted at its default so existing signatures stay valid.
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("sensitive_file_read_enabled"));
+        let off: AgentConfig =
+            serde_json::from_str(r#"{"sensitive_file_read_enabled":false}"#).unwrap();
+        assert!(!off.sensitive_file_read_enabled);
+        assert!(serde_json::to_string(&off)
+            .unwrap()
+            .contains("\"sensitive_file_read_enabled\":false"));
+    }
+
+    #[test]
     fn no_honeytoken_paths_by_default() {
         assert!(AgentConfig::default().honeytoken_paths.is_empty());
         let parsed: AgentConfig = serde_json::from_str("{}").unwrap();
@@ -1208,6 +1230,31 @@ mod signed_config_tests {
         assert!(serde_json::to_string(&on)
             .unwrap()
             .contains("\"device_serial_capture_enabled\":true"));
+    }
+
+    /// The backend signs the config in its own key order (TRAPD
+    /// `frontend/lib/api/config/sign.ts`) and the agent verifies its
+    /// re-serialised struct, so the opt-in fields must keep this order.
+    #[test]
+    fn opt_in_fields_serialise_in_the_backend_signing_order() {
+        let config = AgentConfig {
+            script_block_capture_enabled: true,
+            user_response_notifications_enabled: true,
+            sensitive_file_read_enabled: false,
+            device_serial_capture_enabled: true,
+            ..AgentConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let order: Vec<usize> = [
+            "\"script_block_capture_enabled\":true",
+            "\"user_response_notifications_enabled\":true",
+            "\"sensitive_file_read_enabled\":false",
+            "\"device_serial_capture_enabled\":true",
+        ]
+        .iter()
+        .map(|k| json.find(k).unwrap_or_else(|| panic!("{k} missing")))
+        .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{json}");
     }
 
     #[test]
