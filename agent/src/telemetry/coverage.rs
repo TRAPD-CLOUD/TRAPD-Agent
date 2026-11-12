@@ -41,6 +41,13 @@ pub struct Coverage {
     /// agent switches it off itself because the session started losing events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etw_pipe_provider: Option<bool>,
+    /// AMSI scan metadata via Microsoft-Antimalware-Scan-Interface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etw_amsi_provider: Option<bool>,
+    /// Scanned script text is captured (`script_block_capture_enabled`). When
+    /// `false`, AMSI contributes only content-free verdict metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amsi_content_capture: Option<bool>,
     /// Events the ETW session dropped (cumulative since start).
     #[serde(skip_serializing_if = "is_zero")]
     pub etw_events_lost: u64,
@@ -128,6 +135,10 @@ impl Coverage {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn etw_pipe_active(&self) -> bool {
         self.etw_session == Some(true) && self.etw_pipe_provider == Some(true)
+    }
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn etw_amsi_active(&self) -> bool {
+        self.etw_session == Some(true) && self.etw_amsi_provider == Some(true)
     }
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn etw_network_active(&self) -> bool {

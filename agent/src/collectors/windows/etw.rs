@@ -97,7 +97,20 @@ fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-pub struct EtwCollector;
+/// Whether AMSI script text may be read at all. Mirrors
+/// `script_block_capture_enabled`; checked in the ETW callback so that, when
+/// off, the content property is never read into memory.
+static AMSI_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub struct EtwCollector {
+    config: Arc<std::sync::RwLock<crate::config::AgentConfig>>,
+}
+
+impl EtwCollector {
+    pub fn new(config: Arc<std::sync::RwLock<crate::config::AgentConfig>>) -> Self {
+        Self { config }
+    }
+}
 
 #[async_trait]
 impl Collector for EtwCollector {
@@ -111,6 +124,8 @@ impl Collector for EtwCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
+        // The opt-in must hold before the first record is decoded.
+        sync_amsi_capture(&self.config);
         let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<EtwRecord>(8192);
         let sink = Arc::new(Sink {
             tx: rec_tx,
@@ -152,6 +167,7 @@ impl Collector for EtwCollector {
         let mut batch: Vec<EtwRecord> = Vec::with_capacity(DECODE_BATCH);
         loop {
             crate::telemetry::liveness::beat("WindowsEtwCollector");
+            sync_amsi_capture(&self.config);
             if pipe_guard.observe(coverage::snapshot().etw_events_lost) {
                 let rc = control.disable_provider(etw_map::KERNEL_FILE);
                 coverage::update(|c| c.etw_pipe_provider = Some(false));
@@ -212,6 +228,20 @@ impl Collector for EtwCollector {
             ))
             .await;
         Err(anyhow!("ETW session ended"))
+    }
+}
+
+/// Copy the operator's script-content opt-in into the callback-visible flag
+/// and the coverage record. Off when the config cannot be read.
+fn sync_amsi_capture(config: &std::sync::RwLock<crate::config::AgentConfig>) {
+    let on = config
+        .read()
+        .map(|c| c.script_block_capture_enabled)
+        .unwrap_or(false);
+    if AMSI_CAPTURE.swap(on, std::sync::atomic::Ordering::AcqRel) != on
+        || coverage::snapshot().amsi_content_capture.is_none()
+    {
+        coverage::update(|c| c.amsi_content_capture = Some(on));
     }
 }
 
@@ -282,6 +312,7 @@ impl Session {
                 (etw_map::KERNEL_NETWORK, etw_map::KERNEL_NETWORK_KEYWORDS),
                 (etw_map::DNS_CLIENT, 0u64),
                 (etw_map::KERNEL_FILE, etw_map::KERNEL_FILE_KEYWORDS),
+                (etw_map::AMSI, 0u64),
             ] {
                 let g = guid_from_u128(guid);
                 let rc = EnableTraceEx2(
@@ -302,6 +333,7 @@ impl Session {
                     }
                     etw_map::KERNEL_NETWORK => c.etw_network_provider = Some(rc == ERROR_SUCCESS),
                     etw_map::KERNEL_FILE => c.etw_pipe_provider = Some(rc == ERROR_SUCCESS),
+                    etw_map::AMSI => c.etw_amsi_provider = Some(rc == ERROR_SUCCESS),
                     _ => c.etw_dns_provider = Some(rc == ERROR_SUCCESS),
                 });
                 if rc != ERROR_SUCCESS {
@@ -441,6 +473,7 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         etw_map::KERNEL_NETWORK,
         etw_map::DNS_CLIENT,
         etw_map::KERNEL_FILE,
+        etw_map::AMSI,
     ]
     .contains(&guid_to_u128(&record.EventHeader.ProviderId))
     {
@@ -489,6 +522,7 @@ unsafe fn decode_record(record: &EVENT_RECORD) -> Option<EtwRecord> {
         && provider != etw_map::KERNEL_NETWORK
         && provider != etw_map::DNS_CLIENT
         && provider != etw_map::KERNEL_FILE
+        && provider != etw_map::AMSI
     {
         return None;
     }
@@ -540,6 +574,13 @@ unsafe fn decode_record(record: &EVENT_RECORD) -> Option<EtwRecord> {
         };
         let name = String::from_utf16_lossy(&raw[..end]);
         if name.is_empty() {
+            continue;
+        }
+        // Script text is read only with the operator's opt-in.
+        if provider == etw_map::AMSI
+            && name.eq_ignore_ascii_case("content")
+            && !AMSI_CAPTURE.load(std::sync::atomic::Ordering::Acquire)
+        {
             continue;
         }
         let in_type = pi.Anonymous1.nonStructType.InType;
@@ -652,6 +693,9 @@ struct DecodeState {
     started: std::time::Instant,
     driver_gate: etw_map::RateGate,
     pipe_gate: etw_map::RateGate,
+    amsi_gate: etw_map::RateGate,
+    /// Identical scans (same content hash, or same app/name/verdict) once a minute.
+    amsi_seen: etw_map::RecentSet<String>,
     /// (pid, pipe path): a client reopening one pipe is reported once a minute.
     pipes_seen: etw_map::RecentSet<(u32, String)>,
     /// image digest -> signature verdict, so a reloaded driver is verified once.
@@ -670,6 +714,8 @@ impl DecodeState {
             driver_gate: etw_map::RateGate::new(5, 256),
             driver_signatures: HashMap::new(),
             pipe_gate: etw_map::RateGate::new(20, 100),
+            amsi_gate: etw_map::RateGate::new(10, 50),
+            amsi_seen: etw_map::RecentSet::new(60_000, 4096),
             pipes_seen: etw_map::RecentSet::new(60_000, 4096),
             proc_images: HashMap::new(),
         }
@@ -853,6 +899,36 @@ impl DecodeState {
                             EventClass::Filesystem,
                             EventAction::Create,
                             EventData::Filesystem(data),
+                        );
+                    }
+                }
+            }
+            p if p == etw_map::AMSI => {
+                let capture = AMSI_CAPTURE.load(std::sync::atomic::Ordering::Acquire);
+                if let Some(scan) = etw_map::amsi_scan(rec, capture) {
+                    let now_ms = self.started.elapsed().as_millis() as u64;
+                    let key = scan.content_sha256.clone().unwrap_or_else(|| {
+                        format!(
+                            "{}|{}|{}",
+                            scan.data.proc.as_deref().unwrap_or_default(),
+                            scan.data
+                                .fields
+                                .get("content_name")
+                                .unwrap_or(&serde_json::Value::Null),
+                            scan.data
+                                .fields
+                                .get("scan_result")
+                                .unwrap_or(&serde_json::Value::Null),
+                        )
+                    });
+                    if !self.amsi_seen.first_seen(key, now_ms) || !self.amsi_gate.allow(now_ms) {
+                        crate::telemetry::metrics::metrics()
+                            .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
+                    } else {
+                        emit(
+                            EventClass::Log,
+                            EventAction::Log,
+                            EventData::Log(Box::new(scan.data)),
                         );
                     }
                 }

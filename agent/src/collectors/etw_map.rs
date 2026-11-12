@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::schema::{
-    DnsResolutionData, NetworkConnectionData, ProcessCreateData, ProcessTerminateData,
+    DnsResolutionData, LogEventData, NetworkConnectionData, ProcessCreateData, ProcessTerminateData,
 };
 
 pub const KERNEL_PROCESS: u128 = 0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716;
@@ -464,6 +464,177 @@ impl LossGuard {
         self.tripped = true;
         true
     }
+}
+
+/// Most decoded script text kept per AMSI scan.
+pub const AMSI_MAX_CONTENT_BYTES: usize = 32 * 1024;
+/// AMSI scan results from here up are an antimalware verdict (admin block
+/// range `0x4000..=0x4fff`, detected `>= 0x8000`).
+const AMSI_RESULT_FLAGGED_MIN: u32 = 0x4000;
+
+fn amsi_verdict(result: u32) -> &'static str {
+    match result {
+        0 => "clean",
+        1..=0x3fff => "not_detected",
+        0x4000..=0x7fff => "blocked_by_admin",
+        _ => "detected",
+    }
+}
+
+/// AMSI content bytes → text, or `None` when they are not script text
+/// (a .NET assembly, a binary blob). PowerShell and the script hosts hand over
+/// UTF-16LE; anything else is read as UTF-8. Nothing binary is shipped.
+pub fn decode_amsi_text(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() || bytes.starts_with(b"MZ") {
+        return None;
+    }
+    let odd_zero = bytes.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+    let utf16 =
+        bytes.len() >= 2 && bytes.len().is_multiple_of(2) && odd_zero * 2 >= bytes.len() / 2;
+    let text = if utf16 {
+        let mut units = Vec::with_capacity(bytes.len() / 2);
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            units.push(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+            i += 2;
+        }
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    let text = text.trim_start_matches('\u{feff}').trim_end_matches('\0');
+    let total = text.chars().count();
+    let junk = text
+        .chars()
+        .filter(|c| *c == '\u{fffd}' || (c.is_control() && !matches!(c, '\t' | '\n' | '\r')))
+        .count();
+    (total > 0 && junk * 10 <= total).then(|| text.to_string())
+}
+
+/// One AMSI scan, ready to ship as a log event.
+#[derive(Debug, Clone)]
+pub struct AmsiScan {
+    /// `sha256:<hex>` of the scanned bytes, when they were read.
+    pub content_sha256: Option<String>,
+    pub data: LogEventData,
+}
+
+/// Microsoft-Antimalware-Scan-Interface event 1101 → log record.
+///
+/// Script text can hold credentials, so `capture` is the operator's
+/// `script_block_capture_enabled` opt-in. Without it no content is decoded
+/// (the ETW layer does not even read the property) and only scans that
+/// received an antimalware verdict are reported, as metadata without text.
+/// With it, text is kept up to [`AMSI_MAX_CONTENT_BYTES`] with explicit
+/// `content_truncated` / `content_omitted` markers.
+pub fn amsi_scan(rec: &EtwRecord, capture: bool) -> Option<AmsiScan> {
+    use sha2::{Digest, Sha256};
+    if rec.provider != AMSI || rec.id != 1101 {
+        return None;
+    }
+    let scan_result = rec
+        .int(&["scanResult", "ScanResult"])
+        .and_then(|r| u32::try_from(r).ok())
+        .unwrap_or(0);
+    let flagged = scan_result >= AMSI_RESULT_FLAGGED_MIN;
+    let content_size = rec.int(&["contentsize", "ContentSize"]).unwrap_or(0);
+    if !flagged && (!capture || content_size == 0) {
+        return None;
+    }
+    let app_name = rec
+        .str(&["appname", "AppName"])
+        .unwrap_or_default()
+        .chars()
+        .take(512)
+        .collect::<String>();
+    let content_name = rec
+        .str(&["contentname", "ContentName"])
+        .unwrap_or_default()
+        .chars()
+        .take(1024)
+        .collect::<String>();
+    let bytes = if capture {
+        rec.raw(&["content", "Content"])
+    } else {
+        None
+    };
+    let content_sha256 = bytes
+        .as_ref()
+        .map(|b| format!("sha256:{}", hex::encode(Sha256::digest(b))));
+    let verdict = amsi_verdict(scan_result);
+    let mut text = String::new();
+    let mut truncation = None;
+    let mut omitted = None;
+    match (capture, bytes.as_deref()) {
+        (false, _) => omitted = Some("capture_disabled"),
+        (true, Some(b)) => match decode_amsi_text(b) {
+            Some(t) => {
+                let (kept, tr) = crate::telemetry::limits::truncate_str(&t, AMSI_MAX_CONTENT_BYTES);
+                text = kept;
+                truncation = tr;
+            }
+            None => omitted = Some("binary"),
+        },
+        // The property reader refuses values above its size cap.
+        (true, None) => {
+            omitted = Some(if content_size > 64 * 1024 {
+                "oversize"
+            } else {
+                "unavailable"
+            })
+        }
+    }
+    let mut fields = serde_json::Map::new();
+    fields.insert("EventID".into(), 1101.into());
+    fields.insert("app_name".into(), app_name.clone().into());
+    fields.insert("content_name".into(), content_name.into());
+    fields.insert("scan_result".into(), scan_result.into());
+    fields.insert("scan_verdict".into(), verdict.into());
+    if let Some(status) = rec.int(&["scanStatus", "ScanStatus"]) {
+        fields.insert("scan_status".into(), status.into());
+    }
+    fields.insert("content_size".into(), content_size.into());
+    if let Some(orig) = rec.int(&["originalsize", "OriginalSize"]) {
+        fields.insert("original_size".into(), orig.into());
+    }
+    if let Some(h) = &content_sha256 {
+        fields.insert("content_sha256".into(), h.clone().into());
+    }
+    fields.insert("content_captured".into(), (!text.is_empty()).into());
+    if let Some(reason) = omitted {
+        fields.insert("content_omitted".into(), reason.into());
+    }
+    fields.insert("content_truncated".into(), truncation.is_some().into());
+    let message = if text.is_empty() {
+        format!("AMSI scan {verdict}: {app_name}")
+    } else {
+        text
+    };
+    Some(AmsiScan {
+        content_sha256,
+        data: LogEventData {
+            source: "amsi".into(),
+            source_type: "windows_etw".into(),
+            source_path: "Microsoft-Antimalware-Scan-Interface".into(),
+            parser: "etw_amsi".into(),
+            message,
+            category: "application".into(),
+            log_timestamp: None,
+            facility: None,
+            log_severity: Some(if flagged { "warning" } else { "info" }.into()),
+            proc: Some(app_name).filter(|a| !a.is_empty()),
+            pid: i32::try_from(rec.header_pid).ok().filter(|p| *p > 0),
+            uid: None,
+            username: None,
+            log_host: None,
+            fields,
+            mitre_tactic: None,
+            mitre_technique: None,
+            offset: None,
+            inode: None,
+            truncated_fields: truncation.map(|t| [("message".to_string(), t)].into()),
+        },
+    })
 }
 
 /// A DLL load worth reporting: a process that runs from a protected location
@@ -936,6 +1107,93 @@ mod tests {
             !LossGuard::new(500, 10).observe(400),
             "counter reset is not a trip"
         );
+    }
+
+    fn amsi_rec(result: u64, content: Option<Vec<u8>>, size: u64) -> EtwRecord {
+        let mut props = vec![
+            (
+                "appname",
+                s("PowerShell_C:\\Windows\\System32\\powershell.exe_10.0"),
+            ),
+            ("contentname", s("C:\\Users\\a\\x.ps1")),
+            ("scanResult", int(result, 4)),
+            ("scanStatus", int(0, 1)),
+            ("contentsize", int(size, 4)),
+        ];
+        if let Some(c) = content {
+            props.push(("content", EtwValue::Bytes(c)));
+        }
+        let mut r = rec(AMSI, 1101, &props);
+        r.header_pid = 777;
+        r
+    }
+
+    #[test]
+    fn amsi_text_decodes_utf16_utf8_and_refuses_binary() {
+        assert_eq!(
+            decode_amsi_text(&utf16le("\u{feff}iex 'a'")).as_deref(),
+            Some("iex 'a'")
+        );
+        assert_eq!(decode_amsi_text(b"echo hi").as_deref(), Some("echo hi"));
+        assert!(decode_amsi_text(b"MZ\x90\x00\x03\x00").is_none());
+        assert!(decode_amsi_text(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]).is_none());
+        assert!(decode_amsi_text(b"").is_none());
+    }
+
+    #[test]
+    fn amsi_content_is_only_captured_with_the_opt_in() {
+        let script = utf16le("Invoke-Mimikatz -DumpCreds");
+        let r = amsi_rec(1, Some(script.clone()), script.len() as u64);
+        // Off: a clean scan produces nothing at all.
+        assert!(amsi_scan(&r, false).is_none());
+        // Off, but the scan was flagged: metadata only, never the text.
+        let flagged = amsi_rec(32768, Some(script.clone()), script.len() as u64);
+        let off = amsi_scan(&flagged, false).unwrap();
+        assert!(!off.data.message.contains("Mimikatz"));
+        assert!(off.content_sha256.is_none());
+        assert_eq!(off.data.fields["content_omitted"], "capture_disabled");
+        assert_eq!(off.data.fields["content_captured"], false);
+        assert_eq!(off.data.fields["scan_verdict"], "detected");
+        assert!(!serde_json::to_string(&off.data)
+            .unwrap()
+            .contains("Mimikatz"));
+        // On: the text and its hash travel.
+        let on = amsi_scan(&r, true).unwrap();
+        assert_eq!(on.data.message, "Invoke-Mimikatz -DumpCreds");
+        assert_eq!(on.data.fields["content_captured"], true);
+        assert_eq!(on.data.fields["content_truncated"], false);
+        assert!(on.content_sha256.unwrap().starts_with("sha256:"));
+        assert_eq!(on.data.pid, Some(777));
+        assert_eq!(on.data.source_type, "windows_etw");
+        assert_eq!(on.data.fields["EventID"], 1101);
+    }
+
+    #[test]
+    fn amsi_content_is_truncated_with_markers_and_binary_is_omitted() {
+        let big = "A".repeat(AMSI_MAX_CONTENT_BYTES + 100);
+        let r = amsi_rec(0, Some(big.clone().into_bytes()), big.len() as u64);
+        let scan = amsi_scan(&r, true).unwrap();
+        assert_eq!(scan.data.message.len(), AMSI_MAX_CONTENT_BYTES);
+        assert_eq!(scan.data.fields["content_truncated"], true);
+        assert_eq!(
+            scan.data.truncated_fields.as_ref().unwrap()["message"].original_length,
+            big.len()
+        );
+        let bin = amsi_rec(0, Some(b"MZ\x90\x00\x03".to_vec()), 5);
+        let scan = amsi_scan(&bin, true).unwrap();
+        assert_eq!(scan.data.fields["content_omitted"], "binary");
+        assert!(scan.data.message.starts_with("AMSI scan clean"));
+        // The reader refused a value above its cap: say so, do not guess.
+        let huge = amsi_rec(0, None, 1_000_000);
+        assert_eq!(
+            amsi_scan(&huge, true).unwrap().data.fields["content_omitted"],
+            "oversize"
+        );
+        // Empty scans carry nothing and are skipped; wrong event ids too.
+        assert!(amsi_scan(&amsi_rec(0, None, 0), true).is_none());
+        let mut other = r.clone();
+        other.id = 1102;
+        assert!(amsi_scan(&other, true).is_none());
     }
 
     #[test]
