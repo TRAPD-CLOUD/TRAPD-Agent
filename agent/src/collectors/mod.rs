@@ -48,6 +48,10 @@ pub mod win_mem_rules;
 #[cfg(any(target_os = "windows", test))]
 pub mod supervisor;
 
+// Device attach/detach parsing and bookkeeping shared by Linux and Windows.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+pub mod device;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 

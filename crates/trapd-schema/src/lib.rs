@@ -101,11 +101,13 @@ pub enum EventClass {
     /// Canonical log record from the generic log collector (file, journal,
     /// syslog). Routed by `class=log` + `action=log`; see [`LogEventData`].
     Log,
+    /// Removable / hot-plug device attach (`create`) and detach (`delete`).
+    Device,
 }
 
 impl EventClass {
     /// Every class, in `index()` order.
-    pub const ALL: [EventClass; 12] = [
+    pub const ALL: [EventClass; 13] = [
         EventClass::Process,
         EventClass::Network,
         EventClass::System,
@@ -118,6 +120,7 @@ impl EventClass {
         EventClass::Detection,
         EventClass::Log,
         EventClass::Registry,
+        EventClass::Device,
     ];
 
     /// Stable lowercase label (identical to the serde spelling).
@@ -135,6 +138,7 @@ impl EventClass {
             EventClass::Detection => "detection",
             EventClass::Log => "log",
             EventClass::Registry => "registry",
+            EventClass::Device => "device",
         }
     }
 
@@ -152,6 +156,7 @@ impl EventClass {
             EventClass::Detection => 9,
             EventClass::Log => 10,
             EventClass::Registry => 11,
+            EventClass::Device => 12,
         }
     }
 }
@@ -328,8 +333,48 @@ pub enum EventData {
     // ── Detection engine payload ────────────────────────────────────────
     // Boxed: correlation keys and gate metadata make this a large variant.
     Detection(Box<DetectionData>),
+    /// Device attach/detach. Its `subsystem` + `device_id` are required, so it
+    /// cannot swallow another untagged payload on journal replay.
+    Device(DeviceEventData),
     // ── Observability ────────────────────────────────────────────────────────
     EbpfDrops(EbpfDropsData),
+}
+
+/// A removable / hot-plug device appearing (`device/create`) or going away
+/// (`device/delete`). Identity fields are what the device reports about
+/// itself, so they are evidence of what it claims to be, not proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEventData {
+    /// `usb` or `block` (Linux uevent subsystem); `usb` / `usbstor` (Windows
+    /// enumerator).
+    pub subsystem: String,
+    /// Stable id of the device node: sysfs `DEVPATH` on Linux, the PnP device
+    /// instance id on Windows.
+    pub device_id: String,
+    /// `usb_device`, `usb_interface`, `disk`; Windows: setup class name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_type: Option<String>,
+    /// USB vendor id, four lower-case hex digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_id: Option<String>,
+    /// USB product id, four lower-case hex digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// USB class code, two hex digits (`03` HID, `08` mass storage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_class: Option<String>,
+    /// Serial number as reported by the device; absent when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
+    /// Device node or kernel name (`sdb`, `bus/usb/001/005`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devnode: Option<String>,
+    /// `netlink_uevent` or `setupapi`.
+    pub source: String,
 }
 
 // ── Existing data structs ────────────────────────────────────────────────────────────────────────
@@ -891,6 +936,10 @@ pub struct DnsResolutionData {
     pub transaction_id: u16,
     /// Response code as text (`NOERROR`, `NXDOMAIN`, …).
     pub rcode: String,
+    /// Raw Win32/DNS status of the query (Windows ETW `QueryStatus`), kept
+    /// beside `rcode` because that maps unknown statuses to `UNKNOWN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_status: Option<u32>,
     /// Requesting process, when the sensor can attribute it (Windows ETW
     /// DNS-Client; the packet-capture path cannot).
     #[serde(default, skip_serializing_if = "Option::is_none")]

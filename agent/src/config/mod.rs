@@ -394,6 +394,13 @@ pub struct AgentConfig {
     /// on by default; omitted from the signed canonical form while `true`.
     #[serde(default = "default_true", skip_serializing_if = "skip_if_true")]
     pub sensitive_file_read_enabled: bool,
+    /// Report the serial number of USB / removable devices in device events.
+    /// Off by default: a serial identifies a physical device and, through it,
+    /// a person. When off the serial is never read (Linux sysfs) or reported
+    /// (Windows), and the instance-id segment that may carry it is replaced
+    /// by a per-agent salted hash in `device_id`.
+    #[serde(default, skip_serializing_if = "skip_if_false")]
+    pub device_serial_capture_enabled: bool,
 }
 
 pub use trapd_detection::RuleModeOverride;
@@ -463,6 +470,7 @@ impl Default for AgentConfig {
             script_block_capture_enabled: false,
             user_response_notifications_enabled: false,
             sensitive_file_read_enabled: true,
+            device_serial_capture_enabled: false,
         }
     }
 }
@@ -1206,6 +1214,47 @@ mod signed_config_tests {
         assert!(!serde_json::to_string(&config)
             .unwrap()
             .contains("user_response_notifications_enabled"));
+    }
+
+    #[test]
+    fn device_serial_capture_defaults_off_and_stays_out_of_the_signed_bytes() {
+        let config = AgentConfig::default();
+        assert!(!config.device_serial_capture_enabled);
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("device_serial_capture_enabled"));
+        let on = AgentConfig {
+            device_serial_capture_enabled: true,
+            ..AgentConfig::default()
+        };
+        assert!(serde_json::to_string(&on)
+            .unwrap()
+            .contains("\"device_serial_capture_enabled\":true"));
+    }
+
+    /// The backend signs the config in its own key order (TRAPD
+    /// `frontend/lib/api/config/sign.ts`) and the agent verifies its
+    /// re-serialised struct, so the opt-in fields must keep this order.
+    #[test]
+    fn opt_in_fields_serialise_in_the_backend_signing_order() {
+        let config = AgentConfig {
+            script_block_capture_enabled: true,
+            user_response_notifications_enabled: true,
+            sensitive_file_read_enabled: false,
+            device_serial_capture_enabled: true,
+            ..AgentConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let order: Vec<usize> = [
+            "\"script_block_capture_enabled\":true",
+            "\"user_response_notifications_enabled\":true",
+            "\"sensitive_file_read_enabled\":false",
+            "\"device_serial_capture_enabled\":true",
+        ]
+        .iter()
+        .map(|k| json.find(k).unwrap_or_else(|| panic!("{k} missing")))
+        .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{json}");
     }
 
     #[test]

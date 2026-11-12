@@ -463,6 +463,9 @@ pub async fn run_agent(
         crate::selfprotect::runtime_guard::run_health_watchdog(),
     ));
     spawn_collector!(UserSessionCollector::new());
+    spawn_collector!(crate::collectors::windows::device::DeviceCollector::new(
+        Arc::clone(&agent_config)
+    ));
     spawn_collector!(
         crate::collectors::windows::eventlog::EventLogCollector::new(
             Arc::clone(&agent_config),
