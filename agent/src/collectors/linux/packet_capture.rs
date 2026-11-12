@@ -371,6 +371,7 @@ fn parse_dns_response(
         client_addr: client_addr.to_string(),
         transaction_id: id,
         rcode: rcode_name(flags).to_string(),
+        query_status: None,
         pid: None,
         process: None,
         process_start_time: None,

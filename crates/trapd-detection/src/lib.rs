@@ -14,6 +14,7 @@
 //! migration reference for the backend rule set.
 
 pub mod accessor_correlation;
+pub mod file_actor;
 pub mod fs_heuristics;
 #[cfg(target_os = "linux")] // fed only by the eBPF file-open gate
 pub mod honeytoken;

@@ -870,6 +870,10 @@ pub struct DnsResolutionData {
     pub transaction_id: u16,
     /// Response code as text (`NOERROR`, `NXDOMAIN`, …).
     pub rcode: String,
+    /// Raw Win32/DNS status of the query (Windows ETW `QueryStatus`), kept
+    /// beside `rcode` because that maps unknown statuses to `UNKNOWN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_status: Option<u32>,
     /// Requesting process, when the sensor can attribute it (Windows ETW
     /// DNS-Client; the packet-capture path cannot).
     #[serde(default, skip_serializing_if = "Option::is_none")]
