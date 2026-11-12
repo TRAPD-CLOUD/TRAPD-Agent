@@ -81,6 +81,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Environment",
     "Win32_System_Diagnostics_Etw",
     "Win32_Storage_FileSystem",
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_System_Time",
     "Win32_Security_Authorization",
     "Win32_Security_WinTrust",

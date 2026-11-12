@@ -16,6 +16,7 @@ fn all_eventclass() -> Vec<EventClass> {
         EventClass::Detection,
         EventClass::Log,
         EventClass::Registry,
+        EventClass::Device,
     ]
 }
 
@@ -33,6 +34,7 @@ fn cover_eventclass(value: &EventClass) {
         EventClass::Detection => {}
         EventClass::Log => {}
         EventClass::Registry => {}
+        EventClass::Device => {}
     }
 }
 
