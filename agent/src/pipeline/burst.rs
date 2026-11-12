@@ -70,6 +70,10 @@ fn event(kind: Kind, i: u64) -> AgentEvent {
                 comm: "node".into(),
                 path: format!("/home/alice/project/node_modules/pkg{}/index.js", i % 5000),
                 flags: 0,
+                exe: None,
+                process_start_time: None,
+                sensitive_class: None,
+                suppressed_repeats: None,
             }),
         ),
     }

@@ -204,7 +204,6 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
 /// A parent PID still visible at collection may have been reused after the
 /// child's creation. Only bind a candidate generation demonstrably older
 /// than the child; missing, zero or equal timestamps remain unknown.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parent_generation_before_child(child: Option<u64>, parent: Option<u64>) -> Option<u64> {
     let child = child.filter(|start| *start > 0)?;
     parent.filter(|start| *start > 0 && *start < child)

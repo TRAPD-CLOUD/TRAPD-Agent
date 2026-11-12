@@ -332,6 +332,44 @@ fn harden_dir_perms(dir: &Path) {
 #[cfg(not(any(target_os = "linux", windows)))]
 fn harden_dir_perms(_dir: &Path) {}
 
+/// How long a path counts as "written by this process" after `write_atomic`.
+#[cfg(not(windows))]
+pub const SELF_WRITE_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(not(windows))]
+const SELF_WRITE_CAP: usize = 64;
+
+#[cfg(not(windows))]
+static SELF_WRITES: std::sync::Mutex<Vec<(PathBuf, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Remember that this process is about to replace `path`. Recorded in memory
+/// only (never derived from filesystem names), so another local process cannot
+/// forge it; the tamper watcher uses it to tell the agent's own atomic rewrite
+/// of an identity file from somebody else's.
+#[cfg(not(windows))]
+fn note_self_write(path: &Path) {
+    if let Ok(mut recent) = SELF_WRITES.lock() {
+        recent.retain(|(_, at)| at.elapsed() < SELF_WRITE_WINDOW);
+        if recent.len() >= SELF_WRITE_CAP {
+            recent.remove(0);
+        }
+        recent.push((path.to_path_buf(), std::time::Instant::now()));
+    }
+}
+
+/// Whether this process replaced `path` through [`write_atomic`] within `within`.
+#[cfg(not(windows))]
+pub fn was_self_written(path: &Path, within: std::time::Duration) -> bool {
+    SELF_WRITES
+        .lock()
+        .map(|recent| {
+            recent
+                .iter()
+                .any(|(p, at)| p == path && at.elapsed() < within)
+        })
+        .unwrap_or(false)
+}
+
 /// Atomically write `contents` to `path` (write to a temp file in the same
 /// directory, then rename).  On unix the file is created with `mode` and the
 /// temp file is cleaned up on failure.  A crash mid-write can never leave a
@@ -362,6 +400,8 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
         f.sync_all()
             .with_context(|| format!("fsync temp {}", tmp.display()))?;
         drop(f);
+        #[cfg(not(windows))]
+        note_self_write(path);
         durable_replace(&tmp, path)
             .with_context(|| format!("durable rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())

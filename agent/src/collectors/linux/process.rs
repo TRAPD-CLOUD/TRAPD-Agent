@@ -10,11 +10,15 @@ use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
+use crate::collectors::process_baseline::{
+    build_baseline, emit_baseline, EMIT_BATCH, EMIT_PAUSE, MAX_BASELINE_PROCESSES,
+};
 use crate::collectors::Collector;
 use crate::schema::{
     AgentEvent, DetectionData, EventAction, EventClass, EventData, MemoryAnomalyData,
     ProcessCreateData, ProcessTerminateData, Severity,
 };
+use crate::telemetry::identity::parent_generation_before_child;
 use crate::telemetry::limits::{truncate_str, MAX_CMDLINE_BYTES};
 use crate::telemetry::metrics::{metrics, CollectorMode};
 use crate::telemetry::{Enrichment, EnrichmentError};
@@ -325,6 +329,16 @@ impl Collector for ProcessCollector {
             if !self.initialized {
                 self.known = snapshot_known(&current);
                 self.initialized = true;
+                // Parents that predate the agent never produced a create
+                // event; emit them once so the backend can resolve chains.
+                let baseline =
+                    build_baseline(baseline_candidates(&current), MAX_BASELINE_PROCESSES);
+                let report =
+                    emit_baseline(&tx, &agent_id, &hostname, baseline, EMIT_BATCH, EMIT_PAUSE)
+                        .await;
+                if report.channel_closed {
+                    return Ok(());
+                }
                 continue;
             }
 
@@ -333,6 +347,16 @@ impl Collector for ProcessCollector {
             // New processes
             for pid in diff.created {
                 if let Some(info) = current.get(&pid) {
+                    // Bind the parent's generation only when it provably
+                    // predates this child (the PID may have been recycled).
+                    let mut info = info.clone();
+                    info.parent_start_time = current.get(&info.ppid).and_then(|parent| {
+                        parent_generation_before_child(
+                            info.process_start_time,
+                            parent.process_start_time,
+                        )
+                    });
+                    let info = &info;
                     let event = AgentEvent::new(
                         agent_id.clone(),
                         hostname.clone(),
@@ -420,6 +444,17 @@ impl Collector for ProcessCollector {
             self.known = snapshot_known(&current);
         }
     }
+}
+
+/// Processes worth a baseline event: everything except kernel threads (no
+/// image, no argv), which are never a meaningful parent for a user-space chain
+/// and would consume the cap on large hosts.
+fn baseline_candidates(current: &HashMap<i32, ProcessCreateData>) -> Vec<ProcessCreateData> {
+    current
+        .values()
+        .filter(|p| !(p.exe.is_empty() && p.cmdline.is_empty()))
+        .cloned()
+        .collect()
 }
 
 /// Reduce a poll to the state needed to diff against the next one.
@@ -571,6 +606,19 @@ mod tests {
         let snap = snapshot_known(&current);
         assert_eq!(snap[&7].start_time, Some(42));
         assert_eq!(snap[&7].name, "bash");
+    }
+
+    #[test]
+    fn baseline_candidates_skip_kernel_threads_but_keep_unreadable_exe_with_cmdline() {
+        let mut kthread = seen(2, "kthreadd", Some(1)).1;
+        kthread.exe.clear();
+        kthread.cmdline.clear();
+        let mut user = seen(100, "bash", Some(5)).1;
+        user.cmdline = "bash -l".into();
+        let current = HashMap::from([(2, kthread), (100, user)]);
+        let c = baseline_candidates(&current);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].pid, 100);
     }
 
     #[test]

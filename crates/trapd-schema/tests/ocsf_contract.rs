@@ -16,6 +16,7 @@ fn all_eventclass() -> Vec<EventClass> {
         EventClass::Detection,
         EventClass::Log,
         EventClass::Registry,
+        EventClass::Device,
     ]
 }
 
@@ -33,6 +34,7 @@ fn cover_eventclass(value: &EventClass) {
         EventClass::Detection => {}
         EventClass::Log => {}
         EventClass::Registry => {}
+        EventClass::Device => {}
     }
 }
 
@@ -72,6 +74,7 @@ fn all_eventaction() -> Vec<EventAction> {
         EventAction::WriteRateAnomaly,
         EventAction::KillAttempt,
         EventAction::Setuid,
+        EventAction::PrivilegeChange,
         EventAction::MemfdCreate,
         EventAction::MemoryAnomaly,
         EventAction::ProcessBlocked,
@@ -136,6 +139,7 @@ fn cover_eventaction(value: &EventAction) {
         EventAction::WriteRateAnomaly => {}
         EventAction::KillAttempt => {}
         EventAction::Setuid => {}
+        EventAction::PrivilegeChange => {}
         EventAction::MemfdCreate => {}
         EventAction::MemoryAnomaly => {}
         EventAction::ProcessBlocked => {}
@@ -277,6 +281,7 @@ fn emit_contract() {
                 client_addr: "192.0.2.1".into(),
                 transaction_id: 42,
                 rcode: "NOERROR".into(),
+                query_status: None,
                 pid: None,
                 process: None,
                 process_start_time: None,
@@ -297,6 +302,10 @@ fn emit_contract() {
                 comm: "cat".into(),
                 path: "/tmp/fixture.txt".into(),
                 flags: 0,
+                exe: None,
+                process_start_time: None,
+                sensitive_class: None,
+                suppressed_repeats: None,
             })
             .unwrap(),
         ),
@@ -394,9 +403,30 @@ fn emit_contract() {
                 client_addr: "".into(),
                 transaction_id: 0,
                 rcode: "NOERROR".into(),
+                query_status: None,
                 pid: None,
                 process: None,
                 process_start_time: None,
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/privilege_change".into(),
+        source(
+            json!("process"),
+            json!("privilege_change"),
+            serde_json::to_value(trapd_schema::PrivilegeChangeData {
+                pid: 77,
+                process_start_time: Some(4242),
+                ppid: Some(1),
+                exe: Some("/tmp/exploit".into()),
+                comm: "exploit".into(),
+                old_uid: 1000,
+                new_uid: 0,
+                new_euid: 0,
+                new_suid: Some(0),
+                setuid_binary: false,
             })
             .unwrap(),
         ),
@@ -487,6 +517,20 @@ fn emit_contract() {
     fixtures.push(fixture(
         "network/closed".into(),
         source(json!("network"), json!("connection"), closed),
+    ));
+    fixtures.push(fixture(
+        "network/tls_handshake-ja3s_hash".into(),
+        source(
+            json!("network"),
+            json!("tls_handshake"),
+            json!({
+                "src_addr":"10.0.0.5","dst_addr":"93.184.216.34","dst_port":443,
+                "sni":"example.com","tls_version":"TLS 1.2",
+                "ja3":"771,4865,0-10-11,29,0","ja3_hash":"0123456789abcdef0123456789abcdef",
+                "ja3s_hash":"8d2a028aa94425f76ced7826b1f39039",
+                "ja3s":"771,49199,65281-11-35-16"
+            }),
+        ),
     ));
     let mut no_command = data.clone();
     no_command.as_object_mut().unwrap().remove("command_id");

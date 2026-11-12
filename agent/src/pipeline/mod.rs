@@ -19,6 +19,8 @@ use crate::telemetry::{metrics::metrics, DropReason};
 pub mod backoff;
 pub mod journal;
 #[cfg(any(windows, test))]
+pub mod process_merge;
+#[cfg(any(windows, test))]
 pub mod receipt;
 pub mod spool;
 

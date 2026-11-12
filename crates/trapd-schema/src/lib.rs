@@ -101,11 +101,13 @@ pub enum EventClass {
     /// Canonical log record from the generic log collector (file, journal,
     /// syslog). Routed by `class=log` + `action=log`; see [`LogEventData`].
     Log,
+    /// Removable / hot-plug device attach (`create`) and detach (`delete`).
+    Device,
 }
 
 impl EventClass {
     /// Every class, in `index()` order.
-    pub const ALL: [EventClass; 12] = [
+    pub const ALL: [EventClass; 13] = [
         EventClass::Process,
         EventClass::Network,
         EventClass::System,
@@ -118,6 +120,7 @@ impl EventClass {
         EventClass::Detection,
         EventClass::Log,
         EventClass::Registry,
+        EventClass::Device,
     ];
 
     /// Stable lowercase label (identical to the serde spelling).
@@ -135,6 +138,7 @@ impl EventClass {
             EventClass::Detection => "detection",
             EventClass::Log => "log",
             EventClass::Registry => "registry",
+            EventClass::Device => "device",
         }
     }
 
@@ -152,6 +156,7 @@ impl EventClass {
             EventClass::Detection => 9,
             EventClass::Log => 10,
             EventClass::Registry => 11,
+            EventClass::Device => 12,
         }
     }
 }
@@ -197,6 +202,8 @@ pub enum EventAction {
     KillAttempt,
     // ── New security-monitoring actions ─────────────────────────────────────────
     Setuid,
+    /// A process provably gained effective uid 0 through a uid-changing syscall.
+    PrivilegeChange,
     MemfdCreate,
     MemoryAnomaly,
     // ── Prevention actions (active response) ────────────────────────────────────
@@ -320,6 +327,9 @@ pub enum EventData {
     AgentTamper(AgentTamperData),
     WriteRateAnomaly(WriteRateAnomalyData),
     KillAttempt(KillAttemptData),
+    // Must precede `Setuid`: its fields are a superset of `SetuidData`, and an
+    // untagged enum would otherwise decode it as the weaker variant.
+    PrivilegeChange(PrivilegeChangeData),
     Setuid(SetuidData),
     MemfdCreate(MemfdCreateData),
     MemoryAnomaly(MemoryAnomalyData),
@@ -328,8 +338,48 @@ pub enum EventData {
     // ── Detection engine payload ────────────────────────────────────────
     // Boxed: correlation keys and gate metadata make this a large variant.
     Detection(Box<DetectionData>),
+    /// Device attach/detach. Its `subsystem` + `device_id` are required, so it
+    /// cannot swallow another untagged payload on journal replay.
+    Device(DeviceEventData),
     // ── Observability ────────────────────────────────────────────────────────
     EbpfDrops(EbpfDropsData),
+}
+
+/// A removable / hot-plug device appearing (`device/create`) or going away
+/// (`device/delete`). Identity fields are what the device reports about
+/// itself, so they are evidence of what it claims to be, not proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEventData {
+    /// `usb` or `block` (Linux uevent subsystem); `usb` / `usbstor` (Windows
+    /// enumerator).
+    pub subsystem: String,
+    /// Stable id of the device node: sysfs `DEVPATH` on Linux, the PnP device
+    /// instance id on Windows.
+    pub device_id: String,
+    /// `usb_device`, `usb_interface`, `disk`; Windows: setup class name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_type: Option<String>,
+    /// USB vendor id, four lower-case hex digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_id: Option<String>,
+    /// USB product id, four lower-case hex digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// USB class code, two hex digits (`03` HID, `08` mass storage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_class: Option<String>,
+    /// Serial number as reported by the device; absent when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
+    /// Device node or kernel name (`sdb`, `bus/usb/001/005`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devnode: Option<String>,
+    /// `netlink_uevent` or `setupapi`.
+    pub source: String,
 }
 
 // ── Existing data structs ────────────────────────────────────────────────────────────────────────
@@ -692,6 +742,23 @@ pub struct FileOpenData {
     pub comm: String,
     pub path: String,
     pub flags: u64,
+    /// Opener's executable (`/proc/<pid>/exe`). Set by the sensitive-file
+    /// sensor only; `None` when unreadable (process already gone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    /// Opener's start time (`/proc/<pid>/stat` field 22). Present only when the
+    /// generation is provably older than the open (see AGENTS.md, process
+    /// identity); absent means "cannot correlate", never a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
+    /// Credential class of an inode-matched sensitive file (`shadow`,
+    /// `sudoers`, `ssh_host_key`, ...). `None` for ordinary opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitive_class: Option<String>,
+    /// Identical `(exe, path)` opens suppressed by the agent's rate limit since
+    /// the previous event for the same key. Absent when nothing was suppressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_repeats: Option<u64>,
 }
 
 /// Legacy pre-consolidation FIM payload, retained so queued events written by
@@ -809,6 +876,25 @@ pub struct ModuleLoadData {
     /// Windows: image of the process that loaded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_exe: Option<String>,
+    /// Start time of the loading process (`/proc/<pid>/stat` field 22), so the
+    /// load stays attributable after PID reuse. Linux user-space `.so` loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
+    /// Windows driver loads: `sha256:<hex>` of the image file, read after the
+    /// load notification (the file may have changed or vanished since).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Why `sha256` is absent although a path was known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_error: Option<EnrichmentError>,
+    /// Windows driver loads: `valid_embedded` (a valid embedded Authenticode
+    /// signature) or `unverified`. `unverified` is not "unsigned": a
+    /// catalog-signed driver has no embedded signature and lands here too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Windows driver loads: mapped image size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -870,6 +956,10 @@ pub struct DnsResolutionData {
     pub transaction_id: u16,
     /// Response code as text (`NOERROR`, `NXDOMAIN`, …).
     pub rcode: String,
+    /// Raw Win32/DNS status of the query (Windows ETW `QueryStatus`), kept
+    /// beside `rcode` because that maps unknown statuses to `UNKNOWN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_status: Option<u32>,
     /// Requesting process, when the sensor can attribute it (Windows ETW
     /// DNS-Client; the packet-capture path cannot).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -901,6 +991,14 @@ pub struct TlsHandshakeData {
     /// ALPN protocols offered (`h2`, `http/1.1`, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alpn: Vec<String>,
+    /// MD5 of the JA3S string: fingerprint of the server's ServerHello
+    /// (version, chosen cipher, extension list). Absent when the server reply
+    /// was not observed or could not be parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja3s_hash: Option<String>,
+    /// Raw JA3S string (`version,cipher,extensions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja3s: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1292,6 +1390,36 @@ pub struct SetuidData {
     pub old_uid: u32,
     pub new_uid: u32,
     pub comm: String,
+}
+
+/// A process gained effective uid 0, verified after the syscall completed.
+///
+/// Identity is `(pid, process_start_time)`; `process_start_time` is only set
+/// when it was read before and after verification with the same value.
+/// `old_uid` is the real uid before the call (the kernel hook cannot see the
+/// old effective uid), so a setuid-root binary that already ran with euid 0
+/// is distinguishable only through `setuid_binary`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivilegeChangeData {
+    pub pid: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    pub comm: String,
+    /// Real uid before the call.
+    pub old_uid: u32,
+    /// Real uid after the call.
+    pub new_uid: u32,
+    /// Effective uid after the call (always 0 for emitted events).
+    pub new_euid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_suid: Option<u32>,
+    /// The executable carries the setuid bit and is owned by root.
+    #[serde(default)]
+    pub setuid_binary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

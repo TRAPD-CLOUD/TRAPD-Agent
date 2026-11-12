@@ -22,6 +22,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 - `agent/src/prevention/commands.rs`: signed response command schema.
 - `agent/src/prevention/policy.rs`: IoC policy/rule schema.
 - `agent/src/deception/`: honeytoken deception subsystem — `profiler.rs` (deterministic recon profile / token candidates), `registry.rs` (deployed-token register at `<state>/honeytokens.json`, incl. out-of-band canary records), `validate.rs` (bait-content + out-of-band-canary validation and anti-fingerprinting guards), `mod.rs` (camouflaged deploy + safe revoke). Step 1 places and manages tokens; the on-host detection path lives in `detection/honeytoken.rs`.
+- `agent/src/collectors/linux/sensitive_files.rs`: sensitive credential-file read sensor (GAP T9). A fixed built-in list (`/etc/shadow`, `/etc/gshadow`, `/etc/security/opasswd`, `/etc/sudoers`, `/etc/sudoers.d/*`, `/etc/krb5.keytab`, `/etc/ssh/ssh_host_*_key`, `/root/.ssh/id_*` without `.pub`) is resolved to `(dev, ino)` into the `SENSITIVE_INODES` BPF map and re-resolved on inotify changes of the parent directories plus a 30 s tick (rename-over by `passwd`/`useradd` gives a new inode). The `vfs_open` kprobe checks the map after the honeytoken lookup, so ordinary opens never leave the kernel. Hits arrive on `SENSITIVE_READ_EVENTS` and become `filesystem`/`open` `FileOpenData` with `exe`, `process_start_time` (only when provably older than the open), `sensitive_class` and `suppressed_repeats`. Legitimate readers are not filtered; identical `(exe, path)` events are limited to 3 per 60 s and 120/min overall, every suppressed event counted as `rate_limit_applied`, with a 5 min log summary. Kernel ring-buffer drops use `DROPPED` slot `sensitive_read`. Coverage: `ebpf_sensitive_file_read`. User-level SSH keys and `/etc/passwd` are out of scope.
 - `agent/src/collectors/linux/logs/`: generic Linux log collector — `LogSource → Reader → Framing → Parser → Normalizer → Canonical Event`. File (inode/rotation/truncation/glob), systemd journal, syslog UDP/unix. Parsers for syslog, json, nginx, apache, postgresql, mysql, docker, sshd, sudo, auditd. Checkpoints at `<state>/log_offsets.json`.
 - `agent/src/rootkit/`: cross-view rootkit and host-manipulation detection — `hidden_process.rs` (`/proc` listing vs. direct `/proc/<pid>` vs. `kill(pid,0)` liveness vs. eBPF PIDs), `hidden_socket.rs` (`/proc/net/*` vs. `sock_diag` netlink vs. eBPF binds), `hidden_file.rs` (libc `readdir` vs. raw `getdents64` vs. directory `st_nlink` vs. names harvested from eBPF writes/unlinks/renames, `/proc/<pid>/fd` and `/proc/<pid>/maps`), `hidden_mount.rs` (`/proc/mounts` vs. `/proc/self/mountinfo` vs. `/proc/self/mountstats`, plus file-level mounts that shadow a system file), `hidden_login.rs` (`/var/run/utmp` vs. login sessions rebuilt from `/proc`), `modules.rs` (`/proc/modules` vs. `/sys/module` vs. eBPF module loads vs. `/lib/modules/<release>`), `binaries.rs` (on-disk digest vs. the distribution package database, over a `PATH`-resolved tool set), `kernel_view.rs` (bounded registry of eBPF sightings), `mod.rs` (finding model, corroboration, `diagnostics rootkit`). Driven by `collectors/linux/rootkit.rs`.
 - `agent/src/forensics/`: response forensics (issue #32, point 5) — `session.rs` (login/TTY/container/namespace/cgroup context from `/proc`), `snapshot.rs` (point-in-time process capture for the freeze response), `recorder.rs` (bounded flight recorder of recent pid-bearing telemetry + remote-IP correlation).
@@ -369,6 +370,13 @@ generations are refused without an action, snapshot or memory artifact.
 Legacy commands still decode and verify, and Linux retains legacy omission.
 Command producers must preserve the observed u64 exactly when signing, rather
 than rounding it through a floating-point representation.
+
+At start both process collectors emit the already-running processes once as
+`process` / `snapshot` events with a `ProcessCreateData` payload (cap 4096,
+64 events per 50 ms, overflow counted as `rate_limit_applied` /
+`userspace_channel_full`, no start time = not emitted). `parent_start_time` is
+set only when the parent's start time is provably older than the child's. The
+backend must treat `snapshot` as lineage only, not as a process creation.
 
 Linux honeytoken kernel events append their original `bpf_ktime_get_ns` timestamp.
 Older kernel objects still decode as access telemetry but lack an identity that
@@ -1357,6 +1365,7 @@ older than the last applied config.
   "isolation_allowlist_ips": ["string"],
   "inventory_enabled": "bool, default true",
   "honeytoken_detection_enabled": "bool, default true",
+  "sensitive_file_read_enabled": "bool, default true (Linux; omitted from the signed canonical form while true — the backend canonicalConfig must emit it, as a trailing field, when false)",
   "honeytoken_response": "string, default \"alert\" (none|alert|freeze|kill|isolate)",
   "honeytoken_accessor_allowlist": ["string (extra benign accessor comms)"],
   "honeytoken_deception_escalation": "bool, default false",
