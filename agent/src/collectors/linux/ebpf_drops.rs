@@ -18,30 +18,31 @@ use crate::schema::EbpfDropsData;
 
 /// Number of drop-counter slots. MUST equal `SLOT_COUNT` in
 /// `trapd-agent-ebpf/src/dropcount.rs`.
-pub const SLOT_COUNT: usize = 19;
+pub const SLOT_COUNT: usize = 20;
 
 /// Human-readable program name per slot. Index == slot. MUST stay in sync with
 /// the `SLOT_*` indices in `trapd-agent-ebpf/src/dropcount.rs`.
 pub const SLOT_NAMES: [&str; SLOT_COUNT] = [
-    "exec",        // SLOT_EXEC        = 0
-    "dns",         // SLOT_DNS         = 1
-    "fork",        // SLOT_FORK        = 2
-    "file_open",   // SLOT_FILE_OPEN   = 3
-    "honeytoken",  // SLOT_HONEYTOKEN  = 4
-    "network",     // SLOT_NET         = 5
-    "module_load", // SLOT_MODULE_LOAD = 6
-    "unlink",      // SLOT_UNLINK      = 7
-    "rename",      // SLOT_RENAME      = 8
-    "chmod",       // SLOT_CHMOD       = 9
-    "chown",       // SLOT_CHOWN       = 10
-    "namespace",   // SLOT_NS          = 11
-    "setuid",      // SLOT_SETUID      = 12
-    "write_rate",  // SLOT_WRITE_RATE  = 13
-    "memfd",       // SLOT_MEMFD       = 14
-    "shm",         // SLOT_SHM         = 15
-    "mmap",        // SLOT_MMAP        = 16
-    "ptrace",      // SLOT_PTRACE      = 17
-    "kill",        // SLOT_KILL        = 18
+    "exec",           // SLOT_EXEC        = 0
+    "dns",            // SLOT_DNS         = 1
+    "fork",           // SLOT_FORK        = 2
+    "file_open",      // SLOT_FILE_OPEN   = 3
+    "honeytoken",     // SLOT_HONEYTOKEN  = 4
+    "network",        // SLOT_NET         = 5
+    "module_load",    // SLOT_MODULE_LOAD = 6
+    "unlink",         // SLOT_UNLINK      = 7
+    "rename",         // SLOT_RENAME      = 8
+    "chmod",          // SLOT_CHMOD       = 9
+    "chown",          // SLOT_CHOWN       = 10
+    "namespace",      // SLOT_NS          = 11
+    "setuid",         // SLOT_SETUID      = 12
+    "write_rate",     // SLOT_WRITE_RATE  = 13
+    "memfd",          // SLOT_MEMFD       = 14
+    "shm",            // SLOT_SHM         = 15
+    "mmap",           // SLOT_MMAP        = 16
+    "ptrace",         // SLOT_PTRACE      = 17
+    "kill",           // SLOT_KILL        = 18
+    "sensitive_read", // SLOT_SENSITIVE_READ = 19
 ];
 
 /// Reads and tracks the shared `DROPPED` per-CPU drop-counter map.

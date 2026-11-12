@@ -692,6 +692,23 @@ pub struct FileOpenData {
     pub comm: String,
     pub path: String,
     pub flags: u64,
+    /// Opener's executable (`/proc/<pid>/exe`). Set by the sensitive-file
+    /// sensor only; `None` when unreadable (process already gone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    /// Opener's start time (`/proc/<pid>/stat` field 22). Present only when the
+    /// generation is provably older than the open (see AGENTS.md, process
+    /// identity); absent means "cannot correlate", never a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
+    /// Credential class of an inode-matched sensitive file (`shadow`,
+    /// `sudoers`, `ssh_host_key`, ...). `None` for ordinary opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitive_class: Option<String>,
+    /// Identical `(exe, path)` opens suppressed by the agent's rate limit since
+    /// the previous event for the same key. Absent when nothing was suppressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_repeats: Option<u64>,
 }
 
 /// Legacy pre-consolidation FIM payload, retained so queued events written by

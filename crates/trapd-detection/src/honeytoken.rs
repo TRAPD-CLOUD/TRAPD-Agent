@@ -501,7 +501,7 @@ fn normalized_hit<'a>(hit: &AccessHit<'a>) -> AccessHit<'a> {
 /// same tick cannot authorize action. Boottime is never less than monotonic:
 /// after suspend this may conservatively decline attribution, never accept a
 /// process born after the recorded access. Legacy records have no timestamp.
-fn generation_before_access(start: u64, observed_ns: u64, ticks_per_second: u64) -> bool {
+pub fn generation_before_access(start: u64, observed_ns: u64, ticks_per_second: u64) -> bool {
     start > 0
         && observed_ns > 0
         && ticks_per_second > 0

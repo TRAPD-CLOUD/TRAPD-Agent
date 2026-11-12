@@ -100,6 +100,38 @@ static HONEYTOKEN_PATHS: HashMap<[u8; PATH_LEN], u64> =
 #[map]
 static HONEYTOKEN_INODES: HashMap<[u64; 2], u64> = HashMap::<[u64; 2], u64>::with_max_entries(256, 0);
 
+/// Sensitive credential-file match table: **(filesystem, inode) → class id**.
+/// Armed by userspace from a fixed built-in path list (`/etc/shadow`, SSH host
+/// keys, ...) resolved to inodes with `stat()`. `vfs_open` consults it only after
+/// the honeytoken lookup missed, so an ordinary open costs one extra hash lookup
+/// and never leaves the kernel.
+#[map]
+static SENSITIVE_INODES: HashMap<[u64; 2], u32> = HashMap::<[u64; 2], u32>::with_max_entries(256, 0);
+
+/// Dedicated channel for sensitive-file opens, separate from `FILE_OPEN_EVENTS`
+/// and the honeytoken channel so neither can crowd it out.
+#[map]
+static SENSITIVE_READ_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+/// Open of an armed sensitive file. Userspace resolves `(dev, ino)` back to the
+/// configured path, so no path is copied in the kernel.
+#[repr(C)]
+pub struct SensitiveReadEvent {
+    pub pid:         u32,
+    pub uid:         u32,
+    pub gid:         u32,
+    /// Class id from the match table value.
+    pub class_id:    u32,
+    /// open(2) flags from `file->f_flags`.
+    pub flags:       u64,
+    /// Kernel-encoded `dev_t` (major << 20 | minor) of the matched inode.
+    pub dev:         u64,
+    pub ino:         u64,
+    /// `bpf_ktime_get_ns()` at the open, for process-generation attribution.
+    pub observed_monotonic_ns: u64,
+    pub comm:        [u8; COMM_LEN],
+}
+
 // Kernel-derived offsets: path.dentry, dentry.d_inode, inode.i_ino,
 // inode.i_sb, super_block.s_dev, file.f_flags; slot 6 says the inode kprobe is active.
 #[map]
@@ -668,7 +700,7 @@ fn try_vfs_open(ctx: &ProbeContext) -> Result<(), i64> {
     let key = [dev as u64, ino];
     let token_id = match unsafe { HONEYTOKEN_INODES.get(&key) } {
         Some(&t) => t,
-        None => return Ok(()),
+        None => return emit_sensitive_read(ctx, &key),
     };
 
     let Some(&flags_offset) = HONEYTOKEN_LAYOUT.get(5) else { return Ok(()); };
@@ -683,6 +715,41 @@ fn try_vfs_open(ctx: &ProbeContext) -> Result<(), i64> {
         crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);
     }
 
+    Ok(())
+}
+
+/// Emit a [`SensitiveReadEvent`] when `key` is an armed sensitive credential
+/// file. Called only after the honeytoken lookup missed. Fail-safe like the rest
+/// of `vfs_open`: any unreadable field means no event, never a guessed one.
+#[inline(always)]
+fn emit_sensitive_read(ctx: &ProbeContext, key: &[u64; 2]) -> Result<(), i64> {
+    let class_id = match unsafe { SENSITIVE_INODES.get(key) } {
+        Some(&c) => c,
+        None => return Ok(()),
+    };
+    let Some(&flags_offset) = HONEYTOKEN_LAYOUT.get(5) else { return Ok(()); };
+    if flags_offset > 4096 { return Ok(()); }
+    let file: *const u8 = ctx.arg(1).ok_or(-1i64)?;
+    if file.is_null() { return Ok(()); }
+    let flags: u32 = unsafe {
+        bpf_probe_read_kernel((file as usize + flags_offset as usize) as *const u32).map_err(|_| -1i64)?
+    };
+    if let Some(mut entry) = SENSITIVE_READ_EVENTS.reserve::<SensitiveReadEvent>(0) {
+        let uid_gid = bpf_get_current_uid_gid();
+        let ev = unsafe { entry.assume_init_mut() };
+        ev.pid       = (bpf_get_current_pid_tgid() >> 32) as u32;
+        ev.uid       = (uid_gid & 0xFFFF_FFFF) as u32;
+        ev.gid       = (uid_gid >> 32) as u32;
+        ev.class_id  = class_id;
+        ev.flags     = flags as u64;
+        ev.dev       = key[0];
+        ev.ino       = key[1];
+        ev.observed_monotonic_ns = unsafe { bpf_ktime_get_ns() };
+        ev.comm      = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
+        entry.submit(0);
+    } else {
+        crate::dropcount::record_drop(crate::dropcount::SLOT_SENSITIVE_READ);
+    }
     Ok(())
 }
 

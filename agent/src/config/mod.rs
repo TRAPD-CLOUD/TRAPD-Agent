@@ -388,6 +388,12 @@ pub struct AgentConfig {
     /// device. Off by default: the notice also reaches an attacker at the keyboard.
     #[serde(default, skip_serializing_if = "skip_if_false")]
     pub user_response_notifications_enabled: bool,
+    /// Linux: report opens of real credential files (`/etc/shadow`, SSH host
+    /// keys, sudoers, root's SSH private keys) as `filesystem`/`open` events.
+    /// Inode-filtered in the kernel and rate-limited per `(exe, path)`, so it is
+    /// on by default; omitted from the signed canonical form while `true`.
+    #[serde(default = "default_true", skip_serializing_if = "skip_if_true")]
+    pub sensitive_file_read_enabled: bool,
 }
 
 pub use trapd_detection::RuleModeOverride;
@@ -456,6 +462,7 @@ impl Default for AgentConfig {
             adaptive_decoys: Vec::new(),
             script_block_capture_enabled: false,
             user_response_notifications_enabled: false,
+            sensitive_file_read_enabled: true,
         }
     }
 }
@@ -912,6 +919,21 @@ mod signed_config_tests {
     fn cleanup(p: PathBuf, w: PathBuf) {
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(w);
+    }
+
+    #[test]
+    fn sensitive_file_read_defaults_on_and_keeps_canonical_form() {
+        let cfg = AgentConfig::default();
+        assert!(cfg.sensitive_file_read_enabled);
+        // Omitted at its default so existing signatures stay valid.
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("sensitive_file_read_enabled"));
+        let off: AgentConfig =
+            serde_json::from_str(r#"{"sensitive_file_read_enabled":false}"#).unwrap();
+        assert!(!off.sensitive_file_read_enabled);
+        assert!(serde_json::to_string(&off)
+            .unwrap()
+            .contains("\"sensitive_file_read_enabled\":false"));
     }
 
     #[test]
