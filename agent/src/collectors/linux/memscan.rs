@@ -252,6 +252,76 @@ pub fn is_jit_runtime(exe: &str) -> bool {
         || exe.contains("/electron")
 }
 
+/// Roots under which a JIT runtime image may be allowlisted. Anything else
+/// (`/tmp`, `/home`, `/dev/shm`, `/var/tmp`, …) is never trusted by name.
+const TRUSTED_IMAGE_ROOTS: &[&str] = &[
+    "/usr/", "/opt/", "/snap/", "/bin/", "/sbin/", "/lib/", "/lib64/",
+];
+
+/// `(uid, mode)` of a path, as the trust check needs it.
+type StatFn<'a> = &'a dyn Fn(&std::path::Path) -> Option<(u32, u32)>;
+
+/// Real-filesystem `stat` (follows symlinks) for [`is_root_owned_system_path`].
+fn fs_stat(path: &std::path::Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.uid(), m.mode()))
+}
+
+/// True when `path` is an absolute path under a system root whose file and
+/// every ancestor directory is owned by root and not group/world writable, so
+/// an unprivileged user cannot have planted or swapped the binary. Fails closed
+/// on any `stat` error, `..` component or ` (deleted)` image.
+pub fn is_root_owned_system_path(path: &str, stat: StatFn<'_>) -> bool {
+    use std::path::{Component, Path};
+    if !TRUSTED_IMAGE_ROOTS.iter().any(|r| path.starts_with(r)) || path.ends_with(" (deleted)") {
+        return false;
+    }
+    let p = Path::new(path);
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    p.ancestors()
+        .filter(|a| !a.as_os_str().is_empty())
+        .all(|a| matches!(stat(a), Some((0, mode)) if mode & 0o022 == 0))
+}
+
+/// A JIT runtime is allowlisted only when its name matches *and* the image sits
+/// on a root-owned, non-writable system path. The name alone proves nothing: an
+/// attacker can call a binary `java` or drop it into a `/tmp/jvm/` directory.
+pub fn is_trusted_jit_image(exe: &str, stat: StatFn<'_>) -> bool {
+    exe.starts_with('/') && is_jit_runtime(exe) && is_root_owned_system_path(exe, stat)
+}
+
+/// Stable fold key for anonymous executable memory: one per (image identity,
+/// mapping kind), independent of pid and address, so the backend folds repeats
+/// of the same binary into one signal. The image hash wins over the path (a
+/// replaced binary is a different identity); `comm` is the last resort.
+pub fn anon_exec_dedup_key(
+    image: Option<&str>,
+    sha256: Option<&str>,
+    comm: &str,
+    writable: bool,
+) -> String {
+    let identity = match (sha256, image) {
+        (Some(h), _) => format!("sha256:{}", h.trim_start_matches("sha256:")),
+        (None, Some(p)) => format!("path:{p}"),
+        (None, None) => format!("comm:{comm}"),
+    };
+    let kind = if writable { "rwx" } else { "rx" };
+    let mut key = format!("memory.anon_exec:{identity}:{kind}");
+    // Bound the key (paths and comm are attacker-influenced): keep the kind.
+    if key.len() > 256 {
+        let mut cut = 240;
+        while !key.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        key.truncate(cut);
+        key.push_str(&format!("…:{kind}"));
+    }
+    key
+}
+
 // ── Collector ────────────────────────────────────────────────────────────────
 
 pub struct MemScanCollector {
@@ -459,7 +529,9 @@ impl MemScanCollector {
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| comm.clone());
-        let jit = is_jit_runtime(&exe) || is_jit_runtime(&comm);
+        // `comm` is attacker-controlled (prctl), so only the resolved image path
+        // counts, and only from a root-owned non-writable system location.
+        let jit = is_trusted_jit_image(&exe, &fs_stat);
         let mut out = Vec::new();
         #[cfg(feature = "yara")]
         let mut yara_scanned: Vec<String> = Vec::new();
@@ -488,7 +560,14 @@ impl MemScanCollector {
                     } else {
                         format!("{pid}:{start}:{}:{:#x}", f.rule_id, region.start)
                     };
-                    out.push((key, f.severity, finding_to_detection(pid, &comm, &f)));
+                    let anon_writable =
+                        (f.rule_id == "memory.anon_exec").then(|| region.is_write());
+                    out.push((
+                        key,
+                        f.severity,
+                        finding_to_detection(pid, &comm, &f),
+                        anon_writable,
+                    ));
                 }
             }
             #[cfg(feature = "yara")]
@@ -505,6 +584,7 @@ impl MemScanCollector {
                         key,
                         severity,
                         yara_detection(pid, &comm, region, &rule, severity),
+                        None,
                     ));
                 }
             }
@@ -525,7 +605,7 @@ impl MemScanCollector {
                             detail: format!("PID {pid} ({comm}) runs with LD_PRELOAD={val}"),
                             evidence: serde_json::json!({ "pid": pid, "comm": comm, "ld_preload": val }),
                             ..Default::default()
-                        }));
+                        }, None));
                 }
             }
         }
@@ -543,7 +623,7 @@ impl MemScanCollector {
         let image = exe.starts_with('/').then_some(exe.as_str());
         let mut image_hash: Option<Option<String>> = None;
         out.into_iter()
-            .filter_map(|(key, severity, mut finding)| {
+            .filter_map(|(key, severity, mut finding, anon_writable)| {
                 if !self.seen.insert(key) {
                     return None;
                 }
@@ -557,6 +637,15 @@ impl MemScanCollector {
                         exe_sha256: hash.clone(),
                         ..Default::default()
                     });
+                }
+                // Without a dedup key the backend never folds these: subject and
+                // detail carry the pid, so every process became its own signal.
+                if let Some(writable) = anon_writable {
+                    let sha = finding
+                        .correlation
+                        .as_ref()
+                        .and_then(|c| c.exe_sha256.as_deref());
+                    finding.dedup_key = Some(anon_exec_dedup_key(image, sha, &comm, writable));
                 }
                 Some((severity, finding))
             })
@@ -710,6 +799,100 @@ mod tests {
         assert!(is_jit_runtime("/opt/google/chrome/chrome"));
         assert!(!is_jit_runtime("/tmp/payload"));
         assert!(!is_jit_runtime("/usr/sbin/sshd"));
+    }
+
+    /// Fake filesystem: path -> (uid, mode).
+    fn fake_stat(
+        entries: &'static [(&'static str, u32, u32)],
+    ) -> impl Fn(&std::path::Path) -> Option<(u32, u32)> {
+        move |p: &std::path::Path| {
+            entries
+                .iter()
+                .find(|(path, _, _)| std::path::Path::new(path) == p)
+                .map(|(_, uid, mode)| (*uid, *mode))
+        }
+    }
+
+    const SYSTEM_FS: &[(&str, u32, u32)] = &[
+        ("/", 0, 0o40755),
+        ("/usr", 0, 0o40755),
+        ("/usr/bin", 0, 0o40755),
+        ("/usr/bin/node", 0, 0o100755),
+        ("/usr/bin/java", 1000, 0o100755),
+        ("/tmp", 0, 0o41777),
+        ("/tmp/java", 1000, 0o100755),
+        ("/tmp/jvm", 1000, 0o40755),
+        ("/tmp/jvm/x", 1000, 0o100755),
+        ("/opt", 0, 0o40755),
+        ("/opt/app", 0, 0o40775),
+        ("/opt/app/node", 0, 0o100755),
+    ];
+
+    #[test]
+    fn root_owned_system_jit_is_allowlisted() {
+        let stat = fake_stat(SYSTEM_FS);
+        assert!(is_trusted_jit_image("/usr/bin/node", &stat));
+    }
+
+    #[test]
+    fn same_name_binary_outside_system_paths_is_not_allowlisted() {
+        let stat = fake_stat(SYSTEM_FS);
+        // Name matches a JIT runtime, but the image is user-writable / in /tmp.
+        assert!(!is_trusted_jit_image("/tmp/java", &stat));
+        // The old `/jvm/` substring shortcut must not bypass the path check.
+        assert!(!is_trusted_jit_image("/tmp/jvm/x", &stat));
+        // Right directory, wrong owner.
+        assert!(!is_trusted_jit_image("/usr/bin/java", &stat));
+        // Group-writable parent directory.
+        assert!(!is_trusted_jit_image("/opt/app/node", &stat));
+        // Relative / traversal / deleted / unknown (stat fails) all fail closed.
+        assert!(!is_trusted_jit_image("node", &stat));
+        assert!(!is_trusted_jit_image("/usr/bin/../../tmp/java", &stat));
+        assert!(!is_trusted_jit_image("/usr/bin/node (deleted)", &stat));
+        assert!(!is_trusted_jit_image("/usr/bin/missing-node", &stat));
+    }
+
+    #[test]
+    fn non_jit_system_binary_is_not_allowlisted() {
+        let stat = fake_stat(SYSTEM_FS);
+        assert!(!is_trusted_jit_image("/usr/bin/bash", &stat));
+    }
+
+    #[test]
+    fn anon_exec_dedup_key_is_stable_per_image_and_kind() {
+        let a = anon_exec_dedup_key(Some("/usr/bin/x"), Some("sha256:ab"), "x", true);
+        // Same identity regardless of pid/comm/path spelling of the hash.
+        assert_eq!(
+            a,
+            anon_exec_dedup_key(Some("/other/x"), Some("ab"), "renamed", true)
+        );
+        assert_eq!(a, "memory.anon_exec:sha256:ab:rwx");
+        // Mapping kind and image identity both split the key.
+        assert_ne!(
+            a,
+            anon_exec_dedup_key(Some("/usr/bin/x"), Some("ab"), "x", false)
+        );
+        assert_ne!(
+            a,
+            anon_exec_dedup_key(Some("/usr/bin/x"), Some("cd"), "x", true)
+        );
+        // Without a hash the path, then comm, identify the image.
+        assert_eq!(
+            anon_exec_dedup_key(Some("/tmp/p"), None, "p", false),
+            "memory.anon_exec:path:/tmp/p:rx"
+        );
+        assert_eq!(
+            anon_exec_dedup_key(None, None, "p", false),
+            "memory.anon_exec:comm:p:rx"
+        );
+    }
+
+    #[test]
+    fn anon_exec_dedup_key_is_bounded_and_char_safe() {
+        let long = "é".repeat(400);
+        let k = anon_exec_dedup_key(Some(&long), None, "c", true);
+        assert!(k.len() <= 270, "{}", k.len());
+        assert!(k.ends_with(":rwx"));
     }
 
     #[test]
