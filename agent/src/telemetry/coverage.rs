@@ -20,7 +20,7 @@ const MAX_SHADOW_RULES: usize = 512;
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct Coverage {
-    /// Process telemetry source: `etw`, `polling`, `ebpf`, `proc`.
+    /// Process telemetry source: `etw`, `eventlog_4688`, `polling`, `ebpf`, `proc`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_sensor: Option<String>,
     /// ETW real-time session is running and delivering.
@@ -122,6 +122,25 @@ impl Coverage {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn etw_process_active(&self) -> bool {
         self.etw_session == Some(true) && self.etw_process_provider == Some(true)
+    }
+    /// Security 4688 is being delivered: Process Creation auditing is on and
+    /// the Security channel was readable on its last pass. 4688 is written by
+    /// the kernel for every creation, so unlike a poll it cannot miss a
+    /// short-lived process.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn eventlog_process_active(&self) -> bool {
+        self.audit_process_creation == Some(true) && self.security_eventlog_active == Some(true)
+    }
+    /// Process source to report when ETW is not delivering: `eventlog_4688`
+    /// when 4688 is flowing (the poller then only tracks terminations),
+    /// otherwise `polling` (the poller emits creates, with its known gap).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn fallback_process_sensor(&self) -> &'static str {
+        if self.eventlog_process_active() {
+            "eventlog_4688"
+        } else {
+            "polling"
+        }
     }
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn etw_network_active(&self) -> bool {
@@ -310,5 +329,31 @@ mod tests {
             serde_json::to_value(c).unwrap()["security_eventlog_active"],
             false
         );
+    }
+
+    #[test]
+    fn process_fallback_prefers_4688_only_when_it_is_really_flowing() {
+        let mut c = Coverage::default();
+        assert_eq!(
+            c.fallback_process_sensor(),
+            "polling",
+            "unknown is not covered"
+        );
+        c.audit_process_creation = Some(true);
+        assert_eq!(
+            c.fallback_process_sensor(),
+            "polling",
+            "channel not read yet"
+        );
+        c.security_eventlog_active = Some(true);
+        assert!(c.eventlog_process_active());
+        assert_eq!(c.fallback_process_sensor(), "eventlog_4688");
+        c.security_eventlog_active = Some(false);
+        assert_eq!(c.fallback_process_sensor(), "polling");
+        c.security_eventlog_active = Some(true);
+        c.audit_process_creation = Some(false);
+        assert_eq!(c.fallback_process_sensor(), "polling", "auditing off");
+        c.audit_process_creation = None;
+        assert_eq!(c.fallback_process_sensor(), "polling");
     }
 }

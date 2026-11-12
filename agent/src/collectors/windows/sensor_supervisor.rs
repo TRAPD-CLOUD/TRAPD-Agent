@@ -60,7 +60,7 @@ impl Collector for SensorSupervisor {
             }
             crate::telemetry::coverage::update(|c| {
                 c.etw_session = Some(false);
-                c.process_sensor = Some("polling".into());
+                c.process_sensor = Some(c.fallback_process_sensor().into());
             });
             tokio::select! {
                 _ = tx.closed() => return Ok(()),

@@ -125,7 +125,16 @@ impl Collector for ProcessCollector {
                 self.initialized = true;
                 continue;
             }
-            crate::telemetry::coverage::update(|c| c.process_sensor = Some("polling".into()));
+            // ETW is not delivering. When Security 4688 is flowing it is the
+            // primary create source (complete for short-lived processes) and
+            // this poller only tracks terminations; otherwise it emits
+            // creates itself. Re-evaluated every poll so a 4688 outage hands
+            // creation back to the poller and reports `polling`.
+            let mut emit_creates = true;
+            crate::telemetry::coverage::update(|c| {
+                emit_creates = !c.eventlog_process_active();
+                c.process_sensor = Some(c.fallback_process_sensor().into());
+            });
             crate::telemetry::metrics::metrics()
                 .set_collector_mode(crate::telemetry::metrics::CollectorMode::WindowsPolling);
             // First pass: absorb the already-running baseline without events.
@@ -163,6 +172,7 @@ impl Collector for ProcessCollector {
             // New processes, including a proven replacement in an existing PID.
             let created: Vec<i32> = current
                 .keys()
+                .filter(|_| emit_creates)
                 .filter(|pid| match self.known.get(pid) {
                     None => true,
                     Some((_, before)) => {
