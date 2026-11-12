@@ -18,6 +18,7 @@
 //! provided by the shared [`crate::collectors::system`] collector.
 
 pub mod decoy_audit;
+pub mod device;
 pub mod etw;
 pub mod eventlog;
 pub mod filesystem;
@@ -26,6 +27,7 @@ pub mod memscan;
 pub mod network;
 pub mod process;
 pub mod registry;
+pub mod regnotify;
 pub mod regwatch;
 pub mod users;
 

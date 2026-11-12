@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{AgentEvent, EventData};
+use crate::schema::{AgentEvent, EventAction, EventData};
 
 /// Default capacity of the per-pid event ring.
 pub const DEFAULT_CAPACITY: usize = 512;
@@ -82,6 +82,11 @@ impl FlightRecorder {
             }
         }
 
+        // The start-up process baseline is lineage for the backend, not session
+        // history; thousands of entries would evict the real recent events.
+        if matches!(event.action, EventAction::Snapshot) {
+            return;
+        }
         let Some((pid, summary)) = extract(&event.data) else {
             return;
         };
@@ -160,6 +165,10 @@ fn extract(data: &EventData) -> Option<(i32, String)> {
             format!("chown {}:{} {}", d.new_uid, d.new_gid, d.path),
         ),
         EventData::Mmap(d) => (d.pid, format!("mmap {}", d.comm)),
+        EventData::PrivilegeChange(d) => (
+            d.pid,
+            format!("privilege_change {} -> euid {}", d.old_uid, d.new_euid),
+        ),
         EventData::Setuid(d) => (d.pid, format!("setuid {} -> {}", d.old_uid, d.new_uid)),
         EventData::MemfdCreate(d) => (d.pid, format!("memfd_create {}", d.name)),
         EventData::NetworkSocket(d) => (d.pid, format!("{} {}:{}", d.op, d.addr, d.port)),
@@ -232,6 +241,10 @@ mod tests {
                 comm: "cat".into(),
                 path: path.into(),
                 flags: 0,
+                exe: None,
+                process_start_time: None,
+                sensitive_class: None,
+                suppressed_repeats: None,
             }),
         )
     }
@@ -267,6 +280,24 @@ mod tests {
         assert_eq!(hist.len(), 2);
         assert!(hist[0].summary.contains("/b"), "oldest (/a) was evicted");
         assert!(hist[1].summary.contains("/c"));
+    }
+
+    #[test]
+    fn startup_process_baseline_does_not_enter_the_history_ring() {
+        let r = FlightRecorder::new(10);
+        let mut ev = AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            EventClass::Process,
+            EventAction::Snapshot,
+            Severity::Info,
+            EventData::ProcessCreate(Default::default()),
+        );
+        if let EventData::ProcessCreate(d) = &mut ev.data {
+            d.pid = 7;
+        }
+        r.record(&ev);
+        assert!(r.history_for(&[7], 10).is_empty());
     }
 
     #[test]

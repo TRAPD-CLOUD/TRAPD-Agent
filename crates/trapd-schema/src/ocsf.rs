@@ -53,7 +53,7 @@ fn classification(class: &str, action: &str, data: &Value) -> (u64, u64) {
         ("process", "create" | "exec" | "fork") => (1007, 1),
         ("process", "terminate") => (1007, 2),
         ("process", "ptrace") => (1007, 3),
-        ("process", "setuid") => (1007, 5),
+        ("process", "setuid" | "privilege_change") => (1007, 5),
         ("filesystem", "create") => (1001, 1),
         ("filesystem", "modify" | "integrity_violation") => (1001, 3),
         ("filesystem", "delete" | "unlink") => (1001, 4),
