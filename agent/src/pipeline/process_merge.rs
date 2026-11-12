@@ -202,11 +202,12 @@ impl ProcessCreateMerger {
                 EventData::ProcessCreate(_) => self.on_create(event, now, &mut out),
                 EventData::ProcessTerminate(t) => {
                     let pid = t.pid;
-                    match self
-                        .held
-                        .iter_mut()
-                        .find(|h| create_of(&h.event).is_some_and(|d| d.pid == pid))
-                    {
+                    // A stop belongs to the newest held generation of its pid
+                    // that has not stopped yet; a recycled pid's earlier
+                    // generation already has its own stop queued.
+                    match self.held.iter_mut().rev().find(|h| {
+                        h.trailing.is_empty() && create_of(&h.event).is_some_and(|d| d.pid == pid)
+                    }) {
                         Some(h) => h.trailing.push(event),
                         None => out.push(event),
                     }
@@ -300,12 +301,20 @@ impl ProcessCreateMerger {
         }
         if candidates.is_empty() {
             // A second report of a process already forwarded.
-            let seen = self
-                .seen
-                .iter()
-                .filter(|s| same_process(&s.ident, &ident))
-                .count();
-            if seen == 1 {
+            // A live sensor report is never replaced by an audit record that
+            // went out first: only it carries the creation time and image
+            // digest. Audit records and repeated sensor reports are dropped.
+            let matching = || self.seen.iter().filter(|s| same_process(&s.ident, &ident));
+            // Distinct generations among the matches: sensor reports differ by
+            // creation time; audit-only entries name no generation of their own.
+            let generations = matching().filter(|s| s.ident.start.is_some()).count();
+            let audit_only = matching().any(|s| s.ident.start.is_none());
+            let duplicate = if precise {
+                generations == 1
+            } else {
+                generations == 1 || (generations == 0 && audit_only)
+            };
+            if duplicate {
                 return;
             }
         }
@@ -602,6 +611,44 @@ mod tests {
         let mut later = precise(9, "y");
         create_mut(&mut later).unwrap().process_start_time = Some(START + 9 + 200_000_000);
         assert_eq!(creates(&m.process(vec![later], t0)).len(), 1);
+    }
+
+    #[test]
+    fn live_report_after_a_forwarded_audit_record_is_kept() {
+        let t0 = Instant::now();
+        let mut m = ProcessCreateMerger::new();
+        assert_eq!(
+            creates(&m.process(vec![audit(7, "certutil x")], t0)).len(),
+            1
+        );
+        let out = m.process(vec![precise(7, "certutil x")], t0);
+        let c = creates(&out);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].process_start_time, Some(START + 7));
+        // A second audit record of the same process is still a duplicate.
+        assert!(m.process(vec![audit(7, "certutil x")], t0).is_empty());
+    }
+
+    #[test]
+    fn stops_follow_their_own_generation() {
+        let t0 = Instant::now();
+        let mut m = ProcessCreateMerger::new();
+        let a = precise(7, "");
+        let mut b = precise(7, "");
+        create_mut(&mut b).unwrap().process_start_time = Some(START + 7 + 50_000_000);
+        assert!(m.process(vec![a, stop(7), b, stop(7)], t0).is_empty());
+        let out = m.flush_all(t0);
+        let kinds: Vec<_> = out
+            .iter()
+            .map(|e| match &e.data {
+                EventData::ProcessCreate(d) => {
+                    format!("create {}", d.process_start_time.unwrap() - START)
+                }
+                EventData::ProcessTerminate(_) => "stop".to_string(),
+                _ => "other".to_string(),
+            })
+            .collect();
+        assert_eq!(kinds, ["create 7", "stop", "create 50000007", "stop"]);
     }
 
     #[test]

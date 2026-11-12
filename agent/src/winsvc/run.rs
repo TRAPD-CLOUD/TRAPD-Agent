@@ -538,13 +538,14 @@ pub async fn run_agent(
                 _ = async { tokio::time::sleep_until(held_until.unwrap()).await }, if held_until.is_some() => {
                     let due = merger.flush_due(std::time::Instant::now());
                     if !due.is_empty() {
-                        crate::consume_batch(
+                        crate::consume_batch_with(
                             due,
                             &mut checkpoints,
                             prev_tx.as_ref(),
                             &mode,
                             &buf_for_consumer,
                             &siem,
+                            crate::PreventionTee::ExceptProcessCreate,
                         )
                         .await;
                     }
@@ -553,29 +554,34 @@ pub async fn run_agent(
                     if !more {
                         let rest = merger.flush_all(std::time::Instant::now());
                         if !rest.is_empty() {
-                            crate::consume_batch(
+                            crate::consume_batch_with(
                                 rest,
                                 &mut checkpoints,
                                 prev_tx.as_ref(),
                                 &mode,
                                 &buf_for_consumer,
                                 &siem,
+                                crate::PreventionTee::ExceptProcessCreate,
                             )
                             .await;
                         }
                         break;
                     }
+                    // Prevention gets every live create now; the merger
+                    // only shapes the telemetry sent upstream.
+                    crate::tee_process_creates(&batch, prev_tx.as_ref());
                     let ready = merger.process(
                         std::mem::take(&mut batch),
                         std::time::Instant::now(),
                     );
-                    crate::consume_batch(
+                    crate::consume_batch_with(
                         ready,
                         &mut checkpoints,
                         prev_tx.as_ref(),
                         &mode,
                         &buf_for_consumer,
                         &siem,
+                        crate::PreventionTee::ExceptProcessCreate,
                     )
                     .await;
                 }
