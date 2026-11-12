@@ -25,6 +25,9 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
 use tracing::info;
 
+use crate::collectors::process_baseline::{
+    build_baseline, emit_baseline, EMIT_BATCH, EMIT_PAUSE, MAX_BASELINE_PROCESSES,
+};
 use crate::collectors::Collector;
 use crate::schema::{
     AgentEvent, EventAction, EventClass, EventData, ProcessCreateData, ProcessTerminateData,
@@ -57,6 +60,8 @@ async fn hash_image_off_worker(exe: PathBuf) -> HashOutcome {
 pub struct ProcessCollector {
     sys: System,
     initialized: bool,
+    /// Whether the already-running baseline was emitted by this instance.
+    baseline_emitted: bool,
     /// pid → name of every process seen in the previous poll.
     known: HashMap<i32, (String, Option<u64>)>,
 }
@@ -66,8 +71,48 @@ impl ProcessCollector {
         Self {
             sys: System::new(),
             initialized: false,
+            baseline_emitted: false,
             known: HashMap::new(),
         }
+    }
+
+    /// Process data for the start-up baseline. Unlike the live path it does
+    /// not hash images: the baseline is lineage for the backend, and hashing
+    /// thousands of images at start would be a startup I/O spike.
+    fn baseline_data(
+        &self,
+        pid: i32,
+        current: &HashMap<i32, (String, Option<u64>)>,
+    ) -> Option<ProcessCreateData> {
+        let spid = Pid::from_u32(pid as u32);
+        let proc_ = self.sys.process(spid)?;
+        let mut notes = Enrichment::new();
+        let (cmdline, truncation) = truncate_str(&proc_.cmd().join(" "), MAX_CMDLINE_BYTES);
+        notes.truncated("cmdline", truncation);
+        let exe = proc_.exe().map(Path::to_path_buf).unwrap_or_default();
+        if exe.as_os_str().is_empty() {
+            notes.fail("exe", EnrichmentError::IoError);
+        }
+        let username = self.username_of(spid);
+        if username == "unknown" {
+            notes.fail("username", EnrichmentError::IoError);
+        }
+        let start_time = current.get(&pid).and_then(|(_, s)| *s);
+        Some(ProcessCreateData {
+            pid,
+            ppid: proc_.parent().map(|p| p.as_u32() as i32).unwrap_or(0),
+            name: proc_.name().to_string(),
+            exe: exe.to_string_lossy().into_owned(),
+            cmdline,
+            uid: 0,
+            username,
+            exe_sha256: None,
+            process_start_time: start_time,
+            // Filled by `build_baseline` from the full table.
+            parent_start_time: None,
+            parent_exe: None,
+            enrichment: notes.finish(0),
+        })
     }
 
     fn username_of(&self, pid: Pid) -> String {
@@ -118,6 +163,29 @@ impl Collector for ProcessCollector {
                     )
                 })
                 .collect();
+
+            // Processes that predate the agent never produced a create event
+            // (ETW included); emit them once as a bounded baseline so the
+            // backend can resolve parents such as explorer.exe or services.exe.
+            if !self.baseline_emitted {
+                self.baseline_emitted = true;
+                let candidates: Vec<ProcessCreateData> = current
+                    .keys()
+                    .filter_map(|pid| self.baseline_data(*pid, &current))
+                    .collect();
+                let baseline = build_baseline(candidates, MAX_BASELINE_PROCESSES);
+                // Lineage for honeytoken accessor attribution, as for live
+                // creations; deception activity is deliberately not fed.
+                for data in &baseline.processes {
+                    crate::detection::accessor_correlation::record_process(data);
+                }
+                let report =
+                    emit_baseline(&tx, &agent_id, &hostname, baseline, EMIT_BATCH, EMIT_PAUSE)
+                        .await;
+                if report.channel_closed {
+                    return Ok(());
+                }
+            }
 
             // Maintain cross-view state even while ETW owns process emissions.
             if crate::telemetry::coverage::snapshot().etw_process_active() {

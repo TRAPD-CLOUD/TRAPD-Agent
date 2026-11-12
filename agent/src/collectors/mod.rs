@@ -30,6 +30,10 @@ pub mod fs_plan;
 // Memory-scan finding shared by the Linux and Windows scanners.
 pub mod mem_finding;
 
+// Bounded baseline of processes already running at agent start (Linux and
+// Windows process collectors).
+pub mod process_baseline;
+
 // Generic log collector (file tail, journal, syslog → parsers → events), shared by
 // Linux and Windows; each platform supplies its own built-in source catalogue.
 pub mod logs;
