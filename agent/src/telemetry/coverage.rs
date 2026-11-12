@@ -20,7 +20,7 @@ const MAX_SHADOW_RULES: usize = 512;
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct Coverage {
-    /// Process telemetry source: `etw`, `polling`, `ebpf`, `proc`.
+    /// Process telemetry source: `etw`, `polling`, `polling+eventlog_4688`, `ebpf`, `proc`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_sensor: Option<String>,
     /// ETW real-time session is running and delivering.
@@ -106,6 +106,18 @@ impl Coverage {
             *active = false;
         }
         self.ebpf_honeytoken_inode = Some(false);
+    }
+
+    /// Process sensor label while the poller is live: process creates also
+    /// come from Security 4688 when that audit is on and its channel readable.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn polling_label(&self) -> &'static str {
+        if self.audit_process_creation == Some(true) && self.security_eventlog_active == Some(true)
+        {
+            "polling+eventlog_4688"
+        } else {
+            "polling"
+        }
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -234,6 +246,18 @@ mod tests {
         c.etw_session = Some(false);
         assert!(!c.etw_process_active());
         assert!(!c.etw_network_active());
+    }
+
+    #[test]
+    fn polling_label_names_4688_only_when_it_is_flowing() {
+        let mut c = Coverage::default();
+        assert_eq!(c.polling_label(), "polling");
+        c.audit_process_creation = Some(true);
+        assert_eq!(c.polling_label(), "polling");
+        c.security_eventlog_active = Some(true);
+        assert_eq!(c.polling_label(), "polling+eventlog_4688");
+        c.audit_process_creation = Some(false);
+        assert_eq!(c.polling_label(), "polling");
     }
 
     #[test]

@@ -125,7 +125,9 @@ impl Collector for ProcessCollector {
                 self.initialized = true;
                 continue;
             }
-            crate::telemetry::coverage::update(|c| c.process_sensor = Some("polling".into()));
+            crate::telemetry::coverage::update(|c| {
+                c.process_sensor = Some(c.polling_label().into());
+            });
             crate::telemetry::metrics::metrics()
                 .set_collector_mode(crate::telemetry::metrics::CollectorMode::WindowsPolling);
             // First pass: absorb the already-running baseline without events.

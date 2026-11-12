@@ -570,6 +570,11 @@ pub async fn run_agent(
                     // Prevention gets every live create now; the merger
                     // only shapes the telemetry sent upstream.
                     crate::tee_process_creates(&batch, prev_tx.as_ref());
+                    // Without the ETW process provider the poller is the
+                    // live sensor; give it the chance to meet 4688.
+                    merger.set_audit_hold(
+                        !crate::telemetry::coverage::snapshot().etw_process_active(),
+                    );
                     let ready = merger.process(
                         std::mem::take(&mut batch),
                         std::time::Instant::now(),
