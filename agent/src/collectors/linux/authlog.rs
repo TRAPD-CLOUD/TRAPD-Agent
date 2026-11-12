@@ -339,7 +339,14 @@ async fn follow_journal_once(
                 let _ = child.wait().await;
                 return Ok(false);
             }
-            BoundedLine::TooLong => continue,
+            BoundedLine::TooLong => {
+                // The whole JSON record (message plus journal metadata) is
+                // over the limit; it may have been an auth line, so the loss
+                // is counted like every other drop.
+                crate::telemetry::metrics::metrics()
+                    .event_dropped(crate::telemetry::DropReason::EventTooLarge);
+                continue;
+            }
             BoundedLine::Line => {}
         }
         let Ok(text) = std::str::from_utf8(&buf) else {
