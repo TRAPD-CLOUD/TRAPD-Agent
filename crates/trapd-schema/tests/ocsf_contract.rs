@@ -518,6 +518,20 @@ fn emit_contract() {
         "network/closed".into(),
         source(json!("network"), json!("connection"), closed),
     ));
+    fixtures.push(fixture(
+        "network/tls_handshake-ja3s_hash".into(),
+        source(
+            json!("network"),
+            json!("tls_handshake"),
+            json!({
+                "src_addr":"10.0.0.5","dst_addr":"93.184.216.34","dst_port":443,
+                "sni":"example.com","tls_version":"TLS 1.2",
+                "ja3":"771,4865,0-10-11,29,0","ja3_hash":"0123456789abcdef0123456789abcdef",
+                "ja3s_hash":"8d2a028aa94425f76ced7826b1f39039",
+                "ja3s":"771,49199,65281-11-35-16"
+            }),
+        ),
+    ));
     let mut no_command = data.clone();
     no_command.as_object_mut().unwrap().remove("command_id");
     fixtures.push(fixture(

@@ -991,6 +991,14 @@ pub struct TlsHandshakeData {
     /// ALPN protocols offered (`h2`, `http/1.1`, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alpn: Vec<String>,
+    /// MD5 of the JA3S string: fingerprint of the server's ServerHello
+    /// (version, chosen cipher, extension list). Absent when the server reply
+    /// was not observed or could not be parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja3s_hash: Option<String>,
+    /// Raw JA3S string (`version,cipher,extensions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ja3s: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
