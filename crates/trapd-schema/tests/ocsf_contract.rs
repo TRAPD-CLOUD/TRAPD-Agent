@@ -74,6 +74,7 @@ fn all_eventaction() -> Vec<EventAction> {
         EventAction::WriteRateAnomaly,
         EventAction::KillAttempt,
         EventAction::Setuid,
+        EventAction::PrivilegeChange,
         EventAction::MemfdCreate,
         EventAction::MemoryAnomaly,
         EventAction::ProcessBlocked,
@@ -138,6 +139,7 @@ fn cover_eventaction(value: &EventAction) {
         EventAction::WriteRateAnomaly => {}
         EventAction::KillAttempt => {}
         EventAction::Setuid => {}
+        EventAction::PrivilegeChange => {}
         EventAction::MemfdCreate => {}
         EventAction::MemoryAnomaly => {}
         EventAction::ProcessBlocked => {}
@@ -405,6 +407,26 @@ fn emit_contract() {
                 pid: None,
                 process: None,
                 process_start_time: None,
+            })
+            .unwrap(),
+        ),
+    ));
+    fixtures.push(fixture(
+        "typed/privilege_change".into(),
+        source(
+            json!("process"),
+            json!("privilege_change"),
+            serde_json::to_value(trapd_schema::PrivilegeChangeData {
+                pid: 77,
+                process_start_time: Some(4242),
+                ppid: Some(1),
+                exe: Some("/tmp/exploit".into()),
+                comm: "exploit".into(),
+                old_uid: 1000,
+                new_uid: 0,
+                new_euid: 0,
+                new_suid: Some(0),
+                setuid_binary: false,
             })
             .unwrap(),
         ),

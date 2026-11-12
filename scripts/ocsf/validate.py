@@ -88,7 +88,7 @@ def upstream_schema():
 # TRAPD mapping policy reviewed against upstream activity descriptions. Unknown
 # source combinations deliberately remain Base Event / Other, preserving evidence.
 MAPPING = {
-    "process": (1007, {"create": 1, "exec": 1, "fork": 1, "terminate": 2, "ptrace": 3, "setuid": 5}),
+    "process": (1007, {"create": 1, "exec": 1, "fork": 1, "terminate": 2, "ptrace": 3, "setuid": 5, "privilege_change": 5}),
     "filesystem": (1001, {"create": 1, "modify": 3, "integrity_violation": 3, "delete": 4,
                          "unlink": 4, "rename": 5, "chmod": 7, "chown": 6, "open": 14}),
     "network": (4001, {"connection": 1, "bind": 7, "accept": 1, "tls_handshake": 99}),

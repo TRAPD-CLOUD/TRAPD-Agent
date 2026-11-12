@@ -202,6 +202,8 @@ pub enum EventAction {
     KillAttempt,
     // ── New security-monitoring actions ─────────────────────────────────────────
     Setuid,
+    /// A process provably gained effective uid 0 through a uid-changing syscall.
+    PrivilegeChange,
     MemfdCreate,
     MemoryAnomaly,
     // ── Prevention actions (active response) ────────────────────────────────────
@@ -325,6 +327,9 @@ pub enum EventData {
     AgentTamper(AgentTamperData),
     WriteRateAnomaly(WriteRateAnomalyData),
     KillAttempt(KillAttemptData),
+    // Must precede `Setuid`: its fields are a superset of `SetuidData`, and an
+    // untagged enum would otherwise decode it as the weaker variant.
+    PrivilegeChange(PrivilegeChangeData),
     Setuid(SetuidData),
     MemfdCreate(MemfdCreateData),
     MemoryAnomaly(MemoryAnomalyData),
@@ -1377,6 +1382,36 @@ pub struct SetuidData {
     pub old_uid: u32,
     pub new_uid: u32,
     pub comm: String,
+}
+
+/// A process gained effective uid 0, verified after the syscall completed.
+///
+/// Identity is `(pid, process_start_time)`; `process_start_time` is only set
+/// when it was read before and after verification with the same value.
+/// `old_uid` is the real uid before the call (the kernel hook cannot see the
+/// old effective uid), so a setuid-root binary that already ran with euid 0
+/// is distinguishable only through `setuid_binary`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivilegeChangeData {
+    pub pid: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    pub comm: String,
+    /// Real uid before the call.
+    pub old_uid: u32,
+    /// Real uid after the call.
+    pub new_uid: u32,
+    /// Effective uid after the call (always 0 for emitted events).
+    pub new_euid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_suid: Option<u32>,
+    /// The executable carries the setuid bit and is owned by root.
+    #[serde(default)]
+    pub setuid_binary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

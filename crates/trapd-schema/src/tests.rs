@@ -901,3 +901,55 @@ fn registry_rename_destination_and_source_round_trip_without_fabricated_value_da
         assert_eq!(data.rename_from.unwrap().value_name, source_value);
     }
 }
+
+#[test]
+fn privilege_change_round_trips_and_is_not_decoded_as_setuid() {
+    let event = AgentEvent::new(
+        "agent".to_string(),
+        "host".to_string(),
+        EventClass::Process,
+        EventAction::PrivilegeChange,
+        Severity::High,
+        EventData::PrivilegeChange(super::PrivilegeChangeData {
+            pid: 4242,
+            process_start_time: Some(123_456),
+            ppid: Some(1000),
+            exe: Some("/tmp/x".into()),
+            comm: "x".into(),
+            old_uid: 1000,
+            new_uid: 0,
+            new_euid: 0,
+            new_suid: Some(0),
+            setuid_binary: false,
+        }),
+    );
+    let val = serde_json::to_value(&event).unwrap();
+    assert_eq!(val["action"], "privilege_change");
+    assert_eq!(val["data"]["process_start_time"], 123_456);
+    let back: AgentEvent = serde_json::from_value(val).unwrap();
+    assert!(matches!(back.data, EventData::PrivilegeChange(ref d) if d.pid == 4242));
+
+    // A plain setuid payload (no `new_euid`) must keep decoding as Setuid.
+    let legacy = serde_json::json!({"pid": 1, "old_uid": 1000, "new_uid": 0, "comm": "su"});
+    let data: EventData = serde_json::from_value(legacy).unwrap();
+    assert!(matches!(data, EventData::Setuid(_)));
+}
+
+#[test]
+fn privilege_change_omits_unproven_identity() {
+    let data = super::PrivilegeChangeData {
+        pid: 1,
+        process_start_time: None,
+        ppid: None,
+        exe: None,
+        comm: "c".into(),
+        old_uid: 1,
+        new_uid: 0,
+        new_euid: 0,
+        new_suid: None,
+        setuid_binary: false,
+    };
+    let val = serde_json::to_value(&data).unwrap();
+    assert!(val.get("process_start_time").is_none());
+    assert!(val.get("exe").is_none());
+}

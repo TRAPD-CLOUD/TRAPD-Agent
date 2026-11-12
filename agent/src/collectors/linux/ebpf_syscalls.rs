@@ -83,6 +83,7 @@ use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{info, warn};
 
 use crate::collectors::linux::ebpf_drops::DropMonitor;
+use crate::collectors::linux::privilege_change;
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
 use crate::detection::honeytoken::{self, AccessHit, AccessKind, Allowlist};
@@ -701,6 +702,75 @@ pub(super) fn proc_username(uid: u32) -> String {
         })
         .unwrap_or_else(|| format!("uid:{uid}"))
 }
+
+/// Verify a setuid-to-0 candidate off the ring-buffer loop and emit
+/// `process/privilege_change` only for a proven escalation (see
+/// [`privilege_change`]). Shed candidates are counted, never silent.
+fn spawn_privilege_check(
+    tracker: &Arc<std::sync::Mutex<privilege_change::Tracker>>,
+    tx: Sender<AgentEvent>,
+    agent_id: String,
+    hostname: String,
+    pid: i32,
+    old_uid: u32,
+    comm: String,
+) {
+    use crate::telemetry::{metrics::metrics, DropReason};
+    use privilege_change::{Admission, ProcSource, Verdict};
+    let Some(start) = privilege_change::RealProc.start_time(pid) else {
+        metrics().event_dropped(DropReason::EnrichmentTimeout);
+        return;
+    };
+    let admission = match tracker.lock() {
+        Ok(mut t) => t.admit(pid, start, std::time::Instant::now()),
+        Err(_) => Admission::RateLimited,
+    };
+    if admission != Admission::Admit {
+        metrics().event_dropped(DropReason::RateLimitApplied);
+        return;
+    }
+    let tracker = Arc::clone(tracker);
+    tokio::spawn(async move {
+        let mut verdict = Verdict::Unprovable;
+        for _ in 0..privilege_change::VERIFY_ATTEMPTS {
+            tokio::time::sleep(privilege_change::VERIFY_DELAY).await;
+            verdict =
+                privilege_change::verify(&privilege_change::RealProc, pid, start, old_uid, &comm);
+            if !matches!(verdict, Verdict::NotEscalated) {
+                break;
+            }
+        }
+        match verdict {
+            Verdict::Escalated(data) => {
+                let sev = if data.setuid_binary {
+                    Severity::Medium
+                } else {
+                    Severity::High
+                };
+                let event = AgentEvent::new(
+                    agent_id,
+                    hostname,
+                    EventClass::Process,
+                    EventAction::PrivilegeChange,
+                    sev,
+                    EventData::PrivilegeChange(data),
+                );
+                if tx.try_send(event).is_err() {
+                    metrics().event_dropped(DropReason::UserspaceChannelFull);
+                }
+            }
+            Verdict::NotEscalated | Verdict::Unprovable => {
+                if verdict == Verdict::Unprovable {
+                    metrics().event_dropped(DropReason::EnrichmentTimeout);
+                }
+                if let Ok(mut t) = tracker.lock() {
+                    t.release(pid, start);
+                }
+            }
+        }
+    });
+}
+
 
 /// Attach `raw_sys_enter`, which handles every syscall with a path argument
 /// the collector watches (open family incl. creat/openat2, the honeytoken
@@ -1372,6 +1442,7 @@ impl Collector for EbpfSyscallCollector {
         // Our own PID, used to drop the agent's self-generated file opens (see
         // the FILE_OPEN_EVENTS arm below) and break the events.ndjson loop.
         let agent_pid = std::process::id();
+        let priv_tracker = Arc::new(std::sync::Mutex::new(privilege_change::Tracker::new()));
 
         // ── eBPF ring-buffer drop counters (issue #52) ──────────────────────
         // The kernel side bumps a per-program counter in the shared `DROPPED`
@@ -1897,6 +1968,13 @@ impl Collector for EbpfSyscallCollector {
                                            }),
                                        );
                                        if tx.send(event).await.is_err() { return Ok(()); }
+                                       if privilege_change::is_candidate(ev.old_uid, ev.new_uid) {
+                                           spawn_privilege_check(
+                                               &priv_tracker, tx.clone(), agent_id.clone(),
+                                               hostname.clone(), ev.pid as i32, ev.old_uid,
+                                               cstr(&ev.comm).to_string(),
+                                           );
+                                       }
                                    }
                                }
                                guard.clear_ready();
