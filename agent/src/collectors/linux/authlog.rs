@@ -41,56 +41,321 @@ impl Collector for AuthLogCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
-        // Locate a readable auth log. On distros without one — or before the
-        // agent has been granted read access (CAP_DAC_READ_SEARCH) — keep
-        // retrying instead of giving up for the whole process lifetime.
-        let (path, file) = loop {
-            if let Some(found) = open_auth_log().await {
-                break found;
+        // Pick a source: a readable auth log first, else the systemd journal
+        // (journal-only distros). If neither is available — or before the agent
+        // has been granted read access (CAP_DAC_READ_SEARCH) — keep retrying
+        // instead of giving up for the whole process lifetime.
+        loop {
+            let file = open_auth_log().await;
+            let journalctl = find_journalctl();
+            match select_source(file.is_some(), journalctl) {
+                AuthSource::File => {
+                    let (path, file) = file.expect("select_source returned File");
+                    return tail_file(path, file, tx, agent_id, hostname).await;
+                }
+                AuthSource::Journal(bin) => {
+                    return run_journal(bin, tx, agent_id, hostname).await;
+                }
+                AuthSource::Unavailable => {
+                    warn!(
+                        "AuthLogCollector: no readable auth log in {AUTH_LOG_CANDIDATES:?} and no journalctl; retrying in 30s"
+                    );
+                    sleep(Duration::from_secs(30)).await;
+                    if tx.is_closed() {
+                        return Ok(());
+                    }
+                }
             }
-            warn!(
-                "AuthLogCollector: no readable auth log in {AUTH_LOG_CANDIDATES:?}; retrying in 30s"
-            );
-            sleep(Duration::from_secs(30)).await;
-            if tx.is_closed() {
-                return Ok(());
-            }
-        };
-        info!("AuthLogCollector: tailing {path}");
+        }
+    }
+}
 
-        let mut reader = BufReader::new(file);
-        // Start at the end — ignore historical entries.
-        let mut offset = reader.seek(std::io::SeekFrom::End(0)).await?;
-        let mut ticker = interval(Duration::from_secs(2));
-        let mut line = String::new();
+/// Where auth events come from.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthSource {
+    File,
+    Journal(&'static str),
+    Unavailable,
+}
+
+/// A readable auth log always wins (identical behaviour to before); the
+/// journal is the fallback for hosts that only run systemd-journald.
+fn select_source(file_readable: bool, journalctl: Option<&'static str>) -> AuthSource {
+    match (file_readable, journalctl) {
+        (true, _) => AuthSource::File,
+        (false, Some(bin)) => AuthSource::Journal(bin),
+        (false, None) => AuthSource::Unavailable,
+    }
+}
+
+async fn tail_file(
+    path: String,
+    file: File,
+    tx: Sender<AgentEvent>,
+    agent_id: String,
+    hostname: String,
+) -> Result<()> {
+    info!("AuthLogCollector: tailing {path}");
+
+    let mut reader = BufReader::new(file);
+    // Start at the end — ignore historical entries.
+    let mut offset = reader.seek(std::io::SeekFrom::End(0)).await?;
+    let mut ticker = interval(Duration::from_secs(2));
+    let mut line = String::new();
+
+    loop {
+        ticker.tick().await;
+
+        // Handle log rotation / truncation: if the file shrank, logrotate
+        // rotated or truncated it — reopen the path from the start.
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if meta.len() < offset {
+                if let Ok(f) = File::open(&path).await {
+                    reader = BufReader::new(f);
+                    offset = 0;
+                }
+            }
+        }
 
         loop {
-            ticker.tick().await;
-
-            // Handle log rotation / truncation: if the file shrank, logrotate
-            // rotated or truncated it — reopen the path from the start.
-            if let Ok(meta) = tokio::fs::metadata(&path).await {
-                if meta.len() < offset {
-                    if let Ok(f) = File::open(&path).await {
-                        reader = BufReader::new(f);
-                        offset = 0;
-                    }
+            line.clear();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                break; // no new data yet
+            }
+            offset += n as u64;
+            let trimmed = line.trim_end();
+            if let Some(event) = parse_auth_line(trimmed, agent_id.clone(), hostname.clone()) {
+                if tx.send(event).await.is_err() {
+                    return Ok(()); // channel closed
                 }
             }
+        }
+    }
+}
 
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line).await?;
-                if n == 0 {
-                    break; // no new data yet
-                }
-                offset += n as u64;
-                let trimmed = line.trim_end();
-                if let Some(event) = parse_auth_line(trimmed, agent_id.clone(), hostname.clone()) {
-                    if tx.send(event).await.is_err() {
-                        return Ok(()); // channel closed
-                    }
-                }
+// ── systemd-journald source ──────────────────────────────────────────────────
+
+/// Absolute `journalctl` locations. Never resolved through `PATH`: the agent
+/// runs privileged, so a `PATH` entry must not decide which binary it executes.
+const JOURNALCTL_CANDIDATES: &[&str] = &["/usr/bin/journalctl", "/bin/journalctl"];
+
+/// Syslog identifiers whose messages the file parser understands: sshd (and the
+/// OpenSSH >= 9.8 `sshd-session` split), sudo/su/login, logind and the display
+/// managers' PAM session lines.
+const JOURNAL_IDENTIFIERS: &[&str] = &[
+    "sshd",
+    "sshd-session",
+    "sudo",
+    "su",
+    "login",
+    "systemd-logind",
+    "gdm-password",
+    "sddm-helper",
+];
+
+/// Longest journal JSON line accepted. Longer records are skipped, so a hostile
+/// message cannot grow the agent's memory.
+const JOURNAL_MAX_LINE: usize = 64 * 1024;
+/// Restart backoff bounds for a journalctl child that exits.
+const JOURNAL_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const JOURNAL_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+fn find_journalctl() -> Option<&'static str> {
+    JOURNALCTL_CANDIDATES
+        .iter()
+        .copied()
+        .find(|p| std::path::Path::new(p).is_file())
+}
+
+/// Journal cursors look like `s=…;i=…;b=…;m=…;t=…;x=…`. They come from the
+/// journal, but are re-validated before being handed back to a child process.
+fn is_valid_cursor(c: &str) -> bool {
+    !c.is_empty()
+        && c.len() <= 256
+        && c.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'=' | b';' | b'-' | b'_'))
+}
+
+/// Fixed argv (no shell, no user-controlled values). Without a cursor, start at
+/// the tail (`-n 0`) so history is never replayed; with one, resume after it.
+/// `_UID=0` restricts to records written by privileged processes, so an
+/// unprivileged user cannot forge `sshd` lines via `logger -t sshd`.
+fn journalctl_args(cursor: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["--no-pager", "--follow", "--output=json"]
+        .map(String::from)
+        .to_vec();
+    match cursor.filter(|c| is_valid_cursor(c)) {
+        Some(c) => args.push(format!("--after-cursor={c}")),
+        None => args.extend(["--lines=0".to_string()]),
+    }
+    args.push("_UID=0".into());
+    args.extend(
+        JOURNAL_IDENTIFIERS
+            .iter()
+            .map(|id| format!("SYSLOG_IDENTIFIER={id}")),
+    );
+    args
+}
+
+/// One journal JSON record reduced to what the auth parser needs.
+#[derive(Debug, PartialEq, Eq)]
+struct JournalRecord {
+    message: String,
+    cursor: Option<String>,
+}
+
+/// Parse one `journalctl -o json` line. Rejects records that are not from a
+/// privileged writer or an expected identifier (defence in depth: the same
+/// filter is also passed to journalctl) and non-text `MESSAGE`s (journald
+/// encodes binary messages as byte arrays).
+fn parse_journal_record(line: &str) -> Option<JournalRecord> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("_UID").and_then(|u| u.as_str()) != Some("0") {
+        return None;
+    }
+    let ident = v.get("SYSLOG_IDENTIFIER").and_then(|i| i.as_str())?;
+    if !JOURNAL_IDENTIFIERS.contains(&ident) {
+        return None;
+    }
+    let message = v.get("MESSAGE")?.as_str()?.to_string();
+    let cursor = v
+        .get("__CURSOR")
+        .and_then(|c| c.as_str())
+        .filter(|c| is_valid_cursor(c))
+        .map(String::from);
+    Some(JournalRecord { message, cursor })
+}
+
+/// Result of reading one bounded line.
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedLine {
+    Line,
+    /// Exceeded the cap; the remainder up to the newline was discarded.
+    TooLong,
+    Eof,
+}
+
+/// Read up to a newline into `buf`, holding at most `max` bytes in memory.
+async fn read_bounded_line<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<BoundedLine> {
+    buf.clear();
+    let mut too_long = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(if buf.is_empty() && !too_long {
+                BoundedLine::Eof
+            } else if too_long {
+                BoundedLine::TooLong
+            } else {
+                BoundedLine::Line
+            });
+        }
+        let (take, found_nl) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        if !too_long {
+            if buf.len() + take > max {
+                too_long = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(&chunk[..take]);
+            }
+        }
+        reader.consume(take);
+        if found_nl {
+            return Ok(if too_long {
+                BoundedLine::TooLong
+            } else {
+                BoundedLine::Line
+            });
+        }
+    }
+}
+
+/// Follow the journal via a `journalctl` child, restarting with exponential
+/// backoff and resuming after the last seen cursor so a restart neither replays
+/// history nor (when a cursor is known) drops events.
+async fn run_journal(
+    journalctl: &'static str,
+    tx: Sender<AgentEvent>,
+    agent_id: String,
+    hostname: String,
+) -> Result<()> {
+    info!("AuthLogCollector: no auth log file; following systemd journal via {journalctl}");
+    let mut cursor: Option<String> = None;
+    let mut backoff = JOURNAL_BACKOFF_MIN;
+    loop {
+        let started = std::time::Instant::now();
+        match follow_journal_once(journalctl, &mut cursor, &tx, &agent_id, &hostname).await {
+            Ok(true) => return Ok(()), // event channel closed
+            Ok(false) => warn!("AuthLogCollector: journalctl exited; restarting in {backoff:?}"),
+            Err(e) => warn!("AuthLogCollector: journalctl failed ({e}); restarting in {backoff:?}"),
+        }
+        if started.elapsed() > JOURNAL_BACKOFF_MAX {
+            backoff = JOURNAL_BACKOFF_MIN; // it ran healthily for a while
+        }
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(JOURNAL_BACKOFF_MAX);
+        if tx.is_closed() {
+            return Ok(());
+        }
+    }
+}
+
+/// Run one journalctl child to completion. `Ok(true)` = the event channel is
+/// closed and the collector should stop.
+async fn follow_journal_once(
+    journalctl: &str,
+    cursor: &mut Option<String>,
+    tx: &Sender<AgentEvent>,
+    agent_id: &str,
+    hostname: &str,
+) -> Result<bool> {
+    use tokio::process::Command;
+    let mut child = Command::new(journalctl)
+        .args(journalctl_args(cursor.as_deref()))
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("journalctl stdout not captured"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut buf = Vec::new();
+    loop {
+        match read_bounded_line(&mut reader, &mut buf, JOURNAL_MAX_LINE).await? {
+            BoundedLine::Eof => {
+                let _ = child.wait().await;
+                return Ok(false);
+            }
+            BoundedLine::TooLong => continue,
+            BoundedLine::Line => {}
+        }
+        let Ok(text) = std::str::from_utf8(&buf) else {
+            continue;
+        };
+        let Some(rec) = parse_journal_record(text.trim_end()) else {
+            continue;
+        };
+        if rec.cursor.is_some() {
+            *cursor = rec.cursor.clone();
+        }
+        if let Some(event) =
+            parse_auth_line(rec.message.trim_end(), agent_id.into(), hostname.into())
+        {
+            if tx.send(event).await.is_err() {
+                return Ok(true);
             }
         }
     }
@@ -321,5 +586,109 @@ mod tests {
         let ev = parse_auth_line(&l, "agent_test".into(), "victim".into()).expect("event");
         assert!(matches!(ev.action, EventAction::LogonFailed));
         assert!(matches!(ev.class, EventClass::User));
+    }
+
+    #[test]
+    fn source_selection_prefers_file_then_journal() {
+        assert_eq!(
+            select_source(true, Some("/usr/bin/journalctl")),
+            AuthSource::File
+        );
+        assert_eq!(select_source(true, None), AuthSource::File);
+        assert_eq!(
+            select_source(false, Some("/usr/bin/journalctl")),
+            AuthSource::Journal("/usr/bin/journalctl")
+        );
+        assert_eq!(select_source(false, None), AuthSource::Unavailable);
+    }
+
+    #[test]
+    fn journal_record_message_goes_through_the_file_parser() {
+        let line = r#"{"__CURSOR":"s=abc;i=1;b=2;m=3;t=4;x=5","_UID":"0","SYSLOG_IDENTIFIER":"sshd-session","MESSAGE":"Accepted publickey for alice from 203.0.113.5 port 5000 ssh2: ED25519 SHA256:x"}"#;
+        let rec = parse_journal_record(line).expect("record");
+        assert_eq!(rec.cursor.as_deref(), Some("s=abc;i=1;b=2;m=3;t=4;x=5"));
+        let ev = parse_auth_line(&rec.message, "a".into(), "h".into()).expect("event");
+        assert!(matches!(ev.action, EventAction::Logon));
+        let EventData::UserLogon(d) = ev.data else {
+            panic!("logon expected")
+        };
+        assert_eq!(d.username, "alice");
+        assert_eq!(d.auth_method.as_deref(), Some("publickey"));
+        assert!(d.success);
+
+        // Identical to the file path for the same message text.
+        let file_ev = parse_auth_line(&rec.message, "a".into(), "h".into()).unwrap();
+        assert!(matches!(file_ev.class, EventClass::User));
+    }
+
+    #[test]
+    fn journal_records_from_unprivileged_or_foreign_writers_are_rejected() {
+        let forged = r#"{"_UID":"1000","SYSLOG_IDENTIFIER":"sshd","MESSAGE":"Accepted password for root from 1.2.3.4 port 1 ssh2"}"#;
+        assert!(parse_journal_record(forged).is_none());
+        let other = r#"{"_UID":"0","SYSLOG_IDENTIFIER":"cron","MESSAGE":"x"}"#;
+        assert!(parse_journal_record(other).is_none());
+        let no_uid = r#"{"SYSLOG_IDENTIFIER":"sshd","MESSAGE":"x"}"#;
+        assert!(parse_journal_record(no_uid).is_none());
+        // Binary messages are byte arrays, not strings.
+        let binary = r#"{"_UID":"0","SYSLOG_IDENTIFIER":"sshd","MESSAGE":[65,66]}"#;
+        assert!(parse_journal_record(binary).is_none());
+        assert!(parse_journal_record("not json").is_none());
+    }
+
+    #[test]
+    fn invalid_cursor_is_dropped_from_the_record() {
+        let line =
+            r#"{"__CURSOR":"s=1; rm -rf /","_UID":"0","SYSLOG_IDENTIFIER":"su","MESSAGE":"x"}"#;
+        assert_eq!(parse_journal_record(line).unwrap().cursor, None);
+    }
+
+    #[test]
+    fn journalctl_argv_is_fixed_and_starts_at_the_tail() {
+        let a = journalctl_args(None);
+        assert!(a.contains(&"--lines=0".to_string()));
+        assert!(a.contains(&"--output=json".to_string()));
+        assert!(a.contains(&"_UID=0".to_string()));
+        assert!(a.contains(&"SYSLOG_IDENTIFIER=sshd".to_string()));
+        assert!(!a.iter().any(|x| x.starts_with("--after-cursor")));
+    }
+
+    #[test]
+    fn journalctl_argv_resumes_after_a_valid_cursor_only() {
+        let a = journalctl_args(Some("s=abc;i=1"));
+        assert!(a.contains(&"--after-cursor=s=abc;i=1".to_string()));
+        assert!(!a.contains(&"--lines=0".to_string()));
+        // A malformed cursor can never reach argv: fall back to the tail.
+        let b = journalctl_args(Some("x --unit=evil"));
+        assert!(b.contains(&"--lines=0".to_string()));
+        assert!(!b.iter().any(|x| x.contains("evil")));
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_skips_oversized_lines_without_buffering_them() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ok1\n");
+        data.extend(std::iter::repeat_n(b'A', 5000));
+        data.extend_from_slice(b"\nok2\n");
+        let mut r = tokio::io::BufReader::with_capacity(16, &data[..]);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut r, &mut buf, 100).await.unwrap(),
+            BoundedLine::Line
+        );
+        assert_eq!(buf, b"ok1\n");
+        assert_eq!(
+            read_bounded_line(&mut r, &mut buf, 100).await.unwrap(),
+            BoundedLine::TooLong
+        );
+        assert!(buf.is_empty());
+        assert_eq!(
+            read_bounded_line(&mut r, &mut buf, 100).await.unwrap(),
+            BoundedLine::Line
+        );
+        assert_eq!(buf, b"ok2\n");
+        assert_eq!(
+            read_bounded_line(&mut r, &mut buf, 100).await.unwrap(),
+            BoundedLine::Eof
+        );
     }
 }
