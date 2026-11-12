@@ -14,6 +14,7 @@
 
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
@@ -26,6 +27,7 @@ use crate::collectors::device::{
     MAX_UEVENT_BYTES,
 };
 use crate::collectors::Collector;
+use crate::config::AgentConfig;
 use crate::schema::{AgentEvent, EventAction, EventClass, EventData, Severity};
 use crate::telemetry::{metrics::metrics, DropReason};
 
@@ -34,11 +36,13 @@ const KERNEL_GROUP: u32 = 1;
 const EVENTS_PER_SECOND: u32 = 50;
 const SYSFS_READ_MAX: u64 = 256;
 
-pub struct DeviceCollector;
+pub struct DeviceCollector {
+    config: Arc<RwLock<AgentConfig>>,
+}
 
 impl DeviceCollector {
-    pub fn new() -> Self {
-        Self
+    pub fn new(config: Arc<RwLock<AgentConfig>>) -> Self {
+        Self { config }
     }
 }
 
@@ -123,12 +127,15 @@ fn read_attr(devpath: &str, name: &str) -> Option<String> {
     clean_text(&text)
 }
 
-fn sysfs_info(u: &Uevent) -> SysfsInfo {
+fn sysfs_info(u: &Uevent, capture_serial: bool) -> SysfsInfo {
     if u.action != Action::Add || u.devtype != "usb_device" {
         return SysfsInfo::default();
     }
     SysfsInfo {
-        serial: read_attr(&u.devpath, "serial"),
+        // Never read the serial unless the operator opted in.
+        serial: capture_serial
+            .then(|| read_attr(&u.devpath, "serial"))
+            .flatten(),
         manufacturer: read_attr(&u.devpath, "manufacturer"),
         product: read_attr(&u.devpath, "product"),
     }
@@ -148,6 +155,7 @@ impl Collector for DeviceCollector {
     ) -> Result<()> {
         let fd = open_socket().map_err(|e| anyhow!("uevent socket unavailable: {e}"))?;
         info!("DeviceCollector: listening for kernel uevents (usb, block)");
+        let config = Arc::clone(&self.config);
         tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; MAX_UEVENT_BYTES + 1];
             let mut budget = RateBudget::new(EVENTS_PER_SECOND, Instant::now());
@@ -178,7 +186,15 @@ impl Collector for DeviceCollector {
                                 Action::Add => EventAction::Create,
                                 Action::Remove => EventAction::Delete,
                             };
-                            let data = event_from_uevent(&u, sysfs_info(&u));
+                            let capture_serial = config
+                                .read()
+                                .map(|c| c.device_serial_capture_enabled)
+                                .unwrap_or(false);
+                            let data = event_from_uevent(
+                                &u,
+                                sysfs_info(&u, capture_serial),
+                                capture_serial,
+                            );
                             let ev = AgentEvent::new(
                                 agent_id.clone(),
                                 hostname.clone(),

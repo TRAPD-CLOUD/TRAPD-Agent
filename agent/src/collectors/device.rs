@@ -183,7 +183,14 @@ pub struct SysfsInfo {
     pub product: Option<String>,
 }
 
-pub fn event_from_uevent(u: &Uevent, sysfs: SysfsInfo) -> DeviceEventData {
+pub fn event_from_uevent(
+    u: &Uevent,
+    mut sysfs: SysfsInfo,
+    capture_serial: bool,
+) -> DeviceEventData {
+    if !capture_serial {
+        sysfs.serial = None;
+    }
     let (vendor_id, product_id) = u
         .product
         .as_deref()
@@ -244,6 +251,36 @@ pub fn parse_instance_id(id: &str) -> InstanceId {
             .then(|| clean_text(instance))
             .flatten(),
     }
+}
+
+/// Windows instance id with the instance segment replaced by a salted hash.
+///
+/// `USB\VID_0781&PID_5581\<serial>` carries the device serial in its third
+/// segment, and for `USBSTOR` it is the serial plus a `&N` suffix, so the
+/// segment cannot be reliably told apart from a generated id. Whenever serial
+/// capture is off the whole segment is replaced by
+/// `h-` + 16 hex chars of `SHA-256(salt || 0x00 || segment)`. The salt is the
+/// agent id, so the value is stable per host (attach/detach pairs and repeat
+/// attaches of the same stick on one host still correlate) but is neither the
+/// serial nor comparable across hosts. Trade-off: the hash of a short serial
+/// can be brute-forced by someone who knows the salt; the agent id is not
+/// secret from the backend, so this is pseudonymisation, not anonymisation.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn redact_instance_id(id: &str, salt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut seg = id.splitn(3, '\\');
+    let (Some(a), Some(b), Some(instance)) = (seg.next(), seg.next(), seg.next()) else {
+        return id.to_string();
+    };
+    let mut h = Sha256::new();
+    h.update(salt.as_bytes());
+    h.update([0u8]);
+    h.update(instance.as_bytes());
+    let hex: String = h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{a}\\{b}\\h-{hex}")
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -370,6 +407,7 @@ mod tests {
                 manufacturer: Some("Logitech".into()),
                 product: Some("Receiver".into()),
             },
+            true,
         );
         assert_eq!(e.subsystem, "usb");
         assert_eq!(e.device_id, USB_DEV);
@@ -398,7 +436,7 @@ mod tests {
         let Parsed::Event(u) = parse_uevent(&m) else {
             panic!()
         };
-        let e = event_from_uevent(&u, SysfsInfo::default());
+        let e = event_from_uevent(&u, SysfsInfo::default(), false);
         assert_eq!(e.device_class.as_deref(), Some("03"));
         assert_eq!(e.device_type.as_deref(), Some("usb_interface"));
     }
@@ -546,6 +584,41 @@ mod tests {
         assert_eq!(c.enumerator, "usb");
         let d = parse_instance_id("garbage");
         assert_eq!((d.vendor_id, d.product_id, d.serial), (None, None, None));
+    }
+
+    #[test]
+    fn serial_is_dropped_from_the_event_unless_capture_is_on() {
+        let Parsed::Event(u) = parse_uevent(&usb_add()) else {
+            panic!("not an event");
+        };
+        let info = || SysfsInfo {
+            serial: Some("SECRET-SN-42".into()),
+            manufacturer: Some("Logitech".into()),
+            product: Some("Receiver".into()),
+        };
+        let off = event_from_uevent(&u, info(), false);
+        assert_eq!(off.serial, None);
+        assert_eq!(off.vendor_id.as_deref(), Some("046d"));
+        assert!(!serde_json::to_string(&off)
+            .unwrap()
+            .contains("SECRET-SN-42"));
+        let on = event_from_uevent(&u, info(), true);
+        assert!(serde_json::to_string(&on).unwrap().contains("SECRET-SN-42"));
+    }
+
+    #[test]
+    fn redacted_instance_id_hides_the_serial_but_stays_stable() {
+        for id in [
+            "USB\\VID_0781&PID_5581\\4C530001230911112345",
+            "USBSTOR\\DISK&VEN_SANDISK&PROD_X&REV_1.00\\4C530001230911112345&0",
+        ] {
+            let r = redact_instance_id(id, "agent-1");
+            assert!(!r.contains("4C5300"), "{r}");
+            assert_eq!(r, redact_instance_id(id, "agent-1"));
+            assert_ne!(r, redact_instance_id(id, "agent-2"));
+            assert!(r.starts_with(id.rsplit_once('\\').unwrap().0));
+        }
+        assert_eq!(redact_instance_id("garbage", "s"), "garbage");
     }
 
     fn dev(id: &str) -> DeviceEventData {

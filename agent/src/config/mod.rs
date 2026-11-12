@@ -388,6 +388,13 @@ pub struct AgentConfig {
     /// device. Off by default: the notice also reaches an attacker at the keyboard.
     #[serde(default, skip_serializing_if = "skip_if_false")]
     pub user_response_notifications_enabled: bool,
+    /// Report the serial number of USB / removable devices in device events.
+    /// Off by default: a serial identifies a physical device and, through it,
+    /// a person. When off the serial is never read (Linux sysfs) or reported
+    /// (Windows), and the instance-id segment that may carry it is replaced
+    /// by a per-agent salted hash in `device_id`.
+    #[serde(default, skip_serializing_if = "skip_if_false")]
+    pub device_serial_capture_enabled: bool,
 }
 
 pub use trapd_detection::RuleModeOverride;
@@ -456,6 +463,7 @@ impl Default for AgentConfig {
             adaptive_decoys: Vec::new(),
             script_block_capture_enabled: false,
             user_response_notifications_enabled: false,
+            device_serial_capture_enabled: false,
         }
     }
 }
@@ -1184,6 +1192,22 @@ mod signed_config_tests {
         assert!(!serde_json::to_string(&config)
             .unwrap()
             .contains("user_response_notifications_enabled"));
+    }
+
+    #[test]
+    fn device_serial_capture_defaults_off_and_stays_out_of_the_signed_bytes() {
+        let config = AgentConfig::default();
+        assert!(!config.device_serial_capture_enabled);
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("device_serial_capture_enabled"));
+        let on = AgentConfig {
+            device_serial_capture_enabled: true,
+            ..AgentConfig::default()
+        };
+        assert!(serde_json::to_string(&on)
+            .unwrap()
+            .contains("\"device_serial_capture_enabled\":true"));
     }
 
     #[test]

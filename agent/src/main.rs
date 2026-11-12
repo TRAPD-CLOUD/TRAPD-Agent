@@ -375,7 +375,9 @@ async fn main() -> Result<()> {
         spawn_collector!(ProcessCollector::new());
         spawn_collector!(NetworkCollector::new());
         spawn_collector!(AuthLogCollector::new());
-        spawn_collector!(collectors::linux::device::DeviceCollector::new());
+        spawn_collector!(collectors::linux::device::DeviceCollector::new(Arc::clone(
+            &agent_config
+        )));
         spawn_collector!(LogCollector::new(Arc::clone(&agent_config)));
         spawn_collector!(FilesystemCollector::new(Arc::clone(&agent_config)));
         spawn_collector!(AgentProtectCollector::new());
@@ -411,7 +413,9 @@ async fn main() -> Result<()> {
                 &agent_config
             ))
         );
-        spawn_collector!(collectors::windows::device::DeviceCollector::new());
+        spawn_collector!(collectors::windows::device::DeviceCollector::new(
+            Arc::clone(&agent_config)
+        ));
         spawn_collector!(collectors::windows::eventlog::EventLogCollector::new(
             Arc::clone(&agent_config),
             !offline

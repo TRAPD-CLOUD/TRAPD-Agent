@@ -10,9 +10,12 @@
 //!
 //! The first snapshot is a baseline: devices present at start are not reported
 //! as attached. Identity comes from the PnP instance id (vendor/product ids,
-//! serial only when the id carries a real one) and the registry properties
+//! serial only when the id carries a real one and
+//! `device_serial_capture_enabled` is on; otherwise the instance segment is
+//! hashed, see [`redact_instance_id`]) and the registry properties
 //! Windows keeps for the node.
 
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -24,8 +27,11 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     DIGCF_PRESENT, SPDRP_CLASS, SPDRP_DEVICEDESC, SPDRP_MFG, SP_DEVINFO_DATA,
 };
 
-use crate::collectors::device::{clean_text, parse_instance_id, DeviceInventory};
+use crate::collectors::device::{
+    clean_text, parse_instance_id, redact_instance_id, DeviceInventory,
+};
 use crate::collectors::Collector;
+use crate::config::AgentConfig;
 use crate::schema::{AgentEvent, DeviceEventData, EventAction, EventClass, EventData, Severity};
 use crate::telemetry::{metrics::metrics, DropReason};
 
@@ -34,11 +40,13 @@ const ENUMERATORS: [&str; 2] = ["USB", "USBSTOR"];
 /// Hard stop on one enumeration (a driver stack gone wrong must not spin).
 const MAX_ENUM: u32 = 8192;
 
-pub struct DeviceCollector;
+pub struct DeviceCollector {
+    config: Arc<RwLock<AgentConfig>>,
+}
 
 impl DeviceCollector {
-    pub fn new() -> Self {
-        Self
+    pub fn new(config: Arc<RwLock<AgentConfig>>) -> Self {
+        Self { config }
     }
 }
 
@@ -69,7 +77,7 @@ unsafe fn property(
     (ok != 0).then(|| utf16_text(&buf)).flatten()
 }
 
-fn enumerate(enumerator: &str) -> Vec<DeviceEventData> {
+fn enumerate(enumerator: &str, capture_serial: bool, salt: &str) -> Vec<DeviceEventData> {
     let mut out = Vec::new();
     let name = wide(enumerator);
     // SAFETY: the device-info set is destroyed on every path below and every
@@ -105,14 +113,21 @@ fn enumerate(enumerator: &str) -> Vec<DeviceEventData> {
                 continue;
             };
             let parsed = parse_instance_id(&instance);
+            // Without opt-in the serial is neither reported nor left inside
+            // the instance id.
+            let (device_id, serial) = if capture_serial {
+                (instance, parsed.serial)
+            } else {
+                (redact_instance_id(&instance, salt), None)
+            };
             out.push(DeviceEventData {
                 subsystem: parsed.enumerator.clone(),
-                device_id: instance,
+                device_id,
                 device_type: property(set, &info, SPDRP_CLASS),
                 vendor_id: parsed.vendor_id,
                 product_id: parsed.product_id,
                 device_class: None,
-                serial: parsed.serial,
+                serial,
                 product: property(set, &info, SPDRP_DEVICEDESC),
                 manufacturer: property(set, &info, SPDRP_MFG),
                 devnode: None,
@@ -124,8 +139,11 @@ fn enumerate(enumerator: &str) -> Vec<DeviceEventData> {
     out
 }
 
-fn snapshot() -> Vec<DeviceEventData> {
-    ENUMERATORS.iter().flat_map(|e| enumerate(e)).collect()
+fn snapshot(capture_serial: bool, salt: &str) -> Vec<DeviceEventData> {
+    ENUMERATORS
+        .iter()
+        .flat_map(|e| enumerate(e, capture_serial, salt))
+        .collect()
 }
 
 #[async_trait]
@@ -142,7 +160,14 @@ impl Collector for DeviceCollector {
     ) -> Result<()> {
         let mut inventory = DeviceInventory::new();
         loop {
-            let current = tokio::task::spawn_blocking(snapshot).await?;
+            let capture_serial = self
+                .config
+                .read()
+                .map(|c| c.device_serial_capture_enabled)
+                .unwrap_or(false);
+            let salt = agent_id.clone();
+            let current =
+                tokio::task::spawn_blocking(move || snapshot(capture_serial, &salt)).await?;
             let (attached, detached, excess) = inventory.update(current);
             if excess > 0 {
                 metrics().events_dropped(DropReason::InternalError, excess as u64);
