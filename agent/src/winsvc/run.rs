@@ -522,21 +522,55 @@ pub async fn run_agent(
         let mut checkpoints = crate::detection::CheckpointTracker::default();
         let mut shutting_down = false;
         let mut batch = Vec::with_capacity(crate::pipeline::MAX_BATCH);
+        // ETW/poller and the event log both report a process start; merge
+        // them into one `process.create` before anything else sees them.
+        let mut merger = crate::pipeline::process_merge::ProcessCreateMerger::new();
         loop {
             // Idle wake-ups come from `flush_tick` (30 s), so a missing beat
             // means the consumer is stuck inside event handling.
             crate::telemetry::liveness::beat("pipeline_consumer");
+            let held_until = merger.next_deadline().map(tokio::time::Instant::from_std);
             tokio::select! {
                 _ = &mut shutdown_rx, if !shutting_down => {
                     rx.close();
                     shutting_down = true;
                 }
+                _ = async { tokio::time::sleep_until(held_until.unwrap()).await }, if held_until.is_some() => {
+                    let due = merger.flush_due(std::time::Instant::now());
+                    if !due.is_empty() {
+                        crate::consume_batch(
+                            due,
+                            &mut checkpoints,
+                            prev_tx.as_ref(),
+                            &mode,
+                            &buf_for_consumer,
+                            &siem,
+                        )
+                        .await;
+                    }
+                }
                 more = crate::pipeline::next_batch(&mut rx, &mut batch) => {
                     if !more {
+                        let rest = merger.flush_all(std::time::Instant::now());
+                        if !rest.is_empty() {
+                            crate::consume_batch(
+                                rest,
+                                &mut checkpoints,
+                                prev_tx.as_ref(),
+                                &mode,
+                                &buf_for_consumer,
+                                &siem,
+                            )
+                            .await;
+                        }
                         break;
                     }
-                    crate::consume_batch(
+                    let ready = merger.process(
                         std::mem::take(&mut batch),
+                        std::time::Instant::now(),
+                    );
+                    crate::consume_batch(
+                        ready,
                         &mut checkpoints,
                         prev_tx.as_ref(),
                         &mode,
