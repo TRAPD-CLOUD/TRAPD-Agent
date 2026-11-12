@@ -47,6 +47,17 @@ pub struct Coverage {
     /// Audit Registry success enabled; target-key SACLs are still required.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_registry: Option<bool>,
+    /// How registry changes are noticed: `notify` (change notifications wake
+    /// the snapshot poll) or `polling` (interval only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_sensor: Option<String>,
+    /// Keys currently held by registry change notification.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub registry_notify_keys: u64,
+    /// Keys not event-driven right now, by reason (`over_capacity`,
+    /// `key_missing`, `open_failed`, `arm_failed`, `wait_failed`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub registry_notify_fallbacks: BTreeMap<String, u64>,
     /// Collector is enabled and its last Security channel read succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_eventlog_active: Option<bool>,
