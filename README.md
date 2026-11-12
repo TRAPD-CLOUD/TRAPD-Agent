@@ -389,6 +389,7 @@ without a restart. Key settings and their defaults:
 | `inventory_enabled` | `true` | Inventory reporting |
 | `siem_enabled` / `siem_format` | `false` / `cef` | SIEM forwarding |
 | `honeytoken_detection_enabled` | `true` | Honeytoken access detection |
+| `sensitive_file_read_enabled` | `true` | Linux: report opens of real credential files (shadow, sudoers, SSH host/root keys); inode-filtered in the kernel, rate-limited per `(exe, path)` |
 | `honeytoken_response` | `alert` | `none`, `alert`, `freeze`, `kill` or `isolate` |
 | `honeytoken_deception_escalation` | `false` | Emits escalation signals on honeytoken hits |
 | `isolation_allowlist_ips` | set by the backend | Addresses that remain reachable while the host is isolated |

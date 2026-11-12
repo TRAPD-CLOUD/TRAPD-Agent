@@ -16,6 +16,7 @@ fn all_eventclass() -> Vec<EventClass> {
         EventClass::Detection,
         EventClass::Log,
         EventClass::Registry,
+        EventClass::Device,
     ]
 }
 
@@ -33,6 +34,7 @@ fn cover_eventclass(value: &EventClass) {
         EventClass::Detection => {}
         EventClass::Log => {}
         EventClass::Registry => {}
+        EventClass::Device => {}
     }
 }
 
@@ -277,6 +279,7 @@ fn emit_contract() {
                 client_addr: "192.0.2.1".into(),
                 transaction_id: 42,
                 rcode: "NOERROR".into(),
+                query_status: None,
                 pid: None,
                 process: None,
                 process_start_time: None,
@@ -297,6 +300,10 @@ fn emit_contract() {
                 comm: "cat".into(),
                 path: "/tmp/fixture.txt".into(),
                 flags: 0,
+                exe: None,
+                process_start_time: None,
+                sensitive_class: None,
+                suppressed_repeats: None,
             })
             .unwrap(),
         ),
@@ -394,6 +401,7 @@ fn emit_contract() {
                 client_addr: "".into(),
                 transaction_id: 0,
                 rcode: "NOERROR".into(),
+                query_status: None,
                 pid: None,
                 process: None,
                 process_start_time: None,

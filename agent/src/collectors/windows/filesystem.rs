@@ -199,8 +199,16 @@ fn checked_event(
     ev
 }
 
-/// Attach the best-effort actor (a process whose command line named the file).
+/// Attach the actor: the process the kernel saw write the path (ETW
+/// Kernel-File, when enabled) wins; otherwise a best-effort process whose
+/// command line named the file.
 fn with_actor(mut ev: AgentEvent, path: &str) -> AgentEvent {
+    if let (EventData::Filesystem(d), Some(kernel)) =
+        (&mut ev.data, crate::detection::file_actor::lookup(path))
+    {
+        d.actor = Some(kernel);
+        return ev;
+    }
     if let (EventData::Filesystem(d), Some(m)) = (
         &mut ev.data,
         crate::detection::accessor_correlation::attribute(path),

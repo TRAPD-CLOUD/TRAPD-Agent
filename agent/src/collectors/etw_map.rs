@@ -23,8 +23,8 @@
 //! `ImageFileName`, `ParentProcessID` vs. `ParentId`); every lookup accepts the
 //! known aliases.
 
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::schema::{
     DnsResolutionData, LogEventData, NetworkConnectionData, ProcessCreateData, ProcessTerminateData,
@@ -33,6 +33,8 @@ use crate::schema::{
 pub const KERNEL_PROCESS: u128 = 0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716;
 pub const KERNEL_NETWORK: u128 = 0x7dd42a49_5329_4832_8dfd_43d979153a88;
 pub const DNS_CLIENT: u128 = 0x1c95126e_7eea_49a9_a3fe_a378b03ddb4d;
+/// Microsoft-Windows-Kernel-File. The file-actor sensor reads it in its own
+/// session; the main session subscribes to creates only, for named pipes.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const KERNEL_FILE: u128 = 0xedd08927_9cc4_4e65_b970_c2560fb5c289;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -42,9 +44,15 @@ pub const AMSI: u128 = 0x2a576b87_09a7_520e_c21a_4942f0271d67;
 pub const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x40;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const KERNEL_NETWORK_KEYWORDS: u64 = 0x10 | 0x20;
-/// Kernel-File `CREATE` keyword only: no reads, writes, deletes or renames.
+/// Kernel-File keywords CREATE (0x80) and WRITE (0x200), from the provider
+/// manifest, for the file-actor session. Not field-verified on a Windows host
+/// yet: a wrong value only yields no events, never wrong ones.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const KERNEL_FILE_KEYWORDS: u64 = 0x80;
+pub const KERNEL_FILE_KEYWORDS: u64 = 0x80 | 0x200;
+/// Kernel-File `CREATE` keyword only, for named pipes on the main session:
+/// no reads, writes, deletes or renames.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const KERNEL_FILE_PIPE_KEYWORDS: u64 = 0x80;
 
 /// One decoded property value.
 #[derive(Debug, Clone, PartialEq)]
@@ -833,15 +841,279 @@ pub fn dns_query(rec: &EtwRecord) -> Option<(u32, DnsResolutionData)> {
             qtype,
             resolved_ips: ips,
             cnames,
+            // The provider delivers neither client address nor transaction id;
+            // the server comes from `dns_server_hint`, never from here.
             server_addr: String::new(),
             client_addr: String::new(),
             transaction_id: 0,
             rcode: rcode(status).to_string(),
+            query_status: u32::try_from(status).ok(),
             pid: None,
             process: None,
             process_start_time: None,
         },
     ))
+}
+
+/// DNS-Client events that name the server a query was sent to (3009 network
+/// query initiated, 3010 query sent, 3011 response received) →
+/// `(lower-case query name, query type, server address)`. Only a value that
+/// parses as an IP address is accepted.
+pub fn dns_server_hint(rec: &EtwRecord) -> Option<(String, u64, String)> {
+    if rec.provider != DNS_CLIENT || !matches!(rec.id, 3009..=3011) {
+        return None;
+    }
+    let qname = rec
+        .str(&["QueryName"])?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if qname.is_empty() {
+        return None;
+    }
+    let server = rec.str(&["DnsServerIpAddress", "DnsServerAddress"])?;
+    let server = server.trim().trim_matches(|c| c == '[' || c == ']');
+    let ip: IpAddr = server.parse().ok()?;
+    Some((qname, rec.int(&["QueryType"]).unwrap_or(0), ip.to_string()))
+}
+
+/// How long a server hint may precede the completion event it belongs to.
+const DNS_HINT_TTL_TICKS: i64 = 30 * 10_000_000;
+const DNS_HINT_MAX: usize = 1024;
+
+/// Bounded `(name, type)` → server memory joining the "query sent" events to
+/// the completion event. A hint only decorates an event that is emitted
+/// anyway, so overflowing it loses a field, not an event.
+#[derive(Default)]
+pub struct DnsServerHints {
+    map: HashMap<(String, u64), (String, i64)>,
+    order: VecDeque<(String, u64)>,
+}
+
+impl DnsServerHints {
+    pub fn note(&mut self, rec: &EtwRecord) {
+        let Some((name, qtype, server)) = dns_server_hint(rec) else {
+            return;
+        };
+        let key = (name, qtype);
+        if self
+            .map
+            .insert(key.clone(), (server, rec.timestamp))
+            .is_none()
+        {
+            self.order.push_back(key);
+        }
+        while self.map.len() > DNS_HINT_MAX {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.map.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Server for a completion event, when one was seen shortly before it.
+    pub fn take(&mut self, qname: &str, qtype: u64, completed: i64) -> Option<String> {
+        let (server, at) = self.map.remove(&(qname.to_ascii_lowercase(), qtype))?;
+        (completed >= at && completed - at <= DNS_HINT_TTL_TICKS).then_some(server)
+    }
+}
+
+/// Process that issued a file create/overwrite or write (Kernel-File).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTouch {
+    pub pid: i32,
+    pub path: String,
+}
+
+const FILE_OBJECTS_MAX: usize = 8192;
+const TOUCH_INTERVAL_TICKS: i64 = 10_000_000;
+/// `FILE_DIRECTORY_FILE` in `CreateOptions`.
+const FILE_DIRECTORY_FILE: u64 = 0x1;
+
+/// FileObject → path for open handles, filled by Create and read by Write
+/// (a Write event carries no name). Bounded; cleared when full, so at worst
+/// writes to files opened before the clear are not attributed.
+#[derive(Default)]
+pub struct FileObjects {
+    /// FileObject → (path, FILETIME of the last touch reported).
+    paths: HashMap<u64, (String, Option<i64>)>,
+    /// Times the table was cleared at its bound (attribution lost, no event).
+    pub overflows: u64,
+}
+
+impl FileObjects {
+    /// Kernel-File Create (12) / Cleanup (13) / Close (14) / Write (16) → the
+    /// touch it proves. A create counts only when its disposition creates or
+    /// truncates (`FILE_SUPERSEDE`, `FILE_CREATE`, `FILE_OVERWRITE`,
+    /// `FILE_OVERWRITE_IF`); opening an existing file proves nothing.
+    /// `header_pid` is the issuing process of the operation.
+    pub fn observe(&mut self, rec: &EtwRecord, devices: &DeviceMap) -> Option<FileTouch> {
+        if rec.provider != KERNEL_FILE {
+            return None;
+        }
+        let object = rec.int(&["FileObject"])?;
+        let pid = i32::try_from(rec.header_pid).ok().filter(|p| *p > 0)?;
+        match rec.id {
+            12 => {
+                let name = rec.str(&["FileName"]).filter(|n| !n.is_empty())?;
+                let options = rec.int(&["CreateOptions"]).unwrap_or(0);
+                if options & FILE_DIRECTORY_FILE != 0 {
+                    return None;
+                }
+                let path = device_to_dos(&name, devices);
+                if self.paths.len() >= FILE_OBJECTS_MAX {
+                    self.paths.clear();
+                    self.overflows += 1;
+                }
+                let creates = matches!((options >> 24) & 0xff, 0 | 2 | 4 | 5);
+                self.paths
+                    .insert(object, (path.clone(), creates.then_some(rec.timestamp)));
+                creates.then_some(FileTouch { pid, path })
+            }
+            13 | 14 => {
+                self.paths.remove(&object);
+                None
+            }
+            // One report per open file per second: a bulk write is one
+            // attribution, not thousands of identity look-ups.
+            16 => {
+                let (path, last) = self.paths.get_mut(&object)?;
+                if last.is_some_and(|t| rec.timestamp.saturating_sub(t) < TOUCH_INTERVAL_TICKS) {
+                    return None;
+                }
+                *last = Some(rec.timestamp);
+                Some(FileTouch {
+                    pid,
+                    path: path.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Network flows tracked for byte accounting.
+const FLOWS_MAX: usize = 8192;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FlowKey {
+    pid: i32,
+    /// The two endpoints in a fixed order: the provider does not use one
+    /// orientation for every event of an accepted connection.
+    ends: ((String, u16), (String, u16)),
+}
+
+struct Flow {
+    data: NetworkConnectionData,
+    first_ts: i64,
+    sent: u64,
+    recv: u64,
+}
+
+/// Per-connection byte totals from Kernel-Network send/receive events, emitted
+/// as one `closed` record when the connection ends. Bounded by [`FLOWS_MAX`];
+/// the oldest flow is flushed as an `open` snapshot instead of dropped.
+/// Only TCP flows whose connect/accept was observed are tracked, so a
+/// connection that predates the session reports no bytes rather than wrong
+/// ones.
+#[derive(Default)]
+pub struct NetFlows {
+    flows: HashMap<FlowKey, Flow>,
+    order: VecDeque<FlowKey>,
+    /// Traffic for connections never seen opening (no totals emitted).
+    pub untracked: u64,
+}
+
+fn flow_key(pid: i32, a: (String, u16), b: (String, u16)) -> FlowKey {
+    let ends = if a <= b { (a, b) } else { (b, a) };
+    FlowKey { pid, ends }
+}
+
+fn record_key(rec: &EtwRecord) -> Option<FlowKey> {
+    let pid = i32::try_from(rec.int(&["PID"])?).ok()?;
+    Some(flow_key(
+        pid,
+        (address(rec, "saddr")?, port(rec, "sport")?),
+        (address(rec, "daddr")?, port(rec, "dport")?),
+    ))
+}
+
+impl NetFlows {
+    /// Start tracking a flow from its connect/accept record (already mapped).
+    /// Returns the snapshot of a flow evicted to make room, if any.
+    pub fn open(&mut self, data: &NetworkConnectionData, ts: i64) -> Option<NetworkConnectionData> {
+        let pid = data.pid?;
+        let key = flow_key(
+            pid,
+            (data.src_addr.clone(), data.src_port),
+            (data.dst_addr.clone(), data.dst_port),
+        );
+        let flow = Flow {
+            data: data.clone(),
+            first_ts: ts,
+            sent: 0,
+            recv: 0,
+        };
+        let mut evicted = None;
+        if !self.flows.contains_key(&key) {
+            while self.flows.len() >= FLOWS_MAX {
+                let Some(old) = self.order.pop_front() else {
+                    break;
+                };
+                if let Some(f) = self.flows.remove(&old) {
+                    evicted = Some(f.finish("open", ts));
+                }
+            }
+            self.order.push_back(key.clone());
+        }
+        self.flows.insert(key, flow);
+        evicted
+    }
+
+    /// Fold a Kernel-Network send (10/26), receive (11/27) or disconnect
+    /// (13/29) record in. Returns the `closed` record on disconnect.
+    pub fn observe(&mut self, rec: &EtwRecord) -> Option<NetworkConnectionData> {
+        if rec.provider != KERNEL_NETWORK {
+            return None;
+        }
+        let (sending, receiving, closing) = match rec.id {
+            10 | 26 => (true, false, false),
+            11 | 27 => (false, true, false),
+            13 | 29 => (false, false, true),
+            _ => return None,
+        };
+        let key = record_key(rec)?;
+        let Some(flow) = self.flows.get_mut(&key) else {
+            self.untracked += 1;
+            return None;
+        };
+        let size = rec.int(&["size"]).unwrap_or(0);
+        if sending {
+            flow.sent = flow.sent.saturating_add(size);
+        } else if receiving {
+            flow.recv = flow.recv.saturating_add(size);
+        }
+        if !closing {
+            return None;
+        }
+        let flow = self.flows.remove(&key)?;
+        self.order.retain(|k| k != &key);
+        Some(flow.finish("closed", rec.timestamp))
+    }
+}
+
+impl Flow {
+    fn finish(self, state: &str, ts: i64) -> NetworkConnectionData {
+        let mut data = self.data;
+        data.state = state.into();
+        data.bytes_sent = Some(self.sent);
+        data.bytes_recv = Some(self.recv);
+        if ts >= self.first_ts && self.first_ts > 0 {
+            data.duration_ms = Some(((ts - self.first_ts) / 10_000) as u64);
+        }
+        data
+    }
 }
 
 #[cfg(test)]
@@ -1538,5 +1810,231 @@ mod tests {
         assert_eq!(m.exe_sha256.as_deref(), Some("sha256:ab"));
         let none = ProcessEnrichment::default().prefer_over(ProcessEnrichment::default());
         assert!(none.cmdline.is_none() && none.username.is_none());
+    }
+
+    fn file_rec(id: u16, pid: u32, ts: i64, props: &[(&str, EtwValue)]) -> EtwRecord {
+        let mut r = rec(KERNEL_FILE, id, props);
+        r.header_pid = pid;
+        r.timestamp = ts;
+        r
+    }
+
+    #[test]
+    fn file_create_and_write_name_the_issuing_process() {
+        let mut t = FileObjects::default();
+        let d = devices();
+        let name = s("\\Device\\HarddiskVolume3\\Users\\a\\x.txt");
+        // FILE_OPEN (1): proves nothing yet, but remembers the object.
+        let open = file_rec(
+            12,
+            900,
+            0,
+            &[
+                ("FileObject", int(7, 8)),
+                ("FileName", name.clone()),
+                ("CreateOptions", int(1 << 24, 4)),
+            ],
+        );
+        assert!(t.observe(&open, &d).is_none());
+        let w = file_rec(16, 900, 50_000_000, &[("FileObject", int(7, 8))]);
+        let touch = t.observe(&w, &d).unwrap();
+        assert_eq!(
+            (touch.pid, touch.path.as_str()),
+            (900, "C:\\Users\\a\\x.txt")
+        );
+        // Bulk writes inside a second are one attribution.
+        let w2 = file_rec(16, 900, 50_000_100, &[("FileObject", int(7, 8))]);
+        assert!(t.observe(&w2, &d).is_none());
+        let w3 = file_rec(16, 901, 70_000_000, &[("FileObject", int(7, 8))]);
+        assert_eq!(t.observe(&w3, &d).unwrap().pid, 901);
+        // Close forgets the object; an unknown object is never attributed.
+        t.observe(&file_rec(14, 900, 0, &[("FileObject", int(7, 8))]), &d);
+        assert!(t
+            .observe(
+                &file_rec(16, 900, 99_000_000, &[("FileObject", int(7, 8))]),
+                &d
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn file_create_dispositions_and_directories() {
+        let d = devices();
+        let mut t = FileObjects::default();
+        let mk = |obj: u64, disp: u64, extra: u64| {
+            file_rec(
+                12,
+                5,
+                1,
+                &[
+                    ("FileObject", int(obj, 8)),
+                    ("FileName", s("C:\\a\\f")),
+                    ("CreateOptions", int((disp << 24) | extra, 4)),
+                ],
+            )
+        };
+        assert!(t.observe(&mk(1, 2, 0), &d).is_some(), "FILE_CREATE");
+        assert!(t.observe(&mk(2, 5, 0), &d).is_some(), "FILE_OVERWRITE_IF");
+        assert!(
+            t.observe(&mk(3, 3, 0), &d).is_none(),
+            "FILE_OPEN_IF may only open"
+        );
+        assert!(
+            t.observe(&mk(4, 2, FILE_DIRECTORY_FILE), &d).is_none(),
+            "directory"
+        );
+        let mut other = mk(5, 2, 0);
+        other.provider = KERNEL_NETWORK;
+        assert!(t.observe(&other, &d).is_none());
+        let mut nopid = mk(6, 2, 0);
+        nopid.header_pid = 0;
+        assert!(t.observe(&nopid, &d).is_none());
+    }
+
+    #[test]
+    fn file_object_table_is_bounded() {
+        let d = devices();
+        let mut t = FileObjects::default();
+        for i in 0..(FILE_OBJECTS_MAX as u64 + 1) {
+            t.observe(
+                &file_rec(
+                    12,
+                    5,
+                    1,
+                    &[
+                        ("FileObject", int(i, 8)),
+                        ("FileName", s("C:\\f")),
+                        ("CreateOptions", int(1 << 24, 4)),
+                    ],
+                ),
+                &d,
+            );
+        }
+        assert_eq!(t.overflows, 1);
+        assert!(t.paths.len() <= FILE_OBJECTS_MAX);
+    }
+
+    fn dns_hint_rec(id: u16, name: &str, server: &str, ts: i64) -> EtwRecord {
+        let mut r = rec(
+            DNS_CLIENT,
+            id,
+            &[
+                ("QueryName", s(name)),
+                ("QueryType", int(1, 2)),
+                ("DnsServerIpAddress", s(server)),
+            ],
+        );
+        r.timestamp = ts;
+        r
+    }
+
+    #[test]
+    fn dns_server_comes_only_from_a_valid_query_sent_event() {
+        let mut h = DnsServerHints::default();
+        h.note(&dns_hint_rec(3010, "Example.COM.", "10.0.0.53", 100));
+        h.note(&dns_hint_rec(3010, "bad.example", "not-an-ip", 100));
+        h.note(&dns_hint_rec(3006, "ignored.example", "10.0.0.1", 100));
+        assert_eq!(h.take("example.com", 1, 200).as_deref(), Some("10.0.0.53"));
+        assert!(h.take("example.com", 1, 200).is_none(), "consumed once");
+        assert!(h.take("bad.example", 1, 200).is_none());
+        assert!(h.take("ignored.example", 1, 200).is_none());
+        h.note(&dns_hint_rec(3011, "old.example", "[2001:db8::53]", 0));
+        assert!(
+            h.take("old.example", 1, DNS_HINT_TTL_TICKS + 1).is_none(),
+            "stale"
+        );
+        for i in 0..(DNS_HINT_MAX + 5) {
+            h.note(&dns_hint_rec(
+                3010,
+                &format!("h{i}.example"),
+                "10.0.0.53",
+                1,
+            ));
+        }
+        assert!(h.map.len() <= DNS_HINT_MAX);
+    }
+
+    #[test]
+    fn dns_completion_keeps_raw_status_and_invents_no_client_or_txid() {
+        let r = rec(
+            DNS_CLIENT,
+            3008,
+            &[
+                ("QueryName", s("x.example")),
+                ("QueryType", int(1, 2)),
+                ("QueryStatus", int(9003, 4)),
+            ],
+        );
+        let (_, d) = dns_query(&r).unwrap();
+        assert_eq!(d.query_status, Some(9003));
+        assert_eq!(
+            (
+                d.client_addr.as_str(),
+                d.server_addr.as_str(),
+                d.transaction_id
+            ),
+            ("", "", 0)
+        );
+    }
+
+    fn net_rec(id: u16, size: u64, flip: bool) -> EtwRecord {
+        let (l, r, lp, rp): ([u8; 4], [u8; 4], u16, u16) =
+            ([10, 0, 0, 5], [93, 184, 216, 34], 51000, 443);
+        let (sa, da, sp, dp) = if flip { (r, l, rp, lp) } else { (l, r, lp, rp) };
+        let mut x = rec(
+            KERNEL_NETWORK,
+            id,
+            &[
+                ("PID", int(77, 4)),
+                ("size", int(size, 4)),
+                ("saddr", EtwValue::Int(0, sa.to_vec())),
+                ("daddr", EtwValue::Int(0, da.to_vec())),
+                ("sport", EtwValue::Int(0, sp.to_be_bytes().to_vec())),
+                ("dport", EtwValue::Int(0, dp.to_be_bytes().to_vec())),
+            ],
+        );
+        x.timestamp = 1_000_000_000;
+        x
+    }
+
+    #[test]
+    fn network_bytes_aggregate_per_flow_and_emit_on_close() {
+        let mut f = NetFlows::default();
+        let connect = net_rec(12, 0, false);
+        let data = network_connection(&connect, None).unwrap();
+        assert!(f.open(&data, connect.timestamp).is_none());
+        assert!(f.observe(&net_rec(10, 100, false)).is_none());
+        assert!(
+            f.observe(&net_rec(10, 50, true)).is_none(),
+            "other orientation, same flow"
+        );
+        assert!(f.observe(&net_rec(11, 4000, false)).is_none());
+        let mut close = net_rec(13, 0, false);
+        close.timestamp += 25_000_000;
+        let c = f.observe(&close).unwrap();
+        assert_eq!((c.bytes_sent, c.bytes_recv), (Some(150), Some(4000)));
+        assert_eq!((c.state.as_str(), c.duration_ms), ("closed", Some(2500)));
+        assert_eq!((c.dst_addr.as_str(), c.dst_port), ("93.184.216.34", 443));
+        assert!(f.flows.is_empty() && f.order.is_empty());
+        // Traffic of a flow that was never seen opening reports nothing.
+        assert!(f.observe(&net_rec(10, 9, false)).is_none());
+        assert_eq!(f.untracked, 1);
+    }
+
+    #[test]
+    fn network_flow_table_is_bounded_and_flushes_evictions() {
+        let mut f = NetFlows::default();
+        let base = network_connection(&net_rec(12, 0, false), None).unwrap();
+        let mut flushed = 0;
+        for i in 0..(FLOWS_MAX as u16 + 3) {
+            let mut d = base.clone();
+            d.src_port = 1000 + i;
+            if let Some(e) = f.open(&d, 1) {
+                assert_eq!((e.state.as_str(), e.bytes_sent), ("open", Some(0)));
+                flushed += 1;
+            }
+        }
+        assert_eq!(flushed, 3);
+        assert_eq!(f.flows.len(), FLOWS_MAX);
     }
 }

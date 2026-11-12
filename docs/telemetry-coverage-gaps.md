@@ -61,8 +61,8 @@ measurements).
 | B7 | Windows | Driver loads only as periodic inventory, no load event stream | Vulnerable/malicious driver loading (BYOVD) is seen late |
 | B8 | Windows | Network telemetry has no byte/packet/RTT depth, no TLS SNI/JA3 (Linux has both) | Exfiltration volume, TLS fingerprinting |
 | B9 | Windows, Linux | No removable-media / device-attach events (no `usb`/`udev` in `agent/src`) | Physical exfiltration and rubber-ducky style attacks |
-| B10 | Linux | No container lifecycle stream (CRI/containerd planned), no multi-segment TLS reassembly, no JA3S | Container escape/start visibility; weaker TLS fingerprints |
-| B11 | Linux | Agent tamper collector watches only `$HOME/.trapd`; state dir not watched | Tampering with agent state is not reported |
+| B10 | Linux | Container start/stop (cgroup watch) and user-space `.so` loads (bounded `/proc/<pid>/maps` diff, `kernel/module_load`) are now emitted. Still open: no multi-segment TLS reassembly, no JA3S; container events are `log/log` (`category=container`) until the backend maps them | Weaker TLS fingerprints; container events are stored but not evaluated |
+| B11 | Linux | Tamper collector now watches the derived state/config/key/binary/eBPF/unit-file/drop-in locations. inotify cannot name the acting process, so events carry no actor (correlate with the eBPF unlink/rename stream) | Actor attribution for tamper is by correlation only |
 | B12 | Windows | Rootkit cross-view detection not available (depends on `/proc`, `getdents`, `sock_diag`) | No hidden process/socket/file detection on Windows |
 | B13 | Windows | No kernel-side exec blocking (post-creation kill only) | Short-lived malware executes before it is killed |
 | B14 | both | Heartbeat `coverage` / `shadow_hits` fields are stripped by the backend web schema | Sensor health is partly invisible to operators. `shadow_hits` is now meaningless |

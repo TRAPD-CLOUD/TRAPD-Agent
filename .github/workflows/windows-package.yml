@@ -18,7 +18,9 @@ jobs:
   package:
     runs-on: windows-latest
     # A hung service stop (see test-msi.ps1) must fail the job, not run for hours.
-    timeout-minutes: 60
+    # A CI build takes 6-8 minutes; 25 leaves room for a cold cache. Release
+    # builds keep 60 because they also wait for SignPath to sign the MSI.
+    timeout-minutes: ${{ inputs.require_signing && 60 || 25 }}
     env:
       DOTNET_ROLL_FORWARD: Major
     steps:

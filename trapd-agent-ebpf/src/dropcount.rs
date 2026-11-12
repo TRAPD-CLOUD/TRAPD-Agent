@@ -29,6 +29,7 @@
 //! | file_open          | `FILE_OPEN_EVENTS`        | 512 KiB|
 //! | network            | `NET_EVENTS`              | 512 KiB|
 //! | honeytoken         | `HONEYTOKEN_ACCESS_EVENTS`| 64 KiB |
+//! | sensitive read     | `SENSITIVE_READ_EVENTS`   | 64 KiB |
 //! | all others         | `*_EVENTS`                | 256 KiB|
 //!
 //! exec gets the largest buffer because exec/fork storms are the most bursty
@@ -60,10 +61,11 @@ pub const SLOT_SHM: u32 = 15;
 pub const SLOT_MMAP: u32 = 16;
 pub const SLOT_PTRACE: u32 = 17;
 pub const SLOT_KILL: u32 = 18;
+pub const SLOT_SENSITIVE_READ: u32 = 19;
 
 /// Number of slots — also the `max_entries` of the `DROPPED` map. Bump this
 /// (and add a `SLOT_*` above) when a new event ring buffer is introduced.
-pub const SLOT_COUNT: u32 = 19;
+pub const SLOT_COUNT: u32 = 20;
 
 /// Per-CPU drop counters, indexed by `SLOT_*`. Map name `DROPPED` is the lookup
 /// key used by userspace.

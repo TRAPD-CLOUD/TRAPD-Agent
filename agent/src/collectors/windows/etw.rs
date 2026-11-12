@@ -51,6 +51,10 @@ const MAX_PROP_BYTES: usize = 64 * 1024;
 struct Sink {
     tx: tokio::sync::mpsc::Sender<EtwRecord>,
     lost: std::sync::atomic::AtomicU64,
+    /// Main session: Kernel-File is subscribed only for named pipes, so every
+    /// other Kernel-File record is dropped in the callback. The file-actor
+    /// session needs all of them and leaves this off.
+    kernel_file_pipes_only: bool,
 }
 
 /// Stops the native session when its async consumer is cancelled or exits.
@@ -130,6 +134,7 @@ impl Collector for EtwCollector {
         let sink = Arc::new(Sink {
             tx: rec_tx,
             lost: std::sync::atomic::AtomicU64::new(0),
+            kernel_file_pipes_only: true,
         });
         // The blocking ProcessTrace loop owns a dedicated OS thread.
         let session = Session::start(sink).context("start ETW session")?;
@@ -231,6 +236,144 @@ impl Collector for EtwCollector {
     }
 }
 
+/// Own session for Kernel-File: the volume (every create/write on the host)
+/// must never compete with process events for the main session's buffers.
+const FILE_SESSION_NAME: &str = "TRAPD-Agent-File";
+
+/// Environment switch for the file-actor sensor. Off by default until its CPU
+/// cost has been measured on a Windows host.
+pub fn file_actor_enabled() -> bool {
+    std::env::var("TRAPD_ETW_FILE_ACTOR")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Emits no events: it feeds `detection::file_actor` so the filesystem
+/// collector can name the process that wrote a changed path.
+pub struct EtwFileActorCollector;
+
+struct FileActorState {
+    devices: DeviceMap,
+    objects: etw_map::FileObjects,
+    /// pid → (creation FILETIME, lineage); an entry is used only while the
+    /// pid's live creation time still equals the cached one.
+    lineages: HashMap<i32, (u64, Arc<crate::schema::ProcessLineage>)>,
+}
+
+impl FileActorState {
+    fn handle(&mut self, rec: &EtwRecord) {
+        let Some(touch) = self.objects.observe(rec, &self.devices) else {
+            return;
+        };
+        let Some(start) = crate::telemetry::identity::process_start_time(touch.pid) else {
+            return;
+        };
+        // PID reuse guard: the process must have existed before the record.
+        if !etw_map::same_process_generation(Some(start), Some(start), rec.timestamp) {
+            return;
+        }
+        let actor = match self.lineages.get(&touch.pid) {
+            Some((s, l)) if *s == start => Arc::clone(l),
+            _ => {
+                let exe = crate::telemetry::identity::windows_process_image(touch.pid);
+                let comm = exe
+                    .as_deref()
+                    .and_then(|e| e.rsplit('\\').next())
+                    .unwrap_or_default()
+                    .to_string();
+                let lineage = Arc::new(crate::schema::ProcessLineage {
+                    pid: touch.pid,
+                    process_start_time: Some(start),
+                    uid: 0,
+                    gid: 0,
+                    username: crate::telemetry::identity::windows_process_account(touch.pid)
+                        .unwrap_or_default(),
+                    comm,
+                    exe,
+                    cmdline: None,
+                    ancestors: Vec::new(),
+                });
+                if self.lineages.len() >= 1024 {
+                    self.lineages.clear();
+                }
+                self.lineages
+                    .insert(touch.pid, (start, Arc::clone(&lineage)));
+                lineage
+            }
+        };
+        crate::detection::file_actor::record(&touch.path, actor);
+    }
+}
+
+struct FileSessionGuard(Arc<NativeControl>);
+impl Drop for FileSessionGuard {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
+#[async_trait]
+impl Collector for EtwFileActorCollector {
+    fn name(&self) -> &'static str {
+        "WindowsEtwFileActorCollector"
+    }
+
+    async fn run(
+        &mut self,
+        tx: Sender<AgentEvent>,
+        _agent_id: String,
+        _hostname: String,
+    ) -> Result<()> {
+        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<EtwRecord>(8192);
+        let sink = Arc::new(Sink {
+            tx: rec_tx,
+            lost: std::sync::atomic::AtomicU64::new(0),
+            kernel_file_pipes_only: false,
+        });
+        let session = Session::start_named(
+            sink,
+            FILE_SESSION_NAME,
+            &[(etw_map::KERNEL_FILE, etw_map::KERNEL_FILE_KEYWORDS)],
+        )
+        .context("start file-actor ETW session")?;
+        let _guard = FileSessionGuard(Arc::clone(&session.control));
+        let trace_thread = std::thread::Builder::new()
+            .name("trapd-etw-file".into())
+            .spawn(move || session.process())
+            .context("spawn file-actor ETW thread")?;
+        info!("WindowsEtwFileActorCollector: Kernel-File session started");
+        let mut state = FileActorState {
+            devices: device_map(),
+            objects: etw_map::FileObjects::default(),
+            lineages: HashMap::new(),
+        };
+        let mut batch: Vec<EtwRecord> = Vec::with_capacity(DECODE_BATCH);
+        loop {
+            batch.clear();
+            tokio::select! {
+                n = rec_rx.recv_many(&mut batch, DECODE_BATCH) => if n == 0 { break },
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    if trace_thread.is_finished() { break; }
+                    continue;
+                }
+                _ = tx.closed() => return Ok(()),
+            }
+            let records = std::mem::take(&mut batch);
+            let (next_state, recycled) = tokio::task::spawn_blocking(move || {
+                for rec in &records {
+                    state.handle(rec);
+                }
+                (state, records)
+            })
+            .await?;
+            state = next_state;
+            batch = recycled;
+        }
+        warn!("WindowsEtwFileActorCollector: Kernel-File session ended");
+        Err(anyhow!("Kernel-File ETW session ended"))
+    }
+}
+
 /// Copy the operator's script-content opt-in into the callback-visible flag
 /// and the coverage record. Off when the config cannot be read.
 fn sync_amsi_capture(config: &std::sync::RwLock<crate::config::AgentConfig>) {
@@ -277,11 +420,25 @@ unsafe impl Send for Session {}
 
 impl Session {
     fn start(sink: Arc<Sink>) -> Result<Self> {
+        Self::start_named(
+            sink,
+            SESSION_NAME,
+            &[
+                (etw_map::KERNEL_PROCESS, etw_map::KERNEL_PROCESS_KEYWORDS),
+                (etw_map::KERNEL_NETWORK, etw_map::KERNEL_NETWORK_KEYWORDS),
+                (etw_map::DNS_CLIENT, 0u64),
+                (etw_map::KERNEL_FILE, etw_map::KERNEL_FILE_PIPE_KEYWORDS),
+                (etw_map::AMSI, 0u64),
+            ],
+        )
+    }
+
+    fn start_named(sink: Arc<Sink>, session: &str, providers: &[(u128, u64)]) -> Result<Self> {
         unsafe {
             // Stop a leftover session of the same name first.
-            let _ = stop_named(SESSION_NAME);
+            let _ = stop_named(session);
 
-            let name = utf16(SESSION_NAME);
+            let name = utf16(session);
             // EVENT_TRACE_PROPERTIES is followed in memory by the logger name.
             let buf_len = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name.len() * 2;
             let mut buf = vec![0u8; buf_len];
@@ -299,21 +456,13 @@ impl Session {
             let mut control = CONTROLTRACE_HANDLE { Value: 0 };
             let rc = StartTraceW(&mut control, name.as_ptr(), props);
             if rc == ERROR_ALREADY_EXISTS {
-                return Err(anyhow!(
-                    "an ETW session named {SESSION_NAME} already exists"
-                ));
+                return Err(anyhow!("an ETW session named {session} already exists"));
             }
             if rc != ERROR_SUCCESS {
                 return Err(anyhow!("StartTraceW failed: {rc}"));
             }
 
-            for (guid, any_keyword) in [
-                (etw_map::KERNEL_PROCESS, etw_map::KERNEL_PROCESS_KEYWORDS),
-                (etw_map::KERNEL_NETWORK, etw_map::KERNEL_NETWORK_KEYWORDS),
-                (etw_map::DNS_CLIENT, 0u64),
-                (etw_map::KERNEL_FILE, etw_map::KERNEL_FILE_KEYWORDS),
-                (etw_map::AMSI, 0u64),
-            ] {
+            for &(guid, any_keyword) in providers {
                 let g = guid_from_u128(guid);
                 let rc = EnableTraceEx2(
                     control,
@@ -332,15 +481,24 @@ impl Session {
                         c.etw_driver_load = Some(rc == ERROR_SUCCESS);
                     }
                     etw_map::KERNEL_NETWORK => c.etw_network_provider = Some(rc == ERROR_SUCCESS),
-                    etw_map::KERNEL_FILE => c.etw_pipe_provider = Some(rc == ERROR_SUCCESS),
+                    etw_map::DNS_CLIENT => c.etw_dns_provider = Some(rc == ERROR_SUCCESS),
+                    // Only the main session's Kernel-File subscription feeds named
+                    // pipes; the file-actor session reports through its own task.
+                    etw_map::KERNEL_FILE if session == SESSION_NAME => {
+                        c.etw_pipe_provider = Some(rc == ERROR_SUCCESS)
+                    }
                     etw_map::AMSI => c.etw_amsi_provider = Some(rc == ERROR_SUCCESS),
-                    _ => c.etw_dns_provider = Some(rc == ERROR_SUCCESS),
+                    _ => {}
                 });
                 if rc != ERROR_SUCCESS {
                     warn!(provider = %format!("{guid:032x}"), rc, "EnableTraceEx2 failed");
-                    if guid == etw_map::KERNEL_PROCESS {
+                    // Kernel-File is required only by the file-actor session; on
+                    // the main session it carries optional pipe telemetry.
+                    let required = guid == etw_map::KERNEL_PROCESS
+                        || (guid == etw_map::KERNEL_FILE && session != SESSION_NAME);
+                    if required {
                         let _ = stop_control(control);
-                        return Err(anyhow!("ETW process provider unavailable: {rc}"));
+                        return Err(anyhow!("ETW provider {guid:032x} unavailable: {rc}"));
                     }
                 }
             }
@@ -355,7 +513,7 @@ impl Session {
             logfile.BufferCallback = Some(buffer_callback);
             let trace = OpenTraceW(&mut logfile);
             if trace.Value == u64::MAX {
-                let _ = stop_named(SESSION_NAME);
+                let _ = stop_named(session);
                 return Err(anyhow!(
                     "OpenTraceW failed: {}",
                     std::io::Error::last_os_error()
@@ -442,10 +600,12 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         return;
     };
     // Kernel-File create events are orders of magnitude more frequent than
-    // anything else on this session and only named pipes are wanted: decide
+    // anything else on the main session and only named pipes are wanted: decide
     // on the raw payload, before TDH decoding or the channel. Not an error and
     // not a loss, so nothing is counted.
-    if guid_to_u128(&record.EventHeader.ProviderId) == etw_map::KERNEL_FILE {
+    if sink.kernel_file_pipes_only
+        && guid_to_u128(&record.EventHeader.ProviderId) == etw_map::KERNEL_FILE
+    {
         let payload: &[u8] = if record.UserData.is_null() {
             &[]
         } else {
@@ -702,6 +862,10 @@ struct DecodeState {
     driver_signatures: HashMap<String, &'static str>,
     /// pid → image path, so a network/DNS event can name its process.
     proc_images: HashMap<i32, (String, u64)>,
+    /// Per-connection byte totals (Kernel-Network send/receive).
+    flows: etw_map::NetFlows,
+    /// DNS server per recent query (DNS-Client "query sent" events).
+    dns_servers: etw_map::DnsServerHints,
 }
 
 impl DecodeState {
@@ -718,6 +882,8 @@ impl DecodeState {
             amsi_seen: etw_map::RecentSet::new(60_000, 4096),
             pipes_seen: etw_map::RecentSet::new(60_000, 4096),
             proc_images: HashMap::new(),
+            flows: etw_map::NetFlows::default(),
+            dns_servers: etw_map::DnsServerHints::default(),
         }
     }
 
@@ -849,6 +1015,7 @@ impl DecodeState {
                                     taints: 0,
                                     path: Some(dll),
                                     process_exe: Some(exe),
+                                    process_start_time: None,
                                     sha256: None,
                                     hash_error: None,
                                     signature: None,
@@ -861,6 +1028,15 @@ impl DecodeState {
                 _ => {}
             },
             p if p == etw_map::KERNEL_NETWORK => {
+                // Send/receive/disconnect only fold into a tracked flow; the
+                // disconnect yields the `closed` record with the byte totals.
+                if let Some(closed) = self.flows.observe(rec) {
+                    emit(
+                        EventClass::Network,
+                        EventAction::Connection,
+                        EventData::NetworkConnection(closed),
+                    );
+                }
                 let pid = rec.int(&["PID"]).and_then(|p| i32::try_from(p).ok());
                 let process = pid
                     .and_then(|p| {
@@ -885,6 +1061,13 @@ impl DecodeState {
                             )
                         })
                     });
+                    if let Some(snapshot) = self.flows.open(&data, rec.timestamp) {
+                        emit(
+                            EventClass::Network,
+                            EventAction::Connection,
+                            EventData::NetworkConnection(snapshot),
+                        );
+                    }
                     emit(
                         EventClass::Network,
                         EventAction::Connection,
@@ -934,8 +1117,13 @@ impl DecodeState {
                 }
             }
             p if p == etw_map::DNS_CLIENT => {
+                self.dns_servers.note(rec);
                 if let Some((pid, mut data)) = etw_map::dns_query(rec) {
                     self.attribute_dns(rec.timestamp, pid, &mut data);
+                    let qtype = rec.int(&["QueryType"]).unwrap_or(0);
+                    if let Some(server) = self.dns_servers.take(&data.qname, qtype, rec.timestamp) {
+                        data.server_addr = server;
+                    }
                     crate::deception::activity::record_hostname(&data.qname);
                     emit(
                         EventClass::Network,
@@ -986,6 +1174,7 @@ impl DecodeState {
             taints: 0,
             path: Some(drv.path),
             process_exe: None,
+            process_start_time: None,
             sha256: hash.digest().map(str::to_owned),
             hash_error: hash.failure(),
             signature: Some(signature.into()),
@@ -1253,6 +1442,7 @@ mod native_tests {
             let sink = Arc::new(Sink {
                 tx,
                 lost: std::sync::atomic::AtomicU64::new(0),
+                kernel_file_pipes_only: true,
             });
             let session =
                 Session::start(sink).expect("ETW session requires an elevated Windows runner");
