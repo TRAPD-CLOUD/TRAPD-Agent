@@ -174,6 +174,12 @@ pub fn render(report: &TelemetryReport, now_unix_ms: u64) -> String {
             "no durability failure reported"
         }
     );
+    let _ = writeln!(
+        out,
+        "  Journal disk reserve: {} (released {} time(s))",
+        m.spool_reserve_state.as_str(),
+        m.spool_reserve_consumed_total
+    );
     if m.spool_truncated_tail_records_total > 0 {
         let _ = writeln!(
             out,

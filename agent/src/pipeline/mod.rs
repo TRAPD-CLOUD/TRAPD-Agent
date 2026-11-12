@@ -28,7 +28,8 @@ pub mod spool;
 // runtime builds its spool through `winsvc::run`.
 #[allow(unused_imports)]
 pub use spool::{
-    spool_max_bytes_from_env, spool_max_from_env, Spool, SpoolEntry, SPOOL_MAX_MEMORY,
+    spool_max_bytes_from_env, spool_max_from_env, spool_reserve_bytes_from_env, Spool, SpoolEntry,
+    SPOOL_MAX_MEMORY,
 };
 
 /// Depth of the collector→consumer channel.
