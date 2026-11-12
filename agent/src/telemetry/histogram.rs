@@ -110,8 +110,8 @@ impl LatencyHistogram {
         // Rank of the sample we want, 1-based, rounded up.
         let target = ((total as f64) * q).ceil().max(1.0) as u64;
         let mut cumulative = 0u64;
-        for i in 0..BUCKET_COUNT {
-            cumulative += self.buckets[i].load(Ordering::Relaxed);
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            cumulative += bucket.load(Ordering::Relaxed);
             if cumulative >= target {
                 return Some(upper_bound(i));
             }

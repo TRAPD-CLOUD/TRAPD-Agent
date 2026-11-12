@@ -765,9 +765,7 @@ mod tests {
     #[test]
     fn unusual_hours_need_enough_history() {
         let mut sum = UserActivitySummary::default();
-        for h in 8..18 {
-            sum.hours[h] = 20;
-        }
+        sum.hours[8..18].fill(20);
         assert_eq!(
             sum.is_unusual_hour(3),
             None,
