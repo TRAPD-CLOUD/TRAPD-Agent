@@ -14,5 +14,6 @@ pub mod packet_capture;
 pub mod proc_enrich;
 pub mod process;
 pub mod rootkit;
+pub mod sensitive_files;
 
 mod honeytoken_layout;

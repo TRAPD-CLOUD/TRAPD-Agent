@@ -69,6 +69,9 @@ pub struct Coverage {
     pub ebpf_honeytoken_programs: BTreeMap<String, bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ebpf_honeytoken_inode: Option<bool>,
+    /// Sensitive credential-file read sensor (inode gate) is armed and consuming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ebpf_sensitive_file_read: Option<bool>,
     /// Telemetry hooks (`category/name`) and whether each attached. A `false`
     /// names events this host cannot produce, e.g. `module/module_load` on a
     /// kernel built without loadable modules.
@@ -106,6 +109,9 @@ impl Coverage {
             *active = false;
         }
         self.ebpf_honeytoken_inode = Some(false);
+        if self.ebpf_sensitive_file_read.is_some() {
+            self.ebpf_sensitive_file_read = Some(false);
+        }
     }
 
     /// Process sensor label while the poller is live: process creates also
