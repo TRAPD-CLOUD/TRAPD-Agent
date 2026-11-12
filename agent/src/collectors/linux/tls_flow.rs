@@ -14,7 +14,7 @@
 //!    the first handshake message is complete.
 //! 3. The finished ClientHello becomes a pending [`TlsHandshakeData`]; the flow
 //!    then waits for the ServerHello in the reverse direction, reassembled the
-//!    same way, and attaches `ja3s`.
+//!    same way, and attaches `ja3s_hash`.
 //! 4. The event is released when the ServerHello arrives, the flow is closed
 //!    (FIN/RST) or its TTL expires. A client event is never lost merely because
 //!    the server side was not seen.
@@ -93,7 +93,7 @@ impl ServerHello {
     /// in the Salesforce JA3S reference, so TLS 1.3 shows as 771. GREASE
     /// extension types (RFC 8701) are excluded like in JA3; the single cipher is
     /// kept verbatim.
-    pub(super) fn ja3s_string(&self) -> String {
+    pub(super) fn ja3s(&self) -> String {
         let exts = self
             .extensions
             .iter()
@@ -445,9 +445,9 @@ impl TlsTracker {
         };
         if let (Some(ev), Some(sh)) = (flow.hello.as_mut(), finished) {
             if !sh.hello_retry {
-                let s = sh.ja3s_string();
-                ev.ja3s = Some(md5_hex(s.as_bytes()));
-                ev.ja3s_string = Some(s);
+                let s = sh.ja3s();
+                ev.ja3s_hash = Some(md5_hex(s.as_bytes()));
+                ev.ja3s = Some(s);
             }
         }
         out.extend(flow.hello);
@@ -596,8 +596,8 @@ mod tests {
         assert_eq!(sh.cipher, 0xc02f);
         assert_eq!(sh.extensions, vec![0xff01, 0x000b, 0x0023, 0x0010]);
         assert!(!sh.hello_retry);
-        assert_eq!(sh.ja3s_string(), KAT_JA3S_STRING);
-        assert_eq!(md5_hex(sh.ja3s_string().as_bytes()), KAT_JA3S_MD5);
+        assert_eq!(sh.ja3s(), KAT_JA3S_STRING);
+        assert_eq!(md5_hex(sh.ja3s().as_bytes()), KAT_JA3S_MD5);
     }
 
     #[test]
@@ -607,8 +607,8 @@ mod tests {
         let msg = server_hello_msg(0x1301, &[ext(43, &[3, 4]), ext(51, &key_share)], [1u8; 32]);
         let sh = parse_server_hello(&msg).unwrap();
         // TLS 1.3 keeps legacy_version 0x0303 = 771 on the wire.
-        assert_eq!(sh.ja3s_string(), "771,4865,43-51");
-        assert_eq!(md5_hex(sh.ja3s_string().as_bytes()), TLS13_JA3S_MD5);
+        assert_eq!(sh.ja3s(), "771,4865,43-51");
+        assert_eq!(md5_hex(sh.ja3s().as_bytes()), TLS13_JA3S_MD5);
     }
 
     #[test]
@@ -619,12 +619,12 @@ mod tests {
             extensions: vec![0x0a0a, 43, 0xfafa, 51],
             hello_retry: false,
         };
-        assert_eq!(sh.ja3s_string(), "771,4865,43-51");
+        assert_eq!(sh.ja3s(), "771,4865,43-51");
         let sh = ServerHello {
             extensions: vec![],
             ..sh
         };
-        assert_eq!(sh.ja3s_string(), "771,4865,");
+        assert_eq!(sh.ja3s(), "771,4865,");
     }
 
     // ── hostile input: parsers ──
@@ -823,8 +823,8 @@ mod tests {
         assert_eq!(ev.src_addr, CLIENT);
         assert_eq!(ev.dst_port, SPORT);
         assert_eq!(ev.ja3, "771,4865,0-10-11-21,29,0");
-        assert_eq!(ev.ja3s.as_deref(), Some(KAT_JA3S_MD5));
-        assert_eq!(ev.ja3s_string.as_deref(), Some(KAT_JA3S_STRING));
+        assert_eq!(ev.ja3s_hash.as_deref(), Some(KAT_JA3S_MD5));
+        assert_eq!(ev.ja3s.as_deref(), Some(KAT_JA3S_STRING));
         assert_eq!(w.t.flow_count(), 0);
         assert!(w.t.dropped.is_empty());
     }
@@ -841,7 +841,7 @@ mod tests {
         let out = w.t.sweep(w.now + FLOW_TTL);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].sni.as_deref(), Some("quiet.example"));
-        assert!(out[0].ja3s.is_none() && out[0].ja3s_string.is_none());
+        assert!(out[0].ja3s_hash.is_none() && out[0].ja3s.is_none());
         assert_eq!(w.t.flow_count(), 0);
         assert!(w.t.dropped.is_empty()); // a missing server reply is not a loss
     }
@@ -865,7 +865,7 @@ mod tests {
         let out = w.client(w.cseq + 500, &ch[500..], 0);
         assert!(out.is_empty());
         let out = w.server(w.sseq, &kat_server_hello_record(), 0);
-        assert_eq!(out[0].ja3s.as_deref(), Some(KAT_JA3S_MD5));
+        assert_eq!(out[0].ja3s_hash.as_deref(), Some(KAT_JA3S_MD5));
     }
 
     #[test]
@@ -875,7 +875,7 @@ mod tests {
         w.client(w.cseq, &ch, 0);
         let out = w.server(w.sseq, &[], TCP_RST);
         assert_eq!(out.len(), 1);
-        assert!(out[0].ja3s.is_none());
+        assert!(out[0].ja3s_hash.is_none());
         assert_eq!(w.t.flow_count(), 0);
     }
 
@@ -890,7 +890,7 @@ mod tests {
         );
         let out = w.server(w.sseq, &hrr, 0);
         assert_eq!(out.len(), 1);
-        assert!(out[0].ja3s.is_none());
+        assert!(out[0].ja3s_hash.is_none());
     }
 
     #[test]

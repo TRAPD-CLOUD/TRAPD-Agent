@@ -905,10 +905,10 @@ pub struct TlsHandshakeData {
     /// (version, chosen cipher, extension list). Absent when the server reply
     /// was not observed or could not be parsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ja3s: Option<String>,
+    pub ja3s_hash: Option<String>,
     /// Raw JA3S string (`version,cipher,extensions`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ja3s_string: Option<String>,
+    pub ja3s: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

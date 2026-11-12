@@ -484,7 +484,7 @@ fn tls_version_name(v: u16) -> &'static str {
 }
 
 /// Build the handshake event from a complete ClientHello handshake message
-/// (reassembled by [`super::tls_flow`]). `ja3s` is filled in later from the
+/// (reassembled by [`super::tls_flow`]). `ja3s_hash` is filled in later from the
 /// server's reply. Returns `None` if the message is malformed.
 pub(super) fn client_hello_event(
     msg: &[u8],
@@ -516,8 +516,8 @@ pub(super) fn client_hello_event(
         ja3,
         ja3_hash,
         alpn: ch.alpn,
+        ja3s_hash: None,
         ja3s: None,
-        ja3s_string: None,
     })
 }
 
@@ -883,7 +883,7 @@ mod tests {
         // 32-hex md5
         assert_eq!(t.ja3_hash.len(), 32);
         assert!(t.ja3_hash.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert!(t.ja3s.is_none() && t.ja3s_string.is_none());
+        assert!(t.ja3s_hash.is_none() && t.ja3s.is_none());
     }
 
     #[test]
