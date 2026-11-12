@@ -56,11 +56,11 @@ const COMPRESS_MIN_BYTES: usize = 1024;
 /// park the transport for hours.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 
-/// Optional per-event result envelope.
+/// Per-event result envelope of a 2xx ingest response.
 ///
-/// A backend that partially accepts a batch reports which events it took; one
-/// that does not simply returns 2xx with an empty or unparseable body, which is
-/// treated as full acceptance.
+/// A backend that partially accepts a batch reports which events it took. A
+/// JSON object without the lists confirms the whole batch. Anything that is
+/// not a JSON object confirms nothing (see [`parse_ack`]).
 #[derive(Debug, Default, Deserialize)]
 struct IngestResponse {
     /// `event_id`s the backend durably accepted.
@@ -243,11 +243,22 @@ impl Transport {
 
         match response {
             Ok(resp) if resp.status().is_success() => {
+                // A 2xx only counts with the backend's receipt. A proxy error
+                // page or a cut-off body is not one: keep the batch and retry.
+                let body = resp.bytes().await;
+                let Some(report) = body.as_deref().ok().and_then(parse_ack) else {
+                    warn!(
+                        events = n,
+                        "Transport: 2xx without a valid receipt — will retry"
+                    );
+                    metrics().transport_batch_failed();
+                    if let Ok(mut buf) = self.buffer.lock() {
+                        buf.nack(&seqs);
+                    }
+                    return FlushOutcome::Failed;
+                };
                 metrics().transport_batch_sent();
                 metrics().set_backend_connected(true);
-
-                // Read per-event results if the backend provides them.
-                let report: IngestResponse = resp.json().await.unwrap_or_default();
                 let (acked_seqs, requeue_seqs, rejected_seqs) =
                     partition_by_report(&batch, &report);
 
@@ -396,6 +407,19 @@ fn advertises_ocsf(headers: &reqwest::header::HeaderMap) -> bool {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
         .any(|token| token.trim() == "ocsf-1.9.0")
+}
+
+/// Read the receipt of a 2xx ingest response.
+///
+/// The backend always answers with a JSON object. Everything else (an HTML
+/// page from a misrouted proxy, a truncated or empty body, a bare array) is
+/// `None`: nothing was confirmed, so nothing may leave the queue.
+fn parse_ack(body: &[u8]) -> Option<IngestResponse> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    serde_json::from_value(value).ok()
 }
 
 /// Split a batch into accepted / retry / rejected sets without counting losses.
@@ -719,6 +743,33 @@ mod tests {
         assert!(rejected.is_empty());
         assert_eq!(ack, vec![1], "a repeated id must not acknowledge twice");
         assert_eq!(requeue, vec![2]);
+    }
+
+    #[test]
+    fn a_2xx_body_that_is_not_a_receipt_confirms_nothing() {
+        for body in [
+            &b"<html><body>502 Bad Gateway</body></html>"[..],
+            br#"{"received":2,"accepted":["a""#,
+            b"",
+            b"[]",
+            b"null",
+            b"\"ok\"",
+            br#"{"accepted":"all"}"#,
+        ] {
+            assert!(
+                parse_ack(body).is_none(),
+                "{:?} must not acknowledge a batch",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_object_is_a_receipt() {
+        let bare = parse_ack(br#"{"received":2,"errors":0,"request_id":"r"}"#).unwrap();
+        assert!(bare.accepted.is_empty() && bare.rejected.is_empty());
+        let partial = parse_ack(br#"{"received":1,"accepted":["a"],"quarantined":1}"#).unwrap();
+        assert_eq!(partial.accepted, vec!["a"]);
     }
 
     #[test]
