@@ -661,6 +661,53 @@ pub(crate) async fn consume_batch(
     buf: &Arc<Mutex<Spool>>,
     siem: &output::siem::SiemForwarder,
 ) {
+    consume_batch_with(
+        batch,
+        checkpoints,
+        prev_tx,
+        mode,
+        buf,
+        siem,
+        PreventionTee::All,
+    )
+    .await
+}
+
+/// Which events [`consume_batch_with`] hands to prevention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum PreventionTee {
+    All,
+    /// Process creates were already teed, unmerged and without delay, by
+    /// [`tee_process_creates`]; the batch is the merged telemetry view.
+    ExceptProcessCreate,
+}
+
+/// Tee every process create of a raw collector batch to prevention at once.
+/// Prevention must see each live sensor report as it arrives; merging and
+/// holding (`pipeline::process_merge`) only shape what is sent upstream.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn tee_process_creates(
+    batch: &[schema::AgentEvent],
+    prev_tx: Option<&tokio::sync::mpsc::Sender<schema::AgentEvent>>,
+) {
+    let Some(p) = prev_tx else { return };
+    for event in batch {
+        if matches!(event.data, schema::EventData::ProcessCreate(_)) {
+            pipeline::try_tee(p, event.clone(), "prevention_tee");
+        }
+    }
+}
+
+pub(crate) async fn consume_batch_with(
+    batch: Vec<schema::AgentEvent>,
+    checkpoints: &mut detection::CheckpointTracker,
+    prev_tx: Option<&tokio::sync::mpsc::Sender<schema::AgentEvent>>,
+    mode: &OutputMode,
+    buf: &Arc<Mutex<Spool>>,
+    siem: &output::siem::SiemForwarder,
+    tee: PreventionTee,
+) {
     let mut fresh = Vec::with_capacity(batch.len());
     let mut to_spool = Vec::with_capacity(batch.len());
     for mut event in batch {
@@ -685,7 +732,9 @@ pub(crate) async fn consume_batch(
         // Forwarding to prevention is best-effort — a stalled enforcement
         // engine must not stall telemetry — but a dropped tee is still
         // counted rather than swallowed.
-        if let Some(p) = prev_tx {
+        let teed_already = tee == PreventionTee::ExceptProcessCreate
+            && matches!(event.data, schema::EventData::ProcessCreate(_));
+        if let (Some(p), false) = (prev_tx, teed_already) {
             pipeline::try_tee(p, event.clone(), "prevention_tee");
             telemetry::metrics::metrics()
                 .set_detection_queue_depth(p.max_capacity().saturating_sub(p.capacity()) as u64);
@@ -912,6 +961,60 @@ mod tests {
         assert_eq!(d.mode, Some(schema::DetectionMode::Signal));
         assert!(teed.severity <= schema::Severity::Low);
         assert_eq!(spool.lock().unwrap().len(), 1);
+    }
+
+    /// The Windows consumer tees raw process creates itself (before merging);
+    /// the merged batch must not tee them a second time, everything else must.
+    #[tokio::test]
+    async fn prevention_sees_raw_creates_once_and_other_events_as_before() {
+        let spool: Arc<Mutex<Spool>> = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let siem = output::siem::SiemForwarder::from_config(
+            &config::AgentConfig::default(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let (tee_tx, mut tee_rx) = tokio::sync::mpsc::channel(8);
+        let create = schema::AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            schema::EventClass::Process,
+            schema::EventAction::Create,
+            schema::Severity::Info,
+            schema::EventData::ProcessCreate(schema::ProcessCreateData {
+                pid: 7,
+                ..Default::default()
+            }),
+        );
+        let stop = schema::AgentEvent::new(
+            "a".into(),
+            "h".into(),
+            schema::EventClass::Process,
+            schema::EventAction::Terminate,
+            schema::Severity::Info,
+            schema::EventData::ProcessTerminate(schema::ProcessTerminateData {
+                pid: 7,
+                name: "x".into(),
+            }),
+        );
+        tee_process_creates(&[create.clone(), stop.clone()], Some(&tee_tx));
+        consume_batch_with(
+            vec![create, stop],
+            &mut detection::CheckpointTracker::default(),
+            Some(&tee_tx),
+            &OutputMode::Off,
+            &spool,
+            &siem,
+            PreventionTee::ExceptProcessCreate,
+        )
+        .await;
+        let first = tee_rx.recv().await.unwrap();
+        let second = tee_rx.recv().await.unwrap();
+        assert!(matches!(first.data, schema::EventData::ProcessCreate(_)));
+        assert!(matches!(
+            second.data,
+            schema::EventData::ProcessTerminate(_)
+        ));
+        assert!(tee_rx.try_recv().is_err(), "create teed twice");
+        assert_eq!(spool.lock().unwrap().len(), 2);
     }
 
     /// A rule the operator put in shadow mode (signed config) is counted but
