@@ -80,6 +80,11 @@ struct PipelineCounters {
     replayed_from_disk: u64,
     /// Journal backing failed; queued events are still available in memory.
     durability_lost: bool,
+    /// Emergency disk reserve of the journal: `armed`, `in_use`, `unavailable`
+    /// or `disabled`. Additive; older backends ignore it.
+    spool_reserve_state: crate::telemetry::metrics::ReserveState,
+    /// Times the reserve was released to survive a full disk.
+    spool_reserve_consumed: u64,
     /// Events re-queued for another attempt after a failed send.
     retried: u64,
     /// Current queue depth / bytes / age of the oldest queued event.
@@ -101,6 +106,8 @@ impl PipelineCounters {
             priority_evicted: s.spool_priority_evicted_total,
             replayed_from_disk: s.spool_recovered_records_total,
             durability_lost: s.spool_durability_lost,
+            spool_reserve_state: s.spool_reserve_state,
+            spool_reserve_consumed: s.spool_reserve_consumed_total,
             retried: s.transport_events_retried_total,
             queued: s.spool_events,
             queued_bytes: s.spool_bytes,
@@ -122,6 +129,24 @@ mod durability_tests {
         let counters = serde_json::to_value(PipelineCounters::from_snapshot(&snapshot)).unwrap();
         assert_eq!(counters["durability_lost"], true);
         assert_eq!(counters["dropped_total"], 0);
+    }
+
+    #[test]
+    fn heartbeat_reports_reserve_state_and_consumption() {
+        let mut value =
+            serde_json::to_value(crate::telemetry::metrics::MetricsSnapshot::default()).unwrap();
+        value["spool_reserve_state"] = serde_json::json!("in_use");
+        value["spool_reserve_consumed_total"] = serde_json::json!(2);
+        let snapshot = serde_json::from_value(value).unwrap();
+        let counters = serde_json::to_value(PipelineCounters::from_snapshot(&snapshot)).unwrap();
+        assert_eq!(counters["spool_reserve_state"], "in_use");
+        assert_eq!(counters["spool_reserve_consumed"], 2);
+        // A snapshot from an older agent has neither field.
+        let default = serde_json::to_value(PipelineCounters::from_snapshot(
+            &crate::telemetry::metrics::MetricsSnapshot::default(),
+        ))
+        .unwrap();
+        assert_eq!(default["spool_reserve_state"], "disabled");
     }
 }
 

@@ -38,12 +38,25 @@
 //! marked *degraded*, the queue continues in memory, and the condition is
 //! counted and logged — losing durability is bad, but stopping collection is
 //! worse, and a silent switch to in-memory would be worst of all.
+//!
+//! ## Emergency disk reserve
+//!
+//! To ride out a *short* disk-full period without losing durability, the
+//! durable spool pre-allocates a reserve file (`journal.reserve`, 64 MiB by
+//! default, `TRAPD_SPOOL_RESERVE_MB`) next to the journal. The bytes are really
+//! written, not a sparse `set_len`, because a sparse file frees nothing when it
+//! is deleted. On a disk-full error the reserve is deleted and the failed write
+//! is retried once; only if that also fails does the journal degrade as
+//! described above. The reserve is re-created after a compaction (or every few
+//! minutes) once free space allows it with headroom, and never at the cost of
+//! filling the disk itself.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use tokio::sync::Notify;
@@ -54,6 +67,7 @@ use super::backoff;
 use super::journal::{self, JournalRecord, LineRead, RecordOutcome};
 use crate::schema::{AgentEvent, EventClass};
 use crate::telemetry::limits::{MAX_BATCH_BYTES, MAX_EVENT_BYTES, MAX_RECORD_BYTES};
+use crate::telemetry::metrics::ReserveState;
 use crate::telemetry::{metrics::metrics, DropReason};
 
 /// Default in-memory capacity (offline, or when the journal is unavailable).
@@ -74,6 +88,30 @@ const COMPACT_EVERY: usize = 5_000;
 /// far more often than) [`COMPACT_EVERY`] — see the module-level durability
 /// note above.
 const FSYNC_EVERY: usize = 50;
+
+/// Default size of the emergency disk reserve.
+pub const SPOOL_RESERVE_DEFAULT_MB: u64 = 64;
+
+/// Upper bound for `TRAPD_SPOOL_RESERVE_MB`: a reserve is dead weight on the
+/// disk, so a typo must not claim gigabytes.
+const SPOOL_RESERVE_MAX_MB: u64 = 1024;
+
+/// File name of the reserve, always next to the journal.
+const RESERVE_FILE_NAME: &str = "journal.reserve";
+
+/// Allocation is written in chunks of this size.
+const RESERVE_CHUNK: usize = 1024 * 1024;
+
+/// Upper bound on how long allocating the reserve may take. A slow or hung
+/// disk must delay startup by at most this, never indefinitely.
+const RESERVE_ALLOC_BUDGET: Duration = Duration::from_secs(10);
+
+/// Minimum spacing between attempts to re-create the reserve.
+const RESERVE_REARM_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Free space required before re-creating the reserve, as a multiple of its
+/// size, so re-arming itself cannot push the disk back to full.
+const RESERVE_REARM_HEADROOM: u64 = 2;
 
 /// A queued event and its delivery state.
 #[derive(Debug, Clone)]
@@ -104,6 +142,27 @@ impl SpoolEntry {
 struct JournalFile {
     path: PathBuf,
     handle: File,
+    /// Length of the journal after the last fully written record, or `None`
+    /// if it could not be determined. Used to cut a half-written record off
+    /// the tail before a retry (see [`Spool::write_journal`]).
+    len: Option<u64>,
+}
+
+impl JournalFile {
+    fn new(path: PathBuf, handle: File) -> Self {
+        let len = handle.metadata().ok().map(|m| m.len());
+        Self { path, handle, len }
+    }
+}
+
+/// The emergency reserve of a durable spool.
+struct Reserve {
+    path: PathBuf,
+    size: u64,
+    state: ReserveState,
+    consumed_total: u64,
+    /// Last allocation attempt after start-up, to throttle re-arming.
+    last_attempt: Option<Instant>,
 }
 
 /// A bounded, durable FIFO of events awaiting delivery.
@@ -118,6 +177,7 @@ pub struct Spool {
     /// the queue fell back to memory. Surfaced so the condition is visible
     /// rather than inferred from a missing file.
     degraded: bool,
+    reserve: Option<Reserve>,
     dropped_total: u64,
     corrupt_records: u64,
     appends_since_compact: usize,
@@ -131,6 +191,16 @@ pub struct Spool {
     /// async executor thread (i.e. inside `spawn_blocking`).
     #[cfg(test)]
     last_push_thread: Option<std::thread::ThreadId>,
+    /// Test-only: number of upcoming journal writes to fail with disk-full,
+    /// after writing half of the record (a torn write).
+    #[cfg(test)]
+    inject_write_disk_full: u32,
+    /// Test-only: number of upcoming fsyncs to fail with disk-full.
+    #[cfg(test)]
+    inject_sync_disk_full: u32,
+    /// Test-only: pretend this many bytes are free instead of asking the OS.
+    #[cfg(test)]
+    free_space_override: Option<u64>,
 }
 
 impl Spool {
@@ -145,6 +215,7 @@ impl Spool {
             next_seq: 1,
             file: None,
             degraded: false,
+            reserve: None,
             dropped_total: 0,
             corrupt_records: 0,
             appends_since_compact: 0,
@@ -153,6 +224,12 @@ impl Spool {
             priority_wake: Arc::new(Notify::new()),
             #[cfg(test)]
             last_push_thread: None,
+            #[cfg(test)]
+            inject_write_disk_full: 0,
+            #[cfg(test)]
+            inject_sync_disk_full: 0,
+            #[cfg(test)]
+            free_space_override: None,
         };
         // Publish immediately: a capacity of zero in the diagnostics report
         // would make every utilization reading meaningless.
@@ -167,13 +244,62 @@ impl Spool {
         let path = crate::paths::state_dir()
             .join("spool")
             .join("queue.journal");
-        Self::durable_at(path, max_events)
+        Self::durable_at(path, max_events).with_reserve_bytes(spool_reserve_bytes_from_env())
     }
 
     /// Byte ceiling override, for tests and for `TRAPD_SPOOL_MAX_BYTES`.
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
         self.max_bytes = max_bytes;
         self.publish_capacity();
+        self
+    }
+
+    /// Allocate the emergency disk reserve next to the journal (`0` disables
+    /// it). A no-op for in-memory and degraded spools. Failing to allocate is
+    /// logged and surfaced as `unavailable`, never an error: the spool then
+    /// behaves exactly as it did before the reserve existed.
+    pub(crate) fn with_reserve_bytes(mut self, bytes: u64) -> Self {
+        let Some(journal_path) = self.file.as_ref().map(|f| f.path.clone()) else {
+            return self;
+        };
+        let path = journal_path.with_file_name(RESERVE_FILE_NAME);
+        if bytes == 0 {
+            // Turning the reserve off must give its disk space back.
+            let _ = std::fs::remove_file(&path);
+            self.reserve = Some(Reserve {
+                path,
+                size: 0,
+                state: ReserveState::Disabled,
+                consumed_total: 0,
+                last_attempt: None,
+            });
+            self.publish();
+            return self;
+        }
+        let state = match std::fs::metadata(&path) {
+            // Left by a previous run: reuse it rather than rewriting 64 MiB on
+            // every start.
+            Ok(m) if m.is_file() && m.len() == bytes => ReserveState::Armed,
+            _ => match allocate_reserve(&path, bytes, RESERVE_ALLOC_BUDGET) {
+                Ok(()) => ReserveState::Armed,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "spool: cannot allocate the disk-full reserve — journal runs without it"
+                    );
+                    ReserveState::Unavailable
+                }
+            },
+        };
+        self.reserve = Some(Reserve {
+            path,
+            size: bytes,
+            state,
+            consumed_total: 0,
+            last_attempt: Some(Instant::now()),
+        });
+        self.publish();
         self
     }
 
@@ -197,10 +323,7 @@ impl Spool {
 
         match open_private_append(&path) {
             Ok(handle) => {
-                spool.file = Some(JournalFile {
-                    path: path.clone(),
-                    handle,
-                });
+                spool.file = Some(JournalFile::new(path.clone(), handle));
                 // Rewrite from the recovered set so the file starts clean:
                 // corrupt lines and over-cap records are not carried forward.
                 spool.compact();
@@ -336,6 +459,7 @@ impl Spool {
         if self.file.is_some() && self.appends_since_compact >= COMPACT_EVERY {
             self.compact();
         }
+        self.maybe_rearm(false);
         self.publish();
         #[cfg(any(windows, test))]
         if wants_receipt {
@@ -355,8 +479,8 @@ impl Spool {
         if self.appends_since_fsync == 0 {
             return;
         }
-        if let Some(file) = self.file.as_mut() {
-            match file.handle.sync_all() {
+        if self.file.is_some() {
+            match self.sync_journal() {
                 Ok(()) => {
                     self.fsyncs_total += 1;
                     self.appends_since_fsync = 0;
@@ -410,10 +534,16 @@ impl Spool {
     }
 
     fn append_to_journal(&mut self, encoded: &[u8]) {
-        let Some(f) = self.file.as_mut() else {
+        if self.file.is_none() {
             return;
-        };
-        if let Err(e) = f.handle.write_all(encoded) {
+        }
+        let mut result = self.write_journal(encoded);
+        if let Err(e) = &result {
+            if is_disk_full(e) && self.release_reserve() {
+                result = self.write_journal(encoded);
+            }
+        }
+        if let Err(e) = result {
             // Disk full or a read-only remount. Keep collecting in memory and
             // make the loss of durability explicit.
             warn!(
@@ -431,7 +561,7 @@ impl Spool {
         // fixed cadence independent of compaction so durability does not wait
         // for COMPACT_EVERY (see the module-level durability note).
         if self.appends_since_fsync >= FSYNC_EVERY {
-            if let Err(e) = f.handle.sync_all() {
+            if let Err(e) = self.sync_journal() {
                 warn!(error = %e, "spool: periodic journal fsync failed — durability lost, continuing in memory");
                 self.file = None;
                 self.degraded = true;
@@ -440,6 +570,178 @@ impl Spool {
             self.fsyncs_total += 1;
             self.appends_since_fsync = 0;
         }
+    }
+
+    /// Append one encoded record to the open journal.
+    ///
+    /// Torn-write safety: the journal is line-oriented and the reader only
+    /// tolerates a torn record at the very *end* of the file. A failed
+    /// `write_all` may still have written a prefix of the record (no trailing
+    /// newline). Appending the retry directly behind that prefix would glue
+    /// both into one line that fails its checksum, destroying the retried
+    /// record too. So on any failure the file is cut back to the length of the
+    /// last complete record before the caller may retry. The shrink needs no
+    /// free space. If the length is unknown or the shrink fails, the error is
+    /// returned as a plain failure and the caller degrades instead of retrying.
+    fn write_journal(&mut self, encoded: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        let injected = self.inject_write_disk_full > 0;
+        #[cfg(test)]
+        if injected {
+            self.inject_write_disk_full -= 1;
+        }
+        let Some(f) = self.file.as_mut() else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        let result = if injected {
+            f.handle
+                .write_all(&encoded[..encoded.len() / 2])
+                .and_then(|()| Err(std::io::Error::from(std::io::ErrorKind::StorageFull)))
+        } else {
+            f.handle.write_all(encoded)
+        };
+        #[cfg(not(test))]
+        let result = f.handle.write_all(encoded);
+
+        match result {
+            Ok(()) => {
+                f.len = f.len.map(|l| l + encoded.len() as u64);
+                Ok(())
+            }
+            Err(e) => {
+                let Some(len) = f.len else {
+                    return Err(e);
+                };
+                // A separate write handle: the append handle may lack
+                // `FILE_WRITE_DATA` (Windows), which truncation needs.
+                let cut = OpenOptions::new()
+                    .write(true)
+                    .open(&f.path)
+                    .and_then(|h| h.set_len(len));
+                if let Err(cut_err) = cut {
+                    warn!(error = %cut_err, "spool: cannot trim a partial journal record");
+                    f.len = None;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `fsync` the journal. On a disk-full error (delayed allocation can
+    /// surface ENOSPC only here) the reserve is released and the sync retried
+    /// once. Caveat: after a failed `fsync` some kernels drop the dirty pages,
+    /// so a successful retry is best-effort evidence, not proof; the journal's
+    /// per-record checksums still catch whatever did not reach the disk.
+    fn sync_journal(&mut self) -> std::io::Result<()> {
+        let mut result = self.sync_once();
+        if let Err(e) = &result {
+            if is_disk_full(e) && self.release_reserve() {
+                result = self.sync_once();
+            }
+        }
+        result
+    }
+
+    fn sync_once(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.inject_sync_disk_full > 0 {
+            self.inject_sync_disk_full -= 1;
+            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        }
+        match self.file.as_ref() {
+            Some(f) => f.handle.sync_all(),
+            None => Ok(()),
+        }
+    }
+
+    // ── Emergency reserve ────────────────────────────────────────────────────
+
+    /// Delete the armed reserve to make room. Returns whether space was freed
+    /// and the failed write is worth retrying; `false` means "behave as before".
+    fn release_reserve(&mut self) -> bool {
+        let Some(r) = self.reserve.as_mut() else {
+            return false;
+        };
+        if r.state != ReserveState::Armed {
+            return false;
+        }
+        match std::fs::remove_file(&r.path) {
+            Ok(()) => {
+                r.state = ReserveState::InUse;
+                r.consumed_total += 1;
+                warn!(
+                    reserve_bytes = r.size,
+                    consumed_total = r.consumed_total,
+                    "spool: disk full — released the emergency reserve to keep the journal durable"
+                );
+                self.publish();
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "spool: cannot release the emergency reserve");
+                r.state = ReserveState::Unavailable;
+                self.publish();
+                false
+            }
+        }
+    }
+
+    /// Re-create a consumed or missing reserve if the disk allows it.
+    ///
+    /// `after_compaction` skips the interval throttle once (compaction just
+    /// freed space), but never the free-space check.
+    fn maybe_rearm(&mut self, after_compaction: bool) {
+        if self.file.is_none() {
+            return;
+        }
+        let Some(r) = self.reserve.as_ref() else {
+            return;
+        };
+        if !matches!(r.state, ReserveState::InUse | ReserveState::Unavailable) {
+            return;
+        }
+        if !after_compaction
+            && r.last_attempt
+                .is_some_and(|t| t.elapsed() < RESERVE_REARM_INTERVAL)
+        {
+            return;
+        }
+        let (path, size) = (r.path.clone(), r.size);
+        if let Some(r) = self.reserve.as_mut() {
+            r.last_attempt = Some(Instant::now());
+        }
+
+        // Without a free-space API the allocation itself is the probe; it
+        // deletes its partial file on failure.
+        if let Some(free) = self.free_space(&path) {
+            if free < size.saturating_mul(RESERVE_REARM_HEADROOM) {
+                return;
+            }
+        }
+        match allocate_reserve(&path, size, RESERVE_ALLOC_BUDGET) {
+            Ok(()) => {
+                if let Some(r) = self.reserve.as_mut() {
+                    r.state = ReserveState::Armed;
+                }
+                info!(
+                    reserve_bytes = size,
+                    "spool: emergency disk reserve re-armed"
+                );
+                self.publish();
+            }
+            Err(e) => {
+                warn!(error = %e, "spool: cannot re-arm the emergency reserve — will retry later");
+            }
+        }
+    }
+
+    fn free_space(&self, path: &Path) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(v) = self.free_space_override {
+            return Some(v);
+        }
+        free_space_bytes(path)
     }
 
     // ── Consumer side ────────────────────────────────────────────────────────
@@ -560,6 +862,11 @@ impl Spool {
     fn publish(&self) {
         metrics().set_spool_state(self.mem.len() as u64, self.bytes);
         metrics().set_spool_durability_lost(self.degraded);
+        let (reserve_state, reserve_consumed) = self
+            .reserve
+            .as_ref()
+            .map_or((ReserveState::Disabled, 0), |r| (r.state, r.consumed_total));
+        metrics().set_spool_reserve(reserve_state, reserve_consumed);
         let age = self.mem.front().map_or(0, |entry| {
             chrono::Utc::now()
                 .signed_duration_since(entry.event.timestamp)
@@ -737,11 +1044,12 @@ impl Spool {
         match result {
             Ok(()) => match open_private_append(&path) {
                 Ok(handle) => {
-                    self.file = Some(JournalFile { path, handle });
+                    self.file = Some(JournalFile::new(path, handle));
                     self.appends_since_compact = 0;
                     // Compaction just fsync'd the rewritten journal, so the
                     // periodic-fsync clock also resets here.
                     self.appends_since_fsync = 0;
+                    self.maybe_rearm(true);
                 }
                 Err(e) => {
                     warn!(error = %e, "spool: reopen after compaction failed — memory only");
@@ -761,8 +1069,8 @@ impl Spool {
     /// Flush and compact — called on a clean shutdown so the next start replays
     /// exactly the un-acknowledged set.
     pub fn checkpoint(&mut self) {
-        if let Some(f) = self.file.as_mut() {
-            if let Err(e) = f.handle.sync_all() {
+        if self.file.is_some() {
+            if let Err(e) = self.sync_journal() {
                 warn!(error = %e, "spool: final journal fsync failed — durability lost, continuing in memory");
                 self.file = None;
                 self.degraded = true;
@@ -827,6 +1135,13 @@ impl Spool {
         self.degraded
     }
 
+    /// State of the emergency disk reserve.
+    pub fn reserve_state(&self) -> ReserveState {
+        self.reserve
+            .as_ref()
+            .map_or(ReserveState::Disabled, |r| r.state)
+    }
+
     /// True when the queue is durable — writes are reaching the journal.
     pub fn is_durable(&self) -> bool {
         self.file.is_some()
@@ -855,6 +1170,108 @@ fn open_private_append(path: &Path) -> std::io::Result<File> {
     opts.create(true).append(true);
     set_private_mode(&mut opts);
     opts.open(path)
+}
+
+/// Create a new file `0600`, failing if anything (including a symlink) is
+/// already at `path` — `O_EXCL` does not follow a planted link.
+fn open_private_create_new(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    set_private_mode(&mut opts);
+    opts.open(path)
+}
+
+/// Really allocate `size` bytes at `path`: zeros are written and synced, a
+/// sparse `set_len` would free nothing when the file is later deleted. Bounded
+/// by `budget`; a partial file is removed on any failure.
+fn allocate_reserve(path: &Path, size: u64, budget: Duration) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = open_private_create_new(path)?;
+    let started = Instant::now();
+    let result = (|| -> std::io::Result<()> {
+        let chunk = vec![0u8; RESERVE_CHUNK];
+        let mut left = size;
+        while left > 0 {
+            if started.elapsed() > budget {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "reserve allocation exceeded its time budget",
+                ));
+            }
+            let n = left.min(RESERVE_CHUNK as u64) as usize;
+            file.write_all(&chunk[..n])?;
+            left -= n as u64;
+        }
+        file.sync_all()
+    })();
+    if result.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+/// True for "no space left" errors: `ErrorKind::StorageFull`, `ENOSPC` on
+/// Unix, `ERROR_DISK_FULL` (112) / `ERROR_HANDLE_DISK_FULL` (39) on Windows.
+pub(crate) fn is_disk_full(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::StorageFull {
+        return true;
+    }
+    match e.raw_os_error() {
+        #[cfg(unix)]
+        Some(code) => code == libc::ENOSPC,
+        #[cfg(windows)]
+        Some(code) => code == 112 || code == 39,
+        _ => false,
+    }
+}
+
+/// Bytes available to the unprivileged agent on the filesystem holding `path`'s
+/// directory, or `None` if the platform query is unavailable or fails.
+#[cfg(unix)]
+fn free_space_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = path.parent()?;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated path and `st` is a properly sized
+    // out-parameter that statvfs fully initialises on success.
+    let st = unsafe {
+        let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if libc::statvfs(c.as_ptr(), st.as_mut_ptr()) != 0 {
+            return None;
+        }
+        st.assume_init()
+    };
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(windows)]
+fn free_space_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let dir = path.parent()?;
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut available = 0u64;
+    // SAFETY: `wide` is NUL-terminated and `available` is a valid out-pointer;
+    // the other two out-parameters are optional and passed as null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(available)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn free_space_bytes(_path: &Path) -> Option<u64> {
+    None
 }
 
 fn open_private_write(path: &Path) -> std::io::Result<File> {
@@ -889,6 +1306,17 @@ pub fn spool_max_bytes_from_env() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(SPOOL_MAX_BYTES)
+}
+
+/// Resolve the emergency reserve size in bytes, honouring
+/// `TRAPD_SPOOL_RESERVE_MB` (`0` disables, clamped to a sane maximum).
+pub fn spool_reserve_bytes_from_env() -> u64 {
+    let mb = std::env::var("TRAPD_SPOOL_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(SPOOL_RESERVE_DEFAULT_MB)
+        .min(SPOOL_RESERVE_MAX_MB);
+    mb * 1024 * 1024
 }
 
 #[cfg(all(test, unix))]
@@ -982,6 +1410,295 @@ mod sync_failure_tests {
             "loss of durability is not confirmed event loss"
         );
         drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    use super::*;
+    use crate::schema::{EventAction, EventData, Severity};
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn event() -> AgentEvent {
+        AgentEvent::new(
+            "test".into(),
+            "host".into(),
+            EventClass::Process,
+            EventAction::Exec,
+            Severity::Info,
+            EventData::ProcessExec(Box::default()),
+        )
+    }
+
+    fn temp_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("trapd-reserve-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn reserve_path(dir: &Path) -> PathBuf {
+        dir.join(RESERVE_FILE_NAME)
+    }
+
+    fn spool_with_reserve(dir: &Path, mb: u64) -> Spool {
+        Spool::durable_at(dir.join("queue.journal"), 100).with_reserve_bytes(mb * MIB)
+    }
+
+    #[test]
+    fn reserve_is_created_fully_allocated_with_configured_size() {
+        let dir = temp_dir();
+        let spool = spool_with_reserve(&dir, 2);
+        assert_eq!(spool.reserve_state(), ReserveState::Armed);
+        let meta = std::fs::metadata(reserve_path(&dir)).unwrap();
+        assert_eq!(meta.len(), 2 * MIB);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            // Really allocated (not sparse) and private.
+            assert!(meta.blocks() * 512 >= 2 * MIB);
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reserve_size_zero_disables_and_removes_a_stale_file() {
+        let dir = temp_dir();
+        drop(spool_with_reserve(&dir, 1));
+        assert!(reserve_path(&dir).exists());
+        let spool = spool_with_reserve(&dir, 0);
+        assert_eq!(spool.reserve_state(), ReserveState::Disabled);
+        assert!(!reserve_path(&dir).exists());
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn in_memory_spool_never_creates_a_reserve() {
+        let spool = Spool::in_memory(10).with_reserve_bytes(MIB);
+        assert_eq!(spool.reserve_state(), ReserveState::Disabled);
+        assert!(spool.reserve.is_none());
+    }
+
+    #[test]
+    fn unallocatable_reserve_is_unavailable_and_leaves_no_file() {
+        let dir = temp_dir();
+        let mut spool = Spool::durable_at(dir.join("queue.journal"), 100);
+        // A directory squatting on the path makes allocation fail.
+        std::fs::create_dir(reserve_path(&dir)).unwrap();
+        spool = spool.with_reserve_bytes(MIB);
+        assert_eq!(spool.reserve_state(), ReserveState::Unavailable);
+        assert!(spool.push(event()).is_ok());
+        assert!(spool.is_durable());
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn allocation_over_budget_is_aborted_and_cleaned_up() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = reserve_path(&dir);
+        let err = allocate_reserve(&path, 4 * MIB, Duration::ZERO).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn env_size_defaults_clamps_and_disables() {
+        // Single test owns the variable to avoid races with other tests.
+        std::env::remove_var("TRAPD_SPOOL_RESERVE_MB");
+        assert_eq!(spool_reserve_bytes_from_env(), 64 * MIB);
+        std::env::set_var("TRAPD_SPOOL_RESERVE_MB", "0");
+        assert_eq!(spool_reserve_bytes_from_env(), 0);
+        std::env::set_var("TRAPD_SPOOL_RESERVE_MB", "999999");
+        assert_eq!(spool_reserve_bytes_from_env(), 1024 * MIB);
+        std::env::set_var("TRAPD_SPOOL_RESERVE_MB", "garbage");
+        assert_eq!(spool_reserve_bytes_from_env(), 64 * MIB);
+        std::env::remove_var("TRAPD_SPOOL_RESERVE_MB");
+    }
+
+    #[test]
+    fn disk_full_classification() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_disk_full(&Error::from(ErrorKind::StorageFull)));
+        assert!(!is_disk_full(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!is_disk_full(&Error::other("x")));
+        #[cfg(unix)]
+        {
+            assert!(is_disk_full(&Error::from_raw_os_error(libc::ENOSPC)));
+            assert!(!is_disk_full(&Error::from_raw_os_error(libc::EACCES)));
+            assert!(!is_disk_full(&Error::from_raw_os_error(libc::EIO)));
+        }
+        #[cfg(windows)]
+        {
+            assert!(is_disk_full(&Error::from_raw_os_error(112)));
+            assert!(is_disk_full(&Error::from_raw_os_error(39)));
+            assert!(!is_disk_full(&Error::from_raw_os_error(5)));
+        }
+    }
+
+    #[test]
+    fn disk_full_append_consumes_reserve_and_stays_durable_without_corruption() {
+        let dir = temp_dir();
+        let mut spool = spool_with_reserve(&dir, 1);
+        spool.push(event()).unwrap();
+        spool.inject_write_disk_full = 1;
+        spool.push(event()).unwrap();
+        spool.push(event()).unwrap();
+
+        assert!(!spool.is_degraded());
+        assert!(spool.is_durable());
+        assert_eq!(spool.reserve_state(), ReserveState::InUse);
+        assert_eq!(spool.reserve.as_ref().unwrap().consumed_total, 1);
+        assert!(!reserve_path(&dir).exists());
+        assert_eq!(spool.len(), 3);
+
+        // The half-written first attempt must not have corrupted the journal:
+        // all three records replay, none is corrupt.
+        drop(spool);
+        let replayed = Spool::durable_at(dir.join("queue.journal"), 100);
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed.corrupt_records(), 0);
+        drop(replayed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn second_disk_full_without_reserve_degrades_as_before() {
+        let dir = temp_dir();
+        let mut spool = spool_with_reserve(&dir, 1);
+        spool.inject_write_disk_full = 1;
+        spool.push(event()).unwrap();
+        assert!(spool.is_durable());
+        assert_eq!(spool.reserve_state(), ReserveState::InUse);
+
+        spool.inject_write_disk_full = 1;
+        spool.push(event()).unwrap();
+        assert!(spool.is_degraded());
+        assert!(!spool.is_durable());
+        assert_eq!(spool.len(), 2, "collection continues in memory");
+        assert_eq!(spool.dropped_total(), 0);
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_retry_after_reserve_release_degrades() {
+        let dir = temp_dir();
+        let mut spool = spool_with_reserve(&dir, 1);
+        spool.inject_write_disk_full = 2;
+        spool.push(event()).unwrap();
+        assert!(spool.is_degraded());
+        assert_eq!(spool.reserve_state(), ReserveState::InUse);
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn non_disk_full_error_does_not_touch_the_reserve() {
+        let dir = temp_dir();
+        let mut spool = spool_with_reserve(&dir, 1);
+        // A read-only handle fails with EBADF / access denied, not disk-full.
+        spool.file.as_mut().unwrap().handle = File::open(dir.join("queue.journal")).unwrap();
+        spool.push(event()).unwrap();
+        assert!(spool.is_degraded());
+        assert_eq!(spool.reserve_state(), ReserveState::Armed);
+        assert!(reserve_path(&dir).exists());
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn disk_full_fsync_consumes_reserve_and_retries_once() {
+        let dir = temp_dir();
+        let mut spool = spool_with_reserve(&dir, 1);
+        for _ in 0..FSYNC_EVERY - 1 {
+            spool.push(event()).unwrap();
+        }
+        spool.inject_sync_disk_full = 1;
+        spool.push(event()).unwrap();
+        assert!(!spool.is_degraded());
+        assert_eq!(spool.reserve_state(), ReserveState::InUse);
+        assert_eq!(spool.fsyncs_total(), 1);
+
+        // Reserve gone: the next disk-full fsync degrades.
+        for _ in 0..FSYNC_EVERY - 1 {
+            spool.push(event()).unwrap();
+        }
+        spool.inject_sync_disk_full = 1;
+        spool.push(event()).unwrap();
+        assert!(spool.is_degraded());
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reserve_is_rearmed_after_compaction_when_space_allows() {
+        let dir = temp_dir();
+        let mut spool = spool_with_reserve(&dir, 1);
+        spool.inject_write_disk_full = 1;
+        spool.push(event()).unwrap();
+        assert_eq!(spool.reserve_state(), ReserveState::InUse);
+
+        spool.free_space_override = Some(2 * MIB);
+        spool.compact();
+        assert_eq!(spool.reserve_state(), ReserveState::Armed);
+        assert_eq!(std::fs::metadata(reserve_path(&dir)).unwrap().len(), MIB);
+        assert_eq!(
+            spool.reserve.as_ref().unwrap().consumed_total,
+            1,
+            "history of consumption is kept"
+        );
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rearm_is_skipped_below_twice_the_reserve_size() {
+        let dir = temp_dir();
+        let mut spool = spool_with_reserve(&dir, 1);
+        spool.inject_write_disk_full = 1;
+        spool.push(event()).unwrap();
+
+        spool.free_space_override = Some(2 * MIB - 1);
+        spool.compact();
+        assert_eq!(spool.reserve_state(), ReserveState::InUse);
+        assert!(!reserve_path(&dir).exists());
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn periodic_rearm_is_throttled() {
+        let dir = temp_dir();
+        let mut spool = spool_with_reserve(&dir, 1);
+        spool.inject_write_disk_full = 1;
+        spool.push(event()).unwrap();
+        spool.free_space_override = Some(10 * MIB);
+
+        // Just attempted: a plain push must not retry yet.
+        spool.reserve.as_mut().unwrap().last_attempt = Some(Instant::now());
+        spool.push(event()).unwrap();
+        assert_eq!(spool.reserve_state(), ReserveState::InUse);
+
+        // Long enough ago: the next push re-arms.
+        spool.reserve.as_mut().unwrap().last_attempt =
+            Instant::now().checked_sub(RESERVE_REARM_INTERVAL + Duration::from_secs(1));
+        spool.push(event()).unwrap();
+        assert_eq!(spool.reserve_state(), ReserveState::Armed);
+        drop(spool);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn free_space_query_reports_something_for_a_real_directory() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(free_space_bytes(&dir.join("x")).is_some_and(|b| b > 0));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

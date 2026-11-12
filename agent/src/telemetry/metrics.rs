@@ -12,7 +12,7 @@
 //! on-disk diagnostics file and `trapd-agent diagnostics telemetry`.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +117,9 @@ pub struct Metrics {
     spool_capacity_events: AtomicU64,
     spool_corrupt_records: AtomicU64,
     spool_durability_lost: AtomicBool,
+    /// [`ReserveState`] as its `u8` discriminant.
+    spool_reserve_state: AtomicU8,
+    spool_reserve_consumed: AtomicU64,
     spool_truncated_tail_records: AtomicU64,
     spool_recovered_records: AtomicU64,
     spool_oldest_age_ms: AtomicU64,
@@ -174,6 +177,8 @@ impl Metrics {
             spool_capacity_events: AtomicU64::new(0),
             spool_corrupt_records: AtomicU64::new(0),
             spool_durability_lost: AtomicBool::new(false),
+            spool_reserve_state: AtomicU8::new(ReserveState::Disabled as u8),
+            spool_reserve_consumed: AtomicU64::new(0),
             spool_truncated_tail_records: AtomicU64::new(0),
             spool_recovered_records: AtomicU64::new(0),
             spool_oldest_age_ms: AtomicU64::new(0),
@@ -339,6 +344,15 @@ impl Metrics {
     /// Loss of journal backing, independent of confirmed event loss.
     pub fn set_spool_durability_lost(&self, lost: bool) {
         self.spool_durability_lost.store(lost, Ordering::Relaxed);
+    }
+
+    /// Publish the journal's emergency disk reserve state and how many times
+    /// it has been consumed since the process started.
+    pub fn set_spool_reserve(&self, state: ReserveState, consumed_total: u64) {
+        self.spool_reserve_state
+            .store(state as u8, Ordering::Relaxed);
+        self.spool_reserve_consumed
+            .store(consumed_total, Ordering::Relaxed);
     }
 
     pub fn set_spool_oldest_age_ms(&self, age: u64) {
@@ -514,6 +528,10 @@ impl Metrics {
             spool_capacity_bytes: self.spool_capacity_bytes.load(Ordering::Relaxed),
             spool_corrupt_records_total: self.spool_corrupt_records.load(Ordering::Relaxed),
             spool_durability_lost: self.spool_durability_lost.load(Ordering::Relaxed),
+            spool_reserve_state: ReserveState::from_u8(
+                self.spool_reserve_state.load(Ordering::Relaxed),
+            ),
+            spool_reserve_consumed_total: self.spool_reserve_consumed.load(Ordering::Relaxed),
             spool_truncated_tail_records_total: self
                 .spool_truncated_tail_records
                 .load(Ordering::Relaxed),
@@ -575,6 +593,9 @@ impl Metrics {
         self.spool_capacity_bytes.store(0, Ordering::Relaxed);
         self.spool_corrupt_records.store(0, Ordering::Relaxed);
         self.spool_durability_lost.store(false, Ordering::Relaxed);
+        self.spool_reserve_state
+            .store(ReserveState::Disabled as u8, Ordering::Relaxed);
+        self.spool_reserve_consumed.store(0, Ordering::Relaxed);
         self.spool_truncated_tail_records
             .store(0, Ordering::Relaxed);
         self.spool_recovered_records.store(0, Ordering::Relaxed);
@@ -612,6 +633,47 @@ pub fn now_unix_ms() -> u64 {
 
 /// Serializable view of the whole registry — the payload of the on-disk
 /// diagnostics snapshot.
+/// State of the journal's emergency disk reserve.
+///
+/// The reserve is pre-allocated space next to the journal that is released
+/// when the disk fills, so a short disk-full period does not cost durability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum ReserveState {
+    /// Turned off (`TRAPD_SPOOL_RESERVE_MB=0`) or no durable journal.
+    #[default]
+    Disabled = 0,
+    /// Allocated and ready to be released.
+    Armed = 1,
+    /// Released after a disk-full error and not yet re-created.
+    InUse = 2,
+    /// Could not be allocated (no space, I/O error); the journal behaves as
+    /// it would without a reserve.
+    Unavailable = 3,
+}
+
+impl ReserveState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Armed,
+            2 => Self::InUse,
+            3 => Self::Unavailable,
+            _ => Self::Disabled,
+        }
+    }
+
+    /// Stable lowercase name, as serialized.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Armed => "armed",
+            Self::InUse => "in_use",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     /// Accepted events per class (per-sensor view); absent classes are zero.
@@ -654,6 +716,13 @@ pub struct MetricsSnapshot {
     /// True when an intended durable spool has fallen back to memory.
     #[serde(default)]
     pub spool_durability_lost: bool,
+    /// State of the journal's emergency disk reserve (additive field).
+    #[serde(default)]
+    pub spool_reserve_state: ReserveState,
+    /// Times the reserve was released to keep the journal durable on a full
+    /// disk.
+    #[serde(default)]
+    pub spool_reserve_consumed_total: u64,
     pub spool_truncated_tail_records_total: u64,
     pub spool_recovered_records_total: u64,
     #[serde(default)]
