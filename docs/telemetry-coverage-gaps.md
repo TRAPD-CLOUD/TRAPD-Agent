@@ -93,3 +93,66 @@ Not yet done: per-component profiling of the collectors on the Windows test
 host. The earlier measurement (about a third of one core at idle on the
 installed 0.7.x service) came from collectors, not from the rule engine, so
 the engine removal alone will not reach the target; see PRs #138-#140.
+
+## E. Channel burst measurement (GAP-MATRIX L1)
+
+Harness: `agent/src/pipeline/burst.rs` (test module of the agent crate).
+It drives the real `try_emit` -> `next_batch` -> `consume_batch` -> durable
+`Spool` (journal in a temp dir, `OutputMode::Off`, SIEM disabled) with a
+producer OS thread, as the ring-buffer consumers do. No network, no
+collectors. Drops are counted from `try_emit`'s return value.
+
+```text
+cargo test --release -p trapd-agent --bin trapd-agent burst_measurement_table -- --ignored --nocapture
+```
+
+Host: Linux dev box (QEMU virtual CPU, `nproc` = 4), `--release` profile,
+rustc 1.98.1, single run per cell (no repeats; timing-dependent cells vary by
+tens of percent between runs). Event sizes: about 400 B exec event (process),
+about 250 B file-open event.
+
+| scenario | capacity | sent | dropped (userspace_channel_full) | peak occupancy | drain ms |
+|---|---|---|---|---|---|
+| max 1k | 1024 | 1000 | 0 | 804 | 42 |
+| max 1k | 4096 | 1000 | 0 | 763 | 41 |
+| max 1k | 16384 | 1000 | 0 | 709 | 40 |
+| max 5k | 1024 | 1510 | 3490 | 1024 | 53 |
+| max 5k | 4096 | 4639 | 361 | 4096 | 181 |
+| max 5k | 16384 | 5000 | 0 | 4478 | 230 |
+| max 20k | 1024 | 2084 | 17916 | 1024 | 44 |
+| max 20k | 4096 | 5393 | 14607 | 4096 | 226 |
+| max 20k | 16384 | 17948 | 2052 | 16384 | 1100 |
+| max 50k | 1024 | 2570 | 47430 | 1024 | 93 |
+| max 50k | 4096 | 5641 | 44359 | 4096 | 366 |
+| max 50k | 16384 | 17677 | 32323 | 16384 | 1390 |
+| process storm 2k/s x5s | 1024 | 10000 | 0 | 65 | 100 |
+| process storm 2k/s x5s | 4096 | 10000 | 0 | 123 | 89 |
+| process storm 2k/s x5s | 16384 | 10000 | 0 | 72 | 72 |
+| file storm 10k/s x2s | 1024 | 20000 | 0 | 839 | 144 |
+| file storm 10k/s x2s | 4096 | 20000 | 0 | 1644 | 164 |
+| file storm 10k/s x2s | 16384 | 20000 | 0 | 901 | 113 |
+
+Findings:
+
+- The consumer sustains roughly 20-40k events/s here (batching plus journal
+  append with fsync every 50 records). The realistic storms (2k/s and 10k/s)
+  are well below that: no drops at any tested capacity, peak occupancy 65-1644.
+- Drops appear only for instantaneous bursts of more than about the capacity
+  plus what the consumer drains meanwhile (5k at 1024, 20k at 4096). Those are
+  synthetic worst cases: a real producer is rate-limited by the kernel ring
+  buffer drain and `/proc` enrichment, so a 20k-event spike with zero spacing
+  does not occur. Whether it does on a real host stays unmeasured.
+- 4,096 gives 2.5x headroom over the observed peak of the 10k/s file storm
+  (1,644); 1,024 gave 839 in that run, i.e. little margin. The capacity change
+  to 4,096 is justified; raising it further only moves the cliff (16,384 still
+  drops at 20k instantaneous) at about 4 MiB more worst-case memory per 10k
+  slots. No code change to the capacity or to backpressure was made.
+
+Not covered: the second tee channel to prevention (capacity 1,024, drops
+counted as `userspace_channel_full` too) with a real prevention engine behind
+it; collector-side cost (`/proc` enrichment, ring-buffer reads); the Windows
+ETW path; the network stage; a slower disk than this box's.
+
+Regression tests (fast, no clocks): a burst of exactly `CHANNEL_CAPACITY`
+events with a stalled consumer is not dropped and fully reaches the spool;
+overflow beyond capacity is counted exactly.

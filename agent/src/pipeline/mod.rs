@@ -139,3 +139,6 @@ fn warn_throttled(source: &str, event: &AgentEvent) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod burst;
