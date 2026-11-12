@@ -160,6 +160,10 @@ fn extract(data: &EventData) -> Option<(i32, String)> {
             format!("chown {}:{} {}", d.new_uid, d.new_gid, d.path),
         ),
         EventData::Mmap(d) => (d.pid, format!("mmap {}", d.comm)),
+        EventData::PrivilegeChange(d) => (
+            d.pid,
+            format!("privilege_change {} -> euid {}", d.old_uid, d.new_euid),
+        ),
         EventData::Setuid(d) => (d.pid, format!("setuid {} -> {}", d.old_uid, d.new_uid)),
         EventData::MemfdCreate(d) => (d.pid, format!("memfd_create {}", d.name)),
         EventData::NetworkSocket(d) => (d.pid, format!("{} {}:{}", d.op, d.addr, d.port)),

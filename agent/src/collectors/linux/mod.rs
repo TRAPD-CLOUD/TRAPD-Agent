@@ -11,6 +11,7 @@ pub mod inet_diag;
 pub mod memscan;
 pub mod network;
 pub mod packet_capture;
+pub mod privilege_change;
 pub mod proc_enrich;
 pub mod process;
 pub mod rootkit;
