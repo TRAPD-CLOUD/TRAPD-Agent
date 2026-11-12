@@ -42,6 +42,9 @@ pub const AMSI: u128 = 0x2a576b87_09a7_520e_c21a_4942f0271d67;
 pub const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x40;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const KERNEL_NETWORK_KEYWORDS: u64 = 0x10 | 0x20;
+/// Kernel-File `CREATE` keyword only: no reads, writes, deletes or renames.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const KERNEL_FILE_KEYWORDS: u64 = 0x80;
 
 /// One decoded property value.
 #[derive(Debug, Clone, PartialEq)]
@@ -345,6 +348,121 @@ impl RateGate {
         } else {
             false
         }
+    }
+}
+
+/// Does a raw Kernel-File event payload mention `\NamedPipe\` (UTF-16LE,
+/// ASCII case-insensitive)? A cheap, layout-independent prefilter run in the ETW
+/// callback so the far more frequent ordinary file creates never reach TDH
+/// decoding or the channel.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn payload_mentions_pipe(user_data: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"\\NamedPipe\\";
+    let n = NEEDLE.len();
+    if user_data.len() < n * 2 {
+        return false;
+    }
+    (0..=user_data.len() - n * 2).any(|start| {
+        NEEDLE.iter().enumerate().all(|(i, b)| {
+            user_data[start + 2 * i].eq_ignore_ascii_case(b) && user_data[start + 2 * i + 1] == 0
+        })
+    })
+}
+
+/// Longest pipe name kept (Windows limits a pipe name to 256 characters).
+const MAX_PIPE_NAME_CHARS: usize = 256;
+
+/// Kernel-File event 12 (Create) on `\Device\NamedPipe\<name>` → (logging PID,
+/// `\\.\pipe\<name>`). Creation of a server instance and a client connect both
+/// appear here and cannot be told apart from this event; the root directory
+/// open (no name) is not a pipe and is refused.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn pipe_create(rec: &EtwRecord) -> Option<(u32, String)> {
+    if rec.provider != KERNEL_FILE || rec.id != 12 {
+        return None;
+    }
+    const PREFIX: &str = "\\Device\\NamedPipe\\";
+    let file = rec.str(&["FileName"])?;
+    let head = file.get(..PREFIX.len())?;
+    if !head.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let name: String = file[PREFIX.len()..]
+        .chars()
+        .take(MAX_PIPE_NAME_CHARS)
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    Some((rec.header_pid, format!("\\\\.\\pipe\\{name}")))
+}
+
+/// Remembers keys seen within a time window so identical repeats (a client
+/// reopening one pipe, the same script scanned again) are reported once.
+/// Bounded: it is cleared when full. Callers count a suppressed repeat as
+/// `rate_limit_applied`.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug)]
+pub struct RecentSet<K: std::hash::Hash + Eq> {
+    seen: HashMap<K, u64>,
+    window_ms: u64,
+    cap: usize,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl<K: std::hash::Hash + Eq> RecentSet<K> {
+    pub fn new(window_ms: u64, cap: usize) -> Self {
+        Self {
+            seen: HashMap::new(),
+            window_ms,
+            cap,
+        }
+    }
+
+    /// `true` when `key` was not seen within the window (and records it).
+    pub fn first_seen(&mut self, key: K, now_ms: u64) -> bool {
+        if let Some(last) = self.seen.get(&key) {
+            if now_ms.saturating_sub(*last) < self.window_ms {
+                return false;
+            }
+        }
+        if self.seen.len() >= self.cap && !self.seen.contains_key(&key) {
+            self.seen.clear();
+        }
+        self.seen.insert(key, now_ms);
+        true
+    }
+}
+
+/// Sheds the noisiest optional provider when the shared session starts losing
+/// events: process and network telemetry share its buffers, and an optional
+/// stream must not cost them. Trips once; the owner then disables the
+/// provider and reports it in coverage.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug)]
+pub struct LossGuard {
+    baseline: u64,
+    max_lost: u64,
+    tripped: bool,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl LossGuard {
+    pub fn new(baseline_lost: u64, max_lost: u64) -> Self {
+        Self {
+            baseline: baseline_lost,
+            max_lost,
+            tripped: false,
+        }
+    }
+
+    /// `true` exactly once: when losses since creation first exceed the limit.
+    pub fn observe(&mut self, total_lost: u64) -> bool {
+        if self.tripped || total_lost.saturating_sub(self.baseline) <= self.max_lost {
+            return false;
+        }
+        self.tripped = true;
+        true
     }
 }
 
@@ -738,6 +856,86 @@ mod tests {
             assert!(g.allow(60_000));
         }
         assert!(!g.allow(60_000));
+    }
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn pipe_prefilter_finds_the_device_in_a_raw_payload() {
+        let mut payload = vec![0u8; 32];
+        payload.extend(utf16le("\\Device\\NamedPipe\\msagent_81"));
+        assert!(payload_mentions_pipe(&payload));
+        let mut lower = vec![1u8; 7];
+        lower.extend(utf16le("\\device\\namedpipe\\x"));
+        assert!(payload_mentions_pipe(&lower));
+        // An ordinary file, a short buffer, and a byte-shifted (odd) match.
+        let mut file = vec![0u8; 32];
+        file.extend(utf16le("\\Device\\HarddiskVolume3\\a.txt"));
+        assert!(!payload_mentions_pipe(&file));
+        assert!(!payload_mentions_pipe(&[0u8; 4]));
+        assert!(!payload_mentions_pipe(b"\\NamedPipe\\ascii-not-utf16"));
+    }
+
+    #[test]
+    fn pipe_create_maps_to_the_win32_pipe_path() {
+        let r = rec(
+            KERNEL_FILE,
+            12,
+            &[("FileName", s("\\Device\\NamedPipe\\MSSE-1234-server"))],
+        );
+        let mut r = r;
+        r.header_pid = 4242;
+        assert_eq!(
+            pipe_create(&r),
+            Some((4242, "\\\\.\\pipe\\MSSE-1234-server".to_string()))
+        );
+        // Not a pipe, the pipe root, another event id, another provider.
+        let other = rec(
+            KERNEL_FILE,
+            12,
+            &[("FileName", s("\\Device\\HarddiskVolume3\\x"))],
+        );
+        assert!(pipe_create(&other).is_none());
+        let root = rec(KERNEL_FILE, 12, &[("FileName", s("\\Device\\NamedPipe\\"))]);
+        assert!(pipe_create(&root).is_none());
+        let mut wrong_id = r.clone();
+        wrong_id.id = 14;
+        assert!(pipe_create(&wrong_id).is_none());
+        let mut wrong_provider = r.clone();
+        wrong_provider.provider = DNS_CLIENT;
+        assert!(pipe_create(&wrong_provider).is_none());
+        // Hostile name length is bounded.
+        let long = format!("\\Device\\NamedPipe\\{}", "a".repeat(5000));
+        let rl = rec(KERNEL_FILE, 12, &[("FileName", s(&long))]);
+        let (_, path) = pipe_create(&rl).unwrap();
+        assert_eq!(path.chars().count(), "\\\\.\\pipe\\".len() + 256);
+    }
+
+    #[test]
+    fn recent_set_reports_repeats_once_per_window_and_stays_bounded() {
+        let mut set = RecentSet::new(1000, 2);
+        assert!(set.first_seen("a", 0));
+        assert!(!set.first_seen("a", 999));
+        assert!(set.first_seen("a", 1000), "window elapsed");
+        assert!(set.first_seen("b", 1000));
+        // Full: a new key clears instead of growing.
+        assert!(set.first_seen("c", 1001));
+        assert!(set.seen.len() <= 2);
+    }
+
+    #[test]
+    fn loss_guard_trips_once_past_the_limit() {
+        let mut g = LossGuard::new(100, 50);
+        assert!(!g.observe(100));
+        assert!(!g.observe(150), "exactly at the limit is tolerated");
+        assert!(g.observe(151));
+        assert!(!g.observe(10_000), "only once");
+        assert!(
+            !LossGuard::new(500, 10).observe(400),
+            "counter reset is not a trip"
+        );
     }
 
     #[test]

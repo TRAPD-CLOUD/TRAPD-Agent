@@ -37,6 +37,10 @@ pub struct Coverage {
     /// periodic driver inventory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etw_driver_load: Option<bool>,
+    /// Named-pipe creates/connects via Kernel-File. Turns `false` when the
+    /// agent switches it off itself because the session started losing events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etw_pipe_provider: Option<bool>,
     /// Events the ETW session dropped (cumulative since start).
     #[serde(skip_serializing_if = "is_zero")]
     pub etw_events_lost: u64,
@@ -120,6 +124,10 @@ impl Coverage {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn etw_driver_load_active(&self) -> bool {
         self.etw_session == Some(true) && self.etw_driver_load == Some(true)
+    }
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn etw_pipe_active(&self) -> bool {
+        self.etw_session == Some(true) && self.etw_pipe_provider == Some(true)
     }
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn etw_network_active(&self) -> bool {

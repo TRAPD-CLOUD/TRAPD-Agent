@@ -67,6 +67,24 @@ impl NativeControl {
         }
     }
 }
+impl NativeControl {
+    /// Switch one provider off while the session keeps running.
+    fn disable_provider(&self, guid: u128) -> u32 {
+        let g = guid_from_u128(guid);
+        unsafe {
+            EnableTraceEx2(
+                self.handle,
+                &g,
+                EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        }
+    }
+}
 struct RunGuard(Arc<NativeControl>);
 impl Drop for RunGuard {
     fn drop(&mut self) {
@@ -101,6 +119,11 @@ impl Collector for EtwCollector {
         // The blocking ProcessTrace loop owns a dedicated OS thread.
         let session = Session::start(sink).context("start ETW session")?;
         let _guard = RunGuard(Arc::clone(&session.control));
+        let control = Arc::clone(&session.control);
+        // The session is shared with process/network telemetry; named pipes
+        // are the optional, noisiest stream and are shed first.
+        let mut pipe_guard =
+            etw_map::LossGuard::new(coverage::snapshot().etw_events_lost, PIPE_SHED_AFTER_LOST);
         let trace_thread = std::thread::Builder::new()
             .name("trapd-etw".into())
             .spawn(move || session.process())
@@ -129,6 +152,14 @@ impl Collector for EtwCollector {
         let mut batch: Vec<EtwRecord> = Vec::with_capacity(DECODE_BATCH);
         loop {
             crate::telemetry::liveness::beat("WindowsEtwCollector");
+            if pipe_guard.observe(coverage::snapshot().etw_events_lost) {
+                let rc = control.disable_provider(etw_map::KERNEL_FILE);
+                coverage::update(|c| c.etw_pipe_provider = Some(false));
+                warn!(
+                    rc,
+                    "ETW session is losing events; named-pipe telemetry switched off to protect process and network coverage"
+                );
+            }
             batch.clear();
             tokio::select! {
                 n = rec_rx.recv_many(&mut batch, DECODE_BATCH) => if n == 0 { break },
@@ -183,6 +214,9 @@ impl Collector for EtwCollector {
         Err(anyhow!("ETW session ended"))
     }
 }
+
+/// Events the session may lose after start before named-pipe telemetry is shed.
+const PIPE_SHED_AFTER_LOST: u64 = 2000;
 
 /// Records decoded per blocking task.
 const DECODE_BATCH: usize = 256;
@@ -247,6 +281,7 @@ impl Session {
                 (etw_map::KERNEL_PROCESS, etw_map::KERNEL_PROCESS_KEYWORDS),
                 (etw_map::KERNEL_NETWORK, etw_map::KERNEL_NETWORK_KEYWORDS),
                 (etw_map::DNS_CLIENT, 0u64),
+                (etw_map::KERNEL_FILE, etw_map::KERNEL_FILE_KEYWORDS),
             ] {
                 let g = guid_from_u128(guid);
                 let rc = EnableTraceEx2(
@@ -266,6 +301,7 @@ impl Session {
                         c.etw_driver_load = Some(rc == ERROR_SUCCESS);
                     }
                     etw_map::KERNEL_NETWORK => c.etw_network_provider = Some(rc == ERROR_SUCCESS),
+                    etw_map::KERNEL_FILE => c.etw_pipe_provider = Some(rc == ERROR_SUCCESS),
                     _ => c.etw_dns_provider = Some(rc == ERROR_SUCCESS),
                 });
                 if rc != ERROR_SUCCESS {
@@ -373,6 +409,23 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
     let Some(sink) = (record.UserContext as *const Sink).as_ref() else {
         return;
     };
+    // Kernel-File create events are orders of magnitude more frequent than
+    // anything else on this session and only named pipes are wanted: decide
+    // on the raw payload, before TDH decoding or the channel. Not an error and
+    // not a loss, so nothing is counted.
+    if guid_to_u128(&record.EventHeader.ProviderId) == etw_map::KERNEL_FILE {
+        let payload: &[u8] = if record.UserData.is_null() {
+            &[]
+        } else {
+            std::slice::from_raw_parts(
+                record.UserData as *const u8,
+                (record.UserDataLength as usize).min(4096),
+            )
+        };
+        if record.EventHeader.EventDescriptor.Id != 12 || !etw_map::payload_mentions_pipe(payload) {
+            return;
+        }
+    }
     if let Some(mut decoded) = decode_record(record) {
         if decoded.provider == etw_map::KERNEL_PROCESS && decoded.id == 1 {
             decoded.captured = Some(capture_at_start(&decoded));
@@ -387,6 +440,7 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         etw_map::KERNEL_PROCESS,
         etw_map::KERNEL_NETWORK,
         etw_map::DNS_CLIENT,
+        etw_map::KERNEL_FILE,
     ]
     .contains(&guid_to_u128(&record.EventHeader.ProviderId))
     {
@@ -434,6 +488,7 @@ unsafe fn decode_record(record: &EVENT_RECORD) -> Option<EtwRecord> {
     if provider != etw_map::KERNEL_PROCESS
         && provider != etw_map::KERNEL_NETWORK
         && provider != etw_map::DNS_CLIENT
+        && provider != etw_map::KERNEL_FILE
     {
         return None;
     }
@@ -596,6 +651,9 @@ struct DecodeState {
     system_root: String,
     started: std::time::Instant,
     driver_gate: etw_map::RateGate,
+    pipe_gate: etw_map::RateGate,
+    /// (pid, pipe path): a client reopening one pipe is reported once a minute.
+    pipes_seen: etw_map::RecentSet<(u32, String)>,
     /// image digest -> signature verdict, so a reloaded driver is verified once.
     driver_signatures: HashMap<String, &'static str>,
     /// pid → image path, so a network/DNS event can name its process.
@@ -611,6 +669,8 @@ impl DecodeState {
             // Boot-time driver storms fit the burst; sustained 5/s is not a driver load rate.
             driver_gate: etw_map::RateGate::new(5, 256),
             driver_signatures: HashMap::new(),
+            pipe_gate: etw_map::RateGate::new(20, 100),
+            pipes_seen: etw_map::RecentSet::new(60_000, 4096),
             proc_images: HashMap::new(),
         }
     }
@@ -786,6 +846,17 @@ impl DecodeState {
                     );
                 }
             }
+            p if p == etw_map::KERNEL_FILE => {
+                if let Some((pid, path)) = etw_map::pipe_create(rec) {
+                    if let Some(data) = self.pipe_event(rec.timestamp, pid, path) {
+                        emit(
+                            EventClass::Filesystem,
+                            EventAction::Create,
+                            EventData::Filesystem(data),
+                        );
+                    }
+                }
+            }
             p if p == etw_map::DNS_CLIENT => {
                 if let Some((pid, mut data)) = etw_map::dns_query(rec) {
                     self.attribute_dns(rec.timestamp, pid, &mut data);
@@ -843,6 +914,65 @@ impl DecodeState {
             hash_error: hash.failure(),
             signature: Some(signature.into()),
             image_size: drv.image_size,
+        })
+    }
+
+    /// A named-pipe create/connect as a filesystem create under `\\.\pipe\`.
+    /// Pipe names are never allow-listed (a Cobalt Strike profile can imitate
+    /// any browser's pipe names), so volume is bounded by per-(pid, name)
+    /// deduplication and a token bucket; both refusals are counted as
+    /// `rate_limit_applied`.
+    fn pipe_event(
+        &mut self,
+        observed: i64,
+        pid: u32,
+        path: String,
+    ) -> Option<crate::schema::FilesystemEventData> {
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        let limited = !self.pipes_seen.first_seen((pid, path.clone()), now_ms)
+            || !self.pipe_gate.allow(now_ms);
+        if limited {
+            crate::telemetry::metrics::metrics()
+                .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
+            return None;
+        }
+        let pid = i32::try_from(pid).ok().filter(|p| *p > 0);
+        // Same generation rule as network events: a recycled PID never lends
+        // its image to a pipe it did not open.
+        let actor = pid.map(|pid| {
+            let start = crate::telemetry::identity::process_start_time(pid)
+                .filter(|s| etw_map::same_process_generation(Some(*s), Some(*s), observed));
+            let exe = start.and_then(|s| {
+                self.proc_images
+                    .get(&pid)
+                    .filter(|(_, started)| *started == s)
+                    .map(|(image, _)| image.clone())
+            });
+            crate::schema::ProcessLineage {
+                pid,
+                process_start_time: start,
+                uid: 0,
+                gid: 0,
+                username: String::new(),
+                comm: exe
+                    .as_deref()
+                    .map(|e| e.rsplit('\\').next().unwrap_or(e).to_string())
+                    .unwrap_or_default(),
+                exe,
+                cmdline: None,
+                ancestors: Vec::new(),
+            }
+        });
+        Some(crate::schema::FilesystemEventData {
+            path,
+            operation: crate::schema::FilesystemOperation::Created,
+            source: crate::schema::FilesystemSource::Realtime,
+            integrity: crate::schema::IntegrityStatus::NotChecked,
+            expected_hash: None,
+            actual_hash: None,
+            size_delta: None,
+            actor,
+            change_summary: None,
         })
     }
 
