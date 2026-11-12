@@ -15,11 +15,13 @@
 //! `CAP_NET_RAW` it fails to open and the collector exits cleanly, exactly like
 //! the eBPF collectors — every other collector keeps running.
 //!
-//! Scope is deliberately narrow (UDP/53 responses and the TLS ClientHello in the
-//! first TCP segment) so the parse path stays bounded and the capture volume
-//! low; deep TCP reassembly / JA3S (server-side) are out of scope here.
+//! Scope is deliberately narrow (UDP/53 responses and the first ClientHello /
+//! ServerHello of a TLS flow) so the parse path stays bounded and the capture
+//! volume low. The handshake is reassembled across TCP segments with hard
+//! per-flow and per-table caps in [`super::tls_flow`], which also derives JA3S.
 
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -27,6 +29,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::Sender;
 use tracing::info;
 
+use super::tls_flow::{TcpSegment, TlsTracker};
 use crate::collectors::Collector;
 use crate::schema::{
     AgentEvent, DnsResolutionData, EventAction, EventClass, EventData, Severity, TlsHandshakeData,
@@ -70,41 +73,53 @@ impl Collector for PacketCaptureCollector {
         info!("Passive DNS/TLS capture attached (AF_PACKET)");
 
         let mut buf = [0u8; 65_536];
+        let mut tracker = TlsTracker::new();
+        let mut sweep_tick = tokio::time::interval(Duration::from_secs(1));
+        sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let mut guard = async_fd.readable().await?;
-            // Drain everything currently queued before re-arming readiness.
-            loop {
-                let fd = guard.get_inner().0;
-                let n =
-                    unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-                if n <= 0 {
-                    // EWOULDBLOCK (queue drained) or a transient error: re-arm.
-                    guard.clear_ready();
-                    break;
-                }
-                let frame = &buf[..n as usize];
-                for ev in parse_frame(frame) {
-                    let event = match ev {
-                        CaptureEvent::Dns(d) => AgentEvent::new(
-                            agent_id.clone(),
-                            hostname.clone(),
-                            EventClass::Network,
-                            EventAction::DnsResponse,
-                            Severity::Info,
-                            EventData::DnsResolution(d),
-                        ),
-                        CaptureEvent::Tls(t) => AgentEvent::new(
-                            agent_id.clone(),
-                            hostname.clone(),
-                            EventClass::Network,
-                            EventAction::TlsHandshake,
-                            Severity::Info,
-                            EventData::TlsHandshake(t),
-                        ),
-                    };
-                    if tx.send(event).await.is_err() {
-                        return Ok(());
+            let mut ready = Vec::new();
+            tokio::select! {
+                guard = async_fd.readable() => {
+                    let mut guard = guard?;
+                    // Drain everything currently queued before re-arming readiness.
+                    loop {
+                        let fd = guard.get_inner().0;
+                        let n = unsafe {
+                            libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+                        };
+                        if n <= 0 {
+                            // EWOULDBLOCK (queue drained) or a transient error: re-arm.
+                            guard.clear_ready();
+                            break;
+                        }
+                        ready.extend(parse_frame(&buf[..n as usize], &mut tracker, Instant::now()));
                     }
+                }
+                _ = sweep_tick.tick() => {
+                    ready.extend(tracker.sweep(Instant::now()).into_iter().map(CaptureEvent::Tls));
+                }
+            }
+            for ev in ready {
+                let event = match ev {
+                    CaptureEvent::Dns(d) => AgentEvent::new(
+                        agent_id.clone(),
+                        hostname.clone(),
+                        EventClass::Network,
+                        EventAction::DnsResponse,
+                        Severity::Info,
+                        EventData::DnsResolution(d),
+                    ),
+                    CaptureEvent::Tls(t) => AgentEvent::new(
+                        agent_id.clone(),
+                        hostname.clone(),
+                        EventClass::Network,
+                        EventAction::TlsHandshake,
+                        Severity::Info,
+                        EventData::TlsHandshake(t),
+                    ),
+                };
+                if tx.send(event).await.is_err() {
+                    return Ok(());
                 }
             }
         }
@@ -154,7 +169,7 @@ enum CaptureEvent {
 }
 
 /// Parse one captured L3 frame (IP packet) into zero or more capture events.
-fn parse_frame(frame: &[u8]) -> Vec<CaptureEvent> {
+fn parse_frame(frame: &[u8], tracker: &mut TlsTracker, now: Instant) -> Vec<CaptureEvent> {
     let mut out = Vec::new();
     let Some(l3) = parse_l3(frame) else {
         return out;
@@ -172,10 +187,13 @@ fn parse_frame(frame: &[u8]) -> Vec<CaptureEvent> {
             }
         }
         IPPROTO_TCP => {
-            if let Some((_sport, dport, payload)) = parse_tcp(l3.payload) {
-                if let Some(t) = parse_tls(payload, l3.src, l3.dst, dport) {
-                    out.push(CaptureEvent::Tls(t));
-                }
+            if let Some(seg) = parse_tcp(l3.payload) {
+                out.extend(
+                    tracker
+                        .on_tcp(l3.src, l3.dst, &seg, now)
+                        .into_iter()
+                        .map(CaptureEvent::Tls),
+                );
             }
         }
         _ => {}
@@ -250,7 +268,7 @@ fn parse_udp(data: &[u8]) -> Option<(u16, u16, &[u8])> {
     Some((sport, dport, &data[8..]))
 }
 
-fn parse_tcp(data: &[u8]) -> Option<(u16, u16, &[u8])> {
+fn parse_tcp(data: &[u8]) -> Option<TcpSegment<'_>> {
     if data.len() < 20 {
         return None;
     }
@@ -260,7 +278,13 @@ fn parse_tcp(data: &[u8]) -> Option<(u16, u16, &[u8])> {
     if data_off < 20 || data.len() < data_off {
         return None;
     }
-    Some((sport, dport, &data[data_off..]))
+    Some(TcpSegment {
+        sport,
+        dport,
+        seq: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
+        flags: data[13],
+        payload: &data[data_off..],
+    })
 }
 
 // ── DNS ─────────────────────────────────────────────────────────────────────
@@ -444,7 +468,7 @@ struct ClientHello {
 }
 
 /// GREASE values (RFC 8701) are excluded from JA3 — pattern `0x?A?A`.
-fn is_grease(v: u16) -> bool {
+pub(super) fn is_grease(v: u16) -> bool {
     (v & 0x0f0f) == 0x0a0a
 }
 
@@ -459,10 +483,16 @@ fn tls_version_name(v: u16) -> &'static str {
     }
 }
 
-/// Parse a TLS record carrying a ClientHello (first TCP segment) into a
-/// [`TlsHandshakeData`] with SNI + JA3. Returns `None` if it isn't a ClientHello.
-fn parse_tls(payload: &[u8], src: IpAddr, dst: IpAddr, dport: u16) -> Option<TlsHandshakeData> {
-    let ch = parse_client_hello(payload)?;
+/// Build the handshake event from a complete ClientHello handshake message
+/// (reassembled by [`super::tls_flow`]). `ja3s` is filled in later from the
+/// server's reply. Returns `None` if the message is malformed.
+pub(super) fn client_hello_event(
+    msg: &[u8],
+    src: IpAddr,
+    dst: IpAddr,
+    dport: u16,
+) -> Option<TlsHandshakeData> {
+    let ch = parse_client_hello(msg)?;
 
     // Prefer the highest non-GREASE supported_versions entry, else the legacy
     // version, for the human-readable label.
@@ -486,6 +516,8 @@ fn parse_tls(payload: &[u8], src: IpAddr, dst: IpAddr, dport: u16) -> Option<Tls
         ja3,
         ja3_hash,
         alpn: ch.alpn,
+        ja3s: None,
+        ja3s_string: None,
     })
 }
 
@@ -521,16 +553,9 @@ fn md5_hex(data: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// Parse the ClientHello out of one or more TLS records in `payload`.
-fn parse_client_hello(payload: &[u8]) -> Option<ClientHello> {
-    // TLS record header: type(1)=22 handshake, version(2), length(2).
-    if payload.len() < 5 || payload[0] != 22 {
-        return None;
-    }
-    let rec_len = u16::from_be_bytes([payload[3], payload[4]]) as usize;
-    let body = payload.get(5..5 + rec_len.min(payload.len().saturating_sub(5)))?;
-
-    // Handshake header: type(1)=1 ClientHello, length(3).
+/// Parse a complete ClientHello handshake message (starting at the handshake
+/// header: type(1)=1, length(3)).
+fn parse_client_hello(body: &[u8]) -> Option<ClientHello> {
     if body.len() < 4 || body[0] != 1 {
         return None;
     }
@@ -843,8 +868,8 @@ mod tests {
     #[test]
     fn parses_client_hello_sni_and_ja3() {
         let rec = sample_client_hello();
-        let t = parse_tls(
-            &rec,
+        let t = client_hello_event(
+            &rec[5..], // handshake message without the record header
             "10.0.0.5".parse().unwrap(),
             "1.2.3.4".parse().unwrap(),
             443,
@@ -858,6 +883,7 @@ mod tests {
         // 32-hex md5
         assert_eq!(t.ja3_hash.len(), 32);
         assert!(t.ja3_hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(t.ja3s.is_none() && t.ja3s_string.is_none());
     }
 
     #[test]
@@ -872,7 +898,7 @@ mod tests {
     #[test]
     fn non_tls_payload_is_none() {
         assert!(parse_client_hello(b"GET / HTTP/1.1\r\n").is_none());
-        assert!(parse_client_hello(&[22, 3, 1, 0, 2, 99, 0]).is_none()); // handshake type 99
+        assert!(parse_client_hello(&[99, 0, 0, 0]).is_none()); // handshake type 99
     }
 
     #[test]
@@ -906,11 +932,30 @@ mod tests {
         pkt.extend_from_slice(&((dns.len() + 8) as u16).to_be_bytes());
         pkt.extend_from_slice(&0u16.to_be_bytes());
         pkt.extend_from_slice(&dns);
-        let events = parse_frame(&pkt);
+        let events = parse_frame(&pkt, &mut TlsTracker::new(), Instant::now());
         assert_eq!(events.len(), 1);
         match &events[0] {
             CaptureEvent::Dns(d) => assert_eq!(d.qname, "example.com"),
             _ => panic!("expected DNS event"),
         }
+    }
+
+    #[test]
+    fn parse_tcp_extracts_seq_flags_and_payload() {
+        let mut tcp = vec![0u8; 20];
+        tcp[0..2].copy_from_slice(&40000u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        tcp[4..8].copy_from_slice(&0xdead_beefu32.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = 0x18; // PSH|ACK
+        tcp.extend_from_slice(b"hi");
+        let seg = parse_tcp(&tcp).unwrap();
+        assert_eq!((seg.sport, seg.dport), (40000, 443));
+        assert_eq!(seg.seq, 0xdead_beef);
+        assert_eq!(seg.flags, 0x18);
+        assert_eq!(seg.payload, b"hi");
+        assert!(parse_tcp(&tcp[..19]).is_none());
+        tcp[12] = 4 << 4; // data offset below the minimum header
+        assert!(parse_tcp(&tcp).is_none());
     }
 }
