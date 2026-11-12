@@ -260,7 +260,11 @@ impl Session {
                     std::ptr::null(),
                 );
                 coverage::update(|c| match guid {
-                    etw_map::KERNEL_PROCESS => c.etw_process_provider = Some(rc == ERROR_SUCCESS),
+                    etw_map::KERNEL_PROCESS => {
+                        c.etw_process_provider = Some(rc == ERROR_SUCCESS);
+                        // Driver loads ride on the image-load keyword of this provider.
+                        c.etw_driver_load = Some(rc == ERROR_SUCCESS);
+                    }
                     etw_map::KERNEL_NETWORK => c.etw_network_provider = Some(rc == ERROR_SUCCESS),
                     _ => c.etw_dns_provider = Some(rc == ERROR_SUCCESS),
                 });
@@ -589,6 +593,11 @@ fn guid_to_u128(g: &GUID) -> u128 {
 /// handle keeps the exited process object alive in the kernel.
 struct DecodeState {
     devices: DeviceMap,
+    system_root: String,
+    started: std::time::Instant,
+    driver_gate: etw_map::RateGate,
+    /// image digest -> signature verdict, so a reloaded driver is verified once.
+    driver_signatures: HashMap<String, &'static str>,
     /// pid → image path, so a network/DNS event can name its process.
     proc_images: HashMap<i32, (String, u64)>,
 }
@@ -597,6 +606,11 @@ impl DecodeState {
     fn new() -> Self {
         Self {
             devices: device_map(),
+            system_root: std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
+            started: std::time::Instant::now(),
+            // Boot-time driver storms fit the burst; sustained 5/s is not a driver load rate.
+            driver_gate: etw_map::RateGate::new(5, 256),
+            driver_signatures: HashMap::new(),
             proc_images: HashMap::new(),
         }
     }
@@ -692,7 +706,15 @@ impl DecodeState {
                     }
                 }
                 5 => {
-                    if let Some((pid, dll)) = etw_map::image_load(rec, &self.devices) {
+                    if let Some(drv) = etw_map::driver_load(rec, &self.devices, &self.system_root) {
+                        if let Some(data) = self.driver_module(drv) {
+                            emit(
+                                EventClass::Kernel,
+                                EventAction::ModuleLoad,
+                                EventData::ModuleLoad(data),
+                            );
+                        }
+                    } else if let Some((pid, dll)) = etw_map::image_load(rec, &self.devices) {
                         let process_exe = self
                             .proc_images
                             .get(&pid)
@@ -721,6 +743,10 @@ impl DecodeState {
                                     taints: 0,
                                     path: Some(dll),
                                     process_exe: Some(exe),
+                                    sha256: None,
+                                    hash_error: None,
+                                    signature: None,
+                                    image_size: None,
                                 }),
                             );
                         }
@@ -774,6 +800,50 @@ impl DecodeState {
             _ => {}
         }
         out
+    }
+
+    /// A kernel-mode image load as a `kernel/module_load` event: path, size,
+    /// image hash and embedded-signature verdict. Rate-limited; a refusal is
+    /// counted as `rate_limit_applied`. Runs inside `spawn_blocking`, so the
+    /// file reads do not occupy an async worker.
+    fn driver_module(&mut self, drv: etw_map::DriverLoad) -> Option<crate::schema::ModuleLoadData> {
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        if !self.driver_gate.allow(now_ms) {
+            crate::telemetry::metrics::metrics()
+                .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
+            return None;
+        }
+        let path = std::path::Path::new(&drv.path);
+        let hash = image_hash::hash_image(path);
+        let signature = match hash.digest() {
+            Some(digest) => {
+                if self.driver_signatures.len() >= 1024 {
+                    self.driver_signatures.clear();
+                }
+                *self
+                    .driver_signatures
+                    .entry(digest.to_string())
+                    .or_insert_with(|| signature_verdict(path))
+            }
+            // No digest: the file is unreadable or too large, so a verdict
+            // about it would not describe what was loaded.
+            None => "unverified",
+        };
+        Some(crate::schema::ModuleLoadData {
+            // Kernel images belong to the System process.
+            pid: 4,
+            uid: 0,
+            gid: 0,
+            username: "SYSTEM".into(),
+            name: drv.name,
+            taints: 0,
+            path: Some(drv.path),
+            process_exe: None,
+            sha256: hash.digest().map(str::to_owned),
+            hash_error: hash.failure(),
+            signature: Some(signature.into()),
+            image_size: drv.image_size,
+        })
     }
 
     /// Names the process behind a DNS-Client event. The DNS-Client library runs
@@ -852,6 +922,14 @@ impl DecodeState {
             exe_sha256: hash.digest().map(str::to_owned),
             exe_sha256_error: hash.failure(),
         }
+    }
+}
+
+fn signature_verdict(path: &std::path::Path) -> &'static str {
+    if crate::inventory::windows_drivers::embedded_signature_valid(path) {
+        "valid_embedded"
+    } else {
+        "unverified"
     }
 }
 

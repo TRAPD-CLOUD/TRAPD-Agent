@@ -809,6 +809,21 @@ pub struct ModuleLoadData {
     /// Windows: image of the process that loaded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_exe: Option<String>,
+    /// Windows driver loads: `sha256:<hex>` of the image file, read after the
+    /// load notification (the file may have changed or vanished since).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Why `sha256` is absent although a path was known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_error: Option<EnrichmentError>,
+    /// Windows driver loads: `valid_embedded` (a valid embedded Authenticode
+    /// signature) or `unverified`. `unverified` is not "unsigned": a
+    /// catalog-signed driver has no embedded signature and lands here too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Windows driver loads: mapped image size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

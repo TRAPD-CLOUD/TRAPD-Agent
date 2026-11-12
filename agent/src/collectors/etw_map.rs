@@ -13,6 +13,11 @@
 //! | Microsoft-Windows-Kernel-Process | `22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716` | `0x10` process, `0x40` image | 1 ProcessStart, 2 ProcessStop, 5 ImageLoad |
 //! | Microsoft-Windows-Kernel-Network | `7dd42a49-5329-4832-8dfd-43d979153a88` | `0x10` IPv4, `0x20` IPv6 | 12/28 connect, 15/31 accept |
 //! | Microsoft-Windows-DNS-Client | `1c95126e-7eea-49a9-a3fe-a378b03ddb4d` | all | 3008 query completed |
+//! | Microsoft-Windows-Kernel-File | `edd08927-9cc4-4e65-b970-c2560fb5c289` | `0x80` create | 12 Create (named pipes only) |
+//! | Microsoft-Antimalware-Scan-Interface | `2a576b87-09a7-520e-c21a-4942f0271d67` | all | 1101 scan |
+//!
+//! Driver loads are Kernel-Process event 5 whose image base lies in kernel
+//! space (no extra provider).
 //!
 //! Property names differ slightly between Windows builds (`ImageName` vs.
 //! `ImageFileName`, `ParentProcessID` vs. `ParentId`); every lookup accepts the
@@ -28,6 +33,10 @@ use crate::schema::{
 pub const KERNEL_PROCESS: u128 = 0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716;
 pub const KERNEL_NETWORK: u128 = 0x7dd42a49_5329_4832_8dfd_43d979153a88;
 pub const DNS_CLIENT: u128 = 0x1c95126e_7eea_49a9_a3fe_a378b03ddb4d;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const KERNEL_FILE: u128 = 0xedd08927_9cc4_4e65_b970_c2560fb5c289;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const AMSI: u128 = 0x2a576b87_09a7_520e_c21a_4942f0271d67;
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const KERNEL_PROCESS_KEYWORDS: u64 = 0x10 | 0x40;
@@ -245,6 +254,98 @@ pub fn image_load(rec: &EtwRecord, devices: &DeviceMap) -> Option<(i32, String)>
     let pid = i32::try_from(rec.int(&["ProcessID", "ProcessId"])?).ok()?;
     let image = rec.str(&["ImageName", "FileName"])?;
     Some((pid, device_to_dos(&image, devices)))
+}
+
+/// First address of kernel space on x64 Windows (canonical upper half).
+const KERNEL_SPACE_START: u64 = 0xFFFF_8000_0000_0000;
+
+/// A kernel-mode image load (a driver, or the kernel itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverLoad {
+    pub path: String,
+    pub name: String,
+    pub image_size: Option<u64>,
+}
+
+/// `\SystemRoot\...` (the loader's own alias) → `<system_root>\...`.
+fn resolve_system_root(path: &str, system_root: &str) -> String {
+    const PREFIX: &str = "\\SystemRoot\\";
+    match path.get(..PREFIX.len()) {
+        Some(p) if p.eq_ignore_ascii_case(PREFIX) && !system_root.is_empty() => format!(
+            "{}\\{}",
+            system_root.trim_end_matches('\\'),
+            &path[PREFIX.len()..]
+        ),
+        _ => path.to_string(),
+    }
+}
+
+/// Kernel-Process event 5 for a kernel-mode image → driver load.
+///
+/// The image base decides: user-mode DLLs and EXEs never map into kernel
+/// space, so `ImageBase >= 0xFFFF800000000000` is definitive and independent of
+/// which pseudo-PID the provider reports (4 / 0). Without an `ImageBase`
+/// property the PID 4 + `.sys` shape is accepted as a weaker fallback.
+pub fn driver_load(rec: &EtwRecord, devices: &DeviceMap, system_root: &str) -> Option<DriverLoad> {
+    if rec.provider != KERNEL_PROCESS || rec.id != 5 {
+        return None;
+    }
+    let raw = rec.str(&["ImageName", "FileName"])?;
+    let in_kernel = match rec.int(&["ImageBase"]) {
+        Some(base) => base >= KERNEL_SPACE_START,
+        None => {
+            rec.int(&["ProcessID", "ProcessId"]) == Some(4)
+                && raw.to_ascii_lowercase().ends_with(".sys")
+        }
+    };
+    if !in_kernel {
+        return None;
+    }
+    let path = resolve_system_root(&device_to_dos(&raw, devices), system_root);
+    if path.is_empty() {
+        return None;
+    }
+    Some(DriverLoad {
+        name: basename(&path),
+        path,
+        image_size: rec.int(&["ImageSize"]).filter(|s| *s > 0),
+    })
+}
+
+/// Token bucket with an injected clock (milliseconds), so tests are
+/// deterministic. Every refusal must be counted by the caller as
+/// `DropReason::RateLimitApplied`; the gate never discards silently itself.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub struct RateGate {
+    per_sec: f64,
+    burst: f64,
+    tokens: f64,
+    last_ms: u64,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl RateGate {
+    pub fn new(per_sec: u32, burst: u32) -> Self {
+        Self {
+            per_sec: f64::from(per_sec),
+            burst: f64::from(burst.max(1)),
+            tokens: f64::from(burst.max(1)),
+            last_ms: 0,
+        }
+    }
+
+    pub fn allow(&mut self, now_ms: u64) -> bool {
+        let dt = now_ms.saturating_sub(self.last_ms) as f64 / 1000.0;
+        self.last_ms = self.last_ms.max(now_ms);
+        self.tokens = (self.tokens + dt * self.per_sec).min(self.burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// A DLL load worth reporting: a process that runs from a protected location
@@ -544,6 +645,99 @@ mod tests {
             device_to_dos("aéabc", &vec![("ab".into(), "C:".into())]),
             "aéabc"
         );
+    }
+
+    #[test]
+    fn kernel_space_image_loads_are_driver_loads() {
+        let d = devices();
+        let base = |b: u64| int(b, 8);
+        let r = rec(
+            KERNEL_PROCESS,
+            5,
+            &[
+                ("ProcessID", int(4, 4)),
+                (
+                    "ImageName",
+                    s("\\Device\\HarddiskVolume3\\Windows\\System32\\drivers\\RTCore64.sys"),
+                ),
+                ("ImageBase", base(0xFFFF_F801_2345_0000)),
+                ("ImageSize", int(0x9000, 4)),
+            ],
+        );
+        let drv = driver_load(&r, &d, "C:\\Windows").unwrap();
+        assert_eq!(drv.path, "C:\\Windows\\System32\\drivers\\RTCore64.sys");
+        assert_eq!(drv.name, "RTCore64.sys");
+        assert_eq!(drv.image_size, Some(0x9000));
+        // The pseudo-PID does not matter, the base does.
+        let r = rec(
+            KERNEL_PROCESS,
+            5,
+            &[
+                ("ProcessID", int(0, 4)),
+                ("ImageName", s("\\SystemRoot\\system32\\drivers\\x.sys")),
+                ("ImageBase", base(0xFFFF_8000_0000_0000)),
+            ],
+        );
+        assert_eq!(
+            driver_load(&r, &d, "C:\\Windows").unwrap().path,
+            "C:\\Windows\\system32\\drivers\\x.sys"
+        );
+    }
+
+    #[test]
+    fn user_mode_images_are_not_driver_loads() {
+        let d = devices();
+        let r = rec(
+            KERNEL_PROCESS,
+            5,
+            &[
+                ("ProcessID", int(4, 4)),
+                ("ImageName", s("\\Device\\HarddiskVolume3\\a.sys")),
+                ("ImageBase", int(0x7FF6_0000_0000, 8)),
+            ],
+        );
+        // A .sys name in a user-mode mapping must not pass on the name alone.
+        assert!(driver_load(&r, &d, "C:\\Windows").is_none());
+        // Wrong provider / event id.
+        let mut r2 = r.clone();
+        r2.id = 1;
+        assert!(driver_load(&r2, &d, "").is_none());
+        // Fallback only when ImageBase is absent: PID 4 and .sys.
+        let r3 = rec(
+            KERNEL_PROCESS,
+            5,
+            &[
+                ("ProcessID", int(4, 4)),
+                ("ImageName", s("\\Device\\HarddiskVolume3\\b.SYS")),
+            ],
+        );
+        assert!(driver_load(&r3, &d, "").is_some());
+        let r4 = rec(
+            KERNEL_PROCESS,
+            5,
+            &[
+                ("ProcessID", int(900, 4)),
+                ("ImageName", s("\\Device\\HarddiskVolume3\\b.dll")),
+            ],
+        );
+        assert!(driver_load(&r4, &d, "").is_none());
+    }
+
+    #[test]
+    fn rate_gate_bursts_then_refills() {
+        let mut g = RateGate::new(2, 3);
+        assert!(g.allow(0) && g.allow(0) && g.allow(0));
+        assert!(!g.allow(0), "burst exhausted");
+        assert!(!g.allow(100), "0.2 tokens only");
+        assert!(g.allow(600), "one token after 0.5 s at 2/s");
+        assert!(!g.allow(600));
+        // A clock that goes backwards neither panics nor mints tokens.
+        assert!(!g.allow(10));
+        // Never above the burst.
+        for _ in 0..3 {
+            assert!(g.allow(60_000));
+        }
+        assert!(!g.allow(60_000));
     }
 
     #[test]

@@ -307,6 +307,10 @@ fn test_module_load_event_roundtrip() {
             taints: 0,
             path: None,
             process_exe: None,
+            sha256: None,
+            hash_error: None,
+            signature: None,
+            image_size: None,
         }),
     );
     let json = serde_json::to_string(&event).expect("must serialize");

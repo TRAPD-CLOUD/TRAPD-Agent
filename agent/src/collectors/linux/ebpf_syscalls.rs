@@ -1696,6 +1696,10 @@ impl Collector for EbpfSyscallCollector {
                                     taints:   ev.taints,
                                     path: None,
                                     process_exe: None,
+                                    sha256: None,
+                                    hash_error: None,
+                                    signature: None,
+                                    image_size: None,
                                 }),
                             );
                             if tx.send(event).await.is_err() { return Ok(()); }

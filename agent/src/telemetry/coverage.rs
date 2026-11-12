@@ -32,6 +32,11 @@ pub struct Coverage {
     pub etw_network_provider: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etw_dns_provider: Option<bool>,
+    /// Driver loads (kernel-mode images) arrive through the Kernel-Process
+    /// image-load keyword. Loads before the agent started are only in the
+    /// periodic driver inventory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etw_driver_load: Option<bool>,
     /// Events the ETW session dropped (cumulative since start).
     #[serde(skip_serializing_if = "is_zero")]
     pub etw_events_lost: u64,
@@ -111,6 +116,10 @@ impl Coverage {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn etw_process_active(&self) -> bool {
         self.etw_session == Some(true) && self.etw_process_provider == Some(true)
+    }
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn etw_driver_load_active(&self) -> bool {
+        self.etw_session == Some(true) && self.etw_driver_load == Some(true)
     }
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn etw_network_active(&self) -> bool {

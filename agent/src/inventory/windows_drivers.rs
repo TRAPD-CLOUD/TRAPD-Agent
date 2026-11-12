@@ -111,7 +111,7 @@ pub fn loaded() -> Vec<super::KernelModule> {
 
 /// Verify the embedded Authenticode signature without UI or network access.
 #[cfg(windows)]
-fn embedded_signature_valid(path: &std::path::Path) -> bool {
+pub(crate) fn embedded_signature_valid(path: &std::path::Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::WinTrust::{
         WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
