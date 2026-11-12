@@ -51,6 +51,10 @@ const MAX_PROP_BYTES: usize = 64 * 1024;
 struct Sink {
     tx: tokio::sync::mpsc::Sender<EtwRecord>,
     lost: std::sync::atomic::AtomicU64,
+    /// Main session: Kernel-File is subscribed only for named pipes, so every
+    /// other Kernel-File record is dropped in the callback. The file-actor
+    /// session needs all of them and leaves this off.
+    kernel_file_pipes_only: bool,
 }
 
 /// Stops the native session when its async consumer is cancelled or exits.
@@ -67,6 +71,24 @@ impl NativeControl {
         }
     }
 }
+impl NativeControl {
+    /// Switch one provider off while the session keeps running.
+    fn disable_provider(&self, guid: u128) -> u32 {
+        let g = guid_from_u128(guid);
+        unsafe {
+            EnableTraceEx2(
+                self.handle,
+                &g,
+                EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        }
+    }
+}
 struct RunGuard(Arc<NativeControl>);
 impl Drop for RunGuard {
     fn drop(&mut self) {
@@ -79,7 +101,20 @@ fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-pub struct EtwCollector;
+/// Whether AMSI script text may be read at all. Mirrors
+/// `script_block_capture_enabled`; checked in the ETW callback so that, when
+/// off, the content property is never read into memory.
+static AMSI_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub struct EtwCollector {
+    config: Arc<std::sync::RwLock<crate::config::AgentConfig>>,
+}
+
+impl EtwCollector {
+    pub fn new(config: Arc<std::sync::RwLock<crate::config::AgentConfig>>) -> Self {
+        Self { config }
+    }
+}
 
 #[async_trait]
 impl Collector for EtwCollector {
@@ -93,14 +128,22 @@ impl Collector for EtwCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
+        // The opt-in must hold before the first record is decoded.
+        sync_amsi_capture(&self.config);
         let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<EtwRecord>(8192);
         let sink = Arc::new(Sink {
             tx: rec_tx,
             lost: std::sync::atomic::AtomicU64::new(0),
+            kernel_file_pipes_only: true,
         });
         // The blocking ProcessTrace loop owns a dedicated OS thread.
         let session = Session::start(sink).context("start ETW session")?;
         let _guard = RunGuard(Arc::clone(&session.control));
+        let control = Arc::clone(&session.control);
+        // The session is shared with process/network telemetry; named pipes
+        // are the optional, noisiest stream and are shed first.
+        let mut pipe_guard =
+            etw_map::LossGuard::new(coverage::snapshot().etw_events_lost, PIPE_SHED_AFTER_LOST);
         let trace_thread = std::thread::Builder::new()
             .name("trapd-etw".into())
             .spawn(move || session.process())
@@ -129,6 +172,15 @@ impl Collector for EtwCollector {
         let mut batch: Vec<EtwRecord> = Vec::with_capacity(DECODE_BATCH);
         loop {
             crate::telemetry::liveness::beat("WindowsEtwCollector");
+            sync_amsi_capture(&self.config);
+            if pipe_guard.observe(coverage::snapshot().etw_events_lost) {
+                let rc = control.disable_provider(etw_map::KERNEL_FILE);
+                coverage::update(|c| c.etw_pipe_provider = Some(false));
+                warn!(
+                    rc,
+                    "ETW session is losing events; named-pipe telemetry switched off to protect process and network coverage"
+                );
+            }
             batch.clear();
             tokio::select! {
                 n = rec_rx.recv_many(&mut batch, DECODE_BATCH) => if n == 0 { break },
@@ -276,6 +328,7 @@ impl Collector for EtwFileActorCollector {
         let sink = Arc::new(Sink {
             tx: rec_tx,
             lost: std::sync::atomic::AtomicU64::new(0),
+            kernel_file_pipes_only: false,
         });
         let session = Session::start_named(
             sink,
@@ -321,6 +374,23 @@ impl Collector for EtwFileActorCollector {
     }
 }
 
+/// Copy the operator's script-content opt-in into the callback-visible flag
+/// and the coverage record. Off when the config cannot be read.
+fn sync_amsi_capture(config: &std::sync::RwLock<crate::config::AgentConfig>) {
+    let on = config
+        .read()
+        .map(|c| c.script_block_capture_enabled)
+        .unwrap_or(false);
+    if AMSI_CAPTURE.swap(on, std::sync::atomic::Ordering::AcqRel) != on
+        || coverage::snapshot().amsi_content_capture.is_none()
+    {
+        coverage::update(|c| c.amsi_content_capture = Some(on));
+    }
+}
+
+/// Events the session may lose after start before named-pipe telemetry is shed.
+const PIPE_SHED_AFTER_LOST: u64 = 2000;
+
 /// Records decoded per blocking task.
 const DECODE_BATCH: usize = 256;
 
@@ -357,6 +427,8 @@ impl Session {
                 (etw_map::KERNEL_PROCESS, etw_map::KERNEL_PROCESS_KEYWORDS),
                 (etw_map::KERNEL_NETWORK, etw_map::KERNEL_NETWORK_KEYWORDS),
                 (etw_map::DNS_CLIENT, 0u64),
+                (etw_map::KERNEL_FILE, etw_map::KERNEL_FILE_PIPE_KEYWORDS),
+                (etw_map::AMSI, 0u64),
             ],
         )
     }
@@ -403,14 +475,28 @@ impl Session {
                     std::ptr::null(),
                 );
                 coverage::update(|c| match guid {
-                    etw_map::KERNEL_PROCESS => c.etw_process_provider = Some(rc == ERROR_SUCCESS),
+                    etw_map::KERNEL_PROCESS => {
+                        c.etw_process_provider = Some(rc == ERROR_SUCCESS);
+                        // Driver loads ride on the image-load keyword of this provider.
+                        c.etw_driver_load = Some(rc == ERROR_SUCCESS);
+                    }
                     etw_map::KERNEL_NETWORK => c.etw_network_provider = Some(rc == ERROR_SUCCESS),
                     etw_map::DNS_CLIENT => c.etw_dns_provider = Some(rc == ERROR_SUCCESS),
+                    // Only the main session's Kernel-File subscription feeds named
+                    // pipes; the file-actor session reports through its own task.
+                    etw_map::KERNEL_FILE if session == SESSION_NAME => {
+                        c.etw_pipe_provider = Some(rc == ERROR_SUCCESS)
+                    }
+                    etw_map::AMSI => c.etw_amsi_provider = Some(rc == ERROR_SUCCESS),
                     _ => {}
                 });
                 if rc != ERROR_SUCCESS {
                     warn!(provider = %format!("{guid:032x}"), rc, "EnableTraceEx2 failed");
-                    if guid == etw_map::KERNEL_PROCESS || guid == etw_map::KERNEL_FILE {
+                    // Kernel-File is required only by the file-actor session; on
+                    // the main session it carries optional pipe telemetry.
+                    let required = guid == etw_map::KERNEL_PROCESS
+                        || (guid == etw_map::KERNEL_FILE && session != SESSION_NAME);
+                    if required {
                         let _ = stop_control(control);
                         return Err(anyhow!("ETW provider {guid:032x} unavailable: {rc}"));
                     }
@@ -513,6 +599,25 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
     let Some(sink) = (record.UserContext as *const Sink).as_ref() else {
         return;
     };
+    // Kernel-File create events are orders of magnitude more frequent than
+    // anything else on the main session and only named pipes are wanted: decide
+    // on the raw payload, before TDH decoding or the channel. Not an error and
+    // not a loss, so nothing is counted.
+    if sink.kernel_file_pipes_only
+        && guid_to_u128(&record.EventHeader.ProviderId) == etw_map::KERNEL_FILE
+    {
+        let payload: &[u8] = if record.UserData.is_null() {
+            &[]
+        } else {
+            std::slice::from_raw_parts(
+                record.UserData as *const u8,
+                (record.UserDataLength as usize).min(4096),
+            )
+        };
+        if record.EventHeader.EventDescriptor.Id != 12 || !etw_map::payload_mentions_pipe(payload) {
+            return;
+        }
+    }
     if let Some(mut decoded) = decode_record(record) {
         if decoded.provider == etw_map::KERNEL_PROCESS && decoded.id == 1 {
             decoded.captured = Some(capture_at_start(&decoded));
@@ -528,6 +633,7 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         etw_map::KERNEL_NETWORK,
         etw_map::DNS_CLIENT,
         etw_map::KERNEL_FILE,
+        etw_map::AMSI,
     ]
     .contains(&guid_to_u128(&record.EventHeader.ProviderId))
     {
@@ -576,6 +682,7 @@ unsafe fn decode_record(record: &EVENT_RECORD) -> Option<EtwRecord> {
         && provider != etw_map::KERNEL_NETWORK
         && provider != etw_map::DNS_CLIENT
         && provider != etw_map::KERNEL_FILE
+        && provider != etw_map::AMSI
     {
         return None;
     }
@@ -627,6 +734,13 @@ unsafe fn decode_record(record: &EVENT_RECORD) -> Option<EtwRecord> {
         };
         let name = String::from_utf16_lossy(&raw[..end]);
         if name.is_empty() {
+            continue;
+        }
+        // Script text is read only with the operator's opt-in.
+        if provider == etw_map::AMSI
+            && name.eq_ignore_ascii_case("content")
+            && !AMSI_CAPTURE.load(std::sync::atomic::Ordering::Acquire)
+        {
             continue;
         }
         let in_type = pi.Anonymous1.nonStructType.InType;
@@ -735,6 +849,17 @@ fn guid_to_u128(g: &GUID) -> u128 {
 /// handle keeps the exited process object alive in the kernel.
 struct DecodeState {
     devices: DeviceMap,
+    system_root: String,
+    started: std::time::Instant,
+    driver_gate: etw_map::RateGate,
+    pipe_gate: etw_map::RateGate,
+    amsi_gate: etw_map::RateGate,
+    /// Identical scans (same content hash, or same app/name/verdict) once a minute.
+    amsi_seen: etw_map::RecentSet<String>,
+    /// (pid, pipe path): a client reopening one pipe is reported once a minute.
+    pipes_seen: etw_map::RecentSet<(u32, String)>,
+    /// image digest -> signature verdict, so a reloaded driver is verified once.
+    driver_signatures: HashMap<String, &'static str>,
     /// pid → image path, so a network/DNS event can name its process.
     proc_images: HashMap<i32, (String, u64)>,
     /// Per-connection byte totals (Kernel-Network send/receive).
@@ -747,6 +872,15 @@ impl DecodeState {
     fn new() -> Self {
         Self {
             devices: device_map(),
+            system_root: std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
+            started: std::time::Instant::now(),
+            // Boot-time driver storms fit the burst; sustained 5/s is not a driver load rate.
+            driver_gate: etw_map::RateGate::new(5, 256),
+            driver_signatures: HashMap::new(),
+            pipe_gate: etw_map::RateGate::new(20, 100),
+            amsi_gate: etw_map::RateGate::new(10, 50),
+            amsi_seen: etw_map::RecentSet::new(60_000, 4096),
+            pipes_seen: etw_map::RecentSet::new(60_000, 4096),
             proc_images: HashMap::new(),
             flows: etw_map::NetFlows::default(),
             dns_servers: etw_map::DnsServerHints::default(),
@@ -844,7 +978,15 @@ impl DecodeState {
                     }
                 }
                 5 => {
-                    if let Some((pid, dll)) = etw_map::image_load(rec, &self.devices) {
+                    if let Some(drv) = etw_map::driver_load(rec, &self.devices, &self.system_root) {
+                        if let Some(data) = self.driver_module(drv) {
+                            emit(
+                                EventClass::Kernel,
+                                EventAction::ModuleLoad,
+                                EventData::ModuleLoad(data),
+                            );
+                        }
+                    } else if let Some((pid, dll)) = etw_map::image_load(rec, &self.devices) {
                         let process_exe = self
                             .proc_images
                             .get(&pid)
@@ -874,6 +1016,10 @@ impl DecodeState {
                                     path: Some(dll),
                                     process_exe: Some(exe),
                                     process_start_time: None,
+                                    sha256: None,
+                                    hash_error: None,
+                                    signature: None,
+                                    image_size: None,
                                 }),
                             );
                         }
@@ -929,6 +1075,47 @@ impl DecodeState {
                     );
                 }
             }
+            p if p == etw_map::KERNEL_FILE => {
+                if let Some((pid, path)) = etw_map::pipe_create(rec) {
+                    if let Some(data) = self.pipe_event(rec.timestamp, pid, path) {
+                        emit(
+                            EventClass::Filesystem,
+                            EventAction::Create,
+                            EventData::Filesystem(data),
+                        );
+                    }
+                }
+            }
+            p if p == etw_map::AMSI => {
+                let capture = AMSI_CAPTURE.load(std::sync::atomic::Ordering::Acquire);
+                if let Some(scan) = etw_map::amsi_scan(rec, capture) {
+                    let now_ms = self.started.elapsed().as_millis() as u64;
+                    let key = scan.content_sha256.clone().unwrap_or_else(|| {
+                        format!(
+                            "{}|{}|{}",
+                            scan.data.proc.as_deref().unwrap_or_default(),
+                            scan.data
+                                .fields
+                                .get("content_name")
+                                .unwrap_or(&serde_json::Value::Null),
+                            scan.data
+                                .fields
+                                .get("scan_result")
+                                .unwrap_or(&serde_json::Value::Null),
+                        )
+                    });
+                    if !self.amsi_seen.first_seen(key, now_ms) || !self.amsi_gate.allow(now_ms) {
+                        crate::telemetry::metrics::metrics()
+                            .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
+                    } else {
+                        emit(
+                            EventClass::Log,
+                            EventAction::Log,
+                            EventData::Log(Box::new(scan.data)),
+                        );
+                    }
+                }
+            }
             p if p == etw_map::DNS_CLIENT => {
                 self.dns_servers.note(rec);
                 if let Some((pid, mut data)) = etw_map::dns_query(rec) {
@@ -948,6 +1135,110 @@ impl DecodeState {
             _ => {}
         }
         out
+    }
+
+    /// A kernel-mode image load as a `kernel/module_load` event: path, size,
+    /// image hash and embedded-signature verdict. Rate-limited; a refusal is
+    /// counted as `rate_limit_applied`. Runs inside `spawn_blocking`, so the
+    /// file reads do not occupy an async worker.
+    fn driver_module(&mut self, drv: etw_map::DriverLoad) -> Option<crate::schema::ModuleLoadData> {
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        if !self.driver_gate.allow(now_ms) {
+            crate::telemetry::metrics::metrics()
+                .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
+            return None;
+        }
+        let path = std::path::Path::new(&drv.path);
+        let hash = image_hash::hash_image(path);
+        let signature = match hash.digest() {
+            Some(digest) => {
+                if self.driver_signatures.len() >= 1024 {
+                    self.driver_signatures.clear();
+                }
+                *self
+                    .driver_signatures
+                    .entry(digest.to_string())
+                    .or_insert_with(|| signature_verdict(path))
+            }
+            // No digest: the file is unreadable or too large, so a verdict
+            // about it would not describe what was loaded.
+            None => "unverified",
+        };
+        Some(crate::schema::ModuleLoadData {
+            // Kernel images belong to the System process.
+            pid: 4,
+            uid: 0,
+            gid: 0,
+            username: "SYSTEM".into(),
+            name: drv.name,
+            taints: 0,
+            path: Some(drv.path),
+            process_exe: None,
+            process_start_time: None,
+            sha256: hash.digest().map(str::to_owned),
+            hash_error: hash.failure(),
+            signature: Some(signature.into()),
+            image_size: drv.image_size,
+        })
+    }
+
+    /// A named-pipe create/connect as a filesystem create under `\\.\pipe\`.
+    /// Pipe names are never allow-listed (a Cobalt Strike profile can imitate
+    /// any browser's pipe names), so volume is bounded by per-(pid, name)
+    /// deduplication and a token bucket; both refusals are counted as
+    /// `rate_limit_applied`.
+    fn pipe_event(
+        &mut self,
+        observed: i64,
+        pid: u32,
+        path: String,
+    ) -> Option<crate::schema::FilesystemEventData> {
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        let limited = !self.pipes_seen.first_seen((pid, path.clone()), now_ms)
+            || !self.pipe_gate.allow(now_ms);
+        if limited {
+            crate::telemetry::metrics::metrics()
+                .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
+            return None;
+        }
+        let pid = i32::try_from(pid).ok().filter(|p| *p > 0);
+        // Same generation rule as network events: a recycled PID never lends
+        // its image to a pipe it did not open.
+        let actor = pid.map(|pid| {
+            let start = crate::telemetry::identity::process_start_time(pid)
+                .filter(|s| etw_map::same_process_generation(Some(*s), Some(*s), observed));
+            let exe = start.and_then(|s| {
+                self.proc_images
+                    .get(&pid)
+                    .filter(|(_, started)| *started == s)
+                    .map(|(image, _)| image.clone())
+            });
+            crate::schema::ProcessLineage {
+                pid,
+                process_start_time: start,
+                uid: 0,
+                gid: 0,
+                username: String::new(),
+                comm: exe
+                    .as_deref()
+                    .map(|e| e.rsplit('\\').next().unwrap_or(e).to_string())
+                    .unwrap_or_default(),
+                exe,
+                cmdline: None,
+                ancestors: Vec::new(),
+            }
+        });
+        Some(crate::schema::FilesystemEventData {
+            path,
+            operation: crate::schema::FilesystemOperation::Created,
+            source: crate::schema::FilesystemSource::Realtime,
+            integrity: crate::schema::IntegrityStatus::NotChecked,
+            expected_hash: None,
+            actual_hash: None,
+            size_delta: None,
+            actor,
+            change_summary: None,
+        })
     }
 
     /// Names the process behind a DNS-Client event. The DNS-Client library runs
@@ -1026,6 +1317,14 @@ impl DecodeState {
             exe_sha256: hash.digest().map(str::to_owned),
             exe_sha256_error: hash.failure(),
         }
+    }
+}
+
+fn signature_verdict(path: &std::path::Path) -> &'static str {
+    if crate::inventory::windows_drivers::embedded_signature_valid(path) {
+        "valid_embedded"
+    } else {
+        "unverified"
     }
 }
 
@@ -1143,6 +1442,7 @@ mod native_tests {
             let sink = Arc::new(Sink {
                 tx,
                 lost: std::sync::atomic::AtomicU64::new(0),
+                kernel_file_pipes_only: true,
             });
             let session =
                 Session::start(sink).expect("ETW session requires an elevated Windows runner");

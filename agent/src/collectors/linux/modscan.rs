@@ -233,6 +233,10 @@ pub fn to_event(agent_id: &str, hostname: &str, l: &Load) -> AgentEvent {
             path: Some(l.path.clone()),
             process_exe: Some(l.exe.clone()),
             process_start_time: Some(l.start_time),
+            sha256: None,
+            hash_error: None,
+            signature: None,
+            image_size: None,
         }),
     )
 }

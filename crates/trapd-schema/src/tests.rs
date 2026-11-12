@@ -312,6 +312,10 @@ fn test_module_load_event_roundtrip() {
             path: None,
             process_exe: None,
             process_start_time: None,
+            sha256: None,
+            hash_error: None,
+            signature: None,
+            image_size: None,
         }),
     );
     let json = serde_json::to_string(&event).expect("must serialize");

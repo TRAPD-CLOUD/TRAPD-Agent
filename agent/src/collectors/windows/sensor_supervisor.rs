@@ -62,7 +62,7 @@ impl Collector for SensorSupervisor {
         loop {
             let enabled = self.config.read().map(|c| c.etw_enabled).unwrap_or(false);
             if enabled {
-                let mut etw = super::etw::EtwCollector;
+                let mut etw = super::etw::EtwCollector::new(self.config.clone());
                 let attempt = etw.run(tx.clone(), agent_id.clone(), hostname.clone());
                 tokio::pin!(attempt);
                 loop {

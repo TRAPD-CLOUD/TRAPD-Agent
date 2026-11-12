@@ -1715,6 +1715,10 @@ impl Collector for EbpfSyscallCollector {
                                                path: None,
                                                process_exe: None,
                                                process_start_time: None,
+                                               sha256: None,
+                                               hash_error: None,
+                                               signature: None,
+                                               image_size: None,
                                            }),
                                        );
                                        if tx.send(event).await.is_err() { return Ok(()); }
