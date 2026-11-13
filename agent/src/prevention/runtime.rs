@@ -38,7 +38,11 @@ pub async fn start(
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<crate::schema::AgentEvent>(1024);
 
-    let audit = AuditEmitter::new(pipeline_tx.clone(), agent_id.into(), hostname.into());
+    let journal = Arc::new(super::journal::CommandJournal::open(
+        &crate::paths::state_dir().join("command_journal"),
+    )?);
+    let audit = AuditEmitter::new(pipeline_tx.clone(), agent_id.into(), hostname.into())
+        .with_journal(Arc::clone(&journal));
 
     let policy_path = local_policy_path();
     let store = load_local_policy(&policy_path)
@@ -78,16 +82,23 @@ pub async fn start(
         Arc::clone(&reconcile_signal),
     );
 
-    let engine = Arc::new(
-        Engine::new(
-            policy.clone(),
-            audit.clone(),
-            engine_cfg,
-            Arc::clone(&honeytokens),
-            Arc::clone(&cfg_handle),
-        )
-        .with_reconcile_signal(reconcile_signal),
-    );
+    let engine = Engine::new(
+        policy.clone(),
+        audit.clone(),
+        engine_cfg,
+        Arc::clone(&honeytokens),
+        Arc::clone(&cfg_handle),
+    )
+    .with_reconcile_signal(reconcile_signal)
+    .with_journal(Arc::clone(&journal));
+    #[cfg(target_os = "linux")]
+    let engine = engine.with_ip_expiry(Arc::new(
+        super::ip_expiry::Registry::open(&crate::paths::state_dir().join("ip_expiry.json"))
+            .context("load durable IP block leases")?,
+    ));
+    let engine = Arc::new(engine);
+    #[cfg(target_os = "linux")]
+    Arc::clone(&engine).start_linux_ip_expiry().await;
     #[cfg(windows)]
     Arc::clone(&engine).start_firewall_expiry().await;
     Arc::clone(&engine).spawn_event_loop(event_rx);
@@ -106,6 +117,7 @@ pub async fn start(
             audit.clone(),
             cmd_tx,
             poll_secs,
+            Arc::clone(&journal),
         )?;
         tokio::spawn(async move { puller.run().await });
         Arc::clone(&engine).spawn_command_loop(cmd_rx);

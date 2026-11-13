@@ -62,7 +62,8 @@ const FORBIDDEN_MARKERS: &[&str] = &[
 
 /// Validate bait `content` for the declared token `kind`, then apply the
 /// universal anti-fingerprinting guard. Returns `Ok(())` when the content is
-/// safe to place.
+/// structurally plausible. Filesystem placement also requires an independent
+/// exact local approval; this function never authorizes a write.
 pub fn validate_bait(kind: &str, content: &[u8]) -> Result<(), BaitError> {
     // Empty content is never a believable artefact.
     if content.is_empty() {

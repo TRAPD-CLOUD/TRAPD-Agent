@@ -95,7 +95,10 @@ pub enum CommandPayload {
         pid: i32,
         /// Observed generation; required on Windows. Omission preserves legacy signatures.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(with = "crate::schema::identity_wire")]
         process_start_time: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_boot_id: Option<String>,
     },
     /// Enable full host isolation. `allowlist_ips` are the only destinations
     /// reachable in addition to the management channel.
@@ -175,13 +178,19 @@ pub enum CommandPayload {
     FreezePid {
         pid: i32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(with = "crate::schema::identity_wire")]
         process_start_time: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_boot_id: Option<String>,
     },
     /// Resume a previously-frozen process (SIGCONT).
     ThawPid {
         pid: i32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(with = "crate::schema::identity_wire")]
         process_start_time: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_boot_id: Option<String>,
     },
     // ── Real-Time Response (RTR) ─────────────────────────────────────────────
     /// Execute a signed remediation script. `script_b64` is base64 of the script
@@ -211,7 +220,10 @@ pub enum CommandPayload {
         /// Observed process generation: Windows creation FILETIME, Linux
         /// start ticks. Required on Windows; omission preserves legacy signatures.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(with = "crate::schema::identity_wire")]
         process_start_time: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_boot_id: Option<String>,
     },
 }
 
@@ -301,20 +313,19 @@ impl Verifier {
         })
     }
 
+    pub fn verify_identity(&self, cmd: &SignedCommand) -> std::result::Result<(), String> {
+        verify_canonical(&self.key, &cmd.envelope, &cmd.signature)?;
+        if cmd.envelope.agent_id != self.agent_id {
+            return Err("command addressed to another agent".into());
+        }
+        Ok(())
+    }
+
     /// Verify a `SignedCommand` end-to-end.  Failure reasons are returned so
     /// the caller can emit a `CommandRejected` audit event with context.
     pub fn verify(&self, cmd: &SignedCommand) -> Verdict {
-        // Signature check (canonical-JSON, re-serialised) is shared with the
-        // remote-config channel via `verify_canonical`.
-        if let Err(reason) = verify_canonical(&self.key, &cmd.envelope, &cmd.signature) {
+        if let Err(reason) = self.verify_identity(cmd) {
             return Verdict::Rejected(reason);
-        }
-
-        if cmd.envelope.agent_id != self.agent_id {
-            return Verdict::Rejected(format!(
-                "command addressed to {}, not us ({})",
-                cmd.envelope.agent_id, self.agent_id
-            ));
         }
 
         let now = Utc::now();
@@ -354,7 +365,7 @@ impl Verifier {
 
         debug!(
             command_id = %cmd.envelope.command_id,
-            kind = ?cmd.envelope.payload,
+
             "signed command verified",
         );
 
@@ -447,7 +458,7 @@ mod cross_lang_tests {
         const LEGACY: &str = r#"{"command_id":"11111111-1111-1111-1111-111111111111","issued_at":"2020-01-01T00:00:00Z","expires_at":"2099-12-31T23:59:59Z","agent_id":"agent-test","nonce":"22222222-2222-2222-2222-222222222222","payload":{"kind":"collect_process_memory","pid":1234,"max_bytes":4096}}"#;
         let observed = LEGACY.replace(
             "\"max_bytes\":4096",
-            "\"max_bytes\":4096,\"process_start_time\":123456789",
+            "\"max_bytes\":4096,\"process_start_time\":\"123456789\"",
         );
         for wire in [LEGACY, observed.as_str()] {
             let envelope: CommandEnvelope = serde_json::from_str(wire).unwrap();
@@ -473,7 +484,7 @@ mod cross_lang_tests {
             );
             let observed = legacy.replace(
                 "\"pid\":1234",
-                "\"pid\":1234,\"process_start_time\":123456789",
+                "\"pid\":1234,\"process_start_time\":\"123456789\"",
             );
             for wire in [&legacy, &observed] {
                 let envelope: CommandEnvelope = serde_json::from_str(wire).unwrap();

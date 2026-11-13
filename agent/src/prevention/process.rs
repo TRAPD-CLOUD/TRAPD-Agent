@@ -28,13 +28,6 @@ use super::policy::{Match, PolicyHandle, RuleAction};
 /// Send SIGKILL to the given PID.  Errors if the process is gone or we lack
 /// permission (in which case the audit event records `success=false`).
 pub fn kill_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if observed_start.is_none() {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        return kill(Pid::from_raw(pid), Signal::SIGKILL)
-            .with_context(|| format!("SIGKILL pid={pid} failed"));
-    }
     kill_observed(pid, observed_start)
 }
 
@@ -138,25 +131,11 @@ fn signal_observed(pid: i32, observed_start: Option<u64>, signal: i32) -> Result
 /// snapshot is taken and an operator decides what to do ("freeze, snapshot, then
 /// decide" — issue #32, point 5). Resume with [`thaw_pid`].
 pub fn freeze_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if observed_start.is_none() {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        return kill(Pid::from_raw(pid), Signal::SIGSTOP)
-            .with_context(|| format!("SIGSTOP pid={pid} failed"));
-    }
     freeze_observed(pid, observed_start)
 }
 
 /// Resume a previously-frozen process by sending SIGCONT.
 pub fn thaw_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if observed_start.is_none() {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        return kill(Pid::from_raw(pid), Signal::SIGCONT)
-            .with_context(|| format!("SIGCONT pid={pid} failed"));
-    }
     thaw_observed(pid, observed_start)
 }
 

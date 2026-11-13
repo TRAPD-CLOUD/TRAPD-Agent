@@ -14,14 +14,16 @@
 //! actually executes them.  Rejected commands emit a `CommandRejected`
 //! audit event but never crash the loop.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::Sender;
 use tokio::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use super::audit::AuditEmitter;
 use super::commands::{CommandEnvelope, SignedCommand, Verdict, Verifier};
+use super::journal::{CommandJournal, CommandResult};
 
 /// Number of consecutive failed polls before the puller emits a tamper-evident
 /// audit event that the command channel may be severed.
@@ -68,9 +70,12 @@ pub struct CommandPuller {
     audit: AuditEmitter,
     out: Sender<CommandEnvelope>,
     interval: Duration,
+    journal: Arc<CommandJournal>,
+    result_offset: AtomicUsize,
 }
 
 impl CommandPuller {
+    #[allow(clippy::too_many_arguments)] // Explicit runtime trust and storage dependencies.
     pub fn new(
         backend_url: &str,
         agent_id: &str,
@@ -79,6 +84,7 @@ impl CommandPuller {
         audit: AuditEmitter,
         out: Sender<CommandEnvelope>,
         poll_secs: u64,
+        journal: Arc<CommandJournal>,
     ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
         Ok(Self {
@@ -89,10 +95,26 @@ impl CommandPuller {
             audit,
             out,
             interval: Duration::from_secs(poll_secs.max(2)),
+            journal,
+            result_offset: AtomicUsize::new(0),
         })
     }
 
     pub async fn run(self) {
+        let puller = Arc::new(self);
+        let reporter = Arc::clone(&puller);
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async move {
+            loop {
+                reporter.flush_results().await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        puller.run_polls().await;
+        workers.shutdown().await;
+    }
+
+    async fn run_polls(&self) {
         let mut consecutive_failures: u32 = 0;
         loop {
             let started = Instant::now();
@@ -142,6 +164,7 @@ impl CommandPuller {
             .client
             .get(&self.url)
             .query(&[("wait", LONG_POLL_WAIT_SECS)])
+            .header("X-TRAPD-Command-Receipts", "1")
             .timeout(LONG_POLL_TIMEOUT)
             .bearer_auth(&self.token)
             .send()
@@ -161,43 +184,158 @@ impl CommandPuller {
             return PollOutcome::Failed;
         }
 
-        let commands: Vec<SignedCommand> = match resp.json().await {
+        // Bound hostile or misconfigured control-plane responses before decode.
+        let mut response = resp;
+        let mut body = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if body.len().saturating_add(chunk.len()) <= 4 * 1024 * 1024 => {
+                    body.extend_from_slice(&chunk)
+                }
+                Ok(Some(_)) | Err(_) => return PollOutcome::Failed,
+                Ok(None) => break,
+            }
+        }
+        let commands: Vec<SignedCommand> = match serde_json::from_slice(&body) {
             Ok(v) => v,
-            Err(e) => {
-                warn!("malformed command payload: {e}");
+            Err(_) => {
+                warn!("malformed command payload");
                 return PollOutcome::Failed;
             }
         };
+        if commands.len() > 25 {
+            return PollOutcome::Failed;
+        }
         if commands.is_empty() {
             return PollOutcome::Empty;
         }
 
         for cmd in commands {
+            // Duplicate completed deliveries remain reportable after expiry, but
+            // must still have a valid signature and this endpoint identity.
+            if let Err(reason) = self.verifier.verify_identity(&cmd) {
+                self.reject(&cmd, reason);
+                continue;
+            }
+            match self.journal.contains(&cmd.envelope) {
+                Ok(true) => continue,
+                Err(error) => {
+                    self.reject(&cmd, error.to_string());
+                    continue;
+                }
+                Ok(false) => {}
+            }
+            // Journal first, then durable nonce, then remote acceptance. A crash
+            // in any gap produces an explicit interrupted outcome on restart.
+            if let Err(error) = self.journal.accept(&cmd.envelope) {
+                self.reject(&cmd, format!("cannot journal command: {error}"));
+                continue;
+            }
             match self.verifier.verify(&cmd) {
                 Verdict::Ok(envelope) => {
-                    debug!(command_id = %envelope.command_id, "command verified");
-                    if self.out.send(envelope).await.is_err() {
-                        warn!("engine channel closed — dropping command");
-                        return PollOutcome::Delivered;
+                    if !self
+                        .receipt(envelope.command_id, &serde_json::json!({"state":"acked"}))
+                        .await
+                    {
+                        let _ = self.journal.complete(
+                            envelope.command_id,
+                            CommandResult::failure(
+                                "delivery acknowledgement failed; no effect executed",
+                            ),
+                        );
+                        continue;
+                    }
+                    let id = envelope.command_id;
+                    if self.out.try_send(envelope).is_err() {
+                        let _ = self.journal.complete(
+                            id,
+                            CommandResult::failure(
+                                "execution queue full or closed; no effect executed",
+                            ),
+                        );
+                        continue;
                     }
                 }
                 Verdict::Rejected(reason) => {
-                    self.audit.emit(
-                        crate::schema::EventAction::CommandRejected,
-                        crate::schema::Severity::High,
-                        "command_rejected",
-                        cmd.envelope.command_id.to_string(),
-                        false,
-                        reason,
-                        None,
-                        Some(cmd.envelope.command_id.to_string()),
-                        serde_json::to_value(&cmd.envelope.payload)
-                            .unwrap_or(serde_json::Value::Null),
+                    let _ = self.journal.complete(
+                        cmd.envelope.command_id,
+                        CommandResult::failure(reason.clone()),
                     );
+                    self.reject(&cmd, reason);
                 }
             }
         }
         PollOutcome::Delivered
+    }
+    fn reject(&self, cmd: &SignedCommand, reason: String) {
+        // Never log untrusted script/file bytes or forged response results.
+        self.audit.emit(
+            crate::schema::EventAction::CommandRejected,
+            crate::schema::Severity::High,
+            "command_rejected",
+            cmd.envelope.command_id.to_string(),
+            false,
+            reason,
+            None,
+            None,
+            serde_json::Value::Null,
+        );
+    }
+    async fn receipt(&self, id: uuid::Uuid, body: &serde_json::Value) -> bool {
+        self.client
+            .post(format!("{}/{id}/receipt", self.url))
+            .bearer_auth(&self.token)
+            .json(body)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+    }
+    async fn flush_results(&self) {
+        let results = match self.journal.pending_results() {
+            Ok(results) => results,
+            Err(error) => {
+                warn!(%error,"cannot read command result outbox");
+                return;
+            }
+        };
+        if results.is_empty() {
+            return;
+        }
+        // Bounded concurrent retries keep an unavailable receipt endpoint from
+        // delaying new defense commands, and rotate past permanently bad rows.
+        let offset = self.result_offset.fetch_add(16, Ordering::Relaxed) % results.len();
+        let mut retries = tokio::task::JoinSet::new();
+        for (id, result) in results
+            .iter()
+            .cycle()
+            .skip(offset)
+            .take(results.len().min(16))
+        {
+            let id = *id;
+            let result = result.clone();
+            let client = self.client.clone();
+            let url = format!("{}/{id}/receipt", self.url);
+            let token = self.token.clone();
+            retries.spawn(async move {
+                let ok = client
+                    .post(url)
+                    .bearer_auth(token)
+                    .json(&serde_json::json!({"state":"completed","result":result}))
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success());
+                (id, ok)
+            });
+        }
+        while let Some(Ok((id, ok))) = retries.join_next().await {
+            if ok {
+                if let Err(error) = self.journal.mark_reported(id) {
+                    warn!(%error,"cannot persist receipt acknowledgement");
+                }
+            }
+        }
     }
 }
 
@@ -250,3 +388,7 @@ mod tests {
         assert!(LONG_POLL_TIMEOUT > Duration::from_secs(LONG_POLL_WAIT_SECS));
     }
 }
+
+#[cfg(test)]
+#[path = "command_puller_delivery_tests.rs"]
+mod delivery_tests;

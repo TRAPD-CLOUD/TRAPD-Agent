@@ -155,6 +155,7 @@ pub struct ProcessKey {
     /// without a start time is deliberately **not** treated as equal to any
     /// other key for the same PID — see [`ProcessKey::same_process_as`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::schema::identity_wire")]
     pub start_time: Option<u64>,
 }
 

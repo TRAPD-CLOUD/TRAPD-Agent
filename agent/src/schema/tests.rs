@@ -621,10 +621,10 @@ fn process_events_carry_a_start_time_for_pid_reuse() {
     )
     .unwrap();
     assert_eq!(
-        val["data"]["process_start_time"], 987_654,
+        val["data"]["process_start_time"], "987654",
         "a bare PID is not an identity — the start time is what disambiguates reuse"
     );
-    assert_eq!(val["data"]["parent_start_time"], 12);
+    assert_eq!(val["data"]["parent_start_time"], "12");
 }
 
 // ── Enrichment on the wire ───────────────────────────────────────────────────

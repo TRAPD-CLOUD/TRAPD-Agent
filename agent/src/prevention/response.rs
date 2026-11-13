@@ -285,14 +285,14 @@ pub fn targets_for_rule(rule_id: &str, subject: &str, evidence: &serde_json::Val
         (
             pid.as_i64(),
             match evidence.get("process_start_time") {
-                Some(start) => start.as_u64(),
+                Some(start) => crate::schema::identity_wire::parse(start),
                 None => lineage_head
                     .filter(|head| {
                         pid.as_i64().is_some()
                             && head.get("pid").and_then(|v| v.as_i64()) == pid.as_i64()
                     })
                     .and_then(|head| head.get("process_start_time"))
-                    .and_then(|start| start.as_u64()),
+                    .and_then(crate::schema::identity_wire::parse),
             },
         )
     } else {
@@ -302,7 +302,7 @@ pub fn targets_for_rule(rule_id: &str, subject: &str, evidence: &serde_json::Val
                 .and_then(|v| v.as_i64()),
             lineage_head
                 .and_then(|h| h.get("process_start_time"))
-                .and_then(|v| v.as_u64()),
+                .and_then(crate::schema::identity_wire::parse),
         )
     };
     let pid = pid
@@ -594,7 +594,13 @@ mod tests {
 
     #[test]
     fn invalid_explicit_generation_cannot_be_replaced_by_lineage() {
-        for start in [json!(0), json!(-1), json!(null), json!("123")] {
+        for start in [
+            json!(0),
+            json!(-1),
+            json!(null),
+            json!("0123"),
+            json!("bad"),
+        ] {
             let targets = targets_for_rule(
                 "memory.inject",
                 "",
@@ -890,5 +896,18 @@ mod tests {
             let ev = json!({ "dropped_file": p });
             assert!(targets_for_rule("x", "x", &ev).file_path.is_none(), "{p}");
         }
+    }
+    #[test]
+    fn lineage_decimal_generation_keeps_observed_identity() {
+        let generation = "133800000000000001";
+        let targets = targets_for_rule(
+            "execution.suspicious",
+            "",
+            &serde_json::json!({
+                "process_lineage":[{"pid":99,"process_start_time":generation}]
+            }),
+        );
+        assert_eq!(targets.pid, Some(99));
+        assert_eq!(targets.process_start_time, Some(133800000000000001));
     }
 }

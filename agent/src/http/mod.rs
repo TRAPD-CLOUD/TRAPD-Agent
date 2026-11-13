@@ -86,12 +86,14 @@ fn system_roots_opt_in() -> bool {
 pub fn build_client(total_timeout: Duration, connect_timeout: Duration) -> Result<reqwest::Client> {
     let builder = ClientBuilder::new()
         .use_rustls_tls()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(USER_AGENT)
         .timeout(total_timeout)
         .connect_timeout(connect_timeout);
 
     let builder = apply_ca_pinning(builder)?;
-    let builder = apply_mtls_identity(builder);
+    let builder = apply_mtls_identity(builder)?;
 
     builder.build().context("http: failed to build TLS client")
 }
@@ -151,50 +153,39 @@ fn pin_required(ca_exists: bool, opt_in: bool) -> Result<bool> {
     }
 }
 
-/// Load a PEM client certificate + key for mutual TLS authentication.  Both
-/// files must be present; otherwise mTLS is skipped (TLS still applies).
-fn apply_mtls_identity(builder: ClientBuilder) -> ClientBuilder {
+/// Load an optional PEM identity. A partly provisioned or invalid identity is
+/// a configuration error; never silently downgrade a configured mTLS client.
+fn apply_mtls_identity(builder: ClientBuilder) -> Result<ClientBuilder> {
     let cert_path = paths::config_dir().join("agent.crt");
     let key_path = paths::config_dir().join("agent.key");
-
-    if !cert_path.exists() || !key_path.exists() {
-        return builder;
-    }
-
-    let cert_pem = match std::fs::read(&cert_path) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("mTLS: cannot read {}: {e}", cert_path.display());
-            return builder;
+    let read_optional = |path: &std::path::Path| -> Result<Option<Vec<u8>>> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink is configured material, not absence.
+                match std::fs::symlink_metadata(path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    _ => Err(anyhow!("mTLS: configured identity is unreadable")),
+                }
+            }
+            Err(_) => Err(anyhow!("mTLS: configured identity is unreadable")),
         }
     };
-    let key_pem = match std::fs::read(&key_path) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("mTLS: cannot read {}: {e}", key_path.display());
-            return builder;
+    let cert = read_optional(&cert_path)?;
+    let key = read_optional(&key_path)?;
+    match (cert, key) {
+        (None, None) => Ok(builder),
+        (Some(mut cert), Some(key)) => {
+            cert.extend_from_slice(b"\n");
+            cert.extend_from_slice(&key);
+            let identity = reqwest::Identity::from_pem(&cert)
+                .context("mTLS: configured certificate/key identity is invalid")?;
+            info!("mTLS: client identity loaded");
+            Ok(builder.identity(identity))
         }
-    };
-
-    // `Identity::from_pem` expects the certificate chain and private key
-    // concatenated in a single PEM buffer.
-    let mut combined = cert_pem;
-    combined.extend_from_slice(b"\n");
-    combined.extend_from_slice(&key_pem);
-
-    match reqwest::Identity::from_pem(&combined) {
-        Ok(identity) => {
-            info!("mTLS: client identity loaded — mutual TLS enabled");
-            builder.identity(identity)
-        }
-        Err(e) => {
-            warn!(
-                "mTLS: cannot build identity from {} + {}: {e}",
-                cert_path.display(),
-                key_path.display()
-            );
-            builder
-        }
+        _ => Err(anyhow!(
+            "mTLS: certificate and private key must both be provisioned"
+        )),
     }
 }
 
@@ -266,6 +257,101 @@ mod tests {
         assert_eq!(
             normalize_base_url("https://h.example.com/base/"),
             "https://h.example.com/base"
+        );
+    }
+
+    // Run in a subprocess so TLS configuration cannot race other tests' env.
+    #[test]
+    fn rejects_http_before_transmitting_credentials() {
+        if std::env::var_os("TRAPD_HTTP_SECURITY_TEST_CHILD").is_some() {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let client = super::control_client().unwrap();
+                let request = client
+                    .get(format!("http://{address}/commands"))
+                    .bearer_auth("secret-must-never-leave-host")
+                    .timeout(std::time::Duration::from_millis(100))
+                    .send()
+                    .await;
+                assert!(request.is_err(), "HTTP must be rejected before I/O");
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "credentials reached plaintext listener"
+                );
+            });
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trapd-http-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "http::tests::rejects_http_before_transmitting_credentials",
+                "--nocapture",
+            ])
+            .env("TRAPD_HTTP_SECURITY_TEST_CHILD", "1")
+            .env("TRAPD_TLS_ALLOW_SYSTEM_ROOTS", "1")
+            .env("TRAPD_CONFIG_DIR", &dir)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn incomplete_or_malformed_mtls_never_degrades_to_no_identity() {
+        if std::env::var_os("TRAPD_MTLS_SECURITY_TEST_CHILD").is_some() {
+            let dir = crate::paths::config_dir();
+            std::fs::write(dir.join("agent.crt"), b"malformed cert").unwrap();
+            assert!(
+                super::control_client().is_err(),
+                "missing key must fail closed"
+            );
+            std::fs::write(dir.join("agent.key"), b"malformed key").unwrap();
+            assert!(
+                super::control_client().is_err(),
+                "bad identity must fail closed"
+            );
+            std::fs::remove_file(dir.join("agent.crt")).unwrap();
+            assert!(
+                super::control_client().is_err(),
+                "missing certificate must fail closed"
+            );
+            std::fs::create_dir(dir.join("agent.crt")).unwrap();
+            assert!(
+                super::control_client().is_err(),
+                "unreadable identity must fail closed"
+            );
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trapd-mtls-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "http::tests::incomplete_or_malformed_mtls_never_degrades_to_no_identity",
+                "--nocapture",
+            ])
+            .env("TRAPD_MTLS_SECURITY_TEST_CHILD", "1")
+            .env("TRAPD_TLS_ALLOW_SYSTEM_ROOTS", "1")
+            .env("TRAPD_CONFIG_DIR", &dir)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }

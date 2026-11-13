@@ -39,12 +39,15 @@
 //!
 //!   * **never overwrite** an existing file — placement refuses if the target
 //!     exists, so a command can never clobber real user data;
-//!   * **never follow a symlink / escape** — the target must be absolute with
-//!     no `..` components;
+//!   * **local approval** — exact path, kind, digest and safe mode must be
+//!     authorized in the customer-controlled service environment;
+//!   * **never follow a symlink / escape** — absolute unambiguous paths only,
+//!     with fd-relative Linux operations and locked plain Windows ancestors;
 //!   * **revoke only what we planted** — `revoke` removes a file only when it
 //!     is present in the local register, so a malformed command can never make
 //!     the agent delete an arbitrary file.
 
+mod placement;
 pub mod profiler;
 pub mod registry;
 pub mod validate;
@@ -84,6 +87,66 @@ mod safety_regressions {
         let path = std::env::temp_dir().join(format!("trapd-safety-{}", Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn unsigned_local_placement_approval_is_required() {
+        let dir = scratch();
+        let target = dir.join("credentials.txt");
+        let store = HoneytokenStore::load_from(dir.join("register.json"));
+        let result = deploy(
+            &store,
+            DeployRequest {
+                path: target.to_string_lossy().into_owned(),
+                content: b"DB_PASSWORD=secret\n".to_vec(),
+                mode: 0o600,
+                mimic_neighbor: false,
+                canary_marker: None,
+                out_of_band: None,
+                kind: Some("webroot_env".into()),
+                command_id: None,
+                breadcrumbs: Vec::new(),
+            },
+        );
+        assert!(
+            result.is_err(),
+            "remote signer must not authorize arbitrary local writes"
+        );
+        assert!(!target.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn general_append_is_not_a_deception_primitive() {
+        let dir = scratch();
+        let target = dir.join("authorized_keys");
+        fs::write(&target, b"original\n").unwrap();
+        let result = place_breadcrumb(&Breadcrumb {
+            path: target.to_string_lossy().into_owned(),
+            content: b"attacker key".to_vec(),
+            mode: 0o600,
+            append: true,
+        });
+        assert!(
+            result.is_err(),
+            "deception must never append arbitrary remote bytes"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"original\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn executable_and_special_modes_are_never_published() {
+        let dir = scratch();
+        for mode in [0o755, 0o4755, 0o2600, 0o666, 0o100600] {
+            let path = dir.join(format!("unsafe-{mode:o}.txt"));
+            assert!(
+                write_camouflaged(&path, b"harmless", mode, None, None).is_err(),
+                "unsafe mode {mode:o} must not be written"
+            );
+            assert!(!path.exists());
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -176,7 +239,7 @@ pub struct DeployRequest {
     pub path: String,
     /// Already-decoded token content (the engine base64-decodes the command).
     pub content: Vec<u8>,
-    /// File mode to apply. `0` means "use the mimicked neighbour's mode".
+    /// File mode: 0600, 0640 or 0644. Zero defaults to 0600; never inherited.
     pub mode: u32,
     /// Copy owner/group + atime/mtime from a neighbouring file for blend-in.
     pub mimic_neighbor: bool,
@@ -193,20 +256,15 @@ pub struct DeployRequest {
     /// Id of the signed command requesting this deployment.
     pub command_id: Option<String>,
     /// Optional cross-linking artefacts placed alongside the token so an
-    /// attacker *finds* it: a config that references the key, a `.bash_history`
-    /// line with a "forgotten" `mysql -u root -p…`, etc. (issue #32, point 3).
+    /// attacker *finds* it: a locally approved standalone text note referencing
+    /// the key. Appending to existing files is no longer permitted.
     pub breadcrumbs: Vec<Breadcrumb>,
 }
 
 /// A breadcrumb that points an attacker at a token, raising its discoverability.
 ///
-/// Two placement modes:
-///   * **create** (`append == false`) — written like the token itself, refusing
-///     to overwrite an existing file;
-///   * **append** (`append == true`) — appended *safely* to an existing (or new)
-///     file such as `~/.bash_history`, never truncating it and always starting
-///     on a fresh line. The exact bytes added are recorded so revoke can remove
-///     precisely our addition without corrupting the user's later writes.
+/// New deployments create locally approved standalone notes. General append is
+/// refused; the append field remains on the wire for explicit legacy rejection.
 #[derive(Debug, Clone)]
 pub struct Breadcrumb {
     pub path: String,
@@ -243,6 +301,16 @@ fn sandbox_hint(_error: &anyhow::Error) -> &'static str {
 /// Returns the persisted [`HoneytokenRecord`] on success. Fails (without side
 /// effects on the target) if a safety invariant is violated.
 pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenRecord> {
+    // Parse only local service configuration; signed config never grants placement.
+    let policy = placement::PlacementPolicy::local()?;
+    deploy_with_policy(store, req, &policy)
+}
+
+fn deploy_with_policy(
+    store: &HoneytokenStore,
+    req: DeployRequest,
+    policy: &placement::PlacementPolicy,
+) -> Result<HoneytokenRecord> {
     let target = validate_target(&req.path)?;
 
     // Quality gate (issue #32, point 3): a malformed token, or one carrying a
@@ -279,6 +347,10 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
         }
     }
 
+    policy.authorize(&req)?;
+    #[cfg(windows)]
+    let _parent_locks = placement::lock_parents(&target)?;
+
     // Hard safety rule: never clobber an existing file. `symlink_metadata`
     // (lstat) catches a symlink planted at the path too — we treat any
     // existing entry, symlink included, as "occupied" and refuse.
@@ -302,7 +374,7 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
     let mut neighbor_path: Option<String> = None;
     let mut owner: Option<(u32, u32)> = None;
     let mut times: Option<(SystemTime, SystemTime)> = None;
-    let mut mode = req.mode;
+    let mode = placement::safe_mode(req.mode)?;
 
     if req.mimic_neighbor {
         if let Some(neighbor) = choose_neighbor(parent, &target) {
@@ -312,17 +384,9 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
                     meta.accessed().unwrap_or_else(|_| SystemTime::now()),
                     meta.modified().unwrap_or_else(|_| SystemTime::now()),
                 ));
-                if mode == 0 {
-                    mode = neighbor_mode(&meta);
-                }
                 neighbor_path = Some(neighbor.to_string_lossy().into_owned());
             }
         }
-    }
-    if mode == 0 {
-        // No explicit mode and no neighbour to copy from: a conservative,
-        // credential-file-appropriate default.
-        mode = 0o600;
     }
 
     let sha = hex::encode(Sha256::digest(&req.content));
@@ -338,7 +402,7 @@ pub fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenR
     // logged and skipped; only the breadcrumbs that landed are recorded.
     let mut breadcrumbs: Vec<BreadcrumbRecord> = Vec::new();
     for bc in &req.breadcrumbs {
-        match place_breadcrumb(bc) {
+        match place_approved_breadcrumb(bc, policy) {
             Ok(rec) => {
                 info!(path = %rec.path, appended = rec.appended, "honeytoken breadcrumb placed");
                 breadcrumbs.push(rec);
@@ -401,7 +465,7 @@ pub fn revoke(store: &HoneytokenStore, path: &str) -> Result<HoneytokenRecord> {
         })?;
 
     // Tear down any breadcrumbs we planted alongside the token. Created files are
-    // removed; appended history lines are removed *only* if the file still ends
+    // removed; legacy appended lines are removed *only* if the file still ends
     // with exactly our addition, so a user's later writes are never corrupted.
     for bc in &record.breadcrumbs {
         if let Err(e) = remove_breadcrumb(bc) {
@@ -482,8 +546,20 @@ pub fn verify_record(rec: &HoneytokenRecord) -> HealthCheck {
 // ── Breadcrumbs ───────────────────────────────────────────────────────────────
 
 /// Place one breadcrumb and return the record describing what was written.
+#[cfg(test)]
 fn place_breadcrumb(bc: &Breadcrumb) -> Result<BreadcrumbRecord> {
+    let policy = placement::PlacementPolicy::local()?;
+    place_approved_breadcrumb(bc, &policy)
+}
+
+fn place_approved_breadcrumb(
+    bc: &Breadcrumb,
+    policy: &placement::PlacementPolicy,
+) -> Result<BreadcrumbRecord> {
+    policy.breadcrumb(bc)?;
     let target = validate_target(&bc.path)?;
+    #[cfg(windows)]
+    let _parent_locks = placement::lock_parents(&target)?;
     #[cfg(not(target_os = "linux"))]
     let parent = target
         .parent()
@@ -494,27 +570,15 @@ fn place_breadcrumb(bc: &Breadcrumb) -> Result<BreadcrumbRecord> {
     fs::create_dir_all(parent)
         .with_context(|| format!("create breadcrumb parent dir {}", parent.display()))?;
 
-    if bc.append {
-        let (offset, written) = append_safe(&target, &bc.content, bc.mode)
-            .with_context(|| format!("append breadcrumb to {}", target.display()))?;
-        Ok(BreadcrumbRecord {
-            path: target.to_string_lossy().into_owned(),
-            appended: true,
-            offset: Some(offset),
-            len: Some(written.len() as u64),
-            sha256: Some(hex::encode(Sha256::digest(&written))),
-        })
-    } else {
-        create_breadcrumb_file(&target, &bc.content, bc.mode)
-            .with_context(|| format!("create breadcrumb {}", target.display()))?;
-        Ok(BreadcrumbRecord {
-            path: target.to_string_lossy().into_owned(),
-            appended: false,
-            offset: None,
-            len: Some(bc.content.len() as u64),
-            sha256: Some(hex::encode(Sha256::digest(&bc.content))),
-        })
-    }
+    create_breadcrumb_file(&target, &bc.content, bc.mode)
+        .with_context(|| format!("create breadcrumb {}", target.display()))?;
+    Ok(BreadcrumbRecord {
+        path: target.to_string_lossy().into_owned(),
+        appended: false,
+        offset: None,
+        len: Some(bc.content.len() as u64),
+        sha256: Some(hex::encode(Sha256::digest(&bc.content))),
+    })
 }
 
 /// Create a standalone breadcrumb file, refusing (like the token itself) to
@@ -532,93 +596,14 @@ fn create_breadcrumb_file(target: &Path, content: &[u8], mode: u32) -> Result<()
     )
 }
 
-/// Append `content` to `path` without ever truncating it: the file is opened in
-/// append mode (created at `mode` if absent), a leading newline is inserted when
-/// the existing file does not already end in one, and a trailing newline is
-/// guaranteed so the next genuine entry stays on its own line. Returns the
-/// pre-append offset and the exact bytes written, so revoke can later remove
-/// precisely this addition.
-fn append_safe(target: &Path, content: &[u8], mode: u32) -> Result<(u64, Vec<u8>)> {
-    let mut f = open_append_handle(target, mode)?;
-    let meta = f.metadata()?;
-    if !meta.is_file() {
-        bail!("breadcrumb target is not a regular file");
-    }
-    let pre_len = meta.len();
-
-    // Does the existing file already end with a newline?
-    let needs_leading_nl = if pre_len > 0 {
-        f.seek(SeekFrom::End(-1)).context("seek to tail")?;
-        let mut last = [0u8; 1];
-        f.read_exact(&mut last).context("read tail byte")?;
-        last[0] != b'\n'
-    } else {
-        false
-    };
-
-    let mut payload = Vec::with_capacity(content.len() + 2);
-    if needs_leading_nl {
-        payload.push(b'\n');
-    }
-    payload.extend_from_slice(content);
-    if !payload.ends_with(b"\n") {
-        payload.push(b'\n');
-    }
-
-    f.write_all(&payload).context("append breadcrumb bytes")?;
-    f.sync_all().ok();
-    Ok((pre_len, payload))
-}
-
-#[cfg(target_os = "linux")]
-fn open_append_handle(target: &Path, mode: u32) -> Result<fs::File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let (parent, name) = secure_parent(target, true)?;
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR
-                | libc::O_CREAT
-                | libc::O_APPEND
-                | libc::O_NOFOLLOW
-                | libc::O_NONBLOCK
-                | libc::O_CLOEXEC,
-            if mode == 0 { 0o600 } else { mode },
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(unsafe { fs::File::from_raw_fd(fd) })
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn open_append_handle(target: &Path, mode: u32) -> Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .create(true)
-        .append(true)
-        .mode(if mode == 0 { 0o600 } else { mode })
-        .open(target)
-        .with_context(|| format!("open append {}", target.display()))
-}
-
-#[cfg(not(unix))]
-fn open_append_handle(target: &Path, _mode: u32) -> Result<fs::File> {
-    OpenOptions::new()
-        .read(true)
-        .create(true)
-        .append(true)
-        .open(target)
-        .with_context(|| format!("open append {}", target.display()))
-}
-
 /// Undo a breadcrumb. A created file is deleted; an appended block is removed
 /// only when the file still ends with exactly the bytes we added (verified by
 /// length and SHA-256), so concurrent/later writes are never clobbered.
 fn remove_breadcrumb(bc: &BreadcrumbRecord) -> Result<()> {
+    #[cfg(windows)]
+    if bc.appended {
+        bail!("legacy Windows appended breadcrumbs require local manual cleanup");
+    }
     if !bc.appended {
         let Some(sha) = bc.sha256.as_deref() else {
             warn!(path = %bc.path, "legacy breadcrumb has no content ownership proof; preserving file");
@@ -641,6 +626,13 @@ fn remove_breadcrumb(bc: &BreadcrumbRecord) -> Result<()> {
     let meta = f.metadata()?;
     if !meta.is_file() {
         bail!("breadcrumb cleanup target is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            bail!("breadcrumb cleanup refuses hardlinked files");
+        }
     }
     if meta.len() != offset + len {
         warn!(path = %bc.path, "appended breadcrumb: file grew/shrank since placement — leaving it intact");
@@ -712,10 +704,45 @@ fn validate_target(path: &str) -> Result<PathBuf> {
     Ok(p)
 }
 
+/// Exclusive Windows publication keeps one no-follow, unshared handle open
+/// through all content/timestamp writes. Path-based staging in a user-writable
+/// directory would permit a replacement between creation and metadata writes.
+#[cfg(windows)]
+fn write_camouflaged(
+    target: &Path,
+    content: &[u8],
+    mode: u32,
+    _owner: Option<(u32, u32)>,
+    times: Option<(SystemTime, SystemTime)>,
+) -> Result<()> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    placement::safe_mode(mode)?;
+    let _parent_locks = placement::lock_parents(target)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .custom_flags(0x0020_0000)
+        .open(target)
+        .context("exclusively create approved Windows honeytoken")?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.file_attributes() & 0x400 != 0 {
+        bail!("Windows honeytoken is not a plain file");
+    }
+    // On IO failure leave the unregistered object for local recovery. Removing
+    // a pathname after an uncertain write would claim ownership we cannot prove.
+    file.write_all(content)?;
+    if let Some((atime, mtime)) = times {
+        file.set_times(fs::FileTimes::new().set_accessed(atime).set_modified(mtime))?;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
 /// Write `content` to `target` atomically, applying mode and (best-effort)
 /// owner/timestamps before the rename so the file never appears half-written
 /// or freshly-touched once it is visible at its final path.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn write_camouflaged(
     target: &Path,
     content: &[u8],
@@ -723,6 +750,7 @@ fn write_camouflaged(
     owner: Option<(u32, u32)>,
     times: Option<(SystemTime, SystemTime)>,
 ) -> Result<()> {
+    let mode = placement::safe_mode(mode)?;
     use std::io::Write;
 
     let parent = target.parent().expect("validated target has a parent");
@@ -968,7 +996,71 @@ fn remove_verified_file(target: &Path, sha: &str, max_bytes: u64) -> Result<()> 
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn remove_verified_file(target: &Path, sha: &str, max_bytes: u64) -> Result<()> {
+    use std::os::windows::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawHandle,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+        FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+    };
+    let _parent_locks = placement::lock_parents(target)?;
+    let mut file = match OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES | FILE_READ_DATA)
+        .share_mode(1)
+        .custom_flags(0x0020_0000)
+        .open(target)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.file_attributes() & 0x400 != 0
+        || meta.len() > max_bytes
+        || sha.is_empty()
+    {
+        bail!("artifact ownership cannot be verified; preserving file");
+    }
+    let mut digest = Sha256::new();
+    let mut reader = (&mut file).take(max_bytes.saturating_add(1));
+    let mut buffer = [0u8; 16384];
+    let mut size = 0u64;
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        size += n as u64;
+        if size > max_bytes {
+            bail!("artifact grew beyond ownership verification limit");
+        }
+        digest.update(&buffer[..n]);
+    }
+    if hex::encode(digest.finalize()) != sha {
+        bail!("artifact content changed; preserving file");
+    }
+    // Hash and deletion address the same generation. Denied write/delete
+    // sharing prevents content mutation and path replacement during verification.
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as _,
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of_val(&disposition) as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("delete verified honeytoken handle");
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn remove_verified_file(target: &Path, sha: &str, max_bytes: u64) -> Result<()> {
     match crate::paths::bounded_regular_sha256(target, max_bytes) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -991,6 +1083,7 @@ fn write_camouflaged(
     owner: Option<(u32, u32)>,
     times: Option<(SystemTime, SystemTime)>,
 ) -> Result<()> {
+    let mode = placement::safe_mode(mode)?;
     use std::os::fd::{AsRawFd, FromRawFd};
     let (parent, name) = secure_parent(target, true)?;
     let stage = PrivateStage::new(parent)?;
@@ -1084,7 +1177,7 @@ fn create_temp(path: &Path) -> Result<fs::File> {
         .with_context(|| format!("create temp {}", path.display()))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn create_temp(path: &Path) -> Result<fs::File> {
     OpenOptions::new()
         .write(true)
@@ -1099,7 +1192,7 @@ fn set_mode(path: &Path, mode: u32) {
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn set_mode(_path: &Path, _mode: u32) {}
 
 #[cfg(unix)]
@@ -1113,19 +1206,8 @@ fn file_owner(_meta: &fs::Metadata) -> Option<(u32, u32)> {
     None
 }
 
-#[cfg(unix)]
-fn neighbor_mode(meta: &fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o7777
-}
-
-#[cfg(not(unix))]
-fn neighbor_mode(_meta: &fs::Metadata) -> u32 {
-    0o600
-}
-
 /// Align atime/mtime to the mimicked neighbour via the stable std API.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn set_times(path: &Path, atime: SystemTime, mtime: SystemTime) {
     let times = fs::FileTimes::new().set_accessed(atime).set_modified(mtime);
     match OpenOptions::new().write(true).open(path) {
@@ -1138,7 +1220,7 @@ fn set_times(path: &Path, atime: SystemTime, mtime: SystemTime) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn chown(_path: &Path, _uid: u32, _gid: u32) -> Result<()> {
     Ok(())
 }
@@ -1176,6 +1258,38 @@ mod tests {
         HoneytokenStore::load_from(dir.join("honeytokens.json"))
     }
 
+    fn deploy(store: &HoneytokenStore, req: DeployRequest) -> Result<HoneytokenRecord> {
+        let mut approvals = vec![serde_json::json!({
+            "path": req.path, "kind": req.kind, "mode": if req.mode == 0 { 0o600 } else { req.mode },
+            "sha256": hex::encode(Sha256::digest(&req.content)),
+        })];
+        for bc in &req.breadcrumbs {
+            approvals.push(serde_json::json!({
+                "path": bc.path, "kind": "breadcrumb", "mode": bc.mode,
+                "sha256": hex::encode(Sha256::digest(&bc.content)),
+            }));
+        }
+        // Keep syntax/content rejection tests on their existing validation path.
+        let json = serde_json::json!({"approvals": approvals}).to_string();
+        let policy = placement::PlacementPolicy::parse(&json).unwrap_or_default();
+        #[cfg(windows)]
+        {
+            if let Some(parent) = Path::new(&req.path).parent() {
+                if parent.is_absolute() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+            }
+            for bc in &req.breadcrumbs {
+                if let Some(parent) = Path::new(&bc.path).parent() {
+                    if parent.is_absolute() {
+                        fs::create_dir_all(parent).unwrap();
+                    }
+                }
+            }
+        }
+        deploy_with_policy(store, req, &policy)
+    }
+
     /// Structurally valid AWS credentials content (passes `validate_bait`).
     const VALID_AWS: &str = "[default]\naws_access_key_id = AKIA2E0AABCDEFGHIJKL\n\
                              aws_secret_access_key = wJalrXUtnFEMIabcdefGHIjklMNOpqrsTUVwxyz1\n";
@@ -1192,6 +1306,132 @@ mod tests {
             command_id: Some("cmd-1".into()),
             breadcrumbs: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_destination_rejects_parent_symlink_and_existing_hardlink() {
+        let dir = scratch_dir();
+        let actual = dir.join("actual");
+        fs::create_dir(&actual).unwrap();
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let store = store_in(&dir);
+        assert!(deploy(
+            &store,
+            req(alias.join("credentials").to_str().unwrap(), VALID_AWS)
+        )
+        .is_err());
+        assert!(!actual.join("credentials").exists());
+        let real = dir.join("original.txt");
+        fs::write(&real, b"real customer bytes").unwrap();
+        let link = dir.join("credentials");
+        fs::hard_link(&real, &link).unwrap();
+        assert!(deploy(&store, req(link.to_str().unwrap(), VALID_AWS)).is_err());
+        assert_eq!(fs::read(&real).unwrap(), b"real customer bytes");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_mode_never_inherits_executable_neighbor_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir();
+        let neighbor = dir.join("neighbor");
+        fs::write(&neighbor, b"neighbor").unwrap();
+        fs::set_permissions(&neighbor, fs::Permissions::from_mode(0o4755)).unwrap();
+        let target = dir.join("credentials");
+        let mut request = req(target.to_str().unwrap(), VALID_AWS);
+        request.mode = 0;
+        request.mimic_neighbor = true;
+        let record = deploy(&store_in(&dir), request).unwrap();
+        assert_eq!(record.mode, 0o600);
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn denied_breadcrumb_rejects_entire_deployment_before_mutation() {
+        let dir = scratch_dir();
+        let target = dir.join("credentials");
+        let mut request = req(target.to_str().unwrap(), VALID_AWS);
+        request.breadcrumbs.push(Breadcrumb {
+            path: dir.join("note.txt").to_string_lossy().into_owned(),
+            content: b"note".to_vec(),
+            mode: 0o600,
+            append: true,
+        });
+        assert!(deploy(&store_in(&dir), request).is_err());
+        assert!(!target.exists());
+        assert!(!dir.join("note.txt").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_append_cleanup_never_truncates_a_hardlink_alias() {
+        let dir = scratch_dir();
+        let target = dir.join("history");
+        let alias = dir.join("alias");
+        fs::write(&target, b"original\naddition\n").unwrap();
+        fs::hard_link(&target, &alias).unwrap();
+        let record = BreadcrumbRecord {
+            path: alias.to_string_lossy().into_owned(),
+            appended: true,
+            offset: Some(9),
+            len: Some(9),
+            sha256: Some(hex::encode(Sha256::digest(b"addition\n"))),
+        };
+        assert!(remove_breadcrumb(&record).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"original\naddition\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn service_environment_approvals_enable_reviewed_deployment() {
+        let dir = scratch_dir();
+        let target = dir.join("credentials.txt");
+        let policy = serde_json::json!({"approvals": [{
+            "path": target, "kind": "aws_credentials", "mode": 0o600,
+            "sha256": hex::encode(Sha256::digest(VALID_AWS.as_bytes())),
+        }]})
+        .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "deception::tests::approved_environment_child",
+                "--test-threads=1",
+            ])
+            .env("TRAPD_DECEPTION_TEST_DIR", &dir)
+            .env("TRAPD_DECEPTION_PLACEMENTS", policy)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert!(!target.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn approved_environment_child() {
+        let Some(dir) = std::env::var_os("TRAPD_DECEPTION_TEST_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let target = dir.join("credentials.txt");
+        let store = store_in(&dir);
+        let request = req(target.to_str().unwrap(), VALID_AWS);
+        let record = super::deploy(&store, request).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), VALID_AWS.as_bytes());
+        assert!(store.contains_path(&record.path));
+        revoke(&store, &record.path).unwrap();
     }
 
     #[test]
@@ -1413,75 +1653,35 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn breadcrumb_append_is_safe_and_reversible() {
+    fn legacy_breadcrumb_append_cleanup_preserves_later_writes() {
         let dir = scratch_dir();
-        let store = store_in(&dir);
-        let token = dir.join(".aws").join("credentials");
         let history = dir.join(".bash_history");
-        // Pre-existing history WITHOUT a trailing newline — append must not glue
-        // its line onto the last command.
-        fs::write(&history, b"ls -la\ncat /etc/passwd").unwrap();
-        let original = fs::read(&history).unwrap();
-
-        let mut r = req(&token.to_string_lossy(), VALID_AWS);
-        r.breadcrumbs = vec![Breadcrumb {
+        let original = b"first\n";
+        let addition = b"legacy credential note\n";
+        fs::write(
+            &history,
+            [original.as_slice(), addition.as_slice()].concat(),
+        )
+        .unwrap();
+        let record = BreadcrumbRecord {
             path: history.to_string_lossy().into_owned(),
-            content: b"mysql -u root -psup3rs3cret prod_db".to_vec(),
-            mode: 0o600,
-            append: true,
-        }];
-        let rec = deploy(&store, r).unwrap();
-
-        let after = fs::read_to_string(&history).unwrap();
-        assert!(
-            after.starts_with("ls -la\ncat /etc/passwd\n"),
-            "must not clobber prior history: {after:?}"
-        );
-        assert!(after.contains("mysql -u root -psup3rs3cret prod_db"));
-        assert!(rec.breadcrumbs[0].appended);
-
-        // Revoke removes exactly our appended block, restoring the original file.
-        revoke(&store, &token.to_string_lossy()).unwrap();
-        assert_eq!(
-            fs::read(&history).unwrap(),
-            original,
-            "history must be restored byte-for-byte"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn breadcrumb_append_left_intact_if_file_changed() {
-        let dir = scratch_dir();
-        let store = store_in(&dir);
-        let token = dir.join(".aws").join("credentials");
-        let history = dir.join(".bash_history");
-        fs::write(&history, b"first\n").unwrap();
-
-        let mut r = req(&token.to_string_lossy(), VALID_AWS);
-        r.breadcrumbs = vec![Breadcrumb {
-            path: history.to_string_lossy().into_owned(),
-            content: b"leaked-cmd --token abc".to_vec(),
-            mode: 0o600,
-            append: true,
-        }];
-        deploy(&store, r).unwrap();
-        // The user writes more history after our breadcrumb.
-        {
-            use std::io::Write as _;
-            let mut f = OpenOptions::new().append(true).open(&history).unwrap();
-            f.write_all(b"later-command\n").unwrap();
-        }
-        // Revoke must NOT corrupt the file: our block is no longer the tail.
-        revoke(&store, &token.to_string_lossy()).unwrap();
-        let after = fs::read_to_string(&history).unwrap();
-        assert!(
-            after.contains("leaked-cmd --token abc"),
-            "left intact when tail changed"
-        );
-        assert!(after.ends_with("later-command\n"));
-        let _ = fs::remove_dir_all(&dir);
+            appended: true,
+            offset: Some(original.len() as u64),
+            len: Some(addition.len() as u64),
+            sha256: Some(hex::encode(Sha256::digest(addition))),
+        };
+        remove_breadcrumb(&record).unwrap();
+        assert_eq!(fs::read(&history).unwrap(), original);
+        fs::write(
+            &history,
+            [original.as_slice(), addition.as_slice(), b"later\n"].concat(),
+        )
+        .unwrap();
+        remove_breadcrumb(&record).unwrap();
+        assert!(fs::read(&history).unwrap().ends_with(b"later\n"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

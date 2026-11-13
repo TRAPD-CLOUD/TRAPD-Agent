@@ -19,6 +19,9 @@
 // enforcement modules below act on Linux primitives (signals, iptables,
 // chattr, LSM) and are compiled for Linux only.
 pub mod commands;
+#[cfg(target_os = "linux")]
+pub mod ip_expiry;
+pub mod journal;
 pub mod policy;
 
 pub mod audit;
@@ -35,11 +38,11 @@ pub mod runtime;
 pub mod software;
 #[cfg(windows)]
 pub mod winfirewall;
-#[cfg(windows)]
-mod winquarantine;
 pub mod winguard;
 #[cfg(windows)]
 pub mod winproc;
+#[cfg(windows)]
+mod winquarantine;
 
 use std::path::PathBuf;
 

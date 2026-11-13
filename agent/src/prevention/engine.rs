@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use base64::Engine as _;
 use serde_json::json;
 use tokio::sync::mpsc::Receiver;
@@ -147,6 +148,10 @@ pub struct Engine {
     reconcile_signal: Option<Arc<Notify>>,
     /// Owns the attached kernel program for the full prevention runtime.
     kernel_blocker: LsmHandle,
+    journal: Option<Arc<super::journal::CommandJournal>>,
+    #[cfg(target_os = "linux")]
+    ip_expiry: Option<Arc<super::ip_expiry::Registry>>,
+    local_rtr_approval: fn() -> bool,
 }
 
 impl Engine {
@@ -168,7 +173,175 @@ impl Engine {
             auto_cooldown: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             reconcile_signal: None,
             kernel_blocker: LsmHandle::disabled(),
+            journal: None,
+            #[cfg(target_os = "linux")]
+            ip_expiry: None,
+            local_rtr_approval: response_rtr::locally_enabled,
         }
+    }
+
+    pub fn with_journal(mut self, journal: Arc<super::journal::CommandJournal>) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_ip_expiry(mut self, registry: Arc<super::ip_expiry::Registry>) -> Self {
+        self.ip_expiry = Some(registry);
+        self
+    }
+
+    async fn block_ip_with_lease(
+        &self,
+        ip: &str,
+        ttl_secs: Option<u64>,
+        cmd_id: &str,
+    ) -> anyhow::Result<String> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(registry) = &self.ip_expiry {
+                let now = chrono::Utc::now()
+                    .timestamp()
+                    .try_into()
+                    .context("invalid IP lease clock")?;
+                let registry = Arc::clone(registry);
+                let backend = self.cfg.net_backend;
+                let target = ip.to_string();
+                let command_id = cmd_id.to_string();
+                let install = move || {
+                    registry.block(&target, ttl_secs, &command_id, now, |target| {
+                        network::block_ip(backend, target)
+                    })
+                };
+                #[cfg(not(test))]
+                return tokio::task::spawn_blocking(install)
+                    .await
+                    .context("IP block worker failed")?;
+                #[cfg(test)]
+                return install();
+            }
+            anyhow::ensure!(
+                ttl_secs.is_none(),
+                "IP TTL registry unavailable; refusing temporary block"
+            );
+        }
+        network::block_ip_with_ttl(self.cfg.net_backend, ip, ttl_secs, cmd_id)
+    }
+
+    async fn unblock_ip_with_lease(&self, ip: &str) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(registry) = &self.ip_expiry {
+            let registry = Arc::clone(registry);
+            let backend = self.cfg.net_backend;
+            let target = ip.to_string();
+            let remove =
+                move || registry.unblock(&target, |target| network::unblock_ip(backend, target));
+            #[cfg(not(test))]
+            return tokio::task::spawn_blocking(remove)
+                .await
+                .context("IP unblock worker failed")?;
+            #[cfg(test)]
+            return remove();
+        }
+        network::unblock_ip(self.cfg.net_backend, ip)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn start_linux_ip_expiry(self: Arc<Self>) {
+        let mut restore = !self.reconcile_linux_ip_expiry(true).await;
+        tokio::spawn(async move {
+            let period = Duration::from_secs(5);
+            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if self.reconcile_linux_ip_expiry(restore).await {
+                    restore = false;
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn reconcile_linux_ip_expiry(&self, restore: bool) -> bool {
+        let Some(registry) = &self.ip_expiry else {
+            return true;
+        };
+        let mut blocked = self.blocked.lock().await;
+        let Ok(now) = chrono::Utc::now().timestamp().try_into() else {
+            warn!("invalid clock; refusing IP expiry changes");
+            return false;
+        };
+        let registry = Arc::clone(registry);
+        let backend = self.cfg.net_backend;
+        let reconcile = move || {
+            registry.reconcile(
+                now,
+                restore,
+                |target| network::block_ip(backend, target),
+                |target| network::unblock_ip(backend, target),
+            )
+        };
+        // Real expiry work uses the blocking pool. Test fixtures deliberately
+        // execute the same registry operation directly on their mock's thread.
+        #[cfg(not(test))]
+        let reconciled = match tokio::task::spawn_blocking(reconcile).await {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(%error, "IP expiry worker failed; preserving firewall rules");
+                return false;
+            }
+        };
+        #[cfg(test)]
+        let reconciled = reconcile();
+        match reconciled {
+            Ok(reconciled) => {
+                let complete = reconciled.complete;
+                blocked.extend(reconciled.active);
+                for expired in reconciled.removed {
+                    blocked.retain(|key| {
+                        network::canonical_target(key).ok().as_deref()
+                            != Some(expired.target.as_str())
+                    });
+                    self.audit.emit(
+                        EventAction::IpUnblocked,
+                        Severity::Info,
+                        "ip_unblock",
+                        expired.target,
+                        true,
+                        "durable IP block lease expired or removal recovered",
+                        None,
+                        (!expired.command_id.is_empty()).then_some(expired.command_id),
+                        serde_json::Value::Null,
+                    );
+                }
+                complete
+            }
+            Err(error) => {
+                warn!(%error, "IP expiry reconciliation failed; preserving remaining firewall rules");
+                false
+            }
+        }
+    }
+
+    async fn firewall_effect<F>(effect: F) -> anyhow::Result<()>
+    where
+        F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    {
+        #[cfg(not(test))]
+        {
+            tokio::task::spawn_blocking(effect)
+                .await
+                .context("firewall task failed")?
+        }
+        #[cfg(test)]
+        {
+            effect()
+        } // Tests keep their thread-local simulated firewall.
+    }
+    async fn apply_isolation(&self, allow: Vec<std::net::IpAddr>) -> anyhow::Result<()> {
+        let backend = self.cfg.net_backend;
+        Self::firewall_effect(move || network::isolate(backend, &allow)).await
     }
 
     /// Attach the shared reconcile/health kick. Pulsed after every honeytoken
@@ -410,11 +583,10 @@ impl Engine {
             actions.push(if killed { "kill" } else { "kill_failed" });
         }
         if matches!(level, ResponseLevel::Isolate) {
-            isolated = self
-                .isolation_allowlist(&[])
-                .await
-                .and_then(|allow| network::isolate(self.cfg.net_backend, &allow))
-                .is_ok();
+            isolated = match self.isolation_allowlist(&[]).await {
+                Ok(allow) => self.apply_isolation(allow).await.is_ok(),
+                Err(_) => false,
+            };
             actions.push(if isolated {
                 "isolate"
             } else {
@@ -633,11 +805,10 @@ impl Engine {
         }
 
         if matches!(decision.action, AutoAction::Isolate) {
-            isolated = self
-                .isolation_allowlist(&[])
-                .await
-                .and_then(|allow| network::isolate(self.cfg.net_backend, &allow))
-                .is_ok();
+            isolated = match self.isolation_allowlist(&[]).await {
+                Ok(allow) => self.apply_isolation(allow).await.is_ok(),
+                Err(_) => false,
+            };
             actions.push(if isolated {
                 "isolate"
             } else {
@@ -773,10 +944,18 @@ impl Engine {
         if block {
             let key = addr.to_string();
             let mut set = self.blocked.lock().await;
-            if set.contains(&key) {
+            #[cfg(target_os = "linux")]
+            let update_lease = self
+                .ip_expiry
+                .as_ref()
+                .is_some_and(|registry| !registry.has_indefinite_lease(&key));
+            #[cfg(not(target_os = "linux"))]
+            let update_lease = false;
+            if set.contains(&key) && !update_lease {
                 blocked_now = true;
             } else {
-                match network::block_ip(self.cfg.net_backend, &key) {
+                // An automatic indefinite block also replaces any signed TTL.
+                match self.block_ip_with_lease(&key, None, "automatic").await {
                     Ok(handle) => {
                         info!(%addr, rule = %m.rule_id, %handle, "network IoC blocked");
                         set.insert(key);
@@ -906,16 +1085,45 @@ impl Engine {
     pub fn spawn_command_loop(self: Arc<Self>, mut rx: Receiver<CommandEnvelope>) {
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
-                let me = Arc::clone(&self);
-                tokio::spawn(async move {
-                    me.handle(cmd).await;
-                });
+                let id = cmd.command_id;
+                if let Some(journal) = &self.journal {
+                    if let Err(error) = journal.start(id) {
+                        warn!(%error, %id, "command cannot enter durable running state; refusing effect");
+                        let _ = journal.complete(
+                            id,
+                            super::journal::CommandResult::failure(
+                                "execution could not start; no effect executed",
+                            ),
+                        );
+                        continue;
+                    }
+                }
+                self.handle(cmd).await;
+                if let Some(journal) = &self.journal {
+                    if let Err(error) = journal.finish_if_unreported(id) {
+                        warn!(%error, %id, "cannot finalize command execution journal");
+                    }
+                }
             }
         });
     }
 
     async fn handle(&self, env: CommandEnvelope) {
         let cmd_id = env.command_id.to_string();
+        if env.expires_at <= chrono::Utc::now() {
+            self.audit.emit(
+                EventAction::CommandRejected,
+                Severity::Medium,
+                "command_rejected",
+                "<command>",
+                false,
+                "command expired before execution",
+                None,
+                Some(cmd_id),
+                serde_json::Value::Null,
+            );
+            return;
+        }
         if !self.prevention_enabled() {
             self.kernel_blocker.set_enabled(false).await;
             self.audit.emit(
@@ -931,10 +1139,40 @@ impl Engine {
             );
             return;
         }
+        let observed_boot = match &env.payload {
+            CommandPayload::KillPid {
+                process_boot_id, ..
+            }
+            | CommandPayload::FreezePid {
+                process_boot_id, ..
+            }
+            | CommandPayload::ThawPid {
+                process_boot_id, ..
+            }
+            | CommandPayload::CollectProcessMemory {
+                process_boot_id, ..
+            } => Some(process_boot_id.as_deref()),
+            _ => None,
+        };
+        if observed_boot.is_some_and(|boot| boot != Some(crate::telemetry::identity::boot_id())) {
+            self.audit.emit(
+                EventAction::CommandRejected,
+                Severity::Medium,
+                "command_rejected",
+                "<process>",
+                false,
+                "missing or stale observed process boot identity",
+                None,
+                Some(cmd_id),
+                serde_json::Value::Null,
+            );
+            return;
+        }
         match &env.payload {
             CommandPayload::KillPid {
                 pid,
                 process_start_time,
+                process_boot_id: _,
             } => {
                 self.cmd_kill_pid(*pid, *process_start_time, &cmd_id);
             }
@@ -942,7 +1180,7 @@ impl Engine {
                 self.cmd_isolate(allowlist_ips.clone(), &cmd_id).await;
             }
             CommandPayload::DeisolateNetwork => {
-                self.cmd_deisolate(&cmd_id);
+                self.cmd_deisolate(&cmd_id).await;
             }
             CommandPayload::QuarantineFile { path } => {
                 self.cmd_quarantine(path, &cmd_id);
@@ -960,17 +1198,19 @@ impl Engine {
                 self.cmd_update_policy(rules.clone(), &cmd_id).await;
             }
             CommandPayload::InstallPackage { name } => {
-                self.cmd_package(super::software::Operation::Install(name), &cmd_id);
+                self.cmd_package(super::software::Operation::Install(name), &cmd_id)
+                    .await;
             }
             CommandPayload::RemovePackage { name } => {
-                self.cmd_package(super::software::Operation::Remove(name), &cmd_id);
+                self.cmd_package(super::software::Operation::Remove(name), &cmd_id)
+                    .await;
             }
             CommandPayload::UpgradePackage { name } => {
                 let op = match name {
                     Some(n) => super::software::Operation::Upgrade(n),
                     None => super::software::Operation::UpgradeAll,
                 };
-                self.cmd_package(op, &cmd_id);
+                self.cmd_package(op, &cmd_id).await;
             }
             CommandPayload::DeployHoneytoken {
                 path,
@@ -1000,12 +1240,14 @@ impl Engine {
             CommandPayload::FreezePid {
                 pid,
                 process_start_time,
+                process_boot_id: _,
             } => {
                 self.cmd_freeze_pid(*pid, *process_start_time, &cmd_id);
             }
             CommandPayload::ThawPid {
                 pid,
                 process_start_time,
+                process_boot_id: _,
             } => {
                 self.cmd_thaw_pid(*pid, *process_start_time, &cmd_id);
             }
@@ -1027,6 +1269,7 @@ impl Engine {
                 pid,
                 max_bytes,
                 process_start_time,
+                process_boot_id: _,
             } => {
                 self.cmd_collect_process_memory(*pid, *max_bytes, *process_start_time, &cmd_id);
             }
@@ -1039,7 +1282,12 @@ impl Engine {
     fn rtr_settings(&self) -> (bool, u64) {
         self.cfg_handle
             .read()
-            .map(|c| (c.rtr_enabled, c.rtr_max_artifact_bytes))
+            .map(|c| {
+                (
+                    c.rtr_enabled && (self.local_rtr_approval)(),
+                    c.rtr_max_artifact_bytes.min(256 * 1024),
+                )
+            })
             .unwrap_or((false, 0))
     }
 
@@ -1051,7 +1299,7 @@ impl Engine {
             kind,
             target,
             false,
-            "RTR is disabled (set rtr_enabled=true to allow)",
+            "RTR requires local customer approval and rtr_enabled=true",
             None,
             Some(cmd_id.into()),
             serde_json::Value::Null,
@@ -1083,37 +1331,39 @@ impl Engine {
         let script_args = response_rtr::script_args(&prog, &script);
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 300));
 
-        // `kill_on_drop`: the timeout below drops this future, and the script
-        // must stop with it rather than keep running unobserved after the
-        // result was reported as timed out.
-        let run = tokio::process::Command::new(&prog)
-            .args(&script_args)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
-
-        let (success, code, stdout, stderr, note) = match tokio::time::timeout(timeout, run).await {
-            Ok(Ok(out)) => (
-                out.status.success(),
-                out.status.code(),
-                out.stdout,
-                out.stderr,
-                String::new(),
-            ),
-            Ok(Err(e)) => (
-                false,
-                None,
-                Vec::new(),
-                Vec::new(),
-                format!("spawn failed: {e}"),
-            ),
-            Err(_) => (false, None, Vec::new(), Vec::new(), "timed out".to_string()),
-        };
-
+        let (success, code, stdout, stderr, out_total, err_total, note) =
+            match response_rtr::run_bounded(&prog, &script_args, timeout, max_bytes as usize).await
+            {
+                Ok(out) => (
+                    out.success(),
+                    out.exit_code,
+                    out.stdout,
+                    out.stderr,
+                    out.stdout_total,
+                    out.stderr_total,
+                    if out.timed_out {
+                        "timed out".to_string()
+                    } else {
+                        String::new()
+                    },
+                ),
+                Err(e) => (
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    0,
+                    0,
+                    format!("script execution failed: {e}"),
+                ),
+            };
         let max = max_bytes as usize;
-        let out_art = response_rtr::cap_and_encode(&stdout, max);
-        let err_art =
-            response_rtr::cap_and_encode(&stderr, max.saturating_sub(out_art.b64.len()).max(1));
+        let mut out_art = response_rtr::cap_and_encode(&stdout, max);
+        let mut err_art = response_rtr::cap_and_encode(&stderr, max.saturating_sub(stdout.len()));
+        out_art.total_len = out_total;
+        out_art.truncated = out_total > out_art.returned_len;
+        err_art.total_len = err_total;
+        err_art.truncated = err_total > err_art.returned_len;
 
         self.audit.emit(
             EventAction::CommandAccepted,
@@ -1157,9 +1407,8 @@ impl Engine {
             return self.rtr_refuse("rtr_collect_file", path.to_string(), cmd_id);
         }
         let cap = max_bytes.unwrap_or(default_max).min(default_max) as usize;
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let art = response_rtr::cap_and_encode(&bytes, cap);
+        match response_rtr::collect_file(Path::new(path), cap) {
+            Ok(art) => {
                 self.audit.emit(
                     EventAction::CommandAccepted,
                     Severity::Info,
@@ -1202,18 +1451,33 @@ impl Engine {
         }
         match std::fs::read_dir(path) {
             Ok(rd) => {
-                let entries: Vec<serde_json::Value> = rd
-                    .flatten()
-                    .take(4096)
-                    .map(|e| {
-                        let md = e.metadata().ok();
-                        json!({
-                            "name": e.file_name().to_string_lossy(),
-                            "dir": md.as_ref().map(|m| m.is_dir()).unwrap_or(false),
-                            "size": md.as_ref().map(|m| m.len()).unwrap_or(0),
-                        })
-                    })
-                    .collect();
+                let (_, max_bytes) = self.rtr_settings();
+                let mut entries = Vec::new();
+                let mut used_bytes = 0usize;
+                let mut truncated = false;
+                for entry in rd.take(4097) {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(_) => continue,
+                    };
+                    let md = entry.metadata().ok();
+                    let value = json!({
+                        "name": entry.file_name().to_string_lossy(),
+                        "dir": md.as_ref().map(|m|m.is_dir()).unwrap_or(false),
+                        "size": md.as_ref().map(|m|m.len()).unwrap_or(0),
+                    });
+                    let bytes = serde_json::to_vec(&value)
+                        .map(|v| v.len())
+                        .unwrap_or(usize::MAX);
+                    if entries.len() >= 4096
+                        || used_bytes.saturating_add(bytes) > max_bytes as usize
+                    {
+                        truncated = true;
+                        break;
+                    }
+                    used_bytes += bytes;
+                    entries.push(value);
+                }
                 self.audit.emit(
                     EventAction::CommandAccepted,
                     Severity::Info,
@@ -1223,7 +1487,7 @@ impl Engine {
                     format!("listed {} entries in {path}", entries.len()),
                     None,
                     Some(cmd_id.into()),
-                    json!({ "path": path, "entries": entries }),
+                    json!({ "path": path, "entries": entries, "truncated": truncated }),
                 );
             }
             Err(e) => self.audit.emit(
@@ -1253,7 +1517,7 @@ impl Engine {
         cmd_id: &str,
     ) -> bool {
         let own_pid = std::process::id() as i32;
-        if is_valid_target_pid(pid, own_pid) {
+        if is_valid_target_pid(pid, own_pid) && process_start_time.is_some_and(|t| t > 0) {
             return true;
         }
         self.audit.emit(
@@ -1264,7 +1528,7 @@ impl Engine {
             false,
             format!(
                 "refusing PID-targeted command: pid {pid} is not a valid single \
-                 target (must be > 1 and not the agent's own pid {own_pid})"
+                 target (requires observed generation, pid > 1 and not own pid {own_pid})"
             ),
             None,
             Some(cmd_id.into()),
@@ -1307,7 +1571,8 @@ impl Engine {
         use std::io::{Read, Seek, SeekFrom};
 
         let verify_generation = || -> anyhow::Result<()> {
-            if let Some(expected) = expected_start {
+            let expected = expected_start.context("missing observed process generation")?;
+            {
                 anyhow::ensure!(
                     expected > 0,
                     "unknown observed identity for pid {pid}; refusing"
@@ -1392,7 +1657,7 @@ impl Engine {
 
         let (enabled, default_max) = self.rtr_settings();
         if !enabled {
-            return refuse("RTR is disabled (set rtr_enabled=true to allow)".into());
+            return refuse("RTR requires local customer approval and rtr_enabled=true".into());
         }
         let cap = max_bytes.unwrap_or(default_max).min(default_max);
 
@@ -1669,7 +1934,7 @@ impl Engine {
 
     /// Run a software-management operation and audit the outcome.  Package work
     /// shells out to the package manager (via an argv, no shell).
-    fn cmd_package(&self, op: super::software::Operation<'_>, cmd_id: &str) {
+    async fn cmd_package(&self, op: super::software::Operation<'_>, cmd_id: &str) {
         use super::software::Operation;
         use crate::schema::{EventAction, Severity};
 
@@ -1692,7 +1957,7 @@ impl Engine {
             ),
         };
 
-        let result = super::software::execute(op);
+        let result = super::software::execute(op).await;
         let severity = if result.success {
             Severity::Info
         } else {
@@ -1739,10 +2004,13 @@ impl Engine {
     }
 
     async fn cmd_isolate(&self, mut allow: Vec<std::net::IpAddr>, cmd_id: &str) {
-        let res = self.isolation_allowlist(&allow).await.and_then(|current| {
-            allow = current;
-            network::isolate(self.cfg.net_backend, &allow)
-        });
+        let res = match self.isolation_allowlist(&allow).await {
+            Ok(current) => {
+                allow = current;
+                self.apply_isolation(allow.clone()).await
+            }
+            Err(error) => Err(error),
+        };
         let (success, reason) = match res {
             Ok(_) => (
                 true,
@@ -1763,8 +2031,9 @@ impl Engine {
         );
     }
 
-    fn cmd_deisolate(&self, cmd_id: &str) {
-        let res = network::deisolate(self.cfg.net_backend);
+    async fn cmd_deisolate(&self, cmd_id: &str) {
+        let backend = self.cfg.net_backend;
+        let res = Self::firewall_effect(move || network::deisolate(backend)).await;
         let (success, reason) = match res {
             Ok(_) => (true, "host isolation lifted".to_string()),
             Err(e) => (false, format!("deisolate failed: {e:#}")),
@@ -1865,13 +2134,17 @@ impl Engine {
 
     async fn cmd_block_ip(&self, ip: &str, ttl_secs: Option<u64>, cmd_id: &str) {
         let mut blocked = self.blocked.lock().await;
-        let res = network::block_ip_with_ttl(self.cfg.net_backend, ip, ttl_secs, cmd_id);
+        let res = self.block_ip_with_lease(ip, ttl_secs, cmd_id).await;
         let (success, reason) = match &res {
             Ok(handle) => (true, format!("block rule installed ({handle})")),
             Err(e) => (false, format!("block_ip failed: {e:#}")),
         };
         if success {
-            blocked.insert(ip.to_string());
+            #[cfg(target_os = "linux")]
+            let key = network::canonical_target(ip).unwrap_or_else(|_| ip.into());
+            #[cfg(not(target_os = "linux"))]
+            let key = ip.to_string();
+            blocked.insert(key);
         }
         drop(blocked);
         self.audit.emit(
@@ -1885,51 +2158,23 @@ impl Engine {
             Some(cmd_id.into()),
             json!({ "ttl_secs": ttl_secs }),
         );
-
-        // Windows expiry is driven by persistent rule metadata, including
-        // replacement commands, rather than a stale per-command sleep.
-        #[cfg(windows)]
-        if matches!(self.cfg.net_backend, Backend::WindowsFirewall) {
-            return;
-        }
-
-        if let (true, Some(ttl)) = (success, ttl_secs) {
-            let backend = self.cfg.net_backend;
-            let blocked = Arc::clone(&self.blocked);
-            let ip_owned = ip.to_string();
-            let audit = self.audit.clone();
-            let cmd_id = cmd_id.to_string();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(ttl)).await;
-                if let Err(e) = network::unblock_ip(backend, &ip_owned) {
-                    warn!(ip = %ip_owned, error = %e, "TTL unblock failed");
-                } else {
-                    blocked.lock().await.remove(&ip_owned);
-                    audit.emit(
-                        crate::schema::EventAction::IpUnblocked,
-                        crate::schema::Severity::Info,
-                        "ip_unblock",
-                        ip_owned.clone(),
-                        true,
-                        "TTL expired",
-                        None,
-                        Some(cmd_id),
-                        serde_json::Value::Null,
-                    );
-                }
-            });
-        }
     }
 
     async fn cmd_unblock_ip(&self, ip: &str, cmd_id: &str) {
         let mut blocked = self.blocked.lock().await;
-        let res = network::unblock_ip(self.cfg.net_backend, ip);
+        let res = self.unblock_ip_with_lease(ip).await;
         let (success, reason) = match res {
             Ok(_) => (true, format!("unblocked {ip}")),
             Err(e) => (false, format!("unblock failed: {e:#}")),
         };
         if success {
             blocked.remove(ip);
+            #[cfg(target_os = "linux")]
+            if let Ok(target) = network::canonical_target(ip) {
+                blocked.retain(|key| {
+                    network::canonical_target(key).ok().as_deref() != Some(target.as_str())
+                });
+            }
             #[cfg(windows)]
             if let Ok(target) = network::canonical_windows_target(ip) {
                 blocked.retain(|key| {
@@ -2012,7 +2257,7 @@ mod tests {
             std::process::id(),
             &rx
         ));
-        let engine = Engine::new(
+        let mut engine = Engine::new(
             PolicyHandle::new(PolicyStore::default()),
             audit,
             EngineConfig {
@@ -2022,6 +2267,9 @@ mod tests {
             Arc::new(HoneytokenStore::load_from(ht_path)),
             Arc::new(RwLock::new(AgentConfig::default())),
         );
+        // The production constructor always uses the local customer gate;
+        // these engine tests isolate execution after a customer has approved it.
+        engine.local_rtr_approval = || true;
         (engine, rx)
     }
 
@@ -2030,7 +2278,7 @@ mod tests {
         use crate::prevention::network::tests::{no_calls, setup};
         use crate::prevention::runtime::tests::fake_management_dns;
         let (mut engine, mut audit_rx) = test_engine();
-        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.net_backend = Backend::Nft;
         engine.cfg.management_host = Some("control.example.test".into());
         engine.cfg_handle.write().unwrap().prevention_enabled = true;
         let backend = "192.0.2.1".parse().unwrap();
@@ -2059,7 +2307,7 @@ mod tests {
         use crate::prevention::network::tests::{called, setup};
         use crate::prevention::runtime::tests::fake_management_dns;
         let (mut engine, _) = test_engine();
-        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.net_backend = Backend::Nft;
         engine.cfg.management_host = Some("control.example.test".into());
         engine.cfg_handle.write().unwrap().prevention_enabled = true;
         let backend = "192.0.2.1".parse().unwrap();
@@ -2078,12 +2326,32 @@ mod tests {
             .cmd_isolate(vec![dns_v6], "dns-preflight-allowed")
             .await;
         assert!(called(
-            "iptables",
-            &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.53", "-j", "ACCEPT"]
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                "trapd",
+                "isolate_allow",
+                "ip",
+                "daddr",
+                "192.0.2.53",
+                "accept"
+            ]
         ));
         assert!(called(
-            "ip6tables",
-            &["-A", "TRAPD_ISOLATE", "-d", "2001:db8::53", "-j", "ACCEPT"]
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                "trapd",
+                "isolate_allow",
+                "ip6",
+                "daddr",
+                "2001:db8::53",
+                "accept"
+            ]
         ));
         engine.cfg.management_host = Some("2001:db8::1".into());
         let allow = engine.isolation_allowlist(&[]).await.unwrap();
@@ -2106,7 +2374,7 @@ mod tests {
         use crate::prevention::network::tests::{called, no_calls, setup};
         use crate::prevention::runtime::tests::fake_management_answers;
         let (mut engine, mut audit_rx) = test_engine();
-        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.net_backend = Backend::Nft;
         engine.cfg.management_host = Some("control.example.test".into());
         {
             let mut cfg = engine.cfg_handle.write().unwrap();
@@ -2130,8 +2398,18 @@ mod tests {
         setup(false);
         engine.cmd_isolate(vec![], "initial-dns").await;
         assert!(called(
-            "iptables",
-            &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.1", "-j", "ACCEPT"]
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                "trapd",
+                "isolate_allow",
+                "ip",
+                "daddr",
+                "192.0.2.1",
+                "accept"
+            ]
         ));
         for path in ["command", "automatic", "honeytoken"] {
             setup(false);
@@ -2163,22 +2441,52 @@ mod tests {
             }
             assert!(
                 called(
-                    "iptables",
-                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.2", "-j", "ACCEPT"]
+                    "nft",
+                    &[
+                        "add",
+                        "rule",
+                        "inet",
+                        "trapd",
+                        "isolate_allow",
+                        "ip",
+                        "daddr",
+                        "192.0.2.2",
+                        "accept"
+                    ]
                 ),
                 "{path}"
             );
             assert!(
                 called(
-                    "ip6tables",
-                    &["-A", "TRAPD_ISOLATE", "-d", "2001:db8::2", "-j", "ACCEPT"]
+                    "nft",
+                    &[
+                        "add",
+                        "rule",
+                        "inet",
+                        "trapd",
+                        "isolate_allow",
+                        "ip6",
+                        "daddr",
+                        "2001:db8::2",
+                        "accept"
+                    ]
                 ),
                 "{path}"
             );
             assert!(
                 !called(
-                    "iptables",
-                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.1", "-j", "ACCEPT"]
+                    "nft",
+                    &[
+                        "add",
+                        "rule",
+                        "inet",
+                        "trapd",
+                        "isolate_allow",
+                        "ip",
+                        "daddr",
+                        "192.0.2.1",
+                        "accept"
+                    ]
                 ),
                 "stale DNS allowance on {path}"
             );
@@ -2201,7 +2509,7 @@ mod tests {
     async fn isolation_rechecks_live_prevention_setting_before_firewall_mutation() {
         use crate::prevention::network::tests::{no_calls, setup};
         let (mut engine, mut audit_rx) = test_engine();
-        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.net_backend = Backend::Nft;
         engine.cfg.management_host = Some("::1".into());
         engine.cfg_handle.write().unwrap().prevention_enabled = false;
         setup(false);
@@ -2217,7 +2525,7 @@ mod tests {
     async fn isolation_uses_live_allowlist_for_commands_and_automatic_responses() {
         use crate::prevention::network::tests::{called, setup};
         let (mut engine, _audit_rx) = test_engine();
-        engine.cfg.net_backend = Backend::Iptables;
+        engine.cfg.net_backend = Backend::Nft;
         engine.cfg.management_host = Some("2001:db8::1".into());
         {
             let mut cfg = engine.cfg_handle.write().unwrap();
@@ -2228,8 +2536,18 @@ mod tests {
         setup(false);
         engine.cmd_isolate(vec![], "initial").await;
         assert!(called(
-            "iptables",
-            &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.10", "-j", "ACCEPT"]
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                "trapd",
+                "isolate_allow",
+                "ip",
+                "daddr",
+                "192.0.2.10",
+                "accept"
+            ]
         ));
         engine.cfg_handle.write().unwrap().isolation_allowlist_ips =
             vec!["192.0.2.20".into(), "invalid".into()];
@@ -2267,32 +2585,140 @@ mod tests {
             }
             assert!(
                 called(
-                    "ip6tables",
-                    &["-A", "TRAPD_ISOLATE", "-d", "2001:db8::1", "-j", "ACCEPT"]
+                    "nft",
+                    &[
+                        "add",
+                        "rule",
+                        "inet",
+                        "trapd",
+                        "isolate_allow",
+                        "ip6",
+                        "daddr",
+                        "2001:db8::1",
+                        "accept"
+                    ]
                 ),
                 "{response_path}"
             );
             assert!(
                 called(
-                    "iptables",
-                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.20", "-j", "ACCEPT"]
+                    "nft",
+                    &[
+                        "add",
+                        "rule",
+                        "inet",
+                        "trapd",
+                        "isolate_allow",
+                        "ip",
+                        "daddr",
+                        "192.0.2.20",
+                        "accept"
+                    ]
                 ),
                 "{response_path}"
             );
             assert!(
                 !called(
-                    "iptables",
-                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.10", "-j", "ACCEPT"]
+                    "nft",
+                    &[
+                        "add",
+                        "rule",
+                        "inet",
+                        "trapd",
+                        "isolate_allow",
+                        "ip",
+                        "daddr",
+                        "192.0.2.10",
+                        "accept"
+                    ]
                 ),
                 "removed allowance on {response_path}"
             );
             if response_path == "command" {
                 assert!(called(
-                    "iptables",
-                    &["-A", "TRAPD_ISOLATE", "-d", "192.0.2.30", "-j", "ACCEPT"]
+                    "nft",
+                    &[
+                        "add",
+                        "rule",
+                        "inet",
+                        "trapd",
+                        "isolate_allow",
+                        "ip",
+                        "daddr",
+                        "192.0.2.30",
+                        "accept"
+                    ]
                 ));
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_old_ttl_cannot_remove_a_new_indefinite_ip_block() {
+        use crate::prevention::network::tests::setup;
+        use std::os::unix::fs::PermissionsExt;
+        for replacement in ["manual", "flow", "dns"] {
+            let (mut engine, _) = test_engine();
+            engine.cfg.net_backend = Backend::Iptables;
+            engine.cfg_handle.write().unwrap().prevention_enabled = true;
+            let directory =
+                std::env::temp_dir().join(format!("trapd-engine-ip-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            engine.ip_expiry = Some(Arc::new(
+                crate::prevention::ip_expiry::Registry::open(&directory.join("leases.json"))
+                    .unwrap(),
+            ));
+            setup(false);
+            engine.cmd_block_ip("192.0.2.123", Some(0), "old-ttl").await;
+            if replacement == "manual" {
+                engine
+                    .cmd_block_ip("192.0.2.123", None, "new-indefinite")
+                    .await;
+            } else {
+                engine
+                    .enforce_net_match(
+                        "192.0.2.123".parse().unwrap(),
+                        443,
+                        None,
+                        None,
+                        Match {
+                            rule_id: "automatic".into(),
+                            action: RuleAction::Block,
+                            reason: "fixture".into(),
+                        },
+                        replacement,
+                        None,
+                    )
+                    .await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(engine.reconcile_linux_ip_expiry(false).await);
+            assert!(
+                engine.blocked.lock().await.contains("192.0.2.123"),
+                "old expiry removed its {replacement} indefinite replacement"
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ttl_commands_require_a_durable_registry_before_touching_the_firewall() {
+        use crate::prevention::network::tests::{no_calls, setup};
+        let (mut engine, mut audit) = test_engine();
+        engine.cfg.net_backend = Backend::Nft;
+        setup(false);
+        engine
+            .cmd_block_ip("192.0.2.123", Some(5), "no-registry")
+            .await;
+        assert!(no_calls());
+        let EventData::Prevention(result) = audit.try_recv().unwrap().data else {
+            panic!("audit");
+        };
+        assert!(!result.success);
+        assert!(engine.blocked.lock().await.is_empty());
     }
 
     #[cfg(windows)]
@@ -2369,8 +2795,7 @@ mod tests {
         pid: i32,
         generation: Option<u64>,
     ) -> crate::prevention::commands::CommandEnvelope {
-        let mut payload =
-            serde_json::json!({ "kind": "collect_process_memory", "pid": pid, "max_bytes": 4096 });
+        let mut payload = serde_json::json!({ "kind": "collect_process_memory", "pid": pid, "max_bytes": 4096, "process_boot_id": crate::telemetry::identity::boot_id() });
         if let Some(start) = generation {
             payload["process_start_time"] = serde_json::json!(start);
         }
@@ -2416,7 +2841,7 @@ mod tests {
     async fn memory_command_early_refusals_preserve_the_requested_generation() {
         for (pid, enabled, reason) in [
             (1, true, "invalid target"),
-            (54321, false, "RTR is disabled"),
+            (54321, false, "RTR requires local customer approval"),
         ] {
             let (engine, mut rx) = test_engine();
             engine.cfg_handle.write().unwrap().rtr_enabled = enabled;
@@ -2458,11 +2883,7 @@ mod tests {
     async fn memory_commands_read_the_observed_child_and_audit_the_generation() {
         let child = ChildFixture::new();
         let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
-        let generations = if cfg!(windows) {
-            vec![Some(start)]
-        } else {
-            vec![Some(start), None]
-        };
+        let generations = vec![Some(start)];
         for generation in generations {
             let (engine, mut rx) = test_engine();
             engine.cfg_handle.write().unwrap().rtr_enabled = true;
@@ -2493,7 +2914,7 @@ mod tests {
         pid: i32,
         generation: Option<u64>,
     ) -> crate::prevention::commands::CommandEnvelope {
-        let mut payload = serde_json::json!({ "kind": kind, "pid": pid });
+        let mut payload = serde_json::json!({ "kind": kind, "pid": pid, "process_boot_id": crate::telemetry::identity::boot_id() });
         if let Some(start) = generation {
             payload["process_start_time"] = serde_json::json!(start);
         }
@@ -2533,9 +2954,9 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
-    async fn manual_process_commands_reject_missing_windows_generations() {
+    async fn manual_process_commands_reject_missing_generations() {
         for kind in ["kill_pid", "freeze_pid", "thaw_pid"] {
             let mut child = ChildFixture::new();
             let (engine, mut rx) = test_engine();
@@ -2559,12 +2980,8 @@ mod tests {
 
     #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
-    async fn manual_process_commands_control_the_observed_child_and_preserve_linux_legacy() {
-        let legacy_modes = if cfg!(windows) {
-            vec![false]
-        } else {
-            vec![false, true]
-        };
+    async fn manual_process_commands_control_only_the_observed_child() {
+        let legacy_modes = vec![false];
         for legacy in legacy_modes {
             // This child would exit in one second unless freeze actually stops it.
             #[cfg(windows)]
@@ -3062,5 +3479,49 @@ mod tests {
             ResponseLevel::None.for_access(&access(true, Some("pts/1"))),
             Some(ResponseLevel::None)
         );
+    }
+    #[tokio::test]
+    async fn expired_commands_cannot_modify_policy() {
+        let (engine, mut rx) = test_engine();
+        let mut env = process_command("kill_pid", 4242, Some(123));
+        env.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        engine.handle(env).await;
+        let EventData::Prevention(outcome) = rx.try_recv().unwrap().data else {
+            panic!("audit")
+        };
+        assert!(!outcome.success);
+        assert!(outcome.reason.contains("expired"));
+    }
+    #[test]
+    fn remote_rtr_flag_does_not_override_local_customer_denial() {
+        let (mut engine, _) = test_engine();
+        engine.cfg_handle.write().unwrap().rtr_enabled = true;
+        engine.local_rtr_approval = || false;
+        assert!(!engine.rtr_settings().0);
+    }
+    #[tokio::test]
+    async fn process_commands_require_the_observed_boot_identity() {
+        for supplied in [None, Some(uuid::Uuid::new_v4().to_string())] {
+            let mut child = ChildFixture::new();
+            let generation = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+            let (engine, mut rx) = test_engine();
+            let mut env = process_command("kill_pid", child.pid(), Some(generation));
+            if let crate::prevention::commands::CommandPayload::KillPid {
+                process_boot_id, ..
+            } = &mut env.payload
+            {
+                *process_boot_id = supplied;
+            }
+            engine.handle(env).await;
+            let EventData::Prevention(outcome) = rx.try_recv().unwrap().data else {
+                panic!("audit")
+            };
+            assert!(!outcome.success);
+            assert!(outcome.reason.contains("boot identity"));
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "stale boot must never address current child"
+            );
+        }
     }
 }

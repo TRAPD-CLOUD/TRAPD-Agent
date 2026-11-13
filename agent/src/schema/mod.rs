@@ -1,3 +1,4 @@
+pub(crate) mod identity_wire;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -302,10 +303,12 @@ pub struct ProcessCreateData {
     /// 22) — the discriminator that makes this process distinguishable from a
     /// later one that reused its PID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::schema::identity_wire")]
     pub process_start_time: Option<u64>,
     /// Observed parent's creation identity; absent when it cannot be bound to
     /// a generation that already existed when this child was created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::schema::identity_wire")]
     pub parent_start_time: Option<u64>,
     /// Which `/proc` reads failed or were truncated while building this event.
     #[serde(default, flatten)]
@@ -334,9 +337,11 @@ pub struct ExecEventData {
     /// stable identity — a bare PID is not one, because the kernel reuses PIDs
     /// and correlating on PID alone fabricates lineages that never existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::schema::identity_wire")]
     pub process_start_time: Option<u64>,
     /// Parent's start time, so parent→child links survive PID reuse too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::schema::identity_wire")]
     pub parent_start_time: Option<u64>,
     /// Which `/proc` reads failed or were truncated. Flattened, so a partially
     /// enriched event carries `enrichment_status` / `enrichment_errors` /
@@ -437,6 +442,7 @@ pub struct NetworkConnectionData {
     /// Observed process generation: native creation FILETIME on Windows,
     /// /proc start ticks on Linux. Missing identity never authorizes automatic control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::schema::identity_wire")]
     pub process_start_time: Option<u64>,
     pub process: Option<String>,
     /// Flow lifetime in milliseconds, measured from first observation to the
@@ -752,6 +758,7 @@ pub struct RansomwareIndicatorData {
     /// Observed process generation: native creation FILETIME on Windows,
     /// /proc start ticks on Linux. Missing identity never authorizes automatic control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::schema::identity_wire")]
     pub process_start_time: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comm: Option<String>,
@@ -1102,6 +1109,7 @@ pub struct ProcessLineage {
     /// Observed process generation: native creation FILETIME on Windows,
     /// /proc start ticks on Linux. Missing identity never authorizes automatic control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::schema::identity_wire")]
     pub process_start_time: Option<u64>,
     pub uid: u32,
     pub gid: u32,
