@@ -514,6 +514,9 @@ fn audit_tamper(
         subject: format!("event {id}"),
         detail: detail.into(),
         evidence: serde_json::json!({ "event_id": id }),
+        // Clearing many logs (or one tool looping) raises one event per log;
+        // fold them per event id in the backend instead of one alert each.
+        dedup_key: Some(format!("selfprotect.audit_tamper:{id}")),
         ..Default::default()
     })
 }
@@ -916,6 +919,22 @@ impl Collector for EventLogCollector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audit_tamper_folds_per_event_id() {
+        let fields = |id: u64| {
+            let mut m = serde_json::Map::new();
+            m.insert("EventID".into(), id.into());
+            m
+        };
+        let a = super::audit_tamper("System", &fields(104)).unwrap();
+        let b = super::audit_tamper("System", &fields(104)).unwrap();
+        let c = super::audit_tamper("Security", &fields(1102)).unwrap();
+        assert_eq!(a.dedup_key.as_deref(), Some("selfprotect.audit_tamper:104"));
+        assert_eq!(a.dedup_key, b.dedup_key);
+        assert_ne!(a.dedup_key, c.dedup_key);
+        assert!(super::audit_tamper("Application", &fields(104)).is_none());
+    }
+
     #[test]
     fn script_blocks_are_dropped_unless_capture_is_enabled() {
         let xml = "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>\
