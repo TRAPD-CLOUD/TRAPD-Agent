@@ -293,34 +293,7 @@ pub fn is_trusted_jit_image(exe: &str, stat: StatFn<'_>) -> bool {
     exe.starts_with('/') && is_jit_runtime(exe) && is_root_owned_system_path(exe, stat)
 }
 
-/// Stable fold key for anonymous executable memory: one per (image identity,
-/// mapping kind), independent of pid and address, so the backend folds repeats
-/// of the same binary into one signal. The image hash wins over the path (a
-/// replaced binary is a different identity); `comm` is the last resort.
-pub fn anon_exec_dedup_key(
-    image: Option<&str>,
-    sha256: Option<&str>,
-    comm: &str,
-    writable: bool,
-) -> String {
-    let identity = match (sha256, image) {
-        (Some(h), _) => format!("sha256:{}", h.trim_start_matches("sha256:")),
-        (None, Some(p)) => format!("path:{p}"),
-        (None, None) => format!("comm:{comm}"),
-    };
-    let kind = if writable { "rwx" } else { "rx" };
-    let mut key = format!("memory.anon_exec:{identity}:{kind}");
-    // Bound the key (paths and comm are attacker-influenced): keep the kind.
-    if key.len() > 256 {
-        let mut cut = 240;
-        while !key.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        key.truncate(cut);
-        key.push_str(&format!("…:{kind}"));
-    }
-    key
-}
+pub use crate::collectors::mem_finding::anon_exec_dedup_key;
 
 // ── Collector ────────────────────────────────────────────────────────────────
 
