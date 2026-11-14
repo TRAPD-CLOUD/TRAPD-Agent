@@ -1449,33 +1449,48 @@ mod native_tests {
             let control = Arc::clone(&session.control);
             let trace = std::thread::spawn(move || session.process());
             let guard = RunGuard(control);
-            let child = std::process::Command::new("cmd.exe")
-                .args(["/C", "ping -n 4 127.0.0.1 >NUL"])
-                .spawn()
-                .unwrap();
-            let pid = child.id() as u64;
+            // A real-time session drops events logged before its consumer is
+            // attached, and `process()` attaches on another thread. Start a
+            // fresh child every second until one of them is seen, instead of
+            // racing a single child against the consumer start.
+            let spawn = || {
+                std::process::Command::new("cmd.exe")
+                    .args(["/C", "ping -n 3 127.0.0.1 >NUL"])
+                    .spawn()
+                    .unwrap()
+            };
+            let mut children = vec![spawn()];
             let received = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                while let Some(record) = rx.recv().await {
-                    if record.provider == etw_map::KERNEL_PROCESS
-                        && record.id == 1
-                        && record.int(&["ProcessID", "ProcessId"]) == Some(pid)
-                    {
-                        assert!(
-                            record.int(&["CreateTime"]).is_some(),
-                            "real FILETIME was not decoded"
-                        );
-                        assert!(etw_map::filetime_timestamp(record.timestamp).is_some());
-                        return true;
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        record = rx.recv() => {
+                            let Some(record) = record else { return false };
+                            let pid = record.int(&["ProcessID", "ProcessId"]);
+                            if record.provider == etw_map::KERNEL_PROCESS
+                                && record.id == 1
+                                && children.iter().any(|c| Some(c.id() as u64) == pid)
+                            {
+                                assert!(
+                                    record.int(&["CreateTime"]).is_some(),
+                                    "real FILETIME was not decoded"
+                                );
+                                assert!(etw_map::filetime_timestamp(record.timestamp).is_some());
+                                return true;
+                            }
+                        }
+                        _ = tick.tick() => children.push(spawn()),
                     }
                 }
-                false
             })
             .await;
             drop(guard);
             trace.join().unwrap();
-            let mut child = child;
-            let _ = child.kill();
-            let _ = child.wait();
+            for mut child in children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             assert!(
                 received.unwrap(),
                 "new session did not deliver the process start"
