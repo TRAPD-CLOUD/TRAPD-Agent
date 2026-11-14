@@ -58,6 +58,62 @@ impl MemFindingKey {
     }
 }
 
+/// Stable fold key for anonymous executable memory: one per (image identity,
+/// mapping kind), independent of pid and address, so the backend folds repeats
+/// of the same binary into one signal. Shared by the Linux and Windows
+/// scanners so both platforms fold identically. The image hash wins over the path (a
+/// replaced binary is a different identity); `comm` is the last resort.
+pub fn anon_exec_dedup_key(
+    image: Option<&str>,
+    sha256: Option<&str>,
+    comm: &str,
+    writable: bool,
+) -> String {
+    let identity = match (sha256, image) {
+        (Some(h), _) => format!("sha256:{}", h.trim_start_matches("sha256:")),
+        (None, Some(p)) => format!("path:{p}"),
+        (None, None) => format!("comm:{comm}"),
+    };
+    let kind = if writable { "rwx" } else { "rx" };
+    let mut key = format!("memory.anon_exec:{identity}:{kind}");
+    // Bound the key (paths and comm are attacker-influenced): keep the kind.
+    if key.len() > 256 {
+        let mut cut = 240;
+        while !key.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        key.truncate(cut);
+        key.push_str(&format!("…:{kind}"));
+    }
+    key
+}
+
+/// Backend fold key for a Windows finding. Only low-confidence allocator
+/// context (`memory.anon_exec` below the alert threshold) folds per image:
+/// JITs, hooking engines and Atomic-style test harnesses leave it in many
+/// processes, and without a key every pid became its own signal. Injected PE
+/// images and running threads stay one signal per region.
+#[cfg(any(windows, test))]
+pub fn windows_context_dedup_key(
+    finding: &MemFinding,
+    writable: bool,
+    image: Option<&str>,
+    sha256: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    if finding.rule_id != "memory.anon_exec" || finding.confidence >= 50 {
+        return None;
+    }
+    // Windows paths are case-insensitive; the same binary must fold.
+    let image = image.map(str::to_lowercase);
+    Some(anon_exec_dedup_key(
+        image.as_deref(),
+        sha256,
+        name,
+        writable,
+    ))
+}
+
 /// Turn a finding into the detection event the engine and the response layer
 /// consume. The offending pid is carried in `evidence`, so automated response
 /// can act on it.
@@ -106,5 +162,69 @@ mod tests {
         let mut seen = std::collections::HashSet::from([old, current.clone()]);
         seen.retain(|key| live.contains(&(key.pid, key.process_start_time)));
         assert_eq!(seen, std::collections::HashSet::from([current]));
+    }
+
+    #[test]
+    fn windows_context_findings_fold_per_image_and_alerts_do_not() {
+        let ctx = MemFinding {
+            rule_id: "memory.anon_exec",
+            title: "Executable private memory",
+            technique: "T1055",
+            confidence: 40,
+            severity: Severity::Low,
+            region: "0x1000-0x2000 r-x <private>".into(),
+        };
+        let a = windows_context_dedup_key(
+            &ctx,
+            false,
+            Some(r"C:\Windows\System32\RUNDLL32.EXE"),
+            None,
+            "rundll32.exe",
+        );
+        let b = windows_context_dedup_key(
+            &ctx,
+            false,
+            Some(r"c:\windows\system32\rundll32.exe"),
+            None,
+            "rundll32.exe",
+        );
+        assert_eq!(a, b);
+        assert_eq!(
+            a.as_deref(),
+            Some(r"memory.anon_exec:path:c:\windows\system32\rundll32.exe:rx")
+        );
+        assert_ne!(
+            a,
+            windows_context_dedup_key(
+                &ctx,
+                true,
+                Some(r"C:\Windows\System32\rundll32.exe"),
+                None,
+                "rundll32.exe"
+            )
+        );
+        assert_eq!(
+            windows_context_dedup_key(&ctx, false, Some(r"C:\x.exe"), Some("sha256:ab"), "x.exe")
+                .as_deref(),
+            Some("memory.anon_exec:sha256:ab:rx")
+        );
+        let thread = MemFinding {
+            confidence: 94,
+            severity: Severity::High,
+            ..ctx.clone()
+        };
+        assert_eq!(
+            windows_context_dedup_key(&thread, true, Some("C:\\x.exe"), None, "x.exe"),
+            None
+        );
+        let pe = MemFinding {
+            rule_id: "memory.injected_pe",
+            confidence: 88,
+            ..ctx
+        };
+        assert_eq!(
+            windows_context_dedup_key(&pe, true, Some("C:\\x.exe"), None, "x.exe"),
+            None
+        );
     }
 }

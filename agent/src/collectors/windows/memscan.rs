@@ -19,7 +19,9 @@ use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
 use tracing::info;
 
-use crate::collectors::mem_finding::{finding_to_detection, MemFindingKey};
+use crate::collectors::mem_finding::{
+    finding_to_detection, windows_context_dedup_key, MemFindingKey,
+};
 use crate::collectors::win_mem_rules::{classify, is_jit_module, is_jit_process, RegionContext};
 use crate::collectors::Collector;
 use crate::config::AgentConfig;
@@ -121,13 +123,8 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
                 finding = classify(&r.region, ctx);
             }
             let Some(f) = finding else { continue };
-            let key = MemFindingKey::new(
-                pid,
-                process_start_time,
-                &f,
-                r.region.base,
-                r.region.is_writable_executable(),
-            );
+            let writable = r.region.is_writable_executable();
+            let key = MemFindingKey::new(pid, process_start_time, &f, r.region.base, writable);
             let mut det = finding_to_detection(pid, &name, &f);
             // Full image path, so suppressions match the binary (`exe`) and
             // not the spoofable process name in the subject.
@@ -137,7 +134,7 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
                 ..Default::default()
             });
             det.evidence["process_start_time"] = process_start_time.into();
-            process_findings.push((key, f.severity, det));
+            process_findings.push((key, f, writable, det));
         }
         // The helper queries open their own process handles. Never attach
         // findings from one generation to a PID that changed during the sweep.
@@ -150,7 +147,7 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
         // This identifies the file at that path, not the in-memory image of a
         // hollowed process; it is the same trust level as the path itself.
         let mut image_hash: Option<Option<String>> = None;
-        for (key, severity, mut det) in process_findings {
+        for (key, f, writable, mut det) in process_findings {
             if !seen.insert(key) {
                 continue;
             }
@@ -164,7 +161,13 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
                 });
                 corr.exe_sha256 = hash.clone();
             }
-            findings.push((severity, det));
+            // Without a fold key the backend opens one signal per process
+            // (subject and detail carry the pid), as the Linux scanner did
+            // before it got the same key.
+            let sha = det.correlation.as_ref().and_then(|c| c.exe_sha256.clone());
+            det.dedup_key =
+                windows_context_dedup_key(&f, writable, image.as_deref(), sha.as_deref(), &name);
+            findings.push((f.severity, det));
         }
     }
     (findings, live)
