@@ -153,8 +153,43 @@ The merged combination on `main` has no full CI run yet.
 |---|---|---|
 | Windows 11 field test: processes, network/DNS, files, logins, registry persistence, ransomware rename burst, honeytoken read, offline buffering and replay. Events checked in ClickHouse. | 2026-10-10, 0.7.2 | Mixed, findings F1–F14 in [docs/windows-v0.7.2-field-test.md](docs/windows-v0.7.2-field-test.md). Fixed since: double-hex `exe_sha256`, short-lived command lines (4688 merge), registry watcher, honeytoken accessor (Audit File System), alert noise. Not re-run as a full field test. |
 | Windows CPU and handle measurement on the same host | 2026-10-12 | Log collector 60 % → 9 % of one core; ETW process-handle leak fixed (PRs #138–#140) |
-| Atomic Red Team in a Windows 11 VM against the dev backend (T1082, T1490) | 2026-11-11, 0.7.7 | Telemetry arrives and backend rules fire. A full Atomic run after the alert-folding change is still open. |
+| Atomic Red Team in a Windows 11 VM against the dev backend (T1082, T1490) | 2026-11-11, 0.7.7 | Telemetry arrives and backend rules fire. |
+| Atomic Red Team in a Windows 11 VM, three runs plus one rerun, with the PowerShell script-block opt-in on from run 3 | 2026-11-14, 0.7.8 | All tested techniques raise an alert; details in [Atomic Red Team results](#atomic-red-team-results-2026-11-14). Two agent-side alert floods found and fixed for 0.7.9 (PRs #178, #179). |
+| CPU, memory and handles on a Windows 11 host, 10 minutes | 2026-11-14, 0.7.8 | 6.2–7.8 % of one core, 52–55 MB working set, 938–951 handles, flat |
 | Channel burst measurement (synthetic, `agent/src/pipeline/burst.rs`) | 2026-11 | No drops for 2k/s process and 10k/s file storms; table in docs/telemetry-coverage-gaps.md §E |
+
+### Atomic Red Team results (2026-11-14)
+
+Windows 11 VM, agent 0.7.8, dev backend with the agent rule pack. Detection
+runs in the backend (Sigma rules); the agent supplies telemetry and a few
+host-side detections. Technique IDs before the ATT&CK v19 renumbering, v19 IDs
+in brackets.
+
+| Technique | Alerts that fired |
+|---|---|
+| T1082 System information discovery | `Windows Account Discovery (whoami)`, `Burst of different discovery commands on one host` |
+| T1059.001 PowerShell / Mimikatz | `Mimikatz syntax in a script block` (critical, needs the script-block opt-in), `Mimikatz syntax in a command line` (critical), `PowerShell with encoded command`, `PowerShell downloads and executes code` |
+| T1547.001 Run keys | `Autostart registry value added via reg.exe` |
+| T1047 WMI | `WMIC starts a process` |
+| T1546.003 WMI subscription | `WMI command-line event consumer registered` |
+| T1490 Inhibit system recovery | `Volume shadow copies or backups deleted`, `Windows recovery disabled` |
+| T1003.001 LSASS dump | `LSASS memory dumped` |
+| T1053.005 Scheduled task | `Scheduled task runs from a user-writable path` |
+| T1218.010 regsvr32, T1218.011 rundll32 | `regsvr32 loads a remote scriptlet`, `rundll32 executes script` |
+| T1543.003 Windows service | `Service created from a user-writable path`, `Service installed from a user-writable path`, `Service DLL set via reg.exe` (gap in run 2, closed by new backend rules) |
+| T1070.001 [T1685.005] Clear event logs | `Windows event log cleared` (backend rule, 1 213 hits folded into one alert) and the agent's own `Security event log cleared` / `Windows event log cleared` |
+| T1562.001 [T1685] Disable Defender/AMSI | `Microsoft Defender protection disabled or excluded`, `AMSI bypass attempt in a script block`, `PowerShell script block downloads and executes code` |
+| T1562.002 [T1685.001] Disable event logging (Invoke-Phant0m) | `Event log service threads killed (Invoke-Phant0m)` (no alert in run 3, new rule, confirmed in the rerun) |
+
+Agent findings from these runs, fixed for 0.7.9:
+
+- Low-confidence `Executable private memory` context raised one alert per
+  process (26–42 per run). It now carries a fold key (#178).
+- Clearing event logs raised one agent alert per cleared log (315). The
+  detection now folds per event ID (#179).
+
+Not covered: IIS logging tests (no IIS on the VM). The rule-pack side and the
+full gap list are tracked in the backend repository (`docs/audits/GAP-MATRIX.md`).
 
 **Not tested on a real host yet:** the Linux agent end-to-end against the
 backend after 0.7.7, the MSI audit-baseline path outside CI, Windows CPU cost
