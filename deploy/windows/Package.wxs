@@ -25,6 +25,13 @@
          leaves the machine's audit policy alone. Only settings the installer
          itself turned on are reverted on removal. -->
     <Property Id="AUDITBASELINE" Secure="yes" Value="1" />
+    <!-- Rollback switch for self-protection WP2/WP3: TRAPD_LEGACY_ACLS=1 installs
+         the previous service, registry and directory ACLs (Administrators may
+         stop and reconfigure the service and edit agent.env). It is not
+         remembered: pass it on every install and upgrade, otherwise the upgrade
+         hardens the host. The agent skips its ACL drift check while the marker
+         value below exists. -->
+    <Property Id="TRAPD_LEGACY_ACLS" Secure="yes" />
     <Property Id="ENROLLTOKEN" Secure="yes" Hidden="yes">
       <RegistrySearch Id="ExistingEnrollToken" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="raw" Bitness="always64" />
     </Property>
@@ -38,11 +45,18 @@
                           Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" Vital="yes">
             <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
                                 ThirdFailureActionType="restart" ResetPeriodInDays="1" RestartServiceDelayInSeconds="10" />
-            <!-- Hardened service DACL: SYSTEM full control; Administrators can query,
-                 start, stop and delete (MSI maintenance, Stop-Service) but cannot
-                 rewrite the DACL or take ownership; interactive and service
-                 accounts may only query. -->
-            <PermissionEx Sddl="D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)" />
+            <!-- Hardened service DACL (self-protection WP2): SYSTEM full control;
+                 Administrators may query, start, interrogate, read and send the
+                 user-defined control that asks the service to process a
+                 maintenance-token stop request, but cannot stop, reconfigure,
+                 delete or re-ACL the service (no DC, WP, DT, SD, WD, WO); an
+                 OWNER RIGHTS entry strips the owner's implicit WRITE_DAC;
+                 interactive and service accounts may only query. MSI
+                 install/repair/upgrade/removal and signed self-update run as
+                 SYSTEM (deferred, Impersonate="no"). Keep in sync with
+                 selfprotect::acl_policy::SERVICE_DACL_SDDL (unit-tested there);
+                 TRAPD_LEGACY_ACLS=1 restores the previous descriptor. -->
+            <PermissionEx Sddl="D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCLCSWRPLOCRRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RC;;;OW)" />
 
             <!-- Only EventLog: the Security/System channels the sensors read.
                  Deliberately NOT BFE: hosts with a third-party firewall
@@ -60,6 +74,11 @@
           <RemoveFile Id="ResetBinaryBaseline" Directory="CONFIGDIR" Name="binary.sha256" On="install" />
           <RemoveFile Id="ResetBinarySignature" Directory="CONFIGDIR" Name="binary.sig" On="install" />
           <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+          <!-- Install directory (WP3): SYSTEM full, Administrators read and
+               execute only, so the executable cannot be replaced by an
+               administrator's file copy. Program Files would otherwise grant
+               Administrators full control. Same string as acl_policy::DIR_SDDL. -->
+          <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;RC;;;OW)" /></CreateFolder>
         </Component>
         <!-- Lives in Program Files (not user-writable): it is started elevated. -->
         <Component Id="PairScript" Guid="D33A716E-0180-4E99-BB29-0F79C3AD16B2" Bitness="always64">
@@ -83,14 +102,20 @@
         </Component>
       </Directory>
     </StandardDirectory>
+    <!-- Data, config, state and log directories (WP3): SYSTEM full, Administrators
+         read and execute. The service writes; an administrator only reads, so
+         agent.env (backend URL, offline switch), the trust anchors and the
+         binary baseline cannot be edited from an elevated shell. Configure
+         through the BACKENDURL/ENROLLTOKEN properties or provision files before
+         the install. Same string as acl_policy::DIR_SDDL. -->
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="DATADIR" Name="TRAPD">
         <Component Id="DataDirectory" Guid="136A6095-4BF6-48D3-9CF0-CBA31D045040" Permanent="yes" Bitness="always64">
-          <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" /></CreateFolder>
+          <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;RC;;;OW)" /></CreateFolder>
         </Component>
         <Directory Id="CONFIGDIR" Name="config">
           <Component Id="ConfigDirectory" Guid="216B2CBE-ED4D-454C-AC9A-7C0E44A45C43" Permanent="yes" Bitness="always64">
-            <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" /></CreateFolder>
+            <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;RC;;;OW)" /></CreateFolder>
           </Component>
           <Component Id="DefaultConfig" Guid="7C6D5625-F935-45E3-8A13-A6278F92D2C8" Permanent="yes" NeverOverwrite="yes" Bitness="always64">
             <File Id="DefaultEnv" Source="$(var.SourceDir)\agent.env.default" Name="agent.env" KeyPath="yes" />
@@ -113,38 +138,52 @@
             <File Id="TrustReleaseKeyFile" Source="$(var.TrustDir)\release_signing.pub" Name="release_signing.pub" KeyPath="yes" />
           </Component>
           <?endif?>
+          <?ifdef HasMaintenanceKey?>
+          <!-- Dedicated key that verifies maintenance tokens (stop/uninstall).
+               Never the release or command key. Without it an MSI-only install
+               rejects every token. The agent looks for it next to the other
+               trust anchors (selfprotect::maintenance, release key dir). -->
+          <Component Id="TrustMaintenanceKey" Guid="2F4C8D91-3A6B-4E57-8C10-D9A7B5E63F42" Permanent="yes" NeverOverwrite="yes" Bitness="always64">
+            <File Id="TrustMaintenanceKeyFile" Source="$(var.TrustDir)\maintenance_signing.pub" Name="maintenance_signing.pub" KeyPath="yes" />
+          </Component>
+          <?endif?>
           <?endif?>
         </Directory>
         <Directory Id="STATEDIR" Name="state">
           <Component Id="StateDirectory" Guid="A7BD0384-9A98-4B66-BDA8-E1292C094696" Permanent="yes" Bitness="always64">
-            <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" /></CreateFolder>
+            <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;RC;;;OW)" /></CreateFolder>
           </Component>
         </Directory>
         <Directory Id="LOGDIR" Name="logs">
           <Component Id="LogDirectory" Guid="CC125FE4-1CBB-459E-8C48-A1A8BEB91074" Permanent="yes" Bitness="always64">
-            <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" /></CreateFolder>
+            <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;RC;;;OW)" /></CreateFolder>
           </Component>
         </Directory>
       </Directory>
     </StandardDirectory>
     <!-- Every component writing into HKLM\SOFTWARE\TRAPD\Agent carries the same
-         SYSTEM/Administrators-only descriptor: MSI applies the descriptor of the
+         descriptor (SYSTEM full, Administrators read, WP3; acl_policy::REGISTRY_KEY_SDDL): MSI applies the descriptor of the
          value that creates the key, so relying on "Installed" alone left the
          BackendUrl/EnrollToken values exposed depending on write order. The agent
          deletes EnrollToken after a successful enrollment. -->
     <Component Id="RegistryConfig" Directory="INSTALLFOLDER" Guid="9625220B-260F-4E51-BFBE-476EF6BE1543" Permanent="yes" Bitness="always64">
       <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="Installed" Type="integer" Value="1" KeyPath="yes">
-        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
+        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KR;;;BA)(A;CI;RC;;;OW)" />
+      </RegistryValue>
+    </Component>
+    <Component Id="LegacyAclMarker" Directory="INSTALLFOLDER" Guid="6B1E0A57-7D0C-4F0F-9B2D-3C8A4E5F1A90" Bitness="always64" Condition="TRAPD_LEGACY_ACLS=&quot;1&quot;">
+      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="LegacyAcls" Type="integer" Value="1" KeyPath="yes">
+        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KR;;;BA)(A;CI;RC;;;OW)" />
       </RegistryValue>
     </Component>
     <Component Id="BackendConfig" Directory="INSTALLFOLDER" Guid="0C71EE73-B218-46C4-AE14-839BED9F71FC" Permanent="yes" Bitness="always64" Condition="BACKENDURL">
       <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="BackendUrl" Type="string" Value="[BACKENDURL]" KeyPath="yes">
-        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
+        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KR;;;BA)(A;CI;RC;;;OW)" />
       </RegistryValue>
     </Component>
     <Component Id="EnrollmentConfig" Directory="INSTALLFOLDER" Guid="91605497-3A06-4D6A-90AA-C6857E11B074" Permanent="yes" Bitness="always64" Condition="ENROLLTOKEN">
       <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="string" Value="[ENROLLTOKEN]" KeyPath="yes">
-        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)" />
+        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KR;;;BA)(A;CI;RC;;;OW)" />
       </RegistryValue>
     </Component>
 
@@ -169,7 +208,18 @@
          rollback action undoes only what ApplyAuditBaseline added in this run. -->
     <CustomAction Id="RollbackAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline rollback" Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="RestoreAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline restore" Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- ACLs the declarative tables cannot express: the service-key descriptor
+         (the key belongs to the SCM, so the MSI cannot own it) and, with
+         TRAPD_LEGACY_ACLS=1, the whole previous set. Both run as SYSTEM after the
+         service exists and before it starts. The hardened one is Return="ignore"
+         on purpose: the service re-applies and reports drift itself at start,
+         and a hardening hiccup must not make the sensor uninstallable. The
+         legacy one is an explicit operator request and fails the install. -->
+    <CustomAction Id="ApplyAcls" FileRef="AgentExe" ExeCommand="acl apply" Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="ApplyLegacyAcls" FileRef="AgentExe" ExeCommand="acl legacy" Execute="deferred" Impersonate="no" Return="check" />
     <InstallExecuteSequence>
+      <Custom Action="ApplyAcls" After="InstallServices" Condition="NOT REMOVE AND NOT TRAPD_LEGACY_ACLS=&quot;1&quot;" />
+      <Custom Action="ApplyLegacyAcls" After="InstallServices" Condition="NOT REMOVE AND TRAPD_LEGACY_ACLS=&quot;1&quot;" />
       <Custom Action="ResetBinaryBaselineAction" After="InstallFiles" Condition="NOT REMOVE" />
       <Custom Action="RollbackAuditBaseline" After="ResetBinaryBaselineAction" Condition="AUDITBASELINE&lt;&gt;&quot;0&quot; AND NOT REMOVE" />
       <Custom Action="ApplyAuditBaseline" After="RollbackAuditBaseline" Condition="AUDITBASELINE&lt;&gt;&quot;0&quot; AND NOT REMOVE" />
@@ -180,10 +230,12 @@
       <ComponentRef Id="AgentService" /><ComponentRef Id="DataDirectory" /><ComponentRef Id="ConfigDirectory" />
       <ComponentRef Id="DefaultConfig" /><ComponentRef Id="StateDirectory" /><ComponentRef Id="LogDirectory" />
       <ComponentRef Id="RegistryConfig" /><ComponentRef Id="BackendConfig" /><ComponentRef Id="EnrollmentConfig" />
+      <ComponentRef Id="LegacyAclMarker" />
       <ComponentRef Id="PairScript" /><ComponentRef Id="PairShortcut" />
       <?ifdef TrustDir?>
       <ComponentRef Id="TrustCa" /><ComponentRef Id="TrustCommandKey" />
       <?ifdef HasReleaseKey?><ComponentRef Id="TrustReleaseKey" /><?endif?>
+      <?ifdef HasMaintenanceKey?><ComponentRef Id="TrustMaintenanceKey" /><?endif?>
       <?endif?>
     </Feature>
   </Package>

@@ -156,7 +156,16 @@ pub fn sddl_is_system_admin_only(sddl: &str) -> bool {
     let mut aces = 0;
     for ace in dacl[first_ace..].split(')').filter(|a| !a.is_empty()) {
         let fields: Vec<&str> = ace.trim_start_matches('(').split(';').collect();
-        if fields.len() < 6 || fields[0] != "A" || !trusted(fields[5]) {
+        if fields.len() < 6 || fields[0] != "A" {
+            return false;
+        }
+        // `OWNER RIGHTS` limited to READ_CONTROL is how the hardened directory
+        // descriptors (selfprotect::acl_policy) strip the owner's implicit
+        // WRITE_DAC. It grants nothing writable, so it does not make the
+        // directory less private; any wider `OW` entry still fails closed.
+        let owner_rights_read_only =
+            matches!(fields[5], "OW" | "S-1-3-4") && matches!(fields[2], "RC" | "0x20000");
+        if !trusted(fields[5]) && !owner_rights_read_only {
             return false;
         }
         aces += 1;
@@ -874,6 +883,8 @@ mod tests {
             "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
             "O:BAG:SYD:AI(A;OICIID;FA;;;BA)(A;OICIID;FA;;;SY)",
             "O:S-1-5-18D:(A;;FA;;;S-1-5-32-544)",
+            // Hardened directory descriptor: Administrators read/execute, owner rights neutralised.
+            "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;RC;;;OW)",
         ] {
             assert!(sddl_is_system_admin_only(ok), "{ok}");
         }
@@ -884,6 +895,7 @@ mod tests {
             "O:BUD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",                   // non-admin owner
             "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",                       // no owner
             "O:SYD:P(D;OICI;FA;;;BU)(A;OICI;FA;;;SY)",                   // deny ACE
+            "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)",                   // owner rights with write
             "O:SYD:",                                                    // null DACL
             "O:SYD:P",                                                   // empty DACL
             "O:SY",                                                      // no DACL

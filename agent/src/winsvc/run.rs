@@ -221,6 +221,7 @@ pub(super) async fn run_agent(
     crate::selfprotect::process_mitigation::apply();
     if as_service {
         crate::selfprotect::process_dacl::apply();
+        crate::selfprotect::maintenance::prepare_requests_dir();
     }
     // Include startup recovery and pending enrollment in this process run.
     crate::heartbeat::lifecycle::begin_process();
@@ -357,6 +358,15 @@ pub(super) async fn run_agent(
         hostname.clone(),
         offline,
     ));
+    // Service/registry ACL guard (WP2/WP3): checks and re-asserts at start, then
+    // watches. Only the SYSTEM service can apply the ACLs; a console run skips it.
+    if as_service {
+        tokio::spawn(crate::selfprotect::acl_guard::run(
+            tx.clone(),
+            agent_id.clone(),
+            hostname.clone(),
+        ));
+    }
     let startup_audit =
         crate::prevention::audit::AuditEmitter::new(tx.clone(), agent_id.clone(), hostname.clone());
     for expired in startup_expired {
@@ -644,7 +654,10 @@ pub(super) async fn run_agent(
         Arc::clone(&ring_buffer),
     );
 
+    // Backend access for reporting a consumed maintenance token before exit.
+    let mut maintenance_report: Option<(String, String, String)> = None;
     if !offline {
+        maintenance_report = Some((backend_url.clone(), agent_id.clone(), token.clone()));
         let transport =
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
         handles.push(tokio::spawn(async move { transport.run().await }));
@@ -719,6 +732,17 @@ pub(super) async fn run_agent(
     // Report the stop before the (slower) drain: bounded to a few seconds, well
     // inside the SCM wait hint, and never fatal.
     if let Some(request) = stop_request {
+        // A token the service just claimed must reach the backend before the
+        // stop notice does, so the backend can correlate the two. Bounded.
+        if request.source == crate::selfprotect::stop::StopSource::MaintenanceToken {
+            if let Some((url, id, secret)) = &maintenance_report {
+                let _ = tokio::time::timeout(
+                    crate::selfprotect::stop::STOP_FLUSH_BUDGET,
+                    crate::selfprotect::maintenance::report_pending(url, id, secret),
+                )
+                .await;
+            }
+        }
         stop_announcer.announce(request.kind, request.source).await;
     }
     // Close the receiver, reject further sends and drain already received

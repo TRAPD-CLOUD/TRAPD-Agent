@@ -56,6 +56,10 @@ pub enum StopSource {
     Sigterm,
     /// `SIGINT` / Ctrl-C.
     Interrupt,
+    /// The service verified and claimed a maintenance token (Windows). Evidence
+    /// only: the backend decides from its own record of the token, never from
+    /// this claim.
+    MaintenanceToken,
 }
 
 impl StopSource {
@@ -64,6 +68,7 @@ impl StopSource {
             Self::ScmStop => "scm_stop",
             Self::Sigterm => "sigterm",
             Self::Interrupt => "interrupt",
+            Self::MaintenanceToken => "maintenance_token",
         }
     }
 }
