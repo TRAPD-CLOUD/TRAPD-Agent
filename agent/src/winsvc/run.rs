@@ -103,24 +103,7 @@ pub fn load_config_env() {
 }
 
 fn load_env_file() {
-    let path = paths::config_dir().join("agent.env");
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            let value = value.trim().trim_matches('"');
-            if !key.is_empty() && std::env::var_os(key).is_none() {
-                std::env::set_var(key, value);
-            }
-        }
-    }
-    info!(path = %path.display(), "loaded agent.env");
+    crate::paths::load_agent_env_file();
 }
 
 /// Drop `TRAPD_ENROLL_TOKEN=` lines from `agent.env` content. Returns the
@@ -697,6 +680,13 @@ pub(super) async fn run_agent(
                 hostname.clone(),
                 Arc::clone(&agent_config),
             )?,
+        );
+
+        // Report maintenance-token uses the CLI could not send (offline host).
+        crate::selfprotect::maintenance::spawn_pending_report(
+            backend_url.clone(),
+            agent_id.clone(),
+            token_for_update.clone(),
         );
 
         // Signed self-update. Opt-in by key provisioning: without the pinned

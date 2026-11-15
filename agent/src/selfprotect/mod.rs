@@ -3,6 +3,7 @@ pub mod anti_ptrace;
 pub mod binary_integrity;
 #[cfg(target_os = "linux")]
 pub mod kernel_hardening;
+pub mod maintenance;
 // Pure SDDL constant + parser are testable everywhere; the apply path is Windows-only.
 #[cfg(any(target_os = "windows", test))]
 pub mod process_dacl;
