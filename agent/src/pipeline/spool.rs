@@ -796,6 +796,12 @@ impl Spool {
             .collect()
     }
 
+    /// Whether the entry with this sequence number is still queued, i.e. not
+    /// yet acknowledged, rejected or evicted.
+    pub fn contains_seq(&self, seq: u64) -> bool {
+        self.mem.iter().any(|e| e.seq == seq)
+    }
+
     /// Remove acknowledged entries.
     ///
     /// Idempotent and order-independent: acknowledging a `seq` that is already

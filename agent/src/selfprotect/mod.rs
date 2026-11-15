@@ -5,6 +5,7 @@ pub mod binary_integrity;
 pub mod kernel_hardening;
 #[cfg(target_os = "windows")]
 pub mod process_mitigation;
+pub mod stop;
 // Windows: runtime integrity recheck + health watchdog (SCM recovery handles process death).
 #[cfg(any(target_os = "windows", test))]
 pub mod runtime_guard;

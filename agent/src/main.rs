@@ -523,6 +523,17 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { inv.run().await });
     }
 
+    // The periodic senders must be stopped before the stop is announced: a
+    // regular heartbeat after the final one would cancel the announcement.
+    let mut backend_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // How the agent ends is reported from here (see `selfprotect::stop`); the
+    // backend parts are attached below when connected.
+    let mut stop_announcer = selfprotect::stop::StopAnnouncer::new(
+        agent_id.clone(),
+        hostname.clone(),
+        Arc::clone(&ring_buffer),
+    );
+
     // Backend channels only run when connected; offline = pure local telemetry.
     if !offline {
         // All three open the (fail-closed) pinned control channel; a pinning
@@ -530,7 +541,7 @@ async fn main() -> Result<()> {
         // fall-back to the system trust store.
         let transport =
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
-        tokio::spawn(async move { transport.run().await });
+        backend_tasks.push(tokio::spawn(async move { transport.run().await }));
 
         let config_puller = ConfigPuller::new(
             Arc::clone(&agent_config),
@@ -548,11 +559,21 @@ async fn main() -> Result<()> {
         let heartbeat = Heartbeat::new(
             &backend_url,
             agent_id.clone(),
-            token,
+            token.clone(),
             hostname.clone(),
             Arc::clone(&agent_config),
         )?;
-        tokio::spawn(async move { heartbeat.run().await });
+        backend_tasks.push(tokio::spawn(async move { heartbeat.run().await }));
+        stop_announcer = stop_announcer.with_backend(
+            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?,
+            Heartbeat::new(
+                &backend_url,
+                agent_id.clone(),
+                token,
+                hostname.clone(),
+                Arc::clone(&agent_config),
+            )?,
+        );
 
         // Self-update is opt-in by key provisioning: without both pinned signing
         // keys no update can be verified, so the updater is not started.
@@ -564,12 +585,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut stop_source: Option<selfprotect::stop::StopSource> = None;
     let consumer_done = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down");
             for handle in &handles {
                 handle.abort();
             }
+            stop_source = Some(selfprotect::stop::StopSource::Interrupt);
             false
         }
         // `systemctl stop` sends SIGTERM: shut down the same orderly way, so
@@ -579,6 +602,7 @@ async fn main() -> Result<()> {
             for handle in &handles {
                 handle.abort();
             }
+            stop_source = Some(selfprotect::stop::StopSource::Sigterm);
             false
         }
         _ = &mut consumer => {
@@ -586,6 +610,20 @@ async fn main() -> Result<()> {
             true
         }
     };
+
+    // Report the stop first: it is bounded (a few seconds) and the one thing
+    // that must reach the backend even if the rest of the shutdown is cut short.
+    if let Some(source) = stop_source {
+        for task in &backend_tasks {
+            task.abort();
+        }
+        // A host shutdown also sends SIGTERM; only a service stop is a finding.
+        let kind = match source {
+            selfprotect::stop::StopSource::Sigterm => selfprotect::stop::classify_sigterm().await,
+            _ => selfprotect::stop::StopKind::ServiceStop,
+        };
+        stop_announcer.announce(kind, source).await;
+    }
 
     // The consumer ends once every event sender is gone, but tasks outside
     // `handles` (prevention audit, heartbeat, the detection feedback path)

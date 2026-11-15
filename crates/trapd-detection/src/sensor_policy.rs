@@ -517,6 +517,17 @@ mod tests {
     }
 
     #[test]
+    fn a_requested_service_stop_is_a_high_alert_mapped_to_t1562_001() {
+        let entry = table()
+            .iter()
+            .find(|e| e.id == "selfprotect.service_stop_requested")
+            .expect("catalogued");
+        assert_eq!(entry.base, Severity::High);
+        assert_eq!(entry.mode, DetectionMode::Alert);
+        assert_eq!(entry.technique, "T1562.001");
+    }
+
+    #[test]
     fn table_parses_and_every_entry_is_consistent() {
         for e in table() {
             assert!(rank(e.base) <= rank(e.max), "{} base above max", e.id);

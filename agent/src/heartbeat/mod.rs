@@ -39,6 +39,12 @@ struct HeartbeatPayload {
     agent_last_restart: String,
     /// How the previous run ended: clean, unclean (killed/crashed) or unknown.
     previous_shutdown: lifecycle::PreviousShutdown,
+    /// Set only on the final beat of an orderly host shutdown (reboot, power
+    /// off). Tells the backend the coming silence is expected. A hint from an
+    /// untrusted source: the backend may only use it to keep its long silence
+    /// threshold, never to suppress a finding.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    host_shutdown: bool,
     /// Delivery accounting since process start, to verify loss after outages.
     pipeline: PipelineCounters,
     /// What the sensors can currently see (empty object when unknown).
@@ -219,7 +225,16 @@ impl Heartbeat {
         }
     }
 
+    /// Final beat of a host shutdown. Returns whether the backend accepted it.
+    pub async fn send_host_shutdown(&self) -> bool {
+        self.send_beat(true).await
+    }
+
     async fn send(&self) {
+        self.send_beat(false).await;
+    }
+
+    async fn send_beat(&self, host_shutdown: bool) -> bool {
         let metrics = self.sample_metrics();
         let life = lifecycle::begin_process();
         let payload = HeartbeatPayload {
@@ -231,6 +246,7 @@ impl Heartbeat {
             agent_uptime_seconds: life.uptime_seconds(),
             agent_last_restart: life.last_restart(),
             previous_shutdown: life.previous_shutdown(),
+            host_shutdown,
             pipeline: PipelineCounters::from_snapshot(
                 &crate::telemetry::metrics::metrics().snapshot(),
             ),
@@ -248,6 +264,7 @@ impl Heartbeat {
             Ok(resp) if resp.status().is_success() => {
                 debug!("Heartbeat sent successfully");
                 crate::update::confirm_healthy();
+                return true;
             }
             Ok(resp) => {
                 warn!("Heartbeat rejected by backend: HTTP {}", resp.status());
@@ -258,6 +275,7 @@ impl Heartbeat {
                 crate::telemetry::coverage::restore_shadow_hits(payload.shadow_hits);
             }
         }
+        false
     }
 
     fn sample_metrics(&self) -> Metrics {
@@ -391,6 +409,29 @@ mod tests {
             c.spooled + c.replayed_from_disk,
             c.acked + c.queued + c.dropped_by_reason["persistent_queue_full"],
         );
+    }
+
+    #[test]
+    fn host_shutdown_is_only_on_the_wire_when_set() {
+        let beat = |flag: bool| {
+            serde_json::to_value(HeartbeatPayload {
+                agent_id: "a".into(),
+                hostname: "h".into(),
+                agent_version: "0".into(),
+                timestamp: Utc::now(),
+                metrics: Metrics::default(),
+                agent_uptime_seconds: 1,
+                agent_last_restart: String::new(),
+                previous_shutdown: lifecycle::PreviousShutdown::Clean,
+                host_shutdown: flag,
+                pipeline: PipelineCounters::from_snapshot(&MetricsSnapshot::default()),
+                coverage: Default::default(),
+                shadow_hits: Default::default(),
+            })
+            .unwrap()
+        };
+        assert!(beat(false).get("host_shutdown").is_none());
+        assert_eq!(beat(true)["host_shutdown"], true);
     }
 
     #[test]
