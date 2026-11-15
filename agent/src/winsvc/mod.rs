@@ -84,6 +84,15 @@ pub fn entry() -> Result<()> {
                 .inspect_err(|e| tracing::error!("firewall cleanup failed: {e:#}"))
                 .context("remove containment firewall rules")
         }
+        // Sanctioned maintenance: `maintenance --purpose stop --token-file <path>`.
+        // The token is read from a file only; see `selfprotect::maintenance`.
+        Some("maintenance") => {
+            run::init_tracing_file();
+            crate::paths::init_state_dir();
+            run::load_config_env();
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            crate::selfprotect::maintenance::run_cli(&args, stop_service)
+        }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("telemetry") => {
             print!("{}", crate::telemetry::diagnostics::run());
             Ok(())
@@ -315,6 +324,30 @@ fn run_service() -> Result<()> {
     let _ = reporter.join();
     report_status(&status_handle, status_for(Phase::Done, 0, exit));
     result
+}
+
+/// Ask the SCM to stop the service and wait (bounded) for it to report Stopped.
+/// This is the same orderly path as `sc stop`: the service handles `Stop`.
+fn stop_service() -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("connect to the service manager (run from an elevated prompt)")?;
+    let service = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+        )
+        .context("open service (is it installed?)")?;
+    if service.query_status()?.current_state != ServiceState::Stopped {
+        service.stop().context("stop service")?;
+        for _ in 0..30 {
+            if service.query_status()?.current_state == ServiceState::Stopped {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        bail!("service did not stop within 30 seconds");
+    }
+    Ok(())
 }
 
 // ── install / uninstall ───────────────────────────────────────────────────────

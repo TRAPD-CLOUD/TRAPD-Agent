@@ -127,6 +127,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `trapd-agent maintenance --purpose stop --token-file <path>` — sanctioned
+    // stop authorised by a signed, single-use maintenance token (file input only).
+    if std::env::args().nth(1).as_deref() == Some("maintenance") {
+        paths::init_state_dir();
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return selfprotect::maintenance::run_cli(&args, || {
+            let status = std::process::Command::new("systemctl")
+                .args(["stop", "trapd-agent"])
+                .status()
+                .context("run systemctl")?;
+            anyhow::ensure!(status.success(), "systemctl stop failed ({status})");
+            Ok(())
+        });
+    }
+
     // `trapd-agent diagnostics telemetry` — report on the running agent's
     // pipeline. Read-only and side-effect free, so it must run before any of
     // the start-up work below (which would fight the live agent for the state
@@ -553,6 +568,13 @@ async fn main() -> Result<()> {
             Arc::clone(&agent_config),
         )?;
         tokio::spawn(async move { heartbeat.run().await });
+
+        // Report maintenance-token uses the CLI could not send (offline host).
+        selfprotect::maintenance::spawn_pending_report(
+            backend_url.clone(),
+            agent_id.clone(),
+            token_for_update.clone(),
+        );
 
         // Self-update is opt-in by key provisioning: without both pinned signing
         // keys no update can be verified, so the updater is not started.

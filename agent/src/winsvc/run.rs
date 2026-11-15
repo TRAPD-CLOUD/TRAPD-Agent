@@ -651,6 +651,13 @@ pub async fn run_agent(
         )?;
         handles.push(tokio::spawn(async move { heartbeat.run().await }));
 
+        // Report maintenance-token uses the CLI could not send (offline host).
+        crate::selfprotect::maintenance::spawn_pending_report(
+            backend_url.clone(),
+            agent_id.clone(),
+            token_for_update.clone(),
+        );
+
         // Signed self-update. Opt-in by key provisioning: without the pinned
         // release and command keys no update can be verified, so it is not started.
         match crate::update::Updater::new(&backend_url, agent_id.clone(), token_for_update) {

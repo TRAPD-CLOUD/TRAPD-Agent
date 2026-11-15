@@ -269,6 +269,15 @@ async fn try_enroll(
 
 // ── Persistence ─────────────────────────────────────────────────────────────
 
+/// Synchronous read of the persisted identity for short-lived CLI verbs that
+/// must never enroll. `None` when absent or invalid.
+pub(crate) fn load_persisted_blocking() -> Option<Credentials> {
+    let raw = std::fs::read_to_string(paths::credentials_file()).ok()?;
+    serde_json::from_str::<Credentials>(&raw)
+        .ok()
+        .filter(Credentials::is_valid)
+}
+
 async fn load_persisted() -> Option<Credentials> {
     let path = paths::credentials_file();
     if !path.exists() {

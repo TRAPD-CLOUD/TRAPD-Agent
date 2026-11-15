@@ -121,12 +121,9 @@ pub(crate) fn binary_baseline_line(hash_hex: &str) -> String {
     format!("sha256:{hash_hex}")
 }
 
-/// Hash an untrusted on-disk token with bounded memory and IO. Links and
-/// special files are refused before reading; a concurrent growth is bounded
-/// by the reader as well as the initial size check.
-pub(crate) fn bounded_regular_sha256(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
+/// Open an untrusted on-disk file for bounded reading. Links, reparse points
+/// and special files are refused before any content is read.
+fn open_bounded_regular(path: &Path, max_bytes: u64) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -159,6 +156,33 @@ pub(crate) fn bounded_regular_sha256(path: &Path, max_bytes: u64) -> std::io::Re
             "token is not a bounded regular file",
         ));
     }
+    Ok(file)
+}
+
+/// Read an untrusted on-disk file into memory, bounded by `max_bytes` (same
+/// link/special-file refusal as [`bounded_regular_sha256`]).
+pub(crate) fn bounded_regular_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = open_bounded_regular(path, max_bytes)?;
+    let mut out = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeded read limit",
+        ));
+    }
+    Ok(out)
+}
+
+/// Hash an untrusted on-disk token with bounded memory and IO. Links and
+/// special files are refused before reading; a concurrent growth is bounded
+/// by the reader as well as the initial size check.
+pub(crate) fn bounded_regular_sha256(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let file = open_bounded_regular(path, max_bytes)?;
     let mut reader = file.take(max_bytes.saturating_add(1));
     let mut hasher = Sha256::new();
     let mut bytes = 0u64;

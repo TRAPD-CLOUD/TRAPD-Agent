@@ -3,6 +3,7 @@ pub mod anti_ptrace;
 pub mod binary_integrity;
 #[cfg(target_os = "linux")]
 pub mod kernel_hardening;
+pub mod maintenance;
 #[cfg(target_os = "windows")]
 pub mod process_mitigation;
 // Windows: runtime integrity recheck + health watchdog (SCM recovery handles process death).
