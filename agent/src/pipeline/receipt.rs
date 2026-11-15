@@ -5,8 +5,20 @@ use std::sync::{Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-fn waiters() -> &'static Mutex<HashMap<Uuid, oneshot::Sender<bool>>> {
-    static WAITERS: OnceLock<Mutex<HashMap<Uuid, oneshot::Sender<bool>>>> = OnceLock::new();
+/// How a requested receipt was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The event reached stable journal storage.
+    Durable,
+    /// The event was dropped on purpose by a local policy (signed suppression
+    /// or shadow rule). Nothing was stored, and nothing needs to be retried.
+    Discarded,
+    /// The spool could not store the event durably.
+    NotDurable,
+}
+
+fn waiters() -> &'static Mutex<HashMap<Uuid, oneshot::Sender<Outcome>>> {
+    static WAITERS: OnceLock<Mutex<HashMap<Uuid, oneshot::Sender<Outcome>>>> = OnceLock::new();
     WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -26,9 +38,26 @@ pub(super) fn requested(id: Uuid) -> bool {
 }
 
 pub(super) fn complete(id: Uuid, durable: bool) {
+    resolve(
+        id,
+        if durable {
+            Outcome::Durable
+        } else {
+            Outcome::NotDurable
+        },
+    );
+}
+
+/// Resolve a waiting receipt for an event the consumer dropped by policy, so
+/// the sender is not left waiting for a journal write that will never happen.
+pub(crate) fn complete_discarded(id: Uuid) {
+    resolve(id, Outcome::Discarded);
+}
+
+fn resolve(id: Uuid, outcome: Outcome) {
     if let Ok(mut waiters) = waiters().lock() {
         if let Some(sender) = waiters.remove(&id) {
-            let _ = sender.send(durable);
+            let _ = sender.send(outcome);
         }
     }
 }
@@ -36,7 +65,18 @@ pub(super) fn complete(id: Uuid, durable: bool) {
 /// Only online checkpointing sensors use this handoff. The bounded registration
 /// is removed on success, failure, timeout or cancellation. Offline collection
 /// keeps the existing NDJSON output semantics and uses ordinary channel sends.
+///
+/// `Ok` means the event is safe to stop tracking: stored durably, or discarded
+/// by policy. Callers that must tell the two apart use [`send_durable_outcome`].
 pub async fn send_durable(tx: &mpsc::Sender<AgentEvent>, event: AgentEvent) -> anyhow::Result<()> {
+    send_durable_outcome(tx, event).await.map(|_| ())
+}
+
+/// Like [`send_durable`], but reports whether the event was stored or discarded.
+pub async fn send_durable_outcome(
+    tx: &mpsc::Sender<AgentEvent>,
+    event: AgentEvent,
+) -> anyhow::Result<Outcome> {
     let (sender, receiver) = oneshot::channel();
     {
         let mut waiters = waiters()
@@ -57,11 +97,10 @@ pub async fn send_durable(tx: &mpsc::Sender<AgentEvent>, event: AgentEvent) -> a
         tx.send(event)
             .await
             .map_err(|_| anyhow::anyhow!("pipeline closed"))?;
-        anyhow::ensure!(
-            receiver.await.unwrap_or(false),
-            "event was not durably journaled"
-        );
-        Ok(())
+        match receiver.await.unwrap_or(Outcome::NotDurable) {
+            Outcome::NotDurable => Err(anyhow::anyhow!("event was not durably journaled")),
+            outcome => Ok(outcome),
+        }
     })
     .await
     .map_err(|_| anyhow::anyhow!("durable handoff timed out"))?

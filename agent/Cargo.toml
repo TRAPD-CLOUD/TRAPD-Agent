@@ -99,3 +99,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 roxmltree = "0.20"
 windows-service = "0.7"
+
+# Windows builds get it above; non-Windows needs it only for the portable
+# System-log classification tests (selfprotect::restart_forensics).
+[target.'cfg(not(windows))'.dev-dependencies]
+roxmltree = "0.20"

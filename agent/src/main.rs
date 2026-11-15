@@ -164,6 +164,8 @@ async fn main() -> Result<()> {
 
     if let Err(e) = selfprotect::binary_integrity::check() {
         error!("{e:#}");
+        // One bounded, best-effort report (rate limited); else kept pending.
+        selfprotect::tamper_alert::report(&e).await;
         // Not transient: hold before exiting so Restart=always cannot spin.
         if let Some(hold) = selfprotect::binary_integrity::hold_duration(&e) {
             tokio::time::sleep(hold).await;
@@ -280,6 +282,25 @@ async fn main() -> Result<()> {
     let ring_buffer: Arc<Mutex<Spool>> = Arc::new(Mutex::new(spool));
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
+
+    // A tamper alert a previous failed start could not deliver.
+    if offline {
+        // The in-memory spool is never drained offline: local output is the record.
+        selfprotect::tamper_alert::handoff_pending_offline(
+            paths::state_dir(),
+            &agent_id,
+            &hostname,
+            &output_mode,
+        )
+        .await;
+    } else if let Ok(mut spool) = ring_buffer.lock() {
+        selfprotect::tamper_alert::handoff_pending(
+            paths::state_dir(),
+            &agent_id,
+            &hostname,
+            &mut spool,
+        );
+    }
 
     // A start after a kill/crash/power loss is worth one low-severity signal.
     if let Some(finding) = heartbeat::lifecycle::unclean_shutdown_finding(
@@ -768,10 +789,14 @@ pub(crate) async fn consume_batch_with(
             detection::sensor_policy::Disposition::Shadow(rule) => {
                 // Shadow rules are counted, never emitted or acted on.
                 telemetry::coverage::shadow_hit(&rule);
+                #[cfg(any(windows, test))]
+                pipeline::receipt::complete_discarded(event.event_id);
                 continue;
             }
             detection::sensor_policy::Disposition::Suppressed => {
                 telemetry::metrics::metrics().detection_suppressed();
+                #[cfg(any(windows, test))]
+                pipeline::receipt::complete_discarded(event.event_id);
                 continue;
             }
         }
@@ -1098,11 +1123,98 @@ mod tests {
             &siem,
         )
         .await;
-        detection::sensor_policy::set_rule_modes(&[]);
         assert!(
             tee_rx.try_recv().is_err(),
             "shadow finding must not reach prevention"
         );
         assert_eq!(spool.lock().unwrap().len(), 0, "and must not be spooled");
+
+        // Restart forensics hand findings over with a durable receipt. A
+        // finding discarded by policy resolves it, so the sender neither
+        // times out nor blocks the findings behind it.
+        let dir = std::env::temp_dir().join(format!(
+            "trapd_discard_receipt_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let durable: Arc<Mutex<Spool>> =
+            Arc::new(Mutex::new(Spool::durable_at(dir.join("queue.journal"), 10)));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let consumer = {
+            let durable = Arc::clone(&durable);
+            tokio::spawn(async move {
+                let mut tracker = detection::CheckpointTracker::default();
+                while let Some(event) = rx.recv().await {
+                    consume_batch(
+                        vec![event],
+                        &mut tracker,
+                        None,
+                        &OutputMode::Off,
+                        &durable,
+                        &siem,
+                    )
+                    .await;
+                }
+            })
+        };
+        let finding = |record_id: u64, rule: &str| selfprotect::restart_forensics::Finding {
+            time: chrono::Utc::now(),
+            severity: schema::Severity::High,
+            record_id,
+            detection: schema::DetectionData {
+                rule_id: rule.into(),
+                confidence: 90,
+                ..Default::default()
+            },
+        };
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let delivered = selfprotect::restart_forensics::deliver_all(
+            vec![
+                finding(1, "selfprotect.unclean_shutdown"),
+                finding(2, "selfprotect.test_forwarded"),
+            ],
+            |f| {
+                let event = schema::AgentEvent::new(
+                    "a".into(),
+                    "h".into(),
+                    schema::EventClass::Detection,
+                    schema::EventAction::Detected,
+                    f.severity,
+                    schema::EventData::Detection(Box::new(f.detection)),
+                );
+                let tx = tx.clone();
+                let seen = Arc::clone(&outcomes);
+                let outcome = async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        pipeline::receipt::send_durable_outcome(&tx, event),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("receipt never resolved"))?
+                };
+                async move {
+                    let o = outcome.await?;
+                    seen.lock().unwrap().push(o);
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        detection::sensor_policy::set_rule_modes(&[]);
+        assert!(
+            delivered,
+            "a discarded finding must not block the watermark"
+        );
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![
+                pipeline::receipt::Outcome::Discarded,
+                pipeline::receipt::Outcome::Durable
+            ],
+            "discarded is never reported as stored"
+        );
+        assert_eq!(durable.lock().unwrap().len(), 1, "only the later finding");
+        consumer.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -248,6 +248,8 @@ pub(super) async fn run_agent(
     // a self-reported version to excuse a hash mismatch.
     if let Err(e) = crate::selfprotect::binary_integrity::check() {
         error!("{e:#}");
+        // One bounded, best-effort report (rate limited); else kept pending.
+        crate::selfprotect::tamper_alert::report(&e).await;
         // Not transient: hold before reporting the failure, so the SCM recovery
         // policy cannot restart-loop every 10 s. A pending service accepts no
         // controls, so report the service as started first: the hold can last
@@ -347,6 +349,31 @@ pub(super) async fn run_agent(
     let ring_buffer: Arc<Mutex<Spool>> = Arc::new(Mutex::new(spool));
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
+    // Evidence the System log kept while the agent was not running, and a
+    // tamper alert a previous failed start could not deliver.
+    if offline {
+        // The in-memory spool is never drained offline: local output is the record.
+        crate::selfprotect::tamper_alert::handoff_pending_offline(
+            paths::state_dir(),
+            &agent_id,
+            &hostname,
+            &output_mode,
+        )
+        .await;
+    } else if let Ok(mut spool) = ring_buffer.lock() {
+        crate::selfprotect::tamper_alert::handoff_pending(
+            paths::state_dir(),
+            &agent_id,
+            &hostname,
+            &mut spool,
+        );
+    }
+    tokio::spawn(crate::selfprotect::restart_forensics::run(
+        tx.clone(),
+        agent_id.clone(),
+        hostname.clone(),
+        offline,
+    ));
     let startup_audit =
         crate::prevention::audit::AuditEmitter::new(tx.clone(), agent_id.clone(), hostname.clone());
     for expired in startup_expired {
