@@ -250,6 +250,48 @@ pub fn handoff_pending(dir: &Path, agent_id: &str, hostname: &str, spool: &mut S
     let _ = std::fs::remove_file(dir.join(STATE_FILE));
 }
 
+/// Offline counterpart of [`handoff_pending`]. An offline start has only an
+/// in-memory spool that nothing drains, so the local output is the sole
+/// system of record: write the alert there (like the stop announcer does) and
+/// drop the pending record only once that write succeeded.
+///
+/// The alert is written directly, never through the consumer's policy path, so
+/// a signed suppression or shadow rule cannot hide it. With `OutputMode::Off`
+/// nothing can be written, so the record stays for a later online start.
+pub async fn handoff_pending_offline(
+    dir: &Path,
+    agent_id: &str,
+    hostname: &str,
+    mode: &crate::output::OutputMode,
+) {
+    handoff_pending_offline_with(dir, agent_id, hostname, |event| async move {
+        !matches!(mode, crate::output::OutputMode::Off)
+            && crate::output::write_events(std::slice::from_ref(&event), mode)
+                .await
+                .is_ok()
+    })
+    .await;
+}
+
+async fn handoff_pending_offline_with<W, Fut>(
+    dir: &Path,
+    agent_id: &str,
+    hostname: &str,
+    write_local: W,
+) where
+    W: FnOnce(AgentEvent) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let Some(state) = read_state(dir) else {
+        return;
+    };
+    if state.delivered_at.is_none() && !write_local(event(&state, agent_id, hostname)).await {
+        tracing::warn!("pending tamper alert could not be written to the local output");
+        return;
+    }
+    let _ = std::fs::remove_file(dir.join(STATE_FILE));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +406,38 @@ mod tests {
         // A crash right after the push loses nothing: reopen finds the event.
         let reopened = Spool::durable_at(journal, 10);
         assert_eq!(reopened.peek_batch(1)[0].event.event_id, s.event_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn offline_pending_alert_reaches_local_output_then_the_record_is_removed() {
+        let dir = tmp("offline");
+        let s = next_state(None, H1, 1, t("2026-11-15T10:00:00Z"));
+        write_state(&dir, &s);
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // A failing local write keeps the record for the next start.
+        handoff_pending_offline_with(&dir, "a", "h", |_| async { false }).await;
+        assert_eq!(read_state(&dir), Some(s.clone()));
+        let sink = std::sync::Arc::clone(&written);
+        handoff_pending_offline_with(&dir, "a", "h", move |e| async move {
+            sink.lock().unwrap().push(e);
+            true
+        })
+        .await;
+        let written = written.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].event_id, s.event_id);
+        assert!(read_state(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn offline_without_a_local_output_keeps_the_record() {
+        let dir = tmp("offline_off");
+        let s = next_state(None, H1, 1, t("2026-11-15T10:00:00Z"));
+        write_state(&dir, &s);
+        handoff_pending_offline(&dir, "a", "h", &crate::output::OutputMode::Off).await;
+        assert_eq!(read_state(&dir), Some(s));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

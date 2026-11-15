@@ -351,7 +351,16 @@ pub(super) async fn run_agent(
     let mut handles = Vec::new();
     // Evidence the System log kept while the agent was not running, and a
     // tamper alert a previous failed start could not deliver.
-    if let Ok(mut spool) = ring_buffer.lock() {
+    if offline {
+        // The in-memory spool is never drained offline: local output is the record.
+        crate::selfprotect::tamper_alert::handoff_pending_offline(
+            paths::state_dir(),
+            &agent_id,
+            &hostname,
+            &output_mode,
+        )
+        .await;
+    } else if let Ok(mut spool) = ring_buffer.lock() {
         crate::selfprotect::tamper_alert::handoff_pending(
             paths::state_dir(),
             &agent_id,
