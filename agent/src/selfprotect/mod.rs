@@ -16,3 +16,9 @@ pub mod runtime_guard;
 // Linux watchdog subprocess; Windows uses SCM recovery plus runtime_guard.
 #[cfg(target_os = "linux")]
 pub mod watchdog;
+// Best-effort report of a binary-integrity failure before the fail-closed exit.
+pub mod tamper_alert;
+// Windows: System-log read-back (service stop/config change, driver install,
+// unexpected shutdown) since the previous run. Classification is portable.
+#[cfg(any(target_os = "windows", test))]
+pub mod restart_forensics;

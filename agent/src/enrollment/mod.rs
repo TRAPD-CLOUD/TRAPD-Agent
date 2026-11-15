@@ -278,7 +278,7 @@ pub(crate) fn load_persisted_blocking() -> Option<Credentials> {
         .filter(Credentials::is_valid)
 }
 
-async fn load_persisted() -> Option<Credentials> {
+pub(crate) async fn load_persisted() -> Option<Credentials> {
     let path = paths::credentials_file();
     if !path.exists() {
         return None;
