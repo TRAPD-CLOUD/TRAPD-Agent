@@ -205,49 +205,82 @@ impl StopAnnouncer {
     }
 
     async fn announce_service_stop(&self, source: StopSource) {
+        let mode = crate::output::OutputMode::from_env();
+        self.announce_service_stop_with(source, STOP_FLUSH_BUDGET, move |event| async move {
+            crate::output::write_events(std::slice::from_ref(&event), &mode)
+                .await
+                .is_ok()
+        })
+        .await;
+    }
+
+    /// The whole stop notice (local write, spool insertion and delivery) runs
+    /// under one deadline of `budget`, so a slow disk can never hold up the
+    /// shutdown. `write_local` is the seam for the local output.
+    async fn announce_service_stop_with<W, Fut>(
+        &self,
+        source: StopSource,
+        budget: Duration,
+        write_local: W,
+    ) where
+        W: FnOnce(AgentEvent) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
         let event = stop_event(&self.agent_id, &self.hostname, source);
+        // This event bypasses the consumer, so it is written to the configured
+        // local output itself, online and offline alike, independent of
+        // whether the backend takes it.
         let local_copy = event.clone();
-        let seq = match self.spool.lock() {
-            Ok(mut spool) => spool.push(event),
-            Err(e) => {
-                warn!(error = %e, "stop notice: spool unavailable");
-                return;
+        let local = async {
+            if write_local(local_copy).await {
+                info!("stop notice written to local output");
+            } else {
+                warn!("stop notice could not be written to local output");
             }
         };
-        let seq = match seq {
-            Ok(seq) => seq,
-            Err(reason) => {
-                warn!(?reason, "stop notice: could not queue the finding");
-                return;
-            }
-        };
-        // Queued: if delivery below fails, the journal replays it on the next
-        // start, so the finding is late rather than lost.
-        let Some(transport) = &self.transport else {
-            // Offline: the spool is in memory and this event bypasses the
-            // consumer, so write it to the configured local output directly or
-            // it is lost when the process exits.
-            let mode = crate::output::OutputMode::from_env();
-            match within(STOP_FLUSH_BUDGET, async {
-                crate::output::write_events(std::slice::from_ref(&local_copy), &mode)
-                    .await
-                    .is_ok()
+        // `Spool::push` is synchronous (journal write, fsync, compaction), so
+        // it runs on the blocking pool. If the deadline passes first, the
+        // task is abandoned (it may still finish while the process exits).
+        let spool = Arc::clone(&self.spool);
+        let transport = self.transport.as_ref();
+        let queue_and_deliver = async move {
+            let queued = tokio::task::spawn_blocking(move || match spool.lock() {
+                Ok(mut spool) => spool.push(event).map_err(|r| format!("{r:?}")),
+                Err(e) => Err(format!("spool unavailable: {e}")),
             })
-            .await
-            {
-                Delivery::Delivered => info!("stop notice written to local output"),
-                _ => warn!("stop notice could not be written to local output"),
+            .await;
+            let seq = match queued {
+                Ok(Ok(seq)) => seq,
+                Ok(Err(reason)) => {
+                    warn!(%reason, "stop notice: could not queue the finding");
+                    return None;
+                }
+                Err(e) => {
+                    warn!(error = %e, "stop notice: queueing task failed");
+                    return None;
+                }
+            };
+            // Queued: if delivery fails, the journal replays it on the next
+            // start, so the finding is late rather than lost.
+            match transport {
+                Some(t) => Some(t.deliver(seq).await),
+                None => Some(true),
             }
-            return;
         };
-        match within(STOP_FLUSH_BUDGET, transport.deliver(seq)).await {
-            Delivery::Delivered => info!("stop notice delivered to the backend"),
-            Delivery::Failed => {
+        let work = async { tokio::join!(local, queue_and_deliver).1 };
+        match tokio::time::timeout(budget, work).await {
+            Ok(Some(true)) => {
+                if self.transport.is_some() {
+                    info!("stop notice delivered to the backend");
+                }
+            }
+            Ok(Some(false)) => {
                 warn!("stop notice not delivered; it stays queued for the next start")
             }
-            Delivery::TimedOut => warn!(
-                budget_ms = STOP_FLUSH_BUDGET.as_millis() as u64,
-                "stop notice not delivered in time; it stays queued for the next start"
+            Ok(None) => {}
+            Err(_) => warn!(
+                budget_ms = budget.as_millis() as u64,
+                "stop notice not completed in time; it stays queued for the next start"
             ),
         }
     }
@@ -362,5 +395,57 @@ mod tests {
         a.announce(StopKind::HostShutdown, StopSource::ScmStop)
             .await;
         assert_eq!(spool.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_finding_is_written_to_the_local_output() {
+        let spool = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let a = StopAnnouncer::new("a".into(), "h".into(), Arc::clone(&spool));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&written);
+        a.announce_service_stop_with(
+            StopSource::Sigterm,
+            STOP_FLUSH_BUDGET,
+            move |e| async move {
+                sink.lock().unwrap().push(e);
+                true
+            },
+        )
+        .await;
+        assert_eq!(written.lock().unwrap().len(), 1);
+        assert_eq!(spool.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_spool_insertion_cannot_hold_up_the_shutdown() {
+        let spool = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let a = StopAnnouncer::new("a".into(), "h".into(), Arc::clone(&spool));
+        // Hold the lock so the blocking insertion cannot finish.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let spool = Arc::clone(&spool);
+            std::thread::spawn(move || {
+                let _guard = spool.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(600));
+            })
+        };
+        locked_rx.recv().unwrap();
+        let written = Arc::new(Mutex::new(0));
+        let sink = Arc::clone(&written);
+        let started = std::time::Instant::now();
+        a.announce_service_stop_with(
+            StopSource::Sigterm,
+            Duration::from_millis(150),
+            move |_| async move {
+                *sink.lock().unwrap() += 1;
+                true
+            },
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The local copy does not depend on the queue.
+        assert_eq!(*written.lock().unwrap(), 1);
+        holder.join().unwrap();
     }
 }
