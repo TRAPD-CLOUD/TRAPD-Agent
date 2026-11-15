@@ -12,7 +12,7 @@ use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-    SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    SetNamedSecurityInfoW, SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
     GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACL, DACL_SECURITY_INFORMATION,
@@ -68,6 +68,103 @@ pub fn is_elevated() -> bool {
         );
         CloseHandle(token);
         ok != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+/// Whether this process runs as `LocalSystem` (the service account). A console
+/// run by an administrator is not, and must not be locked out of its own process.
+pub fn is_local_system() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let system_sid = wide_str("S-1-5-18");
+    // SAFETY: the token handle and the converted SID are released on every
+    // path; the token-user buffer is 8-byte aligned (u64) and its byte length
+    // is the one GetTokenInformation reported.
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut needed = 0u32;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+        let mut returned = 0u32;
+        let mut result = false;
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * 8) as u32,
+            &mut returned,
+        ) != 0
+        {
+            let user = &*(buffer.as_ptr().cast::<TOKEN_USER>());
+            let mut sid = std::ptr::null_mut();
+            if ConvertStringSidToSidW(system_sid.as_ptr(), &mut sid) != 0 {
+                result = EqualSid(user.User.Sid, sid) != 0;
+                LocalFree(sid);
+            }
+        }
+        CloseHandle(token);
+        result
+    }
+}
+
+/// Replace the DACL of the current process object with the one described by
+/// `sddl`. The descriptor must be protected so no ACE is inherited.
+pub fn set_current_process_dacl(sddl: &str) -> Result<()> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if !sddl_is_protected(sddl) {
+        bail!("process DACL must be protected");
+    }
+    let wsddl = wide_str(sddl);
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: NUL-terminated input; `sd` is a valid out-pointer freed below;
+    // the DACL pointer points into `sd`, which outlives the call.
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wsddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            bail!(
+                "invalid security descriptor: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let got = GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted);
+        let result = if got == 0 || present == 0 || dacl.is_null() {
+            Err(anyhow!("security descriptor carries no DACL"))
+        } else {
+            let status = SetSecurityInfo(
+                GetCurrentProcess(),
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            );
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "SetSecurityInfo(process) failed: {}",
+                    std::io::Error::from_raw_os_error(status as i32)
+                ))
+            }
+        };
+        LocalFree(sd);
+        result
     }
 }
 

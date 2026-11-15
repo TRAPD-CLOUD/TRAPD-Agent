@@ -232,9 +232,13 @@ async fn reconcile_pending_firewall_expiry() -> Vec<crate::prevention::winfirewa
 pub async fn run_agent(
     mut stop: tokio::sync::mpsc::UnboundedReceiver<()>,
     on_ready: impl FnOnce(),
+    as_service: bool,
 ) -> Result<()> {
     paths::init_state_dir();
     crate::selfprotect::process_mitigation::apply();
+    if as_service {
+        crate::selfprotect::process_dacl::apply();
+    }
     // Include startup recovery and pending enrollment in this process run.
     crate::heartbeat::lifecycle::begin_process();
 

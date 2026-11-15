@@ -130,7 +130,7 @@ fn run_console() -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             let _ = stop_tx.send(());
         });
-        run::run_agent(stop_rx, || {}).await
+        run::run_agent(stop_rx, || {}, false).await
     });
     rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     result
@@ -290,14 +290,18 @@ fn run_service() -> Result<()> {
         }
     };
     let ready_tx = phase_tx.clone();
-    let result = rt.block_on(run::run_agent(stop_rx, move || {
-        // Past the integrity check: only now is the service Running.
-        let _ = ready_tx.send(Phase::Running);
-        evtlog::notify(
-            evtlog::Event::Started,
-            &format!("TRAPD Agent v{} started.", env!("CARGO_PKG_VERSION")),
-        );
-    }));
+    let result = rt.block_on(run::run_agent(
+        stop_rx,
+        move || {
+            // Past the integrity check: only now is the service Running.
+            let _ = ready_tx.send(Phase::Running);
+            evtlog::notify(
+                evtlog::Event::Started,
+                &format!("TRAPD Agent v{} started.", env!("CARGO_PKG_VERSION")),
+            );
+        },
+        true,
+    ));
 
     // Stopping (stop request, or the agent ended on its own): keep the SCM
     // informed while blocking tasks wind down, but never wait for them forever.
