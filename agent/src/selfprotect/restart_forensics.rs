@@ -472,6 +472,46 @@ pub fn advance_watermark(dir: &Path, now: DateTime<Utc>, complete: bool) {
     }
 }
 
+/// Stable `event_id` for a replayed record: the same record yields the same id
+/// on every restart (the backend deduplicates on it), a different agent,
+/// channel, record or rule yields a different one. A SHA-256 over
+/// length-prefixed parts, truncated to 16 bytes, with the UUIDv5 version and
+/// variant bits set (the `uuid` crate has no `v5` feature enabled here).
+pub fn stable_event_id(agent_id: &str, channel: &str, record_id: u64, rule_id: &str) -> uuid::Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"trapd.restart_forensics.v1");
+    for part in [agent_id, channel, rule_id] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.update(record_id.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
+
+/// Hand every finding to `send` (a durable handoff) in order and report
+/// whether all were confirmed. Stops at the first failure so the caller keeps
+/// the old watermark and the window is replayed (with identical event ids).
+pub async fn deliver_all<F, Fut>(findings: Vec<Finding>, mut send: F) -> bool
+where
+    F: FnMut(Finding) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    for finding in findings {
+        let record_id = finding.record_id;
+        if let Err(e) = send(finding).await {
+            tracing::warn!(record_id, error = %e, "restart forensic finding was not durably handed off; keeping the watermark");
+            return false;
+        }
+    }
+    true
+}
+
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ`, the form `TimeCreated/@SystemTime` compares in.
 fn xpath_time(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
@@ -505,6 +545,12 @@ pub fn queries(since: DateTime<Utc>) -> Vec<(String, usize)> {
 #[cfg(windows)]
 fn build_event(finding: Finding, agent_id: &str, hostname: &str) -> trapd_schema::AgentEvent {
     use trapd_schema::{AgentEvent, EventAction, EventClass, EventData};
+    let event_id = stable_event_id(
+        agent_id,
+        "System",
+        finding.record_id,
+        &finding.detection.rule_id,
+    );
     let mut event = AgentEvent::new(
         agent_id.into(),
         hostname.into(),
@@ -516,6 +562,7 @@ fn build_event(finding: Finding, agent_id: &str, hostname: &str) -> trapd_schema
     // Native time and source keep a replayed record from authorizing a live
     // response (see `is_historical_windows_record`).
     event.timestamp = finding.time;
+    event.event_id = event_id;
     event.with_source(&format!("windows_eventlog:System:{}", finding.record_id))
 }
 
@@ -571,21 +618,72 @@ pub async fn run(
         truncated_queries = outcome.truncated,
         "System log read-back finished"
     );
-    for finding in findings {
-        if tx
-            .send(build_event(finding, &agent_id, &hostname))
-            .await
-            .is_err()
-        {
-            return;
-        }
-    }
-    advance_watermark(state, now, outcome.complete);
+    // The watermark moves only after the journal confirmed every finding; an
+    // in-memory-only queue never confirms, so the window is then replayed.
+    let delivered = deliver_all(findings, |finding| {
+        let event = build_event(finding, &agent_id, &hostname);
+        let tx = &tx;
+        async move { crate::pipeline::receipt::send_durable(tx, event).await }
+    })
+    .await;
+    advance_watermark(state, now, outcome.complete && delivered);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finding(record_id: u64, rule: &str) -> Finding {
+        Finding {
+            time: ts("2026-11-14T10:00:00Z"),
+            severity: Severity::High,
+            record_id,
+            detection: DetectionData {
+                rule_id: rule.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn stable_event_id_is_deterministic_and_distinguishes_inputs() {
+        let a = stable_event_id("agent-1", "System", 10, "r");
+        assert_eq!(a, stable_event_id("agent-1", "System", 10, "r"));
+        assert_ne!(a, stable_event_id("agent-1", "System", 11, "r"));
+        assert_ne!(a, stable_event_id("agent-2", "System", 10, "r"));
+        assert_ne!(a, stable_event_id("agent-1", "Other", 10, "r"));
+        assert_ne!(a, stable_event_id("agent-1", "System", 10, "r2"));
+        // Length prefixes keep part boundaries unambiguous.
+        assert_ne!(
+            stable_event_id("ab", "c", 1, "r"),
+            stable_event_id("a", "bc", 1, "r")
+        );
+        assert_eq!(a.get_version_num(), 5);
+    }
+
+    #[tokio::test]
+    async fn watermark_is_not_advanced_when_durable_handoff_fails() {
+        let dir = std::env::temp_dir().join(format!("trapd_rf_durable_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = ts("2026-11-14T12:00:00Z");
+        let mut sent = 0;
+        let delivered = deliver_all(vec![finding(1, "a"), finding(2, "b")], |_| {
+            sent += 1;
+            async { Err(anyhow::anyhow!("event was not durably journaled")) }
+        })
+        .await;
+        assert!(!delivered);
+        assert_eq!(sent, 1, "stops at the first failure");
+        advance_watermark(&dir, now, delivered);
+        assert!(read_watermark(&dir).is_none());
+
+        let delivered = deliver_all(vec![finding(1, "a")], |_| async { Ok(()) }).await;
+        assert!(delivered);
+        advance_watermark(&dir, now, delivered);
+        assert_eq!(read_watermark(&dir), Some(now));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
