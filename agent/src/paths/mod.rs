@@ -657,3 +657,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Load `<config>/agent.env` into the process environment without overriding
+/// variables that are already set. The services get this file from the
+/// service manager (systemd `EnvironmentFile`) or the Windows startup path; CLI
+/// verbs that must see the same identity and state dir (e.g. `maintenance`)
+/// call this before [`init_state_dir`].
+pub fn load_agent_env_file() {
+    let path = config_dir().join("agent.env");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    for (key, value) in parse_agent_env(&contents) {
+        if std::env::var_os(&key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+    tracing::info!(path = %path.display(), "loaded agent.env");
+}
+
+/// `KEY=value` lines; blank lines and `#` comments skipped, surrounding quotes trimmed.
+fn parse_agent_env(contents: &str) -> Vec<(String, String)> {
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().trim_matches('"').to_string()))
+        .filter(|(k, _)| !k.is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod agent_env_tests {
+    use super::parse_agent_env;
+
+    #[test]
+    fn parses_keys_skipping_comments_blanks_and_quotes() {
+        let got = parse_agent_env("# c\n\nTRAPD_STATE_DIR=\"/srv/trapd\"\n =x\nNOEQ\n A = b \n");
+        assert_eq!(
+            got,
+            vec![
+                ("TRAPD_STATE_DIR".to_string(), "/srv/trapd".to_string()),
+                ("A".to_string(), "b".to_string())
+            ]
+        );
+    }
+}

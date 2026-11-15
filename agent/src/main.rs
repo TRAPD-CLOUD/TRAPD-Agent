@@ -130,6 +130,10 @@ async fn main() -> Result<()> {
     // `trapd-agent maintenance --purpose stop --token-file <path>` — sanctioned
     // stop authorised by a signed, single-use maintenance token (file input only).
     if std::env::args().nth(1).as_deref() == Some("maintenance") {
+        // Same identity and state dir as the service: systemd loads agent.env
+        // via EnvironmentFile, a shell does not. Load it before the (cached)
+        // state dir is resolved.
+        paths::load_agent_env_file();
         paths::init_state_dir();
         let args: Vec<String> = std::env::args().skip(2).collect();
         return selfprotect::maintenance::run_cli(&args, || {
