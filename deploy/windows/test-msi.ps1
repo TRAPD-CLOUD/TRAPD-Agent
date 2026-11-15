@@ -182,7 +182,12 @@ try {
     if (Test-Path $pairingFile) { throw 'pairing.txt survived the service stop.' }
     if (Test-Path (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'TRAPD')) { throw 'Uninstall left the Start Menu folder.' }
 
-    Invoke-Msi @('/i', "`"$Msi`"", '/qn', '/norestart', "BACKENDURL=$url", 'ENROLLTOKEN=test-enrollment-token', '/L*v', "`"$(Join-Path $root 'install.log')`"")
+    # Token goes through a file (ENROLLTOKENFILE): the MSI log and command line must never carry it.
+    $tokenFile = Join-Path $root 'enroll.token'
+    [IO.File]::WriteAllText($tokenFile, 'test-enrollment-token', (New-Object Text.UTF8Encoding $false))
+    Invoke-Msi @('/i', "`"$Msi`"", '/qn', '/norestart', "BACKENDURL=$url", "ENROLLTOKENFILE=`"$tokenFile`"", '/L*v', "`"$(Join-Path $root 'install.log')`"")
+    Remove-Item -Force $tokenFile -ErrorAction SilentlyContinue
+    if (Select-String -LiteralPath (Join-Path $root 'install.log') -SimpleMatch 'test-enrollment-token' -Quiet) { throw 'The enrollment token appears in the MSI log.' }
     Wait-Until { (Get-Service trapd-agent -ErrorAction SilentlyContinue).Status -eq 'Running' } 'MSI service did not start.'
     Wait-Until { Test-Path (Join-Path $state 'config_issued_at.json') } 'Signed configuration was not applied.'
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'system' }).Count -gt 0 } 'No system telemetry.'

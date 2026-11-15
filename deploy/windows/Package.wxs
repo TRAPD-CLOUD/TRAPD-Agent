@@ -36,6 +36,14 @@
       <RegistrySearch Id="ExistingEnrollToken" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="raw" Bitness="always64" />
     </Property>
 
+    <!-- Path (never the token) of a file holding a one-time enrollment token.
+         install.ps1 -EnrollTokenFile passes it: the deferred SYSTEM action
+         ImportEnrollToken reads it with the bounded no-link reader and stages the
+         token in the protected registry key, so the token is on no command line,
+         in no MSI log and does not need write access to the hardened key for an
+         elevated administrator. Prefer this over ENROLLTOKEN=. -->
+    <Property Id="ENROLLTOKENFILE" Secure="yes" />
+
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="TRAPD Agent">
         <Component Id="AgentService" Guid="CF0BCF0C-FB5C-4DD4-A872-1C16C7FAE06B" Bitness="always64">
@@ -217,7 +225,15 @@
          legacy one is an explicit operator request and fails the install. -->
     <CustomAction Id="ApplyAcls" FileRef="AgentExe" ExeCommand="acl apply" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="ApplyLegacyAcls" FileRef="AgentExe" ExeCommand="acl legacy" Execute="deferred" Impersonate="no" Return="check" />
+    <!-- ENROLLTOKENFILE: deferred actions only see CustomActionData, so the path
+         is handed over through a property named like the action. The rollback
+         action drops a token staged by a transaction that later failed. -->
+    <SetProperty Action="SetImportEnrollTokenData" Id="ImportEnrollToken" Value="[ENROLLTOKENFILE]" Before="ImportEnrollToken" Sequence="execute" Condition="ENROLLTOKENFILE AND NOT REMOVE" />
+    <CustomAction Id="ImportEnrollToken" FileRef="AgentExe" ExeCommand="enroll-token-import &quot;[CustomActionData]&quot;" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="RollbackEnrollToken" FileRef="AgentExe" ExeCommand="enroll-token-clear" Execute="rollback" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
+      <Custom Action="RollbackEnrollToken" After="WriteRegistryValues" Condition="ENROLLTOKENFILE AND NOT REMOVE" />
+      <Custom Action="ImportEnrollToken" After="RollbackEnrollToken" Condition="ENROLLTOKENFILE AND NOT REMOVE" />
       <Custom Action="ApplyAcls" After="InstallServices" Condition="NOT REMOVE AND NOT TRAPD_LEGACY_ACLS=&quot;1&quot;" />
       <Custom Action="ApplyLegacyAcls" After="InstallServices" Condition="NOT REMOVE AND TRAPD_LEGACY_ACLS=&quot;1&quot;" />
       <Custom Action="ResetBinaryBaselineAction" After="InstallFiles" Condition="NOT REMOVE" />

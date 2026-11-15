@@ -137,6 +137,22 @@ pub fn entry() -> Result<()> {
                 _ => bail!("usage: trapd-agent.exe acl <apply|legacy>"),
             }
         }
+        // Invoked by the MSI (deferred, SYSTEM) for `ENROLLTOKENFILE=<path>`:
+        // stage the one-time enrollment token in the protected registry key.
+        // The token never appears on a command line or in the MSI log.
+        Some("enroll-token-import") => {
+            run::init_tracing_file();
+            let path = std::env::args()
+                .nth(2)
+                .context("usage: trapd-agent.exe enroll-token-import <file>")?;
+            let token = crate::enrollment::token_file::read(std::path::Path::new(&path))?;
+            registry_stage_enroll_token(Some(&token))
+        }
+        // MSI rollback counterpart: drop a token staged by this transaction.
+        Some("enroll-token-clear") => {
+            run::init_tracing_file();
+            registry_stage_enroll_token(None)
+        }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("telemetry") => {
             print!("{}", crate::telemetry::diagnostics::run());
             Ok(())
@@ -162,6 +178,17 @@ pub fn entry() -> Result<()> {
             bail!("unknown command {other:?} — usage: trapd-agent.exe [install|uninstall|run]")
         }
     }
+}
+
+fn registry_stage_enroll_token(token: Option<&str>) -> Result<()> {
+    use crate::collectors::windows::registry;
+    use windows_sys::Win32::System::Registry::KEY_WOW64_64KEY;
+    const KEY: &str = "SOFTWARE\\TRAPD\\Agent";
+    let result = match token {
+        Some(token) => registry::set_string(KEY, "EnrollToken", token, KEY_WOW64_64KEY),
+        None => registry::delete_value(KEY, "EnrollToken", KEY_WOW64_64KEY),
+    };
+    result.map_err(|status| anyhow::anyhow!("enrollment token registry update failed ({status})"))
 }
 
 // ── Console mode ──────────────────────────────────────────────────────────────

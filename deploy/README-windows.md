@@ -66,9 +66,14 @@ Prefer device pairing (no token). For managed deployments, `BACKENDURL` and
 entries. The MSI stores them in a 64-bit `HKLM\SOFTWARE\TRAPD\Agent` key that is
 restricted to SYSTEM and Administrators. Environment variables and then
 `agent.env` take precedence. Do not pass `ENROLLTOKEN=` to `msiexec` directly: a
-command line is visible to every local user and to process telemetry. Use
-`install.ps1 -EnrollTokenFile <file>` (or `-EnrollToken`), which stages the
-token in the protected registry key instead of the command line. The agent
+command line is visible to every local user and to process telemetry. Pass
+`ENROLLTOKENFILE=<path>` instead (this is what `install.ps1 -EnrollTokenFile
+<file>` or `-EnrollToken` does, via a private temporary file): a deferred SYSTEM
+custom action reads that file (bounded, no links) and stages the token in the
+protected registry key. Only the path appears on the command line and in the
+MSI log. Staging from the script itself is not possible on a hardened host,
+where an elevated administrator cannot write that key; delete the file after
+the install. The agent
 deletes the registry `EnrollToken` value as soon as enrollment succeeded (or
 persisted credentials exist), so the one-time token does not stay on disk.
 TLS pinning fails closed unless `TRAPD_TLS_ALLOW_SYSTEM_ROOTS=1` is explicitly
