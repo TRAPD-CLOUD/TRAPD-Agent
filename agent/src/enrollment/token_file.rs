@@ -35,6 +35,27 @@ fn parse(bytes: &[u8]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A deferred EXE custom action has its `ExeCommand` formatted when it is
+    /// scheduled; `[CustomActionData]` is empty there, so the install would run
+    /// `enroll-token-import ""` and roll back (seen in CI). Pin the working form.
+    #[test]
+    fn msi_exe_actions_never_format_custom_action_data() {
+        let wxs = include_str!("../../../deploy/windows/Package.wxs");
+        let mut checked = 0;
+        for line in wxs.lines().filter(|l| l.contains("<CustomAction ")) {
+            if line.contains("FileRef=") {
+                checked += 1;
+                assert!(
+                    !line.contains("CustomActionData"),
+                    "EXE custom action formats CustomActionData: {line}"
+                );
+            }
+        }
+        assert!(checked >= 5, "expected the EXE custom actions to be found");
+        assert!(wxs.contains("ExeCommand=\"enroll-token-import &quot;[ENROLLTOKENFILE]&quot;\""));
+        assert!(!wxs.contains("SetImportEnrollTokenData"));
+    }
+
     use super::*;
     use std::path::PathBuf;
 

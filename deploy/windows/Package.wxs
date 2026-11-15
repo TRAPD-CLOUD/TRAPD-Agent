@@ -245,11 +245,17 @@
          legacy one is an explicit operator request and fails the install. -->
     <CustomAction Id="ApplyAcls" FileRef="AgentExe" ExeCommand="acl apply" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="ApplyLegacyAcls" FileRef="AgentExe" ExeCommand="acl legacy" Execute="deferred" Impersonate="no" Return="check" />
-    <!-- ENROLLTOKENFILE: deferred actions only see CustomActionData, so the path
-         is handed over through a property named like the action. The rollback
-         action drops a token staged by a transaction that later failed. -->
-    <SetProperty Action="SetImportEnrollTokenData" Id="ImportEnrollToken" Value="[ENROLLTOKENFILE]" Before="ImportEnrollToken" Sequence="execute" Condition="ENROLLTOKENFILE AND NOT REMOVE" />
-    <CustomAction Id="ImportEnrollToken" FileRef="AgentExe" ExeCommand="enroll-token-import &quot;[CustomActionData]&quot;" Execute="deferred" Impersonate="no" Return="check" />
+    <!-- ENROLLTOKENFILE: the path (not the token) is formatted straight into
+         ExeCommand. For a deferred EXE action (type 18 with the Deferred bit)
+         Windows Installer formats the Target column when the action is
+         SCHEDULED, in the immediate script, where ordinary properties are
+         visible; the result is written into the execute script. CustomActionData
+         is not populated for it (it only exists for the run-time of DLL/script
+         actions, and an EXE action does not read it), so "[CustomActionData]"
+         formatted to an empty string and the install rolled back. The path is
+         not a secret. The rollback action drops a token staged by a transaction
+         that later failed. -->
+    <CustomAction Id="ImportEnrollToken" FileRef="AgentExe" ExeCommand="enroll-token-import &quot;[ENROLLTOKENFILE]&quot;" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="RollbackEnrollToken" FileRef="AgentExe" ExeCommand="enroll-token-clear" Execute="rollback" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="RollbackStopMarker" Before="RequireUninstallToken" Condition="REMOVE~=&quot;ALL&quot;" />
