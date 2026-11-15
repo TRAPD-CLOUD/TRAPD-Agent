@@ -771,6 +771,7 @@ fn spawn_privilege_check(
     });
 }
 
+
 /// Attach `raw_sys_enter`, which handles every syscall with a path argument
 /// the collector watches (open family incl. creat/openat2, the honeytoken
 /// stat/readlink/link gates, unlink, rename, chmod, chown) from the raw
