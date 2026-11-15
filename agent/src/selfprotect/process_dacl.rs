@@ -28,9 +28,15 @@ pub const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
 /// `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | READ_CONTROL`.
 pub const ADMIN_PROCESS_RIGHTS: u32 = 0x0000_1000 | 0x0010_0000 | 0x0002_0000;
 
+/// `SYNCHRONIZE` only: what the process owner keeps through `OWNER RIGHTS`.
+pub const OWNER_PROCESS_RIGHTS: u32 = 0x0010_0000;
+
 /// Protected DACL: `SYSTEM` full access, `Administrators` read-only subset,
-/// nobody else (no owner/creator, no Everyone, no inheritance).
-pub const PROCESS_DACL_SDDL: &str = "D:P(A;;0x1fffff;;;SY)(A;;0x121000;;;BA)";
+/// nobody else (no Everyone, no inheritance). The `OWNER RIGHTS` (`OW`) ACE
+/// replaces the owner's implicit `READ_CONTROL | WRITE_DAC`: a LocalSystem
+/// service process is typically owned by `BUILTIN\Administrators`, and without
+/// it an elevated admin could simply rewrite this DACL.
+pub const PROCESS_DACL_SDDL: &str = "D:P(A;;0x1fffff;;;SY)(A;;0x121000;;;BA)(A;;0x100000;;;OW)";
 
 /// Parse `(A;;<hex mask>;;;<sid>)` entries of a protected-DACL SDDL string.
 #[cfg(test)]
@@ -72,9 +78,10 @@ mod tests {
         assert!(PROCESS_DACL_SDDL.starts_with("D:P"));
         let aces = parse_allow_aces(PROCESS_DACL_SDDL);
         let sids: Vec<_> = aces.iter().map(|(_, s)| s.as_str()).collect();
-        assert_eq!(sids, ["SY", "BA"]);
+        assert_eq!(sids, ["SY", "BA", "OW"]);
         assert_eq!(aces[0].0, PROCESS_ALL_ACCESS);
         assert_eq!(aces[1].0, ADMIN_PROCESS_RIGHTS);
+        assert_eq!(aces[2].0, OWNER_PROCESS_RIGHTS);
         assert_eq!(ADMIN_PROCESS_RIGHTS, 0x121000);
     }
 
@@ -95,7 +102,10 @@ mod tests {
         const QUERY_LIMITED: u32 = 0x1000;
         const READ_CONTROL: u32 = 0x0002_0000;
         const SYNCHRONIZE: u32 = 0x0010_0000;
-        let admin = parse_allow_aces(PROCESS_DACL_SDDL)[1].0;
+        let aces = parse_allow_aces(PROCESS_DACL_SDDL);
+        let admin = aces[1].0;
+        // The owner (often Administrators) must not regain WRITE_DAC implicitly.
+        let owner = aces[2].0;
         let forbidden = TERMINATE
             | CREATE_THREAD
             | VM_OPERATION
@@ -109,14 +119,19 @@ mod tests {
             | WRITE_OWNER
             | DELETE;
         assert_eq!(admin & forbidden, 0, "admin mask {admin:#x}");
+        assert_eq!(
+            owner & (forbidden | READ_CONTROL),
+            0,
+            "owner mask {owner:#x}"
+        );
         assert_eq!(admin, QUERY_LIMITED | READ_CONTROL | SYNCHRONIZE);
     }
 
     #[test]
     fn no_other_principal_is_granted_access() {
         let aces = parse_allow_aces(PROCESS_DACL_SDDL);
-        assert_eq!(aces.len(), 2);
-        for forbidden in ["WD", "AU", "BU", "OW", "CO", "IU", "S-1-1-0"] {
+        assert_eq!(aces.len(), 3);
+        for forbidden in ["WD", "AU", "BU", "CO", "IU", "S-1-1-0"] {
             assert!(!PROCESS_DACL_SDDL.contains(&format!(";;;{forbidden})")));
         }
     }
