@@ -441,7 +441,13 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
 #[cfg(not(windows))]
 fn durable_replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
     std::fs::rename(tmp, path)?;
-    std::fs::File::open(path.parent().unwrap())?.sync_all()
+    sync_dir(path.parent().unwrap())
+}
+
+/// Persist the entries of directory `dir` (new files, renames) to disk.
+#[cfg(not(windows))]
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 // Windows has no portable directory fsync. Request a write-through replacement

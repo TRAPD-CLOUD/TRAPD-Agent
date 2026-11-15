@@ -238,6 +238,15 @@ impl ConsumedStore {
     pub fn claim(&self, claims: &Claims, now: i64) -> std::result::Result<(), ClaimError> {
         use std::io::Write as _;
         let io_err = |e: io::Error| ClaimError::Io(e.to_string());
+        // Directories this call creates must be made durable too, or a crash
+        // after "success" could lose the whole consumed-nonce directory.
+        #[cfg(unix)]
+        let new_dirs: Vec<PathBuf> = self
+            .dir
+            .ancestors()
+            .take_while(|p| !p.as_os_str().is_empty() && !p.exists())
+            .map(Path::to_path_buf)
+            .collect();
         std::fs::create_dir_all(&self.dir).map_err(io_err)?;
         let path = self.path_for(&claims.nonce).map_err(io_err)?;
         let mut options = std::fs::OpenOptions::new();
@@ -261,6 +270,20 @@ impl ConsumedStore {
         let bytes = serde_json::to_vec(&record).map_err(|e| ClaimError::Io(e.to_string()))?;
         file.write_all(&bytes).map_err(io_err)?;
         file.sync_all().map_err(io_err)?;
+        // The new directory entry is only durable once the directory is synced
+        // (and, for directories created above, their parents). Windows has no
+        // directory fsync and NTFS journals metadata, so nothing is done there.
+        #[cfg(unix)]
+        {
+            paths::sync_dir(&self.dir).map_err(io_err)?;
+            for dir in &new_dirs {
+                let parent = match dir.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p,
+                    _ => Path::new("."),
+                };
+                paths::sync_dir(parent).map_err(io_err)?;
+            }
+        }
         Ok(())
     }
 
@@ -474,6 +497,15 @@ pub fn parse_cli(args: &[String]) -> Result<(Purpose, PathBuf)> {
     ))
 }
 
+/// The backend URL to report a consumed token to right away, or `None` when
+/// the host is in explicit offline mode or has no backend configured.
+fn immediate_report_url(offline: bool, backend_url: Option<String>) -> Option<String> {
+    if offline {
+        return None;
+    }
+    backend_url.filter(|u| !u.trim().is_empty())
+}
+
 /// Run the verb. Only `stop` is wired up in this step; `upgrade` and
 /// `uninstall` are consumed by the MSI custom action through
 /// [`authorize_from_file`].
@@ -493,10 +525,13 @@ pub fn run_cli(args: &[String], stop_service: impl FnOnce() -> Result<()>) -> Re
 
     // Report the use now if the backend is reachable; otherwise the running
     // service (or the next start) retries. Best effort and bounded.
-    if let (Ok(url), Some(creds)) = (
-        std::env::var("TRAPD_BACKEND_URL"),
-        crate::enrollment::load_persisted_blocking(),
-    ) {
+    // Explicit offline mode (the predicate the startup paths use) skips the
+    // attempt: the record stays pending for a later online start.
+    let backend = immediate_report_url(
+        crate::env_truthy("TRAPD_OFFLINE"),
+        std::env::var("TRAPD_BACKEND_URL").ok(),
+    );
+    if let (Some(url), Some(creds)) = (backend, crate::enrollment::load_persisted_blocking()) {
         // On Linux this runs inside `#[tokio::main]`, where a nested
         // `block_on` panics after the token was already consumed. A dedicated
         // thread with its own runtime works from both sync and async callers.
@@ -530,7 +565,16 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
     const AGENT: &str = "agent_abc";
-    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    /// Per-process random 32-hex nonces; the deterministic interop vector below
+    /// is the only fixed one.
+    fn nonce() -> &'static str {
+        static N: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        N.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+    }
+    fn other_nonce() -> &'static str {
+        static N: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        N.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+    }
 
     /// Self-cleaning temp dir (no extra dev-dependency).
     struct TempDir(PathBuf);
@@ -572,7 +616,11 @@ mod tests {
     }
 
     fn token(purpose: &str, iat: i64, exp: i64) -> String {
-        sign_with(&key(), &payload(1, AGENT, purpose, NONCE, iat, exp), DOMAIN)
+        sign_with(
+            &key(),
+            &payload(1, AGENT, purpose, nonce(), iat, exp),
+            DOMAIN,
+        )
     }
 
     fn verify(t: &str, purpose: Purpose, now: i64) -> std::result::Result<Claims, VerifyError> {
@@ -583,7 +631,7 @@ mod tests {
     fn roundtrip_accepts_a_valid_token() {
         let c = verify(&token("stop", NOW, NOW + 900), Purpose::Stop, NOW + 10).unwrap();
         assert_eq!(c.agent_id, AGENT);
-        assert_eq!(c.nonce, NONCE);
+        assert_eq!(c.nonce, nonce());
         assert_eq!(c.purpose, Purpose::Stop);
     }
 
@@ -667,7 +715,7 @@ mod tests {
 
     #[test]
     fn signature_without_the_domain_prefix_is_rejected() {
-        let p = payload(1, AGENT, "stop", NONCE, NOW, NOW + 900);
+        let p = payload(1, AGENT, "stop", nonce(), NOW, NOW + 900);
         let bare = sign_with(&key(), &p, b"");
         assert_eq!(
             verify(&bare, Purpose::Stop, NOW),
@@ -684,7 +732,7 @@ mod tests {
     fn rejects_wrong_version_even_when_correctly_signed() {
         let t = sign_with(
             &key(),
-            &payload(2, AGENT, "stop", NONCE, NOW, NOW + 900),
+            &payload(2, AGENT, "stop", nonce(), NOW, NOW + 900),
             DOMAIN,
         );
         assert_eq!(verify(&t, Purpose::Stop, NOW), Err(VerifyError::BadVersion));
@@ -728,16 +776,17 @@ mod tests {
             "not json".to_string(),
             // Unknown field.
             format!(
-                r#"{{"v":1,"agent_id":"{AGENT}","tenant_id":"t","purpose":"stop","nonce":"{NONCE}","iat":{NOW},"exp":{},"admin":true}}"#,
+                r#"{{"v":1,"agent_id":"{AGENT}","tenant_id":"t","purpose":"stop","nonce":"{}","iat":{NOW},"exp":{},"admin":true}}"#,
+                nonce(),
                 NOW + 900
             ),
             // Bad nonce.
             payload(1, AGENT, "stop", "SHORT", NOW, NOW + 900),
             // Unknown purpose.
-            payload(1, AGENT, "reboot", NONCE, NOW, NOW + 900),
+            payload(1, AGENT, "reboot", nonce(), NOW, NOW + 900),
             // Lifetime over one hour / inverted.
-            payload(1, AGENT, "stop", NONCE, NOW, NOW + MAX_TTL_SECS + 1),
-            payload(1, AGENT, "stop", NONCE, NOW, NOW),
+            payload(1, AGENT, "stop", nonce(), NOW, NOW + MAX_TTL_SECS + 1),
+            payload(1, AGENT, "stop", nonce(), NOW, NOW),
         ];
         for p in cases {
             let t = sign_with(&key(), &p, DOMAIN);
@@ -779,18 +828,50 @@ mod tests {
         // A rejected token never burns a nonce.
         let t2 = sign_with(
             &key(),
-            &payload(
-                1,
-                AGENT,
-                "stop",
-                "ffffffffffffffffffffffffffffffff",
-                NOW,
-                NOW + 900,
-            ),
+            &payload(1, AGENT, "stop", other_nonce(), NOW, NOW + 900),
             DOMAIN,
         );
         assert!(authorize(&t2, &vk, "agent_other", Purpose::Stop, &store, NOW + 1).is_err());
         assert!(authorize(&t2, &vk, AGENT, Purpose::Stop, &store, NOW + 1).is_ok());
+    }
+
+    #[test]
+    fn explicit_offline_mode_skips_the_immediate_report() {
+        let url = Some("https://backend.example".to_string());
+        assert_eq!(immediate_report_url(true, url.clone()), None);
+        assert_eq!(immediate_report_url(false, url.clone()), url);
+        assert_eq!(immediate_report_url(false, Some("  ".into())), None);
+        assert_eq!(immediate_report_url(false, None), None);
+    }
+
+    #[test]
+    fn a_claimed_token_stays_pending_until_reported() {
+        // Offline: no report is attempted, so the record must still be pending
+        // for a later online start.
+        let dir = tmp();
+        let store = ConsumedStore::new(dir.path());
+        store
+            .claim(&claims_of(&token("stop", NOW, NOW + 900)), NOW)
+            .unwrap();
+        assert_eq!(
+            immediate_report_url(true, Some("https://b.example".into())),
+            None
+        );
+        let pending = store.pending();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].1.reported);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_creates_missing_directories_and_persists_the_record() {
+        let dir = tmp();
+        let nested = dir.path().join("a").join("b").join("consumed");
+        let store = ConsumedStore::new(&nested);
+        store
+            .claim(&claims_of(&token("stop", NOW, NOW + 900)), NOW)
+            .unwrap();
+        assert!(store.read(nonce()).is_some());
     }
 
     #[test]
@@ -824,12 +905,12 @@ mod tests {
             1,
             "unreported records are never pruned"
         );
-        store.mark_reported(NONCE).unwrap();
+        store.mark_reported(nonce()).unwrap();
         assert!(store.pending().is_empty());
         store.prune(NOW + 1000);
-        assert!(store.read(NONCE).is_some(), "recent reported record kept");
+        assert!(store.read(nonce()).is_some(), "recent reported record kept");
         store.prune(far);
-        assert!(store.read(NONCE).is_none(), "old reported record pruned");
+        assert!(store.read(nonce()).is_none(), "old reported record pruned");
     }
 
     #[test]
