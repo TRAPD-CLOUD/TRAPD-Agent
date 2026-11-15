@@ -159,6 +159,25 @@ impl Transport {
         }
     }
 
+    /// Shutdown path: send queued events until the entry `seq` has left the
+    /// queue (acknowledged by the backend). Detections go first in a batch, so
+    /// this normally takes one request. Stops at the first failed or idle flush
+    /// (retrying inside a shutdown window cannot help) and returns whether
+    /// `seq` was delivered. The caller bounds the total time.
+    pub async fn deliver(&self, seq: u64) -> bool {
+        loop {
+            if !self.buffer.lock().is_ok_and(|b| b.contains_seq(seq)) {
+                return true;
+            }
+            match self.flush(false).await {
+                FlushOutcome::Delivered => {}
+                FlushOutcome::Idle | FlushOutcome::Failed => {
+                    return !self.buffer.lock().is_ok_and(|b| b.contains_seq(seq));
+                }
+            }
+        }
+    }
+
     /// Wait for the next flush: the full interval, or until a priority event
     /// arrives (then only [`PRIORITY_MIN_GAP`] from now, to bound the request
     /// rate under a detection storm).
@@ -1180,6 +1199,81 @@ mod tests {
             assert!(events[0].get("event_id").is_some());
             assert!(events[0].get("class_uid").is_none());
         }
+    }
+
+    fn detection_event() -> AgentEvent {
+        crate::selfprotect::stop::stop_event(
+            "agent",
+            "host",
+            crate::selfprotect::stop::StopSource::Sigterm,
+        )
+    }
+
+    /// Queue bulk telemetry, then one detection; returns its sequence number.
+    fn queue_with_detection(t: &Transport, bulk: usize) -> u64 {
+        let mut spool = t.buffer.lock().unwrap();
+        for _ in 0..bulk {
+            spool.push(event()).unwrap();
+        }
+        spool.push(detection_event()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn deliver_sends_the_detection_first_and_reports_success() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
+        let (url, backend) = mock_backend(vec![http("202 Accepted", "")]).await;
+        let t = transport_for(url, 0);
+        let seq = queue_with_detection(&t, 5);
+        assert!(t.deliver(seq).await);
+        assert!(!t.buffer.lock().unwrap().contains_seq(seq));
+        let seen = backend.await.unwrap();
+        let events: Vec<serde_json::Value> = serde_json::from_slice(&seen[0].body).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e["data"]["rule_id"] == "selfprotect.service_stop_requested"),
+            "the stop finding is in the first batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_gives_up_after_one_failed_request() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
+        let (url, backend) = mock_backend(vec![http("503 Service Unavailable", "")]).await;
+        let t = transport_for(url, 0);
+        let seq = queue_with_detection(&t, 0);
+        assert!(!t.deliver(seq).await);
+        assert!(
+            t.buffer.lock().unwrap().contains_seq(seq),
+            "undelivered: stays queued for the next start"
+        );
+        assert_eq!(backend.await.unwrap().len(), 1, "no retry inside shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_never_answers_is_cut_off_by_the_shutdown_budget() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
+        // Accepts the connection and then says nothing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/v1/ingest/events",
+            listener.local_addr().unwrap()
+        );
+        let _held = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let t = transport_for(url, 0);
+        let seq = queue_with_detection(&t, 0);
+        let budget = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let out = crate::selfprotect::stop::within(budget, t.deliver(seq)).await;
+        assert_eq!(out, crate::selfprotect::stop::Delivery::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            t.buffer.lock().unwrap().contains_seq(seq),
+            "the finding is still queued after the timeout"
+        );
     }
 
     #[tokio::test]

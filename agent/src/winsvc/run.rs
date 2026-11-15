@@ -229,12 +229,16 @@ async fn reconcile_pending_firewall_expiry() -> Vec<crate::prevention::winfirewa
 /// `on_ready` runs once start-up is past the self-integrity check (the point
 /// where the service may report `SERVICE_RUNNING`). Environment configuration
 /// must already be loaded via [`load_config_env`].
-pub async fn run_agent(
-    mut stop: tokio::sync::mpsc::UnboundedReceiver<()>,
+pub(super) async fn run_agent(
+    mut stop: tokio::sync::mpsc::UnboundedReceiver<super::StopRequest>,
     on_ready: impl FnOnce(),
+    as_service: bool,
 ) -> Result<()> {
     paths::init_state_dir();
     crate::selfprotect::process_mitigation::apply();
+    if as_service {
+        crate::selfprotect::process_dacl::apply();
+    }
     // Include startup recovery and pending enrollment in this process run.
     crate::heartbeat::lifecycle::begin_process();
 
@@ -641,6 +645,13 @@ pub async fn run_agent(
     )?;
     handles.push(tokio::spawn(async move { inventory.run().await }));
 
+    // How the agent ends is reported from here (see `selfprotect::stop`).
+    let mut stop_announcer = crate::selfprotect::stop::StopAnnouncer::new(
+        agent_id.clone(),
+        hostname.clone(),
+        Arc::clone(&ring_buffer),
+    );
+
     if !offline {
         let transport =
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
@@ -663,11 +674,21 @@ pub async fn run_agent(
         let heartbeat = Heartbeat::new(
             &backend_url,
             agent_id.clone(),
-            token,
+            token.clone(),
             hostname.clone(),
             Arc::clone(&agent_config),
         )?;
         handles.push(tokio::spawn(async move { heartbeat.run().await }));
+        stop_announcer = stop_announcer.with_backend(
+            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?,
+            Heartbeat::new(
+                &backend_url,
+                agent_id.clone(),
+                token,
+                hostname.clone(),
+                Arc::clone(&agent_config),
+            )?,
+        );
 
         // Signed self-update. Opt-in by key provisioning: without the pinned
         // release and command keys no update can be verified, so it is not started.
@@ -677,12 +698,14 @@ pub async fn run_agent(
         }
     }
 
+    let mut stop_request = None;
     let consumer_finished = tokio::select! {
-        _ = stop.recv() => {
-            info!("Stop requested, shutting down");
+        request = stop.recv() => {
+            info!(?request, "Stop requested, shutting down");
             for handle in &handles {
                 handle.abort();
             }
+            stop_request = request;
             false
         }
         _ = &mut consumer => {
@@ -693,6 +716,11 @@ pub async fn run_agent(
 
     for handle in &handles {
         handle.abort();
+    }
+    // Report the stop before the (slower) drain: bounded to a few seconds, well
+    // inside the SCM wait hint, and never fatal.
+    if let Some(request) = stop_request {
+        stop_announcer.announce(request.kind, request.source).await;
     }
     // Close the receiver, reject further sends and drain already received
     // events before checkpointing, even if native monitor threads hold senders.
