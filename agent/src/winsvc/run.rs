@@ -359,6 +359,7 @@ pub async fn run_agent(
         tx.clone(),
         agent_id.clone(),
         hostname.clone(),
+        offline,
     ));
     let startup_audit =
         crate::prevention::audit::AuditEmitter::new(tx.clone(), agent_id.clone(), hostname.clone());

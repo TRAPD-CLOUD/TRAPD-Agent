@@ -477,7 +477,13 @@ pub fn advance_watermark(dir: &Path, now: DateTime<Utc>, complete: bool) {
 /// channel, record or rule yields a different one. A SHA-256 over
 /// length-prefixed parts, truncated to 16 bytes, with the UUIDv5 version and
 /// variant bits set (the `uuid` crate has no `v5` feature enabled here).
-pub fn stable_event_id(agent_id: &str, channel: &str, record_id: u64, rule_id: &str) -> uuid::Uuid {
+pub fn stable_event_id(
+    agent_id: &str,
+    channel: &str,
+    record_id: u64,
+    record_time: DateTime<Utc>,
+    rule_id: &str,
+) -> uuid::Uuid {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"trapd.restart_forensics.v1");
@@ -486,6 +492,9 @@ pub fn stable_event_id(agent_id: &str, channel: &str, record_id: u64, rule_id: &
         hasher.update(part.as_bytes());
     }
     hasher.update(record_id.to_be_bytes());
+    // Clearing the log restarts record numbering; the native timestamp keeps a
+    // later record with a reused id from colliding with an older finding.
+    hasher.update(record_time.timestamp_micros().to_be_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -549,6 +558,7 @@ fn build_event(finding: Finding, agent_id: &str, hostname: &str) -> trapd_schema
         agent_id,
         "System",
         finding.record_id,
+        finding.time,
         &finding.detection.rule_id,
     );
     let mut event = AgentEvent::new(
@@ -573,6 +583,7 @@ pub async fn run(
     tx: tokio::sync::mpsc::Sender<trapd_schema::AgentEvent>,
     agent_id: String,
     hostname: String,
+    offline: bool,
 ) {
     let life = crate::heartbeat::lifecycle::begin_process();
     let state = crate::paths::state_dir();
@@ -618,12 +629,21 @@ pub async fn run(
         truncated_queries = outcome.truncated,
         "System log read-back finished"
     );
-    // The watermark moves only after the journal confirmed every finding; an
-    // in-memory-only queue never confirms, so the window is then replayed.
+    // Online, the watermark moves only after the journal confirmed every
+    // finding. Offline there is no journal (in-memory spool, local output), so
+    // ordinary channel delivery is the handoff.
     let delivered = deliver_all(findings, |finding| {
         let event = build_event(finding, &agent_id, &hostname);
         let tx = &tx;
-        async move { crate::pipeline::receipt::send_durable(tx, event).await }
+        async move {
+            if offline {
+                tx.send(event)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("event pipeline closed"))
+            } else {
+                crate::pipeline::receipt::send_durable(tx, event).await
+            }
+        }
     })
     .await;
     advance_watermark(state, now, outcome.complete && delivered);
@@ -647,16 +667,36 @@ mod tests {
 
     #[test]
     fn stable_event_id_is_deterministic_and_distinguishes_inputs() {
-        let a = stable_event_id("agent-1", "System", 10, "r");
-        assert_eq!(a, stable_event_id("agent-1", "System", 10, "r"));
-        assert_ne!(a, stable_event_id("agent-1", "System", 11, "r"));
-        assert_ne!(a, stable_event_id("agent-2", "System", 10, "r"));
-        assert_ne!(a, stable_event_id("agent-1", "Other", 10, "r"));
-        assert_ne!(a, stable_event_id("agent-1", "System", 10, "r2"));
+        let a = stable_event_id("agent-1", "System", 10, ts("2026-11-14T10:00:00Z"), "r");
+        assert_eq!(
+            a,
+            stable_event_id("agent-1", "System", 10, ts("2026-11-14T10:00:00Z"), "r")
+        );
+        assert_ne!(
+            a,
+            stable_event_id("agent-1", "System", 11, ts("2026-11-14T10:00:00Z"), "r")
+        );
+        assert_ne!(
+            a,
+            stable_event_id("agent-2", "System", 10, ts("2026-11-14T10:00:00Z"), "r")
+        );
+        assert_ne!(
+            a,
+            stable_event_id("agent-1", "Other", 10, ts("2026-11-14T10:00:00Z"), "r")
+        );
+        assert_ne!(
+            a,
+            stable_event_id("agent-1", "System", 10, ts("2026-11-14T10:00:00Z"), "r2")
+        );
         // Length prefixes keep part boundaries unambiguous.
         assert_ne!(
-            stable_event_id("ab", "c", 1, "r"),
-            stable_event_id("a", "bc", 1, "r")
+            stable_event_id("ab", "c", 1, ts("2026-11-14T10:00:00Z"), "r"),
+            stable_event_id("a", "bc", 1, ts("2026-11-14T10:00:00Z"), "r")
+        );
+        // A reused record id after a log clear carries a different timestamp.
+        assert_ne!(
+            a,
+            stable_event_id("agent-1", "System", 10, ts("2026-11-14T11:00:00Z"), "r")
         );
         assert_eq!(a.get_version_num(), 5);
     }
