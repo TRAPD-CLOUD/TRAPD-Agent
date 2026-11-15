@@ -229,7 +229,10 @@
          stopped or removed, so nothing is left half-removed. On success the
          agent writes a short-lived authorized-stop marker so the coming service
          stop is not reported as tampering. -->
-    <CustomAction Id="RequireUninstallToken" FileRef="AgentExe" ExeCommand="uninstall-gate --token-file &quot;[MAINTENANCE_TOKEN_FILE]&quot;" Execute="deferred" Impersonate="no" Return="check" />
+    <!-- A deferred action cannot read ordinary properties at run time, only
+         CustomActionData: hand the token file path over through it. -->
+    <SetProperty Action="SetRequireUninstallTokenData" Id="RequireUninstallToken" Value="[MAINTENANCE_TOKEN_FILE]" Before="RequireUninstallToken" Sequence="execute" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    <CustomAction Id="RequireUninstallToken" FileRef="AgentExe" ExeCommand="uninstall-gate --token-file &quot;[CustomActionData]&quot;" Execute="deferred" Impersonate="no" Return="check" />
     <!-- Removal half of a major upgrade: mark the stop as planned (best effort). -->
     <CustomAction Id="MarkUpgradeStop" FileRef="AgentExe" ExeCommand="stop-marker upgrade" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="RollbackStopMarker" FileRef="AgentExe" ExeCommand="stop-marker clear" Execute="rollback" Impersonate="no" Return="ignore" />

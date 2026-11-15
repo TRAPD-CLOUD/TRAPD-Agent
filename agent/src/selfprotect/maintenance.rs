@@ -1522,9 +1522,12 @@ mod tests {
         }
         let gate_ca = wxs
             .lines()
-            .find(|l| l.contains("Id=\"RequireUninstallToken\""))
+            .find(|l| l.contains("<CustomAction") && l.contains("Id=\"RequireUninstallToken\""))
             .unwrap();
         assert!(gate_ca.contains("Return=\"check\""));
+        // Deferred actions only see CustomActionData, not ordinary properties.
+        assert!(wxs.contains("--token-file &quot;[CustomActionData]&quot;"));
+        assert!(!wxs.contains("--token-file &quot;[MAINTENANCE_TOKEN_FILE]&quot;"));
         assert!(
             !wxs.contains("[MAINTENANCE_TOKEN]"),
             "a token must never be formatted into a command line"
