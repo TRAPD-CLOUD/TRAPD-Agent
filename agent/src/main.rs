@@ -284,10 +284,13 @@ async fn main() -> Result<()> {
     let mut handles = Vec::new();
 
     // A tamper alert a previous failed start could not deliver.
-    if let Some(pending) = selfprotect::tamper_alert::take_pending(paths::state_dir()) {
-        let _ = tx.try_send(selfprotect::tamper_alert::event(
-            &pending, &agent_id, &hostname,
-        ));
+    if let Ok(mut spool) = ring_buffer.lock() {
+        selfprotect::tamper_alert::handoff_pending(
+            paths::state_dir(),
+            &agent_id,
+            &hostname,
+            &mut spool,
+        );
     }
 
     // A start after a kill/crash/power loss is worth one low-severity signal.

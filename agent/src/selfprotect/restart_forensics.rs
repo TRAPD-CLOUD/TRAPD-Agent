@@ -431,6 +431,38 @@ pub fn write_watermark(dir: &Path, scanned_until: DateTime<Utc>) {
     }
 }
 
+/// Outcome of the read-back queries. Queries read newest first up to a limit,
+/// so a truncated query leaves an unread *older* gap that a "scanned until"
+/// watermark cannot represent: advancing it would drop that gap for good.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReadOutcome {
+    /// Every query ran and saw the end of its matches.
+    pub complete: bool,
+    /// Queries cut short by their limit; each is counted as a rate-limit drop.
+    pub truncated: usize,
+    failed: bool,
+}
+
+impl ReadOutcome {
+    pub fn new() -> Self {
+        Self {
+            complete: true,
+            truncated: 0,
+            failed: false,
+        }
+    }
+
+    /// Record one query: `Some(exhausted)` when it ran, `None` when it failed.
+    pub fn record(&mut self, query: Option<bool>) {
+        match query {
+            Some(true) => {}
+            Some(false) => self.truncated += 1,
+            None => self.failed = true,
+        }
+        self.complete = !self.failed && self.truncated == 0;
+    }
+}
+
 /// Record `now` as scanned, but only when every query succeeded. A partial
 /// read, and any early return before this point, leaves the old watermark so
 /// the next start reads the same window again.
@@ -505,32 +537,38 @@ pub async fn run(
         .ok()
         .map(|p| p.to_string_lossy().to_ascii_lowercase());
     let mut records = Vec::new();
-    let mut complete = true;
+    let mut outcome = ReadOutcome::new();
     for (query, limit) in queries(since) {
         let result = tokio::task::spawn_blocking(move || {
             crate::collectors::windows::eventlog::read_matching("System", &query, limit)
         })
         .await;
         match result {
-            Ok(Ok(xml)) => records.extend(xml.iter().filter_map(|x| Record::from_xml(x))),
+            Ok(Ok((xml, exhausted))) => {
+                outcome.record(Some(exhausted));
+                records.extend(xml.iter().filter_map(|x| Record::from_xml(x)));
+            }
             Ok(Err(e)) => {
-                complete = false;
+                outcome.record(None);
                 tracing::warn!(error = %e, "System log read-back query failed");
             }
             Err(e) => {
-                complete = false;
+                outcome.record(None);
                 tracing::warn!(error = %e, "System log read-back task failed");
             }
         }
     }
     let (findings, dropped) = scan(records, own_exe.as_deref());
-    for _ in 0..dropped {
+    // A truncated query hides an unknown number of older records: count one
+    // drop per query and keep the old watermark so the window is not skipped.
+    for _ in 0..dropped + outcome.truncated {
         crate::telemetry::metrics::metrics()
             .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
     }
     tracing::info!(
         findings = findings.len(),
         dropped,
+        truncated_queries = outcome.truncated,
         "System log read-back finished"
     );
     for finding in findings {
@@ -542,7 +580,7 @@ pub async fn run(
             return;
         }
     }
-    advance_watermark(state, now, complete);
+    advance_watermark(state, now, outcome.complete);
 }
 
 #[cfg(test)]
@@ -864,6 +902,34 @@ mod tests {
         // A successful scan advances it.
         advance_watermark(&dir, t2, true);
         assert_eq!(read_watermark(&dir), Some(t2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_query_is_incomplete_and_keeps_the_watermark() {
+        let mut ok = ReadOutcome::new();
+        for _ in 0..3 {
+            ok.record(Some(true));
+        }
+        assert!(ok.complete && ok.truncated == 0);
+        // More matches than the limit: not complete, counted, old watermark stays.
+        let mut cut = ReadOutcome::new();
+        cut.record(Some(true));
+        cut.record(Some(false));
+        cut.record(Some(true));
+        assert!(!cut.complete);
+        assert_eq!(cut.truncated, 1);
+        let mut failed = ReadOutcome::new();
+        failed.record(Some(true));
+        failed.record(None);
+        failed.record(Some(true));
+        assert!(!failed.complete);
+        let dir = std::env::temp_dir().join(format!("trapd_rf_trunc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = ts("2026-11-15T08:00:00Z");
+        write_watermark(&dir, old);
+        advance_watermark(&dir, ts("2026-11-15T10:00:00Z"), cut.complete);
+        assert_eq!(read_watermark(&dir), Some(old));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -133,9 +133,16 @@ fn read_batch(channel: &str, cursor: Option<u64>, limit: usize) -> Result<Batch>
 /// For one-shot forensic reads that need a time/event-id filter instead of the
 /// collector's record-id cursor. The caller owns the query text: build it only
 /// from constants and formatted numbers/timestamps, never from event data.
+///
+/// The second value is `true` only when the log reported no further matches.
+/// `false` means the limit cut the read short and older matches were not seen.
 #[cfg(windows)]
-pub(crate) fn read_matching(channel: &str, xpath: &str, limit: usize) -> Result<Vec<String>> {
-    run_query(channel, xpath, true, limit.min(READ_LIMIT)).map(|b| b.records)
+pub(crate) fn read_matching(
+    channel: &str,
+    xpath: &str,
+    limit: usize,
+) -> Result<(Vec<String>, bool)> {
+    run_query(channel, xpath, true, limit.min(READ_LIMIT)).map(|b| (b.records, b.exhausted))
 }
 
 fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<Batch> {

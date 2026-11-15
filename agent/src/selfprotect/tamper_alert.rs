@@ -16,7 +16,7 @@
 //! uses the same pinned-TLS client and bearer credential as the transport. If
 //! it fails (backend down, not enrolled, offline mode) the pending record is
 //! kept and the next *healthy* start delivers it through the normal pipeline
-//! ([`take_pending`]); until then the heartbeat gap is the signal.
+//! ([`handoff_pending`]); until then the heartbeat gap is the signal.
 //!
 //! Rate limit: the existing restart-loop guard already spaces restarts
 //! (30 s ... 15 min). On top of that a delivered alert is not repeated for the
@@ -37,6 +37,7 @@ use trapd_schema::{AgentEvent, DetectionData, EventAction, EventClass, EventData
 use uuid::Uuid;
 
 use super::binary_integrity::IntegrityViolation;
+use crate::pipeline::Spool;
 
 const STATE_FILE: &str = "integrity_alert.json";
 const MAX_STATE_BYTES: u64 = 4096;
@@ -224,12 +225,29 @@ pub async fn report(err: &anyhow::Error) {
     }
 }
 
-/// On a healthy start: remove the record and return it when it was never
-/// delivered, so the caller can send it through the normal pipeline.
-pub fn take_pending(dir: &Path) -> Option<AlertState> {
-    let state = read_state(dir);
+/// On a healthy start: move a never-delivered alert into the spool and only
+/// then drop the pending record.
+///
+/// The record is the only persisted copy until the spool holds the event, so it
+/// is removed only after the push succeeded *and* the journal was synced. A
+/// crash in between at worst re-sends the same event (same `event_id`, the
+/// backend dedupes on it), never loses it. An in-memory or degraded spool is
+/// not a durable handoff: the record stays and is retried on the next start.
+/// A record that was already delivered is just cleaned up.
+pub fn handoff_pending(dir: &Path, agent_id: &str, hostname: &str, spool: &mut Spool) {
+    let Some(state) = read_state(dir) else {
+        return;
+    };
+    if state.delivered_at.is_none() {
+        if spool.push(event(&state, agent_id, hostname)).is_err() {
+            return;
+        }
+        spool.checkpoint();
+        if !spool.is_durable() {
+            return;
+        }
+    }
     let _ = std::fs::remove_file(dir.join(STATE_FILE));
-    state.filter(|s| s.delivered_at.is_none())
 }
 
 #[cfg(test)]
@@ -315,13 +333,56 @@ mod tests {
     }
 
     #[test]
-    fn pending_file_round_trips_and_is_taken_once() {
+    fn pending_file_round_trips() {
         let dir = tmp("pending");
         let s = next_state(None, H1, 1, t("2026-11-15T10:00:00Z"));
         write_state(&dir, &s);
+        assert_eq!(read_state(&dir), Some(s));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_alert_is_removed_only_after_a_durable_spool_push() {
+        let dir = tmp("handoff");
+        let s = next_state(None, H1, 1, t("2026-11-15T10:00:00Z"));
+        write_state(&dir, &s);
+        // Non-durable spool: the record must survive for the next start.
+        let mut mem = Spool::in_memory(10);
+        handoff_pending(&dir, "a", "h", &mut mem);
         assert_eq!(read_state(&dir), Some(s.clone()));
-        assert_eq!(take_pending(&dir), Some(s));
-        assert!(take_pending(&dir).is_none());
+        // Rejected push (zero capacity): still kept.
+        let mut full = Spool::in_memory(0);
+        handoff_pending(&dir, "a", "h", &mut full);
+        assert_eq!(read_state(&dir), Some(s.clone()));
+        // Durable spool: event is queued with the persisted id, record gone.
+        let journal = dir.join("queue.journal");
+        let mut spool = Spool::durable_at(journal.clone(), 10);
+        handoff_pending(&dir, "a", "h", &mut spool);
+        assert!(read_state(&dir).is_none());
+        assert_eq!(spool.len(), 1);
+        drop(spool);
+        // A crash right after the push loses nothing: reopen finds the event.
+        let reopened = Spool::durable_at(journal, 10);
+        assert_eq!(reopened.peek_batch(1)[0].event.event_id, s.event_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crash_before_removal_resends_the_same_event_id() {
+        let dir = tmp("resend");
+        let s = next_state(None, H1, 1, t("2026-11-15T10:00:00Z"));
+        write_state(&dir, &s);
+        let mut first = Spool::durable_at(dir.join("q.journal"), 10);
+        handoff_pending(&dir, "a", "h", &mut first);
+        // Simulate the crash window: the record reappears after the push.
+        write_state(&dir, &s);
+        handoff_pending(&dir, "a", "h", &mut first);
+        let ids: Vec<_> = first
+            .peek_batch(10)
+            .iter()
+            .map(|e| e.event.event_id)
+            .collect();
+        assert_eq!(ids, vec![s.event_id, s.event_id]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -349,7 +410,7 @@ mod tests {
         // Persisted and read back for the next process.
         let dir = tmp("eventid");
         write_state(&dir, &pending);
-        assert_eq!(take_pending(&dir).unwrap().event_id, pending.event_id);
+        assert_eq!(read_state(&dir).unwrap().event_id, pending.event_id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -382,7 +443,9 @@ mod tests {
         let mut s = next_state(None, H1, 1, t("2026-11-15T10:00:00Z"));
         s.delivered_at = Some(s.detected_at);
         write_state(&dir, &s);
-        assert!(take_pending(&dir).is_none());
+        let mut spool = Spool::durable_at(dir.join("q.journal"), 10);
+        handoff_pending(&dir, "a", "h", &mut spool);
+        assert_eq!(spool.len(), 0);
         assert!(read_state(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -347,10 +347,13 @@ pub async fn run_agent(
     let mut handles = Vec::new();
     // Evidence the System log kept while the agent was not running, and a
     // tamper alert a previous failed start could not deliver.
-    if let Some(pending) = crate::selfprotect::tamper_alert::take_pending(paths::state_dir()) {
-        let _ = tx.try_send(crate::selfprotect::tamper_alert::event(
-            &pending, &agent_id, &hostname,
-        ));
+    if let Ok(mut spool) = ring_buffer.lock() {
+        crate::selfprotect::tamper_alert::handoff_pending(
+            paths::state_dir(),
+            &agent_id,
+            &hostname,
+            &mut spool,
+        );
     }
     tokio::spawn(crate::selfprotect::restart_forensics::run(
         tx.clone(),
