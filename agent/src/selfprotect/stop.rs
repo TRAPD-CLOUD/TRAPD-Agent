@@ -206,6 +206,7 @@ impl StopAnnouncer {
 
     async fn announce_service_stop(&self, source: StopSource) {
         let event = stop_event(&self.agent_id, &self.hostname, source);
+        let local_copy = event.clone();
         let seq = match self.spool.lock() {
             Ok(mut spool) => spool.push(event),
             Err(e) => {
@@ -223,6 +224,20 @@ impl StopAnnouncer {
         // Queued: if delivery below fails, the journal replays it on the next
         // start, so the finding is late rather than lost.
         let Some(transport) = &self.transport else {
+            // Offline: the spool is in memory and this event bypasses the
+            // consumer, so write it to the configured local output directly or
+            // it is lost when the process exits.
+            let mode = crate::output::OutputMode::from_env();
+            match within(STOP_FLUSH_BUDGET, async {
+                crate::output::write_events(std::slice::from_ref(&local_copy), &mode)
+                    .await
+                    .is_ok()
+            })
+            .await
+            {
+                Delivery::Delivered => info!("stop notice written to local output"),
+                _ => warn!("stop notice could not be written to local output"),
+            }
             return;
         };
         match within(STOP_FLUSH_BUDGET, transport.deliver(seq)).await {
