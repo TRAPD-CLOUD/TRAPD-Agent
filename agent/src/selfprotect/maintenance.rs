@@ -43,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::paths;
+use crate::selfprotect::stop_marker::{self, Reason, StopMarker};
 
 pub const TOKEN_VERSION: u32 = 1;
 /// Hard cap on the token text; the backend never issues more.
@@ -497,6 +498,119 @@ pub fn parse_cli(args: &[String]) -> Result<(Purpose, PathBuf)> {
     ))
 }
 
+// ── MSI uninstall gate ───────────────────────────────────────────────────────
+
+/// Why an uninstall may proceed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// A valid `uninstall` token was verified and consumed.
+    Authorized(Claims),
+    /// Nothing to protect: the agent never enrolled, or no maintenance key was
+    /// provisioned (self-hosted builds without trust anchors).
+    NotProtected(&'static str),
+}
+
+/// What the device can verify against.
+pub enum KeyState {
+    Missing,
+    Present(VerifyingKey),
+}
+
+/// Pure decision core of the uninstall gate. `agent_id` is `None` when the
+/// device is not enrolled. A provisioned key makes the token mandatory.
+pub(crate) fn uninstall_gate_decision(
+    agent_id: Option<&str>,
+    key: &KeyState,
+    token: Option<&str>,
+    store: &ConsumedStore,
+    now: i64,
+) -> Result<GateOutcome> {
+    let Some(agent_id) = agent_id else {
+        return Ok(GateOutcome::NotProtected("agent is not enrolled"));
+    };
+    let KeyState::Present(key) = key else {
+        return Ok(GateOutcome::NotProtected(
+            "no maintenance signing key is provisioned",
+        ));
+    };
+    let token = token.context(
+        "uninstall requires a maintenance token: pass MAINTENANCE_TOKEN_FILE=<path to token file>",
+    )?;
+    authorize(token, key, agent_id, Purpose::Uninstall, store, now).map(GateOutcome::Authorized)
+}
+
+/// `trapd-agent uninstall-gate [--token-file <path>]`, run by the MSI as a
+/// deferred, non-impersonated custom action before the service is stopped.
+/// An `Err` aborts the uninstall. On success with a token, the planned-stop
+/// marker is written and the consumption is reported.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn run_uninstall_gate(args: &[String]) -> Result<()> {
+    let token_file = parse_gate_args(args)?;
+    let agent_id = crate::enrollment::load_persisted_blocking().map(|c| c.agent_id.clone());
+    let key_path = crate::update::release_key_dir().join(KEY_FILE);
+    let key = if key_path.exists() {
+        KeyState::Present(load_pinned_key()?)
+    } else {
+        KeyState::Missing
+    };
+    let token = match (&agent_id, &key, token_file) {
+        (Some(_), KeyState::Present(_), Some(path)) => Some(read_token_file(&path)?),
+        _ => None,
+    };
+    let store = ConsumedStore::new(paths::state_dir());
+    let now = chrono::Utc::now().timestamp();
+    match uninstall_gate_decision(agent_id.as_deref(), &key, token.as_deref(), &store, now)? {
+        GateOutcome::Authorized(claims) => {
+            info!(nonce = %claims.nonce, "uninstall authorized by maintenance token");
+            write_stop_marker(Reason::Uninstall, Some(claims.nonce));
+            report_consumption_now();
+        }
+        GateOutcome::NotProtected(why) => warn!(why, "uninstall is not token-protected"),
+    }
+    Ok(())
+}
+
+/// The path is optional (the MSI property may be empty) and an empty value
+/// counts as absent. Nothing but `--token-file` is accepted.
+pub(crate) fn parse_gate_args(args: &[String]) -> Result<Option<PathBuf>> {
+    match args {
+        [] => Ok(None),
+        [flag, value] if flag == "--token-file" => {
+            Ok((!value.trim().is_empty()).then(|| PathBuf::from(value)))
+        }
+        [flag] if flag == "--token-file" => Ok(None),
+        _ => bail!("usage: uninstall-gate [--token-file <path>]"),
+    }
+}
+
+/// Write the planned-stop marker; failing to is only logged: the stop is then
+/// reported as unauthorized, which is the safe direction.
+pub fn write_stop_marker(reason: Reason, nonce: Option<String>) {
+    let marker = StopMarker::new(
+        reason,
+        nonce,
+        Some(env!("CARGO_PKG_VERSION").to_owned()),
+        None,
+        chrono::Utc::now().timestamp(),
+    );
+    if let Err(e) = stop_marker::write(paths::state_dir(), &marker) {
+        warn!(error = %e, "could not write the authorized-stop marker; the stop will be reported");
+    }
+}
+
+/// `trapd-agent stop-marker upgrade|clear`: MSI-internal helper. `upgrade` marks
+/// the stop of the old product during a major upgrade, `clear` undoes it on
+/// rollback.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn run_stop_marker(args: &[String]) -> Result<()> {
+    match args {
+        [a] if a == "upgrade" => write_stop_marker(Reason::Upgrade, None),
+        [a] if a == "clear" => stop_marker::clear(paths::state_dir()),
+        _ => bail!("usage: stop-marker upgrade|clear"),
+    }
+    Ok(())
+}
+
 /// The backend URL to report a consumed token to right away, or `None` when
 /// the host is in explicit offline mode or has no backend configured.
 fn immediate_report_url(offline: bool, backend_url: Option<String>) -> Option<String> {
@@ -506,23 +620,8 @@ fn immediate_report_url(offline: bool, backend_url: Option<String>) -> Option<St
     backend_url.filter(|u| !u.trim().is_empty())
 }
 
-/// Run the verb. Only `stop` is wired up in this step; `upgrade` and
-/// `uninstall` are consumed by the MSI custom action through
-/// [`authorize_from_file`].
-pub fn run_cli(args: &[String], stop_service: impl FnOnce() -> Result<()>) -> Result<()> {
-    let (purpose, token_file) = parse_cli(args)?;
-    if purpose != Purpose::Stop {
-        bail!(
-            "purpose {:?} is not available through this command",
-            purpose.as_str()
-        );
-    }
-    authorize_from_file(&token_file, purpose)?;
-    println!(
-        "Maintenance token accepted (purpose: {}).",
-        purpose.as_str()
-    );
-
+/// Best-effort immediate report of consumed tokens (see `report_pending`).
+fn report_consumption_now() {
     // Report the use now if the backend is reachable; otherwise the running
     // service (or the next start) retries. Best effort and bounded.
     // Explicit offline mode (the predicate the startup paths use) skips the
@@ -552,6 +651,29 @@ pub fn run_cli(args: &[String], stop_service: impl FnOnce() -> Result<()>) -> Re
             tracing::warn!("maintenance report thread panicked; the service retries");
         }
     }
+}
+
+/// Run the verb. Only `stop` is wired up in this step; `upgrade` and
+/// `uninstall` are consumed by the MSI custom action through
+/// [`authorize_from_file`].
+pub fn run_cli(args: &[String], stop_service: impl FnOnce() -> Result<()>) -> Result<()> {
+    let (purpose, token_file) = parse_cli(args)?;
+    if purpose != Purpose::Stop {
+        bail!(
+            "purpose {:?} is not available through this command",
+            purpose.as_str()
+        );
+    }
+    let claims = authorize_from_file(&token_file, purpose)?;
+    println!(
+        "Maintenance token accepted (purpose: {}).",
+        purpose.as_str()
+    );
+    // Planned stop: mark it so the agent reports an authorized stop (with the
+    // token nonce for the backend to match) instead of a tamper finding.
+    write_stop_marker(Reason::Maintenance, Some(claims.nonce.clone()));
+
+    report_consumption_now();
 
     stop_service().context("the token was consumed but the agent could not be stopped")?;
     println!("Agent stop requested.");
@@ -1014,5 +1136,144 @@ mod tests {
         );
         assert!(r.is_err());
         assert!(!called.get());
+    }
+
+    // ── uninstall gate ───────────────────────────────────────────────────────
+
+    fn gate(token: Option<&str>, key: &KeyState, agent: Option<&str>) -> Result<GateOutcome> {
+        let dir = tmp();
+        let store = ConsumedStore::new(dir.path());
+        uninstall_gate_decision(agent, key, token, &store, NOW + 1)
+    }
+
+    fn present() -> KeyState {
+        KeyState::Present(key().verifying_key())
+    }
+
+    #[test]
+    fn gate_accepts_a_valid_uninstall_token_once() {
+        let dir = tmp();
+        let store = ConsumedStore::new(dir.path());
+        let t = token("uninstall", NOW, NOW + 600);
+        let out =
+            uninstall_gate_decision(Some(AGENT), &present(), Some(&t), &store, NOW + 1).unwrap();
+        assert!(matches!(out, GateOutcome::Authorized(c) if c.purpose == Purpose::Uninstall));
+        assert!(
+            uninstall_gate_decision(Some(AGENT), &present(), Some(&t), &store, NOW + 2).is_err(),
+            "replay"
+        );
+    }
+
+    #[test]
+    fn gate_refuses_missing_expired_foreign_and_wrong_purpose_tokens() {
+        assert!(gate(None, &present(), Some(AGENT)).is_err(), "no token");
+        let expired = token("uninstall", NOW - 7200, NOW - 3600);
+        assert!(gate(Some(&expired), &present(), Some(AGENT)).is_err());
+        let foreign = token("uninstall", NOW, NOW + 600);
+        assert!(gate(Some(&foreign), &present(), Some("agent_other")).is_err());
+        assert!(gate(Some("garbage"), &present(), Some(AGENT)).is_err());
+        let forged = sign_with(
+            &SigningKey::from_bytes(&[9u8; 32]),
+            &payload(1, AGENT, "uninstall", nonce(), NOW, NOW + 600),
+            DOMAIN,
+        );
+        assert!(gate(Some(&forged), &present(), Some(AGENT)).is_err());
+    }
+
+    #[test]
+    fn a_stop_or_upgrade_token_does_not_authorize_uninstall() {
+        for purpose in ["stop", "upgrade"] {
+            let t = token(purpose, NOW, NOW + 600);
+            let err = gate(Some(&t), &present(), Some(AGENT)).unwrap_err();
+            assert!(err.to_string().contains("different purpose"), "{purpose}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_purpose_token_is_not_consumed() {
+        let dir = tmp();
+        let store = ConsumedStore::new(dir.path());
+        let stop = token("stop", NOW, NOW + 600);
+        assert!(
+            uninstall_gate_decision(Some(AGENT), &present(), Some(&stop), &store, NOW).is_err()
+        );
+        // The same nonce is still usable for its own purpose.
+        assert!(authorize(
+            &stop,
+            &key().verifying_key(),
+            AGENT,
+            Purpose::Stop,
+            &store,
+            NOW
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn gate_does_not_protect_unenrolled_or_unkeyed_devices() {
+        assert!(matches!(
+            gate(None, &present(), None).unwrap(),
+            GateOutcome::NotProtected(_)
+        ));
+        assert!(matches!(
+            gate(None, &KeyState::Missing, Some(AGENT)).unwrap(),
+            GateOutcome::NotProtected(_)
+        ));
+    }
+
+    #[test]
+    fn gate_args_are_strict_and_an_empty_path_counts_as_absent() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_gate_args(&a(&[])).unwrap(), None);
+        assert_eq!(parse_gate_args(&a(&["--token-file", ""])).unwrap(), None);
+        assert_eq!(parse_gate_args(&a(&["--token-file"])).unwrap(), None);
+        assert_eq!(
+            parse_gate_args(&a(&["--token-file", "C:\\t.txt"])).unwrap(),
+            Some(PathBuf::from("C:\\t.txt"))
+        );
+        assert!(parse_gate_args(&a(&["--token", "abc"])).is_err());
+        assert!(parse_gate_args(&a(&["--token-file", "a", "b"])).is_err());
+    }
+
+    /// The MSI conditions are the safety property that keeps upgrades and
+    /// repairs from being blocked, so they are pinned here.
+    #[test]
+    fn msi_gate_runs_only_for_a_real_uninstall_before_the_service_stops() {
+        let wxs = include_str!("../../../deploy/windows/Package.wxs");
+        let seq: Vec<&str> = wxs
+            .lines()
+            .filter(|l| l.contains("<Custom Action="))
+            .collect();
+        let line = |id: &str| {
+            *seq.iter()
+                .find(|l| l.contains(&format!("Action=\"{id}\"")))
+                .unwrap_or_else(|| panic!("{id} is not scheduled"))
+        };
+        let real_uninstall = "REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE";
+        let gate = line("RequireUninstallToken");
+        assert!(gate.contains(real_uninstall) && gate.contains("Before=\"StopServices\""));
+        let up = line("MarkUpgradeStop");
+        assert!(
+            up.contains("REMOVE~=&quot;ALL&quot; AND UPGRADINGPRODUCTCODE")
+                && up.contains("Before=\"StopServices\"")
+        );
+        // Install, repair and the new product of a major upgrade never gate.
+        assert!(!gate.contains("NOT REMOVE") && !gate.contains("Installed"));
+        for id in ["RequireUninstallToken", "MarkUpgradeStop"] {
+            let ca = wxs
+                .lines()
+                .find(|l| l.contains("<CustomAction") && l.contains(&format!("Id=\"{id}\"")))
+                .unwrap();
+            assert!(ca.contains("Execute=\"deferred\"") && ca.contains("Impersonate=\"no\""));
+        }
+        let gate_ca = wxs
+            .lines()
+            .find(|l| l.contains("Id=\"RequireUninstallToken\""))
+            .unwrap();
+        assert!(gate_ca.contains("Return=\"check\""));
+        assert!(
+            !wxs.contains("[MAINTENANCE_TOKEN]"),
+            "a token must never be formatted into a command line"
+        );
     }
 }

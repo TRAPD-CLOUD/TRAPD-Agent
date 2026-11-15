@@ -10,6 +10,7 @@ pub mod process_dacl;
 #[cfg(target_os = "windows")]
 pub mod process_mitigation;
 pub mod stop;
+pub mod stop_marker;
 // Windows: runtime integrity recheck + health watchdog (SCM recovery handles process death).
 #[cfg(any(target_os = "windows", test))]
 pub mod runtime_guard;

@@ -34,6 +34,10 @@ impl StagingPaths {
             dir: state_dir.join("update"),
         }
     }
+    /// The state directory this staging area lives in.
+    pub fn state_dir(&self) -> &Path {
+        self.dir.parent().unwrap_or(&self.dir)
+    }
     pub fn artifact(&self) -> PathBuf {
         self.dir.join("staged.bin")
     }
@@ -594,6 +598,20 @@ fn clear_absence_evidence(installed: &[Installed]) -> Result<()> {
     Ok(())
 }
 
+fn write_self_update_marker(ctx: &ApplyContext<'_>, to_version: &str) {
+    use crate::selfprotect::stop_marker::{self, Reason, StopMarker};
+    let marker = StopMarker::new(
+        Reason::SelfUpdate,
+        None,
+        Some(ctx.verify.current_version.to_owned()),
+        Some(to_version.to_owned()),
+        chrono::Utc::now().timestamp(),
+    );
+    if let Err(e) = stop_marker::write(ctx.paths.state_dir(), &marker) {
+        tracing::warn!(error = %e, "update: could not write the authorized-stop marker");
+    }
+}
+
 /// Undo a failed file installation before any restart of the new service.
 fn abort_update(ctx: &ApplyContext<'_>, installed: &[Installed], version: &str) -> Result<()> {
     restore_files(installed)?;
@@ -770,6 +788,10 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
         installed: Vec::new(),
         signed_directive_sha256: hex::encode(Sha256::digest(offer.payload.as_bytes())),
     };
+    // The restart below is planned and signature-verified: mark it so the
+    // agent reports an authorized stop (with from/to version for the backend to
+    // correlate) instead of a tamper finding. Best effort, never fatal.
+    write_self_update_marker(ctx, &verified.version);
     // The verification context uses the helper's actual OS. On Windows the
     // service must be fully stopped before any protected file changes; a staged
     // offer is never authority to suppress tamper detection in a live collector.

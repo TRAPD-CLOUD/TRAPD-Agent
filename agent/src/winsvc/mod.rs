@@ -121,6 +121,27 @@ pub fn entry() -> Result<()> {
             let args: Vec<String> = std::env::args().skip(2).collect();
             crate::selfprotect::maintenance::run_cli(&args, stop_service)
         }
+        // Invoked by the MSI before the service is stopped for an uninstall
+        // (`RequireUninstallToken`, Return="check"): a failure aborts the
+        // uninstall. The token is read from a file named by
+        // MAINTENANCE_TOKEN_FILE, never passed as an argument.
+        Some("uninstall-gate") => {
+            run::init_tracing_file();
+            run::load_config_env();
+            crate::paths::init_state_dir();
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            crate::selfprotect::maintenance::run_uninstall_gate(&args)
+                .inspect_err(|e| tracing::error!("uninstall refused: {e:#}"))
+        }
+        // MSI-internal: mark (or unmark on rollback) the planned stop of a major
+        // upgrade so it is not reported as tampering.
+        Some("stop-marker") => {
+            run::init_tracing_file();
+            run::load_config_env();
+            crate::paths::init_state_dir();
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            crate::selfprotect::maintenance::run_stop_marker(&args)
+        }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("telemetry") => {
             print!("{}", crate::telemetry::diagnostics::run());
             Ok(())

@@ -25,6 +25,11 @@
          leaves the machine's audit policy alone. Only settings the installer
          itself turned on are reverted on removal. -->
     <Property Id="AUDITBASELINE" Secure="yes" Value="1" />
+    <!-- Path of a file holding a maintenance token (purpose "uninstall"), needed
+         for `msiexec /x ... MAINTENANCE_TOKEN_FILE=<path>`. A path, not the
+         token: a token property would sit on the msiexec command line (event
+         4688) and in the MSI log; a Hidden property only covers the log. -->
+    <Property Id="MAINTENANCE_TOKEN_FILE" Secure="yes" />
     <Property Id="ENROLLTOKEN" Secure="yes" Hidden="yes">
       <RegistrySearch Id="ExistingEnrollToken" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="raw" Bitness="always64" />
     </Property>
@@ -169,7 +174,22 @@
          rollback action undoes only what ApplyAuditBaseline added in this run. -->
     <CustomAction Id="RollbackAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline rollback" Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="RestoreAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline restore" Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- Uninstall gate (self-protection WP4). Runs before StopServices, only for
+         a real removal: REMOVE=ALL and not as the removal half of a major
+         upgrade (UPGRADINGPRODUCTCODE is set in that case). Install, repair and
+         upgrade never reach it. Return="check": a missing, expired, foreign,
+         replayed or wrong-purpose token aborts the uninstall before anything is
+         stopped or removed, so nothing is left half-removed. On success the
+         agent writes a short-lived authorized-stop marker so the coming service
+         stop is not reported as tampering. -->
+    <CustomAction Id="RequireUninstallToken" FileRef="AgentExe" ExeCommand="uninstall-gate --token-file &quot;[MAINTENANCE_TOKEN_FILE]&quot;" Execute="deferred" Impersonate="no" Return="check" />
+    <!-- Removal half of a major upgrade: mark the stop as planned (best effort). -->
+    <CustomAction Id="MarkUpgradeStop" FileRef="AgentExe" ExeCommand="stop-marker upgrade" Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RollbackStopMarker" FileRef="AgentExe" ExeCommand="stop-marker clear" Execute="rollback" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
+      <Custom Action="RollbackStopMarker" Before="RequireUninstallToken" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RequireUninstallToken" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="MarkUpgradeStop" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot; AND UPGRADINGPRODUCTCODE" />
       <Custom Action="ResetBinaryBaselineAction" After="InstallFiles" Condition="NOT REMOVE" />
       <Custom Action="RollbackAuditBaseline" After="ResetBinaryBaselineAction" Condition="AUDITBASELINE&lt;&gt;&quot;0&quot; AND NOT REMOVE" />
       <Custom Action="ApplyAuditBaseline" After="RollbackAuditBaseline" Condition="AUDITBASELINE&lt;&gt;&quot;0&quot; AND NOT REMOVE" />
