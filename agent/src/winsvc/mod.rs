@@ -33,6 +33,32 @@ use windows_service::service_control_handler::{
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use crate::selfprotect::stop::{StopKind, StopSource};
+
+/// What ended the service, as seen by the SCM control handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StopRequest {
+    pub kind: StopKind,
+    pub source: StopSource,
+}
+
+/// Map an SCM control to a stop request. `Stop` is somebody stopping the
+/// service (`sc stop`, `Stop-Service`, MSI maintenance); `Shutdown` and
+/// `Preshutdown` are the host going down. Any other control is not a stop.
+fn stop_request_for(control: &ServiceControl) -> Option<StopRequest> {
+    match control {
+        ServiceControl::Stop => Some(StopRequest {
+            kind: StopKind::ServiceStop,
+            source: StopSource::ScmStop,
+        }),
+        ServiceControl::Shutdown | ServiceControl::Preshutdown => Some(StopRequest {
+            kind: StopKind::HostShutdown,
+            source: StopSource::ScmStop,
+        }),
+        _ => None,
+    }
+}
+
 const SERVICE_NAME: &str = "trapd-agent";
 const SERVICE_DISPLAY_NAME: &str = "TRAPD Agent";
 const SERVICE_DESCRIPTION: &str =
@@ -128,7 +154,12 @@ fn run_console() -> Result<()> {
         let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            let _ = stop_tx.send(());
+            // Ctrl-C on a console run ends the agent on purpose, but it is
+            // still someone stopping the sensor: report it like a service stop.
+            let _ = stop_tx.send(StopRequest {
+                kind: StopKind::ServiceStop,
+                source: StopSource::Interrupt,
+            });
         });
         run::run_agent(stop_rx, || {}, false).await
     });
@@ -252,12 +283,12 @@ fn run_service() -> Result<()> {
 
     let handler_phase_tx = phase_tx.clone();
     let event_handler = move |control| -> ServiceControlHandlerResult {
+        if let Some(request) = stop_request_for(&control) {
+            let _ = handler_phase_tx.send(Phase::Stopping);
+            let _ = stop_tx.send(request);
+            return ServiceControlHandlerResult::NoError;
+        }
         match control {
-            ServiceControl::Stop | ServiceControl::Shutdown => {
-                let _ = handler_phase_tx.send(Phase::Stopping);
-                let _ = stop_tx.send(());
-                ServiceControlHandlerResult::NoError
-            }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         }
@@ -461,4 +492,32 @@ fn uninstall() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_is_a_service_stop_and_shutdown_is_a_host_shutdown() {
+        let stop = stop_request_for(&ServiceControl::Stop).unwrap();
+        assert_eq!(stop.kind, StopKind::ServiceStop);
+        assert_eq!(stop.source, StopSource::ScmStop);
+        for control in [ServiceControl::Shutdown, ServiceControl::Preshutdown] {
+            let request = stop_request_for(&control).unwrap();
+            assert_eq!(request.kind, StopKind::HostShutdown, "{control:?}");
+        }
+    }
+
+    #[test]
+    fn other_controls_never_stop_the_agent() {
+        for control in [
+            ServiceControl::Interrogate,
+            ServiceControl::Pause,
+            ServiceControl::Continue,
+            ServiceControl::ParamChange,
+        ] {
+            assert_eq!(stop_request_for(&control), None, "{control:?}");
+        }
+    }
 }
