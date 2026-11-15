@@ -88,8 +88,10 @@ pub fn entry() -> Result<()> {
         // The token is read from a file only; see `selfprotect::maintenance`.
         Some("maintenance") => {
             run::init_tracing_file();
-            crate::paths::init_state_dir();
+            // Config first: agent.env may set TRAPD_STATE_DIR, and the state
+            // dir is cached on first use (same order as the service).
             run::load_config_env();
+            crate::paths::init_state_dir();
             let args: Vec<String> = std::env::args().skip(2).collect();
             crate::selfprotect::maintenance::run_cli(&args, stop_service)
         }

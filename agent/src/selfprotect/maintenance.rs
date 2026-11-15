@@ -497,11 +497,25 @@ pub fn run_cli(args: &[String], stop_service: impl FnOnce() -> Result<()>) -> Re
         std::env::var("TRAPD_BACKEND_URL"),
         crate::enrollment::load_persisted_blocking(),
     ) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build runtime")?;
-        rt.block_on(report_pending(&url, &creds.agent_id, &creds.agent_secret));
+        // On Linux this runs inside `#[tokio::main]`, where a nested
+        // `block_on` panics after the token was already consumed. A dedicated
+        // thread with its own runtime works from both sync and async callers.
+        let reported =
+            std::thread::spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        rt.block_on(report_pending(&url, &creds.agent_id, &creds.agent_secret))
+                    }
+                    Err(e) => tracing::warn!(error = %e, "maintenance report runtime unavailable"),
+                }
+            })
+            .join();
+        if reported.is_err() {
+            tracing::warn!("maintenance report thread panicked; the service retries");
+        }
     }
 
     stop_service().context("the token was consumed but the agent could not be stopped")?;
