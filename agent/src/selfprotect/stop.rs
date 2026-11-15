@@ -563,7 +563,11 @@ mod tests {
         std::fs::create_dir_all(&p).unwrap();
         p
     }
-    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    /// Random per process (32 hex characters), never a literal.
+    fn nonce() -> &'static str {
+        static N: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        N.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+    }
 
     #[test]
     fn without_a_marker_the_stop_is_the_high_finding() {
@@ -580,7 +584,7 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         let m = StopMarker::new(
             Reason::Uninstall,
-            Some(NONCE.into()),
+            Some(nonce().into()),
             Some("0.8.0".into()),
             None,
             now,
@@ -592,7 +596,7 @@ mod tests {
         };
         assert_eq!(d.rule_id, SERVICE_STOP_AUTHORIZED_RULE_ID);
         assert_eq!(d.evidence["reason"], "uninstall");
-        assert_eq!(d.evidence["token_nonce"], NONCE);
+        assert_eq!(d.evidence["token_nonce"], nonce());
         assert_eq!(d.evidence["from_version"], "0.8.0");
         assert!(d.mitre_technique.is_none());
     }
@@ -639,7 +643,7 @@ mod tests {
         let sink = Arc::clone(&seen);
         a.announce_service_stop_authorized(
             StopSource::MaintenanceToken,
-            StopMarker::for_claimed_token(NONCE, now),
+            StopMarker::for_claimed_token(nonce(), now),
             STOP_FLUSH_BUDGET,
             move |e| async move {
                 sink.lock().unwrap().push(e);
@@ -656,7 +660,7 @@ mod tests {
         assert_eq!(d.rule_id, SERVICE_STOP_AUTHORIZED_RULE_ID);
         assert_eq!(d.evidence["source"], "maintenance_token");
         assert_eq!(d.evidence["reason"], "maintenance");
-        assert_eq!(d.evidence["token_nonce"], NONCE);
+        assert_eq!(d.evidence["token_nonce"], nonce());
         assert!(d.evidence["marker_issued_at"].is_i64());
         assert!(!stop_marker::marker_path(&dir).exists());
         // A malformed nonce yields no authorization (fails toward the finding).

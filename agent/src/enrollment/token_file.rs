@@ -54,6 +54,10 @@ mod tests {
         assert!(checked >= 5, "expected the EXE custom actions to be found");
         assert!(wxs.contains("ExeCommand=\"enroll-token-import &quot;[ENROLLTOKENFILE]&quot;\""));
         assert!(!wxs.contains("SetImportEnrollTokenData"));
+        assert!(wxs.contains(
+            "ExeCommand=\"uninstall-gate --token-file &quot;[MAINTENANCE_TOKEN_FILE]&quot;\""
+        ));
+        assert!(!wxs.contains("SetRequireUninstallTokenData"));
     }
 
     use super::*;

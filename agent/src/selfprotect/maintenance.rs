@@ -742,9 +742,20 @@ pub fn run_cli(args: &[String], stop_service: impl FnOnce() -> Result<()>) -> Re
 
     report_consumption_now();
 
-    stop_service().context("the token was consumed but the agent could not be stopped")?;
+    stop_or_unmark(paths::state_dir(), stop_service)?;
     println!("Agent stop requested.");
     Ok(())
+}
+
+/// Run the stop; if it fails, the planned-stop marker written for it is
+/// removed again. Otherwise a stop that never happened would leave a live
+/// marker that authorizes (and hides from the tamper finding) the next,
+/// unrelated stop within its lifetime.
+#[cfg(not(windows))]
+fn stop_or_unmark(state_dir: &Path, stop_service: impl FnOnce() -> Result<()>) -> Result<()> {
+    stop_service()
+        .inspect_err(|_| stop_marker::clear(state_dir))
+        .context("the token was consumed but the agent could not be stopped")
 }
 
 // ── Delegated stop (Windows) ─────────────────────────────────────────────────
@@ -1387,6 +1398,43 @@ mod tests {
         assert!(!called.get());
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn a_failed_stop_clears_the_planned_stop_marker() {
+        let dir = tmp();
+        let marker = StopMarker::new(
+            Reason::Maintenance,
+            Some(nonce().to_owned()),
+            None,
+            None,
+            chrono::Utc::now().timestamp(),
+        );
+        stop_marker::write(dir.path(), &marker).unwrap();
+        assert!(stop_marker::marker_path(dir.path()).exists());
+        let r = stop_or_unmark(dir.path(), || bail!("systemctl failed"));
+        assert!(r.is_err());
+        assert!(
+            !stop_marker::marker_path(dir.path()).exists(),
+            "marker must not outlive a stop that did not happen"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_successful_stop_keeps_the_planned_stop_marker() {
+        let dir = tmp();
+        let marker = StopMarker::new(
+            Reason::Maintenance,
+            Some(nonce().to_owned()),
+            None,
+            None,
+            chrono::Utc::now().timestamp(),
+        );
+        stop_marker::write(dir.path(), &marker).unwrap();
+        stop_or_unmark(dir.path(), || Ok(())).unwrap();
+        assert!(stop_marker::marker_path(dir.path()).exists());
+    }
+
     // ── uninstall gate ───────────────────────────────────────────────────────
 
     fn gate(token: Option<&str>, key: &KeyState, agent: Option<&str>) -> Result<GateOutcome> {
@@ -1525,9 +1573,12 @@ mod tests {
             .find(|l| l.contains("<CustomAction") && l.contains("Id=\"RequireUninstallToken\""))
             .unwrap();
         assert!(gate_ca.contains("Return=\"check\""));
-        // Deferred actions only see CustomActionData, not ordinary properties.
-        assert!(wxs.contains("--token-file &quot;[CustomActionData]&quot;"));
-        assert!(!wxs.contains("--token-file &quot;[MAINTENANCE_TOKEN_FILE]&quot;"));
+        // A deferred EXE action has its ExeCommand formatted at scheduling
+        // time, where ordinary properties are visible; CustomActionData is
+        // empty for it (that made the install fail in CI).
+        assert!(wxs.contains("--token-file &quot;[MAINTENANCE_TOKEN_FILE]&quot;"));
+        assert!(!wxs.contains("--token-file &quot;[CustomActionData]&quot;"));
+        assert!(!wxs.contains("SetRequireUninstallTokenData"));
         assert!(
             !wxs.contains("[MAINTENANCE_TOKEN]"),
             "a token must never be formatted into a command line"
