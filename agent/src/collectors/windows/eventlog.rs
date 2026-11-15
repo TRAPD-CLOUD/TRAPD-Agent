@@ -122,10 +122,24 @@ fn read(channel: &str, cursor: Option<u64>) -> Result<Vec<String>> {
 /// Read at most `limit` events after `cursor` (or the single newest event when
 /// there is no cursor yet), fetching them from the log in `EVT_BATCH` chunks.
 fn read_batch(channel: &str, cursor: Option<u64>, limit: usize) -> Result<Batch> {
-    let channel: Vec<u16> = channel.encode_utf16().chain(Some(0)).collect();
     let query = cursor
         .map(|id| format!("*[System[EventRecordID > {id}]]"))
         .unwrap_or_else(|| "*".into());
+    let limit = if cursor.is_some() { limit } else { 1 };
+    run_query(channel, &query, cursor.is_none(), limit)
+}
+
+/// Newest-first XML records of `channel` matching `xpath`, at most `limit`.
+/// For one-shot forensic reads that need a time/event-id filter instead of the
+/// collector's record-id cursor. The caller owns the query text: build it only
+/// from constants and formatted numbers/timestamps, never from event data.
+#[cfg(windows)]
+pub(crate) fn read_matching(channel: &str, xpath: &str, limit: usize) -> Result<Vec<String>> {
+    run_query(channel, xpath, true, limit.min(READ_LIMIT)).map(|b| b.records)
+}
+
+fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<Batch> {
+    let channel: Vec<u16> = channel.encode_utf16().chain(Some(0)).collect();
     let query: Vec<u16> = query.encode_utf16().chain(Some(0)).collect();
     // SAFETY: terminated strings; zero session selects the local machine.
     let query = Handle(unsafe {
@@ -134,17 +148,16 @@ fn read_batch(channel: &str, cursor: Option<u64>, limit: usize) -> Result<Batch>
             channel.as_ptr(),
             query.as_ptr(),
             EvtQueryChannelPath
-                | if cursor.is_some() {
-                    EvtQueryForwardDirection
-                } else {
+                | if reverse {
                     EvtQueryReverseDirection
+                } else {
+                    EvtQueryForwardDirection
                 },
         )
     });
     if query.0 == 0 {
         bail!("EvtQuery failed: {}", unsafe { GetLastError() });
     }
-    let limit = if cursor.is_some() { limit } else { 1 };
     let mut out = Vec::with_capacity(limit.min(EVT_BATCH));
     let mut exhausted = false;
     while out.len() < limit {

@@ -101,6 +101,10 @@ pub(crate) fn load_signing_key(path: &Path) -> Result<ed25519_dalek::VerifyingKe
 pub struct IntegrityViolation {
     message: String,
     pub hold: Duration,
+    /// Consecutive failures for this binary hash (1 on the first).
+    pub failures: u32,
+    /// `sha256:<hex>` of the running executable that failed the check.
+    pub hash: String,
 }
 
 impl std::fmt::Display for IntegrityViolation {
@@ -206,8 +210,13 @@ fn run_check(
 }
 
 fn violation(guard: &Path, hash_str: &str, message: String) -> anyhow::Error {
-    let hold = backoff(record_failure(guard, hash_str));
-    anyhow::Error::new(IntegrityViolation { message, hold })
+    let failures = record_failure(guard, hash_str);
+    anyhow::Error::new(IntegrityViolation {
+        message,
+        hold: backoff(failures),
+        failures,
+        hash: hash_str.to_string(),
+    })
 }
 
 /// Outcome of a read-only recheck while the agent is running.

@@ -269,7 +269,7 @@ async fn try_enroll(
 
 // ── Persistence ─────────────────────────────────────────────────────────────
 
-async fn load_persisted() -> Option<Credentials> {
+pub(crate) async fn load_persisted() -> Option<Credentials> {
     let path = paths::credentials_file();
     if !path.exists() {
         return None;

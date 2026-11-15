@@ -164,6 +164,8 @@ async fn main() -> Result<()> {
 
     if let Err(e) = selfprotect::binary_integrity::check() {
         error!("{e:#}");
+        // One bounded, best-effort report (rate limited); else kept pending.
+        selfprotect::tamper_alert::report(&e).await;
         // Not transient: hold before exiting so Restart=always cannot spin.
         if let Some(hold) = selfprotect::binary_integrity::hold_duration(&e) {
             tokio::time::sleep(hold).await;
@@ -280,6 +282,13 @@ async fn main() -> Result<()> {
     let ring_buffer: Arc<Mutex<Spool>> = Arc::new(Mutex::new(spool));
     let (tx, mut rx) = create_pipeline();
     let mut handles = Vec::new();
+
+    // A tamper alert a previous failed start could not deliver.
+    if let Some(pending) = selfprotect::tamper_alert::take_pending(paths::state_dir()) {
+        let _ = tx.try_send(selfprotect::tamper_alert::event(
+            &pending, &agent_id, &hostname,
+        ));
+    }
 
     // A start after a kill/crash/power loss is worth one low-severity signal.
     if let Some(finding) = heartbeat::lifecycle::unclean_shutdown_finding(

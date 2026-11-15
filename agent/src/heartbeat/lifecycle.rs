@@ -71,6 +71,10 @@ pub struct Lifecycle {
     started_at: DateTime<Utc>,
     started: Instant,
     previous: PreviousShutdown,
+    /// Modification time of the marker this run replaced: the previous run's
+    /// start (unclean end) or its orderly shutdown (clean end). A hint with
+    /// the same trust as the marker itself.
+    previous_marker_at: Option<DateTime<Utc>>,
     marker: PathBuf,
 }
 
@@ -78,11 +82,16 @@ impl Lifecycle {
     /// Read the previous marker, then claim it for this run.
     fn begin(marker: PathBuf) -> Self {
         let previous = PreviousShutdown::classify(std::fs::read_to_string(&marker).ok().as_deref());
+        let previous_marker_at = std::fs::metadata(&marker)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(DateTime::<Utc>::from);
         write_marker(&marker, RUNNING);
         Self {
             started_at: Utc::now(),
             started: Instant::now(),
             previous,
+            previous_marker_at,
             marker,
         }
     }
@@ -98,6 +107,12 @@ impl Lifecycle {
 
     pub fn previous_shutdown(&self) -> PreviousShutdown {
         self.previous
+    }
+
+    /// When the previous run's marker was last written, if there was one.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn previous_marker_at(&self) -> Option<DateTime<Utc>> {
+        self.previous_marker_at
     }
 
     fn mark_clean(&self) {
@@ -170,6 +185,7 @@ mod tests {
         let marker = temp_marker("first");
         let l = Lifecycle::begin(marker.clone());
         assert_eq!(l.previous_shutdown(), PreviousShutdown::Unknown);
+        assert!(l.previous_marker_at().is_none());
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), RUNNING);
         let _ = std::fs::remove_dir_all(marker.parent().unwrap());
     }
@@ -181,6 +197,7 @@ mod tests {
         first.mark_clean();
         let second = Lifecycle::begin(marker.clone());
         assert_eq!(second.previous_shutdown(), PreviousShutdown::Clean);
+        assert!(second.previous_marker_at().is_some());
         let _ = std::fs::remove_dir_all(marker.parent().unwrap());
     }
 

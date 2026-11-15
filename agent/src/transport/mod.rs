@@ -400,6 +400,41 @@ fn encode_event_batch(
     raw.push(b']');
     Ok((selected, raw))
 }
+/// One bounded delivery of `events` outside the persistent queue, for the few
+/// cases where the process is about to exit and cannot wait for the transport
+/// loop (see `selfprotect::tamper_alert`). Always the legacy wire form and no
+/// compression: nothing has been negotiated with the backend yet. `Ok` only
+/// when the backend returned a valid receipt that rejects none of the events.
+pub async fn send_once(
+    backend_url: &str,
+    token: &str,
+    events: &[trapd_schema::AgentEvent],
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let client = crate::http::build_client(timeout, timeout.min(Duration::from_secs(2)))?;
+    let url = format!(
+        "{}/api/v1/ingest/events",
+        crate::http::normalize_base_url(backend_url)
+    );
+    let body = serde_json::to_vec(events)?;
+    let resp = client
+        .post(url)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("backend answered {}", resp.status());
+    }
+    let report = parse_ack(&resp.bytes().await?)
+        .ok_or_else(|| anyhow::anyhow!("2xx without a valid receipt"))?;
+    if !report.rejected.is_empty() {
+        anyhow::bail!("backend rejected the event");
+    }
+    Ok(())
+}
+
 fn advertises_ocsf(headers: &reqwest::header::HeaderMap) -> bool {
     headers
         .get_all(trapd_schema::ocsf::CAPABILITY_HEADER)
