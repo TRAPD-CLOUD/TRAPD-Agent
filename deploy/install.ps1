@@ -3,8 +3,12 @@
 #
 # Preferred enrollment is device pairing (no token at all). When a one-time
 # token is used it is NEVER placed on the msiexec command line (visible to all
-# local users and to process telemetry): it is staged in the SYSTEM/Administrators
-# only HKLM\SOFTWARE\TRAPD\Agent key, and the agent deletes it after enrolling.
+# local users and to process telemetry): the script writes it to a temporary
+# file readable only by the current administrator and SYSTEM and passes only
+# the file PATH (ENROLLTOKENFILE). A deferred SYSTEM custom action of the MSI
+# reads it into the protected HKLM\SOFTWARE\TRAPD\Agent key (an elevated
+# administrator cannot write that key on a hardened host), the script deletes
+# the file, and the agent deletes the registry value after enrolling.
 #
 # The MSI must carry a valid Authenticode signature of the expected signer.
 [CmdletBinding()]
@@ -33,28 +37,6 @@ if (-not $AllowUnsigned -and -not $ExpectedThumbprint -and -not $ExpectedPublish
 }
 if ($BackendUrl -match '["\r\n]' -or $EnrollToken -match '["\r\n\s]') { throw 'Invalid MSI configuration value.' }
 
-function Set-StagedEnrollToken([string]$Token) {
-    $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')
-    $key = $hklm.CreateSubKey('SOFTWARE\TRAPD\Agent')
-    try {
-        $acl = New-Object Security.AccessControl.RegistrySecurity
-        $acl.SetAccessRuleProtection($true, $false)
-        foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
-            $identity = New-Object Security.Principal.SecurityIdentifier $sid
-            $acl.AddAccessRule((New-Object Security.AccessControl.RegistryAccessRule($identity, 'FullControl', 'ContainerInherit', 'None', 'Allow')))
-        }
-        $key.SetAccessControl($acl)
-        $key.SetValue('EnrollToken', $Token, 'String')
-    } finally { $key.Dispose(); $hklm.Dispose() }
-}
-function Remove-StagedEnrollToken {
-    $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')
-    try {
-        $key = $hklm.OpenSubKey('SOFTWARE\TRAPD\Agent', $true)
-        if ($key) { $key.DeleteValue('EnrollToken', $false); $key.Dispose() }
-    } finally { $hklm.Dispose() }
-}
-
 $repo = 'trapd-cloud/trapd-agent'
 $headers = @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
 if ($Channel -eq 'stable') {
@@ -70,7 +52,6 @@ $sum = $release.assets | Where-Object name -eq "$name.sha256" | Select-Object -F
 if (-not $asset -or -not $sum) { throw 'Release has no Windows x64 MSI and checksum.' }
 $temp = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
 New-Item -ItemType Directory $temp | Out-Null
-$tokenStaged = $false
 try {
     $msi = Join-Path $temp $name
     $checksum = Join-Path $temp "$name.sha256"
@@ -92,15 +73,25 @@ try {
     $arguments = @('/i', "`"$msi`"", '/qn', '/norestart')
     if ($BackendUrl) { $arguments += "BACKENDURL=`"$BackendUrl`"" }
     if ($EnrollToken) {
-        Set-StagedEnrollToken $EnrollToken
-        $tokenStaged = $true
+        # Private directory first (inheritance off; SYSTEM + current user), then the file.
+        $tokenDir = Join-Path $temp 'enroll'
+        New-Item -ItemType Directory $tokenDir | Out-Null
+        $dirAcl = New-Object Security.AccessControl.DirectorySecurity
+        $dirAcl.SetAccessRuleProtection($true, $false)
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $system = New-Object Security.Principal.SecurityIdentifier 'S-1-5-18'
+        foreach ($sid in $me, $system) {
+            $dirAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        }
+        Set-Acl -LiteralPath $tokenDir -AclObject $dirAcl
+        $tokenPath = Join-Path $tokenDir 'enroll.token'
+        [IO.File]::WriteAllText($tokenPath, $EnrollToken, (New-Object Text.UTF8Encoding $false))
+        $arguments += "ENROLLTOKENFILE=`"$tokenPath`""
     }
     $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
     if ($process.ExitCode -notin @(0, 3010)) { throw "MSI installation failed ($($process.ExitCode))." }
     Write-Host "Installed TRAPD Agent $($release.tag_name) ($Channel)."
-    $tokenStaged = $false
 } finally {
-    # A failed install must not leave a staged one-time token behind.
-    if ($tokenStaged) { Remove-StagedEnrollToken }
+    # The temp directory holds the staged token file; it is removed on every path.
     Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue
 }

@@ -95,6 +95,24 @@ impl StopMarker {
     }
 }
 
+impl StopMarker {
+    /// The in-memory authorization of a stop the SYSTEM service ordered itself
+    /// after claiming a maintenance token (Windows). Never written to disk; the
+    /// backend still matches `token_nonce` against its consumed-token record.
+    /// `None` if the nonce is not a well-formed token nonce.
+    #[cfg(any(windows, test))]
+    pub fn for_claimed_token(nonce: &str, now: i64) -> Option<Self> {
+        let marker = Self::new(
+            Reason::Maintenance,
+            Some(nonce.to_owned()),
+            Some(env!("CARGO_PKG_VERSION").to_owned()),
+            None,
+            now,
+        );
+        validate(&marker, now).ok().map(|()| marker)
+    }
+}
+
 fn is_nonce(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }

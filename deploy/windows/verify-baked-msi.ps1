@@ -16,6 +16,7 @@ try {
 
     $names = @('ca.crt', 'command_signing.pub')
     if (Test-Path -LiteralPath (Join-Path $TrustDir 'release_signing.pub')) { $names += 'release_signing.pub' }
+    if (Test-Path -LiteralPath (Join-Path $TrustDir 'maintenance_signing.pub')) { $names += 'maintenance_signing.pub' }
     foreach ($name in $names) {
         $found = @(Get-ChildItem -Path $tmp -Recurse -File -Filter $name)
         if ($found.Count -ne 1) { throw "Expected exactly one $name in the package, found $($found.Count)." }

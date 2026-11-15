@@ -23,3 +23,10 @@ pub mod tamper_alert;
 // unexpected shutdown) since the previous run. Classification is portable.
 #[cfg(any(target_os = "windows", test))]
 pub mod restart_forensics;
+// Expected ACLs of the service, its registry keys and directories (WP2/WP3).
+// The constants and comparison are portable; the guard that reads and applies
+// them is Windows-only.
+#[cfg(target_os = "windows")]
+pub mod acl_guard;
+#[cfg(any(target_os = "windows", test))]
+pub mod acl_policy;

@@ -36,10 +36,13 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use crate::selfprotect::stop::{StopKind, StopSource};
 
 /// What ended the service, as seen by the SCM control handler.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StopRequest {
     pub kind: StopKind,
     pub source: StopSource,
+    /// Set only when the service itself claimed a maintenance token: the stop
+    /// is then reported as authorized directly, without a marker file.
+    pub claimed_token_nonce: Option<String>,
 }
 
 /// Map an SCM control to a stop request. `Stop` is somebody stopping the
@@ -50,10 +53,12 @@ fn stop_request_for(control: &ServiceControl) -> Option<StopRequest> {
         ServiceControl::Stop => Some(StopRequest {
             kind: StopKind::ServiceStop,
             source: StopSource::ScmStop,
+            claimed_token_nonce: None,
         }),
         ServiceControl::Shutdown | ServiceControl::Preshutdown => Some(StopRequest {
             kind: StopKind::HostShutdown,
             source: StopSource::ScmStop,
+            claimed_token_nonce: None,
         }),
         _ => None,
     }
@@ -119,7 +124,39 @@ pub fn entry() -> Result<()> {
             run::load_config_env();
             crate::paths::init_state_dir();
             let args: Vec<String> = std::env::args().skip(2).collect();
-            crate::selfprotect::maintenance::run_cli(&args, stop_service)
+            // The service DACL does not let an administrator stop the service,
+            // so the verb hands the (pre-checked) token to the service, which
+            // verifies it again and stops itself. See `selfprotect::maintenance`.
+            crate::selfprotect::maintenance::run_cli_delegated(&args, request_stop_via_service)
+        }
+        // Invoked by the MSI (deferred, SYSTEM) to apply the hardened service and
+        // registry ACLs (`acl apply`) or, with `TRAPD_LEGACY_ACLS=1`, the ones
+        // earlier releases installed (`acl legacy`).
+        Some("acl") => {
+            run::init_tracing_file();
+            run::load_config_env();
+            crate::paths::init_state_dir();
+            match std::env::args().nth(2).as_deref() {
+                Some("apply") => crate::selfprotect::acl_guard::apply_hardened(),
+                Some("legacy") => crate::selfprotect::acl_guard::apply_legacy(),
+                _ => bail!("usage: trapd-agent.exe acl <apply|legacy>"),
+            }
+        }
+        // Invoked by the MSI (deferred, SYSTEM) for `ENROLLTOKENFILE=<path>`:
+        // stage the one-time enrollment token in the protected registry key.
+        // The token never appears on a command line or in the MSI log.
+        Some("enroll-token-import") => {
+            run::init_tracing_file();
+            let path = std::env::args()
+                .nth(2)
+                .context("usage: trapd-agent.exe enroll-token-import <file>")?;
+            let token = crate::enrollment::token_file::read(std::path::Path::new(&path))?;
+            registry_stage_enroll_token(Some(&token))
+        }
+        // MSI rollback counterpart: drop a token staged by this transaction.
+        Some("enroll-token-clear") => {
+            run::init_tracing_file();
+            registry_stage_enroll_token(None)
         }
         // Invoked by the MSI before the service is stopped for an uninstall
         // (`RequireUninstallToken`, Return="check"): a failure aborts the
@@ -169,6 +206,17 @@ pub fn entry() -> Result<()> {
     }
 }
 
+fn registry_stage_enroll_token(token: Option<&str>) -> Result<()> {
+    use crate::collectors::windows::registry;
+    use windows_sys::Win32::System::Registry::KEY_WOW64_64KEY;
+    const KEY: &str = "SOFTWARE\\TRAPD\\Agent";
+    let result = match token {
+        Some(token) => registry::set_string(KEY, "EnrollToken", token, KEY_WOW64_64KEY),
+        None => registry::delete_value(KEY, "EnrollToken", KEY_WOW64_64KEY),
+    };
+    result.map_err(|status| anyhow::anyhow!("enrollment token registry update failed ({status})"))
+}
+
 // ── Console mode ──────────────────────────────────────────────────────────────
 
 /// How long the runtime may take to drop its blocking tasks (Event Log
@@ -191,6 +239,7 @@ fn run_console() -> Result<()> {
             let _ = stop_tx.send(StopRequest {
                 kind: StopKind::ServiceStop,
                 source: StopSource::Interrupt,
+                claimed_token_nonce: None,
             });
         });
         run::run_agent(stop_rx, || {}, false).await
@@ -322,6 +371,22 @@ fn run_service() -> Result<()> {
         }
         match control {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            // `maintenance` asked the service to look at a pending, token-bearing
+            // stop request. The control itself carries nothing and proves nothing:
+            // the stop happens only if a request verifies and is claimed.
+            ServiceControl::UserEvent(code)
+                if code.to_raw() == crate::selfprotect::maintenance::STOP_REQUEST_CONTROL =>
+            {
+                if let Some(claims) = crate::selfprotect::maintenance::authorize_pending_stop() {
+                    let _ = handler_phase_tx.send(Phase::Stopping);
+                    let _ = stop_tx.send(StopRequest {
+                        kind: StopKind::ServiceStop,
+                        source: StopSource::MaintenanceToken,
+                        claimed_token_nonce: Some(claims.nonce),
+                    });
+                }
+                ServiceControlHandlerResult::NoError
+            }
             _ => ServiceControlHandlerResult::NotImplemented,
         }
     };
@@ -384,28 +449,34 @@ fn run_service() -> Result<()> {
     result
 }
 
-/// Ask the SCM to stop the service and wait (bounded) for it to report Stopped.
-/// This is the same orderly path as `sc stop`: the service handles `Stop`.
-fn stop_service() -> Result<()> {
+/// Send the service the user-defined "look at the maintenance request" control
+/// and wait (bounded) for it to report Stopped. Administrators hold
+/// `SERVICE_USER_DEFINED_CONTROL` but not `SERVICE_STOP`; the service stops
+/// itself only after it verified the token.
+fn request_stop_via_service() -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("connect to the service manager (run from an elevated prompt)")?;
     let service = manager
         .open_service(
             SERVICE_NAME,
-            ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+            ServiceAccess::USER_DEFINED_CONTROL | ServiceAccess::QUERY_STATUS,
         )
         .context("open service (is it installed?)")?;
-    if service.query_status()?.current_state != ServiceState::Stopped {
-        service.stop().context("stop service")?;
-        for _ in 0..30 {
-            if service.query_status()?.current_state == ServiceState::Stopped {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        bail!("service did not stop within 30 seconds");
+    if service.query_status()?.current_state == ServiceState::Stopped {
+        return Ok(());
     }
-    Ok(())
+    let code = windows_service::service::UserEventCode::from_raw(
+        crate::selfprotect::maintenance::STOP_REQUEST_CONTROL,
+    )
+    .context("user-defined control code")?;
+    service.notify(code).context("send the stop request")?;
+    for _ in 0..30 {
+        if service.query_status()?.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    bail!("service did not stop within 30 seconds");
 }
 
 // ── install / uninstall ───────────────────────────────────────────────────────

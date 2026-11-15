@@ -40,7 +40,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::paths;
 use crate::selfprotect::stop_marker::{self, Reason, StopMarker};
@@ -288,6 +288,12 @@ impl ConsumedStore {
         Ok(())
     }
 
+    /// Whether `nonce` was already used on this device (read-only check).
+    #[cfg(any(windows, test))]
+    pub fn is_consumed(&self, nonce: &str) -> bool {
+        self.path_for(nonce).is_ok_and(|p| p.exists())
+    }
+
     fn read(&self, nonce: &str) -> Option<ConsumedRecord> {
         let bytes = std::fs::read(self.path_for(nonce).ok()?).ok()?;
         serde_json::from_slice(&bytes).ok()
@@ -505,8 +511,8 @@ pub fn parse_cli(args: &[String]) -> Result<(Purpose, PathBuf)> {
 pub enum GateOutcome {
     /// A valid `uninstall` token was verified and consumed.
     Authorized(Claims),
-    /// Nothing to protect: the agent never enrolled, or no maintenance key was
-    /// provisioned (self-hosted builds without trust anchors).
+    /// Nothing to protect: the agent never enrolled. (An enrolled agent without
+    /// a maintenance key is refused, not skipped: see `uninstall_gate_decision`.)
     NotProtected(&'static str),
 }
 
@@ -517,7 +523,10 @@ pub enum KeyState {
 }
 
 /// Pure decision core of the uninstall gate. `agent_id` is `None` when the
-/// device is not enrolled. A provisioned key makes the token mandatory.
+/// device is not enrolled. An enrolled device always needs a token: if the
+/// verification key is missing the gate fails closed (the MSI ships the key, so
+/// a missing one means it was removed). Recovery: restore
+/// `maintenance_signing.pub` (an MSI repair puts it back) and retry.
 pub(crate) fn uninstall_gate_decision(
     agent_id: Option<&str>,
     key: &KeyState,
@@ -529,9 +538,10 @@ pub(crate) fn uninstall_gate_decision(
         return Ok(GateOutcome::NotProtected("agent is not enrolled"));
     };
     let KeyState::Present(key) = key else {
-        return Ok(GateOutcome::NotProtected(
-            "no maintenance signing key is provisioned",
-        ));
+        bail!(
+            "uninstall refused: the maintenance signing key ({KEY_FILE}) is missing on an \
+             enrolled agent, so no token can be verified; restore it (MSI repair) and retry"
+        );
     };
     let token = token.context(
         "uninstall requires a maintenance token: pass MAINTENANCE_TOKEN_FILE=<path to token file>",
@@ -557,6 +567,12 @@ pub fn run_uninstall_gate(args: &[String]) -> Result<()> {
         (Some(_), KeyState::Present(_), Some(path)) => Some(read_token_file(&path)?),
         _ => None,
     };
+    if agent_id.is_some() && matches!(key, KeyState::Missing) {
+        error!(
+            key = KEY_FILE,
+            "enrolled agent has no maintenance signing key; the uninstall is denied"
+        );
+    }
     let store = ConsumedStore::new(paths::state_dir());
     let now = chrono::Utc::now().timestamp();
     match uninstall_gate_decision(agent_id.as_deref(), &key, token.as_deref(), &store, now)? {
@@ -598,11 +614,37 @@ pub fn write_stop_marker(reason: Reason, nonce: Option<String>) {
     }
 }
 
+/// Whether this process is the privileged installer context: `LocalSystem` on
+/// Windows (MSI deferred, non-impersonated actions), euid 0 on Linux.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn running_as_system() -> bool {
+    #[cfg(windows)]
+    {
+        crate::winacl::is_local_system()
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+}
+
+/// An elevated administrator must not be able to pre-authorize their own
+/// `sc stop`: the planned-stop marker is only written for the installer.
+fn stop_marker_privilege(is_system: bool) -> Result<()> {
+    if is_system {
+        Ok(())
+    } else {
+        bail!("stop-marker can only be run by the installer as SYSTEM (euid 0 on Linux)")
+    }
+}
+
 /// `trapd-agent stop-marker upgrade|clear`: MSI-internal helper. `upgrade` marks
 /// the stop of the old product during a major upgrade, `clear` undoes it on
 /// rollback.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn run_stop_marker(args: &[String]) -> Result<()> {
+    stop_marker_privilege(running_as_system())?;
     match args {
         [a] if a == "upgrade" => write_stop_marker(Reason::Upgrade, None),
         [a] if a == "clear" => stop_marker::clear(paths::state_dir()),
@@ -620,7 +662,14 @@ fn immediate_report_url(offline: bool, backend_url: Option<String>) -> Option<St
     backend_url.filter(|u| !u.trim().is_empty())
 }
 
+/// The backend only accepts a token-authorized stop it has a consume record
+/// for, and an uninstalled agent can never report later, so the consumption is
+/// reported before the stop, bounded.
+const IMMEDIATE_REPORT_BUDGET: Duration = Duration::from_secs(5);
+
 /// Best-effort immediate report of consumed tokens (see `report_pending`).
+/// Never blocks longer than [`IMMEDIATE_REPORT_BUDGET`] and never fails the
+/// caller: an unreachable backend only means it raises the alert itself.
 fn report_consumption_now() {
     // Report the use now if the backend is reachable; otherwise the running
     // service (or the next start) retries. Best effort and bounded.
@@ -640,9 +689,17 @@ fn report_consumption_now() {
                     .enable_all()
                     .build()
                 {
-                    Ok(rt) => {
-                        rt.block_on(report_pending(&url, &creds.agent_id, &creds.agent_secret))
-                    }
+                    Ok(rt) => rt.block_on(async {
+                        if tokio::time::timeout(
+                            IMMEDIATE_REPORT_BUDGET,
+                            report_pending(&url, &creds.agent_id, &creds.agent_secret),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!("maintenance use report timed out");
+                        }
+                    }),
                     Err(e) => tracing::warn!(error = %e, "maintenance report runtime unavailable"),
                 }
             })
@@ -651,11 +708,21 @@ fn report_consumption_now() {
             tracing::warn!("maintenance report thread panicked; the service retries");
         }
     }
+    let unreported = ConsumedStore::new(paths::state_dir()).pending().len();
+    if unreported > 0 {
+        warn!(
+            unreported,
+            "maintenance token use could not be reported to the backend; it will treat the stop as unauthorized unless it learns of the use later"
+        );
+    }
 }
 
-/// Run the verb. Only `stop` is wired up in this step; `upgrade` and
-/// `uninstall` are consumed by the MSI custom action through
-/// [`authorize_from_file`].
+/// Run the verb (Linux: the stop is a `systemctl stop` the caller may perform,
+/// so the caller authorizes with a marker). Only `stop` is wired up here;
+/// `uninstall` is consumed by the MSI gate. On Windows the verb is delegated to
+/// the service instead (see below); the service itself reports the authorized
+/// stop from the claimed token, with no marker.
+#[cfg(not(windows))]
 pub fn run_cli(args: &[String], stop_service: impl FnOnce() -> Result<()>) -> Result<()> {
     let (purpose, token_file) = parse_cli(args)?;
     if purpose != Purpose::Stop {
@@ -676,6 +743,181 @@ pub fn run_cli(args: &[String], stop_service: impl FnOnce() -> Result<()>) -> Re
     report_consumption_now();
 
     stop_service().context("the token was consumed but the agent could not be stopped")?;
+    println!("Agent stop requested.");
+    Ok(())
+}
+
+// ── Delegated stop (Windows) ─────────────────────────────────────────────────
+//
+// On Windows the service DACL does not let an administrator stop the service
+// (WP2), so the sanctioned stop cannot be "authorise, then call the SCM as the
+// administrator". Instead:
+//
+//   1. `maintenance` (admin) pre-checks the token read-only (signature, agent,
+//      purpose, expiry, not yet used) so a bad token fails with a reason, then
+//      drops it into `<state>/maintenance/requests/`, a directory the
+//      administrator may only add files to, and sends the service the
+//      user-defined control `STOP_REQUEST_CONTROL` (allowed to Administrators).
+//   2. The service (SYSTEM) re-verifies and *claims* the token itself, against
+//      the key in `config\`, which an administrator cannot replace. Only then
+//      it stops itself. The request file and the control are not trusted: an
+//      administrator who forges either gets nothing, because the signature,
+//      agent binding, expiry and single use are all checked by the service.
+
+/// User-defined SCM control (128..=255) meaning "look at the pending
+/// maintenance requests". Carries no data.
+#[cfg(any(windows, test))]
+pub const STOP_REQUEST_CONTROL: u32 = 128;
+#[cfg(any(windows, test))]
+const MAX_PENDING_REQUESTS: usize = 8;
+
+#[cfg(any(windows, test))]
+pub fn requests_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("maintenance").join("requests")
+}
+
+/// Service start: create the request directory with the add-only ACL.
+#[cfg(windows)]
+pub fn prepare_requests_dir() {
+    let dir = requests_dir(paths::state_dir());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(error = %e, "could not create the maintenance request directory");
+        return;
+    }
+    if let Err(e) = crate::winacl::set_dacl(&dir, super::acl_policy::REQUESTS_DIR_SDDL) {
+        warn!(error = %e, "could not restrict the maintenance request directory");
+    }
+}
+
+/// Read-only check of a token before it is handed to the service.
+#[cfg(any(windows, test))]
+pub fn precheck(
+    token: &str,
+    key: &VerifyingKey,
+    agent_id: &str,
+    store: &ConsumedStore,
+    now: i64,
+) -> Result<Claims> {
+    let claims = verify_token(token, key, agent_id, Purpose::Stop, now)?;
+    if store.is_consumed(&claims.nonce) {
+        return Err(ClaimError::Replayed.into());
+    }
+    Ok(claims)
+}
+
+/// Drop `token` into the request directory under an unpredictable name.
+#[cfg(any(windows, test))]
+pub fn submit_request(dir: &Path, token: &str) -> Result<PathBuf> {
+    use std::io::Write as _;
+    let path = dir.join(format!("{}.req", uuid::Uuid::new_v4().simple()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "cannot place the request in {} (is the agent service running?)",
+                dir.display()
+            )
+        })?;
+    f.write_all(token.as_bytes())?;
+    f.sync_all()?;
+    Ok(path)
+}
+
+/// Service side: consume pending request files and return the claims of the
+/// first token that verifies and is claimed. Every file is removed whether or
+/// not it was valid, and at most `MAX_PENDING_REQUESTS` are looked at, so a
+/// flood of junk cannot keep the handler busy.
+#[cfg(any(windows, test))]
+pub fn process_requests(
+    dir: &Path,
+    key: &VerifyingKey,
+    agent_id: &str,
+    store: &ConsumedStore,
+    now: i64,
+) -> Option<Claims> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut accepted = None;
+    for entry in entries.flatten().take(MAX_PENDING_REQUESTS) {
+        let path = entry.path();
+        let read = paths::bounded_regular_bytes(&path, MAX_TOKEN_FILE_BYTES);
+        // Remove first: a file that cannot be removed must not be replayed.
+        if std::fs::remove_file(&path).is_err() {
+            warn!("maintenance request could not be removed; ignored");
+            continue;
+        }
+        if accepted.is_some() {
+            continue;
+        }
+        let Ok(bytes) = read else {
+            warn!("maintenance request unreadable or oversized; ignored");
+            continue;
+        };
+        let Ok(token) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if let Ok(claims) = authorize(token.trim(), key, agent_id, Purpose::Stop, store, now) {
+            accepted = Some(claims);
+        }
+    }
+    accepted
+}
+
+/// Service control handler entry: look at pending requests and return the
+/// claims of the token the service has claimed, if any.
+#[cfg(windows)]
+pub fn authorize_pending_stop() -> Option<Claims> {
+    let Some(creds) = crate::enrollment::load_persisted_blocking() else {
+        warn!("maintenance request ignored: agent is not enrolled");
+        return None;
+    };
+    let key = match load_pinned_key() {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(error = %e, "maintenance request ignored");
+            return None;
+        }
+    };
+    let store = ConsumedStore::new(paths::state_dir());
+    process_requests(
+        &requests_dir(paths::state_dir()),
+        &key,
+        &creds.agent_id,
+        &store,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+/// `maintenance` verb when the stop is delegated to the service (Windows).
+/// `request_stop` sends the control to the service and waits for it to stop.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))] // Windows wires it up; tests exercise the rest
+pub fn run_cli_delegated(args: &[String], request_stop: impl FnOnce() -> Result<()>) -> Result<()> {
+    let (purpose, token_file) = parse_cli(args)?;
+    if purpose != Purpose::Stop {
+        bail!(
+            "purpose {:?} is not available through this command",
+            purpose.as_str()
+        );
+    }
+    let creds = crate::enrollment::load_persisted_blocking()
+        .context("this agent is not enrolled; no maintenance token can apply")?;
+    let key = load_pinned_key()?;
+    let token = read_token_file(&token_file)?;
+    let store = ConsumedStore::new(paths::state_dir());
+    precheck(
+        &token,
+        &key,
+        &creds.agent_id,
+        &store,
+        chrono::Utc::now().timestamp(),
+    )?;
+    println!("Maintenance token looks valid; asking the agent service to verify it and stop.");
+    submit_request(&requests_dir(paths::state_dir()), &token)?;
+    request_stop().context(
+        "the service did not stop; it verifies the token itself and logs the reason in agent.log",
+    )?;
     println!("Agent stop requested.");
     Ok(())
 }
@@ -1125,6 +1367,13 @@ mod tests {
     }
 
     #[test]
+    fn stop_marker_verb_is_refused_unless_system() {
+        assert!(stop_marker_privilege(false).is_err());
+        assert!(stop_marker_privilege(true).is_ok());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn run_cli_refuses_other_purposes_without_touching_anything() {
         let called = std::cell::Cell::new(false);
         let r = run_cli(
@@ -1210,15 +1459,20 @@ mod tests {
     }
 
     #[test]
-    fn gate_does_not_protect_unenrolled_or_unkeyed_devices() {
+    fn gate_skips_unenrolled_devices_but_fails_closed_without_a_key() {
         assert!(matches!(
             gate(None, &present(), None).unwrap(),
             GateOutcome::NotProtected(_)
         ));
         assert!(matches!(
-            gate(None, &KeyState::Missing, Some(AGENT)).unwrap(),
+            gate(None, &KeyState::Missing, None).unwrap(),
             GateOutcome::NotProtected(_)
         ));
+        // Enrolled but the key is gone: deny, with or without a token.
+        let err = gate(None, &KeyState::Missing, Some(AGENT)).unwrap_err();
+        assert!(format!("{err:#}").contains("missing"), "{err:#}");
+        let t = token("uninstall", NOW, NOW + 900);
+        assert!(gate(Some(&t), &KeyState::Missing, Some(AGENT)).is_err());
     }
 
     #[test]
@@ -1275,5 +1529,90 @@ mod tests {
             !wxs.contains("[MAINTENANCE_TOKEN]"),
             "a token must never be formatted into a command line"
         );
+    }
+
+    // ── delegated stop ──
+    #[test]
+    fn service_claims_a_submitted_token_exactly_once() {
+        let dir = tmp();
+        let requests = requests_dir(dir.path());
+        std::fs::create_dir_all(&requests).unwrap();
+        let store = ConsumedStore::new(dir.path());
+        let vk = key().verifying_key();
+        let t = token("stop", NOW, NOW + 900);
+
+        precheck(&t, &vk, AGENT, &store, NOW + 1).expect("fresh token passes the pre-check");
+        submit_request(&requests, &t).unwrap();
+        let claims = process_requests(&requests, &vk, AGENT, &store, NOW + 2).expect("accepted");
+        assert_eq!(claims.purpose, Purpose::Stop);
+        assert_eq!(
+            std::fs::read_dir(&requests).unwrap().count(),
+            0,
+            "request removed"
+        );
+
+        // The pre-check now refuses it, and a resubmission is not accepted.
+        assert!(precheck(&t, &vk, AGENT, &store, NOW + 3).is_err());
+        submit_request(&requests, &t).unwrap();
+        assert!(process_requests(&requests, &vk, AGENT, &store, NOW + 4).is_none());
+        assert_eq!(std::fs::read_dir(&requests).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn service_ignores_forged_foreign_expired_and_junk_requests() {
+        let dir = tmp();
+        let requests = requests_dir(dir.path());
+        std::fs::create_dir_all(&requests).unwrap();
+        let store = ConsumedStore::new(dir.path());
+        let vk = key().verifying_key();
+        let forger = SigningKey::from_bytes(&[9u8; 32]);
+
+        let forged = sign_with(
+            &forger,
+            &payload(1, AGENT, "stop", other_nonce(), NOW, NOW + 900),
+            DOMAIN,
+        );
+        let foreign = sign_with(
+            &key(),
+            &payload(1, "agent_other", "stop", other_nonce(), NOW, NOW + 900),
+            DOMAIN,
+        );
+        let expired = token("stop", NOW - 5000, NOW - 4000);
+        for body in [
+            forged.as_str(),
+            foreign.as_str(),
+            expired.as_str(),
+            "not a token",
+            "",
+        ] {
+            submit_request(&requests, body).unwrap();
+        }
+        std::fs::write(requests.join("big.req"), "a".repeat(5000)).unwrap();
+        assert!(process_requests(&requests, &vk, AGENT, &store, NOW + 1).is_none());
+        assert_eq!(
+            std::fs::read_dir(&requests).unwrap().count(),
+            0,
+            "all removed"
+        );
+        assert!(!store.is_consumed(other_nonce()), "nothing was consumed");
+    }
+
+    #[test]
+    fn a_flood_of_requests_is_bounded() {
+        let dir = tmp();
+        let requests = requests_dir(dir.path());
+        std::fs::create_dir_all(&requests).unwrap();
+        let store = ConsumedStore::new(dir.path());
+        let vk = key().verifying_key();
+        for _ in 0..(MAX_PENDING_REQUESTS + 5) {
+            submit_request(&requests, "junk").unwrap();
+        }
+        let _ = process_requests(&requests, &vk, AGENT, &store, NOW);
+        assert_eq!(std::fs::read_dir(&requests).unwrap().count(), 5);
+    }
+
+    #[test]
+    fn stop_request_control_is_in_the_user_defined_range() {
+        assert!((128..=255).contains(&STOP_REQUEST_CONTROL));
     }
 }

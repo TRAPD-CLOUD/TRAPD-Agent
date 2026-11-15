@@ -59,6 +59,10 @@ pub enum StopSource {
     Sigterm,
     /// `SIGINT` / Ctrl-C.
     Interrupt,
+    /// The service verified and claimed a maintenance token (Windows). Evidence
+    /// only: the backend decides from its own record of the token, never from
+    /// this claim.
+    MaintenanceToken,
 }
 
 impl StopSource {
@@ -67,6 +71,7 @@ impl StopSource {
             Self::ScmStop => "scm_stop",
             Self::Sigterm => "sigterm",
             Self::Interrupt => "interrupt",
+            Self::MaintenanceToken => "maintenance_token",
         }
     }
 }
@@ -259,25 +264,41 @@ impl StopAnnouncer {
     /// Report the stop. Never fails and never takes longer than the budget of
     /// the chosen path.
     pub async fn announce(&self, kind: StopKind, source: StopSource) {
+        self.announce_authorized(kind, source, None).await
+    }
+
+    /// Like [`announce`](Self::announce), for a stop the caller itself has
+    /// authorized (Windows service after claiming a maintenance token). No
+    /// marker file is involved; a stale one is still consumed so it cannot be
+    /// reused, and exactly one event is produced.
+    pub async fn announce_authorized(
+        &self,
+        kind: StopKind,
+        source: StopSource,
+        authorization: Option<StopMarker>,
+    ) {
         match kind {
-            StopKind::ServiceStop => self.announce_service_stop(source).await,
+            StopKind::ServiceStop => self.announce_service_stop(source, authorization).await,
             StopKind::HostShutdown => self.announce_host_shutdown().await,
         }
     }
 
-    async fn announce_service_stop(&self, source: StopSource) {
+    async fn announce_service_stop(&self, source: StopSource, authorization: Option<StopMarker>) {
         let mode = crate::output::OutputMode::from_env();
-        self.announce_service_stop_with(source, STOP_FLUSH_BUDGET, move |event| async move {
-            crate::output::write_events(std::slice::from_ref(&event), &mode)
-                .await
-                .is_ok()
-        })
+        self.announce_service_stop_authorized(
+            source,
+            authorization,
+            STOP_FLUSH_BUDGET,
+            move |event| async move {
+                crate::output::write_events(std::slice::from_ref(&event), &mode)
+                    .await
+                    .is_ok()
+            },
+        )
         .await;
     }
 
-    /// The whole stop notice (local write, spool insertion and delivery) runs
-    /// under one deadline of `budget`, so a slow disk can never hold up the
-    /// shutdown. `write_local` is the seam for the local output.
+    #[cfg(test)]
     async fn announce_service_stop_with<W, Fut>(
         &self,
         source: StopSource,
@@ -287,9 +308,29 @@ impl StopAnnouncer {
         W: FnOnce(AgentEvent) -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
+        self.announce_service_stop_authorized(source, None, budget, write_local)
+            .await
+    }
+
+    /// The whole stop notice (local write, spool insertion and delivery) runs
+    /// under one deadline of `budget`, so a slow disk can never hold up the
+    /// shutdown. `write_local` is the seam for the local output.
+    async fn announce_service_stop_authorized<W, Fut>(
+        &self,
+        source: StopSource,
+        authorization: Option<StopMarker>,
+        budget: Duration,
+        write_local: W,
+    ) where
+        W: FnOnce(AgentEvent) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
         // Consume the planned-stop marker (single use) before anything else; a
-        // missing, expired or malformed one yields the high finding.
-        let marker = stop_marker::consume(&self.state_dir, chrono::Utc::now().timestamp());
+        // missing, expired or malformed one yields the high finding. A stop the
+        // service authorized itself takes precedence; the file is still
+        // consumed so one stop never yields two events or leaves a marker.
+        let consumed = stop_marker::consume(&self.state_dir, chrono::Utc::now().timestamp());
+        let marker = authorization.or(consumed);
         let event = stop_event_for(&self.agent_id, &self.hostname, source, marker.as_ref());
         // This event bypasses the consumer, so it is written to the configured
         // local output itself, online and offline alike, independent of
@@ -575,6 +616,51 @@ mod tests {
             panic!()
         };
         (d.rule_id, e.severity, spool)
+    }
+
+    /// Windows service-side token stop: authorized directly from the claimed
+    /// token (source maintenance_token), no marker file, exactly one event, and
+    /// the evidence names the fields the backend matches on.
+    #[tokio::test]
+    async fn claimed_token_stop_is_authorized_without_a_marker() {
+        let dir = unique_dir();
+        let now = chrono::Utc::now().timestamp();
+        // A stale marker from another planned stop must not add a second event
+        // or survive.
+        stop_marker::write(
+            &dir,
+            &StopMarker::new(Reason::Upgrade, None, Some("0.8.0".into()), None, now),
+        )
+        .unwrap();
+        let spool = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let a = StopAnnouncer::new("a".into(), "h".into(), Arc::clone(&spool))
+            .with_state_dir(dir.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        a.announce_service_stop_authorized(
+            StopSource::MaintenanceToken,
+            StopMarker::for_claimed_token(NONCE, now),
+            STOP_FLUSH_BUDGET,
+            move |e| async move {
+                sink.lock().unwrap().push(e);
+                true
+            },
+        )
+        .await;
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, Severity::Info);
+        let EventData::Detection(d) = &events[0].data else {
+            panic!()
+        };
+        assert_eq!(d.rule_id, SERVICE_STOP_AUTHORIZED_RULE_ID);
+        assert_eq!(d.evidence["source"], "maintenance_token");
+        assert_eq!(d.evidence["reason"], "maintenance");
+        assert_eq!(d.evidence["token_nonce"], NONCE);
+        assert!(d.evidence["marker_issued_at"].is_i64());
+        assert!(!stop_marker::marker_path(&dir).exists());
+        // A malformed nonce yields no authorization (fails toward the finding).
+        assert!(StopMarker::for_claimed_token("XYZ", now).is_none());
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
     SetNamedSecurityInfoW, SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    SE_OBJECT_TYPE, SE_REGISTRY_KEY,
 };
 use windows_sys::Win32::Security::{
     GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACL, DACL_SECURITY_INFORMATION,
@@ -185,7 +186,22 @@ pub fn set_file_security(path: &Path, sddl: &str) -> Result<()> {
 }
 
 fn set_security(path: &Path, sddl: &str, include_owner: bool) -> Result<()> {
-    let wpath = wide(path);
+    set_security_typed(
+        &wide(path),
+        &path.display().to_string(),
+        SE_FILE_OBJECT,
+        sddl,
+        include_owner,
+    )
+}
+
+fn set_security_typed(
+    wpath: &[u16],
+    label: &str,
+    object_type: SE_OBJECT_TYPE,
+    sddl: &str,
+    include_owner: bool,
+) -> Result<()> {
     let wsddl = wide_str(sddl);
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: NUL-terminated inputs; `sd` is a valid out-pointer freed below.
@@ -220,7 +236,7 @@ fn set_security(path: &Path, sddl: &str, include_owner: bool) -> Result<()> {
             };
             let status = SetNamedSecurityInfoW(
                 wpath.as_ptr() as *mut u16,
-                SE_FILE_OBJECT,
+                object_type,
                 DACL_SECURITY_INFORMATION
                     | protection
                     | if include_owner {
@@ -238,7 +254,7 @@ fn set_security(path: &Path, sddl: &str, include_owner: bool) -> Result<()> {
             } else {
                 Err(anyhow!(
                     "SetNamedSecurityInfo({}) failed: {}",
-                    path.display(),
+                    label,
                     std::io::Error::from_raw_os_error(status as i32)
                 ))
             }
@@ -259,14 +275,27 @@ pub fn get_file_security(path: &Path) -> Result<String> {
 }
 
 fn get_security(path: &Path, information: u32) -> Result<String> {
-    let wpath = wide(path);
+    get_security_typed(
+        &wide(path),
+        &path.display().to_string(),
+        SE_FILE_OBJECT,
+        information,
+    )
+}
+
+fn get_security_typed(
+    wpath: &[u16],
+    label: &str,
+    object_type: SE_OBJECT_TYPE,
+    information: u32,
+) -> Result<String> {
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     // SAFETY: valid out-pointers; the descriptor is freed on every path.
     unsafe {
         let status = GetNamedSecurityInfoW(
             wpath.as_ptr(),
-            SE_FILE_OBJECT,
+            object_type,
             information,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -277,7 +306,7 @@ fn get_security(path: &Path, information: u32) -> Result<String> {
         if status != 0 {
             bail!(
                 "GetNamedSecurityInfo({}) failed: {}",
-                path.display(),
+                label,
                 std::io::Error::from_raw_os_error(status as i32)
             );
         }
@@ -306,6 +335,158 @@ fn get_security(path: &Path, information: u32) -> Result<String> {
         LocalFree(sd);
         result
     }
+}
+
+/// `HKLM\<subkey>` in the form `GetNamedSecurityInfo` wants (`MACHINE\...`).
+fn machine_key(subkey: &str) -> Vec<u16> {
+    wide_str(&format!("MACHINE\\{subkey}"))
+}
+
+/// Owner and DACL of `HKLM\<subkey>` as an SDDL string.
+pub fn get_machine_key_security(subkey: &str) -> Result<String> {
+    get_security_typed(
+        &machine_key(subkey),
+        subkey,
+        SE_REGISTRY_KEY,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+    )
+}
+
+/// Replace the DACL of `HKLM\<subkey>`. Inheritable ACEs propagate to the
+/// subkeys that inherit (the key's `Parameters`, for instance).
+pub fn set_machine_key_dacl(subkey: &str, sddl: &str) -> Result<()> {
+    set_security_typed(&machine_key(subkey), subkey, SE_REGISTRY_KEY, sddl, false)
+}
+
+const READ_CONTROL: u32 = 0x0002_0000;
+const WRITE_DAC: u32 = 0x0004_0000;
+
+struct ServiceHandle(windows_sys::Win32::System::Services::SC_HANDLE);
+impl Drop for ServiceHandle {
+    fn drop(&mut self) {
+        // SAFETY: a handle returned by OpenSCManagerW/OpenServiceW, closed once.
+        unsafe {
+            windows_sys::Win32::System::Services::CloseServiceHandle(self.0);
+        }
+    }
+}
+
+fn open_service(name: &str, access: u32) -> Result<ServiceHandle> {
+    use windows_sys::Win32::System::Services::{OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT};
+    let wname = wide_str(name);
+    // SAFETY: null machine/database select the local active database.
+    let scm = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if scm.is_null() {
+        bail!("OpenSCManager failed: {}", std::io::Error::last_os_error());
+    }
+    let scm = ServiceHandle(scm);
+    // SAFETY: `scm` is a valid manager handle; `wname` is NUL-terminated.
+    let svc = unsafe { OpenServiceW(scm.0, wname.as_ptr(), access) };
+    if svc.is_null() {
+        bail!(
+            "OpenService({name}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(ServiceHandle(svc))
+}
+
+/// The DACL of the named service as an SDDL string.
+pub fn get_service_dacl(name: &str) -> Result<String> {
+    use windows_sys::Win32::System::Services::QueryServiceObjectSecurity;
+    let svc = open_service(name, READ_CONTROL)?;
+    let mut buf = vec![0u8; 1024];
+    let mut needed = 0u32;
+    // SAFETY: `buf` is writable for `buf.len()` bytes; `needed` is a valid out-pointer.
+    let mut ok = unsafe {
+        QueryServiceObjectSecurity(
+            svc.0,
+            DACL_SECURITY_INFORMATION,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &mut needed,
+        )
+    };
+    if ok == 0 && needed as usize > buf.len() && needed <= 64 * 1024 {
+        buf.resize(needed as usize, 0);
+        // SAFETY: as above, with the size the first call asked for.
+        ok = unsafe {
+            QueryServiceObjectSecurity(
+                svc.0,
+                DACL_SECURITY_INFORMATION,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+                &mut needed,
+            )
+        };
+    }
+    if ok == 0 {
+        bail!(
+            "QueryServiceObjectSecurity({name}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: `buf` now holds a self-relative security descriptor.
+    unsafe { descriptor_to_sddl(buf.as_mut_ptr().cast(), DACL_SECURITY_INFORMATION) }
+}
+
+/// Replace the DACL of the named service.
+pub fn set_service_dacl(name: &str, sddl: &str) -> Result<()> {
+    use windows_sys::Win32::System::Services::SetServiceObjectSecurity;
+    let svc = open_service(name, WRITE_DAC)?;
+    let wsddl = wide_str(sddl);
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: NUL-terminated input; `sd` is a valid out-pointer freed below.
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wsddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            bail!(
+                "invalid security descriptor: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let ok = SetServiceObjectSecurity(svc.0, DACL_SECURITY_INFORMATION, sd);
+        let err = std::io::Error::last_os_error();
+        LocalFree(sd);
+        if ok == 0 {
+            bail!("SetServiceObjectSecurity({name}) failed: {err}");
+        }
+    }
+    Ok(())
+}
+
+/// # Safety
+/// `sd` must point to a valid security descriptor.
+unsafe fn descriptor_to_sddl(sd: PSECURITY_DESCRIPTOR, information: u32) -> Result<String> {
+    let mut text: *mut u16 = std::ptr::null_mut();
+    let mut len = 0u32;
+    let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        sd,
+        SDDL_REVISION_1,
+        information,
+        &mut text,
+        &mut len,
+    );
+    let result = if ok == 0 || text.is_null() {
+        Err(anyhow!(
+            "cannot render DACL: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        let slice = std::slice::from_raw_parts(text, len as usize);
+        Ok(String::from_utf16_lossy(slice)
+            .trim_end_matches('\0')
+            .to_string())
+    };
+    if !text.is_null() {
+        LocalFree(text.cast());
+    }
+    result
 }
 
 /// Execute using a duplicate of the effective token, preserving any existing

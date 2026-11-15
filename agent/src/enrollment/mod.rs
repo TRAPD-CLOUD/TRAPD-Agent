@@ -27,6 +27,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::paths;
 
 mod pairing;
+pub(crate) mod token_file;
 
 /// Persisted agent identity. `agent_secret` is a long-lived bearer credential
 /// (equivalent to a password) for every authenticated backend endpoint, so:

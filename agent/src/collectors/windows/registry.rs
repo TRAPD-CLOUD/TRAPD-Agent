@@ -1,8 +1,9 @@
 //! Bounded registry reads shared by MSI configuration and Windows inventory.
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegGetValueW, RegOpenKeyExW, HKEY,
-    HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, KEY_SET_VALUE, RRF_NOEXPAND, RRF_RT_REG_DWORD,
-    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegGetValueW,
+    RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, KEY_SET_VALUE,
+    REG_OPTION_NON_VOLATILE, REG_SZ, RRF_NOEXPAND, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ,
+    RRF_RT_REG_SZ,
 };
 
 /// Which hive a read targets.
@@ -424,6 +425,48 @@ pub fn delete_value(path: &str, name: &str, view: u32) -> Result<(), u32> {
         match status {
             0 | ERROR_FILE_NOT_FOUND => Ok(()),
             other => Err(other),
+        }
+    }
+}
+
+/// Write one `REG_SZ` value under a `HKEY_LOCAL_MACHINE` key, creating the key
+/// when missing (an existing key keeps its security descriptor). `view` is a
+/// `KEY_WOW64_*` flag. Returns the Win32 status on failure.
+pub fn set_string(path: &str, name: &str, value: &str, view: u32) -> Result<(), u32> {
+    let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let data: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+    let mut key = std::ptr::null_mut();
+    // SAFETY: terminated strings, valid out-pointer, handle closed below; the
+    // data length is the byte size of the terminated UTF-16 buffer.
+    unsafe {
+        let status = RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE | view,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        );
+        if status != 0 {
+            return Err(status);
+        }
+        let status = RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_SZ,
+            data.as_ptr().cast(),
+            (data.len() * 2) as u32,
+        );
+        RegCloseKey(key);
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status)
         }
     }
 }

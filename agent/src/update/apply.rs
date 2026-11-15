@@ -160,7 +160,16 @@ pub fn sddl_is_system_admin_only(sddl: &str) -> bool {
     let mut aces = 0;
     for ace in dacl[first_ace..].split(')').filter(|a| !a.is_empty()) {
         let fields: Vec<&str> = ace.trim_start_matches('(').split(';').collect();
-        if fields.len() < 6 || fields[0] != "A" || !trusted(fields[5]) {
+        if fields.len() < 6 || fields[0] != "A" {
+            return false;
+        }
+        // `OWNER RIGHTS` limited to READ_CONTROL is how the hardened directory
+        // descriptors (selfprotect::acl_policy) strip the owner's implicit
+        // WRITE_DAC. It grants nothing writable, so it does not make the
+        // directory less private; any wider `OW` entry still fails closed.
+        let owner_rights_read_only =
+            matches!(fields[5], "OW" | "S-1-3-4") && matches!(fields[2], "RC" | "0x20000");
+        if !trusted(fields[5]) && !owner_rights_read_only {
             return false;
         }
         aces += 1;
@@ -598,12 +607,12 @@ fn clear_absence_evidence(installed: &[Installed]) -> Result<()> {
     Ok(())
 }
 
-fn write_self_update_marker(ctx: &ApplyContext<'_>, to_version: &str) {
+fn write_self_update_marker(ctx: &ApplyContext<'_>, from_version: &str, to_version: &str) {
     use crate::selfprotect::stop_marker::{self, Reason, StopMarker};
     let marker = StopMarker::new(
         Reason::SelfUpdate,
         None,
-        Some(ctx.verify.current_version.to_owned()),
+        Some(from_version.to_owned()),
         Some(to_version.to_owned()),
         chrono::Utc::now().timestamp(),
     );
@@ -619,7 +628,22 @@ fn abort_update(ctx: &ApplyContext<'_>, installed: &[Installed], version: &str) 
     clear_absence_evidence(installed)
 }
 
+/// Rollback stops the (new) service on purpose: mark it as a planned
+/// self-update stop so the rollback does not raise the high finding. A stop
+/// that does not happen (service already down) must not leave the marker
+/// behind to authorize a later, unrelated stop, so it is cleared again.
 fn recover_update(
+    ctx: &ApplyContext<'_>,
+    platform: &dyn Platform,
+    recovery: &Recovery,
+) -> Result<Outcome> {
+    write_self_update_marker(ctx, &recovery.version, &recovery.previous_version);
+    let result = recover_update_unmarked(ctx, platform, recovery);
+    crate::selfprotect::stop_marker::clear(ctx.paths.state_dir());
+    result
+}
+
+fn recover_update_unmarked(
     ctx: &ApplyContext<'_>,
     platform: &dyn Platform,
     recovery: &Recovery,
@@ -662,6 +686,18 @@ fn read_verified(path: &Path, size: u64, sha256: &[u8; 32], what: &str) -> Resul
 /// Re-verify the staged update, install it, and wait for the new agent to
 /// report healthy; otherwise restore the previous files.
 pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<Outcome> {
+    let result = apply_staged_marked(ctx, platform);
+    // The planned-stop marker is written before the service is stopped. If the
+    // update ends in an error (or is rolled back) the marker may not have been
+    // consumed by any stop; it must not outlive the update and authorize an
+    // unrelated stop within its lifetime.
+    if matches!(result, Err(_) | Ok(Outcome::RolledBack { .. })) {
+        crate::selfprotect::stop_marker::clear(ctx.paths.state_dir());
+    }
+    result
+}
+
+fn apply_staged_marked(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<Outcome> {
     if let Some(outcome) = resume_completed_staging(ctx.paths)? {
         return Ok(outcome);
     }
@@ -791,7 +827,7 @@ pub fn apply_staged(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Result<O
     // The restart below is planned and signature-verified: mark it so the
     // agent reports an authorized stop (with from/to version for the backend to
     // correlate) instead of a tamper finding. Best effort, never fatal.
-    write_self_update_marker(ctx, &verified.version);
+    write_self_update_marker(ctx, ctx.verify.current_version, &verified.version);
     // The verification context uses the helper's actual OS. On Windows the
     // service must be fully stopped before any protected file changes; a staged
     // offer is never authority to suppress tamper detection in a live collector.
@@ -896,6 +932,8 @@ mod tests {
             "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
             "O:BAG:SYD:AI(A;OICIID;FA;;;BA)(A;OICIID;FA;;;SY)",
             "O:S-1-5-18D:(A;;FA;;;S-1-5-32-544)",
+            // Hardened directory descriptor: Administrators read/execute, owner rights neutralised.
+            "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;RC;;;OW)",
         ] {
             assert!(sddl_is_system_admin_only(ok), "{ok}");
         }
@@ -906,6 +944,7 @@ mod tests {
             "O:BUD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",                   // non-admin owner
             "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",                       // no owner
             "O:SYD:P(D;OICI;FA;;;BU)(A;OICI;FA;;;SY)",                   // deny ACE
+            "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)",                   // owner rights with write
             "O:SYD:",                                                    // null DACL
             "O:SYD:P",                                                   // empty DACL
             "O:SY",                                                      // no DACL
@@ -1180,6 +1219,9 @@ mod tests {
         let mut p = WindowsPlatform::new(&env);
         p.fail_stop = true;
         assert!(run_windows(&env, &p).is_err());
+        // Regression: the planned-stop marker written before the aborted stop
+        // must not survive to authorize an unrelated stop.
+        assert!(!crate::selfprotect::stop_marker::marker_path(env.paths.state_dir()).exists());
         assert_eq!(*p.stopped_binaries.borrow(), vec![b"OLD BINARY".to_vec()]);
         assert_eq!(p.restarts.get(), 0);
         assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
@@ -1293,6 +1335,7 @@ mod tests {
         struct Order<'a> {
             env: &'a Env,
             seen_at_stop: std::cell::RefCell<Option<Vec<u8>>>,
+            marker_at_stop: std::cell::RefCell<Option<crate::selfprotect::stop_marker::StopMarker>>,
         }
         impl Platform for Order<'_> {
             fn restart_service(&self) -> Result<()> {
@@ -1300,17 +1343,31 @@ mod tests {
             }
             fn stop_service(&self) -> Result<()> {
                 *self.seen_at_stop.borrow_mut() = Some(std::fs::read(&self.env.target)?);
+                // What the stopping agent would consume.
+                *self.marker_at_stop.borrow_mut() = crate::selfprotect::stop_marker::consume(
+                    self.env.paths.state_dir(),
+                    chrono::Utc::now().timestamp(),
+                );
                 Ok(())
             }
         }
         let p = Order {
             env: &env,
             seen_at_stop: Default::default(),
+            marker_at_stop: Default::default(),
         };
         assert!(matches!(
             run(&env, &p, 0).unwrap(),
             Outcome::RolledBack { .. }
         ));
+        // The rollback stop is planned: a self_update marker was in place.
+        let marker = p.marker_at_stop.borrow().clone().expect("rollback marker");
+        assert_eq!(
+            marker.reason,
+            crate::selfprotect::stop_marker::Reason::SelfUpdate
+        );
+        assert_eq!(marker.from_version.as_deref(), Some("0.5.0"));
+        assert!(!crate::selfprotect::stop_marker::marker_path(env.paths.state_dir()).exists());
         assert_eq!(p.seen_at_stop.borrow().as_deref(), Some(&b"NEW BINARY"[..]));
         assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
     }
