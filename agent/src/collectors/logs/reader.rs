@@ -669,11 +669,19 @@ mod tests {
     use std::io::Write;
 
     fn tmpdir() -> PathBuf {
+        // Windows clock ticks are coarse: parallel tests got the same
+        // nanosecond stamp and shared one directory (flaky in CI). A process
+        // wide counter makes the name unique.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let d = std::env::temp_dir().join(format!("trapd_logtail_{nanos}"));
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "trapd_logtail_{}_{nanos}_{seq}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
