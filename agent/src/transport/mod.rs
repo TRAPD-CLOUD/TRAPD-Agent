@@ -404,7 +404,8 @@ fn encode_event_batch(
 /// cases where the process is about to exit and cannot wait for the transport
 /// loop (see `selfprotect::tamper_alert`). Always the legacy wire form and no
 /// compression: nothing has been negotiated with the backend yet. `Ok` only
-/// when the backend returned a valid receipt that rejects none of the events.
+/// when the backend returned a valid receipt that confirms every event (same
+/// per-id semantics as the queue, see [`partition_by_report`]).
 pub async fn send_once(
     backend_url: &str,
     token: &str,
@@ -429,8 +430,33 @@ pub async fn send_once(
     }
     let report = parse_ack(&resp.bytes().await?)
         .ok_or_else(|| anyhow::anyhow!("2xx without a valid receipt"))?;
-    if !report.rejected.is_empty() {
+    receipt_confirms_all(events, &report)
+}
+
+/// `Ok` only when the receipt positively acknowledges every submitted event.
+/// An id that is rejected or not mentioned (while the receipt does per-event
+/// accounting) is not confirmed; unknown ids in the receipt are ignored.
+fn receipt_confirms_all(
+    events: &[trapd_schema::AgentEvent],
+    report: &IngestResponse,
+) -> anyhow::Result<()> {
+    let batch: Vec<crate::pipeline::SpoolEntry> = events
+        .iter()
+        .zip(0u64..)
+        .map(|(event, seq)| crate::pipeline::SpoolEntry {
+            seq,
+            event: event.clone(),
+            attempts: 0,
+            bytes: 0,
+            not_before: None,
+        })
+        .collect();
+    let (_, requeue, rejected) = partition_by_report(&batch, report);
+    if !rejected.is_empty() {
         anyhow::bail!("backend rejected the event");
+    }
+    if !requeue.is_empty() {
+        anyhow::bail!("backend receipt does not confirm the event");
     }
     Ok(())
 }
@@ -710,6 +736,23 @@ mod tests {
     }
 
     // ── Partial acknowledgement ─────────────────────────────────────────────
+
+    #[test]
+    fn one_shot_delivery_needs_the_id_in_the_receipt() {
+        let events = [event()];
+        let id = events[0].event_id.to_string();
+        let report =
+            |accepted: Vec<String>, rejected: Vec<String>| IngestResponse { accepted, rejected };
+        // Legacy backend without per-event accounting: 2xx covers the batch.
+        assert!(receipt_confirms_all(&events, &IngestResponse::default()).is_ok());
+        assert!(receipt_confirms_all(&events, &report(vec![id.clone()], vec![])).is_ok());
+        // Receipt that omits the id (only an unknown one) is not a confirmation.
+        let other = uuid::Uuid::new_v4().to_string();
+        assert!(receipt_confirms_all(&events, &report(vec![other.clone()], vec![])).is_err());
+        assert!(receipt_confirms_all(&events, &report(vec![], vec![other])).is_err());
+        // Rejected is not delivered either.
+        assert!(receipt_confirms_all(&events, &report(vec![], vec![id])).is_err());
+    }
 
     #[test]
     fn an_empty_report_acknowledges_the_whole_batch() {

@@ -19,9 +19,9 @@
 //! persists a record cursor, so a 104 written while the agent was down is read
 //! after the restart and already becomes `selfprotect.audit_policy_changed`.
 //!
-//! Window: from the previous run's marker time (see
-//! [`crate::heartbeat::lifecycle`]) or the last completed read-back, whichever
-//! is later, never older than [`MAX_LOOKBACK`] and never more than a bounded
+//! Window: from the last successfully completed read-back (a watermark that
+//! advances only after a full scan), else from the previous run's marker time
+//! (see [`crate::heartbeat::lifecycle`]), never older than [`MAX_LOOKBACK`] and never more than a bounded
 //! number of records per query. A watermark file keeps a restart loop from
 //! re-reporting the same records.
 //!
@@ -381,21 +381,21 @@ pub enum Basis {
     UnknownPreviousRun,
 }
 
-/// Start of the read-back window: the later of the previous marker time and
-/// the last completed scan, clamped to [`MAX_LOOKBACK`]. A marker or watermark
-/// in the future (clock change, forged file) is ignored. No usable anchor
-/// yields a 24 h window.
+/// Start of the read-back window: the persisted scanned-until watermark, which
+/// advances only after a fully successful scan. Only when there is none does
+/// the previous run's marker time apply (the marker is rewritten at every
+/// start, so it must not override a watermark: a failed scan would otherwise
+/// skip the outage window for good). Clamped to [`MAX_LOOKBACK`]; an anchor in
+/// the future (clock change, forged file) is ignored. No usable anchor yields
+/// a 24 h window.
 pub fn lookback_start(
     now: DateTime<Utc>,
     previous_marker_at: Option<DateTime<Utc>>,
     watermark: Option<DateTime<Utc>>,
 ) -> (DateTime<Utc>, Basis) {
     let floor = now - MAX_LOOKBACK;
-    let anchor = [previous_marker_at, watermark]
-        .into_iter()
-        .flatten()
-        .filter(|t| *t <= now)
-        .max();
+    let usable = |t: Option<DateTime<Utc>>| t.filter(|t| *t <= now);
+    let anchor = usable(watermark).or(usable(previous_marker_at));
     match anchor {
         Some(t) => (t.max(floor), Basis::PreviousRun),
         None => (
@@ -428,6 +428,15 @@ pub fn write_watermark(dir: &Path, scanned_until: DateTime<Utc>) {
     if let Err(e) = crate::paths::write_atomic(&dir.join(WATERMARK_FILE), &raw, 0o600) {
         // Losing it only risks re-reading (and idempotently re-reporting) a window.
         tracing::warn!(error = %e, "could not persist the restart read-back watermark");
+    }
+}
+
+/// Record `now` as scanned, but only when every query succeeded. A partial
+/// read, and any early return before this point, leaves the old watermark so
+/// the next start reads the same window again.
+pub fn advance_watermark(dir: &Path, now: DateTime<Utc>, complete: bool) {
+    if complete {
+        write_watermark(dir, now);
     }
 }
 
@@ -533,10 +542,7 @@ pub async fn run(
             return;
         }
     }
-    // Advance only after every query succeeded; a partial read is retried.
-    if complete {
-        write_watermark(state, now);
-    }
+    advance_watermark(state, now, complete);
 }
 
 #[cfg(test)]
@@ -806,11 +812,18 @@ mod tests {
         let now = ts("2026-11-15T12:00:00Z");
         let (s, b) = lookback_start(now, Some(ts("2026-11-15T09:00:00Z")), None);
         assert_eq!((s, b), (ts("2026-11-15T09:00:00Z"), Basis::PreviousRun));
-        // Later of marker and watermark.
+        // The watermark wins over a marker, even a newer one.
         let (s, _) = lookback_start(
             now,
-            Some(ts("2026-11-15T09:00:00Z")),
             Some(ts("2026-11-15T11:00:00Z")),
+            Some(ts("2026-11-15T09:00:00Z")),
+        );
+        assert_eq!(s, ts("2026-11-15T09:00:00Z"));
+        // A future watermark falls back to the marker.
+        let (s, _) = lookback_start(
+            now,
+            Some(ts("2026-11-15T11:00:00Z")),
+            Some(ts("2027-01-01T00:00:00Z")),
         );
         assert_eq!(s, ts("2026-11-15T11:00:00Z"));
         // Ancient marker is clamped to seven days.
@@ -832,6 +845,26 @@ mod tests {
             (s, b),
             (now - UNKNOWN_PREVIOUS_LOOKBACK, Basis::UnknownPreviousRun)
         );
+    }
+
+    #[test]
+    fn marker_moving_without_a_successful_scan_keeps_the_old_window() {
+        let dir = std::env::temp_dir().join(format!("trapd_rf_adv_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = ts("2026-11-15T08:00:00Z");
+        write_watermark(&dir, old);
+        // Start 1: marker already rewritten, read-back failed.
+        let t1 = ts("2026-11-15T10:00:00Z");
+        advance_watermark(&dir, t1, false);
+        assert_eq!(read_watermark(&dir), Some(old));
+        // Start 2: the marker is now newer, the window still starts at `old`.
+        let t2 = ts("2026-11-15T11:00:00Z");
+        let (since, _) = lookback_start(t2, Some(t1), read_watermark(&dir));
+        assert_eq!(since, old);
+        // A successful scan advances it.
+        advance_watermark(&dir, t2, true);
+        assert_eq!(read_watermark(&dir), Some(t2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

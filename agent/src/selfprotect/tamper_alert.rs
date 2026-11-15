@@ -34,6 +34,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use trapd_schema::{AgentEvent, DetectionData, EventAction, EventClass, EventData, Severity};
+use uuid::Uuid;
 
 use super::binary_integrity::IntegrityViolation;
 
@@ -51,6 +52,11 @@ pub struct AlertState {
     pub detected_at: DateTime<Utc>,
     pub failures: u32,
     pub delivered_at: Option<DateTime<Utc>>,
+    /// Id of the alert event, kept across retries so the backend can dedupe on
+    /// it (delivery is at-least-once). Nil only in state files written before
+    /// this field existed; `read_state` replaces and persists it.
+    #[serde(default)]
+    pub event_id: Uuid,
 }
 
 fn valid_hash(hash: &str) -> bool {
@@ -63,8 +69,18 @@ pub fn read_state(dir: &Path) -> Option<AlertState> {
     if std::fs::metadata(&path).ok()?.len() > MAX_STATE_BYTES {
         return None;
     }
-    let state: AlertState = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    valid_hash(&state.hash).then_some(state)
+    // A malformed `event_id` fails the parse like any other bad field.
+    let mut state: AlertState = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if !valid_hash(&state.hash) {
+        return None;
+    }
+    if state.event_id.is_nil() {
+        // Legacy record: assign the id once and persist it so every retry and
+        // the healthy-start delivery share it.
+        state.event_id = Uuid::new_v4();
+        write_state(dir, &state);
+    }
+    Some(state)
 }
 
 fn write_state(dir: &Path, state: &AlertState) {
@@ -96,15 +112,19 @@ pub fn next_state(
     failures: u32,
     now: DateTime<Utc>,
 ) -> AlertState {
-    let detected_at = match existing {
-        Some(s) if s.hash == hash && s.delivered_at.is_none() => s.detected_at,
-        _ => now,
+    let (detected_at, event_id) = match existing {
+        Some(s) if s.hash == hash && s.delivered_at.is_none() && !s.event_id.is_nil() => {
+            (s.detected_at, s.event_id)
+        }
+        Some(s) if s.hash == hash && s.delivered_at.is_none() => (s.detected_at, Uuid::new_v4()),
+        _ => (now, Uuid::new_v4()),
     };
     AlertState {
         hash: hash.to_string(),
         detected_at,
         failures,
         delivered_at: None,
+        event_id,
     }
 }
 
@@ -143,6 +163,7 @@ pub fn event(state: &AlertState, agent_id: &str, hostname: &str) -> AgentEvent {
         EventData::Detection(Box::new(detection(state))),
     );
     event.timestamp = state.detected_at;
+    event.event_id = state.event_id;
     event
 }
 
@@ -237,6 +258,7 @@ mod tests {
             detected_at: now,
             failures: 1,
             delivered_at: Some(now),
+            event_id: Uuid::new_v4(),
         };
         assert!(attempt_due(Some(&s), H2, now));
     }
@@ -249,6 +271,7 @@ mod tests {
             detected_at: at,
             failures: 3,
             delivered_at: Some(at),
+            event_id: Uuid::new_v4(),
         };
         assert!(!attempt_due(
             Some(&s),
@@ -299,6 +322,57 @@ mod tests {
         assert_eq!(read_state(&dir), Some(s.clone()));
         assert_eq!(take_pending(&dir), Some(s));
         assert!(take_pending(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retries_and_the_healthy_start_reuse_the_event_id() {
+        let first = t("2026-11-15T10:00:00Z");
+        let pending = next_state(None, H1, 1, first);
+        let again = next_state(Some(&pending), H1, 2, first + chrono::Duration::minutes(5));
+        assert_eq!(again.event_id, pending.event_id);
+        assert_eq!(
+            event(&again, "a", "h").event_id,
+            event(&pending, "a", "h").event_id
+        );
+        // A new hash or an already delivered alert is a new alert.
+        assert_ne!(
+            next_state(Some(&pending), H2, 1, first).event_id,
+            pending.event_id
+        );
+        let mut delivered = pending.clone();
+        delivered.delivered_at = Some(first);
+        assert_ne!(
+            next_state(Some(&delivered), H1, 1, first).event_id,
+            pending.event_id
+        );
+        // Persisted and read back for the next process.
+        let dir = tmp("eventid");
+        write_state(&dir, &pending);
+        assert_eq!(take_pending(&dir).unwrap().event_id, pending.event_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_state_without_an_event_id_gets_one_and_keeps_it() {
+        let dir = tmp("legacy");
+        let legacy = format!(
+            r#"{{"hash":"{H1}","detected_at":"2026-11-15T10:00:00Z","failures":2,"delivered_at":null}}"#
+        );
+        std::fs::write(dir.join(STATE_FILE), legacy).unwrap();
+        let first = read_state(&dir).unwrap();
+        assert!(!first.event_id.is_nil());
+        // Persisted: a second read, a retry and the event all agree.
+        assert_eq!(read_state(&dir).unwrap().event_id, first.event_id);
+        let retry = next_state(Some(&first), H1, 3, first.detected_at);
+        assert_eq!(retry.event_id, first.event_id);
+        assert_eq!(event(&retry, "a", "h").event_id, first.event_id);
+        // A malformed id invalidates the record.
+        let bad = format!(
+            r#"{{"hash":"{H1}","detected_at":"2026-11-15T10:00:00Z","failures":2,"delivered_at":null,"event_id":"x"}}"#
+        );
+        std::fs::write(dir.join(STATE_FILE), bad).unwrap();
+        assert!(read_state(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
