@@ -279,6 +279,44 @@ pub(crate) fn load_persisted_blocking() -> Option<Credentials> {
         .filter(Credentials::is_valid)
 }
 
+/// Fail-closed read for the uninstall gate. `Ok(None)` only when the file does
+/// not exist (genuinely unenrolled); any other failure (locked, unreadable,
+/// invalid JSON, invalid identity) is an `Err`, because an administrator can
+/// hold the file open exclusively to make an enrolled agent look unenrolled.
+/// Read errors are retried briefly to ride out transient sharing violations.
+pub(crate) fn load_persisted_strict_blocking() -> anyhow::Result<Option<Credentials>> {
+    const ATTEMPTS: u32 = 8;
+    let path = paths::credentials_file();
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => return parse_persisted_strict(Ok(raw)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => last = Some(e),
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+    parse_persisted_strict(Err(last.expect("at least one attempt")))
+}
+
+pub(crate) fn parse_persisted_strict(
+    read: std::io::Result<String>,
+) -> anyhow::Result<Option<Credentials>> {
+    let raw = match read {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => anyhow::bail!("credentials file is unreadable ({e})"),
+    };
+    let creds: Credentials = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("credentials file is not valid JSON ({e})"))?;
+    if !creds.is_valid() {
+        anyhow::bail!("credentials file holds an invalid identity");
+    }
+    Ok(Some(creds))
+}
+
 pub(crate) async fn load_persisted() -> Option<Credentials> {
     let path = paths::credentials_file();
     if !path.exists() {
@@ -390,6 +428,30 @@ fn read_os_version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_read_only_not_found_means_unenrolled() {
+        let nf = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(parse_persisted_strict(Err(nf)).unwrap().is_none());
+    }
+
+    #[test]
+    fn strict_read_fails_closed_on_unreadable_or_invalid() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(parse_persisted_strict(Err(denied)).is_err());
+        assert!(parse_persisted_strict(Ok("{not json".into())).is_err());
+        assert!(parse_persisted_strict(Ok(String::new())).is_err());
+        let blank = r#"{"agent_id":"","agent_secret":"","project_id":"p"}"#;
+        assert!(parse_persisted_strict(Ok(blank.into())).is_err());
+        let ok = r#"{"agent_id":"a","agent_secret":"s","project_id":"p"}"#;
+        assert_eq!(
+            parse_persisted_strict(Ok(ok.into()))
+                .unwrap()
+                .unwrap()
+                .agent_id,
+            "a"
+        );
+    }
 
     fn sample() -> Credentials {
         Credentials {

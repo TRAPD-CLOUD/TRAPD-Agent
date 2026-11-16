@@ -36,10 +36,13 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use crate::selfprotect::stop::{StopKind, StopSource};
 
 /// What ended the service, as seen by the SCM control handler.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StopRequest {
     pub kind: StopKind,
     pub source: StopSource,
+    /// Set only when the service itself claimed a maintenance token: the stop
+    /// is then reported as authorized directly, without a marker file.
+    pub claimed_token_nonce: Option<String>,
 }
 
 /// Map an SCM control to a stop request. `Stop` is somebody stopping the
@@ -50,10 +53,12 @@ fn stop_request_for(control: &ServiceControl) -> Option<StopRequest> {
         ServiceControl::Stop => Some(StopRequest {
             kind: StopKind::ServiceStop,
             source: StopSource::ScmStop,
+            claimed_token_nonce: None,
         }),
         ServiceControl::Shutdown | ServiceControl::Preshutdown => Some(StopRequest {
             kind: StopKind::HostShutdown,
             source: StopSource::ScmStop,
+            claimed_token_nonce: None,
         }),
         _ => None,
     }
@@ -153,6 +158,27 @@ pub fn entry() -> Result<()> {
             run::init_tracing_file();
             registry_stage_enroll_token(None)
         }
+        // Invoked by the MSI before the service is stopped for an uninstall
+        // (`RequireUninstallToken`, Return="check"): a failure aborts the
+        // uninstall. The token is read from a file named by
+        // MAINTENANCE_TOKEN_FILE, never passed as an argument.
+        Some("uninstall-gate") => {
+            run::init_tracing_file();
+            run::load_config_env();
+            crate::paths::init_state_dir();
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            crate::selfprotect::maintenance::run_uninstall_gate(&args)
+                .inspect_err(|e| tracing::error!("uninstall refused: {e:#}"))
+        }
+        // MSI-internal: mark (or unmark on rollback) the planned stop of a major
+        // upgrade so it is not reported as tampering.
+        Some("stop-marker") => {
+            run::init_tracing_file();
+            run::load_config_env();
+            crate::paths::init_state_dir();
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            crate::selfprotect::maintenance::run_stop_marker(&args)
+        }
         Some("diagnostics") if std::env::args().nth(2).as_deref() == Some("telemetry") => {
             print!("{}", crate::telemetry::diagnostics::run());
             Ok(())
@@ -213,6 +239,7 @@ fn run_console() -> Result<()> {
             let _ = stop_tx.send(StopRequest {
                 kind: StopKind::ServiceStop,
                 source: StopSource::Interrupt,
+                claimed_token_nonce: None,
             });
         });
         run::run_agent(stop_rx, || {}, false).await
@@ -350,11 +377,12 @@ fn run_service() -> Result<()> {
             ServiceControl::UserEvent(code)
                 if code.to_raw() == crate::selfprotect::maintenance::STOP_REQUEST_CONTROL =>
             {
-                if crate::selfprotect::maintenance::authorize_pending_stop() {
+                if let Some(claims) = crate::selfprotect::maintenance::authorize_pending_stop() {
                     let _ = handler_phase_tx.send(Phase::Stopping);
                     let _ = stop_tx.send(StopRequest {
                         kind: StopKind::ServiceStop,
                         source: StopSource::MaintenanceToken,
+                        claimed_token_nonce: Some(claims.nonce),
                     });
                 }
                 ServiceControlHandlerResult::NoError

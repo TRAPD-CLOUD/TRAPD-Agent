@@ -743,7 +743,21 @@ pub(super) async fn run_agent(
                 .await;
             }
         }
-        stop_announcer.announce(request.kind, request.source).await;
+        // A token the service claimed itself authorizes this stop directly
+        // (no marker file); everything else goes through the marker check.
+        let authorization = request
+            .claimed_token_nonce
+            .as_deref()
+            .filter(|_| request.source == crate::selfprotect::stop::StopSource::MaintenanceToken)
+            .and_then(|nonce| {
+                crate::selfprotect::stop_marker::StopMarker::for_claimed_token(
+                    nonce,
+                    chrono::Utc::now().timestamp(),
+                )
+            });
+        stop_announcer
+            .announce_authorized(request.kind, request.source, authorization)
+            .await;
     }
     // Close the receiver, reject further sends and drain already received
     // events before checkpointing, even if native monitor threads hold senders.

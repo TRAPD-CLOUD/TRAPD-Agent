@@ -26,9 +26,12 @@ use tracing::{info, warn};
 use crate::heartbeat::Heartbeat;
 use crate::pipeline::Spool;
 use crate::schema::{AgentEvent, DetectionData, EventAction, EventClass, EventData, Severity};
+use crate::selfprotect::stop_marker::{self, StopMarker};
 use crate::transport::Transport;
 
 pub const SERVICE_STOP_RULE_ID: &str = "selfprotect.service_stop_requested";
+/// Informational counterpart for a planned stop (see `stop_marker`).
+pub const SERVICE_STOP_AUTHORIZED_RULE_ID: &str = "selfprotect.service_stop_authorized";
 
 /// How long a stop may wait for the backend to take the finding. Well inside the
 /// SCM wait hint (30 s) and systemd's default stop timeout (90 s).
@@ -107,6 +110,55 @@ pub fn stop_event(agent_id: &str, hostname: &str, source: StopSource) -> AgentEv
     )
 }
 
+/// The informational finding for a stop the agent was told about beforehand.
+/// Everything in it is the agent's claim: the backend matches `token_nonce`
+/// against its consumed-token record and the versions against the version it
+/// sees afterwards, and treats an unmatched claim like an unauthorized stop.
+pub fn authorized_stop_finding(source: StopSource, marker: &StopMarker) -> DetectionData {
+    DetectionData {
+        rule_id: SERVICE_STOP_AUTHORIZED_RULE_ID.into(),
+        title: "TRAPD agent service was stopped for planned maintenance".into(),
+        category: "maintenance".into(),
+        confidence: 100,
+        subject: "trapd-agent".into(),
+        detail: "The agent service stopped with a short-lived authorization written by the \
+                 installer, updater or maintenance command. The backend must match it against \
+                 its own records."
+            .into(),
+        evidence: serde_json::json!({
+            "source": source.as_str(),
+            "host_shutdown": false,
+            "reason": marker.reason.as_str(),
+            "token_nonce": marker.token_nonce,
+            "from_version": marker.from_version,
+            "to_version": marker.to_version,
+            "marker_issued_at": marker.issued_at,
+        }),
+        ..Default::default()
+    }
+}
+
+/// The event for a stop: the authorized informational one when a valid marker
+/// was consumed, otherwise the high finding. Fails toward the finding.
+pub fn stop_event_for(
+    agent_id: &str,
+    hostname: &str,
+    source: StopSource,
+    marker: Option<&StopMarker>,
+) -> AgentEvent {
+    match marker {
+        None => stop_event(agent_id, hostname, source),
+        Some(m) => AgentEvent::new(
+            agent_id.to_string(),
+            hostname.to_string(),
+            EventClass::Detection,
+            EventAction::Detected,
+            Severity::Info,
+            EventData::Detection(Box::new(authorized_stop_finding(source, m))),
+        ),
+    }
+}
+
 /// `systemctl is-system-running` prints `stopping` while the manager runs the
 /// shutdown transaction (poweroff, reboot, halt, kexec). Anything else,
 /// including an empty or unreadable answer, is not a host shutdown.
@@ -177,6 +229,8 @@ pub struct StopAnnouncer {
     spool: Arc<Mutex<Spool>>,
     transport: Option<Transport>,
     heartbeat: Option<Heartbeat>,
+    /// Where the authorized-stop marker lives (`<state>/maintenance`).
+    state_dir: std::path::PathBuf,
 }
 
 impl StopAnnouncer {
@@ -188,7 +242,14 @@ impl StopAnnouncer {
             spool,
             transport: None,
             heartbeat: None,
+            state_dir: crate::paths::state_dir().to_path_buf(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_state_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.state_dir = dir;
+        self
     }
 
     /// Give the announcer its own (idle) transport and heartbeat sender. They
@@ -203,25 +264,41 @@ impl StopAnnouncer {
     /// Report the stop. Never fails and never takes longer than the budget of
     /// the chosen path.
     pub async fn announce(&self, kind: StopKind, source: StopSource) {
+        self.announce_authorized(kind, source, None).await
+    }
+
+    /// Like [`announce`](Self::announce), for a stop the caller itself has
+    /// authorized (Windows service after claiming a maintenance token). No
+    /// marker file is involved; a stale one is still consumed so it cannot be
+    /// reused, and exactly one event is produced.
+    pub async fn announce_authorized(
+        &self,
+        kind: StopKind,
+        source: StopSource,
+        authorization: Option<StopMarker>,
+    ) {
         match kind {
-            StopKind::ServiceStop => self.announce_service_stop(source).await,
+            StopKind::ServiceStop => self.announce_service_stop(source, authorization).await,
             StopKind::HostShutdown => self.announce_host_shutdown().await,
         }
     }
 
-    async fn announce_service_stop(&self, source: StopSource) {
+    async fn announce_service_stop(&self, source: StopSource, authorization: Option<StopMarker>) {
         let mode = crate::output::OutputMode::from_env();
-        self.announce_service_stop_with(source, STOP_FLUSH_BUDGET, move |event| async move {
-            crate::output::write_events(std::slice::from_ref(&event), &mode)
-                .await
-                .is_ok()
-        })
+        self.announce_service_stop_authorized(
+            source,
+            authorization,
+            STOP_FLUSH_BUDGET,
+            move |event| async move {
+                crate::output::write_events(std::slice::from_ref(&event), &mode)
+                    .await
+                    .is_ok()
+            },
+        )
         .await;
     }
 
-    /// The whole stop notice (local write, spool insertion and delivery) runs
-    /// under one deadline of `budget`, so a slow disk can never hold up the
-    /// shutdown. `write_local` is the seam for the local output.
+    #[cfg(test)]
     async fn announce_service_stop_with<W, Fut>(
         &self,
         source: StopSource,
@@ -231,7 +308,54 @@ impl StopAnnouncer {
         W: FnOnce(AgentEvent) -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
-        let event = stop_event(&self.agent_id, &self.hostname, source);
+        self.announce_service_stop_authorized(source, None, budget, write_local)
+            .await
+    }
+
+    /// The whole stop notice (local write, spool insertion and delivery) runs
+    /// under one deadline of `budget`, so a slow disk can never hold up the
+    /// shutdown. `write_local` is the seam for the local output.
+    async fn announce_service_stop_authorized<W, Fut>(
+        &self,
+        source: StopSource,
+        authorization: Option<StopMarker>,
+        budget: Duration,
+        write_local: W,
+    ) where
+        W: FnOnce(AgentEvent) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        // Consume the planned-stop marker (single use) before anything else; a
+        // missing, expired or malformed one yields the high finding. A stop the
+        // service authorized itself takes precedence; the file is still
+        // consumed so one stop never yields two events or leaves a marker.
+        // The read runs on the blocking pool and counts against the same
+        // deadline (at most half of it, so the finding can still be queued),
+        // so a stalled state filesystem cannot hold up shutdown; if it does
+        // not finish in time the stop is treated as unauthorized.
+        let start = tokio::time::Instant::now();
+        let deadline = start + budget;
+        let state_dir = self.state_dir.clone();
+        let consumed = match tokio::time::timeout_at(
+            start + budget / 2,
+            tokio::task::spawn_blocking(move || {
+                stop_marker::consume(&state_dir, chrono::Utc::now().timestamp())
+            }),
+        )
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                warn!(error = %e, "stop notice: marker read failed");
+                None
+            }
+            Err(_) => {
+                warn!("stop notice: marker read timed out; treating the stop as unauthorized");
+                None
+            }
+        };
+        let marker = authorization.or(consumed);
+        let event = stop_event_for(&self.agent_id, &self.hostname, source, marker.as_ref());
         // This event bypasses the consumer, so it is written to the configured
         // local output itself, online and offline alike, independent of
         // whether the backend takes it.
@@ -273,7 +397,7 @@ impl StopAnnouncer {
             }
         };
         let work = async { tokio::join!(local, queue_and_deliver).1 };
-        match tokio::time::timeout(budget, work).await {
+        match tokio::time::timeout_at(deadline, work).await {
             Ok(Some(true)) => {
                 if self.transport.is_some() {
                     info!("stop notice delivered to the backend");
@@ -452,5 +576,182 @@ mod tests {
         // The local copy does not depend on the queue.
         assert_eq!(*written.lock().unwrap(), 1);
         holder.join().unwrap();
+    }
+
+    // ── planned stops ────────────────────────────────────────────────────────
+
+    use crate::selfprotect::stop_marker::{Reason, StopMarker};
+
+    fn unique_dir() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("trapd-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+    /// Random per process (32 hex characters), never a literal.
+    fn nonce() -> &'static str {
+        static N: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        N.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    #[test]
+    fn without_a_marker_the_stop_is_the_high_finding() {
+        let e = stop_event_for("a", "h", StopSource::ScmStop, None);
+        assert_eq!(e.severity, Severity::High);
+        let EventData::Detection(d) = e.data else {
+            panic!()
+        };
+        assert_eq!(d.rule_id, SERVICE_STOP_RULE_ID);
+    }
+
+    #[test]
+    fn with_a_marker_the_stop_is_informational_and_carries_the_claim() {
+        let now = chrono::Utc::now().timestamp();
+        let m = StopMarker::new(
+            Reason::Uninstall,
+            Some(nonce().into()),
+            Some("0.8.0".into()),
+            None,
+            now,
+        );
+        let e = stop_event_for("a", "h", StopSource::ScmStop, Some(&m));
+        assert_eq!(e.severity, Severity::Info);
+        let EventData::Detection(d) = e.data else {
+            panic!()
+        };
+        assert_eq!(d.rule_id, SERVICE_STOP_AUTHORIZED_RULE_ID);
+        assert_eq!(d.evidence["reason"], "uninstall");
+        assert_eq!(d.evidence["token_nonce"], nonce());
+        assert_eq!(d.evidence["from_version"], "0.8.0");
+        assert!(d.mitre_technique.is_none());
+    }
+
+    async fn announced_rule(dir: std::path::PathBuf) -> (String, Severity, Arc<Mutex<Spool>>) {
+        let spool = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let a = StopAnnouncer::new("a".into(), "h".into(), Arc::clone(&spool)).with_state_dir(dir);
+        let seen = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        a.announce_service_stop_with(
+            StopSource::ScmStop,
+            STOP_FLUSH_BUDGET,
+            move |e| async move {
+                *sink.lock().unwrap() = Some(e);
+                true
+            },
+        )
+        .await;
+        let e = seen.lock().unwrap().take().unwrap();
+        let EventData::Detection(d) = e.data else {
+            panic!()
+        };
+        (d.rule_id, e.severity, spool)
+    }
+
+    /// Windows service-side token stop: authorized directly from the claimed
+    /// token (source maintenance_token), no marker file, exactly one event, and
+    /// the evidence names the fields the backend matches on.
+    #[tokio::test]
+    async fn claimed_token_stop_is_authorized_without_a_marker() {
+        let dir = unique_dir();
+        let now = chrono::Utc::now().timestamp();
+        // A stale marker from another planned stop must not add a second event
+        // or survive.
+        stop_marker::write(
+            &dir,
+            &StopMarker::new(Reason::Upgrade, None, Some("0.8.0".into()), None, now),
+        )
+        .unwrap();
+        let spool = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let a = StopAnnouncer::new("a".into(), "h".into(), Arc::clone(&spool))
+            .with_state_dir(dir.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        a.announce_service_stop_authorized(
+            StopSource::MaintenanceToken,
+            StopMarker::for_claimed_token(nonce(), now),
+            STOP_FLUSH_BUDGET,
+            move |e| async move {
+                sink.lock().unwrap().push(e);
+                true
+            },
+        )
+        .await;
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].severity, Severity::Info);
+        let EventData::Detection(d) = &events[0].data else {
+            panic!()
+        };
+        assert_eq!(d.rule_id, SERVICE_STOP_AUTHORIZED_RULE_ID);
+        assert_eq!(d.evidence["source"], "maintenance_token");
+        assert_eq!(d.evidence["reason"], "maintenance");
+        assert_eq!(d.evidence["token_nonce"], nonce());
+        assert!(d.evidence["marker_issued_at"].is_i64());
+        assert!(!stop_marker::marker_path(&dir).exists());
+        // A malformed nonce yields no authorization (fails toward the finding).
+        assert!(StopMarker::for_claimed_token(&nonce()[..8], now).is_none());
+    }
+
+    #[tokio::test]
+    async fn announcer_consumes_a_valid_marker_once() {
+        let dir = unique_dir();
+        let now = chrono::Utc::now().timestamp();
+        let m = StopMarker::new(
+            Reason::SelfUpdate,
+            None,
+            Some("0.7.9".into()),
+            Some("0.8.0".into()),
+            now,
+        );
+        stop_marker::write(&dir, &m).unwrap();
+        let (rule, sev, _) = announced_rule(dir.clone()).await;
+        assert_eq!(
+            (rule.as_str(), sev),
+            (SERVICE_STOP_AUTHORIZED_RULE_ID, Severity::Info)
+        );
+        // Second stop: the marker is gone, so it is the high finding again.
+        let (rule, sev, _) = announced_rule(dir.clone()).await;
+        assert_eq!((rule.as_str(), sev), (SERVICE_STOP_RULE_ID, Severity::High));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn expired_or_forged_markers_do_not_authorize() {
+        let dir = unique_dir();
+        let old = chrono::Utc::now().timestamp() - 3600;
+        let m = StopMarker::new(Reason::Upgrade, None, None, None, old);
+        stop_marker::write(&dir, &m).unwrap();
+        let (rule, _, _) = announced_rule(dir.clone()).await;
+        assert_eq!(rule, SERVICE_STOP_RULE_ID);
+        // Hand-written: token-backed reason without a nonce.
+        let now = chrono::Utc::now().timestamp();
+        let p = stop_marker::marker_path(&dir);
+        std::fs::write(
+            &p,
+            format!(
+                r#"{{"v":1,"reason":"uninstall","issued_at":{now},"expires_at":{}}}"#,
+                now + 60
+            ),
+        )
+        .unwrap();
+        let (rule, _, _) = announced_rule(dir.clone()).await;
+        assert_eq!(rule, SERVICE_STOP_RULE_ID);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_host_shutdown_leaves_the_marker_alone() {
+        let dir = unique_dir();
+        let now = chrono::Utc::now().timestamp();
+        stop_marker::write(
+            &dir,
+            &StopMarker::new(Reason::Upgrade, None, None, None, now),
+        )
+        .unwrap();
+        let spool = Arc::new(Mutex::new(Spool::in_memory(10)));
+        let a = StopAnnouncer::new("a".into(), "h".into(), spool).with_state_dir(dir.clone());
+        a.announce(StopKind::HostShutdown, StopSource::ScmStop)
+            .await;
+        assert!(stop_marker::marker_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

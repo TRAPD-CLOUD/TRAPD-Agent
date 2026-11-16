@@ -117,7 +117,10 @@ class Handler(BaseHTTPRequestHandler):
         with lock:
             with (args.root / 'requests.ndjson').open('a', encoding='utf-8') as stream:
                 stream.write(json.dumps({'path': self.path, 'body': body, 'status': status}) + '\n')
-        if self.path.endswith('/enroll'):
+        if status == 200 and self.path.endswith('/maintenance-token/consume'):
+            # The real backend answers 201 when it records a token use.
+            self.reply(201, {'recorded': True})
+        elif self.path.endswith('/enroll'):
             self.reply(status, {'agent_id': 'windows-smoke', 'agent_secret': 'test-agent-secret', 'project_id': 'msi-test'})
         elif status == 200 and self.path.endswith('/ingest/events'):
             # The agent only acknowledges a batch on a JSON object receipt.

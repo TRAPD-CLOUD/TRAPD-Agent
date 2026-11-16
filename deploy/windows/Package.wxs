@@ -25,6 +25,11 @@
          leaves the machine's audit policy alone. Only settings the installer
          itself turned on are reverted on removal. -->
     <Property Id="AUDITBASELINE" Secure="yes" Value="1" />
+    <!-- Path of a file holding a maintenance token (purpose "uninstall"), needed
+         for `msiexec /x ... MAINTENANCE_TOKEN_FILE=<path>`. A path, not the
+         token: a token property would sit on the msiexec command line (event
+         4688) and in the MSI log; a Hidden property only covers the log. -->
+    <Property Id="MAINTENANCE_TOKEN_FILE" Secure="yes" />
     <!-- Rollback switch for self-protection WP2/WP3: TRAPD_LEGACY_ACLS=1 installs
          the previous service, registry and directory ACLs (Administrators may
          stop and reconfigure the service and edit agent.env). It is not
@@ -219,6 +224,38 @@
          rollback action undoes only what ApplyAuditBaseline added in this run. -->
     <CustomAction Id="RollbackAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline rollback" Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="RestoreAuditBaseline" FileRef="AgentExe" ExeCommand="audit-baseline restore" Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- Uninstall gate (self-protection WP4). Runs before StopServices for every
+         removal (REMOVE=ALL), including the removal half of a major upgrade.
+         Install, repair and the new product of an upgrade never reach it.
+         Return="check": a missing, expired, foreign, replayed or wrong-purpose
+         token aborts the uninstall before anything is stopped or removed, so
+         nothing is left half-removed. On success the agent writes a short-lived
+         authorized-stop marker so the coming service stop is not reported as
+         tampering.
+         UPGRADINGPRODUCTCODE is a PUBLIC property: any administrator can set it
+         on the command line (`msiexec /x ... UPGRADINGPRODUCTCODE=1`), so it is
+         never trusted on its own and does not skip the gate. It is passed to the
+         gate only as a claim, which the gate accepts solely if it equals the
+         ProductCode in a fresh `upgrade` marker that the NEW package wrote as
+         SYSTEM (StageUpgradeMarker below) before it removed this product. -->
+    <!-- The token FILE PATH (not a secret) is formatted straight into ExeCommand:
+         a deferred EXE action has its Target formatted at scheduling time, where
+         ordinary properties such as MAINTENANCE_TOKEN_FILE are visible.
+         CustomActionData is not populated for EXE actions and formats to an
+         empty string, which would make the gate see "no token". An unset
+         property formats to "", which the gate treats as absent. -->
+    <CustomAction Id="RequireUninstallToken" FileRef="AgentExe" ExeCommand="uninstall-gate --token-file &quot;[MAINTENANCE_TOKEN_FILE]&quot; --upgrading-product &quot;[UPGRADINGPRODUCTCODE]&quot;" Execute="deferred" Impersonate="no" Return="check" />
+    <!-- New package of a major upgrade: before RemoveExistingProducts folds the
+         old product's removal into this transaction, write the upgrade marker
+         bound to THIS package's ProductCode (the value Windows Installer will
+         later report to the old product as UPGRADINGPRODUCTCODE). It runs as
+         SYSTEM from the already installed executable, and `stop-marker` refuses
+         any other caller. Best effort: if it fails (e.g. upgrading from a build
+         without the verb), the old product's gate falls back to requiring a
+         token. [ProductCode] is formatted at scheduling time, as above. -->
+    <CustomAction Id="StageUpgradeMarker" FileRef="AgentExe" ExeCommand="stop-marker upgrade --product &quot;[ProductCode]&quot;" Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RollbackUpgradeMarker" FileRef="AgentExe" ExeCommand="stop-marker clear" Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RollbackStopMarker" FileRef="AgentExe" ExeCommand="stop-marker clear" Execute="rollback" Impersonate="no" Return="ignore" />
     <!-- ACLs the declarative tables cannot express: the service-key descriptor
          (the key belongs to the SCM, so the MSI cannot own it) and, with
          TRAPD_LEGACY_ACLS=1, the whole previous set. Both run as SYSTEM after the
@@ -241,6 +278,10 @@
     <CustomAction Id="ImportEnrollToken" FileRef="AgentExe" ExeCommand="enroll-token-import &quot;[ENROLLTOKENFILE]&quot;" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="RollbackEnrollToken" FileRef="AgentExe" ExeCommand="enroll-token-clear" Execute="rollback" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
+      <Custom Action="RollbackStopMarker" Before="RequireUninstallToken" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RequireUninstallToken" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RollbackUpgradeMarker" Before="StageUpgradeMarker" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+      <Custom Action="StageUpgradeMarker" Before="RemoveExistingProducts" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
       <Custom Action="RollbackEnrollToken" After="WriteRegistryValues" Condition="ENROLLTOKENFILE AND NOT REMOVE" />
       <Custom Action="ImportEnrollToken" After="RollbackEnrollToken" Condition="ENROLLTOKENFILE AND NOT REMOVE" />
       <Custom Action="ApplyAcls" After="InstallServices" Condition="NOT REMOVE AND NOT TRAPD_LEGACY_ACLS=&quot;1&quot;" />

@@ -393,7 +393,52 @@ out = pathlib.Path(sys.argv[1])
     }
     $downgrade = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @('/i', "`"$Msi`"", '/qn', '/norestart') -Wait -PassThru
     if ($downgrade.ExitCode -in @(0, 3010)) { throw 'MSI downgrade was accepted.' }
-    Invoke-Msi @('/x', "`"$installedMsi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root 'uninstall.log')`"")
+    # Removal of an ENROLLED agent is token-gated and fails closed. The generic
+    # test MSI ships no maintenance key, so the fixture provisions a throw-away
+    # Ed25519 keypair (generated here, never checked in) the way the MSI would
+    # lay it down (config\maintenance_signing.pub, raw 32 bytes) and signs
+    # tokens bound to the agent id the mock backend enrolled ('windows-smoke').
+    $maint = Join-Path $root 'maintenance'
+    New-Item -ItemType Directory -Force $maint | Out-Null
+    @'
+import base64, json, pathlib, secrets, sys, time
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+out, agent_id = pathlib.Path(sys.argv[1]), sys.argv[2]
+key = Ed25519PrivateKey.generate()
+(out / 'maintenance_signing.pub').write_bytes(key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+def token(purpose):
+    now = int(time.time())
+    payload = json.dumps({'v': 1, 'agent_id': agent_id, 'tenant_id': 'msi-test', 'purpose': purpose,
+                          'nonce': secrets.token_hex(16), 'iat': now, 'exp': now + 600}, separators=(',', ':')).encode()
+    return b64(payload) + '.' + b64(key.sign(b'trapd-maintenance-token-v1\0' + payload))
+(out / 'uninstall.token').write_text(token('uninstall'))
+(out / 'stop.token').write_text(token('stop'))
+'@ | python - $maint 'windows-smoke'
+    if ($LASTEXITCODE -ne 0) { throw 'Could not provision the maintenance token fixture.' }
+    Copy-AsSystem (Join-Path $maint 'maintenance_signing.pub') (Join-Path $config 'maintenance_signing.pub')
+    $installedExePath = Join-Path $env:ProgramFiles 'TRAPD Agent\trapd-agent.exe'
+    # Refusals: no token, a validly signed token of the wrong purpose, and a
+    # forged UPGRADINGPRODUCTCODE claim. Each
+    # must abort the removal before anything is stopped or deleted.
+    $refusals = @(
+        @{ Name = 'no token'; Args = @() },
+        @{ Name = 'wrong-purpose token'; Args = @("MAINTENANCE_TOKEN_FILE=`"$(Join-Path $maint 'stop.token')`"") },
+        # UPGRADINGPRODUCTCODE is a public property: claiming an upgrade on the
+        # command line, without the SYSTEM-written upgrade marker, must not skip
+        # the gate (a bare value, and a well-formed ProductCode).
+        @{ Name = 'bare UPGRADINGPRODUCTCODE'; Args = @('UPGRADINGPRODUCTCODE=1') },
+        @{ Name = 'forged UPGRADINGPRODUCTCODE GUID'; Args = @('UPGRADINGPRODUCTCODE={0D18AC24-8CE9-4513-A1E5-889FD2A01D94}') }
+    )
+    foreach ($refusal in $refusals) {
+        $refused = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList (@('/x', "`"$installedMsi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root ('refused-uninstall-' + ($refusal.Name -replace '\W', '-') + '.log'))`"") + $refusal.Args) -Wait -PassThru
+        if ($refused.ExitCode -in @(0, 3010)) { throw "Uninstall with $($refusal.Name) was accepted." }
+        if ($null -eq (Get-Service trapd-agent -ErrorAction SilentlyContinue)) { throw "Refused uninstall ($($refusal.Name)) removed the service." }
+        if (-not (Test-Path $installedExePath)) { throw "Refused uninstall ($($refusal.Name)) removed the executable." }
+        Wait-Until { (Get-Service trapd-agent).Status -eq 'Running' } "Refused uninstall ($($refusal.Name)) left the service stopped."
+    }
+    Invoke-Msi @('/x', "`"$installedMsi`"", '/qn', '/norestart', "MAINTENANCE_TOKEN_FILE=`"$(Join-Path $maint 'uninstall.token')`"", '/L*v', "`"$(Join-Path $root 'uninstall.log')`"")
     Wait-Until { $null -eq (Get-Service trapd-agent -ErrorAction SilentlyContinue) } 'Uninstall left the service registered.'
     if (Test-Path (Join-Path $env:ProgramFiles 'TRAPD Agent\trapd-agent.exe')) { throw 'Uninstall left the executable.' }
     if (-not (Test-Path (Join-Path $state 'device_id'))) { throw 'Uninstall removed retained identity.' }
