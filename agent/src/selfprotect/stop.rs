@@ -329,7 +329,31 @@ impl StopAnnouncer {
         // missing, expired or malformed one yields the high finding. A stop the
         // service authorized itself takes precedence; the file is still
         // consumed so one stop never yields two events or leaves a marker.
-        let consumed = stop_marker::consume(&self.state_dir, chrono::Utc::now().timestamp());
+        // The read runs on the blocking pool and counts against the same
+        // deadline (at most half of it, so the finding can still be queued),
+        // so a stalled state filesystem cannot hold up shutdown; if it does
+        // not finish in time the stop is treated as unauthorized.
+        let start = tokio::time::Instant::now();
+        let deadline = start + budget;
+        let state_dir = self.state_dir.clone();
+        let consumed = match tokio::time::timeout_at(
+            start + budget / 2,
+            tokio::task::spawn_blocking(move || {
+                stop_marker::consume(&state_dir, chrono::Utc::now().timestamp())
+            }),
+        )
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                warn!(error = %e, "stop notice: marker read failed");
+                None
+            }
+            Err(_) => {
+                warn!("stop notice: marker read timed out; treating the stop as unauthorized");
+                None
+            }
+        };
         let marker = authorization.or(consumed);
         let event = stop_event_for(&self.agent_id, &self.hostname, source, marker.as_ref());
         // This event bypasses the consumer, so it is written to the configured
@@ -373,7 +397,7 @@ impl StopAnnouncer {
             }
         };
         let work = async { tokio::join!(local, queue_and_deliver).1 };
-        match tokio::time::timeout(budget, work).await {
+        match tokio::time::timeout_at(deadline, work).await {
             Ok(Some(true)) => {
                 if self.transport.is_some() {
                     info!("stop notice delivered to the backend");
@@ -664,7 +688,7 @@ mod tests {
         assert!(d.evidence["marker_issued_at"].is_i64());
         assert!(!stop_marker::marker_path(&dir).exists());
         // A malformed nonce yields no authorization (fails toward the finding).
-        assert!(StopMarker::for_claimed_token("XYZ", now).is_none());
+        assert!(StopMarker::for_claimed_token(&nonce()[..8], now).is_none());
     }
 
     #[tokio::test]
