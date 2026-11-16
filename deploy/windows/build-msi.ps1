@@ -63,6 +63,14 @@ if ($TrustDir) {
         $wixArgs += @('-d', 'HasReleaseKey=1')
         Write-Host 'Baking the release-signing key (signed self-update enabled).'
     }
+    # Optional maintenance-token key: enables the sanctioned stop/uninstall. It is
+    # a dedicated key, never the release or command key.
+    $maintenanceKeyPath = Join-Path $TrustDir 'maintenance_signing.pub'
+    if (Test-Path -LiteralPath $maintenanceKeyPath -PathType Leaf) {
+        if ((Get-Item -LiteralPath $maintenanceKeyPath).Length -ne 32) { throw 'maintenance_signing.pub must be exactly 32 raw bytes (Ed25519).' }
+        $wixArgs += @('-d', 'HasMaintenanceKey=1')
+        Write-Host 'Baking the maintenance-token key (sanctioned stop/uninstall enabled).'
+    }
     Write-Host "Baking hosted trust anchors for $url ($($blocks.Count) CA certificate(s))."
 }
 

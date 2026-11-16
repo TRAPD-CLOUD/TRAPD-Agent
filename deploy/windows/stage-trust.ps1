@@ -8,6 +8,10 @@
 # Optional:
 #   TRAPD_HOSTED_RELEASE_PUBKEY   base64 of the raw 32-byte Ed25519 release-signing key;
 #                                 enables signed self-update on the installed agent
+#   TRAPD_HOSTED_MAINTENANCE_PUBKEY
+#                                 base64 of the raw 32-byte Ed25519 key that verifies
+#                                 maintenance tokens; without it an MSI-only install
+#                                 rejects every token (no sanctioned stop/uninstall)
 #
 # Nothing is staged unless all three required values are set. Values are validated by
 # build-msi.ps1, which fails the build on malformed input.
@@ -53,6 +57,14 @@ if (-not [string]::IsNullOrWhiteSpace($env:TRAPD_HOSTED_RELEASE_PUBKEY)) {
         throw 'TRAPD_HOSTED_RELEASE_PUBKEY is not valid base64.'
     }
     [IO.File]::WriteAllBytes((Join-Path $OutDir 'release_signing.pub'), $releaseKey)
+}
+if (-not [string]::IsNullOrWhiteSpace($env:TRAPD_HOSTED_MAINTENANCE_PUBKEY)) {
+    try {
+        $maintenanceKey = [Convert]::FromBase64String($env:TRAPD_HOSTED_MAINTENANCE_PUBKEY.Trim())
+    } catch {
+        throw 'TRAPD_HOSTED_MAINTENANCE_PUBKEY is not valid base64.'
+    }
+    [IO.File]::WriteAllBytes((Join-Path $OutDir 'maintenance_signing.pub'), $maintenanceKey)
 }
 Write-Host 'Staged hosted trust anchors (public values only).'
 Set-BakedFlag $true

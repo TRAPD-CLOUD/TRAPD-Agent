@@ -47,8 +47,8 @@ msiexec.exe /i .\trapd-agent-windows-x86_64.msi /qn /norestart
 On a generic MSI this immediately starts local collection and writes
 `C:\ProgramData\TRAPD\logs\events.ndjson`. Without a configured backend,
 the agent collects in offline mode. To connect it, provision these files in
-`C:\ProgramData\TRAPD\config` before installing or restart the service after
-provisioning them:
+`C:\ProgramData\TRAPD\config` before installing (after installation the directory is
+read-only for administrators, see Self-protection):
 
 - `ca.crt`: PEM certificate authority that pins the backend TLS connection.
 - `command_signing.pub`: raw 32-byte Ed25519 key for signed remote configuration.
@@ -66,9 +66,14 @@ Prefer device pairing (no token). For managed deployments, `BACKENDURL` and
 entries. The MSI stores them in a 64-bit `HKLM\SOFTWARE\TRAPD\Agent` key that is
 restricted to SYSTEM and Administrators. Environment variables and then
 `agent.env` take precedence. Do not pass `ENROLLTOKEN=` to `msiexec` directly: a
-command line is visible to every local user and to process telemetry. Use
-`install.ps1 -EnrollTokenFile <file>` (or `-EnrollToken`), which stages the
-token in the protected registry key instead of the command line. The agent
+command line is visible to every local user and to process telemetry. Pass
+`ENROLLTOKENFILE=<path>` instead (this is what `install.ps1 -EnrollTokenFile
+<file>` or `-EnrollToken` does, via a private temporary file): a deferred SYSTEM
+custom action reads that file (bounded, no links) and stages the token in the
+protected registry key. Only the path appears on the command line and in the
+MSI log. Staging from the script itself is not possible on a hardened host,
+where an elevated administrator cannot write that key; delete the file after
+the install. The agent
 deletes the registry `EnrollToken` value as soon as enrollment succeeded (or
 persisted credentials exist), so the one-time token does not stay on disk.
 TLS pinning fails closed unless `TRAPD_TLS_ALLOW_SYSTEM_ROOTS=1` is explicitly
@@ -247,8 +252,34 @@ rights; it installs a service and generates synthetic security telemetry.
 ## Self-protection
 
 - Process death: SCM recovery actions restart the service (configured by the MSI).
-- Service DACL: SYSTEM full control; Administrators may query, start, stop and
-  delete the service but cannot change its DACL or owner.
+- Service DACL: SYSTEM full control; Administrators may query, start, interrogate and
+  read the service but cannot stop, reconfigure, delete or re-ACL it, and an `OWNER
+  RIGHTS` entry removes the owner's implicit WRITE_DAC. `sc stop`, `Stop-Service`,
+  `sc config` and `sc sdset` from an elevated shell are refused. The sanctioned stop is
+  `trapd-agent.exe maintenance --purpose stop --token-file <file>`: the command pre-checks
+  the token, hands it to the service and the service, running as SYSTEM, verifies and
+  claims it itself before it stops. MSI install, repair, upgrade and removal and the
+  signed self-update run as SYSTEM and are unaffected. Helpdesk `Stop-Service` no longer
+  works; use the token.
+- Registry and directories: `HKLM\SYSTEM\CurrentControlSet\Services\trapd-agent` and
+  `HKLM\SOFTWARE\TRAPD\Agent` grant SYSTEM full control and Administrators read; the
+  install, data, config, state and log directories grant SYSTEM full control and
+  Administrators read and execute. Consequently `agent.env`, the trust anchors and the
+  state cannot be edited from an elevated shell: set `BACKENDURL`/`ENROLLTOKEN` through
+  the MSI, or place files in `config\` before installing. Developers running the agent
+  by hand should use `TRAPD_STATE_DIR`/`TRAPD_CONFIG_DIR` outside `ProgramData`.
+- Detection, not prevention: an administrator with take-ownership or `SeDebugPrivilege`
+  can still bypass these ACLs. The agent re-reads them at start and every 10 minutes,
+  watches the service key with `RegNotifyChangeKeyValue`, re-applies the expected ACLs
+  and reports `selfprotect.service_acl_changed` / `selfprotect.service_registry_changed`
+  (high, T1562.001).
+- Rollback: `msiexec /i ... TRAPD_LEGACY_ACLS=1` restores the previous service,
+  registry and directory ACLs and writes a marker (`HKLM\SOFTWARE\TRAPD\Agent\LegacyAcls`)
+  that switches the drift check off. The property is not remembered; pass it on every
+  upgrade, otherwise the upgrade hardens the host.
+- Maintenance tokens need `maintenance_signing.pub` in `config\`. The hosted MSI bakes it
+  in when `TRAPD_HOSTED_MAINTENANCE_PUBKEY` (base64, 32 bytes) is set; otherwise provision
+  it like `release_signing.pub`.
 - Process mitigation policies (best effort, logged on failure): legacy extension
   points disabled, no images from remote shares or low-integrity locations.
 - While running, the agent re-hashes its executable every 15 minutes and raises

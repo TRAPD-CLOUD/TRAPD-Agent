@@ -96,6 +96,7 @@ jobs:
           TRAPD_HOSTED_CA_PEM: ${{ vars.TRAPD_HOSTED_CA_PEM }}
           TRAPD_HOSTED_COMMAND_PUBKEY: ${{ vars.TRAPD_HOSTED_COMMAND_PUBKEY }}
           TRAPD_HOSTED_RELEASE_PUBKEY: ${{ vars.TRAPD_HOSTED_RELEASE_PUBKEY }}
+          TRAPD_HOSTED_MAINTENANCE_PUBKEY: ${{ vars.TRAPD_HOSTED_MAINTENANCE_PUBKEY }}
         run: ./deploy/windows/stage-trust.ps1 -OutDir trust
       - name: Build hosted MSI with baked trust anchors
         if: steps.trust.outputs.baked == 'true'

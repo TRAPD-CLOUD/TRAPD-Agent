@@ -343,12 +343,26 @@ fn harden_dir_perms(dir: &Path) {
 /// of `0700` root. The MSI already does this for its own directories; this
 /// covers installs that did not come from the MSI. Skipped when not elevated,
 /// where the lock-down would shut the calling user out of their own state.
+///
+/// The LocalSystem service applies the same descriptor the MSI sets
+/// (SYSTEM full, Administrators read and execute): the service writes the state,
+/// an administrator only reads it. An elevated administrator running the agent
+/// by hand (development) keeps the previous, administrator-writable one, and
+/// under the hardened descriptor cannot change it (no WRITE_DAC), which is
+/// logged and harmless. A host installed with `TRAPD_LEGACY_ACLS=1` keeps the
+/// previous descriptor for the service too.
 #[cfg(windows)]
 fn harden_dir_perms(dir: &Path) {
     if !crate::winacl::is_elevated() {
         return;
     }
-    if let Err(e) = crate::winacl::set_dacl(dir, crate::winacl::PRIVATE_DIR_SDDL) {
+    let sddl = if crate::winacl::is_local_system() && !crate::selfprotect::acl_guard::legacy_mode()
+    {
+        crate::selfprotect::acl_policy::DIR_SDDL
+    } else {
+        crate::winacl::PRIVATE_DIR_SDDL
+    };
+    if let Err(e) = crate::winacl::set_dacl(dir, sddl) {
         warn!(dir = %dir.display(), error = %e, "could not restrict the state directory to SYSTEM/Administrators");
     }
 }

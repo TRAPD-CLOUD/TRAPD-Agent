@@ -287,6 +287,12 @@ impl ConsumedStore {
         Ok(())
     }
 
+    /// Whether `nonce` was already used on this device (read-only check).
+    #[cfg(any(windows, test))]
+    pub fn is_consumed(&self, nonce: &str) -> bool {
+        self.path_for(nonce).is_ok_and(|p| p.exists())
+    }
+
     fn read(&self, nonce: &str) -> Option<ConsumedRecord> {
         let bytes = std::fs::read(self.path_for(nonce).ok()?).ok()?;
         serde_json::from_slice(&bytes).ok()
@@ -554,6 +560,182 @@ pub fn run_cli(args: &[String], stop_service: impl FnOnce() -> Result<()>) -> Re
     }
 
     stop_service().context("the token was consumed but the agent could not be stopped")?;
+    println!("Agent stop requested.");
+    Ok(())
+}
+
+// ── Delegated stop (Windows) ─────────────────────────────────────────────────
+//
+// On Windows the service DACL does not let an administrator stop the service
+// (WP2), so the sanctioned stop cannot be "authorise, then call the SCM as the
+// administrator". Instead:
+//
+//   1. `maintenance` (admin) pre-checks the token read-only (signature, agent,
+//      purpose, expiry, not yet used) so a bad token fails with a reason, then
+//      drops it into `<state>/maintenance/requests/`, a directory the
+//      administrator may only add files to, and sends the service the
+//      user-defined control `STOP_REQUEST_CONTROL` (allowed to Administrators).
+//   2. The service (SYSTEM) re-verifies and *claims* the token itself, against
+//      the key in `config\`, which an administrator cannot replace. Only then
+//      it stops itself. The request file and the control are not trusted: an
+//      administrator who forges either gets nothing, because the signature,
+//      agent binding, expiry and single use are all checked by the service.
+
+/// User-defined SCM control (128..=255) meaning "look at the pending
+/// maintenance requests". Carries no data.
+#[cfg(any(windows, test))]
+pub const STOP_REQUEST_CONTROL: u32 = 128;
+#[cfg(any(windows, test))]
+const MAX_PENDING_REQUESTS: usize = 8;
+
+#[cfg(any(windows, test))]
+pub fn requests_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("maintenance").join("requests")
+}
+
+/// Service start: create the request directory with the add-only ACL.
+#[cfg(windows)]
+pub fn prepare_requests_dir() {
+    let dir = requests_dir(paths::state_dir());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(error = %e, "could not create the maintenance request directory");
+        return;
+    }
+    if let Err(e) = crate::winacl::set_dacl(&dir, super::acl_policy::REQUESTS_DIR_SDDL) {
+        warn!(error = %e, "could not restrict the maintenance request directory");
+    }
+}
+
+/// Read-only check of a token before it is handed to the service.
+#[cfg(any(windows, test))]
+pub fn precheck(
+    token: &str,
+    key: &VerifyingKey,
+    agent_id: &str,
+    store: &ConsumedStore,
+    now: i64,
+) -> Result<Claims> {
+    let claims = verify_token(token, key, agent_id, Purpose::Stop, now)?;
+    if store.is_consumed(&claims.nonce) {
+        return Err(ClaimError::Replayed.into());
+    }
+    Ok(claims)
+}
+
+/// Drop `token` into the request directory under an unpredictable name.
+#[cfg(any(windows, test))]
+pub fn submit_request(dir: &Path, token: &str) -> Result<PathBuf> {
+    use std::io::Write as _;
+    let path = dir.join(format!("{}.req", uuid::Uuid::new_v4().simple()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "cannot place the request in {} (is the agent service running?)",
+                dir.display()
+            )
+        })?;
+    f.write_all(token.as_bytes())?;
+    f.sync_all()?;
+    Ok(path)
+}
+
+/// Service side: consume pending request files and return the claims of the
+/// first token that verifies and is claimed. Every file is removed whether or
+/// not it was valid, and at most `MAX_PENDING_REQUESTS` are looked at, so a
+/// flood of junk cannot keep the handler busy.
+#[cfg(any(windows, test))]
+pub fn process_requests(
+    dir: &Path,
+    key: &VerifyingKey,
+    agent_id: &str,
+    store: &ConsumedStore,
+    now: i64,
+) -> Option<Claims> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut accepted = None;
+    for entry in entries.flatten().take(MAX_PENDING_REQUESTS) {
+        let path = entry.path();
+        let read = paths::bounded_regular_bytes(&path, MAX_TOKEN_FILE_BYTES);
+        // Remove first: a file that cannot be removed must not be replayed.
+        if std::fs::remove_file(&path).is_err() {
+            warn!("maintenance request could not be removed; ignored");
+            continue;
+        }
+        if accepted.is_some() {
+            continue;
+        }
+        let Ok(bytes) = read else {
+            warn!("maintenance request unreadable or oversized; ignored");
+            continue;
+        };
+        let Ok(token) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if let Ok(claims) = authorize(token.trim(), key, agent_id, Purpose::Stop, store, now) {
+            accepted = Some(claims);
+        }
+    }
+    accepted
+}
+
+/// Service control handler entry: look at pending requests and say whether the
+/// service has been authorised to stop.
+#[cfg(windows)]
+pub fn authorize_pending_stop() -> bool {
+    let Some(creds) = crate::enrollment::load_persisted_blocking() else {
+        warn!("maintenance request ignored: agent is not enrolled");
+        return false;
+    };
+    let key = match load_pinned_key() {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(error = %e, "maintenance request ignored");
+            return false;
+        }
+    };
+    let store = ConsumedStore::new(paths::state_dir());
+    process_requests(
+        &requests_dir(paths::state_dir()),
+        &key,
+        &creds.agent_id,
+        &store,
+        chrono::Utc::now().timestamp(),
+    )
+    .is_some()
+}
+
+/// `maintenance` verb when the stop is delegated to the service (Windows).
+/// `request_stop` sends the control to the service and waits for it to stop.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))] // Windows wires it up; tests exercise the rest
+pub fn run_cli_delegated(args: &[String], request_stop: impl FnOnce() -> Result<()>) -> Result<()> {
+    let (purpose, token_file) = parse_cli(args)?;
+    if purpose != Purpose::Stop {
+        bail!(
+            "purpose {:?} is not available through this command",
+            purpose.as_str()
+        );
+    }
+    let creds = crate::enrollment::load_persisted_blocking()
+        .context("this agent is not enrolled; no maintenance token can apply")?;
+    let key = load_pinned_key()?;
+    let token = read_token_file(&token_file)?;
+    let store = ConsumedStore::new(paths::state_dir());
+    precheck(
+        &token,
+        &key,
+        &creds.agent_id,
+        &store,
+        chrono::Utc::now().timestamp(),
+    )?;
+    println!("Maintenance token looks valid; asking the agent service to verify it and stop.");
+    submit_request(&requests_dir(paths::state_dir()), &token)?;
+    request_stop().context(
+        "the service did not stop; it verifies the token itself and logs the reason in agent.log",
+    )?;
     println!("Agent stop requested.");
     Ok(())
 }
@@ -1014,5 +1196,90 @@ mod tests {
         );
         assert!(r.is_err());
         assert!(!called.get());
+    }
+
+    // ── delegated stop ──
+    #[test]
+    fn service_claims_a_submitted_token_exactly_once() {
+        let dir = tmp();
+        let requests = requests_dir(dir.path());
+        std::fs::create_dir_all(&requests).unwrap();
+        let store = ConsumedStore::new(dir.path());
+        let vk = key().verifying_key();
+        let t = token("stop", NOW, NOW + 900);
+
+        precheck(&t, &vk, AGENT, &store, NOW + 1).expect("fresh token passes the pre-check");
+        submit_request(&requests, &t).unwrap();
+        let claims = process_requests(&requests, &vk, AGENT, &store, NOW + 2).expect("accepted");
+        assert_eq!(claims.purpose, Purpose::Stop);
+        assert_eq!(
+            std::fs::read_dir(&requests).unwrap().count(),
+            0,
+            "request removed"
+        );
+
+        // The pre-check now refuses it, and a resubmission is not accepted.
+        assert!(precheck(&t, &vk, AGENT, &store, NOW + 3).is_err());
+        submit_request(&requests, &t).unwrap();
+        assert!(process_requests(&requests, &vk, AGENT, &store, NOW + 4).is_none());
+        assert_eq!(std::fs::read_dir(&requests).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn service_ignores_forged_foreign_expired_and_junk_requests() {
+        let dir = tmp();
+        let requests = requests_dir(dir.path());
+        std::fs::create_dir_all(&requests).unwrap();
+        let store = ConsumedStore::new(dir.path());
+        let vk = key().verifying_key();
+        let forger = SigningKey::from_bytes(&[9u8; 32]);
+
+        let forged = sign_with(
+            &forger,
+            &payload(1, AGENT, "stop", other_nonce(), NOW, NOW + 900),
+            DOMAIN,
+        );
+        let foreign = sign_with(
+            &key(),
+            &payload(1, "agent_other", "stop", other_nonce(), NOW, NOW + 900),
+            DOMAIN,
+        );
+        let expired = token("stop", NOW - 5000, NOW - 4000);
+        for body in [
+            forged.as_str(),
+            foreign.as_str(),
+            expired.as_str(),
+            "not a token",
+            "",
+        ] {
+            submit_request(&requests, body).unwrap();
+        }
+        std::fs::write(requests.join("big.req"), "a".repeat(5000)).unwrap();
+        assert!(process_requests(&requests, &vk, AGENT, &store, NOW + 1).is_none());
+        assert_eq!(
+            std::fs::read_dir(&requests).unwrap().count(),
+            0,
+            "all removed"
+        );
+        assert!(!store.is_consumed(other_nonce()), "nothing was consumed");
+    }
+
+    #[test]
+    fn a_flood_of_requests_is_bounded() {
+        let dir = tmp();
+        let requests = requests_dir(dir.path());
+        std::fs::create_dir_all(&requests).unwrap();
+        let store = ConsumedStore::new(dir.path());
+        let vk = key().verifying_key();
+        for _ in 0..(MAX_PENDING_REQUESTS + 5) {
+            submit_request(&requests, "junk").unwrap();
+        }
+        let _ = process_requests(&requests, &vk, AGENT, &store, NOW);
+        assert_eq!(std::fs::read_dir(&requests).unwrap().count(), 5);
+    }
+
+    #[test]
+    fn stop_request_control_is_in_the_user_defined_range() {
+        assert!((128..=255).contains(&STOP_REQUEST_CONTROL));
     }
 }
