@@ -406,11 +406,17 @@ def token(purpose):
     if ($LASTEXITCODE -ne 0) { throw 'Could not provision the maintenance token fixture.' }
     Copy-AsSystem (Join-Path $maint 'maintenance_signing.pub') (Join-Path $config 'maintenance_signing.pub')
     $installedExePath = Join-Path $env:ProgramFiles 'TRAPD Agent\trapd-agent.exe'
-    # Refusals: no token, and a validly signed token of the wrong purpose. Each
+    # Refusals: no token, a validly signed token of the wrong purpose, and a
+    # forged UPGRADINGPRODUCTCODE claim. Each
     # must abort the removal before anything is stopped or deleted.
     $refusals = @(
         @{ Name = 'no token'; Args = @() },
-        @{ Name = 'wrong-purpose token'; Args = @("MAINTENANCE_TOKEN_FILE=`"$(Join-Path $maint 'stop.token')`"") }
+        @{ Name = 'wrong-purpose token'; Args = @("MAINTENANCE_TOKEN_FILE=`"$(Join-Path $maint 'stop.token')`"") },
+        # UPGRADINGPRODUCTCODE is a public property: claiming an upgrade on the
+        # command line, without the SYSTEM-written upgrade marker, must not skip
+        # the gate (a bare value, and a well-formed ProductCode).
+        @{ Name = 'bare UPGRADINGPRODUCTCODE'; Args = @('UPGRADINGPRODUCTCODE=1') },
+        @{ Name = 'forged UPGRADINGPRODUCTCODE GUID'; Args = @('UPGRADINGPRODUCTCODE={0D18AC24-8CE9-4513-A1E5-889FD2A01D94}') }
     )
     foreach ($refusal in $refusals) {
         $refused = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList (@('/x', "`"$installedMsi`"", '/qn', '/norestart', '/L*v', "`"$(Join-Path $root ('refused-uninstall-' + ($refusal.Name -replace '\W', '-') + '.log'))`"") + $refusal.Args) -Wait -PassThru

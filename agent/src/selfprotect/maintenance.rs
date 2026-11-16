@@ -549,13 +549,37 @@ pub(crate) fn uninstall_gate_decision(
     authorize(token, key, agent_id, Purpose::Uninstall, store, now).map(GateOutcome::Authorized)
 }
 
-/// `trapd-agent uninstall-gate [--token-file <path>]`, run by the MSI as a
-/// deferred, non-impersonated custom action before the service is stopped.
-/// An `Err` aborts the uninstall. On success with a token, the planned-stop
-/// marker is written and the consumption is reported.
+/// `trapd-agent uninstall-gate [--token-file <path>] [--upgrading-product <code>]`,
+/// run by the MSI as a deferred, non-impersonated custom action before the
+/// service is stopped. An `Err` aborts the uninstall. On success with a token,
+/// the planned-stop marker is written and the consumption is reported.
+///
+/// The gate runs for every `REMOVE=ALL`, including the removal half of a major
+/// upgrade. The only way past it without a token is a verified upgrade
+/// (`stop_marker::upgrade_authorizes`): `UPGRADINGPRODUCTCODE` is a public
+/// property any administrator can set on the command line, so it is merely a
+/// claim that must match the marker the new package wrote as SYSTEM.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn run_uninstall_gate(args: &[String]) -> Result<()> {
-    let token_file = parse_gate_args(args)?;
+    let GateArgs {
+        token_file,
+        upgrading_product,
+    } = parse_gate_args(args)?;
+    if let Some(product) = upgrading_product.as_deref() {
+        let now = chrono::Utc::now().timestamp();
+        if stop_marker::upgrade_authorizes(paths::state_dir(), product, now) {
+            info!(
+                product,
+                "removal is the verified removal half of a major upgrade"
+            );
+            return Ok(());
+        }
+        warn!(
+            product,
+            "UPGRADINGPRODUCTCODE is set but no matching upgrade marker exists; \
+             treating this as a plain uninstall"
+        );
+    }
     let agent_id = crate::enrollment::load_persisted_blocking().map(|c| c.agent_id.clone());
     let key_path = crate::update::release_key_dir().join(KEY_FILE);
     let key = if key_path.exists() {
@@ -586,17 +610,36 @@ pub fn run_uninstall_gate(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The path is optional (the MSI property may be empty) and an empty value
-/// counts as absent. Nothing but `--token-file` is accepted.
-pub(crate) fn parse_gate_args(args: &[String]) -> Result<Option<PathBuf>> {
-    match args {
-        [] => Ok(None),
-        [flag, value] if flag == "--token-file" => {
-            Ok((!value.trim().is_empty()).then(|| PathBuf::from(value)))
+#[derive(Debug, PartialEq, Eq, Default)]
+pub(crate) struct GateArgs {
+    pub token_file: Option<PathBuf>,
+    pub upgrading_product: Option<String>,
+}
+
+/// Both values are optional (the MSI properties may be empty) and an empty
+/// value counts as absent. Nothing but the two known flags is accepted, each at
+/// most once.
+pub(crate) fn parse_gate_args(args: &[String]) -> Result<GateArgs> {
+    const USAGE: &str = "usage: uninstall-gate [--token-file <path>] [--upgrading-product <code>]";
+    let mut out = GateArgs::default();
+    let (mut saw_file, mut saw_product) = (false, false);
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        // A trailing flag with no value is an empty MSI property.
+        let value = it.next().map(|v| v.trim()).filter(|v| !v.is_empty());
+        match flag.as_str() {
+            "--token-file" if !saw_file => {
+                saw_file = true;
+                out.token_file = value.map(PathBuf::from);
+            }
+            "--upgrading-product" if !saw_product => {
+                saw_product = true;
+                out.upgrading_product = value.map(str::to_owned);
+            }
+            _ => bail!(USAGE),
         }
-        [flag] if flag == "--token-file" => Ok(None),
-        _ => bail!("usage: uninstall-gate [--token-file <path>]"),
     }
+    Ok(out)
 }
 
 /// Write the planned-stop marker; failing to is only logged: the stop is then
@@ -639,16 +682,23 @@ fn stop_marker_privilege(is_system: bool) -> Result<()> {
     }
 }
 
-/// `trapd-agent stop-marker upgrade|clear`: MSI-internal helper. `upgrade` marks
-/// the stop of the old product during a major upgrade, `clear` undoes it on
-/// rollback.
+/// `trapd-agent stop-marker upgrade --product <ProductCode>|clear`: MSI-internal
+/// helper, run by the NEW package (before it removes the old product) as SYSTEM.
+/// `upgrade` writes the marker that lets the old product's uninstall gate and
+/// service stop pass as a planned upgrade; it is bound to the new ProductCode.
+/// `clear` undoes it on rollback.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn run_stop_marker(args: &[String]) -> Result<()> {
     stop_marker_privilege(running_as_system())?;
     match args {
-        [a] if a == "upgrade" => write_stop_marker(Reason::Upgrade, None),
+        [a, flag, product] if a == "upgrade" && flag == "--product" => {
+            let now = chrono::Utc::now().timestamp();
+            let marker = StopMarker::for_upgrade(product, env!("CARGO_PKG_VERSION"), now)
+                .context("--product is not a ProductCode ({GUID})")?;
+            stop_marker::write(paths::state_dir(), &marker)?;
+        }
         [a] if a == "clear" => stop_marker::clear(paths::state_dir()),
-        _ => bail!("usage: stop-marker upgrade|clear"),
+        _ => bail!("usage: stop-marker upgrade --product <ProductCode> | clear"),
     }
     Ok(())
 }
@@ -1526,15 +1576,30 @@ mod tests {
     #[test]
     fn gate_args_are_strict_and_an_empty_path_counts_as_absent() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(parse_gate_args(&a(&[])).unwrap(), None);
-        assert_eq!(parse_gate_args(&a(&["--token-file", ""])).unwrap(), None);
-        assert_eq!(parse_gate_args(&a(&["--token-file"])).unwrap(), None);
+        let file = |v: &[&str]| parse_gate_args(&a(v)).unwrap().token_file;
+        assert_eq!(file(&[]), None);
+        assert_eq!(file(&["--token-file", ""]), None);
+        assert_eq!(file(&["--token-file"]), None);
         assert_eq!(
-            parse_gate_args(&a(&["--token-file", "C:\\t.txt"])).unwrap(),
+            file(&["--token-file", "C:\\t.txt"]),
             Some(PathBuf::from("C:\\t.txt"))
         );
         assert!(parse_gate_args(&a(&["--token", "abc"])).is_err());
         assert!(parse_gate_args(&a(&["--token-file", "a", "b"])).is_err());
+        let g = parse_gate_args(&a(&["--token-file", "", "--upgrading-product", "{X}"])).unwrap();
+        assert_eq!(g.token_file, None);
+        assert_eq!(g.upgrading_product.as_deref(), Some("{X}"));
+        // An empty UPGRADINGPRODUCTCODE (plain uninstall) counts as absent.
+        let g = parse_gate_args(&a(&["--token-file", "t", "--upgrading-product", ""])).unwrap();
+        assert_eq!(g.upgrading_product, None);
+        // Each flag at most once.
+        assert!(parse_gate_args(&a(&[
+            "--upgrading-product",
+            "a",
+            "--upgrading-product",
+            "b"
+        ]))
+        .is_err());
     }
 
     /// The MSI conditions are the safety property that keeps upgrades and
@@ -1551,17 +1616,26 @@ mod tests {
                 .find(|l| l.contains(&format!("Action=\"{id}\"")))
                 .unwrap_or_else(|| panic!("{id} is not scheduled"))
         };
-        let real_uninstall = "REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE";
         let gate = line("RequireUninstallToken");
-        assert!(gate.contains(real_uninstall) && gate.contains("Before=\"StopServices\""));
-        let up = line("MarkUpgradeStop");
-        assert!(
-            up.contains("REMOVE~=&quot;ALL&quot; AND UPGRADINGPRODUCTCODE")
-                && up.contains("Before=\"StopServices\"")
-        );
+        // Every removal is gated; UPGRADINGPRODUCTCODE must NOT be part of any
+        // skip condition (it is a public property, settable on the command line).
+        assert!(gate.contains("Condition=\"REMOVE~=&quot;ALL&quot;\""));
+        assert!(gate.contains("Before=\"StopServices\""));
+        for l in &seq {
+            if l.contains("RequireUninstallToken") || l.contains("StageUpgradeMarker") {
+                assert!(!l.contains("UPGRADINGPRODUCTCODE"), "{l}");
+            }
+        }
+        assert!(!wxs.contains("MarkUpgradeStop"));
+        // The new package writes the marker before the old product is removed.
+        let stage = line("StageUpgradeMarker");
+        assert!(stage.contains("Before=\"RemoveExistingProducts\""));
+        assert!(stage.contains("NOT Installed") && stage.contains("WIX_UPGRADE_DETECTED"));
+        assert!(!stage.contains("REMOVE~="));
+        assert!(line("RollbackUpgradeMarker").contains("Before=\"StageUpgradeMarker\""));
         // Install, repair and the new product of a major upgrade never gate.
         assert!(!gate.contains("NOT REMOVE") && !gate.contains("Installed"));
-        for id in ["RequireUninstallToken", "MarkUpgradeStop"] {
+        for id in ["RequireUninstallToken", "StageUpgradeMarker"] {
             let ca = wxs
                 .lines()
                 .find(|l| l.contains("<CustomAction") && l.contains(&format!("Id=\"{id}\"")))
@@ -1573,6 +1647,7 @@ mod tests {
             .find(|l| l.contains("<CustomAction") && l.contains("Id=\"RequireUninstallToken\""))
             .unwrap();
         assert!(gate_ca.contains("Return=\"check\""));
+        assert!(gate_ca.contains("--upgrading-product &quot;[UPGRADINGPRODUCTCODE]&quot;"));
         // A deferred EXE action has its ExeCommand formatted at scheduling
         // time, where ordinary properties are visible; CustomActionData is
         // empty for it (that made the install fail in CI).

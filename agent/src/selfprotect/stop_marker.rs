@@ -71,6 +71,11 @@ pub struct StopMarker {
     pub from_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_version: Option<String>,
+    /// `upgrade` only: ProductCode (`{GUID}`) of the MSI that is performing the
+    /// major upgrade. The old product's uninstall gate accepts an upgrade only
+    /// if `UPGRADINGPRODUCTCODE` equals this value (see `upgrade_authorizes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_product: Option<String>,
     pub issued_at: i64,
     pub expires_at: i64,
 }
@@ -89,6 +94,7 @@ impl StopMarker {
             token_nonce,
             from_version,
             to_version,
+            upgrade_product: None,
             issued_at: now,
             expires_at: now + MAX_TTL_SECS,
         }
@@ -96,6 +102,19 @@ impl StopMarker {
 }
 
 impl StopMarker {
+    /// An `upgrade` marker bound to the ProductCode of the upgrading MSI.
+    pub fn for_upgrade(product_code: &str, from_version: &str, now: i64) -> Option<Self> {
+        let mut marker = Self::new(
+            Reason::Upgrade,
+            None,
+            Some(from_version.to_owned()),
+            None,
+            now,
+        );
+        marker.upgrade_product = Some(product_code.to_owned());
+        validate(&marker, now).ok().map(|()| marker)
+    }
+
     /// The in-memory authorization of a stop the SYSTEM service ordered itself
     /// after claiming a maintenance token (Windows). Never written to disk; the
     /// backend still matches `token_nonce` against its consumed-token record.
@@ -124,6 +143,18 @@ fn is_version(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
 }
 
+/// `{8-4-4-4-12}` hex GUID, the form MSI formats `[ProductCode]` in.
+pub fn is_product_code(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 38
+        && b[0] == b'{'
+        && b[37] == b'}'
+        && b[1..37].iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invalid {
     Version,
@@ -132,6 +163,7 @@ pub enum Invalid {
     NotYetValid,
     Nonce,
     FieldFormat,
+    Product,
 }
 
 /// Pure validation of a parsed marker at `now`.
@@ -159,7 +191,41 @@ pub fn validate(m: &StopMarker, now: i64) -> std::result::Result<(), Invalid> {
             return Err(Invalid::FieldFormat);
         }
     }
+    match (&m.upgrade_product, m.reason) {
+        (Some(p), Reason::Upgrade) if is_product_code(p) => {}
+        (None, _) => {}
+        _ => return Err(Invalid::Product),
+    }
     Ok(())
+}
+
+/// Whether the old product's MSI uninstall may skip the token because a real
+/// major upgrade is under way: a fresh, valid `upgrade` marker (written by the
+/// new package, as SYSTEM, before the old product is removed) naming exactly the
+/// product that Windows Installer reports as `UPGRADINGPRODUCTCODE`. The bare
+/// property is attacker-controllable (`msiexec /x ... UPGRADINGPRODUCTCODE=1`)
+/// and never suffices. Does not consume the marker: the service stop that
+/// follows still needs it.
+///
+/// Limit: the marker is a file, so someone who can already write the state
+/// directory as SYSTEM/Administrator can forge it. That is tamper-detected via
+/// the backend's version-change match, not prevented.
+pub fn upgrade_authorizes(state_dir: &Path, upgrading_product: &str, now: i64) -> bool {
+    if !is_product_code(upgrading_product) {
+        return false;
+    }
+    let Ok(bytes) = crate::paths::bounded_regular_bytes(&marker_path(state_dir), MAX_MARKER_BYTES)
+    else {
+        return false;
+    };
+    let Ok(m) = serde_json::from_slice::<StopMarker>(&bytes) else {
+        return false;
+    };
+    validate(&m, now).is_ok()
+        && m.reason == Reason::Upgrade
+        && m.upgrade_product
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(upgrading_product))
 }
 
 pub fn marker_path(state_dir: &Path) -> PathBuf {
@@ -329,6 +395,72 @@ mod tests {
         std::fs::write(&p, vec![b' '; 4096]).unwrap();
         assert!(consume(&d.0, NOW).is_none());
         assert!(!p.exists());
+    }
+
+    const NEW_PRODUCT: &str = "{0D18AC24-8CE9-4513-A1E5-889FD2A01D94}";
+
+    #[test]
+    fn product_code_format_is_strict() {
+        assert!(is_product_code(NEW_PRODUCT));
+        assert!(is_product_code(&NEW_PRODUCT.to_lowercase()));
+        for bad in [
+            "",
+            "1",
+            "{}",
+            "0D18AC24-8CE9-4513-A1E5-889FD2A01D94",
+            "{0D18AC24-8CE9-4513-A1E5-889FD2A01D9G}",
+            "{0D18AC24-8CE9-4513-A1E5-889FD2A01D94}x",
+        ] {
+            assert!(!is_product_code(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn upgrade_authorizes_only_with_a_fresh_marker_for_that_product() {
+        let d = tmp();
+        let m = StopMarker::for_upgrade(NEW_PRODUCT, "0.7.9", NOW).unwrap();
+        // No marker: the bare property is worthless.
+        assert!(!upgrade_authorizes(&d.0, NEW_PRODUCT, NOW));
+        write(&d.0, &m).unwrap();
+        assert!(upgrade_authorizes(&d.0, NEW_PRODUCT, NOW + 5));
+        assert!(upgrade_authorizes(
+            &d.0,
+            &NEW_PRODUCT.to_lowercase(),
+            NOW + 5
+        ));
+        // Not consumed (the service stop still needs it).
+        assert!(marker_path(&d.0).exists());
+        // Wrong, junk or empty property value.
+        for bad in ["1", "", "{00000000-0000-0000-0000-000000000000}"] {
+            assert!(!upgrade_authorizes(&d.0, bad, NOW + 5), "{bad:?}");
+        }
+        // Expired.
+        assert!(!upgrade_authorizes(
+            &d.0,
+            NEW_PRODUCT,
+            NOW + MAX_TTL_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn other_marker_kinds_never_authorize_an_upgrade_removal() {
+        let d = tmp();
+        write(&d.0, &uninstall()).unwrap();
+        assert!(!upgrade_authorizes(&d.0, NEW_PRODUCT, NOW));
+        // A product-less upgrade marker (no binding) does not authorize either.
+        write(&d.0, &upgrade()).unwrap();
+        assert!(!upgrade_authorizes(&d.0, NEW_PRODUCT, NOW));
+    }
+
+    #[test]
+    fn a_product_binding_is_only_valid_on_upgrade_markers() {
+        let mut m = uninstall();
+        m.upgrade_product = Some(NEW_PRODUCT.into());
+        assert_eq!(validate(&m, NOW), Err(Invalid::Product));
+        let mut m = upgrade();
+        m.upgrade_product = Some("1".into());
+        assert_eq!(validate(&m, NOW), Err(Invalid::Product));
+        assert!(StopMarker::for_upgrade("1", "0.7.9", NOW).is_none());
     }
 
     #[test]
