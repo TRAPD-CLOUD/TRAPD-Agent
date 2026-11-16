@@ -54,9 +54,16 @@ mod tests {
         assert!(checked >= 5, "expected the EXE custom actions to be found");
         assert!(wxs.contains("ExeCommand=\"enroll-token-import &quot;[ENROLLTOKENFILE]&quot;\""));
         assert!(!wxs.contains("SetImportEnrollTokenData"));
-        assert!(wxs.contains(
-            "ExeCommand=\"uninstall-gate --token-file &quot;[MAINTENANCE_TOKEN_FILE]&quot;\""
+        // Each property goes straight into ExeCommand (extra flags may follow).
+        let gate = wxs
+            .lines()
+            .find(|l| l.contains("Id=\"RequireUninstallToken\""))
+            .expect("RequireUninstallToken action present");
+        assert!(gate.contains(
+            "ExeCommand=\"uninstall-gate --token-file &quot;[MAINTENANCE_TOKEN_FILE]&quot;"
         ));
+        assert!(gate.contains("&quot;[UPGRADINGPRODUCTCODE]&quot;"));
+        assert!(!gate.contains("CustomActionData"));
         assert!(!wxs.contains("SetRequireUninstallTokenData"));
     }
 

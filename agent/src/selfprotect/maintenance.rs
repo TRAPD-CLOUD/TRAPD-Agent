@@ -580,7 +580,13 @@ pub fn run_uninstall_gate(args: &[String]) -> Result<()> {
              treating this as a plain uninstall"
         );
     }
-    let agent_id = crate::enrollment::load_persisted_blocking().map(|c| c.agent_id.clone());
+    // Fail closed: only a missing credentials file means "not enrolled".
+    let agent_id = crate::enrollment::load_persisted_strict_blocking()
+        .context(
+            "uninstall refused: the enrollment state cannot be read, so the agent cannot be \
+             shown to be unenrolled; release any lock on credentials.json and retry",
+        )?
+        .map(|c| c.agent_id.clone());
     let key_path = crate::update::release_key_dir().join(KEY_FILE);
     let key = if key_path.exists() {
         KeyState::Present(load_pinned_key()?)
