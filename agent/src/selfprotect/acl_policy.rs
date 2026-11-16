@@ -65,9 +65,17 @@ pub const AGENT_KEY_PATH: &str = "SOFTWARE\\TRAPD\\Agent";
 
 // ── Directories ───────────────────────────────────────────────────────────────
 
-/// Install, data, config and state/log directories: SYSTEM full, Administrators
-/// read and execute. These are the strings `Package.wxs` applies.
+/// Data, config and state/log directories: SYSTEM full, Administrators read and
+/// execute, no access for standard users (they hold secrets and keys). These
+/// are the strings `Package.wxs` applies.
 pub const DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;RC;;;OW)";
+/// Install directory (program binaries and the pairing helper, nothing secret):
+/// as `DIR_SDDL` plus read and execute for standard users, as Program Files
+/// normally grants. Users need it to start the unelevated "Pair this computer"
+/// shortcut, which reads `pair.ps1` before it elevates. No write for anyone but
+/// SYSTEM. `Package.wxs` applies this string to `INSTALLFOLDER` only.
+pub const INSTALL_DIR_SDDL: &str =
+    "D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;FRFX;;;BU)(A;OICI;RC;;;OW)";
 /// `<state>\maintenance\requests`: Administrators may only add a file
 /// (`FILE_ADD_FILE | SYNCHRONIZE`, on the directory itself, not inherited); they
 /// cannot list, read, replace or delete requests. The service verifies every
@@ -460,6 +468,26 @@ mod tests {
         assert_eq!(mask_of(DIR_SDDL, "SY"), 0x001F_01FF);
         assert_eq!(mask_of(DATA_DIR_LEGACY_SDDL, "BA"), 0x001F_01FF);
         assert!(parse_dacl(INSTALL_DIR_LEGACY_SDDL).is_some());
+    }
+
+    #[test]
+    fn install_directory_lets_users_read_and_execute_but_never_write() {
+        let d = parse_dacl(INSTALL_DIR_SDDL).unwrap();
+        assert!(d.protected);
+        assert!(d.aces.iter().all(|a| a.kind == 'A' && a.flags == "OICI"));
+        let bu = mask_of(INSTALL_DIR_SDDL, "BU");
+        assert_eq!(bu, 0x0012_00A9, "FILE_GENERIC_READ | FILE_GENERIC_EXECUTE");
+        // No write, append, delete, delete-child, attribute write, DACL or owner change.
+        assert_eq!(bu & (0x2 | 0x4 | 0x40 | 0x100 | 0x1_0000 | WD | WO), 0);
+        assert_eq!(mask_of(INSTALL_DIR_SDDL, "BA"), mask_of(DIR_SDDL, "BA"));
+        assert_eq!(mask_of(INSTALL_DIR_SDDL, "SY"), 0x001F_01FF);
+        assert_eq!(mask_of(INSTALL_DIR_SDDL, "OW"), RC);
+        // The data/config/state descriptor stays closed to users.
+        assert!(parse_dacl(DIR_SDDL)
+            .unwrap()
+            .aces
+            .iter()
+            .all(|a| a.sid != "BU"));
     }
 
     #[test]

@@ -85,8 +85,11 @@
           <!-- Install directory (WP3): SYSTEM full, Administrators read and
                execute only, so the executable cannot be replaced by an
                administrator's file copy. Program Files would otherwise grant
-               Administrators full control. Same string as acl_policy::DIR_SDDL. -->
-          <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;RC;;;OW)" /></CreateFolder>
+               Administrators full control. Standard users keep read and
+               execute (as in Program Files): the unelevated pairing shortcut
+               must read pair.ps1 before it can elevate. Nothing secret lives
+               here. Same string as acl_policy::INSTALL_DIR_SDDL. -->
+          <CreateFolder><PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)(A;OICI;FRFX;;;BU)(A;OICI;RC;;;OW)" /></CreateFolder>
         </Component>
         <!-- Lives in Program Files (not user-writable): it is started elevated. -->
         <Component Id="PairScript" Guid="D33A716E-0180-4E99-BB29-0F79C3AD16B2" Bitness="always64">

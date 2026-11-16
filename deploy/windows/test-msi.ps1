@@ -224,6 +224,19 @@ try {
     Assert-AccessDenied 'reg add Start' ($LASTEXITCODE -ne 0)
     try { 'x' | Set-Content -LiteralPath (Join-Path $config 'agent.env') -ErrorAction Stop; throw 'An administrator could write agent.env.' } catch { if ($_.Exception.Message -like 'An administrator*') { throw } }
     try { 'x' | Set-Content -LiteralPath (Join-Path $env:ProgramFiles 'TRAPD Agent\planted.txt') -ErrorAction Stop; throw 'An administrator could write to the install directory.' } catch { if ($_.Exception.Message -like 'An administrator*') { throw } }
+    # Install directory: standard users keep read/execute (the unelevated pairing shortcut reads pair.ps1 before it elevates) but nobody except SYSTEM may write.
+    $installAcl = Get-Acl (Join-Path $env:ProgramFiles 'TRAPD Agent')
+    if (-not $installAcl.AreAccessRulesProtected) { throw 'Install directory ACL is not protected.' }
+    $usersRead = $false
+    foreach ($rule in $installAcl.Access) {
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($rule.AccessControlType -ne 'Allow') { continue }
+        if ($sid -eq 'S-1-5-32-545') {
+            $usersRead = $true
+            if (($rule.FileSystemRights -band ([Security.AccessControl.FileSystemRights]'Write, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership')) -ne 0) { throw "Users can modify the install directory: $($rule.FileSystemRights)" }
+        } elseif ($sid -notin @('S-1-5-18', 'S-1-5-32-544', 'S-1-3-4')) { throw "Unexpected ACL on the install directory: $sid" }
+    }
+    if (-not $usersRead) { throw 'Standard users cannot read the install directory; the unelevated pairing shortcut would fail.' }
     if ((Get-Service trapd-agent).Status -ne 'Running') { throw 'The service stopped although the administrator was refused.' }
     # Drift: SYSTEM widens the service DACL; the agent must report it and put it back.
     $legacySd = 'D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)'
