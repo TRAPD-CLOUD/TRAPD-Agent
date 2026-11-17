@@ -25,14 +25,16 @@ pub enum Message {
     ProcessStopped,
     FileQuarantined,
     FileRestored,
+    DeviceTampered,
 }
 
-const ALL: [Message; 5] = [
+const ALL: [Message; 6] = [
     Message::HostIsolated,
     Message::HostReleased,
     Message::ProcessStopped,
     Message::FileQuarantined,
     Message::FileRestored,
+    Message::DeviceTampered,
 ];
 
 impl Message {
@@ -43,6 +45,7 @@ impl Message {
             Self::ProcessStopped => "3",
             Self::FileQuarantined => "4",
             Self::FileRestored => "5",
+            Self::DeviceTampered => "6",
         }
     }
 
@@ -123,6 +126,12 @@ impl Message {
                 "<text>Your security team restored a file on this device.</text>",
                 "</binding></visual></toast>"
             ),
+            Self::DeviceTampered => concat!(
+                "<toast><visual><binding template=\"ToastGeneric\">",
+                "<text>Device protection was tampered with</text>",
+                "<text>Something tried to interfere with the security software on this device. Contact your IT team.</text>",
+                "</binding></visual></toast>"
+            ),
         }
     }
 }
@@ -164,7 +173,7 @@ impl RateLimiter {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{notify, run_helper};
+pub use windows_impl::{notify, notify_tamper, run_helper};
 
 #[cfg(windows)]
 mod windows_impl {
@@ -207,6 +216,10 @@ mod windows_impl {
         let Some(message) = Message::for_event(action, kind, success, details) else {
             return;
         };
+        show(message);
+    }
+
+    fn show(message: Message) {
         let allowed = LIMITER
             .lock()
             .map(|mut limiter| limiter.allow(message, Instant::now()))
@@ -218,6 +231,11 @@ mod windows_impl {
                 }
             });
         }
+    }
+
+    /// Tamper notice; the caller has already checked the tenant policy.
+    pub fn notify_tamper() {
+        show(Message::DeviceTampered);
     }
 
     fn start_in_active_sessions(message: Message) -> Result<()> {
@@ -438,9 +456,17 @@ mod tests {
 
     #[test]
     fn anything_but_a_known_id_is_rejected() {
-        for id in ["", "0", "6", "1 ", "01", "<toast/>", "HostIsolated"] {
+        for id in ["", "0", "7", "1 ", "01", "<toast/>", "HostIsolated"] {
             assert_eq!(Message::parse(id), None, "{id}");
         }
+    }
+
+    #[test]
+    fn tamper_message_has_its_own_fixed_id_and_text() {
+        assert_eq!(Message::parse("6"), Some(Message::DeviceTampered));
+        let xml = Message::DeviceTampered.toast_xml();
+        assert!(xml.contains("tampered"));
+        assert!(!xml.contains('{'));
     }
 
     #[test]

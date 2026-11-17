@@ -388,6 +388,10 @@ pub struct AgentConfig {
     /// device. Off by default: the notice also reaches an attacker at the keyboard.
     #[serde(default, skip_serializing_if = "skip_if_false")]
     pub user_response_notifications_enabled: bool,
+    /// Windows: tell the signed-in user when the agent detects tampering with
+    /// itself. Off by default, for the same reason as the response notices.
+    #[serde(default, skip_serializing_if = "skip_if_false")]
+    pub tamper_user_notification: bool,
     /// Linux: report opens of real credential files (`/etc/shadow`, SSH host
     /// keys, sudoers, root's SSH private keys) as `filesystem`/`open` events.
     /// Inode-filtered in the kernel and rate-limited per `(exe, path)`, so it is
@@ -469,6 +473,7 @@ impl Default for AgentConfig {
             adaptive_decoys: Vec::new(),
             script_block_capture_enabled: false,
             user_response_notifications_enabled: false,
+            tamper_user_notification: false,
             sensitive_file_read_enabled: true,
             device_serial_capture_enabled: false,
         }
@@ -1233,6 +1238,15 @@ mod signed_config_tests {
     }
 
     #[test]
+    fn tamper_notification_defaults_off_and_stays_out_of_the_signed_bytes() {
+        let config = AgentConfig::default();
+        assert!(!config.tamper_user_notification);
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("tamper_user_notification"));
+    }
+
+    #[test]
     fn device_serial_capture_defaults_off_and_stays_out_of_the_signed_bytes() {
         let config = AgentConfig::default();
         assert!(!config.device_serial_capture_enabled);
@@ -1256,6 +1270,7 @@ mod signed_config_tests {
         let config = AgentConfig {
             script_block_capture_enabled: true,
             user_response_notifications_enabled: true,
+            tamper_user_notification: true,
             sensitive_file_read_enabled: false,
             device_serial_capture_enabled: true,
             ..AgentConfig::default()
@@ -1264,6 +1279,7 @@ mod signed_config_tests {
         let order: Vec<usize> = [
             "\"script_block_capture_enabled\":true",
             "\"user_response_notifications_enabled\":true",
+            "\"tamper_user_notification\":true",
             "\"sensitive_file_read_enabled\":false",
             "\"device_serial_capture_enabled\":true",
         ]

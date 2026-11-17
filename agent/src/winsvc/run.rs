@@ -536,6 +536,7 @@ pub(super) async fn run_agent(
     let echo_tx = tx.downgrade();
     drop(tx);
 
+    crate::selfprotect::local_log::init_policy(Arc::clone(&agent_config));
     if let Ok(cfg) = agent_config.read() {
         crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
         crate::detection::sensor_policy::set_rule_modes(&cfg.rule_modes);

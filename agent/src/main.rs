@@ -295,6 +295,8 @@ async fn main() -> Result<()> {
     // restart keeps the real configuration even though the signed-config channel
     // re-serves it with an already-accepted (and thus replay-rejected) issued_at.
     let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()?));
+    #[cfg(windows)]
+    selfprotect::local_log::init_policy(Arc::clone(&agent_config));
     if let Ok(cfg) = agent_config.read() {
         detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
         detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
@@ -869,6 +871,7 @@ pub(crate) async fn consume_batch_with(
             telemetry::metrics::metrics()
                 .set_detection_queue_depth(p.max_capacity().saturating_sub(p.capacity()) as u64);
         }
+        selfprotect::local_log::record(&event);
         pipeline::accepted(&event);
         fresh.push(event);
     }
