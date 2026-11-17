@@ -64,15 +64,18 @@ configure)
 
     if systemd_active; then
         systemctl daemon-reload || warn "systemctl daemon-reload failed"
-        systemctl enable trapd-agent.service trapd-agent-update.path >/dev/null 2>&1 \
+        systemctl enable trapd-agent.service trapd-guard.service trapd-agent-update.path >/dev/null 2>&1 \
             || warn "could not enable trapd-agent units"
         if start_allowed; then
             if [ -n "$2" ]; then
                 # Upgrade/reinstall: run the new binary.
                 systemctl try-restart trapd-agent.service || warn "could not restart trapd-agent"
+                # The guard is PartOf the agent unit and restarts with it; this also
+                # brings it up when an older package had none.
+                systemctl start trapd-guard.service || warn "could not start trapd-guard"
                 systemctl start trapd-agent-update.path || warn "could not start trapd-agent-update.path"
             else
-                systemctl start trapd-agent.service trapd-agent-update.path \
+                systemctl start trapd-agent.service trapd-guard.service trapd-agent-update.path \
                     || warn "could not start trapd-agent (see: journalctl -u trapd-agent)"
             fi
         fi

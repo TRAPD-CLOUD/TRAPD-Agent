@@ -59,7 +59,7 @@ dpkg --compare-versions "0.6.0~beta.1" lt "0.6.0" && ok "pre-release sorts befor
 LIST="$(dpkg-deb --contents "$DEB1")"
 for p in ./usr/bin/trapd-agent ./usr/lib/trapd-agent/trapd-agent-exec ./etc/trapd/ca.crt \
          ./etc/trapd/command_signing.pub ./etc/trapd-release/release_signing.pub \
-         ./usr/lib/systemd/system/trapd-agent.service ./usr/lib/systemd/system/trapd-agent-update.path \
+         ./usr/lib/systemd/system/trapd-agent.service ./usr/lib/systemd/system/trapd-guard.service ./usr/lib/systemd/system/trapd-agent-update.path \
          ./usr/lib/systemd/system/trapd-agent-update.service ./etc/logrotate.d/trapd ./usr/share/trapd-agent/deception.conf; do
     grep -q " ${p}\$" <<<"$LIST" && ok "contains $p" || fail "missing $p"
 done
@@ -103,6 +103,7 @@ else
     mkdir -p "$TMP/work"
     cp "$DEB1" "$TMP/work/v1.deb"; cp "$DEB2" "$TMP/work/v2.deb"; cp "$HERE/test-in-container.sh" "$TMP/work/"
     cp "$HERE/../install.sh" "$TMP/work/install.sh"
+    cp "$HERE/../trapd-guard.service" "$TMP/work/trapd-guard.service"
     # Reuse the real Ed25519 fixture builder used by the standalone verifier tests.
     python3 - "$HERE/../test-release-verification.py" "$TMP/work" <<'PYFIXTURE'
 import importlib.util

@@ -280,6 +280,19 @@ rights; it installs a service and generates synthetic security telemetry.
 - Maintenance tokens need `maintenance_signing.pub` in `config\`. The hosted MSI bakes it
   in when `TRAPD_HOSTED_MAINTENANCE_PUBKEY` (base64, 32 bytes) is set; otherwise provision
   it like `release_signing.pub`.
+- Guard pair: the MSI installs a second service, `trapd-guard` (the same executable run as
+  `trapd-agent.exe guard`, same protected DACL, depends on `trapd-agent`). Agent and guard
+  watch each other: process-handle wait for death, a ping every 2 s over a SYSTEM-only named
+  pipe (`\\.\pipe\trapd-guard`) for suspension, hung after 10 s of silence. The survivor
+  terminates a hung peer, restarts the service (at most 3 times per 10 minutes) and reports
+  `selfprotect.peer_lost` (`peer`, `reason` died|hung, `announced_stop`,
+  `maintenance_authorized`); a binary that fails its integrity check is not restarted
+  (`selfprotect.peer_binary_tampered`). The guard has no backend credentials: it leaves
+  records in `state\guard-events\` and the agent ships them. A stop with a maintenance token,
+  uninstall or upgrade marker is announced to the guard and is neither restarted nor reported;
+  token and uninstall stops end both services. `TRAPD_GUARD=0` in `agent.env` switches the
+  pair off. Stopping both within the same ~10 s needs purpose-built tooling and shows up as a
+  heartbeat gap at the backend.
 - Process mitigation policies (best effort, logged on failure): legacy extension
   points disabled, no images from remote shares or low-integrity locations.
 - While running, the agent re-hashes its executable every 15 minutes and raises

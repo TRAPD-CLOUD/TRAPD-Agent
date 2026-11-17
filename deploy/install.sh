@@ -34,6 +34,7 @@ EBPF_INSTALL_DIR="/usr/lib/trapd-agent"
 EBPF_INSTALL_BIN="${EBPF_INSTALL_DIR}/trapd-agent-exec"
 UPDATE_BIN="/usr/local/bin/trapd-update"
 SERVICE_FILE="/etc/systemd/system/trapd-agent.service"
+GUARD_SERVICE_FILE="/etc/systemd/system/trapd-guard.service"
 UPDATE_SERVICE_FILE="/etc/systemd/system/trapd-update.service"
 UPDATE_TIMER_FILE="/etc/systemd/system/trapd-update.timer"
 DECEPTION_DROPIN_DIR="/etc/systemd/system/trapd-agent.service.d"
@@ -318,6 +319,7 @@ Description=TRAPD Security Agent
 Documentation=https://github.com/trapd-cloud/trapd-agent
 After=network.target network-online.target
 Wants=network-online.target
+Wants=trapd-guard.service
 
 [Service]
 ExecStart=/usr/local/bin/trapd-agent
@@ -344,6 +346,10 @@ StateDirectoryMode=0700
 LogsDirectory=trapd
 LogsDirectoryMode=0700
 ConfigurationDirectory=trapd
+# Control channel to the guard (/run/trapd/guard.sock); see trapd-guard.service.
+RuntimeDirectory=trapd
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 
 # ── Hardening ────────────────────────────────────────────────────────────────
 ProtectSystem=strict
@@ -369,6 +375,83 @@ RestrictSUIDSGID=true
 RemoveIPC=true
 ProtectControlGroups=true
 SystemCallFilter=@system-service @network-io @file-system @process bpf perf_event_open
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ── Write trapd-guard.service (second service of the guard pair) ──────────────
+# Kept identical to deploy/trapd-guard.service (checked by deploy/deb/test-deb.sh).
+cat > "$GUARD_SERVICE_FILE" <<'EOF'
+[Unit]
+Description=TRAPD Guard (watches the TRAPD Security Agent)
+Documentation=https://github.com/trapd-cloud/trapd-agent
+# The guard pair: this unit and trapd-agent.service watch each other (see
+# agent/src/selfprotect/guard). A stop or restart of the agent unit stops or
+# restarts the guard with it, so an operator's `systemctl stop trapd-agent`
+# leaves both down. The guard never restarts the agent with `systemctl restart`
+# (that would propagate back here); it only ever uses `systemctl start`.
+PartOf=trapd-agent.service
+After=trapd-agent.service
+
+[Service]
+ExecStart=/usr/local/bin/trapd-agent guard
+# A clean exit (an authorized stop of the pair) stays stopped; a kill, crash or
+# signal brings the guard back.
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+Environment=RUST_LOG=info
+Environment=TRAPD_STATE_DIR=/var/lib/trapd
+Environment=TRAPD_CONFIG_DIR=/etc/trapd
+Environment=TRAPD_LOG_DIR=/var/log/trapd
+Environment=HOME=/var/lib/trapd
+EnvironmentFile=-/etc/trapd/agent.env
+
+# The control channel (/run/trapd/guard.sock, 0600) and the records the guard
+# leaves for the agent (/var/lib/trapd/guard-events). Both units declare the
+# runtime directory and keep it, so neither one's stop removes the other's socket.
+RuntimeDirectory=trapd
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=trapd
+StateDirectoryMode=0700
+LogsDirectory=trapd
+LogsDirectoryMode=0700
+ConfigurationDirectory=trapd
+
+# ── Hardening ─────────────────────────────────────────────────────────────────
+# The guard reads /proc/<pid>, hashes the agent binary, writes a few small
+# records and runs `systemctl start`. It needs none of the agent's sensor
+# capabilities and no network at all.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=-/var/lib/trapd -/var/log/trapd -/run/trapd
+NoNewPrivileges=true
+# CAP_KILL: SIGKILL a hung (SIGSTOPped) agent before it is restarted.
+CapabilityBoundingSet=CAP_KILL
+AmbientCapabilities=
+MemoryDenyWriteExecute=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+ProtectControlGroups=true
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictNamespaces=true
+# AF_UNIX: the control channel and systemctl's private manager socket.
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=true
+SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
@@ -479,7 +562,7 @@ EOF
 
 # ── Enable services ───────────────────────────────────────────────────────────
 systemctl daemon-reload
-systemctl enable --now trapd-agent
+systemctl enable --now trapd-agent trapd-guard
 systemctl enable --now trapd-agent-update.path
 # The signed in-agent channel owns automatic rollout. Never enable the legacy
 # timer as a fallback when trust provisioning is missing.

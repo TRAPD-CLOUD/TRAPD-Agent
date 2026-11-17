@@ -102,6 +102,13 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // `trapd-agent guard` — the second service of the guard pair (`trapd-guard`):
+    // watches the agent and restarts it; holds no backend credentials.
+    if std::env::args().nth(1).as_deref() == Some("guard") {
+        paths::init_state_dir();
+        return selfprotect::guard::run::run_until_signal().await;
+    }
+
     // `trapd-agent --apply-update` — helper started by the root-owned
     // `trapd-agent-update.service`; applies (or rolls back) a staged update.
     // The service itself cannot write its own binary (`ProtectSystem=strict`).
@@ -198,6 +205,9 @@ async fn main() -> Result<()> {
     // Resolve & create the (HOME-independent) state directory up front so every
     // later component agrees on where identity/credentials live.
     paths::init_state_dir();
+    // Pair with the guard service before enrollment: pairing can wait for a
+    // human, and the guard must see pings in the meantime.
+    selfprotect::guard::agent_link::start(true);
     // Enrollment can wait indefinitely; claim the run before credentials exist.
     heartbeat::lifecycle::begin_process();
 
@@ -322,6 +332,10 @@ async fn main() -> Result<()> {
             &mut spool,
         );
     }
+
+    // What the guard (or this process, about the guard) recorded while no agent
+    // was shipping events; later ones are picked up by the link itself.
+    selfprotect::guard::agent_link::attach(tx.clone(), agent_id.clone(), hostname.clone());
 
     // A start after a kill/crash/power loss is worth one low-severity signal.
     if let Some(finding) = heartbeat::lifecycle::unclean_shutdown_finding(

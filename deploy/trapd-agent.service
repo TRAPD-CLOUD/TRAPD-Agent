@@ -3,6 +3,9 @@ Description=TRAPD Security Agent
 Documentation=https://github.com/trapd-cloud/trapd-agent
 After=network.target network-online.target
 Wants=network-online.target
+# Guard pair (phase 09 L2): starting the agent starts its guard; the guard is
+# PartOf this unit, so stopping the agent stops both.
+Wants=trapd-guard.service
 
 [Service]
 ExecStart=/usr/local/bin/trapd-agent
@@ -32,6 +35,11 @@ StateDirectoryMode=0700
 LogsDirectory=trapd
 LogsDirectoryMode=0700
 ConfigurationDirectory=trapd
+# Control channel to the guard (/run/trapd/guard.sock). Both units declare the
+# directory and keep it so neither one's stop removes the other's socket.
+RuntimeDirectory=trapd
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 
 # ── Filesystem isolation ──────────────────────────────────────────────────────
 # /usr, /boot, /efi are read-only; agent binary in /usr/local/bin is protected.

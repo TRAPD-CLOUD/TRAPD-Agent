@@ -41,7 +41,13 @@ pub fn init_tracing_stderr() {
 /// event log is a separate file, written by [`crate::output`]). The file is
 /// size-rotated so a long-running service cannot fill the disk.
 pub fn init_tracing_file() {
-    let path = paths::log_dir().join("agent.log");
+    init_tracing_file_named("agent.log");
+}
+
+/// The guard service logs to its own file: two processes must not share one
+/// rotating log.
+pub fn init_tracing_file_named(name: &str) {
+    let path = paths::log_dir().join(name);
     let _ = std::fs::create_dir_all(paths::log_dir());
     let file = RotatingFile::open(
         &path,
@@ -248,6 +254,8 @@ pub(super) async fn run_agent(
         return Err(e);
     }
     on_ready();
+    // Pair with the guard service before anything that can wait (enrollment).
+    crate::selfprotect::guard::agent_link::start(as_service);
 
     // Expired rules may be what prevents enrollment reaching the backend.
     // Recover before ANY backend request, including pending pairing.
@@ -354,6 +362,7 @@ pub(super) async fn run_agent(
             &mut spool,
         );
     }
+    crate::selfprotect::guard::agent_link::attach(tx.clone(), agent_id.clone(), hostname.clone());
     tokio::spawn(crate::selfprotect::restart_forensics::run(
         tx.clone(),
         agent_id.clone(),

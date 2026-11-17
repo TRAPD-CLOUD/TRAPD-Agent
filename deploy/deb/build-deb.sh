@@ -98,6 +98,13 @@ if grep -q '/usr/local/bin' "$ROOT/usr/lib/systemd/system/trapd-agent.service"; 
     grep -v '^[[:space:]]*#' "$ROOT/usr/lib/systemd/system/trapd-agent.service" | grep -q '/usr/local/bin' \
         && die "trapd-agent.service still references /usr/local/bin outside comments"
 fi
+# The guard unit (second service of the guard pair): same binary, `guard` argument.
+sed 's#/usr/local/bin/trapd-agent#/usr/bin/trapd-agent#g' "$DEPLOY_DIR/trapd-guard.service" \
+    > "$ROOT/usr/lib/systemd/system/trapd-guard.service"
+grep -qx 'ExecStart=/usr/bin/trapd-agent guard' "$ROOT/usr/lib/systemd/system/trapd-guard.service" \
+    || die "could not derive the unit: deploy/trapd-guard.service has no 'ExecStart=/usr/local/bin/trapd-agent guard' line"
+grep -v '^[[:space:]]*#' "$ROOT/usr/lib/systemd/system/trapd-guard.service" | grep -q '/usr/local/bin' \
+    && die "trapd-guard.service still references /usr/local/bin outside comments"
 install -m 0644 "$HERE/trapd-agent-update.service" "$ROOT/usr/lib/systemd/system/trapd-agent-update.service"
 install -m 0644 "$HERE/trapd-agent-update.path" "$ROOT/usr/lib/systemd/system/trapd-agent-update.path"
 
