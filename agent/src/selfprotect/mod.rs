@@ -30,3 +30,5 @@ pub mod restart_forensics;
 pub mod acl_guard;
 #[cfg(any(target_os = "windows", test))]
 pub mod acl_policy;
+// L5 platform posture, measured boot and clock-jump detection.
+pub mod posture;
