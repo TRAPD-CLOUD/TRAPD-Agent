@@ -10,6 +10,7 @@
 //! The metrics struct is OS-neutral so the future Windows agent reports the
 //! same shape.
 
+pub mod echo;
 pub mod lifecycle;
 
 use std::collections::BTreeMap;
@@ -185,6 +186,10 @@ pub struct Heartbeat {
     config: Arc<RwLock<AgentConfig>>,
     /// `System` is reused across beats so CPU deltas are meaningful.
     sys: Mutex<System>,
+    /// Answers liveness challenges in heartbeat responses through the event
+    /// pipeline. Only the periodic beat has one; the final host-shutdown beat
+    /// does not need it.
+    echo: Option<echo::LivenessEcho>,
 }
 
 impl Heartbeat {
@@ -207,7 +212,22 @@ impl Heartbeat {
             hostname,
             config,
             sys: Mutex::new(System::new()),
+            echo: None,
         })
+    }
+
+    /// Answer backend liveness challenges with `agent.liveness_echo` events
+    /// sent through `tx`, the normal telemetry channel (not the heartbeat).
+    pub fn with_liveness_echo(
+        mut self,
+        tx: tokio::sync::mpsc::WeakSender<trapd_schema::AgentEvent>,
+    ) -> Self {
+        self.echo = Some(echo::LivenessEcho::new(
+            self.agent_id.clone(),
+            self.hostname.clone(),
+            tx,
+        ));
+        self
     }
 
     pub async fn run(self) {
@@ -265,6 +285,17 @@ impl Heartbeat {
             Ok(resp) if resp.status().is_success() => {
                 debug!("Heartbeat sent successfully");
                 crate::update::confirm_healthy();
+                if let Some(echo) = &self.echo {
+                    // Bounded read: an oversized body is ignored, not buffered.
+                    let small = resp
+                        .content_length()
+                        .is_none_or(|n| n as usize <= echo::MAX_RESPONSE_BYTES);
+                    if small {
+                        if let Ok(body) = resp.bytes().await {
+                            echo.handle(&body);
+                        }
+                    }
+                }
                 return true;
             }
             Ok(resp) => {
