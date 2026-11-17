@@ -10,7 +10,8 @@ pub mod maintenance;
 pub mod guard;
 #[cfg(any(target_os = "windows", test))]
 pub mod process_dacl;
-#[cfg(target_os = "windows")]
+// The policy plan is portable (and tested everywhere); applying it is Windows-only.
+#[cfg(any(target_os = "windows", test))]
 pub mod process_mitigation;
 pub mod stop;
 pub mod stop_marker;
@@ -33,3 +34,7 @@ pub mod restart_forensics;
 pub mod acl_guard;
 #[cfg(any(target_os = "windows", test))]
 pub mod acl_policy;
+// L3 process integrity: periodic self-checks (code patching, injected modules,
+// remote threads, debuggers, foreign handles). Windows and Linux only.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub mod process_integrity;

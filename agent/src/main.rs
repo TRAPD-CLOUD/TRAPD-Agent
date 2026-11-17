@@ -188,6 +188,7 @@ async fn main() -> Result<()> {
     }
 
     selfprotect::kernel_hardening::audit();
+    selfprotect::process_integrity::linux::harden();
 
     if let Err(e) = selfprotect::binary_integrity::check() {
         error!("{e:#}");
@@ -456,6 +457,9 @@ async fn main() -> Result<()> {
         handles.push(tokio::spawn(async move {
             selfprotect::anti_ptrace::run(tx_ap, aid, host).await;
         }));
+        // L3: periodic process-integrity self-checks (mappings, preload,
+        // tracer). `anti_ptrace` above stays the 10 s fast path for TracerPid.
+        spawn_collector!(selfprotect::process_integrity::ProcessIntegrityMonitor::new());
     }
 
     // Windows: OS-neutral system snapshots, a sysinfo-based process collector
