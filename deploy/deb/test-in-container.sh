@@ -105,6 +105,24 @@ dpkg -P trapd-agent >/dev/null 2>&1 && ok "purge succeeds" || fail "purge"
 check "state, log and config directories gone" \
     bash -c '[ ! -e /var/lib/trapd ] && [ ! -e /var/log/trapd ] && [ ! -e /etc/trapd ] && [ ! -e /etc/trapd-release ]'
 
+echo "== uninstall protection: the gate decides a removal"
+dpkg -i /work/protected.deb >/dev/null 2>&1
+# The fixture agent cannot execute: the gate fails, so the removal must fail.
+! dpkg -r trapd-agent >/dev/null 2>&1 && ok "removal refused when the gate fails" || fail "removal went through a failing gate"
+check "package still installed" dpkg -s trapd-agent
+# A gate that authorizes: it gets the token file and the used token is removed.
+cat > /usr/bin/trapd-agent <<'GATE'
+#!/bin/sh
+[ "$1" = uninstall-gate ] && echo "$*" > /tmp/gate-args
+exit 0
+GATE
+chmod 0755 /usr/bin/trapd-agent
+echo token > /etc/trapd/uninstall.token
+dpkg -r trapd-agent >/dev/null 2>&1 && ok "removal allowed when the gate passes" || fail "removal with a passing gate"
+check "gate got the default token file" grep -qx 'uninstall-gate --token-file /etc/trapd/uninstall.token' /tmp/gate-args
+check "used token file removed" test ! -e /etc/trapd/uninstall.token
+dpkg -P trapd-agent >/dev/null 2>&1; rm -rf /etc/trapd /var/lib/trapd /var/log/trapd /tmp/gate-args
+
 echo "== purge does not follow a symlinked data directory"
 dpkg -i "$V1" >/dev/null 2>&1
 mkdir -p /tmp/precious && echo keep > /tmp/precious/file

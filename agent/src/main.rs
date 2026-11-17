@@ -127,6 +127,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `trapd-agent uninstall-gate [--token-file <path>]`, run by the deb's
+    // prerm before the service is stopped for a removal: a failure (non-zero
+    // exit) aborts the removal. Same gate as the Windows MSI action.
+    if std::env::args().nth(1).as_deref() == Some("uninstall-gate") {
+        paths::load_agent_env_file();
+        paths::init_state_dir();
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return selfprotect::maintenance::run_uninstall_gate(&args)
+            .inspect_err(|e| error!("uninstall refused: {e:#}"));
+    }
+
     // `trapd-agent maintenance --purpose stop --token-file <path>` — sanctioned
     // stop authorised by a signed, single-use maintenance token (file input only).
     if std::env::args().nth(1).as_deref() == Some("maintenance") {
