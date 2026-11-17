@@ -65,6 +65,7 @@ fn stop_request_for(control: &ServiceControl) -> Option<StopRequest> {
 }
 
 const SERVICE_NAME: &str = "trapd-agent";
+const GUARD_SERVICE_NAME: &str = "trapd-guard";
 const SERVICE_DISPLAY_NAME: &str = "TRAPD Agent";
 const SERVICE_DESCRIPTION: &str =
     "TRAPD endpoint security agent — telemetry collection and backend reporting.";
@@ -190,6 +191,17 @@ pub fn entry() -> Result<()> {
             );
             Ok(())
         }
+        // The guard service of the guard pair (`trapd-guard`): same binary, own
+        // SCM entry; the MSI registers it with `guard` as its argument.
+        Some("guard") => match service_dispatcher::start(GUARD_SERVICE_NAME, ffi_guard_main) {
+            Ok(()) => Ok(()),
+            Err(windows_service::Error::Winapi(ref e))
+                if e.raw_os_error() == Some(ERROR_NOT_A_SERVICE) =>
+            {
+                run_guard_console()
+            }
+            Err(e) => Err(e).context("guard service dispatcher failed"),
+        },
         Some("run") | Some("--console") => run_console(),
         None => match service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
             Ok(()) => Ok(()),
@@ -447,6 +459,107 @@ fn run_service() -> Result<()> {
     let _ = reporter.join();
     report_status(&status_handle, status_for(Phase::Done, 0, exit));
     result
+}
+
+// ── Guard service (`trapd-agent.exe guard`) ───────────────────────────────────
+
+windows_service::define_windows_service!(ffi_guard_main, guard_main);
+
+fn guard_main(_args: Vec<OsString>) {
+    run::init_tracing_file_named("guard.log");
+    if let Err(e) = run_guard_service() {
+        tracing::error!("guard service failed: {e:#}");
+        evtlog::notify(
+            evtlog::Event::Fatal,
+            &format!("TRAPD Guard service failed: {e}. See guard.log for details."),
+        );
+    }
+}
+
+/// Foreground run of the guard (debugging); it still needs the agent's state dir.
+fn run_guard_console() -> Result<()> {
+    run::init_tracing_stderr();
+    run::load_config_env();
+    crate::paths::init_state_dir();
+    let rt = tokio::runtime::Runtime::new().context("build tokio runtime")?;
+    let result = rt.block_on(crate::selfprotect::guard::run::run(async {
+        let _ = tokio::signal::ctrl_c().await;
+        crate::selfprotect::guard::NoticeKind::ServiceStop
+    }));
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result.map(|_| ())
+}
+
+fn run_guard_service() -> Result<()> {
+    use crate::selfprotect::guard::NoticeKind;
+    run::load_config_env();
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<NoticeKind>();
+    let (phase_tx, phase_rx) = mpsc::channel::<Phase>();
+
+    let handler_phase_tx = phase_tx.clone();
+    let event_handler = move |control| -> ServiceControlHandlerResult {
+        match control {
+            ServiceControl::Stop => {
+                let _ = handler_phase_tx.send(Phase::Stopping);
+                let _ = stop_tx.send(NoticeKind::ServiceStop);
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Shutdown | ServiceControl::Preshutdown => {
+                let _ = handler_phase_tx.send(Phase::Stopping);
+                let _ = stop_tx.send(NoticeKind::HostShutdown);
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+    let status_handle = service_control_handler::register(GUARD_SERVICE_NAME, event_handler)
+        .context("register service control handler")?;
+    let reporter = spawn_status_reporter(status_handle, phase_rx);
+
+    // Startup failures reach the SCM as a nonzero exit code; make them count
+    // for the recovery policy the MSI installed.
+    if let Err(e) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .and_then(|manager| manager.open_service(GUARD_SERVICE_NAME, ServiceAccess::CHANGE_CONFIG))
+        .and_then(|service| service.set_failure_actions_on_non_crash_failures(true))
+    {
+        tracing::warn!(error = %e, "could not enable service recovery for startup failures");
+    }
+
+    crate::paths::init_state_dir();
+    crate::selfprotect::process_mitigation::apply();
+    crate::selfprotect::process_dacl::apply();
+
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = phase_tx.send(Phase::Done);
+            let _ = reporter.join();
+            report_status(
+                &status_handle,
+                status_for(Phase::Done, 0, ServiceExitCode::ServiceSpecific(1)),
+            );
+            return Err(e).context("build tokio runtime");
+        }
+    };
+    let ready_tx = phase_tx.clone();
+    let result = rt.block_on(async {
+        let _ = ready_tx.send(Phase::Running);
+        crate::selfprotect::guard::run::run(async move {
+            stop_rx.recv().await.unwrap_or(NoticeKind::ServiceStop)
+        })
+        .await
+    });
+    let _ = phase_tx.send(Phase::Stopping);
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    let exit = match &result {
+        Ok(_) => ServiceExitCode::Win32(0),
+        Err(_) => ServiceExitCode::ServiceSpecific(1),
+    };
+    let _ = phase_tx.send(Phase::Done);
+    let _ = reporter.join();
+    report_status(&status_handle, status_for(Phase::Done, 0, exit));
+    result.map(|_| ())
 }
 
 /// Send the service the user-defined "look at the maintenance request" control

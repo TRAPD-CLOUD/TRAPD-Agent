@@ -45,8 +45,10 @@ try { $Command; 'ok' | Set-Content -LiteralPath '$result' } catch { `$_.ToString
         if ($text -ne 'ok') { throw "SYSTEM helper failed ($Command): $text" }
     } finally { Unregister-ScheduledTask -TaskName $id -Confirm:$false -ErrorAction SilentlyContinue }
 }
-function Stop-AgentService { Invoke-AsSystem 'Stop-Service trapd-agent' }
-function Start-AgentService { Invoke-AsSystem 'Start-Service trapd-agent' }
+# -Force stops the dependent guard service first (the guard depends on the agent),
+# so the guard cannot restart the agent behind the test's back.
+function Stop-AgentService { Invoke-AsSystem 'Stop-Service trapd-agent -Force' }
+function Start-AgentService { Invoke-AsSystem 'Start-Service trapd-agent; Start-Service trapd-guard' }
 function Copy-AsSystem([string]$From, [string]$To) { Invoke-AsSystem "Copy-Item -LiteralPath '$From' -Destination '$To' -Force" }
 function Assert-AccessDenied([string]$What, [bool]$Denied) {
     # sc.exe reports ERROR_ACCESS_DENIED as 5; reg.exe exits non-zero.
@@ -189,6 +191,13 @@ try {
     Remove-Item -Force $tokenFile -ErrorAction SilentlyContinue
     if (Select-String -LiteralPath (Join-Path $root 'install.log') -SimpleMatch 'test-enrollment-token' -Quiet) { throw 'The enrollment token appears in the MSI log.' }
     Wait-Until { (Get-Service trapd-agent -ErrorAction SilentlyContinue).Status -eq 'Running' } 'MSI service did not start.'
+    # Guard pair (phase 09 L2): the second service runs, depends on the agent and carries the same protected DACL.
+    Wait-Until { (Get-Service trapd-guard -ErrorAction SilentlyContinue).Status -eq 'Running' } 'The guard service did not start.'
+    if ((Get-Service trapd-guard).ServicesDependedOn.Name -notcontains 'trapd-agent') { throw 'The guard service does not depend on the agent service.' }
+    $guardSd = (& "$env:SystemRoot\System32\sc.exe" sdshow trapd-guard) -join ''
+    if ($guardSd -match '\(A;;[A-Z]*(DC|WP|DT|SD|WD|WO)[A-Z]*;;;BA\)') { throw "Administrators can stop, reconfigure, delete or re-ACL the guard service: $guardSd" }
+    & "$env:SystemRoot\System32\sc.exe" stop trapd-guard | Out-Null
+    Assert-AccessDenied 'sc stop trapd-guard' ($LASTEXITCODE -eq 5)
     Wait-Until { Test-Path (Join-Path $state 'config_issued_at.json') } 'Signed configuration was not applied.'
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'system' }).Count -gt 0 } 'No system telemetry.'
     $device = Get-Content -Raw (Join-Path $state 'device_id')
@@ -440,6 +449,7 @@ def token(purpose):
     }
     Invoke-Msi @('/x', "`"$installedMsi`"", '/qn', '/norestart', "MAINTENANCE_TOKEN_FILE=`"$(Join-Path $maint 'uninstall.token')`"", '/L*v', "`"$(Join-Path $root 'uninstall.log')`"")
     Wait-Until { $null -eq (Get-Service trapd-agent -ErrorAction SilentlyContinue) } 'Uninstall left the service registered.'
+    if ($null -ne (Get-Service trapd-guard -ErrorAction SilentlyContinue)) { throw 'Uninstall left the guard service registered.' }
     if (Test-Path (Join-Path $env:ProgramFiles 'TRAPD Agent\trapd-agent.exe')) { throw 'Uninstall left the executable.' }
     if (-not (Test-Path (Join-Path $state 'device_id'))) { throw 'Uninstall removed retained identity.' }
     $remaining = @($firewall.Rules | Where-Object { $_.Grouping -eq 'TRAPD-Containment' })

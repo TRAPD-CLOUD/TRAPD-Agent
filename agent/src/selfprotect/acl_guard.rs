@@ -448,6 +448,14 @@ pub fn apply_hardened() -> Result<()> {
             "agent key",
             winacl::set_machine_key_dacl(AGENT_KEY_PATH, REGISTRY_KEY_SDDL),
         ),
+        report(
+            "guard service",
+            winacl::set_service_dacl(policy::GUARD_SERVICE_NAME, SERVICE_DACL_SDDL),
+        ),
+        report(
+            "guard service key",
+            winacl::set_machine_key_dacl(policy::GUARD_SERVICE_KEY_PATH, REGISTRY_KEY_SDDL),
+        ),
     ];
     if ok.iter().all(|x| *x) {
         Ok(())
@@ -477,6 +485,14 @@ pub fn apply_legacy() -> Result<()> {
         report(
             "agent key",
             winacl::set_machine_key_dacl(AGENT_KEY_PATH, REGISTRY_KEY_LEGACY_SDDL),
+        ),
+        report(
+            "guard service",
+            winacl::set_service_dacl(policy::GUARD_SERVICE_NAME, SERVICE_DACL_LEGACY_SDDL),
+        ),
+        report(
+            "guard service key",
+            winacl::set_machine_key_dacl(policy::GUARD_SERVICE_KEY_PATH, REGISTRY_KEY_LEGACY_SDDL),
         ),
     ];
     let dirs = [
