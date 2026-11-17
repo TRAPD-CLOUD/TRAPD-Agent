@@ -355,6 +355,14 @@ impl StopAnnouncer {
             }
         };
         let marker = authorization.or(consumed);
+        // The guard learns what kind of stop this is before the process ends,
+        // so it neither restarts the agent against the operator's intent nor
+        // reports a planned stop. Bounded; never fatal.
+        super::guard::agent_link::announce_stop(
+            super::guard::NoticeKind::ServiceStop,
+            marker.as_ref(),
+        )
+        .await;
         let event = stop_event_for(&self.agent_id, &self.hostname, source, marker.as_ref());
         // This event bypasses the consumer, so it is written to the configured
         // local output itself, online and offline alike, independent of
@@ -415,6 +423,7 @@ impl StopAnnouncer {
     }
 
     async fn announce_host_shutdown(&self) {
+        super::guard::agent_link::announce_stop(super::guard::NoticeKind::HostShutdown, None).await;
         let Some(heartbeat) = &self.heartbeat else {
             return;
         };
