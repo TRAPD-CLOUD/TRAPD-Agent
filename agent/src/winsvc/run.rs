@@ -483,6 +483,7 @@ pub(super) async fn run_agent(
     // Runtime self-protection: periodic binary recheck and a health watchdog
     // over the liveness beats (consumer, event log, ETW).
     spawn_collector!(crate::selfprotect::runtime_guard::BinaryIntegrityMonitor);
+    spawn_collector!(crate::selfprotect::process_integrity::ProcessIntegrityMonitor::new());
     handles.push(tokio::spawn(
         crate::selfprotect::runtime_guard::run_health_watchdog(),
     ));
