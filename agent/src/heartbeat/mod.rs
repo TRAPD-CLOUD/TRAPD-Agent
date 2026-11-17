@@ -53,6 +53,10 @@ struct HeartbeatPayload {
     /// Findings of shadow-mode rules since the last accepted beat.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     shadow_hits: std::collections::BTreeMap<String, u64>,
+    /// Latest platform posture snapshot and boot id (L5); absent until the
+    /// first snapshot exists or when posture checks are disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform_posture: Option<crate::selfprotect::posture::PostureReport>,
 }
 
 /// Process-local event accounting; recovered records belong to the previous
@@ -272,6 +276,7 @@ impl Heartbeat {
             ),
             coverage: crate::telemetry::coverage::snapshot(),
             shadow_hits: crate::telemetry::coverage::take_shadow_hits(),
+            platform_posture: crate::selfprotect::posture::heartbeat_report(),
         };
         let bearer = self.tokens.current().await;
         match self
@@ -462,6 +467,7 @@ mod tests {
                 pipeline: PipelineCounters::from_snapshot(&MetricsSnapshot::default()),
                 coverage: Default::default(),
                 shadow_hits: Default::default(),
+                platform_posture: None,
             })
             .unwrap()
         };

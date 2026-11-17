@@ -352,6 +352,9 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Platform posture (Secure Boot, lockdown, ...), measured boot and clock jumps.
+    selfprotect::posture::spawn(tx.clone(), agent_id.clone(), hostname.clone());
+
     // ── Prevention subsystem (active response) ────────────────────────────────
     // Requires the backend (signed command channel), so it is skipped offline.
     // Keep the runtime available online even when initially disabled: each

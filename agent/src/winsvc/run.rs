@@ -369,6 +369,7 @@ pub(super) async fn run_agent(
         hostname.clone(),
         offline,
     ));
+    crate::selfprotect::posture::spawn(tx.clone(), agent_id.clone(), hostname.clone());
     // Service/registry ACL guard (WP2/WP3): checks and re-asserts at start, then
     // watches. Only the SYSTEM service can apply the ACLs; a console run skips it.
     if as_service {

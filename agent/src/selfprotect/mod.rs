@@ -40,3 +40,5 @@ pub mod acl_policy;
 // remote threads, debuggers, foreign handles). Windows and Linux only.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod process_integrity;
+// L5 platform posture, measured boot and clock-jump detection.
+pub mod posture;
