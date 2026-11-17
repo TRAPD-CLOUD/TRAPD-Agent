@@ -699,6 +699,17 @@ fn persist_config(cfg: &AgentConfig) {
             if let Err(e) = crate::paths::write_atomic(&persisted_config_path(), &bytes, 0o600) {
                 warn!(error = %e, "cannot persist last-known-good config");
             }
+            // The adopted (signed) policy changed: journal its digest.
+            {
+                use sha2::{Digest as _, Sha256};
+                crate::selfprotect::journal::record(
+                    "config_changed",
+                    serde_json::json!({
+                        "config_sha256": hex::encode(Sha256::digest(&bytes)),
+                        "bytes": bytes.len(),
+                    }),
+                );
+            }
         }
         Err(e) => warn!(error = %e, "cannot serialise config for persistence"),
     }

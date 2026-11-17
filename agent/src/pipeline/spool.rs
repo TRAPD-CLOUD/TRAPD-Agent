@@ -434,6 +434,10 @@ impl Spool {
 
         self.next_seq += 1;
         self.append_to_journal(&encoded);
+        // Tamper journal: every event, from the consumer and from the direct
+        // stop/tamper alerts alike, passes here. Self-protection findings are
+        // chained and signed (no-op until the journal is installed).
+        crate::selfprotect::journal::observe(&record.event);
 
         // Checkpointing sources must not advance their durable baseline/cursor
         // until this particular record has reached stable journal storage.

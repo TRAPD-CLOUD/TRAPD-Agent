@@ -355,6 +355,17 @@ impl StopAnnouncer {
             }
         };
         let marker = authorization.or(consumed);
+        if let Some(m) = &marker {
+            crate::selfprotect::journal::record(
+                "stop_marker_consumed",
+                serde_json::json!({
+                    "reason": m.reason.as_str(),
+                    "token_nonce": m.token_nonce,
+                    "from_version": m.from_version,
+                    "to_version": m.to_version,
+                }),
+            );
+        }
         let event = stop_event_for(&self.agent_id, &self.hostname, source, marker.as_ref());
         // This event bypasses the consumer, so it is written to the configured
         // local output itself, online and offline alike, independent of

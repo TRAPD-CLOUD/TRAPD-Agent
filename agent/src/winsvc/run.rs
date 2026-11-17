@@ -312,6 +312,7 @@ pub(super) async fn run_agent(
             }
         };
         let tokens = crate::identity::SessionTokens::bootstrap(&backend_url, &creds);
+        crate::selfprotect::journal::upload::start(&tokens, &backend_url, &creds.agent_id);
         (backend_url, creds.agent_id.clone(), tokens)
     };
 
