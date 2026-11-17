@@ -138,6 +138,13 @@ fn renew_after(lifetime: Duration) -> Duration {
 }
 
 impl SessionTokens {
+    /// The identity key this holder signs with, if any (not in offline mode,
+    /// not after the identity was stopped). The tamper journal signs with the
+    /// same key the backend has bound.
+    pub fn identity_key(&self) -> Option<Arc<dyn IdentityKey>> {
+        self.net.as_ref().and_then(|n| n.key.clone())
+    }
+
     /// A static bearer without any network behaviour (offline mode, tests).
     pub fn fixed(token: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {

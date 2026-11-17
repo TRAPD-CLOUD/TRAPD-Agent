@@ -258,6 +258,7 @@ async fn main() -> Result<()> {
         };
         let agent_id = creds.agent_id.clone();
         let tokens = identity::SessionTokens::bootstrap(&backend_url, &creds);
+        selfprotect::journal::upload::start(&tokens, &backend_url, &creds.agent_id);
         let project_id = creds.project_id.clone();
         (backend_url, agent_id, tokens, project_id)
     };
