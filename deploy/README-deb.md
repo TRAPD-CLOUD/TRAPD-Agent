@@ -92,6 +92,20 @@ Interaction between dpkg and the self-update:
 - Without systemd (containers, chroots) or when `policy-rc.d` denies, units are
   not started; nothing fails.
 
+## Guard pair
+
+`trapd-guard.service` runs `trapd-agent guard` beside the agent (phase 09 L2). It is
+`PartOf=trapd-agent.service` (stopping or restarting the agent does the same to the guard),
+the agent `Wants=` it, and the guard only ever *starts* the agent (`systemctl start`, never
+`restart`, which would propagate back). Each watches the other through
+`/run/trapd/guard.sock` (root, `0600`, in the root-only runtime directory both units keep)
+and a pidfd; a silent peer (`kill -STOP`) is killed and restarted after 10 s, a dead one at
+once, with at most 3 restarts per 10 minutes. The guard unit has no network, one
+capability (`CAP_KILL`) and `Restart=on-failure`, so an authorized stop stays stopped.
+Findings are `selfprotect.peer_lost` / `selfprotect.peer_binary_tampered`; the guard leaves
+them in `/var/lib/trapd/guard-events/` for the agent to ship. `TRAPD_GUARD=0` in
+`agent.env` switches the pair off.
+
 ## Limits and open points
 
 - `amd64` only. `aarch64` needs an arm64 agent build and is not covered.
@@ -100,6 +114,8 @@ Interaction between dpkg and the self-update:
   fetched from (an apt repository with a signed `Release` file would be the next step).
 - No `copyright` file (the repository has no license file yet), so `lintian`
   would warn; `lintian` was not run.
+- The guard pair (restart through `systemctl start`, the `PartOf` propagation, the unit
+  sandbox with `CAP_KILL` only) was not run under a real systemd either.
 - Not tested against a real systemd: the units pass `systemd-analyze verify`
   syntax-wise, the install paths were tested with a stubbed `systemctl`.
 
