@@ -515,6 +515,8 @@ pub(super) async fn run_agent(
     // Registry persistence watcher (Run keys, services, IFEO, Winlogon, ...).
     spawn_collector!(crate::collectors::windows::regwatch::RegistryWatchCollector::new(!offline));
 
+    // Weak: the liveness echo must not keep the pipeline open at shutdown.
+    let echo_tx = tx.downgrade();
     drop(tx);
 
     if let Ok(cfg) = agent_config.read() {
@@ -682,7 +684,8 @@ pub(super) async fn run_agent(
             token.clone(),
             hostname.clone(),
             Arc::clone(&agent_config),
-        )?;
+        )?
+        .with_liveness_echo(echo_tx);
         handles.push(tokio::spawn(async move { heartbeat.run().await }));
         stop_announcer = stop_announcer.with_backend(
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?,

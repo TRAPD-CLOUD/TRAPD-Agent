@@ -473,6 +473,8 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Weak: the liveness echo must not keep the pipeline open at shutdown.
+    let echo_tx = tx.downgrade();
     drop(tx);
 
     // SIEM forwarder — best-effort export of every event (and detection) to
@@ -602,7 +604,8 @@ async fn main() -> Result<()> {
             token.clone(),
             hostname.clone(),
             Arc::clone(&agent_config),
-        )?;
+        )?
+        .with_liveness_echo(echo_tx);
         backend_tasks.push(tokio::spawn(async move { heartbeat.run().await }));
         stop_announcer = stop_announcer.with_backend(
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?,
