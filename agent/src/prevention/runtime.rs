@@ -28,7 +28,7 @@ use crate::config::AgentConfig;
 pub async fn start(
     backend_url: &str,
     agent_id: &str,
-    token: &str,
+    tokens: Arc<crate::identity::SessionTokens>,
     hostname: &str,
     pipeline_tx: tokio::sync::mpsc::Sender<crate::schema::AgentEvent>,
     cfg_handle: Arc<RwLock<AgentConfig>>,
@@ -105,7 +105,7 @@ pub async fn start(
         let puller = CommandPuller::new(
             backend_url,
             agent_id,
-            token.to_string(),
+            tokens,
             v,
             audit.clone(),
             cmd_tx,

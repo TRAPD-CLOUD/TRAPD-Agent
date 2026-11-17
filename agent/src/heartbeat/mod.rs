@@ -177,7 +177,7 @@ struct Metrics {
 pub struct Heartbeat {
     client: reqwest::Client,
     heartbeat_url: String,
-    token: String,
+    tokens: Arc<crate::identity::SessionTokens>,
     agent_id: String,
     hostname: String,
     /// Live agent config; `heartbeat_interval_secs` is re-read every beat so a
@@ -191,7 +191,7 @@ impl Heartbeat {
     pub fn new(
         backend_url: &str,
         agent_id: String,
-        token: String,
+        tokens: Arc<crate::identity::SessionTokens>,
         hostname: String,
         config: Arc<RwLock<AgentConfig>>,
     ) -> anyhow::Result<Self> {
@@ -202,7 +202,7 @@ impl Heartbeat {
         Ok(Self {
             client: crate::http::control_client()?,
             heartbeat_url: format!("{base}/api/v1/agents/{agent_id}/heartbeat"),
-            token,
+            tokens,
             agent_id,
             hostname,
             config,
@@ -253,10 +253,11 @@ impl Heartbeat {
             coverage: crate::telemetry::coverage::snapshot(),
             shadow_hits: crate::telemetry::coverage::take_shadow_hits(),
         };
+        let bearer = self.tokens.current().await;
         match self
             .client
             .post(&self.heartbeat_url)
-            .bearer_auth(&self.token)
+            .bearer_auth(&bearer)
             .json(&payload)
             .send()
             .await
@@ -267,6 +268,9 @@ impl Heartbeat {
                 return true;
             }
             Ok(resp) => {
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    self.tokens.report_unauthorized(&bearer).await;
+                }
                 warn!("Heartbeat rejected by backend: HTTP {}", resp.status());
                 crate::telemetry::coverage::restore_shadow_hits(payload.shadow_hits);
             }

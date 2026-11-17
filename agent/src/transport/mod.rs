@@ -75,7 +75,7 @@ pub struct Transport {
     buffer: Arc<Mutex<Spool>>,
     client: reqwest::Client,
     ingest_url: String,
-    token: String,
+    tokens: Arc<crate::identity::SessionTokens>,
     /// Set once the backend has advertised `Accept-Encoding: gzip`. Compressing
     /// before that would hand an older backend a body it cannot parse, which it
     /// rejects with a permanent 4xx, and the batch would be dropped.
@@ -93,7 +93,7 @@ impl Transport {
     pub fn new(
         buffer: Arc<Mutex<Spool>>,
         backend_url: String,
-        token: String,
+        tokens: Arc<crate::identity::SessionTokens>,
     ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(&backend_url);
         let ingest_url = format!("{base}/api/v1/ingest/events");
@@ -109,7 +109,7 @@ impl Transport {
             priority_wake,
             client,
             ingest_url,
-            token,
+            tokens,
             gzip_ok: AtomicBool::new(false),
             ocsf_ok: AtomicBool::new(false),
             retry_after_secs: AtomicU64::new(0),
@@ -230,10 +230,11 @@ impl Transport {
         let n = batch.len();
         let seqs: Vec<u64> = batch.iter().map(|e| e.seq).collect();
         let (body, compressed) = encode_body(raw, self.gzip_ok.load(Ordering::Relaxed));
+        let bearer = self.tokens.current().await;
         let mut request = self
             .client
             .post(&self.ingest_url)
-            .bearer_auth(&self.token)
+            .bearer_auth(&bearer)
             .header(reqwest::header::CONTENT_TYPE, "application/json");
         if compressed {
             request = request.header(reqwest::header::CONTENT_ENCODING, "gzip");
@@ -249,6 +250,9 @@ impl Transport {
         );
 
         if let Ok(resp) = &response {
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                self.tokens.report_unauthorized(&bearer).await;
+            }
             if advertises_gzip(resp.headers()) {
                 self.gzip_ok.store(true, Ordering::Relaxed);
             }
@@ -1057,7 +1061,7 @@ mod tests {
             buffer: Arc::new(Mutex::new(spool)),
             client: reqwest::Client::new(),
             ingest_url: url,
-            token: "secret_test".into(),
+            tokens: crate::identity::SessionTokens::fixed("secret_test"),
             gzip_ok: AtomicBool::new(false),
             ocsf_ok: AtomicBool::new(false),
             retry_after_secs: AtomicU64::new(0),
@@ -1381,7 +1385,7 @@ mod tests {
                 buffer: Arc::new(Mutex::new(spool)),
                 client: reqwest::Client::new(),
                 ingest_url: var("TRAPD_E2E_INGEST_URL"),
-                token: var("TRAPD_E2E_TOKEN"),
+                tokens: crate::identity::SessionTokens::fixed(var("TRAPD_E2E_TOKEN")),
                 gzip_ok: AtomicBool::new(false),
                 ocsf_ok: AtomicBool::new(false),
                 retry_after_secs: AtomicU64::new(0),

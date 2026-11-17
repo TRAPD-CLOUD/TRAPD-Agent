@@ -713,7 +713,7 @@ pub struct ConfigPuller {
     config: Arc<RwLock<AgentConfig>>,
     client: reqwest::Client,
     config_url: String,
-    token: String,
+    tokens: std::sync::Arc<crate::identity::SessionTokens>,
     etag: Option<String>,
     verifier: Option<ConfigVerifier>,
     on_apply: Option<ApplyHook>,
@@ -724,7 +724,7 @@ impl ConfigPuller {
         config: Arc<RwLock<AgentConfig>>,
         backend_url: &str,
         agent_id: &str,
-        token: String,
+        tokens: std::sync::Arc<crate::identity::SessionTokens>,
     ) -> Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
         // Config updates must be signed with the pinned command-signing key. If
@@ -751,7 +751,7 @@ impl ConfigPuller {
             // without a provisioned `<config>/ca.crt`.
             client: crate::http::control_client()?,
             config_url: format!("{base}/api/v1/agents/{agent_id}/config"),
-            token,
+            tokens,
             etag: None,
             verifier,
             on_apply: None,
@@ -782,7 +782,8 @@ impl ConfigPuller {
     }
 
     async fn pull(&mut self) {
-        let mut req = self.client.get(&self.config_url).bearer_auth(&self.token);
+        let bearer = self.tokens.current().await;
+        let mut req = self.client.get(&self.config_url).bearer_auth(&bearer);
 
         if let Some(etag) = &self.etag {
             req = req.header("If-None-Match", etag.as_str());
@@ -795,6 +796,10 @@ impl ConfigPuller {
                 return;
             }
         };
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.tokens.report_unauthorized(&bearer).await;
+        }
 
         match resp.status().as_u16() {
             304 => {

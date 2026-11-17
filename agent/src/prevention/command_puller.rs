@@ -102,7 +102,7 @@ fn decode_batch(body: &[u8]) -> Result<Vec<Decoded>, serde_json::Error> {
 pub struct CommandPuller {
     client: reqwest::Client,
     url: String,
-    token: String,
+    tokens: Arc<crate::identity::SessionTokens>,
     verifier: Arc<Verifier>,
     audit: AuditEmitter,
     out: Sender<CommandEnvelope>,
@@ -113,7 +113,7 @@ impl CommandPuller {
     pub fn new(
         backend_url: &str,
         agent_id: &str,
-        token: String,
+        tokens: Arc<crate::identity::SessionTokens>,
         verifier: Arc<Verifier>,
         audit: AuditEmitter,
         out: Sender<CommandEnvelope>,
@@ -123,7 +123,7 @@ impl CommandPuller {
         Ok(Self {
             client: crate::http::control_client()?,
             url: format!("{base}/api/v1/agents/{agent_id}/commands"),
-            token,
+            tokens,
             verifier,
             audit,
             out,
@@ -177,12 +177,13 @@ impl CommandPuller {
     /// malformed response so the caller can count consecutive failures;
     /// otherwise `Empty` or `Delivered` (commands dispatched or audited).
     async fn poll_once(&self) -> PollOutcome {
+        let bearer = self.tokens.current().await;
         let resp = match self
             .client
             .get(&self.url)
             .query(&[("wait", LONG_POLL_WAIT_SECS)])
             .timeout(LONG_POLL_TIMEOUT)
-            .bearer_auth(&self.token)
+            .bearer_auth(&bearer)
             .send()
             .await
         {
@@ -194,6 +195,9 @@ impl CommandPuller {
         };
 
         if !resp.status().is_success() {
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                self.tokens.report_unauthorized(&bearer).await;
+            }
             if resp.status().is_server_error() {
                 warn!(status = %resp.status(), "backend command endpoint error");
             }

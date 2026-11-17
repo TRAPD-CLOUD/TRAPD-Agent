@@ -267,7 +267,7 @@ pub(super) async fn run_agent(
         .unwrap_or(false);
     let offline = env_truthy("TRAPD_OFFLINE") || !backend_configured;
 
-    let (backend_url, agent_id, token) = if offline {
+    let (backend_url, agent_id, tokens) = if offline {
         if !backend_configured {
             warn!(
                 "TRAPD_BACKEND_URL is not set — starting in OFFLINE mode. Telemetry is \
@@ -278,7 +278,11 @@ pub(super) async fn run_agent(
         } else {
             warn!("TRAPD_OFFLINE set — backend communication disabled (telemetry is local only).");
         }
-        (String::new(), device_id.clone(), String::new())
+        (
+            String::new(),
+            device_id.clone(),
+            crate::identity::SessionTokens::fixed(String::new()),
+        )
     } else {
         let backend_url = crate::http::normalize_base_url(
             &std::env::var("TRAPD_BACKEND_URL").unwrap_or_default(),
@@ -307,11 +311,8 @@ pub(super) async fn run_agent(
                 }
             }
         };
-        (
-            backend_url,
-            creds.agent_id.clone(),
-            creds.agent_secret.clone(),
-        )
+        let tokens = crate::identity::SessionTokens::bootstrap(&backend_url, &creds);
+        (backend_url, creds.agent_id.clone(), tokens)
     };
 
     let output_mode = OutputMode::from_env();
@@ -395,7 +396,7 @@ pub(super) async fn run_agent(
         match crate::prevention::runtime::start(
             &backend_url,
             &agent_id,
-            &token,
+            Arc::clone(&tokens),
             &hostname,
             tx.clone(),
             Arc::clone(&agent_config),
@@ -640,7 +641,7 @@ pub(super) async fn run_agent(
         &backend_url,
         agent_id.clone(),
         device_id.clone(),
-        token.clone(),
+        Arc::clone(&tokens),
         hostname.clone(),
         offline,
         Arc::clone(&agent_config),
@@ -655,18 +656,22 @@ pub(super) async fn run_agent(
     );
 
     // Backend access for reporting a consumed maintenance token before exit.
-    let mut maintenance_report: Option<(String, String, String)> = None;
+    let mut maintenance_report: Option<(String, String, Arc<crate::identity::SessionTokens>)> =
+        None;
     if !offline {
-        maintenance_report = Some((backend_url.clone(), agent_id.clone(), token.clone()));
-        let transport =
-            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
+        maintenance_report = Some((backend_url.clone(), agent_id.clone(), Arc::clone(&tokens)));
+        let transport = Transport::new(
+            Arc::clone(&ring_buffer),
+            backend_url.clone(),
+            Arc::clone(&tokens),
+        )?;
         handles.push(tokio::spawn(async move { transport.run().await }));
 
         let config_puller = ConfigPuller::new(
             Arc::clone(&agent_config),
             &backend_url,
             &agent_id,
-            token.clone(),
+            Arc::clone(&tokens),
         )?
         .with_apply_hook(Arc::new(move |cfg: &AgentConfig| {
             crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
@@ -675,21 +680,24 @@ pub(super) async fn run_agent(
         }));
         handles.push(tokio::spawn(async move { config_puller.run().await }));
 
-        let token_for_update = token.clone();
         let heartbeat = Heartbeat::new(
             &backend_url,
             agent_id.clone(),
-            token.clone(),
+            Arc::clone(&tokens),
             hostname.clone(),
             Arc::clone(&agent_config),
         )?;
         handles.push(tokio::spawn(async move { heartbeat.run().await }));
         stop_announcer = stop_announcer.with_backend(
-            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?,
+            Transport::new(
+                Arc::clone(&ring_buffer),
+                backend_url.clone(),
+                Arc::clone(&tokens),
+            )?,
             Heartbeat::new(
                 &backend_url,
                 agent_id.clone(),
-                token,
+                Arc::clone(&tokens),
                 hostname.clone(),
                 Arc::clone(&agent_config),
             )?,
@@ -699,12 +707,12 @@ pub(super) async fn run_agent(
         crate::selfprotect::maintenance::spawn_pending_report(
             backend_url.clone(),
             agent_id.clone(),
-            token_for_update.clone(),
+            tokens.clone(),
         );
 
         // Signed self-update. Opt-in by key provisioning: without the pinned
         // release and command keys no update can be verified, so it is not started.
-        match crate::update::Updater::new(&backend_url, agent_id.clone(), token_for_update) {
+        match crate::update::Updater::new(&backend_url, agent_id.clone(), tokens) {
             Ok(updater) => handles.push(tokio::spawn(async move { updater.run().await })),
             Err(e) => info!(error = %e, "Self-update disabled"),
         }
@@ -735,10 +743,10 @@ pub(super) async fn run_agent(
         // A token the service just claimed must reach the backend before the
         // stop notice does, so the backend can correlate the two. Bounded.
         if request.source == crate::selfprotect::stop::StopSource::MaintenanceToken {
-            if let Some((url, id, secret)) = &maintenance_report {
+            if let Some((url, id, tokens)) = &maintenance_report {
                 let _ = tokio::time::timeout(
                     crate::selfprotect::stop::STOP_FLUSH_BUDGET,
-                    crate::selfprotect::maintenance::report_pending(url, id, secret),
+                    crate::selfprotect::maintenance::report_pending(url, id, tokens),
                 )
                 .await;
             }

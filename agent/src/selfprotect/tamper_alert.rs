@@ -209,10 +209,12 @@ pub async fn report(err: &anyhow::Error) {
         .unwrap_or_else(|_| "unknown".into());
     let events = [event(&state, &creds.agent_id, &hostname)];
     let backend = std::env::var("TRAPD_BACKEND_URL").unwrap_or_default();
-    let sent = tokio::time::timeout(
-        SEND_TIMEOUT,
-        crate::transport::send_once(&backend, &creds.agent_secret, &events, SEND_TIMEOUT),
-    )
+    let sent = tokio::time::timeout(SEND_TIMEOUT, async {
+        let bearer = crate::identity::SessionTokens::for_cli(&backend, &creds)
+            .current()
+            .await;
+        crate::transport::send_once(&backend, &bearer, &events, SEND_TIMEOUT).await
+    })
     .await;
     match sent {
         Ok(Ok(())) => {

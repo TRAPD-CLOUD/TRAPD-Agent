@@ -38,6 +38,9 @@ pub(crate) mod token_file;
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct Credentials {
     pub agent_id: String,
+    /// Legacy bearer secret. Empty once the agent's identity key is bound
+    /// (see [`crate::identity`]); then it is omitted from the file entirely.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent_secret: String,
     pub project_id: String,
 }
@@ -53,8 +56,15 @@ impl std::fmt::Debug for Credentials {
 }
 
 impl Credentials {
+    /// An identity needs an id. The secret is optional: a bound agent
+    /// authenticates with its identity key and no longer stores one.
     fn is_valid(&self) -> bool {
-        !self.agent_id.trim().is_empty() && !self.agent_secret.trim().is_empty()
+        !self.agent_id.trim().is_empty()
+    }
+
+    /// Whether the legacy secret is still present (not yet bound).
+    pub fn has_secret(&self) -> bool {
+        !self.agent_secret.trim().is_empty()
     }
 }
 
@@ -228,7 +238,7 @@ async fn try_enroll(
                     agent_secret: body.agent_secret,
                     project_id: body.project_id,
                 };
-                if creds.is_valid() {
+                if creds.is_valid() && creds.has_secret() {
                     Ok(creds)
                 } else {
                     // 200 but empty identity — treat as transient (proxy/LB quirk).
@@ -334,6 +344,13 @@ pub(crate) async fn load_persisted() -> Option<Credentials> {
             None
         }
     }
+}
+
+/// Atomically (re)write the credentials file at `path`, mode 0600. Used to
+/// drop the legacy secret after the identity key was bound.
+pub(crate) fn write_credentials_at(path: &std::path::Path, creds: &Credentials) -> Result<()> {
+    let content = serde_json::to_vec_pretty(creds).context("serialize credentials")?;
+    paths::write_atomic(path, &content, 0o600)
 }
 
 async fn persist(creds: &Credentials) -> Result<()> {
@@ -451,6 +468,19 @@ mod tests {
                 .agent_id,
             "a"
         );
+    }
+
+    #[test]
+    fn bound_credentials_have_no_secret_and_still_parse() {
+        let bound = Credentials {
+            agent_id: "a".into(),
+            agent_secret: String::new(),
+            project_id: "p".into(),
+        };
+        let json = serde_json::to_string(&bound).unwrap();
+        assert!(!json.contains("agent_secret"), "{json}");
+        let parsed = parse_persisted_strict(Ok(json)).unwrap().unwrap();
+        assert!(!parsed.has_secret());
     }
 
     fn sample() -> Credentials {

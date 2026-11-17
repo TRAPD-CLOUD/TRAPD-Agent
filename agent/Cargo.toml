@@ -37,6 +37,7 @@ globset            = "0.4"
 ipnet              = { version = "2", features = ["serde"] }
 getrandom          = "0.3"
 zeroize            = { version = "1", features = ["derive"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 
 [features]
 yara = ["trapd-detection/yara"]

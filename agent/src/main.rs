@@ -24,6 +24,7 @@ mod enrollment;
 mod forensics;
 mod heartbeat;
 mod http;
+mod identity;
 mod inventory;
 mod output;
 mod paths;
@@ -219,7 +220,7 @@ async fn main() -> Result<()> {
         .unwrap_or(false);
     let offline = env_truthy("TRAPD_OFFLINE") || !backend_configured;
 
-    let (backend_url, agent_id, token, project_id) = if offline {
+    let (backend_url, agent_id, tokens, project_id) = if offline {
         if !backend_configured {
             warn!(
                 "TRAPD_BACKEND_URL is not set — starting in OFFLINE mode. Telemetry is \
@@ -233,7 +234,7 @@ async fn main() -> Result<()> {
         (
             String::new(),
             device_id.clone(),
-            String::new(),
+            identity::SessionTokens::fixed(String::new()),
             "offline".to_string(),
         )
     } else {
@@ -256,9 +257,9 @@ async fn main() -> Result<()> {
             }
         };
         let agent_id = creds.agent_id.clone();
-        let token = creds.agent_secret.clone();
+        let tokens = identity::SessionTokens::bootstrap(&backend_url, &creds);
         let project_id = creds.project_id.clone();
-        (backend_url, agent_id, token, project_id)
+        (backend_url, agent_id, tokens, project_id)
     };
 
     let output_mode = OutputMode::from_env();
@@ -347,7 +348,7 @@ async fn main() -> Result<()> {
         match prevention::runtime::start(
             &backend_url,
             &agent_id,
-            &token,
+            Arc::clone(&tokens),
             &hostname,
             tx.clone(),
             Arc::clone(&agent_config),
@@ -555,7 +556,7 @@ async fn main() -> Result<()> {
             &backend_url,
             agent_id.clone(),
             device_id.clone(),
-            token.clone(),
+            Arc::clone(&tokens),
             hostname.clone(),
             offline,
             Arc::clone(&agent_config),
@@ -579,15 +580,18 @@ async fn main() -> Result<()> {
         // All three open the (fail-closed) pinned control channel; a pinning
         // misconfig surfaces here as a hard error rather than a silent
         // fall-back to the system trust store.
-        let transport =
-            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
+        let transport = Transport::new(
+            Arc::clone(&ring_buffer),
+            backend_url.clone(),
+            Arc::clone(&tokens),
+        )?;
         backend_tasks.push(tokio::spawn(async move { transport.run().await }));
 
         let config_puller = ConfigPuller::new(
             Arc::clone(&agent_config),
             &backend_url,
             &agent_id,
-            token.clone(),
+            Arc::clone(&tokens),
         )?
         .with_apply_hook(std::sync::Arc::new(|cfg: &AgentConfig| {
             detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
@@ -595,21 +599,24 @@ async fn main() -> Result<()> {
         }));
         tokio::spawn(async move { config_puller.run().await });
 
-        let token_for_update = token.clone();
         let heartbeat = Heartbeat::new(
             &backend_url,
             agent_id.clone(),
-            token.clone(),
+            Arc::clone(&tokens),
             hostname.clone(),
             Arc::clone(&agent_config),
         )?;
         backend_tasks.push(tokio::spawn(async move { heartbeat.run().await }));
         stop_announcer = stop_announcer.with_backend(
-            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?,
+            Transport::new(
+                Arc::clone(&ring_buffer),
+                backend_url.clone(),
+                Arc::clone(&tokens),
+            )?,
             Heartbeat::new(
                 &backend_url,
                 agent_id.clone(),
-                token,
+                Arc::clone(&tokens),
                 hostname.clone(),
                 Arc::clone(&agent_config),
             )?,
@@ -619,12 +626,12 @@ async fn main() -> Result<()> {
         selfprotect::maintenance::spawn_pending_report(
             backend_url.clone(),
             agent_id.clone(),
-            token_for_update.clone(),
+            tokens.clone(),
         );
 
         // Self-update is opt-in by key provisioning: without both pinned signing
         // keys no update can be verified, so the updater is not started.
-        match update::Updater::new(&backend_url, agent_id.clone(), token_for_update) {
+        match update::Updater::new(&backend_url, agent_id.clone(), tokens) {
             Ok(updater) => {
                 tokio::spawn(async move { updater.run().await });
             }
