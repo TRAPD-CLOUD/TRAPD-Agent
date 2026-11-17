@@ -495,6 +495,10 @@ pub(super) async fn run_agent(
     // over the liveness beats (consumer, event log, ETW).
     spawn_collector!(crate::selfprotect::runtime_guard::BinaryIntegrityMonitor);
     spawn_collector!(crate::selfprotect::process_integrity::ProcessIntegrityMonitor::new());
+    // L4: WFP/firewall blocks, hosts/proxy/NRPT redirects, TLS pin mismatches.
+    spawn_collector!(crate::selfprotect::network_guard::NetworkGuard::new(
+        &backend_url
+    ));
     handles.push(tokio::spawn(
         crate::selfprotect::runtime_guard::run_health_watchdog(),
     ));

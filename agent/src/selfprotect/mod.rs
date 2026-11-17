@@ -6,6 +6,8 @@ pub mod journal;
 #[cfg(target_os = "linux")]
 pub mod kernel_hardening;
 pub mod maintenance;
+// L4: anti-silencing / anti-redirection of the backend channel (phase 09).
+pub mod network_guard;
 // Pure SDDL constant + parser are testable everywhere; the apply path is Windows-only.
 pub mod guard;
 #[cfg(any(target_os = "windows", test))]

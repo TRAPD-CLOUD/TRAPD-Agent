@@ -438,6 +438,7 @@ async fn main() -> Result<()> {
         spawn_collector!(LogCollector::new(Arc::clone(&agent_config)));
         spawn_collector!(FilesystemCollector::new(Arc::clone(&agent_config)));
         spawn_collector!(AgentProtectCollector::new());
+        spawn_collector!(selfprotect::network_guard::NetworkGuard::new(&backend_url));
         spawn_collector!(collectors::linux::modscan::ModScanCollector::new());
         spawn_collector!(collectors::linux::containerwatch::ContainerWatchCollector::new());
         spawn_collector!(collectors::linux::memscan::MemScanCollector::new(

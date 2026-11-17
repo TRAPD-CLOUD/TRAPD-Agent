@@ -25,13 +25,17 @@
 //! kill/isolate/install command channel) unless the operator explicitly accepts
 //! the system trust store via `TRAPD_TLS_ALLOW_SYSTEM_ROOTS=1`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::ClientBuilder;
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls::RootCertStore;
 use tracing::{info, warn};
 
 use crate::paths;
+use crate::selfprotect::network_guard::tls_pin::{self, PinningVerifier};
 
 const USER_AGENT: &str = concat!("trapd-agent/", env!("CARGO_PKG_VERSION"));
 
@@ -76,6 +80,8 @@ fn system_roots_opt_in() -> bool {
 ///   - rustls TLS backend (memory-safe, no OpenSSL dependency)
 ///   - **mandatory** CA certificate pinning (`<config>/ca.crt`), unless the
 ///     operator opts into the system trust store via `TRAPD_TLS_ALLOW_SYSTEM_ROOTS`
+///   - optional SPKI pinning / observation of the presented chain
+///     ([`crate::selfprotect::network_guard::tls_pin`])
 ///   - optional mTLS client identity (`<config>/agent.{crt,key}`)
 ///   - bounded total + connect timeouts
 ///   - a stable `User-Agent` carrying the agent version
@@ -84,25 +90,50 @@ fn system_roots_opt_in() -> bool {
 /// instead of degrading to a plain `reqwest::Client::new()`. A remote-control
 /// agent must never ship commands/telemetry over a channel it could not pin.
 pub fn build_client(total_timeout: Duration, connect_timeout: Duration) -> Result<reqwest::Client> {
-    let builder = ClientBuilder::new()
-        .use_rustls_tls()
+    ClientBuilder::new()
+        .use_preconfigured_tls(tls_config()?)
         .user_agent(USER_AGENT)
         .timeout(total_timeout)
-        .connect_timeout(connect_timeout);
-
-    let builder = apply_ca_pinning(builder)?;
-    let builder = apply_mtls_identity(builder);
-
-    builder.build().context("http: failed to build TLS client")
+        .connect_timeout(connect_timeout)
+        .build()
+        .context("http: failed to build TLS client")
 }
 
-/// Add `<config>/ca.crt` as the *only* trusted root certificate, pinning the
-/// backend to that CA (equivalent to HPKP without the header mechanism).
+/// rustls configuration shared by every backend client: trust anchors, the
+/// pinning verifier and the optional client identity.
+fn tls_config() -> Result<rustls::ClientConfig> {
+    let roots = trust_anchors()?;
+    let verifier = PinningVerifier::new(roots, Arc::clone(tls_pin::global()))?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("TLS: unsupported protocol version set")?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+    let mut cfg = match mtls_identity() {
+        Some((certs, key)) => match builder.clone().with_client_auth_cert(certs, key) {
+            Ok(cfg) => {
+                info!("mTLS: client identity loaded — mutual TLS enabled");
+                cfg
+            }
+            Err(e) => {
+                warn!("mTLS: client identity rejected: {e}");
+                builder.with_no_client_auth()
+            }
+        },
+        None => builder.with_no_client_auth(),
+    };
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(cfg)
+}
+
+/// `<config>/ca.crt` as the *only* trusted root, pinning the backend to that CA
+/// (equivalent to HPKP without the header mechanism).
 ///
 /// Fail-closed: a missing `ca.crt` is an error unless `TRAPD_TLS_ALLOW_SYSTEM_ROOTS`
 /// is set; a present-but-unreadable/unparseable `ca.crt` is *always* an error
 /// (never a silent fall-back to system roots, which would defeat pinning).
-fn apply_ca_pinning(builder: ClientBuilder) -> Result<ClientBuilder> {
+fn trust_anchors() -> Result<RootCertStore> {
     let path = paths::config_dir().join("ca.crt");
     if !pin_required(path.exists(), system_roots_opt_in()).with_context(|| {
         format!(
@@ -121,17 +152,31 @@ fn apply_ca_pinning(builder: ClientBuilder) -> Result<ClientBuilder> {
             "TLS: no pinned CA — {ALLOW_SYSTEM_ROOTS_ENV} is set, trusting the system root \
              store for the command channel. This is INSECURE; provision ca.crt to pin."
         );
-        return Ok(builder);
+        return Ok(RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        });
     }
 
     let pem = std::fs::read(&path)
         .with_context(|| format!("TLS: cannot read pinned CA {}", path.display()))?;
-    let cert = reqwest::Certificate::from_pem(&pem)
-        .with_context(|| format!("TLS: cannot parse pinned CA {}", path.display()))?;
+    let mut roots = RootCertStore::empty();
+    let mut count = 0usize;
+    for cert in CertificateDer::pem_slice_iter(&pem) {
+        let cert =
+            cert.with_context(|| format!("TLS: cannot parse pinned CA {}", path.display()))?;
+        roots
+            .add(cert)
+            .with_context(|| format!("TLS: cannot use pinned CA {}", path.display()))?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(anyhow!(
+            "TLS: pinned CA {} contains no certificate",
+            path.display()
+        ));
+    }
     info!(ca = %path.display(), "TLS: pinning backend to custom CA");
-    Ok(builder
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(cert))
+    Ok(roots)
 }
 
 /// Pure pinning decision (factored out so it is testable without touching the
@@ -151,51 +196,33 @@ fn pin_required(ca_exists: bool, opt_in: bool) -> Result<bool> {
     }
 }
 
-/// Load a PEM client certificate + key for mutual TLS authentication.  Both
-/// files must be present; otherwise mTLS is skipped (TLS still applies).
-fn apply_mtls_identity(builder: ClientBuilder) -> ClientBuilder {
+/// Load a PEM client certificate chain + key for mutual TLS. Both files must be
+/// present and parse; otherwise mTLS is skipped (TLS still applies).
+fn mtls_identity() -> Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let cert_path = paths::config_dir().join("agent.crt");
     let key_path = paths::config_dir().join("agent.key");
 
     if !cert_path.exists() || !key_path.exists() {
-        return builder;
+        return None;
     }
-
-    let cert_pem = match std::fs::read(&cert_path) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("mTLS: cannot read {}: {e}", cert_path.display());
-            return builder;
-        }
-    };
-    let key_pem = match std::fs::read(&key_path) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("mTLS: cannot read {}: {e}", key_path.display());
-            return builder;
-        }
-    };
-
-    // `Identity::from_pem` expects the certificate chain and private key
-    // concatenated in a single PEM buffer.
-    let mut combined = cert_pem;
-    combined.extend_from_slice(b"\n");
-    combined.extend_from_slice(&key_pem);
-
-    match reqwest::Identity::from_pem(&combined) {
-        Ok(identity) => {
-            info!("mTLS: client identity loaded — mutual TLS enabled");
-            builder.identity(identity)
-        }
-        Err(e) => {
-            warn!(
-                "mTLS: cannot build identity from {} + {}: {e}",
-                cert_path.display(),
-                key_path.display()
-            );
-            builder
-        }
+    let cert_pem = std::fs::read(&cert_path)
+        .map_err(|e| warn!("mTLS: cannot read {}: {e}", cert_path.display()))
+        .ok()?;
+    let key_pem = std::fs::read(&key_path)
+        .map_err(|e| warn!("mTLS: cannot read {}: {e}", key_path.display()))
+        .ok()?;
+    let certs = CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| warn!("mTLS: cannot parse {}: {e}", cert_path.display()))
+        .ok()?;
+    if certs.is_empty() {
+        warn!("mTLS: {} contains no certificate", cert_path.display());
+        return None;
     }
+    let key = PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|e| warn!("mTLS: cannot parse {}: {e}", key_path.display()))
+        .ok()?;
+    Some((certs, key))
 }
 
 /// Normalise a backend base URL: trim whitespace and any trailing slashes so
