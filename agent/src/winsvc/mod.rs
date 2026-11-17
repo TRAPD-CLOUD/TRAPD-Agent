@@ -18,6 +18,11 @@
 mod evtlog;
 mod run;
 
+/// Write one `selfprotect.*` record to the `TRAPD-Agent-Security` log.
+pub(crate) fn write_security_event(id: u32, severity: &trapd_schema::Severity, message: &str) {
+    evtlog::security_event(id, severity, message);
+}
+
 use std::ffi::OsString;
 use std::sync::mpsc;
 use std::time::Duration;
