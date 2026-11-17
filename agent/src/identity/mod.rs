@@ -6,12 +6,17 @@
 //!
 //! Provider selection happens in [`load_or_create`]:
 //!
-//! 1. (WP2, not implemented yet) TPM-backed key — `Protection::Tpm`.
+//! 1. TPM-backed key — `Protection::Tpm` (Windows CNG Platform Crypto
+//!    Provider, machine key; Linux TPM is a separate decision).
 //! 2. Software key — `Protection::Software`:
 //!    * Linux: key file `identity.key` in the state directory (0600,
 //!      written atomically, zeroized in memory).
 //!    * Windows: CNG key in the Microsoft Software Key Storage Provider,
 //!      machine scope, export policy 0 (non-exportable).
+//!
+//! On Windows the provider that created the key is recorded in
+//! `identity.provider`; an existing key is only opened from that provider (see
+//! `select`).
 //!
 //! There is deliberately **no silent downgrade**: once the backend has bound a
 //! public key, a missing/changed key is a loud failure that needs re-enrollment
@@ -20,6 +25,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(windows, test))]
+mod select;
 pub mod session;
 mod software;
 #[cfg(windows)]
@@ -62,22 +69,19 @@ pub trait IdentityKey: Send + Sync {
 /// already-bound agent must use [`load_existing`] so a lost key is not silently
 /// replaced.
 pub fn load_or_create() -> Result<Box<dyn IdentityKey>> {
-    // WP2 HOOK: try the TPM provider first (Windows CNG
-    // `MS_PLATFORM_CRYPTO_PROVIDER`, machine key, non-exportable):
-    //
-    //     if let Some(key) = tpm::try_load_or_create()? { return Ok(key); }
-    //
-    // It must return `Ok(None)` only when no TPM is present. A TPM that is
-    // present but failing is an error, never a fall-through to software.
+    #[cfg(windows)]
+    return windows_cng::load_or_create();
+    #[cfg(not(windows))]
     software::load_or_create()
 }
 
 /// Load the identity key if one exists; `Ok(None)` when there is none.
 ///
-/// Mirrors [`load_or_create`]'s provider order (WP2 adds the TPM provider
-/// first) but never creates a key.
+/// Mirrors [`load_or_create`]'s provider rules but never creates a key.
 pub fn load_existing() -> Result<Option<Box<dyn IdentityKey>>> {
-    // WP2 HOOK: try the TPM provider's existing key first.
+    #[cfg(windows)]
+    return windows_cng::load_existing();
+    #[cfg(not(windows))]
     software::load_existing()
 }
 

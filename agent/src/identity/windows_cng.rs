@@ -1,55 +1,105 @@
 //! Windows CNG (NCrypt) backed identity key.
 //!
-//! Machine-scope, non-exportable (export policy 0) ECDSA P-256 key named
-//! [`KEY_NAME`]. The private key never leaves the key storage provider, so a
-//! copy of `credentials.json` / the state directory does not carry the
-//! identity.
+//! Machine-scope, non-exportable ECDSA P-256 key named [`KEY_NAME`]. The
+//! private key never leaves the key storage provider, so a copy of
+//! `credentials.json` / the state directory does not carry the identity.
 //!
-//! WP2 adds a second [`Provider`] (`MS_PLATFORM_CRYPTO_PROVIDER`, TPM) that is
-//! tried before the software one; the key name and flow stay identical.
+//! Two providers: [`Provider::Platform`] (`MS_PLATFORM_CRYPTO_PROVIDER`, the
+//! TPM; `Protection::Tpm`) and [`Provider::Software`] (`MS_KEY_STORAGE_PROVIDER`).
+//! Which one is used is decided by [`super::select`]; the provider that created
+//! the key is recorded in `identity.provider` in the state directory.
+//!
+//! Key ACL: machine keys are stored under
+//! `%ProgramData%\Microsoft\Crypto\{Keys,PCPKSP}` and are accessible to
+//! SYSTEM and the local Administrators only (CNG default for machine keys; we
+//! set no custom security descriptor). TPM keys additionally cannot be
+//! exported at all (the private part exists only inside the TPM). The key is
+//! created with no UI and no authorization value, so the service can use it
+//! unattended; anyone who can run code as SYSTEM/admin on the host can ask the
+//! TPM to sign, which is why the backend also cross-checks behaviour (L6).
 
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 use windows_sys::core::PCWSTR;
-use windows_sys::Win32::Foundation::NTE_BAD_KEYSET;
+use windows_sys::Win32::Foundation::{
+    NTE_BAD_KEYSET, NTE_DEVICE_NOT_READY, NTE_NOT_SUPPORTED, NTE_NO_KEY, NTE_PROVIDER_DLL_FAIL,
+    NTE_PROV_DLL_NOT_FOUND,
+};
 use windows_sys::Win32::Security::Cryptography::{
     NCryptCreatePersistedKey, NCryptExportKey, NCryptFinalizeKey, NCryptFreeObject, NCryptOpenKey,
     NCryptOpenStorageProvider, NCryptSetProperty, NCryptSignHash, BCRYPT_ECCKEY_BLOB,
     BCRYPT_ECCPUBLIC_BLOB, BCRYPT_ECDSA_P256_ALGORITHM, BCRYPT_ECDSA_PUBLIC_P256_MAGIC,
-    MS_KEY_STORAGE_PROVIDER, NCRYPT_ALLOW_SIGNING_FLAG, NCRYPT_EXPORT_POLICY_PROPERTY,
-    NCRYPT_KEY_HANDLE, NCRYPT_KEY_USAGE_PROPERTY, NCRYPT_MACHINE_KEY_FLAG, NCRYPT_PROV_HANDLE,
-    NCRYPT_SILENT_FLAG,
+    MS_KEY_STORAGE_PROVIDER, MS_PLATFORM_CRYPTO_PROVIDER, NCRYPT_ALLOW_SIGNING_FLAG,
+    NCRYPT_EXPORT_POLICY_PROPERTY, NCRYPT_KEY_HANDLE, NCRYPT_KEY_USAGE_PROPERTY,
+    NCRYPT_MACHINE_KEY_FLAG, NCRYPT_PROV_HANDLE, NCRYPT_SILENT_FLAG,
 };
 
+use super::select::{der_from_p1363, Backend, ProviderError};
 use super::{spki_from_xy, IdentityKey, Protection};
 
 /// Persisted key name inside the provider.
 const KEY_NAME: &str = "TRAPD-Agent-Identity";
 
-/// Key storage provider. WP2: add `Platform` (`MS_PLATFORM_CRYPTO_PROVIDER`).
-#[derive(Clone, Copy)]
+/// Key storage provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
+    /// `MS_KEY_STORAGE_PROVIDER` (software).
     Software,
+    /// `MS_PLATFORM_CRYPTO_PROVIDER` (TPM).
+    Platform,
 }
 
 impl Provider {
     fn name(self) -> PCWSTR {
         match self {
             Provider::Software => MS_KEY_STORAGE_PROVIDER,
+            Provider::Platform => MS_PLATFORM_CRYPTO_PROVIDER,
         }
     }
 
     fn protection(self) -> Protection {
         match self {
             Provider::Software => Protection::Software,
+            Provider::Platform => Protection::Tpm,
         }
     }
 }
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Map an HRESULT to a [`ProviderError`]. With `provider_stage` set, the codes
+/// that mean "this provider cannot be used on this machine" (TPM absent,
+/// disabled, not ready, provider DLL missing, TBS/PCP errors) become
+/// `Unavailable`; everything else is `Failed`.
+fn classify(what: &str, hr: i32, provider_stage: bool) -> Result<(), ProviderError> {
+    if hr >= 0 {
+        return Ok(());
+    }
+    if provider_stage && is_provider_unavailable(hr) {
+        return Err(ProviderError::Unavailable(format!(
+            "{what}: HRESULT 0x{:08X}",
+            hr as u32
+        )));
+    }
+    Err(ProviderError::Failed(anyhow!(
+        "{what} failed: HRESULT 0x{:08X}",
+        hr as u32
+    )))
+}
+
+fn is_provider_unavailable(hr: i32) -> bool {
+    let u = hr as u32;
+    hr == NTE_DEVICE_NOT_READY
+        || hr == NTE_NOT_SUPPORTED
+        || hr == NTE_PROV_DLL_NOT_FOUND
+        || hr == NTE_PROVIDER_DLL_FAIL
+        // TBS (0x8028xxxx) and TPM Platform Crypto Provider (0x8029xxxx) errors,
+        // e.g. TBS_E_TPM_NOT_FOUND, TPM_E_PCP_DEVICE_NOT_READY.
+        || (0x8028_0000..=0x8029_FFFF).contains(&u)
 }
 
 fn check(what: &str, hr: i32) -> Result<()> {
@@ -85,31 +135,36 @@ pub struct CngKey {
 }
 
 impl CngKey {
-    /// Open the persisted key; when absent and `create` is set, generate it.
-    /// `Ok(None)` only when the key is absent and `create` is false.
-    pub fn open_or_create(provider: Provider, create: bool) -> Result<Option<Self>> {
+    /// Open the persisted key `key_name`; when absent and `create` is set,
+    /// generate it. `Ok(None)` only when the key is absent and `create` is
+    /// false. `ProviderError::Unavailable` means the provider itself cannot be
+    /// used on this machine (no/disabled TPM).
+    pub fn open_named(
+        provider: Provider,
+        key_name: &str,
+        create: bool,
+    ) -> Result<Option<Self>, ProviderError> {
         let mut prov: NCRYPT_PROV_HANDLE = 0;
         // SAFETY: out-pointer is valid; provider name is a static wide string.
-        check("NCryptOpenStorageProvider", unsafe {
-            NCryptOpenStorageProvider(&mut prov, provider.name(), 0)
-        })?;
+        let hr = unsafe { NCryptOpenStorageProvider(&mut prov, provider.name(), 0) };
+        classify("NCryptOpenStorageProvider", hr, true)?;
         let mut handles = Handles { prov, key: 0 };
-        let name = wide(KEY_NAME);
+        let name = wide(key_name);
         let flags = NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG;
 
         let mut key: NCRYPT_KEY_HANDLE = 0;
         // SAFETY: valid provider handle, NUL-terminated name, valid out-pointer.
         let hr = unsafe { NCryptOpenKey(handles.prov, &mut key, name.as_ptr(), 0, flags) };
-        if hr == NTE_BAD_KEYSET || hr == windows_sys::Win32::Foundation::NTE_NO_KEY {
+        if hr == NTE_BAD_KEYSET || hr == NTE_NO_KEY {
             if !create {
                 return Ok(None);
             }
-            key = Self::create_key(handles.prov, &name, flags)?;
+            key = Self::create_key(provider, handles.prov, &name, flags)?;
         } else {
-            check("NCryptOpenKey", hr)?;
+            classify("NCryptOpenKey", hr, false)?;
         }
         handles.key = key;
-        let spki = Self::export_spki(key)?;
+        let spki = Self::export_spki(key).map_err(ProviderError::Failed)?;
         Ok(Some(Self {
             handles: Mutex::new(handles),
             spki,
@@ -117,10 +172,15 @@ impl CngKey {
         }))
     }
 
-    fn create_key(prov: NCRYPT_PROV_HANDLE, name: &[u16], flags: u32) -> Result<NCRYPT_KEY_HANDLE> {
+    fn create_key(
+        provider: Provider,
+        prov: NCRYPT_PROV_HANDLE,
+        name: &[u16],
+        flags: u32,
+    ) -> Result<NCRYPT_KEY_HANDLE, ProviderError> {
         let mut key: NCRYPT_KEY_HANDLE = 0;
         // SAFETY: valid provider handle, static algorithm id, NUL-terminated name.
-        check("NCryptCreatePersistedKey", unsafe {
+        let hr = unsafe {
             NCryptCreatePersistedKey(
                 prov,
                 &mut key,
@@ -129,12 +189,15 @@ impl CngKey {
                 0,
                 flags,
             )
-        })?;
-        let result = (|| -> Result<()> {
-            // Export policy 0 = the private key can never be exported.
+        };
+        classify("NCryptCreatePersistedKey", hr, true)?;
+        let result = (|| -> Result<(), ProviderError> {
+            // Export policy 0 = the private key can never be exported. TPM
+            // keys are non-exportable by construction; the platform provider
+            // may reject the property, which is harmless there.
             let policy: u32 = 0;
             // SAFETY: key is a live handle; the buffer is a valid 4-byte DWORD.
-            check("NCryptSetProperty(export policy)", unsafe {
+            let hr = unsafe {
                 NCryptSetProperty(
                     key,
                     NCRYPT_EXPORT_POLICY_PROPERTY,
@@ -142,10 +205,13 @@ impl CngKey {
                     4,
                     NCRYPT_SILENT_FLAG,
                 )
-            })?;
+            };
+            if !(provider == Provider::Platform && hr == NTE_NOT_SUPPORTED) {
+                classify("NCryptSetProperty(export policy)", hr, false)?;
+            }
             let usage: u32 = NCRYPT_ALLOW_SIGNING_FLAG;
             // SAFETY: as above.
-            check("NCryptSetProperty(key usage)", unsafe {
+            let hr = unsafe {
                 NCryptSetProperty(
                     key,
                     NCRYPT_KEY_USAGE_PROPERTY,
@@ -153,11 +219,11 @@ impl CngKey {
                     4,
                     NCRYPT_SILENT_FLAG,
                 )
-            })?;
+            };
+            classify("NCryptSetProperty(key usage)", hr, false)?;
             // SAFETY: key is a live, not yet finalized handle.
-            check("NCryptFinalizeKey", unsafe {
-                NCryptFinalizeKey(key, NCRYPT_SILENT_FLAG)
-            })
+            let hr = unsafe { NCryptFinalizeKey(key, NCRYPT_SILENT_FLAG) };
+            classify("NCryptFinalizeKey", hr, true)
         })();
         if let Err(e) = result {
             // SAFETY: free the half-built handle (not persisted until finalized).
@@ -242,12 +308,145 @@ impl IdentityKey for CngKey {
         if written != 64 {
             bail!("unexpected ECDSA signature length {written}");
         }
-        let sig = p256::ecdsa::Signature::from_slice(&sig)
-            .map_err(|e| anyhow!("malformed CNG signature: {e}"))?;
-        Ok(sig.to_der().as_bytes().to_vec())
+        der_from_p1363(&sig)
     }
 
     fn protection(&self) -> Protection {
         self.provider.protection()
+    }
+}
+
+/// [`Backend`] over one CNG provider and key name.
+pub struct CngBackend {
+    pub provider: Provider,
+    pub key_name: &'static str,
+}
+
+impl Backend for CngBackend {
+    type Key = CngKey;
+    fn open(&self, create: bool) -> Result<Option<CngKey>, ProviderError> {
+        CngKey::open_named(self.provider, self.key_name, create)
+    }
+}
+
+/// Default backends for the production key name.
+pub fn backends() -> (CngBackend, CngBackend) {
+    (
+        CngBackend {
+            provider: Provider::Platform,
+            key_name: KEY_NAME,
+        },
+        CngBackend {
+            provider: Provider::Software,
+            key_name: KEY_NAME,
+        },
+    )
+}
+
+/// Record file naming the provider that holds the key.
+const RECORD_FILE: &str = "identity.provider";
+
+fn record_path() -> std::path::PathBuf {
+    crate::paths::state_dir().join(RECORD_FILE)
+}
+
+fn read_record() -> Result<Option<Protection>> {
+    match std::fs::read_to_string(record_path()) {
+        Ok(raw) => super::select::parse_record(&raw).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!("read {}: {e}", record_path().display())),
+    }
+}
+
+fn write_record(p: Protection) -> Result<()> {
+    crate::paths::write_atomic(&record_path(), p.as_str().as_bytes(), 0o600)
+}
+
+fn finish(sel: super::select::Selected<CngKey>) -> Result<Box<dyn IdentityKey>> {
+    if sel.record_needed {
+        // The record only hardens against provider confusion; the key itself
+        // is already persisted, so a failed write must not fail the agent.
+        if let Err(e) = write_record(sel.protection) {
+            tracing::warn!(error = %e, "identity: could not write the provider record");
+        }
+    }
+    Ok(Box::new(sel.key))
+}
+
+pub fn load_or_create() -> Result<Box<dyn IdentityKey>> {
+    let (tpm, sw) = backends();
+    finish(super::select::select_or_create(read_record()?, &tpm, &sw)?)
+}
+
+pub fn load_existing() -> Result<Option<Box<dyn IdentityKey>>> {
+    let (tpm, sw) = backends();
+    match super::select::select_existing(read_record()?, &tpm, &sw)? {
+        Some(sel) => finish(sel).map(Some),
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+
+    /// Needs a real TPM (or the software KSP); run with
+    /// `cargo test -- --ignored identity::windows_cng` as Administrator.
+    /// Creates a throwaway machine key, signs, verifies, deletes it.
+    fn roundtrip(provider: Provider) {
+        let name = format!("TRAPD-Agent-Identity-test-{}", std::process::id());
+        let key = CngKey::open_named(provider, &name, true)
+            .unwrap_or_else(|e| panic!("create failed: {e}"))
+            .unwrap();
+        assert_eq!(
+            key.protection(),
+            if provider == Provider::Platform {
+                Protection::Tpm
+            } else {
+                Protection::Software
+            }
+        );
+        let spki = key.public_key_spki_der();
+        let vk = VerifyingKey::from_sec1_bytes(&spki[26..]).unwrap();
+        let msg = b"trapd-agent-session-v1\nagent\nnonce";
+        let sig = Signature::from_der(&key.sign(msg).unwrap()).unwrap();
+        vk.verify(msg, &sig).unwrap();
+        assert!(vk.verify(b"other", &sig).is_err());
+        // Reopening yields the same public key.
+        let again = CngKey::open_named(provider, &name, false).unwrap().unwrap();
+        assert_eq!(again.public_key_spki_der(), spki);
+        drop(again);
+        delete_key(provider, &name);
+        assert!(CngKey::open_named(provider, &name, false)
+            .unwrap()
+            .is_none());
+    }
+
+    fn delete_key(provider: Provider, name: &str) {
+        use windows_sys::Win32::Security::Cryptography::NCryptDeleteKey;
+        let mut prov: NCRYPT_PROV_HANDLE = 0;
+        let flags = NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG;
+        let w = wide(name);
+        let mut key: NCRYPT_KEY_HANDLE = 0;
+        // SAFETY: standard open/delete sequence; NCryptDeleteKey frees the key handle.
+        unsafe {
+            assert!(NCryptOpenStorageProvider(&mut prov, provider.name(), 0) >= 0);
+            assert!(NCryptOpenKey(prov, &mut key, w.as_ptr(), 0, flags) >= 0);
+            assert!(NCryptDeleteKey(key, NCRYPT_SILENT_FLAG) >= 0);
+            NCryptFreeObject(prov);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs Windows + Administrator"]
+    fn software_provider_roundtrip() {
+        roundtrip(Provider::Software);
+    }
+
+    #[test]
+    #[ignore = "needs Windows + Administrator + a TPM"]
+    fn platform_provider_roundtrip() {
+        roundtrip(Provider::Platform);
     }
 }

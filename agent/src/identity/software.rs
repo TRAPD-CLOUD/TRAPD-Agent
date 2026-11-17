@@ -2,11 +2,12 @@
 //!
 //! Linux (and any non-Windows target): the key is the raw 32-byte P-256 scalar
 //! in `identity.key` in the state directory, mode 0600, written atomically.
-//! Windows: a non-exportable CNG key in the Microsoft Software Key Storage
-//! Provider (see `windows_cng`); no key material ever touches the disk.
+//! Windows has no file key: the CNG providers live in `windows_cng`.
 
+#[cfg(not(windows))]
 use anyhow::Result;
 
+#[cfg(not(windows))]
 use super::IdentityKey;
 
 #[cfg(not(windows))]
@@ -109,22 +110,6 @@ pub fn load_or_create() -> Result<Box<dyn IdentityKey>> {
 #[cfg(not(windows))]
 pub fn load_existing() -> Result<Option<Box<dyn IdentityKey>>> {
     Ok(SoftwareKey::load_at(&file::default_path())?.map(|k| Box::new(k) as Box<dyn IdentityKey>))
-}
-
-#[cfg(windows)]
-pub fn load_or_create() -> Result<Box<dyn IdentityKey>> {
-    Ok(Box::new(
-        super::windows_cng::CngKey::open_or_create(super::windows_cng::Provider::Software, true)?
-            .expect("create=true always yields a key"),
-    ))
-}
-
-#[cfg(windows)]
-pub fn load_existing() -> Result<Option<Box<dyn IdentityKey>>> {
-    Ok(
-        super::windows_cng::CngKey::open_or_create(super::windows_cng::Provider::Software, false)?
-            .map(|k| Box::new(k) as Box<dyn IdentityKey>),
-    )
 }
 
 #[cfg(all(test, not(windows)))]
