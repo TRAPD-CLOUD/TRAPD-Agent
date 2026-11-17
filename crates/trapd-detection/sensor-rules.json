@@ -81,6 +81,42 @@
   "technique": "T1562.006"
  },
  {
+  "id": "selfprotect.network_silenced",
+  "base": "high",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.004"
+ },
+ {
+  "id": "selfprotect.backend_redirected",
+  "base": "medium",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": true,
+  "tactic": "TA0006 Credential Access",
+  "technique": "T1557"
+ },
+ {
+  "id": "selfprotect.tls_pin_mismatch",
+  "base": "high",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0006 Credential Access",
+  "technique": "T1557"
+ },
+ {
+  "id": "selfprotect.backend_unreachable_selective",
+  "base": "medium",
+  "max": "medium",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.004"
+ },
+ {
   "id": "selfprotect.service_stop_requested",
   "base": "high",
   "max": "high",

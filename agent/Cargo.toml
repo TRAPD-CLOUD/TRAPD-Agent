@@ -37,6 +37,12 @@ globset            = "0.4"
 ipnet              = { version = "2", features = ["serde"] }
 getrandom          = "0.3"
 zeroize            = { version = "1", features = ["derive"] }
+# Custom ServerCertVerifier for SPKI pinning (selfprotect::network_guard::tls_pin).
+# Both crates are already in the tree through reqwest's rustls-tls; they are
+# direct dependencies only so the verifier and root store can be built by hand.
+# ring provider only: no aws-lc-rs (C toolchain) in the Windows cross build.
+rustls             = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots       = "1"
 
 [features]
 yara = ["trapd-detection/yara"]
@@ -91,6 +97,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Memory",
+    "Win32_System_Rpc",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_System_ProcessStatus",
     "Win32_System_WindowsProgramming",
     "Win32_System_Diagnostics_ToolHelp",

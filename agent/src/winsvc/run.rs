@@ -483,6 +483,10 @@ pub(super) async fn run_agent(
     // Runtime self-protection: periodic binary recheck and a health watchdog
     // over the liveness beats (consumer, event log, ETW).
     spawn_collector!(crate::selfprotect::runtime_guard::BinaryIntegrityMonitor);
+    // L4: WFP/firewall blocks, hosts/proxy/NRPT redirects, TLS pin mismatches.
+    spawn_collector!(crate::selfprotect::network_guard::NetworkGuard::new(
+        &backend_url
+    ));
     handles.push(tokio::spawn(
         crate::selfprotect::runtime_guard::run_health_watchdog(),
     ));
