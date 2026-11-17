@@ -34,6 +34,7 @@ EBPF_INSTALL_DIR="/usr/lib/trapd-agent"
 EBPF_INSTALL_BIN="${EBPF_INSTALL_DIR}/trapd-agent-exec"
 UPDATE_BIN="/usr/local/bin/trapd-update"
 SERVICE_FILE="/etc/systemd/system/trapd-agent.service"
+SLEEP_HOOK_FILE="/usr/lib/systemd/system-sleep/trapd-agent"
 UPDATE_SERVICE_FILE="/etc/systemd/system/trapd-update.service"
 UPDATE_TIMER_FILE="/etc/systemd/system/trapd-update.timer"
 DECEPTION_DROPIN_DIR="/etc/systemd/system/trapd-agent.service.d"
@@ -396,6 +397,26 @@ EOF
 elif [[ -f "$DECEPTION_DROPIN_FILE" ]]; then
     echo "Keeping existing honeytoken drop-in (${DECEPTION_DROPIN_FILE})."
 fi
+
+# ── Suspend announcement hook (identical to deploy/trapd-agent-sleep) ────────
+install -d -m 0755 "$(dirname "$SLEEP_HOOK_FILE")"
+cat > "$SLEEP_HOOK_FILE" <<'HOOK'
+#!/bin/sh
+# systemd-sleep hook: tell the TRAPD agent the host is about to suspend, so the
+# backend expects the coming silence instead of reporting a silent agent.
+# The agent sends one final heartbeat on SIGUSR2 (bounded to 1.5 s); the short
+# wait gives it that time before the host suspends. Never blocks suspend: the
+# hook always exits 0.
+case "$1" in
+pre)
+    if systemctl is-active --quiet trapd-agent.service; then
+        systemctl kill --signal=SIGUSR2 --kill-whom=main trapd-agent.service 2>/dev/null && sleep 2
+    fi
+    ;;
+esac
+exit 0
+HOOK
+chmod 0755 "$SLEEP_HOOK_FILE"
 
 # ── Install already-verified legacy updater (manual recovery only) ───────────
 install -m 0755 "$RELEASE_STAGE/trapd-update.sh" "$UPDATE_BIN"

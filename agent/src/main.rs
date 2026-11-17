@@ -92,6 +92,10 @@ async fn main() -> Result<()> {
         println!("trapd-agent v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // Before anything that can take time: the sleep hook's SIGUSR2 would
+    // otherwise terminate the agent (default action).
+    let (suspend, suspend_requests) = heartbeat::suspend::channel();
+    heartbeat::suspend::install_sleep_signal(suspend);
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -604,6 +608,20 @@ async fn main() -> Result<()> {
             Arc::clone(&agent_config),
         )?;
         backend_tasks.push(tokio::spawn(async move { heartbeat.run().await }));
+        let suspend_beat = std::sync::Arc::new(Heartbeat::new(
+            &backend_url,
+            agent_id.clone(),
+            token.clone(),
+            hostname.clone(),
+            Arc::clone(&agent_config),
+        )?);
+        backend_tasks.push(tokio::spawn(heartbeat::suspend::serve(
+            suspend_requests,
+            move || {
+                let beat = std::sync::Arc::clone(&suspend_beat);
+                async move { beat.send_host_shutdown().await }
+            },
+        )));
         stop_announcer = stop_announcer.with_backend(
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?,
             Heartbeat::new(

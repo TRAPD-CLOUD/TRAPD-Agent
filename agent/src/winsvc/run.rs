@@ -214,6 +214,7 @@ async fn reconcile_pending_firewall_expiry() -> Vec<crate::prevention::winfirewa
 /// must already be loaded via [`load_config_env`].
 pub(super) async fn run_agent(
     mut stop: tokio::sync::mpsc::UnboundedReceiver<super::StopRequest>,
+    suspend: tokio::sync::mpsc::UnboundedReceiver<crate::heartbeat::suspend::Request>,
     on_ready: impl FnOnce(),
     as_service: bool,
 ) -> Result<()> {
@@ -684,6 +685,20 @@ pub(super) async fn run_agent(
             Arc::clone(&agent_config),
         )?;
         handles.push(tokio::spawn(async move { heartbeat.run().await }));
+        let suspend_beat = Arc::new(Heartbeat::new(
+            &backend_url,
+            agent_id.clone(),
+            token.clone(),
+            hostname.clone(),
+            Arc::clone(&agent_config),
+        )?);
+        handles.push(tokio::spawn(crate::heartbeat::suspend::serve(
+            suspend,
+            move || {
+                let beat = Arc::clone(&suspend_beat);
+                async move { beat.send_host_shutdown().await }
+            },
+        )));
         stop_announcer = stop_announcer.with_backend(
             Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?,
             Heartbeat::new(

@@ -11,6 +11,7 @@
 //! same shape.
 
 pub mod lifecycle;
+pub mod suspend;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -39,8 +40,9 @@ struct HeartbeatPayload {
     agent_last_restart: String,
     /// How the previous run ended: clean, unclean (killed/crashed) or unknown.
     previous_shutdown: lifecycle::PreviousShutdown,
-    /// Set only on the final beat of an orderly host shutdown (reboot, power
-    /// off). Tells the backend the coming silence is expected. A hint from an
+    /// Set only on the final beat before the host goes quiet on purpose: an
+    /// orderly shutdown (reboot, power off) or a suspend (see [`suspend`]).
+    /// Tells the backend the coming silence is expected. A hint from an
     /// untrusted source: the backend may only use it to keep its long silence
     /// threshold, never to suppress a finding.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -225,7 +227,8 @@ impl Heartbeat {
         }
     }
 
-    /// Final beat of a host shutdown. Returns whether the backend accepted it.
+    /// Final beat before a host shutdown or suspend. Returns whether the
+    /// backend accepted it.
     pub async fn send_host_shutdown(&self) -> bool {
         self.send_beat(true).await
     }
