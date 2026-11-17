@@ -117,6 +117,51 @@
   "technique": "T1562.001"
  },
  {
+  "id": "selfprotect.code_patched",
+  "base": "medium",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.001"
+ },
+ {
+  "id": "selfprotect.module_injected",
+  "base": "medium",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1055"
+ },
+ {
+  "id": "selfprotect.remote_thread",
+  "base": "medium",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1055"
+ },
+ {
+  "id": "selfprotect.debugger_attached",
+  "base": "medium",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.001"
+ },
+ {
+  "id": "selfprotect.handle_access",
+  "base": "low",
+  "max": "medium",
+  "mode": "signal",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.001"
+ },
+ {
   "id": "rootkit.",
   "base": "medium",
   "max": "critical",

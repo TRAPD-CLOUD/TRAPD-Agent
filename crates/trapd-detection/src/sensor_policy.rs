@@ -528,6 +528,50 @@ mod tests {
     }
 
     #[test]
+    fn process_integrity_findings_keep_their_severity_up_to_the_catalogued_cap() {
+        for (rule, sev, expect_mode) in [
+            (
+                "selfprotect.code_patched",
+                Severity::High,
+                DetectionMode::Alert,
+            ),
+            (
+                "selfprotect.module_injected",
+                Severity::Medium,
+                DetectionMode::Alert,
+            ),
+            (
+                "selfprotect.remote_thread",
+                Severity::High,
+                DetectionMode::Alert,
+            ),
+            (
+                "selfprotect.debugger_attached",
+                Severity::High,
+                DetectionMode::Alert,
+            ),
+            (
+                "selfprotect.handle_access",
+                Severity::Medium,
+                DetectionMode::Signal,
+            ),
+        ] {
+            let mut e = finding(rule, 70, sev);
+            let EventData::Detection(d) = &mut e.data else {
+                unreachable!()
+            };
+            d.base_severity = Some(sev);
+            assert_eq!(classify(&mut e), Disposition::Forward);
+            assert_eq!(mode(&e), Some(expect_mode), "{rule}");
+            if expect_mode == DetectionMode::Alert {
+                assert_eq!(e.severity, sev, "{rule}");
+            } else {
+                assert!(e.severity <= Severity::Low, "{rule}: report-only");
+            }
+        }
+    }
+
+    #[test]
     fn table_parses_and_every_entry_is_consistent() {
         for e in table() {
             assert!(rank(e.base) <= rank(e.max), "{} base above max", e.id);
