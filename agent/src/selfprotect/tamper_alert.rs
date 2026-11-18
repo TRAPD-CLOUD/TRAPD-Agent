@@ -198,16 +198,22 @@ pub async fn report(err: &anyhow::Error) {
     // Persist first: if the send is cut off or the host dies, the next healthy
     // start still reports it.
     write_state(dir, &state);
-    if offline() {
-        return;
-    }
-    let Some(creds) = crate::enrollment::load_persisted().await else {
-        return;
-    };
+    let creds = crate::enrollment::load_persisted().await;
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".into());
-    let events = [event(&state, &creds.agent_id, &hostname)];
+    let agent_id = creds.as_ref().map_or("unenrolled", |c| c.agent_id.as_str());
+    let events = [event(&state, agent_id, &hostname)];
+    // This event bypasses the consumer, where every other selfprotect event
+    // reaches the local security log; write it here, before any network, so
+    // the host's own log shows the refused start even when nothing is sent.
+    crate::selfprotect::local_log::record(&events[0]);
+    if offline() {
+        return;
+    }
+    let Some(creds) = creds else {
+        return;
+    };
     let backend = std::env::var("TRAPD_BACKEND_URL").unwrap_or_default();
     let sent = tokio::time::timeout(SEND_TIMEOUT, async {
         let bearer = crate::identity::SessionTokens::for_cli(&backend, &creds)
