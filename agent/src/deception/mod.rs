@@ -45,6 +45,7 @@
 //!     is present in the local register, so a malformed command can never make
 //!     the agent delete an arbitrary file.
 
+pub mod living;
 pub mod profiler;
 pub mod registry;
 pub mod selftest;

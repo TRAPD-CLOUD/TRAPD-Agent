@@ -410,6 +410,11 @@ pub struct AgentConfig {
     /// chose another one. Out-of-range values are clamped on use.
     #[serde(default, skip_serializing_if = "skip_if_zero")]
     pub honeytoken_selftest_interval_secs: u64,
+    /// Let the agent move the access time of its own honeytokens now and then so they do not
+    /// stand out as files nobody ever opened (`deception::living`). Off by default and omitted
+    /// from the signed bytes while off. Declared after `honeytoken_selftest_interval_secs`.
+    #[serde(default, skip_serializing_if = "skip_if_false")]
+    pub honeytoken_living_enabled: bool,
 }
 
 pub use trapd_detection::RuleModeOverride;
@@ -498,6 +503,7 @@ impl Default for AgentConfig {
             sensitive_file_read_enabled: true,
             device_serial_capture_enabled: false,
             honeytoken_selftest_interval_secs: 0,
+            honeytoken_living_enabled: false,
         }
     }
 }
@@ -1288,6 +1294,26 @@ mod signed_config_tests {
             json2.find("\"device_serial_capture_enabled\"").unwrap()
                 < json2.find("\"honeytoken_selftest_interval_secs\"").unwrap(),
             "the interval is the last field, after device_serial_capture_enabled"
+        );
+    }
+
+    #[test]
+    fn living_decoys_default_off_and_follow_the_selftest_interval_in_the_signed_bytes() {
+        let config = AgentConfig::default();
+        assert!(!config.honeytoken_living_enabled);
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("honeytoken_living_enabled"));
+        let on = AgentConfig {
+            honeytoken_selftest_interval_secs: 86_400,
+            honeytoken_living_enabled: true,
+            ..AgentConfig::default()
+        };
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(
+            json.find("\"honeytoken_selftest_interval_secs\"").unwrap()
+                < json.find("\"honeytoken_living_enabled\":true").unwrap(),
+            "{json}"
         );
     }
 

@@ -1512,6 +1512,16 @@ Discriminated by `kind`.
   with `kill_pid`. Both are best-effort: a process that already exited audits
   `success=false` rather than erroring.
 
+#### Living decoys (`honeytoken_living_enabled`)
+
+- Opt-in (signed config, default off). The agent moves only the **access time** of its
+  own registered tokens now and then, to a plausible moment (about once a day per token,
+  jittered, most days nothing), so a decoy does not stand out as a file nobody ever
+  opened. Content and modification time stay as deployed; the integrity digest is
+  unaffected. It never follows a symlink and skips a file whose size changed. The agent's
+  own process is excluded from the honeytoken sensor, so this raises no alert. Reads no
+  user data. See `agent/src/deception/living.rs`.
+
 #### `selftest_honeytoken` semantics
 
 - Proves the alarm path of one deployed token end to end. A child process of the
