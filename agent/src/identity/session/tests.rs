@@ -329,6 +329,41 @@ async fn transient_bind_failure_keeps_legacy_and_the_secret_on_disk() {
 }
 
 #[tokio::test]
+async fn a_lost_bind_response_is_recovered_by_probing_a_session_before_rebinding() {
+    // The first bind commits on the server (secret dropped) but its response never arrives. The
+    // retry must ask for a session with the local key instead of binding with the dead secret.
+    let dir = scratch("lostbind");
+    let path = dir.join("credentials.json");
+    write_legacy_creds(&path);
+    let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inner = backend(401, 900_000, Arc::new(AtomicU32::new(0)));
+    let flag = Arc::clone(&committed);
+    let handler: Handler = Arc::new(move |req: &Req| {
+        if req.path.ends_with("/identity/bind") && !flag.swap(true, Ordering::SeqCst) {
+            return (500, "{}".into()); // committed, answer lost
+        }
+        inner(req)
+    });
+    let mock = Mock::start(handler).await;
+    let h = holder(&mock.base, Some(path.clone()), legacy(), false);
+
+    assert_eq!(h.current().await, "legacy-secret");
+    assert_eq!(mock.count("/identity/bind"), 1);
+    h.state.lock().await.next_attempt = Instant::now();
+    assert_eq!(
+        h.current().await,
+        "tok-1",
+        "session recovered with the existing key"
+    );
+    assert_eq!(
+        mock.count("/identity/bind"),
+        1,
+        "no second bind with a dead secret"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn crash_after_bind_is_recovered_without_rebinding() {
     // Backend already bound the key and nulled the secret (bind would 401), but
     // the file still holds the secret.

@@ -380,6 +380,10 @@ impl SessionTokens {
     }
 
     fn bind_failed(&self, st: &mut State, why: &str) {
+        // The failure is ambiguous: the backend may have committed the bind (and dropped the legacy
+        // secret) while the response got lost or timed out. Ask for a session with the local key
+        // before the next bind attempt, otherwise the retries would keep using a dead secret.
+        st.probe_session_first = true;
         st.fails = st.fails.saturating_add(1);
         let wait = backoff::jittered_delay(st.fails).max(MIN_RETRY);
         st.next_attempt = Instant::now() + wait;
