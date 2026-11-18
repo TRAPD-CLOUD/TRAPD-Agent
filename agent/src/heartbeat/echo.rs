@@ -10,11 +10,13 @@
 //!
 //! Trust: the nonce is backend-provided and untrusted input. It is accepted
 //! only in a strict shape (bounded length, URL-safe alphabet), echoed back
-//! verbatim and never interpreted. One nonce is echoed once; the backend
-//! repeats an unanswered challenge, so a lost event is retried by the next
-//! challenge, not by this module.
+//! verbatim and never interpreted. The backend repeats an unanswered challenge on
+//! every beat. Handing an echo to the channel is not delivery: the spool may evict it during an
+//! outage. So a repeated challenge is answered again, but bounded: not before
+//! [`RESEND_AFTER`] has passed and at most [`MAX_RESENDS`] extra times per nonce.
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::sync::mpsc::WeakSender;
@@ -23,6 +25,11 @@ use trapd_schema::{AgentEvent, DetectionData, EventAction, EventClass, EventData
 pub const RULE_ID: &str = "agent.liveness_echo";
 /// Upper bound for a heartbeat response body that is even looked at.
 pub const MAX_RESPONSE_BYTES: usize = 4096;
+
+/// A repeated challenge is answered again only after this long...
+const RESEND_AFTER: Duration = Duration::from_secs(120);
+/// ...and at most this many extra times.
+const MAX_RESENDS: u32 = 3;
 
 const MIN_NONCE_LEN: usize = 16;
 const MAX_NONCE_LEN: usize = 128;
@@ -75,9 +82,14 @@ pub struct LivenessEcho {
     hostname: String,
     /// Weak, so the echo never keeps the event pipeline open at shutdown.
     tx: WeakSender<AgentEvent>,
-    /// The last nonce handed to the pipeline; a repeated challenge (the
-    /// backend resends an unanswered one every beat) is not echoed again.
-    last: Mutex<Option<String>>,
+    /// The last nonce handed to the pipeline, when, and how often it was resent.
+    last: Mutex<Option<Sent>>,
+}
+
+struct Sent {
+    nonce: String,
+    at: Instant,
+    resends: u32,
 }
 
 impl LivenessEcho {
@@ -91,27 +103,41 @@ impl LivenessEcho {
     }
 
     /// Enqueue an echo for the challenge in `body`. Returns whether an event
-    /// was handed to the pipeline. A full channel drops the echo (the backend
-    /// challenges again), and the nonce stays unanswered so the repeat is
-    /// tried.
+    /// was handed to the pipeline. A full channel drops the echo (counted as a drop), and the
+    /// nonce stays unanswered so the repeat is tried.
     pub fn handle(&self, body: &[u8]) -> bool {
+        self.handle_at(body, Instant::now())
+    }
+
+    fn handle_at(&self, body: &[u8], now: Instant) -> bool {
         let Some(nonce) = parse_nonce(body) else {
             return false;
         };
         let Ok(mut last) = self.last.lock() else {
             return false;
         };
-        if last.as_deref() == Some(nonce.as_str()) {
-            return false;
-        }
+        let resends = match last.as_ref() {
+            Some(sent) if sent.nonce == nonce => {
+                if sent.resends >= MAX_RESENDS || now.duration_since(sent.at) < RESEND_AFTER {
+                    return false;
+                }
+                sent.resends + 1
+            }
+            _ => 0,
+        };
         let Some(tx) = self.tx.upgrade() else {
             return false;
         };
         let event = echo_event(&self.agent_id, &self.hostname, &nonce);
-        if tx.try_send(event).is_err() {
+        // Counted and attributed like every other event the pipeline refuses.
+        if !crate::pipeline::try_emit(&tx, event, "liveness_echo") {
             return false;
         }
-        *last = Some(nonce);
+        *last = Some(Sent {
+            nonce,
+            at: now,
+            resends,
+        });
         true
     }
 }
@@ -178,7 +204,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let echo = LivenessEcho::new("agent-1".into(), "host".into(), tx.downgrade());
         assert!(echo.handle(&body(NONCE)));
-        // The backend repeats an unanswered challenge on every beat.
+        // The backend repeats an unanswered challenge on every beat: not echoed again at once.
         assert!(!echo.handle(&body(NONCE)));
         let ev = serde_json::to_value(rx.try_recv().unwrap()).unwrap();
         assert_eq!(ev["data"]["evidence"]["nonce"], NONCE);
@@ -218,5 +244,31 @@ mod tests {
         drop(tx);
         assert!(!echo.handle(&body(NONCE)));
         drop(rx);
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_challenge_is_resent_after_a_delay_but_only_a_few_times() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let echo = LivenessEcho::new("agent-1".into(), "host".into(), tx.downgrade());
+        let t0 = Instant::now();
+        assert!(echo.handle_at(&body(NONCE), t0));
+        // The first echo may have been evicted from the spool: after the delay it is sent again.
+        assert!(!echo.handle_at(&body(NONCE), t0 + RESEND_AFTER - Duration::from_secs(1)));
+        let mut at = t0;
+        for _ in 0..MAX_RESENDS {
+            at += RESEND_AFTER;
+            assert!(echo.handle_at(&body(NONCE), at), "resend");
+        }
+        at += RESEND_AFTER;
+        assert!(
+            !echo.handle_at(&body(NONCE), at),
+            "bounded: no endless retransmission"
+        );
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok()).count(),
+            1 + MAX_RESENDS as usize
+        );
+        // A new challenge starts over.
+        assert!(echo.handle_at(&body("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo"), at));
     }
 }
