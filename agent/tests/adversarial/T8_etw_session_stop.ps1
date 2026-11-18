@@ -41,7 +41,7 @@ for ($i = 0; $i -lt 24 -and -not $found; $i++) {
 $recreated = ($LASTEXITCODE -eq 0)
 if (-not $recreated) {
     Write-Host 'session not recreated by the agent; restarting the service to restore it'
-    Restart-Service trapd-agent -ErrorAction SilentlyContinue
+    Restart-Service trapd-agent -Force -ErrorAction SilentlyContinue
 }
 
 if ($found) {
