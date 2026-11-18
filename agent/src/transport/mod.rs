@@ -231,6 +231,19 @@ impl Transport {
         let seqs: Vec<u64> = batch.iter().map(|e| e.seq).collect();
         let (body, compressed) = encode_body(raw, self.gzip_ok.load(Ordering::Relaxed));
         let bearer = self.tokens.current().await;
+        if bearer.is_empty() {
+            // No usable session (acquisition failed or the identity is stopped). Sending would only
+            // earn a 401; keep the batch queued and try again after the session is back.
+            warn!(
+                events = n,
+                "Transport: no session token available — will retry"
+            );
+            metrics().transport_batch_failed();
+            if let Ok(mut buf) = self.buffer.lock() {
+                buf.nack(&seqs);
+            }
+            return FlushOutcome::Failed;
+        }
         let mut request = self
             .client
             .post(&self.ingest_url)
@@ -337,6 +350,17 @@ impl Transport {
                     // A rollout may route the next request to an older gateway.
                     // Retry its legacy contract once, preserving every event ID.
                     self.ocsf_ok.store(false, Ordering::Relaxed);
+                    if let Ok(mut buf) = self.buffer.lock() {
+                        buf.nack(&seqs);
+                    }
+                    FlushOutcome::Failed
+                } else if status == reqwest::StatusCode::UNAUTHORIZED {
+                    // An expired or rejected session says nothing about the events: the renewal is
+                    // already scheduled (report_unauthorized), so keep the batch for the next try.
+                    warn!(
+                        events = n,
+                        "Transport: session rejected (401) — will retry after renewal"
+                    );
                     if let Ok(mut buf) = self.buffer.lock() {
                         buf.nack(&seqs);
                     }
@@ -719,6 +743,34 @@ mod tests {
     async fn partial_rejection_does_not_double_count_an_evicted_record() {
         let _guard = RESPONSE_TEST_LOCK.lock().await;
         assert_eq!(flush_with_response("200 OK", true, true).await.0, 0);
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_keeps_the_batch_queued() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
+        let buffer = Arc::new(Mutex::new(Spool::in_memory(2)));
+        buffer.lock().unwrap().push(event()).unwrap();
+        let body = "{}";
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        let (url, backend) = mock_backend_with(vec![response], || {}).await;
+        let mut transport = transport_for(url, 0);
+        transport.priority_wake = buffer.lock().unwrap().priority_wake();
+        transport.buffer = Arc::clone(&buffer);
+        let before = metrics().snapshot();
+        assert_eq!(transport.flush(false).await, FlushOutcome::Failed);
+        backend.await.unwrap();
+        assert_eq!(
+            buffer.lock().unwrap().len(),
+            1,
+            "a 401 is a session problem, not a verdict on the events"
+        );
+        assert_eq!(
+            metrics().snapshot().backend_rejected_events_total,
+            before.backend_rejected_events_total
+        );
     }
 
     // ── Retryable vs permanent statuses ─────────────────────────────────────
