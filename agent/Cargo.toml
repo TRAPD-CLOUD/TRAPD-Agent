@@ -44,6 +44,10 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8
 # ring provider only: no aws-lc-rs (C toolchain) in the Windows cross build.
 rustls             = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots       = "1"
+# Direct dependency (already in the tree through rustls) only to rebuild the validated certification
+# path of a handshake: pins must match certificates that took part in it, not whatever else the
+# server appended to its chain. Same features rustls enables.
+rustls-webpki      = { version = "0.103", default-features = false, features = ["ring", "std"] }
 
 [features]
 yara = ["trapd-detection/yara"]

@@ -110,6 +110,23 @@ pub fn split_bypass(raw: &str) -> Vec<String> {
 }
 
 /// Proxy configuration from process environment values.
+/// A proxy setting without credentials: `http://user:pass@proxy:3128/` becomes
+/// `http://proxy:3128/`. Proxy URLs end up in logs and telemetry, which must never carry the
+/// password (clipping a long string would not remove it).
+pub fn redact_userinfo(server: &str) -> String {
+    let (scheme, rest) = match server.split_once("://") {
+        Some((s, r)) => (Some(s), r),
+        None => (None, server),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    match scheme {
+        Some(s) => format!("{s}://{host}{tail}"),
+        None => format!("{host}{tail}"),
+    }
+}
+
 pub fn env_proxy(get: impl Fn(&str) -> Option<String>) -> Option<ProxyConfig> {
     let server = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
         .iter()
@@ -324,5 +341,24 @@ mod tests {
         assert!(!nrpt_applies(".", "api.trapd.eu"));
         assert!(!nrpt_applies(".other.eu", "api.trapd.eu"));
         assert!(!nrpt_applies("", "api.trapd.eu"));
+    }
+
+    #[test]
+    fn proxy_credentials_are_removed_from_reportable_text() {
+        assert_eq!(
+            redact_userinfo("http://user:p%40ss@proxy.example:3128"),
+            "http://proxy.example:3128"
+        );
+        assert_eq!(
+            redact_userinfo("https://u:p@a@proxy:8080/path?x=1"),
+            "https://proxy:8080/path?x=1"
+        );
+        assert_eq!(redact_userinfo("user:pw@proxy:3128"), "proxy:3128");
+        assert_eq!(redact_userinfo("http://proxy:3128"), "http://proxy:3128");
+        assert_eq!(redact_userinfo("proxy:3128"), "proxy:3128");
+        assert_eq!(
+            redact_userinfo("http=h:1;https=h2:2"),
+            "http=h:1;https=h2:2"
+        );
     }
 }

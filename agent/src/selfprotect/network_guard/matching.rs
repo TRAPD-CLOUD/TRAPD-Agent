@@ -127,36 +127,51 @@ impl Reason {
 /// `Some(reason)` when `f` blocks traffic of ours. A filter that has no
 /// condition naming us or the backend (a plain "block all" default policy) is
 /// not flagged: it is a platform posture, not targeted silencing.
+///
+/// The condition families (application, remote address, UID, cgroup) are a conjunction, as in the
+/// firewalls themselves: a rule that blocks the backend address only for another user or another
+/// executable cannot block us. Every populated family must match; the reported reason is the most
+/// specific one.
 pub fn blocks_us(f: &FilterInfo, t: &Targets) -> Option<Reason> {
     if f.verdict != Verdict::Block || f.disabled {
         return None;
     }
-    if f.app_ids.iter().any(|a| t.app_ids.contains(a)) {
-        return Some(Reason::AppId);
-    }
-    if let Some(uid) = t.uid {
-        if f.uid_ranges
+    let app = (!f.app_ids.is_empty()).then(|| f.app_ids.iter().any(|a| t.app_ids.contains(a)));
+    let uid = (!f.uid_ranges.is_empty()).then(|| {
+        t.uid.is_some_and(|uid| {
+            f.uid_ranges
+                .iter()
+                .any(|(lo, hi)| (*lo..=*hi).contains(&uid))
+        })
+    });
+    let remote = (!f.remote.is_empty()).then(|| {
+        f.remote
             .iter()
-            .any(|(lo, hi)| (*lo..=*hi).contains(&uid))
-        {
-            return Some(Reason::Uid);
+            .any(|m| t.backend_ips.iter().any(|ip| m.contains(*ip)))
+    });
+    let cgroup = (!f.cgroup_paths.is_empty() || !f.cgroup_ids.is_empty()).then(|| {
+        let path_hit = t
+            .cgroup_path
+            .as_ref()
+            .is_some_and(|p| f.cgroup_paths.iter().any(|c| c == p));
+        let id_hit = t.cgroup_id.is_some_and(|id| f.cgroup_ids.contains(&id));
+        path_hit || id_hit
+    });
+    let populated = [
+        (app, Reason::AppId),
+        (uid, Reason::Uid),
+        (remote, Reason::BackendAddress),
+        (cgroup, Reason::Cgroup),
+    ];
+    let mut reason = None;
+    for (matched, why) in populated {
+        match matched {
+            Some(false) => return None,
+            Some(true) => reason = reason.or(Some(why)),
+            None => {}
         }
     }
-    if f.remote
-        .iter()
-        .any(|m| t.backend_ips.iter().any(|ip| m.contains(*ip)))
-    {
-        return Some(Reason::BackendAddress);
-    }
-    let path_hit = t
-        .cgroup_path
-        .as_ref()
-        .is_some_and(|p| f.cgroup_paths.iter().any(|c| c == p));
-    let id_hit = t.cgroup_id.is_some_and(|id| f.cgroup_ids.contains(&id));
-    if path_hit || id_hit {
-        return Some(Reason::Cgroup);
-    }
-    None
+    reason
 }
 
 #[cfg(test)]
@@ -270,6 +285,12 @@ mod tests {
         assert_eq!(blocks_us(&f, &targets()), Some(Reason::Uid));
         f.uid_ranges = vec![(1000, 1000)];
         assert_eq!(blocks_us(&f, &targets()), None);
+        // The families are a conjunction: a uid that is not ours rules the rule out even when a
+        // cgroup condition matches, so the cgroup cases below stand on their own.
+        f.cgroup_ids = vec![4242];
+        assert_eq!(blocks_us(&f, &targets()), None);
+        f.cgroup_ids = vec![];
+        f.uid_ranges = vec![];
         f.cgroup_paths = vec!["system.slice/other.service".into()];
         f.cgroup_ids = vec![7];
         assert_eq!(blocks_us(&f, &targets()), None);
@@ -278,5 +299,44 @@ mod tests {
         f.cgroup_ids = vec![];
         f.cgroup_paths = vec!["system.slice/trapd-agent.service".into()];
         assert_eq!(blocks_us(&f, &targets()), Some(Reason::Cgroup));
+    }
+
+    #[test]
+    fn conditions_are_a_conjunction_not_alternatives() {
+        // Backend address blocked, but only for another uid or another executable: not us.
+        let mut f = filter(Verdict::Block);
+        f.remote = vec![AddrMatch::Addr(ip("203.0.113.10"))];
+        f.uid_ranges = vec![(1000, 1000)];
+        assert_eq!(
+            blocks_us(&f, &targets()),
+            None,
+            "uid 0 is outside 1000-1000"
+        );
+
+        let mut f = filter(Verdict::Block);
+        f.remote = vec![AddrMatch::Addr(ip("203.0.113.10"))];
+        f.app_ids = vec![normalize_app_id(
+            "\\device\\harddiskvolume3\\tools\\other.exe",
+        )];
+        assert_eq!(blocks_us(&f, &targets()), None, "another executable");
+
+        let mut f = filter(Verdict::Block);
+        f.remote = vec![AddrMatch::Addr(ip("198.51.100.1"))];
+        f.uid_ranges = vec![(0, 0)];
+        assert_eq!(
+            blocks_us(&f, &targets()),
+            None,
+            "uid matches, address does not"
+        );
+
+        // Every populated family matches: flagged, with the most specific reason.
+        let mut f = filter(Verdict::Block);
+        f.remote = vec![AddrMatch::Addr(ip("203.0.113.10"))];
+        f.uid_ranges = vec![(0, 0)];
+        assert_eq!(blocks_us(&f, &targets()), Some(Reason::Uid));
+        let mut f = filter(Verdict::Block);
+        f.remote = vec![AddrMatch::Net(ip("203.0.113.0"), 24)];
+        f.cgroup_ids = vec![4242];
+        assert_eq!(blocks_us(&f, &targets()), Some(Reason::BackendAddress));
     }
 }

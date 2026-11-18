@@ -368,12 +368,15 @@ fn redirect_findings_blocking(host: &str) -> Vec<Finding> {
                     "winhttp" => "proxy_winhttp",
                     _ => "proxy_wininet",
                 },
-                subject: p.server.clone(),
+                // The proxy URL may carry credentials (`http://user:password@proxy:3128`). The subject
+                // and detail are logged and sent as telemetry, so only the redacted form goes in.
+                subject: redirect::redact_userinfo(&p.server),
                 detail: format!(
                     "A {} proxy setting routes backend traffic through {}",
-                    p.source, p.server
+                    p.source,
+                    redirect::redact_userinfo(&p.server)
                 ),
-                allow_keys: vec![p.server.clone()],
+                allow_keys: vec![redirect::redact_userinfo(&p.server)],
                 severity: Severity::Medium,
             });
         }
