@@ -17,7 +17,10 @@
 //! while it is the agent's last word; it never suppresses a stop finding.
 
 use std::sync::mpsc as std_mpsc;
+use std::sync::Mutex;
 use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{info, warn};
@@ -32,6 +35,37 @@ pub const ANNOUNCE_BUDGET: Duration = Duration::from_millis(1500);
 /// scheduling, still inside the two seconds Windows grants.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const ACK_WAIT: Duration = Duration::from_millis(1800);
+
+/// While an announcement is fresh, ordinary heartbeats are held back: a regular beat that slips in
+/// between the announcement and the actual suspend becomes the agent's last word and silently
+/// cancels the hint. Covers the window between the announcement and the host going down (the
+/// Linux hook leaves about two seconds, Windows about two).
+const HOLD: Duration = Duration::from_secs(30);
+
+/// Wall-clock deadline, on purpose: a monotonic clock may stand still during a suspend, so after the
+/// resume the wall clock is what shows that the hold is over and regular reporting resumes.
+static HOLD_UNTIL: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
+
+/// Start holding regular beats; called when a suspend announcement is made.
+pub fn hold() {
+    if let Ok(mut until) = HOLD_UNTIL.lock() {
+        *until = Some(hold_deadline(Utc::now()));
+    }
+}
+
+fn hold_deadline(now: DateTime<Utc>) -> DateTime<Utc> {
+    now + chrono::Duration::from_std(HOLD).unwrap_or_default()
+}
+
+/// Whether regular heartbeats are currently held back.
+pub fn holding() -> bool {
+    let until = HOLD_UNTIL.lock().ok().and_then(|u| *u);
+    is_held(until, Utc::now())
+}
+
+fn is_held(until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    until.is_some_and(|until| now < until)
+}
 
 /// One request: the sender is signalled once the announcement finished
 /// (delivered, failed or timed out).
@@ -112,6 +146,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn regular_beats_are_held_after_an_announcement_and_resume_afterwards() {
+        let t0 = Utc::now();
+        let until = Some(hold_deadline(t0));
+        assert!(!is_held(None, t0), "nothing announced");
+        assert!(is_held(until, t0 + chrono::Duration::seconds(1)));
+        assert!(is_held(until, t0 + chrono::Duration::seconds(29)));
+        // After a real suspend the wall clock is far ahead: normal reporting is back.
+        assert!(!is_held(until, t0 + chrono::Duration::seconds(31)));
+        assert!(!is_held(until, t0 + chrono::Duration::hours(8)));
+    }
 
     #[tokio::test]
     async fn a_request_is_acknowledged_after_the_announcement() {

@@ -176,6 +176,10 @@ struct Metrics {
     process_count: usize,
 }
 
+/// Serializes beats of all `Heartbeat` instances (regular loop, suspend announcement, stop
+/// announcement); see [`Heartbeat::send_beat`].
+static BEAT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub struct Heartbeat {
     client: reqwest::Client,
     heartbeat_url: String,
@@ -230,6 +234,8 @@ impl Heartbeat {
     /// Final beat before a host shutdown or suspend. Returns whether the
     /// backend accepted it.
     pub async fn send_host_shutdown(&self) -> bool {
+        // Hold regular beats first, so none can follow the announcement and become the last word.
+        suspend::hold();
         self.send_beat(true).await
     }
 
@@ -238,6 +244,14 @@ impl Heartbeat {
     }
 
     async fn send_beat(&self, host_shutdown: bool) -> bool {
+        // One beat at a time, across every Heartbeat instance of the process: the announcement then
+        // waits for a regular beat that is already in flight (which would otherwise land after it),
+        // and a regular beat that was waiting sees the hold and stays quiet.
+        let _serial = BEAT_LOCK.lock().await;
+        if !host_shutdown && suspend::holding() {
+            debug!("Heartbeat held back: a host suspend was announced");
+            return false;
+        }
         let metrics = self.sample_metrics();
         let life = lifecycle::begin_process();
         let payload = HeartbeatPayload {
