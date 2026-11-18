@@ -671,10 +671,15 @@ impl Checker {
     ) -> Vec<Finding> {
         let mut watched: Vec<(u64, &'static str)> = Vec::new();
         let mut exclude: Vec<u64> = Vec::new();
+        // Every target handle was opened by this process, so its table entry is owned by our own
+        // PID, whatever process it points at. Looking it up under the target's PID would miss the
+        // guard object, or match an unrelated handle with the same number in the guard's table.
+        let owner = u64::from(self.own_pid);
+        exclude.push(owner);
         for (pid, label, h) in targets {
             exclude.push(u64::from(*pid));
             let obj = handles::parse_table(table)
-                .find(|e| e.pid == u64::from(*pid) && e.handle == *h as u64)
+                .find(|e| e.pid == owner && e.handle == *h as u64)
                 .map(|e| e.object);
             match obj {
                 Some(o) if o != 0 => watched.push((o, *label)),
