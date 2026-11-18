@@ -433,7 +433,10 @@ mod tests {
         unsafe {
             assert!(NCryptOpenStorageProvider(&mut prov, provider.name(), 0) >= 0);
             assert!(NCryptOpenKey(prov, &mut key, w.as_ptr(), 0, flags) >= 0);
-            assert!(NCryptDeleteKey(key, NCRYPT_SILENT_FLAG) >= 0);
+            // HRESULT in the message: an assertion alone hid why the Platform
+            // (TPM) provider refused on real hardware.
+            let hr = NCryptDeleteKey(key, 0);
+            assert!(hr >= 0, "NCryptDeleteKey failed: {hr:#010x}");
             NCryptFreeObject(prov);
         }
     }
@@ -448,5 +451,78 @@ mod tests {
     #[ignore = "needs Windows + Administrator + a TPM"]
     fn platform_provider_roundtrip() {
         roundtrip(Provider::Platform);
+    }
+
+    /// T1c core property on real hardware: the private key cannot be exported
+    /// in any format, from either provider (TPM: hardware-bound; software:
+    /// export policy 0). Creates and deletes a throwaway key.
+    fn private_key_is_not_exportable(provider: Provider) {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCRYPT_ECCPRIVATE_BLOB, NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
+        };
+        let name = format!("TRAPD-Agent-Identity-test-export-{}", std::process::id());
+        drop(CngKey::open_named(provider, &name, true).unwrap().unwrap());
+        let mut prov: NCRYPT_PROV_HANDLE = 0;
+        let mut key: NCRYPT_KEY_HANDLE = 0;
+        let w = wide(&name);
+        let mut refused = Vec::new();
+        // SAFETY: standard open sequence on a key created above; handles freed below.
+        unsafe {
+            assert!(NCryptOpenStorageProvider(&mut prov, provider.name(), 0) >= 0);
+            assert!(
+                NCryptOpenKey(
+                    prov,
+                    &mut key,
+                    w.as_ptr(),
+                    0,
+                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG
+                ) >= 0
+            );
+            for blob in [BCRYPT_ECCPRIVATE_BLOB, NCRYPT_PKCS8_PRIVATE_KEY_BLOB] {
+                let mut len: u32 = 0;
+                let size = NCryptExportKey(
+                    key,
+                    0,
+                    blob,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut len,
+                    NCRYPT_SILENT_FLAG,
+                );
+                let hr = if size < 0 {
+                    size
+                } else {
+                    let mut buf = vec![0u8; len as usize];
+                    NCryptExportKey(
+                        key,
+                        0,
+                        blob,
+                        std::ptr::null(),
+                        buf.as_mut_ptr(),
+                        len,
+                        &mut len,
+                        NCRYPT_SILENT_FLAG,
+                    )
+                };
+                refused.push(hr < 0);
+            }
+            NCryptFreeObject(key);
+            NCryptFreeObject(prov);
+        }
+        delete_key(provider, &name);
+        assert_eq!(refused, [true, true], "private key export must be refused");
+    }
+
+    #[test]
+    #[ignore = "needs Windows + Administrator"]
+    fn software_private_key_is_not_exportable() {
+        private_key_is_not_exportable(Provider::Software);
+    }
+
+    #[test]
+    #[ignore = "needs Windows + Administrator + a TPM"]
+    fn platform_private_key_is_not_exportable() {
+        private_key_is_not_exportable(Provider::Platform);
     }
 }
