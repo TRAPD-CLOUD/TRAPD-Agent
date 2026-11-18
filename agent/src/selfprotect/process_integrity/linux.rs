@@ -548,8 +548,15 @@ mod tests {
         Config::default()
     }
 
+    /// `self_check` reads the whole process's `/proc/self/maps`, and
+    /// `live_anonymous_executable_memory_is_detected` maps an RWX page into the same process. The
+    /// default parallel test runner could scan during that window and fail the clean-process test, so
+    /// every live scan holds this lock.
+    static LIVE_SCAN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn live_a_plain_test_process_has_no_injection_findings() {
+        let _scan = LIVE_SCAN.lock().unwrap_or_else(|e| e.into_inner());
         let mut c = Checker::new(&cfg());
         let findings: Vec<_> = c
             .self_check()
@@ -567,6 +574,7 @@ mod tests {
 
     #[test]
     fn live_anonymous_executable_memory_is_detected() {
+        let _scan = LIVE_SCAN.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: anonymous private mapping, unmapped below.
         let p = unsafe {
             libc::mmap(
