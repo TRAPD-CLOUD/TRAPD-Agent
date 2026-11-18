@@ -437,3 +437,76 @@ fn a_backend_ack_that_does_not_match_is_not_applied() {
         Next::Wait(_)
     ));
 }
+
+#[test]
+fn an_acknowledgement_without_fields_or_progress_backs_off_instead_of_looping() {
+    use upload::{handle_response, Next};
+    let dir = Dir::new("ackprogress");
+    let key = Arc::new(TestKey::new());
+    let j = open(&dir, &key);
+    j.append("a", json!({})).unwrap();
+    let mut fails = 0;
+
+    // `{}` is not "sequence 0": it is no acknowledgement at all.
+    for body in [&b"{}"[..], br#"{"last_seq":1}"#, br#"{"last_hash":"00"}"#] {
+        assert!(matches!(
+            handle_response(&j, 200, body, &mut fails),
+            Next::Wait(_)
+        ));
+    }
+    assert_eq!(fails, 3);
+
+    // A well-formed acknowledgement that removes nothing must not be retried immediately either.
+    let zero = format!(r#"{{"last_seq":0,"last_hash":"{GENESIS_HASH}"}}"#);
+    assert!(matches!(
+        handle_response(&j, 200, zero.as_bytes(), &mut fails),
+        Next::Wait(_)
+    ));
+    assert!(j.has_pending());
+}
+
+#[test]
+fn a_failed_append_restores_the_file_boundary() {
+    let dir = Dir::new("rollback");
+    let path = dir.0.join("record");
+    std::fs::write(&path, b"complete line\n").unwrap();
+    let f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    let start = f.metadata().unwrap().len();
+    {
+        use std::io::Write as _;
+        (&f).write_all(b"partial reco").unwrap(); // the disk filled up mid-record
+    }
+    let err = std::io::Error::other("no space left on device");
+    assert!(rollback_on_error(&f, start, Err(err)).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"complete line\n");
+    assert!(rollback_on_error(&f, start, Ok(())).is_ok());
+}
+
+#[test]
+fn overflow_state_survives_a_restart() {
+    let dir = Dir::new("overflowrestart");
+    let key = Arc::new(TestKey::new());
+    {
+        let j = Journal::open(&dir.0, key.clone(), small(10)).unwrap();
+        for i in 0..25 {
+            let _ = j.append("selfprotect.flood", json!({ "i": i }));
+        }
+        assert_eq!(kinds(&j)["journal_truncated"], 1);
+    }
+    // Restart while still full: no second full marker beyond the cap, and the later closing marker
+    // says its count is incomplete instead of silently reporting zero.
+    let j = Journal::open(&dir.0, key.clone(), small(10)).unwrap();
+    assert!(j.append("selfprotect.more", json!({})).unwrap().is_none());
+    assert_eq!(kinds(&j)["journal_truncated"], 1);
+    let (seq, hash) = j.head();
+    assert_eq!(j.ack(seq, &hash), AckOutcome::Acked);
+    assert!(j.append("selfprotect.after", json!({})).unwrap().is_some());
+    let p = j.pending(100);
+    let closing = body(&p[0]);
+    assert_eq!(closing.payload["reason"], "overflow_dropped");
+    assert_eq!(closing.payload["dropped_events_incomplete"], true);
+    assert_eq!(closing.payload["dropped_events"], 1);
+}

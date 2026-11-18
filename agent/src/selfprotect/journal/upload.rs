@@ -26,12 +26,13 @@ const UNSUPPORTED_RETRY: Duration = Duration::from_secs(6 * 3600);
 /// A rejected chain is a fault, not a transient: do not hammer the backend.
 const REJECTED_RETRY: Duration = Duration::from_secs(15 * 60);
 
+/// Both acknowledgement fields are required: a `{}` must never read as "sequence 0, empty hash".
 #[derive(Debug, Deserialize)]
 struct AckBody {
     #[serde(default)]
-    last_seq: u64,
+    last_seq: Option<u64>,
     #[serde(default)]
-    last_hash: String,
+    last_hash: Option<String>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -52,20 +53,34 @@ pub fn handle_response(journal: &Journal, status: u16, body: &[u8], fails: &mut 
     let parsed: Option<AckBody> = serde_json::from_slice(body).ok();
     match status {
         200..=299 => {
-            let Some(b) = parsed else {
+            let Some((last_seq, last_hash)) = parsed
+                .as_ref()
+                .and_then(|b| Some((b.last_seq?, b.last_hash.as_deref()?)))
+            else {
                 *fails += 1;
                 warn!("journal upload: success without a usable acknowledgement");
                 return Next::Wait(backoff(*fails));
             };
-            match journal.ack(b.last_seq, &b.last_hash) {
+            let before = journal.first_pending_seq();
+            match journal.ack(last_seq, last_hash) {
                 AckOutcome::Acked => {
+                    if journal.has_pending() && journal.first_pending_seq() == before {
+                        // Acknowledged, but nothing was removed: sending the same batch again
+                        // immediately would loop without end and bypass the retry backoff.
+                        *fails += 1;
+                        warn!(
+                            backend_seq = last_seq,
+                            "journal upload: acknowledgement made no progress"
+                        );
+                        return Next::Wait(backoff(*fails));
+                    }
                     *fails = 0;
                     Next::Continue
                 }
                 AckOutcome::Diverged(why) => {
                     error!(
                         why,
-                        backend_seq = b.last_seq,
+                        backend_seq = last_seq,
                         "journal diverged from the backend's record"
                     );
                     Next::Wait(REJECTED_RETRY)
@@ -125,10 +140,16 @@ impl Uploader {
     pub async fn run(self) {
         let mut fails = 0u32;
         let mut wait = SETTLE;
+        // Failure backoff is a deadline of its own: a new journal entry may shorten an idle wait,
+        // never a retry delay (429, unsupported route, rejected chain, unavailable backend).
+        let mut retry_at: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 _ = self.journal.notified() => { tokio::time::sleep(SETTLE).await; }
                 _ = tokio::time::sleep(wait) => {}
+            }
+            if let Some(deadline) = retry_at.take() {
+                tokio::time::sleep_until(deadline).await;
             }
             wait = IDLE_RECHECK;
             while self.journal.has_pending() {
@@ -136,10 +157,12 @@ impl Uploader {
                     Next::Continue => continue,
                     Next::Wait(d) => {
                         wait = d;
+                        retry_at = Some(tokio::time::Instant::now() + d);
                         break;
                     }
                     Next::Reauth => {
                         wait = Duration::from_secs(5);
+                        retry_at = Some(tokio::time::Instant::now() + wait);
                         break;
                     }
                 }
