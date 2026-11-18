@@ -1518,7 +1518,7 @@ Discriminated by `kind`.
   own registered tokens now and then, to a plausible moment (about once a day per token,
   jittered, most days nothing), so a decoy does not stand out as a file nobody ever
   opened. Content and modification time stay as deployed; the integrity digest is
-  unaffected. It never follows a symlink and skips a file whose size changed. The agent's
+  unaffected. It never follows a symlink and skips a file whose size changed. Each touch is announced to the token-FIM watcher (`trapd_detection::self_touch`, 3 s, exact path, attribute changes only) so it is not reported as tamper. The agent's
   own process is excluded from the honeytoken sensor, so this raises no alert. Reads no
   user data. See `agent/src/deception/living.rs`.
 
@@ -1539,6 +1539,7 @@ Discriminated by `kind`.
 - Failures are reported as a `prevention.honeytoken_health` event whose
   `details.selftest = { ok, reason, latency_ms }`; the file-status fields are not
   touched by it.
+- A finished test stays attributable (same pid and path) for 120 s, so delayed sensor events of the child are still marked.
 - The agent also runs the test itself for every token: first within 10 minutes to
   6 hours after start (jittered), then every `honeytoken_selftest_interval_secs`
   (config; `0` = one week; clamped to 1 hour .. 90 days) with ±10 % jitter, one

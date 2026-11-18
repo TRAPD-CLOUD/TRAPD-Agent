@@ -117,6 +117,9 @@ mod unix {
         let times = fs::FileTimes::new()
             .set_accessed(target)
             .set_modified(mtime);
+        // The token-FIM watcher reports every attribute change of a token as tamper; tell it
+        // that this one is ours.
+        trapd_detection::self_touch::expect(&rec.path);
         match file.set_times(times) {
             Ok(()) => true,
             Err(error) => {

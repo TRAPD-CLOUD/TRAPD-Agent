@@ -124,6 +124,15 @@ fn persist_deployments(register: &DeploymentRegister) -> Result<()> {
     crate::paths::write_atomic(&deployment_path(), &serde_json::to_vec(register)?, 0o600)
 }
 
+/// Paths of the decoy files this agent planted itself (config-driven file decoys), for the
+/// honeytoken self-test: they live in this register, not in the command-deployed one.
+pub fn owned_decoy_paths() -> Vec<PathBuf> {
+    deployments()
+        .lock()
+        .map(|register| register.files.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 fn owns_path(path: &Path) -> bool {
     deployments()
         .lock()

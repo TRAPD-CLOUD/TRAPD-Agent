@@ -253,7 +253,7 @@ fn spawn_honeytoken_selftest(
                     Duration::from_secs(crate::config::DEFAULT_SELFTEST_INTERVAL_SECS)
                 });
             let now = Instant::now();
-            let tokens = store.list();
+            let tokens = crate::deception::selftest::targets(&store);
             due.retain(|path, _| tokens.iter().any(|t| &t.path == path));
             for token in tokens {
                 let at = *due.entry(token.path.clone()).or_insert_with(|| {

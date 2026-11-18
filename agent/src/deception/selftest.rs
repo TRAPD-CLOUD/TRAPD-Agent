@@ -65,6 +65,46 @@ impl Failure {
     }
 }
 
+/// Something the self-test can test: a token from the command-deployed register, or (Windows) a
+/// decoy file the agent planted from its signed config.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub path: String,
+    pub kind: String,
+    pub id: Option<uuid::Uuid>,
+    /// The register record when there is one (its digest is verified before the test).
+    pub record: Option<HoneytokenRecord>,
+}
+
+/// Every testable decoy of this host: the register of deployed tokens, plus on Windows the
+/// config-planted decoy files that the register does not know.
+pub fn targets(store: &HoneytokenStore) -> Vec<Target> {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut out: Vec<Target> = store
+        .list()
+        .into_iter()
+        .map(|r| Target {
+            path: r.path.clone(),
+            kind: r.kind.clone(),
+            id: Some(r.id),
+            record: Some(r),
+        })
+        .collect();
+    #[cfg(windows)]
+    for path in crate::collectors::windows::honeytokens::owned_decoy_paths() {
+        let text = path.display().to_string();
+        if !out.iter().any(|t| t.path == text) {
+            out.push(Target {
+                path: text,
+                kind: "windows_decoy_file".to_string(),
+                id: None,
+                record: None,
+            });
+        }
+    }
+    out
+}
+
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 struct RunGuard;
@@ -78,7 +118,8 @@ impl RunGuard {
 }
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        trapd_detection::selftest::disarm();
+        // Late sensor events of the child stay attributable for a bounded time.
+        trapd_detection::selftest::finish();
         RUNNING.store(false, Ordering::Release);
     }
 }
@@ -94,8 +135,8 @@ pub async fn run(
     let started = Instant::now();
     let result = execute(store, path).await;
     let latency_ms = started.elapsed().as_millis() as u64;
-    let rec = store.list().into_iter().find(|r| r.path == path);
-    let kind = rec.as_ref().map(|r| r.kind.clone()).unwrap_or_default();
+    let target = targets(store).into_iter().find(|t| t.path == path);
+    let kind = target.as_ref().map(|t| t.kind.clone()).unwrap_or_default();
     let (success, severity, reason) = match &result {
         Ok(_) => (
             true,
@@ -122,7 +163,7 @@ pub async fn run(
         command_id.map(str::to_string),
         if about_health {
             json!({
-                "id": rec.as_ref().map(|r| r.id),
+                "id": target.as_ref().and_then(|t| t.id),
                 "kind": kind,
                 "selftest": {
                     "ok": success,
@@ -146,21 +187,24 @@ async fn execute_with(
     path: &str,
     observe_timeout: Duration,
 ) -> Result<(), Failure> {
-    let rec = store
-        .list()
+    let rec = targets(store)
         .into_iter()
-        .find(|r| r.path == path)
+        .find(|t| t.path == path)
         .ok_or(Failure::NotRegistered)?;
     let _guard = RunGuard::acquire().ok_or(Failure::Busy)?;
 
     // Do not blame the sensor for a file that is simply gone.
-    let health = {
+    let present = {
         let rec = rec.clone();
-        tokio::task::spawn_blocking(move || verify_record(&rec))
-            .await
-            .map_err(|_| Failure::SpawnFailed)?
+        tokio::task::spawn_blocking(move || match &rec.record {
+            Some(record) => verify_record(record).present,
+            // A config-planted decoy has no digest in a register: it must at least still be a file.
+            None => std::fs::symlink_metadata(&rec.path).is_ok_and(|m| m.file_type().is_file()),
+        })
+        .await
+        .map_err(|_| Failure::SpawnFailed)?
     };
-    if !health.present {
+    if !present {
         return Err(Failure::FileMissing);
     }
 
@@ -202,7 +246,7 @@ async fn execute_with(
 /// The test child waits for one input byte, then opens the token and exits. It is
 /// a plain shell/`cmd` process (no agent code runs in it), so what the sensor sees
 /// is an ordinary read by an unrelated process.
-fn spawn_child(rec: &HoneytokenRecord) -> Result<Child, Failure> {
+fn spawn_child(rec: &Target) -> Result<Child, Failure> {
     let path = Path::new(&rec.path);
     #[cfg(unix)]
     {
