@@ -6,7 +6,7 @@
 //! Events are attached later, once the pipeline and identity exist; records
 //! wait in the spool directory until then.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,21 @@ static SHUTDOWN_FLAG: OnceLock<std::sync::Arc<AtomicBool>> = OnceLock::new();
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static STOP: Mutex<Option<StopNotice>> = Mutex::new(None);
 static SINK: OnceLock<Sink> = OnceLock::new();
+/// Pid of the guard as last verified over the channel (OS-reported peer pid,
+/// on Windows also matched against the SCM's pid of the guard service).
+/// 0 = unknown. Read by the handle watch; never taken from a file an
+/// attacker could pre-write.
+static VERIFIED_GUARD_PID: AtomicU32 = AtomicU32::new(0);
+
+/// The guard's pid, if the channel has verified one and it has not exited.
+// Only the Windows handle watch consumes it so far.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn verified_guard_pid() -> Option<u32> {
+    match VERIFIED_GUARD_PID.load(Ordering::Relaxed) {
+        0 => None,
+        pid => Some(pid),
+    }
+}
 
 struct Sink {
     tx: Sender<AgentEvent>,
@@ -141,6 +156,7 @@ async fn link_loop() {
                     .map(|n| classify(n, chrono::Utc::now().timestamp()));
                 monitor.observe(Instant::now(), pid, class);
                 if let Some(pid) = pid {
+                    VERIFIED_GUARD_PID.store(pid, Ordering::Relaxed);
                     if watch.as_ref().map(|(p, _, _)| *p) != Some(pid) {
                         if let Some((_, cancel, _)) = watch.take() {
                             cancel.store(true, Ordering::Relaxed);
@@ -161,6 +177,7 @@ async fn link_loop() {
         if watch.as_ref().is_some_and(|(_, _, h)| h.is_finished()) {
             if let Some((_, _, handle)) = watch.take() {
                 if handle.await.unwrap_or(false) {
+                    VERIFIED_GUARD_PID.store(0, Ordering::Relaxed);
                     monitor.mark_exited();
                 }
             }

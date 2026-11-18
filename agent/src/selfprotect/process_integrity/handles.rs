@@ -160,12 +160,6 @@ pub fn is_expected_opener(image: &str, ex: &Exclusions) -> bool {
     false
 }
 
-/// Parse a pid file (`guard.pid`): one decimal pid, nothing else.
-pub fn parse_pid_file(text: &str) -> Option<u32> {
-    let pid: u32 = text.trim().parse().ok()?;
-    (pid > 4).then_some(pid)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,15 +271,5 @@ mod tests {
         assert!(is_expected_opener(r"E:\anywhere\Backup.exe", &e));
         assert!(is_expected_opener(r"D:\Tools\Scan.exe", &e));
         assert!(!is_expected_opener(r"D:\Other\Scan.exe", &e));
-    }
-
-    #[test]
-    fn pid_file_parsing_is_strict() {
-        assert_eq!(parse_pid_file("1234\n"), Some(1234));
-        assert_eq!(parse_pid_file("  77 "), Some(77));
-        assert_eq!(parse_pid_file("4"), None);
-        assert_eq!(parse_pid_file("12 34"), None);
-        assert_eq!(parse_pid_file("-1"), None);
-        assert_eq!(parse_pid_file(""), None);
     }
 }

@@ -631,9 +631,7 @@ impl Checker {
         if !self.cfg.handles {
             return Vec::new();
         }
-        let guard_pid = std::fs::read_to_string(crate::paths::state_dir().join("guard.pid"))
-            .ok()
-            .and_then(|t| handles::parse_pid_file(&t))
+        let guard_pid = crate::selfprotect::guard::agent_link::verified_guard_pid()
             .filter(|p| *p != self.own_pid);
         // Handles to ourselves/the guard stay open during the snapshot so they
         // appear in it; their object address identifies the processes.
