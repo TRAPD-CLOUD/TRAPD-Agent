@@ -142,11 +142,33 @@ fn read_tcg_log() -> Option<Vec<u8>> {
     {
         use windows_sys::Win32::System::TpmBaseServices::{
             Tbsi_Context_Create, Tbsi_Get_TCG_Log, Tbsip_Context_Close, TBS_CONTEXT_PARAMS,
+            TBS_CONTEXT_PARAMS2, TBS_CONTEXT_PARAMS2_0, TBS_CONTEXT_PARAMS2_0_0,
+            TBS_CONTEXT_VERSION_TWO,
         };
-        let params = TBS_CONTEXT_PARAMS { version: 1 };
+        // A version 1 context only talks to TPM 1.2, so a TPM 2.0 host would never yield a log.
+        // Version 2 with both generation bits set (bit 1 = includeTpm12, bit 2 = includeTpm20)
+        // works on either.
+        const INCLUDE_TPM12: u32 = 1 << 1;
+        const INCLUDE_TPM20: u32 = 1 << 2;
+        let params = TBS_CONTEXT_PARAMS2 {
+            version: TBS_CONTEXT_VERSION_TWO,
+            Anonymous: TBS_CONTEXT_PARAMS2_0 {
+                Anonymous: TBS_CONTEXT_PARAMS2_0_0 {
+                    _bitfield: INCLUDE_TPM12 | INCLUDE_TPM20,
+                },
+            },
+        };
         let mut ctx: *mut core::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: valid in/out pointers; the context is closed below.
-        if unsafe { Tbsi_Context_Create(&params, &mut ctx) } != 0 || ctx.is_null() {
+        // SAFETY: valid in/out pointers; the context is closed below. TBS reads the version field
+        // first and then interprets the structure as TBS_CONTEXT_PARAMS2.
+        if unsafe {
+            Tbsi_Context_Create(
+                std::ptr::from_ref(&params).cast::<TBS_CONTEXT_PARAMS>(),
+                &mut ctx,
+            )
+        } != 0
+            || ctx.is_null()
+        {
             return None;
         }
         let mut len = 0u32;
@@ -183,6 +205,12 @@ pub fn measured_boot_round(
     boot_id: Option<String>,
 ) -> Option<(Option<(Severity, DetectionData)>, tcg_log::BootMeasurements)> {
     let parsed = tcg_log::parse(log)?;
+    if parsed.truncated {
+        // A log that ends mid-event or stops at a record we cannot read is a prefix of the boot, not
+        // the boot: diffing it would report missing measurements as removals, and persisting it
+        // would replace the last complete baseline. Keep the baseline and skip this round.
+        return None;
+    }
     let cur = tcg_log::summarize(&parsed, boot_id);
     let prev: Option<tcg_log::BootMeasurements> =
         crate::paths::bounded_regular_bytes(&dir.join(MEASURED_BOOT_FILE), 512 * 1024)
@@ -361,6 +389,26 @@ mod tests {
         assert_eq!(f.unwrap().0, Severity::High);
         // Unparseable log: no result, no panic.
         assert!(measured_boot_round(&dir, &[1, 2, 3], Some("b3".into())).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncated_log_neither_diffs_nor_replaces_the_complete_baseline() {
+        let dir = tmp();
+        let ok = boot(1, 9, &[0x1000_0001]);
+        let (_, cur) = measured_boot_round(&dir, &ok, Some("b1".into())).unwrap();
+        snapshot::write_json_atomic(&dir.join(MEASURED_BOOT_FILE), &cur).unwrap();
+        // The next boot's log ends in the middle of an event: a prefix, not the boot.
+        let mut cut = boot(1, 9, &[0x1000_0001]);
+        cut.truncate(cut.len() - 5);
+        assert!(
+            tcg_log::parse(&cut).is_some_and(|p| p.truncated),
+            "fixture must parse as truncated"
+        );
+        assert!(
+            measured_boot_round(&dir, &cut, Some("b2".into())).is_none(),
+            "no finding and no new baseline from an incomplete log"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
