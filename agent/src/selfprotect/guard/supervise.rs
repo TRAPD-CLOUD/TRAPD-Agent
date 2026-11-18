@@ -456,8 +456,12 @@ mod tests {
             }),
         });
         let mut s = sup(&fake, &d);
-        s.handle(loss(LossReason::Hung, None, true), Some(42)).await;
-        assert_eq!(fake.restarts.lock().unwrap()[0], (Peer::Agent, Some(42)));
+        s.handle(loss(LossReason::Hung, None, true), Some(id(42)))
+            .await;
+        assert_eq!(
+            fake.restarts.lock().unwrap()[0],
+            (Peer::Agent, Some(id(42)))
+        );
         let records = read_records(&d);
         let r = &records[0].1;
         assert_eq!(r.restart, RestartOutcome::Started);
