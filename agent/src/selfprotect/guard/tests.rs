@@ -361,3 +361,57 @@ fn the_spool_is_bounded() {
     assert_eq!(pending_count(&dir), MAX_SPOOL_RECORDS);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn tracer_pid_is_read_from_proc_status() {
+    let traced = "Name:\ttrapd-agent\nState:\tt (tracing stop)\nTracerPid:\t650\nUid:\t0\n";
+    assert_eq!(parse_tracer_pid(traced), Some(650));
+    assert_eq!(
+        parse_tracer_pid("Name:\tx\nTracerPid:\t0\n"),
+        None,
+        "0 = not traced"
+    );
+    assert_eq!(parse_tracer_pid("Name:\tx\n"), None);
+    assert_eq!(parse_tracer_pid("TracerPid:\tjunk\n"), None);
+}
+
+#[test]
+fn a_record_with_a_malformed_tracer_is_rejected() {
+    let loss = Loss {
+        reason: LossReason::Hung,
+        class: None,
+        first: true,
+        grace_expired: false,
+    };
+    let base = Record::peer_lost(
+        Peer::Agent,
+        &loss,
+        RestartOutcome::Started,
+        chrono::Utc::now(),
+    );
+    let ok = base.clone().with_tracer(Some(Tracer {
+        pid: 650,
+        exe: "/usr/bin/gdb".into(),
+    }));
+    assert!(ok.validate());
+    for bad in [
+        Tracer {
+            pid: 1,
+            exe: "/sbin/init".into(),
+        },
+        Tracer {
+            pid: 650,
+            exe: String::new(),
+        },
+        Tracer {
+            pid: 650,
+            exe: "/tmp/x\nforged line".into(),
+        },
+        Tracer {
+            pid: 650,
+            exe: "a".repeat(4097),
+        },
+    ] {
+        assert!(!base.clone().with_tracer(Some(bad)).validate());
+    }
+}

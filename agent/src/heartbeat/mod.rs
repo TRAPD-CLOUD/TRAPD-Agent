@@ -179,6 +179,23 @@ struct Metrics {
     process_count: usize,
 }
 
+/// Read a response body of at most `limit` bytes, chunk by chunk. A larger body (also a chunked
+/// one without a `Content-Length`) is abandoned as soon as it exceeds the limit instead of being
+/// buffered whole; `None` then, and on a transport error.
+async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n as usize > limit) {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        if body.len() + chunk.len() > limit {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
+
 pub struct Heartbeat {
     client: reqwest::Client,
     heartbeat_url: String,
@@ -291,14 +308,8 @@ impl Heartbeat {
                 debug!("Heartbeat sent successfully");
                 crate::update::confirm_healthy();
                 if let Some(echo) = &self.echo {
-                    // Bounded read: an oversized body is ignored, not buffered.
-                    let small = resp
-                        .content_length()
-                        .is_none_or(|n| n as usize <= echo::MAX_RESPONSE_BYTES);
-                    if small {
-                        if let Ok(body) = resp.bytes().await {
-                            echo.handle(&body);
-                        }
+                    if let Some(body) = read_capped(resp, echo::MAX_RESPONSE_BYTES).await {
+                        echo.handle(&body);
                     }
                 }
                 return true;
@@ -416,6 +427,50 @@ fn count_processes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One-shot HTTP server answering with a chunked body (no Content-Length).
+    async fn chunked_response(chunks: Vec<Vec<u8>>) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            for c in chunks {
+                let _ = sock
+                    .write_all(format!("{:x}\r\n", c.len()).as_bytes())
+                    .await;
+                let _ = sock.write_all(&c).await;
+                let _ = sock.write_all(b"\r\n").await;
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_is_cut_off_at_the_limit_not_buffered_whole() {
+        let big = chunked_response(vec![vec![b'x'; 3000], vec![b'y'; 3000]]).await;
+        assert_eq!(read_capped(big, 4096).await, None);
+        let small = chunked_response(vec![b"{\"ok\":".to_vec(), b"true}".to_vec()]).await;
+        assert_eq!(
+            read_capped(small, 4096).await.as_deref(),
+            Some(&b"{\"ok\":true}"[..])
+        );
+    }
     use crate::telemetry::metrics::MetricsSnapshot;
 
     #[test]

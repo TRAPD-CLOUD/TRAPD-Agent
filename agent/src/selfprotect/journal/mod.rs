@@ -135,6 +135,9 @@ struct Inner {
     /// A `journal_full` marker is in the chain and events are being refused.
     overflowing: bool,
     dropped: u64,
+    /// The journal was full when the process last stopped; the events refused since then
+    /// were not persisted, so the closing marker cannot give an exact count.
+    dropped_before_restart_unknown: bool,
 }
 
 pub struct Journal {
@@ -208,6 +211,7 @@ impl Journal {
                 bytes: 0,
                 overflowing: false,
                 dropped: 0,
+                dropped_before_restart_unknown: false,
             }),
             notify: Notify::new(),
         };
@@ -300,6 +304,23 @@ impl Journal {
             inner.next_seq = last.seq + 1;
             inner.last_hash = last.hash.clone();
         }
+        // A `journal_full` marker without its closing `overflow_dropped` means the previous run
+        // ended while events were being refused: stay in that state instead of forgetting it
+        // (and of writing a second full marker beyond the entry cap).
+        let mut overflowing = false;
+        for s in &good {
+            if let Ok(b) = serde_json::from_str::<EntryBody>(&s.line.e) {
+                if b.kind == "journal_truncated" {
+                    match b.payload.get("reason").and_then(Value::as_str) {
+                        Some("journal_full") => overflowing = true,
+                        Some("overflow_dropped") => overflowing = false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        inner.overflowing = overflowing;
+        inner.dropped_before_restart_unknown = overflowing;
         inner.entries = good.into();
     }
 
@@ -362,6 +383,7 @@ impl Journal {
                 if !inner.overflowing {
                     inner.overflowing = true;
                     inner.dropped = 0;
+                    inner.dropped_before_restart_unknown = false;
                     self.write_entry(
                         &mut inner,
                         "journal_truncated",
@@ -373,13 +395,20 @@ impl Journal {
             }
             if inner.overflowing && unacked <= self.limits.max_unacked / 2 {
                 let dropped = inner.dropped;
+                let unknown = inner.dropped_before_restart_unknown;
                 self.write_entry(
                     &mut inner,
                     "journal_truncated",
-                    json!({"reason": "overflow_dropped", "dropped_events": dropped}),
+                    json!({
+                        "reason": "overflow_dropped",
+                        "dropped_events": dropped,
+                        // True when a restart happened while full: the count is then a lower bound.
+                        "dropped_events_incomplete": unknown,
+                    }),
                 )?;
                 inner.overflowing = false;
                 inner.dropped = 0;
+                inner.dropped_before_restart_unknown = false;
             }
         }
         let seq = self.write_entry(&mut inner, kind, payload)?;
@@ -437,8 +466,9 @@ impl Journal {
         let mut f = opts
             .open(&self.path)
             .with_context(|| format!("open {}", self.path.display()))?;
-        f.write_all(bytes)?;
-        f.sync_data()?;
+        let start = f.metadata()?.len();
+        let result = f.write_all(bytes).and_then(|()| f.sync_data());
+        rollback_on_error(&f, start, result)?;
         Ok(())
     }
 
@@ -457,6 +487,16 @@ impl Journal {
                 signature: s.line.s.clone(),
             })
             .collect()
+    }
+
+    /// Sequence number of the oldest unacknowledged entry.
+    pub fn first_pending_seq(&self) -> Option<u64> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .entries
+            .iter()
+            .find(|s| s.seq > inner.acked)
+            .map(|s| s.seq)
     }
 
     pub fn has_pending(&self) -> bool {
@@ -526,6 +566,20 @@ impl Journal {
             error!(error = %e, "tamper journal: could not append");
         }
     }
+}
+
+/// A failed append (disk full, failed sync) must not leave a partial record behind: the next
+/// successful append would concatenate onto it, and `load` would discard everything after the
+/// damaged line. Restore the file to its length before the append, so the in-memory chain
+/// (which did not advance) and the file agree again.
+fn rollback_on_error(f: &std::fs::File, start: u64, result: std::io::Result<()>) -> Result<()> {
+    if let Err(e) = result {
+        if let Err(trunc) = f.set_len(start) {
+            error!(error = %trunc, "tamper journal: could not restore the file after a failed append");
+        }
+        return Err(anyhow!("append to the tamper journal failed: {e}"));
+    }
+    Ok(())
 }
 
 /// The journal entry for an event, `None` for events that are not

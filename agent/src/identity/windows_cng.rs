@@ -23,10 +23,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 use windows_sys::core::PCWSTR;
-use windows_sys::Win32::Foundation::{
-    NTE_BAD_KEYSET, NTE_DEVICE_NOT_READY, NTE_NOT_SUPPORTED, NTE_NO_KEY, NTE_PROVIDER_DLL_FAIL,
-    NTE_PROV_DLL_NOT_FOUND,
-};
+use windows_sys::Win32::Foundation::{NTE_BAD_KEYSET, NTE_NOT_SUPPORTED, NTE_NO_KEY};
 use windows_sys::Win32::Security::Cryptography::{
     NCryptCreatePersistedKey, NCryptExportKey, NCryptFinalizeKey, NCryptFreeObject, NCryptOpenKey,
     NCryptOpenStorageProvider, NCryptSetProperty, NCryptSignHash, BCRYPT_ECCKEY_BLOB,
@@ -92,14 +89,7 @@ fn classify(what: &str, hr: i32, provider_stage: bool) -> Result<(), ProviderErr
 }
 
 fn is_provider_unavailable(hr: i32) -> bool {
-    let u = hr as u32;
-    hr == NTE_DEVICE_NOT_READY
-        || hr == NTE_NOT_SUPPORTED
-        || hr == NTE_PROV_DLL_NOT_FOUND
-        || hr == NTE_PROVIDER_DLL_FAIL
-        // TBS (0x8028xxxx) and TPM Platform Crypto Provider (0x8029xxxx) errors,
-        // e.g. TBS_E_TPM_NOT_FOUND, TPM_E_PCP_DEVICE_NOT_READY.
-        || (0x8028_0000..=0x8029_FFFF).contains(&u)
+    super::select::is_provider_unavailable_hresult(hr as u32)
 }
 
 fn check(what: &str, hr: i32) -> Result<()> {
@@ -161,7 +151,10 @@ impl CngKey {
             }
             key = Self::create_key(provider, handles.prov, &name, flags)?;
         } else {
-            classify("NCryptOpenKey", hr, false)?;
+            // An open that fails because the provider is not ready counts as "provider unavailable" too, so
+            // the read-only probe can move on to the software provider (selection of a recorded provider
+            // already rejects Unavailable, so this cannot downgrade a recorded TPM identity).
+            classify("NCryptOpenKey", hr, true)?;
         }
         handles.key = key;
         let spki = Self::export_spki(key).map_err(ProviderError::Failed)?;
@@ -388,8 +381,41 @@ pub fn load_existing() -> Result<Option<Box<dyn IdentityKey>>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_unavailable_allowlist_matches_the_windows_constants() {
+        use windows_sys::Win32::Foundation::{
+            TBS_E_SERVICE_DISABLED, TBS_E_SERVICE_NOT_RUNNING, TBS_E_SERVICE_START_PENDING,
+            TBS_E_TPM_NOT_FOUND, TPM_E_DEACTIVATED, TPM_E_DISABLED,
+            TPM_E_PCP_AUTHENTICATION_FAILED, TPM_E_PCP_DEVICE_NOT_READY,
+            TPM_E_PCP_FLAG_NOT_SUPPORTED, TPM_E_PCP_INTERNAL_ERROR, TPM_E_PCP_NOT_SUPPORTED,
+        };
+        for hr in [
+            NTE_DEVICE_NOT_READY,
+            NTE_NOT_SUPPORTED,
+            NTE_PROV_DLL_NOT_FOUND,
+            NTE_PROVIDER_DLL_FAIL,
+            TBS_E_TPM_NOT_FOUND,
+            TBS_E_SERVICE_DISABLED,
+            TBS_E_SERVICE_NOT_RUNNING,
+            TBS_E_SERVICE_START_PENDING,
+            TPM_E_DISABLED,
+            TPM_E_DEACTIVATED,
+            TPM_E_PCP_DEVICE_NOT_READY,
+            TPM_E_PCP_FLAG_NOT_SUPPORTED,
+            TPM_E_PCP_NOT_SUPPORTED,
+        ] {
+            assert!(is_provider_unavailable(hr), "{hr:#x}");
+        }
+        for hr in [TPM_E_PCP_INTERNAL_ERROR, TPM_E_PCP_AUTHENTICATION_FAILED] {
+            assert!(!is_provider_unavailable(hr), "{hr:#x}");
+        }
+    }
+
     use super::*;
     use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+    use windows_sys::Win32::Foundation::{
+        NTE_DEVICE_NOT_READY, NTE_PROVIDER_DLL_FAIL, NTE_PROV_DLL_NOT_FOUND,
+    };
 
     /// Needs a real TPM (or the software KSP); run with
     /// `cargo test -- --ignored identity::windows_cng` as Administrator.
@@ -433,7 +459,10 @@ mod tests {
         unsafe {
             assert!(NCryptOpenStorageProvider(&mut prov, provider.name(), 0) >= 0);
             assert!(NCryptOpenKey(prov, &mut key, w.as_ptr(), 0, flags) >= 0);
-            assert!(NCryptDeleteKey(key, NCRYPT_SILENT_FLAG) >= 0);
+            // HRESULT in the message: an assertion alone hid why the Platform
+            // (TPM) provider refused on real hardware.
+            let hr = NCryptDeleteKey(key, 0);
+            assert!(hr >= 0, "NCryptDeleteKey failed: {hr:#010x}");
             NCryptFreeObject(prov);
         }
     }
@@ -448,5 +477,78 @@ mod tests {
     #[ignore = "needs Windows + Administrator + a TPM"]
     fn platform_provider_roundtrip() {
         roundtrip(Provider::Platform);
+    }
+
+    /// T1c core property on real hardware: the private key cannot be exported
+    /// in any format, from either provider (TPM: hardware-bound; software:
+    /// export policy 0). Creates and deletes a throwaway key.
+    fn private_key_is_not_exportable(provider: Provider) {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCRYPT_ECCPRIVATE_BLOB, NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
+        };
+        let name = format!("TRAPD-Agent-Identity-test-export-{}", std::process::id());
+        drop(CngKey::open_named(provider, &name, true).unwrap().unwrap());
+        let mut prov: NCRYPT_PROV_HANDLE = 0;
+        let mut key: NCRYPT_KEY_HANDLE = 0;
+        let w = wide(&name);
+        let mut refused = Vec::new();
+        // SAFETY: standard open sequence on a key created above; handles freed below.
+        unsafe {
+            assert!(NCryptOpenStorageProvider(&mut prov, provider.name(), 0) >= 0);
+            assert!(
+                NCryptOpenKey(
+                    prov,
+                    &mut key,
+                    w.as_ptr(),
+                    0,
+                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG
+                ) >= 0
+            );
+            for blob in [BCRYPT_ECCPRIVATE_BLOB, NCRYPT_PKCS8_PRIVATE_KEY_BLOB] {
+                let mut len: u32 = 0;
+                let size = NCryptExportKey(
+                    key,
+                    0,
+                    blob,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut len,
+                    NCRYPT_SILENT_FLAG,
+                );
+                let hr = if size < 0 {
+                    size
+                } else {
+                    let mut buf = vec![0u8; len as usize];
+                    NCryptExportKey(
+                        key,
+                        0,
+                        blob,
+                        std::ptr::null(),
+                        buf.as_mut_ptr(),
+                        len,
+                        &mut len,
+                        NCRYPT_SILENT_FLAG,
+                    )
+                };
+                refused.push(hr < 0);
+            }
+            NCryptFreeObject(key);
+            NCryptFreeObject(prov);
+        }
+        delete_key(provider, &name);
+        assert_eq!(refused, [true, true], "private key export must be refused");
+    }
+
+    #[test]
+    #[ignore = "needs Windows + Administrator"]
+    fn software_private_key_is_not_exportable() {
+        private_key_is_not_exportable(Provider::Software);
+    }
+
+    #[test]
+    #[ignore = "needs Windows + Administrator + a TPM"]
+    fn platform_private_key_is_not_exportable() {
+        private_key_is_not_exportable(Provider::Platform);
     }
 }

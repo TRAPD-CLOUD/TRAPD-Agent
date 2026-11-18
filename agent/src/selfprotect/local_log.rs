@@ -151,11 +151,24 @@ pub fn record(event: &AgentEvent) {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::net::UnixDatagram;
         let payload = journal_payload(&detection.rule_id, entry, event);
-        if let Ok(socket) = UnixDatagram::unbound() {
-            // Missing socket (no journald) is expected in containers.
-            let _ = socket.send_to(payload.as_bytes(), "/run/systemd/journal/socket");
+        send_to_journal(std::path::Path::new(JOURNAL_SOCKET), payload.as_bytes());
+    }
+}
+
+#[cfg(unix)]
+const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
+
+/// Best-effort datagram to journald. Non-blocking: `record` runs inside the batch consumer, so a
+/// journald that stopped draining its socket must cost this mirror a record, never stall telemetry.
+/// A missing socket (no journald) is expected in containers; a full queue (WouldBlock) is a lost
+/// local copy.
+#[cfg(unix)]
+fn send_to_journal(socket_path: &std::path::Path, payload: &[u8]) {
+    use std::os::unix::net::UnixDatagram;
+    if let Ok(socket) = UnixDatagram::unbound() {
+        if socket.set_nonblocking(true).is_ok() {
+            let _ = socket.send_to(payload, socket_path);
         }
     }
 }
@@ -182,6 +195,31 @@ fn toast_policy() -> bool {
 mod tests {
     use super::*;
     use trapd_schema::{DetectionData, EventAction, EventClass};
+
+    #[cfg(unix)]
+    #[test]
+    fn an_undrained_journal_socket_never_blocks_the_caller() {
+        let dir = std::env::temp_dir().join(format!("trapd-journal-sock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socket");
+        // A listener that never reads: its datagram queue fills after a handful of messages.
+        let _undrained = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                send_to_journal(&p, &[b'x'; 512]);
+            }
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "send_to_journal blocked on a full queue"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn id_table_is_stable_unique_and_in_the_custom_range() {

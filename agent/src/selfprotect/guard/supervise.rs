@@ -16,9 +16,10 @@ use anyhow::Result;
 use chrono::Utc;
 use tracing::{error, info, warn};
 
+use super::control::ProcessIdentity;
 use super::{
     decide, write_record, Loss, LossReason, Peer, Record, RestartLimiter, RestartOutcome,
-    RestartPolicy,
+    RestartPolicy, Tracer,
 };
 
 /// Grace before acting on a loss: a `systemctl stop` / SCM stop of both
@@ -35,7 +36,8 @@ pub enum Integrity {
 /// manager. Blocking; called from the blocking pool.
 pub trait Actions: Send + Sync + 'static {
     fn integrity(&self) -> Integrity;
-    fn restart(&self, peer: Peer, kill_pid: Option<u32>) -> Result<()>;
+    /// Returns the foreign ptrace holder that had to be ended, if any.
+    fn restart(&self, peer: Peer, kill: Option<ProcessIdentity>) -> Result<Option<Tracer>>;
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -57,8 +59,8 @@ impl Actions for SystemActions {
         }
     }
 
-    fn restart(&self, peer: Peer, kill_pid: Option<u32>) -> Result<()> {
-        super::control::restart(peer, kill_pid)
+    fn restart(&self, peer: Peer, kill: Option<ProcessIdentity>) -> Result<Option<Tracer>> {
+        super::control::restart(peer, kill)
     }
 }
 
@@ -96,9 +98,9 @@ impl<A: Actions> Supervisor<A> {
         self
     }
 
-    /// Handle one loss. `peer_pid` is the pid last seen for the peer (killed
-    /// first when the peer is hung).
-    pub async fn handle(&mut self, loss: Loss, peer_pid: Option<u32>) -> Handled {
+    /// Handle one loss. `peer_proc` is the peer process as last seen (killed first when it is hung,
+    /// bound to its start time so a reused pid is never hit).
+    pub async fn handle(&mut self, loss: Loss, peer_proc: Option<ProcessIdentity>) -> Handled {
         let decision = decide(loss.class, loss.grace_expired);
         if decision.watcher_exits && self.peer == Peer::Agent {
             info!("the agent stopped with a maintenance authorization; the guard stops too");
@@ -116,6 +118,7 @@ impl<A: Actions> Supervisor<A> {
 
         let mut outcome = RestartOutcome::Refused;
         let mut tampered = None;
+        let mut tracer = None;
         if decision.restart == RestartPolicy::Now {
             let actions = Arc::clone(&self.actions);
             let integrity = tokio::task::spawn_blocking(move || actions.integrity())
@@ -134,13 +137,24 @@ impl<A: Actions> Supervisor<A> {
                     let (peer, kill) = (
                         self.peer,
                         (loss.reason == LossReason::Hung)
-                            .then_some(peer_pid)
+                            .then_some(peer_proc)
                             .flatten(),
                     );
                     let result =
                         tokio::task::spawn_blocking(move || actions.restart(peer, kill)).await;
                     outcome = match result {
-                        Ok(Ok(())) => RestartOutcome::Started,
+                        Ok(Ok(held_by)) => {
+                            if let Some(t) = &held_by {
+                                warn!(
+                                    peer = self.peer.as_str(),
+                                    tracer_pid = t.pid,
+                                    tracer_exe = %t.exe,
+                                    "peer was held under ptrace; ended the tracer so it can restart"
+                                );
+                            }
+                            tracer = held_by;
+                            RestartOutcome::Started
+                        }
                         Ok(Err(e)) => {
                             warn!(error = %e, "peer restart failed");
                             RestartOutcome::Failed
@@ -161,7 +175,7 @@ impl<A: Actions> Supervisor<A> {
         if loss.first {
             let now = Utc::now();
             if decision.report {
-                self.record(&Record::peer_lost(self.peer, &loss, outcome, now));
+                self.record(&Record::peer_lost(self.peer, &loss, outcome, now).with_tracer(tracer));
             }
             if let Some((expected, current)) = tampered {
                 self.record(&Record::binary_tampered(
@@ -185,10 +199,18 @@ mod tests {
     use crate::selfprotect::guard::{read_records, RecordKind, StopClass};
     use std::sync::Mutex;
 
+    fn id(pid: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            start: Some(1_000),
+        }
+    }
+
     struct Fake {
         integrity: Integrity,
-        restarts: Mutex<Vec<(Peer, Option<u32>)>>,
+        restarts: Mutex<Vec<(Peer, Option<ProcessIdentity>)>>,
         fail: bool,
+        tracer: Option<Tracer>,
     }
     impl Fake {
         fn ok() -> Arc<Self> {
@@ -196,6 +218,7 @@ mod tests {
                 integrity: Integrity::Ok,
                 restarts: Mutex::new(vec![]),
                 fail: false,
+                tracer: None,
             })
         }
     }
@@ -204,12 +227,12 @@ mod tests {
         fn integrity(&self) -> Integrity {
             self.0.integrity.clone()
         }
-        fn restart(&self, peer: Peer, kill_pid: Option<u32>) -> Result<()> {
-            self.0.restarts.lock().unwrap().push((peer, kill_pid));
+        fn restart(&self, peer: Peer, kill: Option<ProcessIdentity>) -> Result<Option<Tracer>> {
+            self.0.restarts.lock().unwrap().push((peer, kill));
             if self.0.fail {
                 anyhow::bail!("scm refused");
             }
-            Ok(())
+            Ok(self.0.tracer.clone())
         }
     }
 
@@ -242,8 +265,9 @@ mod tests {
     async fn an_unannounced_loss_is_restarted_and_reported_once() {
         let (fake, d) = (Fake::ok(), dir());
         let mut s = sup(&fake, &d);
-        s.handle(loss(LossReason::Died, None, true), Some(42)).await;
-        s.handle(loss(LossReason::Died, None, false), Some(42))
+        s.handle(loss(LossReason::Died, None, true), Some(id(42)))
+            .await;
+        s.handle(loss(LossReason::Died, None, false), Some(id(42)))
             .await;
         assert_eq!(
             fake.restarts.lock().unwrap().len(),
@@ -263,14 +287,14 @@ mod tests {
     async fn a_hung_peer_is_killed_before_the_restart_a_dead_one_is_not() {
         let (fake, d) = (Fake::ok(), dir());
         let mut s = sup(&fake, &d);
-        s.handle(loss(LossReason::Hung, None, true), Some(4242))
+        s.handle(loss(LossReason::Hung, None, true), Some(id(4242)))
             .await;
-        s.handle(loss(LossReason::Died, None, false), Some(4242))
+        s.handle(loss(LossReason::Died, None, false), Some(id(4242)))
             .await;
         let restarts = fake.restarts.lock().unwrap().clone();
         assert_eq!(
             restarts,
-            vec![(Peer::Agent, Some(4242)), (Peer::Agent, None)]
+            vec![(Peer::Agent, Some(id(4242))), (Peer::Agent, None)]
         );
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -338,6 +362,8 @@ mod tests {
             },
             restarts: Mutex::new(vec![]),
             fail: false,
+
+            tracer: None,
         });
         let mut s = sup(&fake, &d);
         s.handle(loss(LossReason::Died, None, true), None).await;
@@ -371,6 +397,8 @@ mod tests {
             integrity: Integrity::Ok,
             restarts: Mutex::new(vec![]),
             fail: true,
+
+            tracer: None,
         });
         let mut s = sup(&fake, &d);
         s.handle(loss(LossReason::Died, None, true), None).await;
@@ -413,5 +441,35 @@ mod tests {
             .await;
         assert_eq!(handled, Handled::Continue);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn a_ptrace_holder_ended_for_the_restart_is_in_the_record() {
+        let d = dir();
+        let fake = Arc::new(Fake {
+            integrity: Integrity::Ok,
+            restarts: Mutex::new(vec![]),
+            fail: false,
+            tracer: Some(Tracer {
+                pid: 4242,
+                exe: "/usr/bin/gdb".into(),
+            }),
+        });
+        let mut s = sup(&fake, &d);
+        s.handle(loss(LossReason::Hung, None, true), Some(id(42)))
+            .await;
+        assert_eq!(
+            fake.restarts.lock().unwrap()[0],
+            (Peer::Agent, Some(id(42)))
+        );
+        let records = read_records(&d);
+        let r = &records[0].1;
+        assert_eq!(r.restart, RestartOutcome::Started);
+        assert_eq!(r.tracer.as_ref().map(|t| t.pid), Some(4242));
+        let ev = super::super::record_event(r, "a", "h");
+        let trapd_schema::EventData::Detection(det) = &ev.data else {
+            panic!("detection expected")
+        };
+        assert_eq!(det.evidence["tracer_exe"], "/usr/bin/gdb");
     }
 }

@@ -5,6 +5,12 @@ Every script tampers with the local agent on purpose. It refuses to run unless
 and restores everything it changes. Rows marked MANUAL have no script (reboot or
 environment change needed).
 
+`run-linux-container.sh <release binary>` runs the rows that need no backend
+(T2, T3, T6 with a freezing debugger, T9) against a real systemd in a
+throwaway privileged container and prints `ALL PASS` or the failing rows.
+T10/T11 are excluded there (kernel-global sysctl and clock); T1, T4, T5, T12
+and T13 need a staging backend.
+
 | Threat | Script | Command / action | Expected event or finding | How to verify |
 |---|---|---|---|---|
 | T1 copied `credentials.json` / cloned VM image | `t1_credentials_copy.sh` | `TRAPD_ADVERSARIAL_OK=1 TRAPD_BACKEND_URL=https://... ./t1_credentials_copy.sh` on a bound agent | file has no `agent_secret`; a leftover secret is rejected with HTTP 401 | script prints `PASS`; console shows the agent with `protection: tpm\|software` |
@@ -35,6 +41,13 @@ environment change needed).
 | T13 delete or restore the local tamper journal | `t13_journal_delete.sh` / `t13_journal_delete.ps1` | `TRAPD_ADVERSARIAL_OK=1 ./t13_journal_delete.sh` (root) / `$env:TRAPD_ADVERSARIAL_OK=1; .\t13_journal_delete.ps1` (elevated) on a bound test agent with some acknowledged journal entries | the agent restarts its chain at seq 1; backend answers 409 and records `selfprotect.journal_gap` (high, reason `fork` or `regression`); a restored old file is detected the same way (backend ahead of the file) | finding in console; agent log `backend rejected the tamper journal`; the script restores the original file afterwards. Unit-level equivalents: `agent_journal_smoke.sql` steps 5-6 and `test-agent-journal-route.mts` T13 rows |
 
 ## Notes
+
+A debugger attach (gdb, T6) freezes the agent, so the agent itself cannot
+report it. The guard treats the frozen agent as hung after ~10 s, ends the
+foreign ptrace holder (otherwise the killed agent stays an unreapable zombie
+and systemd never restarts it) and records `tracer_pid` / `tracer_exe` in
+`selfprotect.peer_lost`. A non-freezing tracer (strace) is reported by the
+agent's own `selfprotect.debugger_attached`.
 
 Not covered by a script (needs a window of two kills within about 10 s, which
 is the stated custom-tooling bar of the guard pair): killing agent and guard

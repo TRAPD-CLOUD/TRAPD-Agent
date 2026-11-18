@@ -4,7 +4,7 @@
 # Usage: BACKEND_HOST=api.example.eu TRAPD_ADVERSARIAL_OK=1 ./t5_hosts_redirect.sh
 set -euo pipefail
 [ "${TRAPD_ADVERSARIAL_OK:-}" = "1" ] || { echo "Refusing to run: set TRAPD_ADVERSARIAL_OK=1 on a disposable test host." >&2; exit 2; }
-: "${BACKEND_HOST:?set BACKEND_HOST to the agent's backend host name}"
+: "${BACKEND_HOST:?set BACKEND_HOST to the backend host name of the agent}"
 backup="$(mktemp)"
 cp -p /etc/hosts "$backup"
 cleanup() { cat "$backup" > /etc/hosts; rm -f "$backup"; echo "hosts restored"; }

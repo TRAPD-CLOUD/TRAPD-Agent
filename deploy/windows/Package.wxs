@@ -86,7 +86,10 @@
                DACL as the agent service, so only SYSTEM can stop or reconfigure
                it. It depends on the agent service: the SCM starts the agent first,
                and every MSI stop/removal stops the guard first, so the guard
-               cannot restart the agent while its files are being replaced. An
+               cannot restart the agent while its files are being replaced. The
+               signed self-update does the same (update/windows.rs stops the guard
+               before the agent and starts it after it): the SCM rejects the agent's
+               stop while its dependent is running. An
                authorized stop (uninstall gate / maintenance token) is announced to
                the guard by the agent and ends both. Failure actions match the
                agent's. Keep the DACL in sync with
