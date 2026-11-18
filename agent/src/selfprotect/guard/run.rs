@@ -108,6 +108,7 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
     );
     let mut monitor = PeerMonitor::new(Instant::now());
     let mut watch: Option<(u32, Arc<AtomicBool>, tokio::task::JoinHandle<bool>)> = None;
+    let mut peer_proc: Option<control::ProcessIdentity> = None;
     let mut tick = tokio::time::interval(TICK);
     tokio::pin!(shutdown);
 
@@ -156,6 +157,8 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
                 monitor.observe(Instant::now(), obs.pid, class);
                 if let Some(pid) = obs.pid {
                     if watch.as_ref().map(|(p, _, _)| *p) != Some(pid) {
+                        // Pin the pid to its process generation while it is freshly authenticated.
+                        peer_proc = Some(control::ProcessIdentity::observe(pid));
                         if let Some((_, cancel, _)) = watch.take() {
                             cancel.store(true, Ordering::Relaxed);
                         }
@@ -174,7 +177,7 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
             _ = tick.tick() => {
                 if let Some(loss) = monitor.poll(Instant::now()) {
                     let handled = tokio::select! {
-                        h = supervisor.handle(loss, monitor.pid()) => h,
+                        h = supervisor.handle(loss, peer_proc.filter(|p| Some(p.pid) == monitor.pid())) => h,
                         kind = &mut shutdown => break Exit::Shutdown(kind),
                     };
                     if handled == Handled::WatcherExits {
