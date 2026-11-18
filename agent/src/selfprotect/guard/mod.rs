@@ -457,11 +457,42 @@ pub struct Record {
     pub announced_stop: bool,
     pub maintenance_authorized: bool,
     pub restart: RestartOutcome,
+    /// A foreign process that held the hung peer under ptrace (debugger
+    /// attach freezes the process and keeps its zombie from being reaped).
+    /// The guard ends it so the service manager can restart the peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracer: Option<Tracer>,
     /// `sha256:<64 hex>`; only for `peer_binary_tampered`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_hash: Option<String>,
+}
+
+/// The process that had the peer under ptrace when the guard intervened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tracer {
+    pub pid: u32,
+    /// Executable path as the kernel reports it; "unknown" if unreadable.
+    pub exe: String,
+}
+
+impl Tracer {
+    fn valid(&self) -> bool {
+        self.pid > 1
+            && !self.exe.is_empty()
+            && self.exe.len() <= 4096
+            && !self.exe.chars().any(char::is_control)
+    }
+}
+
+/// `TracerPid:` from a `/proc/<pid>/status` text; `None` when not traced.
+pub fn parse_tracer_pid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("TracerPid:"))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|p| *p > 0)
 }
 
 fn valid_hash(h: &str) -> bool {
@@ -481,9 +512,16 @@ impl Record {
             announced_stop: loss.class.is_some(),
             maintenance_authorized: loss.class.is_some_and(StopClass::authorized),
             restart,
+            tracer: None,
             expected_hash: None,
             current_hash: None,
         }
+    }
+
+    /// The same record carrying the process that held the peer under ptrace.
+    pub fn with_tracer(mut self, tracer: Option<Tracer>) -> Self {
+        self.tracer = tracer;
+        self
     }
 
     pub fn binary_tampered(
@@ -507,7 +545,11 @@ impl Record {
         self.v == 1
             && !self.event_id.is_nil()
             && match self.kind {
-                RecordKind::PeerLost => self.expected_hash.is_none() && self.current_hash.is_none(),
+                RecordKind::PeerLost => {
+                    self.expected_hash.is_none()
+                        && self.current_hash.is_none()
+                        && self.tracer.as_ref().is_none_or(Tracer::valid)
+                }
                 RecordKind::PeerBinaryTampered => {
                     self.expected_hash.as_deref().is_some_and(valid_hash)
                         && self.current_hash.as_deref().is_some_and(valid_hash)
@@ -549,6 +591,10 @@ pub fn record_event(record: &Record, agent_id: &str, hostname: &str) -> AgentEve
         "maintenance_authorized": record.maintenance_authorized,
         "restart": record.restart,
     });
+    if let Some(t) = &record.tracer {
+        evidence["tracer_pid"] = t.pid.into();
+        evidence["tracer_exe"] = t.exe.clone().into();
+    }
     if record.kind == RecordKind::PeerBinaryTampered {
         evidence["expected_hash"] = record.expected_hash.clone().into();
         evidence["current_hash"] = record.current_hash.clone().into();

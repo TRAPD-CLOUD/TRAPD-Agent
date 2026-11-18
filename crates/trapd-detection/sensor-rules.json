@@ -223,5 +223,50 @@
   "base_from_event": true,
   "tactic": "TA0005 Defense Evasion",
   "technique": "T1055"
+ },
+ {
+  "id": "selfprotect.binary_tampered",
+  "base": "high",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.001"
+ },
+ {
+  "id": "selfprotect.peer_binary_tampered",
+  "base": "critical",
+  "max": "critical",
+  "mode": "alert",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.001"
+ },
+ {
+  "id": "selfprotect.peer_lost",
+  "base": "medium",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": true,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.001"
+ },
+ {
+  "id": "selfprotect.platform_posture_changed",
+  "base": "medium",
+  "max": "high",
+  "mode": "alert",
+  "base_from_event": true,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.001"
+ },
+ {
+  "id": "selfprotect.time_jump",
+  "base": "medium",
+  "max": "medium",
+  "mode": "signal",
+  "base_from_event": false,
+  "tactic": "TA0005 Defense Evasion",
+  "technique": "T1562.001"
  }
 ]

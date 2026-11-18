@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use super::Peer;
+use super::{Peer, Tracer};
 
 /// Poll interval of the exit watch; bounds how long a cancelled watch lingers.
 const WATCH_SLICE: Duration = Duration::from_millis(250);
@@ -93,12 +93,38 @@ mod imp {
     /// works on a stopped process, a stop request would stay pending forever.
     /// `start`, never `restart`: the agent unit is `PartOf` the other way round
     /// and a restart of one would take the restarter down with it.
-    pub fn restart(peer: Peer, kill_pid: Option<u32>) -> Result<()> {
+    pub fn restart(peer: Peer, kill_pid: Option<u32>) -> Result<Option<Tracer>> {
+        let mut held_by = None;
         if let Some(pid) = kill_pid.filter(|p| never_signal_self_or_init(*p)) {
+            // A debugger attach freezes the peer; after SIGKILL its zombie
+            // cannot be reaped while the tracer holds it, so systemd keeps the
+            // unit "active" and `start` does nothing. End the tracer too: no
+            // legitimate tool debugs the sensor outside a maintenance window
+            // (authorized stops never reach this path).
+            let tracer = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .ok()
+                .and_then(|s| super::super::parse_tracer_pid(&s))
+                .filter(|t| never_signal_self_or_init(*t) && *t != pid);
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGKILL,
             );
+            if let Some(t) = tracer {
+                // The guard has no CAP_SYS_PTRACE, so the exe link of another
+                // process may be unreadable; `comm` needs no privilege.
+                let exe = std::fs::read_link(format!("/proc/{t}/exe"))
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .or_else(|_| {
+                        std::fs::read_to_string(format!("/proc/{t}/comm"))
+                            .map(|c| format!("comm:{}", c.trim()))
+                    })
+                    .unwrap_or_else(|_| "unknown".into());
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(t as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                held_by = Some(Tracer { pid: t, exe });
+            }
         }
         let status = Command::new("systemctl")
             .args([
@@ -108,7 +134,7 @@ mod imp {
             ])
             .status()?;
         anyhow::ensure!(status.success(), "systemctl start failed ({status})");
-        Ok(())
+        Ok(held_by)
     }
 }
 
@@ -167,7 +193,9 @@ mod imp {
         ended
     }
 
-    pub fn restart(peer: Peer, kill_pid: Option<u32>) -> Result<()> {
+    pub fn restart(peer: Peer, kill_pid: Option<u32>) -> Result<Option<Tracer>> {
+        // Windows: TerminateProcess ends a debugged process regardless of the
+        // debugger, so there is no holder to report.
         if let Some(pid) = kill_pid.filter(|p| never_signal_self_or_init(*p)) {
             // SAFETY: handle closed below. Both services run as SYSTEM, which
             // the peer's process DACL grants full access.
@@ -185,9 +213,9 @@ mod imp {
             match service.query_status()?.current_state {
                 ServiceState::Stopped => {
                     service.start::<&std::ffi::OsStr>(&[])?;
-                    return Ok(());
+                    return Ok(None);
                 }
-                ServiceState::Running | ServiceState::StartPending => return Ok(()),
+                ServiceState::Running | ServiceState::StartPending => return Ok(None),
                 _ => std::thread::sleep(Duration::from_millis(250)),
             }
         }

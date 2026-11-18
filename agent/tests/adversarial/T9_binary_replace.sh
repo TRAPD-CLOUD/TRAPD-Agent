@@ -25,13 +25,22 @@ bin="${bin:-/usr/local/bin/trapd-agent}"
 [[ -f "$bin" ]] || { echo "agent binary not found at $bin" >&2; exit 2; }
 backup="$(mktemp /var/tmp/trapd-agent.orig.XXXXXX)"
 cp -p "$bin" "$backup"
+reference="$(mktemp /var/tmp/trapd-agent.ref.XXXXXX)"
+cp -p "$bin" "$reference"
 since="$(date '+%Y-%m-%d %H:%M:%S')"
 
 restore() {
-    cp -p "$backup" "$bin" && rm -f "$backup"
+    # Stop first: the running binary cannot be overwritten (ETXTBSY), and a
+    # rename over it is only safe once nothing restarts it meanwhile.
+    systemctl stop trapd-agent.service trapd-guard.service 2>/dev/null || true
+    if mv -f "$backup" "$bin" && cmp -s "$bin" "$reference"; then
+        echo "original binary restored"
+    else
+        echo "ERROR: restore failed; the original is at $backup" >&2
+    fi
+    rm -f "$reference"
     systemctl reset-failed trapd-agent.service trapd-guard.service 2>/dev/null || true
     systemctl start trapd-agent.service || true
-    echo "original binary restored, agent started"
 }
 trap restore EXIT
 
@@ -40,17 +49,21 @@ trap restore EXIT
 tampered="$(mktemp /var/tmp/trapd-agent.tampered.XXXXXX)"
 cp -p "$bin" "$tampered"
 printf '\0' >> "$tampered"
-install -m 0755 "$tampered" "$bin"
-rm -f "$tampered"
+# Replace by rename: the running file cannot be written in place (ETXTBSY).
+chmod 0755 "$tampered"
+mv -f "$tampered" "$bin"
 echo "T9: replaced $bin with a modified copy at $(date -u +%T)"
 
 systemctl restart trapd-agent.service || true
 sleep 20
 
-state="$(systemctl is-active trapd-agent.service || true)"
+# The refused binary does not run the sensor; its process may still show as
+# active while the restart-loop guard spaces the retries, so the verdict is
+# the integrity log line plus the local security entry.
+refused="$(journalctl -q -u trapd-agent --since "$since" -o cat 2>/dev/null | grep -c 'BINARY INTEGRITY VIOLATION' || true)"
 hits="$(journalctl -q --since "$since" SYSLOG_IDENTIFIER=trapd-agent-security TRAPD_RULE_ID=selfprotect.binary_tampered -o cat 2>/dev/null | wc -l)"
-echo "agent state with tampered binary: $state; binary_tampered entries: $hits"
-if [[ "$state" != active && "$hits" -ge 1 ]]; then
+echo "integrity violations logged: $refused; binary_tampered entries: $hits"
+if [[ "$refused" -ge 1 && "$hits" -ge 1 ]]; then
     echo "RESULT: PASS (refused to run and reported)"
 else
     echo "RESULT: FAIL (expected a refused start plus a binary_tampered entry)"
