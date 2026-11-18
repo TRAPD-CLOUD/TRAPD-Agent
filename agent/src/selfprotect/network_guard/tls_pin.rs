@@ -30,7 +30,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{
+    CertificateDer, ServerName, SignatureVerificationAlgorithm, TrustAnchor, UnixTime,
+};
 use rustls::{DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme};
 use sha2::{Digest, Sha256};
 
@@ -280,23 +282,39 @@ impl PinState {
     }
 }
 
+/// The pin policy a settings load result stands for. A load failure is not "no pins": a malformed
+/// document (or one with an unknown field) may well have contained pins, and silently running
+/// report-only would switch the protection off for the life of the process. Reject every backend
+/// certificate instead; the error is loud and the events stay queued until the file is fixed.
+fn policy_from_settings(loaded: Result<super::settings::Settings, String>) -> PinPolicy {
+    match loaded {
+        Ok(settings) => {
+            let (policy, err) =
+                PinPolicy::from_lists(&settings.spki_pins, &settings.inspection_ca_pins);
+            if let Some(e) = err {
+                tracing::error!(error = %e, "invalid TLS pin in configuration; enforcing the valid pins only");
+            }
+            policy
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "network guard settings unreadable; rejecting all backend certificates until fixed"
+            );
+            PinPolicy {
+                enforce: true,
+                ..PinPolicy::default()
+            }
+        }
+    }
+}
+
 /// Process-wide state, initialised from [`super::settings::Settings`] on first
 /// use. An unparseable pin configuration is logged and enforced (fail closed).
 pub fn global() -> &'static Arc<PinState> {
     static STATE: OnceLock<Arc<PinState>> = OnceLock::new();
     STATE.get_or_init(|| {
-        let settings = match super::settings::Settings::load() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "network guard settings unreadable; pins not loaded");
-                Default::default()
-            }
-        };
-        let (policy, err) =
-            PinPolicy::from_lists(&settings.spki_pins, &settings.inspection_ca_pins);
-        if let Some(e) = err {
-            tracing::error!(error = %e, "invalid TLS pin in configuration; enforcing the valid pins only");
-        }
+        let policy = policy_from_settings(super::settings::Settings::load());
         if policy.enforce {
             tracing::info!(
                 pins = policy.pins.len(),
@@ -316,15 +334,80 @@ pub fn global() -> &'static Arc<PinState> {
 pub struct PinningVerifier {
     inner: Arc<WebPkiServerVerifier>,
     state: Arc<PinState>,
+    anchors: Vec<TrustAnchor<'static>>,
+    algs: &'static [&'static dyn SignatureVerificationAlgorithm],
+}
+
+/// DER `SEQUENCE` around `content` (a trust anchor stores the SPKI without its outer header).
+fn der_sequence(content: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x30];
+    let len = content.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let skip = bytes.iter().take_while(|b| **b == 0).count();
+        out.push(0x80 | (bytes.len() - skip) as u8);
+        out.extend_from_slice(&bytes[skip..]);
+    }
+    out.extend_from_slice(content);
+    out
 }
 
 impl PinningVerifier {
     pub fn new(roots: RootCertStore, state: Arc<PinState>) -> anyhow::Result<Arc<Self>> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let algs = provider.signature_verification_algorithms.all;
+        let anchors = roots.roots.clone();
         let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
             .build()
             .map_err(|e| anyhow::anyhow!("TLS: cannot build certificate verifier: {e}"))?;
-        Ok(Arc::new(Self { inner, state }))
+        Ok(Arc::new(Self {
+            inner,
+            state,
+            anchors,
+            algs,
+        }))
+    }
+
+    /// SPKI pins of the certificates the server sent that took part in the validated path (leaf
+    /// first). The path is rebuilt with the same algorithms and trust anchors as the normal
+    /// validation: its end-entity certificate, the intermediates it used and its trust anchor. A
+    /// certificate a server merely appends to its chain is not part of the path and cannot satisfy a
+    /// pin. A root counts when the server sent it and it is the path's anchor.
+    fn validated_path_pins(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Option<Vec<Pin>> {
+        let cert = webpki::EndEntityCert::try_from(end_entity).ok()?;
+        let path = cert
+            .verify_for_usage(
+                self.algs,
+                &self.anchors,
+                intermediates,
+                now,
+                webpki::KeyUsage::server_auth(),
+                None,
+                None,
+            )
+            .ok()?;
+        let mut in_path: HashSet<Pin> = HashSet::new();
+        in_path.insert(spki_pin(end_entity.as_ref())?);
+        for c in path.intermediate_certificates() {
+            in_path.insert(Sha256::digest(c.subject_public_key_info().as_ref()).into());
+        }
+        in_path.insert(
+            Sha256::digest(der_sequence(path.anchor().subject_public_key_info.as_ref())).into(),
+        );
+        Some(
+            std::iter::once(end_entity)
+                .chain(intermediates)
+                .filter_map(|c| spki_pin(c.as_ref()))
+                .filter(|p| in_path.contains(p))
+                .collect(),
+        )
     }
 }
 
@@ -351,10 +434,11 @@ impl ServerCertVerifier for PinningVerifier {
             ocsp_response,
             now,
         )?;
-        let chain: Vec<Pin> = std::iter::once(end_entity)
-            .chain(intermediates)
-            .filter_map(|c| spki_pin(c.as_ref()))
-            .collect();
+        let Some(chain) = self.validated_path_pins(end_entity, intermediates, now) else {
+            return Err(TlsError::General(
+                "backend certificate path could not be rebuilt for SPKI pinning".into(),
+            ));
+        };
         let policy = self.state.policy();
         match decide(&policy, &chain) {
             PinDecision::ReportOnly => {
@@ -486,6 +570,49 @@ mod tests {
         assert!(err.is_some());
         assert!(p.enforce && p.pins.is_empty());
         assert_eq!(decide(&p, &[[1; 32]]), PinDecision::Mismatch);
+    }
+
+    #[test]
+    fn unreadable_settings_reject_instead_of_falling_back_to_report_only() {
+        let p = policy_from_settings(Err("unknown field `spki_pinz`".into()));
+        assert!(p.enforce && p.pins.is_empty() && p.inspection.is_empty());
+        assert_eq!(decide(&p, &[[1; 32]]), PinDecision::Mismatch);
+    }
+
+    #[test]
+    fn an_unrelated_pinned_certificate_appended_to_the_chain_does_not_satisfy_a_pin() {
+        // The server's real chain validates (leaf under the fixture CA) but does not contain the
+        // pinned key; it then appends a certificate that does. WebPKI ignores the extra
+        // certificate, so a pin must not match it either.
+        let (policy, _) = PinPolicy::from_lists(&[OTHER_PIN.into()], &[]);
+        let state = PinState::with_policy(policy);
+        let v = verifier(Arc::clone(&state));
+        let r = v.verify_server_cert(
+            &der(LEAF),
+            &[der(OTHER)],
+            &ServerName::try_from("backend.test".to_string()).unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(
+            r.is_err(),
+            "pin satisfied by a certificate outside the path"
+        );
+        assert_eq!(state.take_mismatches().len(), 1);
+    }
+
+    #[test]
+    fn a_root_the_server_sends_and_that_anchors_the_path_can_still_be_pinned() {
+        let (policy, _) = PinPolicy::from_lists(&[CA_PIN.into()], &[]);
+        let v = verifier(PinState::with_policy(policy));
+        let r = v.verify_server_cert(
+            &der(LEAF),
+            &[der(CA)],
+            &ServerName::try_from("backend.test".to_string()).unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(r.is_ok(), "{r:?}");
     }
 
     #[test]
