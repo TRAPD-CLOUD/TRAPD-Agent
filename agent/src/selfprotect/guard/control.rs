@@ -15,7 +15,20 @@ const WATCH_SLICE: Duration = Duration::from_millis(250);
 
 /// Wait for the process `pid` to end. Returns `true` if it ended, `false` if
 /// `cancel` was set first. Runs on the blocking pool.
+///
+/// Dropping this future (task aborted, runtime shutting down) cancels the
+/// blocking wait as well. Without that, the blocking thread kept polling a
+/// live peer forever and the runtime's shutdown, which joins the blocking
+/// pool, never finished: an agent whose `main` returned stayed a half-dead
+/// process, and the guard then killed it as hung.
 pub async fn wait_exit(pid: u32, cancel: Arc<AtomicBool>) -> bool {
+    struct CancelOnDrop(Arc<AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let _on_drop = CancelOnDrop(Arc::clone(&cancel));
     tokio::task::spawn_blocking(move || wait_exit_blocking(pid, &cancel))
         .await
         .unwrap_or(false)
@@ -263,5 +276,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(ended);
+    }
+
+    /// Field regression: a runtime dropped while a watch on a live peer runs
+    /// (the agent's `main` returned) must shut down promptly instead of
+    /// joining a blocking thread that polls forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runtime_with_a_running_watch_still_shuts_down() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                tokio::spawn(wait_exit(pid, Arc::new(AtomicBool::new(false))));
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+            drop(rt); // joins the blocking pool
+            let _ = tx.send(());
+        });
+        let finished = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        child.kill().unwrap();
+        let _ = child.wait();
+        assert!(finished, "runtime shutdown hung on the exit watch");
     }
 }
