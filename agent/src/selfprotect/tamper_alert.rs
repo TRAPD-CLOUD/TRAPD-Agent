@@ -168,6 +168,11 @@ pub fn event(state: &AlertState, agent_id: &str, hostname: &str) -> AgentEvent {
     event
 }
 
+/// The first report of this binary hash (a retry of the same failure is not new).
+fn is_new_failure(existing: Option<&AlertState>, hash: &str) -> bool {
+    existing.is_none_or(|e| e.hash != hash)
+}
+
 fn offline() -> bool {
     let truthy = |k: &str| {
         std::env::var(k).is_ok_and(|v| {
@@ -198,6 +203,14 @@ pub async fn report(err: &anyhow::Error) {
     // Persist first: if the send is cut off or the host dies, the next healthy
     // start still reports it.
     write_state(dir, &state);
+    // This path runs before the batch consumer exists, so the local security channel (event 122)
+    // is written here, once per failing binary hash, not on every retry.
+    if is_new_failure(existing.as_ref(), &v.hash) {
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".into());
+        super::local_log::record(&event(&state, "unknown", &hostname));
+    }
     if offline() {
         return;
     }
@@ -372,6 +385,14 @@ mod tests {
         assert_eq!(d.rule_id, "selfprotect.binary_tampered");
         assert_eq!(d.evidence["current_sha256"], H1);
         assert_eq!(d.evidence["consecutive_failures"], 4);
+    }
+
+    #[test]
+    fn the_local_record_is_written_once_per_failing_hash_not_per_retry() {
+        let first = next_state(None, H1, 1, t("2026-01-01T00:00:00Z"));
+        assert!(is_new_failure(None, H1));
+        assert!(!is_new_failure(Some(&first), H1), "a retry is not new");
+        assert!(is_new_failure(Some(&first), H2), "another binary is");
     }
 
     #[test]
