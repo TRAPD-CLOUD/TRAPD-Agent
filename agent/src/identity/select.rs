@@ -37,6 +37,31 @@ impl std::fmt::Display for ProviderError {
     }
 }
 
+/// HRESULTs that establish "this provider cannot be used on this machine": no TPM, TPM disabled or
+/// deactivated, TBS service not running, provider DLL missing, device not ready, operation
+/// unsupported. An explicit list: the TBS (0x8028xxxx) and Platform Crypto Provider (0x8029xxxx)
+/// facilities also hold authorization failures (0x80290408), internal errors (0x80290407) and
+/// failed self-tests, which must surface as failures of a TPM that exists instead of silently
+/// creating a software key and downgrading the identity.
+pub fn is_provider_unavailable_hresult(hr: u32) -> bool {
+    matches!(
+        hr,
+        0x8009_0029 // NTE_NOT_SUPPORTED
+        | 0x8009_0030 // NTE_DEVICE_NOT_READY
+        | 0x8009_001D // NTE_PROVIDER_DLL_FAIL
+        | 0x8009_001E // NTE_PROV_DLL_NOT_FOUND
+        | 0x8028_0006 // TPM_E_DEACTIVATED
+        | 0x8028_0007 // TPM_E_DISABLED
+        | 0x8028_4008 // TBS_E_SERVICE_NOT_RUNNING
+        | 0x8028_400B // TBS_E_SERVICE_START_PENDING
+        | 0x8028_400F // TBS_E_TPM_NOT_FOUND
+        | 0x8028_4010 // TBS_E_SERVICE_DISABLED
+        | 0x8029_0401 // TPM_E_PCP_DEVICE_NOT_READY
+        | 0x8029_0404 // TPM_E_PCP_FLAG_NOT_SUPPORTED
+        | 0x8029_0405 // TPM_E_PCP_NOT_SUPPORTED
+    )
+}
+
 /// One key storage provider.
 pub trait Backend {
     type Key;
@@ -371,6 +396,33 @@ mod tests {
             sk.verifying_key()
                 .verify(&msg, &Signature::from_der(&der).unwrap())
                 .unwrap();
+        }
+    }
+
+    #[test]
+    fn only_codes_that_establish_unavailability_allow_the_software_fallback() {
+        for hr in [
+            0x8028_400Fu32, // TBS_E_TPM_NOT_FOUND
+            0x8028_4010,    // TBS_E_SERVICE_DISABLED
+            0x8028_4008,    // TBS_E_SERVICE_NOT_RUNNING
+            0x8028_0007,    // TPM_E_DISABLED
+            0x8029_0401,    // TPM_E_PCP_DEVICE_NOT_READY
+            0x8009_0030,    // NTE_DEVICE_NOT_READY
+            0x8009_0029,    // NTE_NOT_SUPPORTED
+        ] {
+            assert!(is_provider_unavailable_hresult(hr), "{hr:#x}");
+        }
+        // A TPM that exists but fails must not silently become a software key.
+        for hr in [
+            0x8029_0407u32, // TPM_E_PCP_INTERNAL_ERROR
+            0x8029_0408,    // TPM_E_PCP_AUTHENTICATION_FAILED
+            0x8028_4001,    // TBS_E_INTERNAL_ERROR
+            0x8028_0001,    // TPM_E_AUTHFAIL
+            0x8028_0009,    // TPM_E_FAIL
+            0x8009_000B,    // NTE_BAD_KEY_STATE-like generic failure
+            0x8007_0005,    // E_ACCESSDENIED
+        ] {
+            assert!(!is_provider_unavailable_hresult(hr), "{hr:#x}");
         }
     }
 }

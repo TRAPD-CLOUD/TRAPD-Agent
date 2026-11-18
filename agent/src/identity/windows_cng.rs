@@ -23,10 +23,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 use windows_sys::core::PCWSTR;
-use windows_sys::Win32::Foundation::{
-    NTE_BAD_KEYSET, NTE_DEVICE_NOT_READY, NTE_NOT_SUPPORTED, NTE_NO_KEY, NTE_PROVIDER_DLL_FAIL,
-    NTE_PROV_DLL_NOT_FOUND,
-};
+use windows_sys::Win32::Foundation::{NTE_BAD_KEYSET, NTE_NOT_SUPPORTED, NTE_NO_KEY};
 use windows_sys::Win32::Security::Cryptography::{
     NCryptCreatePersistedKey, NCryptExportKey, NCryptFinalizeKey, NCryptFreeObject, NCryptOpenKey,
     NCryptOpenStorageProvider, NCryptSetProperty, NCryptSignHash, BCRYPT_ECCKEY_BLOB,
@@ -92,14 +89,7 @@ fn classify(what: &str, hr: i32, provider_stage: bool) -> Result<(), ProviderErr
 }
 
 fn is_provider_unavailable(hr: i32) -> bool {
-    let u = hr as u32;
-    hr == NTE_DEVICE_NOT_READY
-        || hr == NTE_NOT_SUPPORTED
-        || hr == NTE_PROV_DLL_NOT_FOUND
-        || hr == NTE_PROVIDER_DLL_FAIL
-        // TBS (0x8028xxxx) and TPM Platform Crypto Provider (0x8029xxxx) errors,
-        // e.g. TBS_E_TPM_NOT_FOUND, TPM_E_PCP_DEVICE_NOT_READY.
-        || (0x8028_0000..=0x8029_FFFF).contains(&u)
+    super::select::is_provider_unavailable_hresult(hr as u32)
 }
 
 fn check(what: &str, hr: i32) -> Result<()> {
@@ -161,7 +151,10 @@ impl CngKey {
             }
             key = Self::create_key(provider, handles.prov, &name, flags)?;
         } else {
-            classify("NCryptOpenKey", hr, false)?;
+            // An open that fails because the provider is not ready counts as "provider unavailable" too, so
+            // the read-only probe can move on to the software provider (selection of a recorded provider
+            // already rejects Unavailable, so this cannot downgrade a recorded TPM identity).
+            classify("NCryptOpenKey", hr, true)?;
         }
         handles.key = key;
         let spki = Self::export_spki(key).map_err(ProviderError::Failed)?;
@@ -388,8 +381,41 @@ pub fn load_existing() -> Result<Option<Box<dyn IdentityKey>>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_unavailable_allowlist_matches_the_windows_constants() {
+        use windows_sys::Win32::Foundation::{
+            TBS_E_SERVICE_DISABLED, TBS_E_SERVICE_NOT_RUNNING, TBS_E_SERVICE_START_PENDING,
+            TBS_E_TPM_NOT_FOUND, TPM_E_DEACTIVATED, TPM_E_DISABLED,
+            TPM_E_PCP_AUTHENTICATION_FAILED, TPM_E_PCP_DEVICE_NOT_READY,
+            TPM_E_PCP_FLAG_NOT_SUPPORTED, TPM_E_PCP_INTERNAL_ERROR, TPM_E_PCP_NOT_SUPPORTED,
+        };
+        for hr in [
+            NTE_DEVICE_NOT_READY,
+            NTE_NOT_SUPPORTED,
+            NTE_PROV_DLL_NOT_FOUND,
+            NTE_PROVIDER_DLL_FAIL,
+            TBS_E_TPM_NOT_FOUND,
+            TBS_E_SERVICE_DISABLED,
+            TBS_E_SERVICE_NOT_RUNNING,
+            TBS_E_SERVICE_START_PENDING,
+            TPM_E_DISABLED,
+            TPM_E_DEACTIVATED,
+            TPM_E_PCP_DEVICE_NOT_READY,
+            TPM_E_PCP_FLAG_NOT_SUPPORTED,
+            TPM_E_PCP_NOT_SUPPORTED,
+        ] {
+            assert!(is_provider_unavailable(hr), "{hr:#x}");
+        }
+        for hr in [TPM_E_PCP_INTERNAL_ERROR, TPM_E_PCP_AUTHENTICATION_FAILED] {
+            assert!(!is_provider_unavailable(hr), "{hr:#x}");
+        }
+    }
+
     use super::*;
     use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+    use windows_sys::Win32::Foundation::{
+        NTE_DEVICE_NOT_READY, NTE_PROVIDER_DLL_FAIL, NTE_PROV_DLL_NOT_FOUND,
+    };
 
     /// Needs a real TPM (or the software KSP); run with
     /// `cargo test -- --ignored identity::windows_cng` as Administrator.
