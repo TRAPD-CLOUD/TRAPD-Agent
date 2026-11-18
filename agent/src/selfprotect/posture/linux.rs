@@ -10,9 +10,10 @@ use super::snapshot::Setting;
 const SECURE_BOOT_VAR: &str =
     "sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 /// `kernel.tainted` bits that mean the module/kernel integrity chain was
-/// bypassed: forced module load (1), forced module unload (2), unsigned module
-/// (13). Proprietary (0) and out-of-tree (12) modules are common and benign.
-pub const TAINT_INTEGRITY_MASK: u64 = (1 << 1) | (1 << 2) | (1 << 13);
+/// bypassed: forced module load (bit 1), forced module unload (bit 3), unsigned module
+/// (bit 13). Proprietary (0), out-of-specification SMP (2) and out-of-tree (12) are
+/// common and benign. See Documentation/admin-guide/tainted-kernels.rst.
+pub const TAINT_INTEGRITY_MASK: u64 = (1 << 1) | (1 << 3) | (1 << 13);
 
 fn read_small(root: &Path, rel: &str) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
@@ -183,6 +184,40 @@ mod tests {
             assert_eq!(s.secure, Some(false), "{k}: {s:?}");
         }
         let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn each_integrity_taint_bit_is_insecure_on_its_own_and_benign_bits_are_not() {
+        // forced load (1), forced unload (3), unsigned module (13)
+        for bit in [1u32, 3, 13] {
+            let r = tree();
+            put(
+                &r,
+                "proc/sys/kernel/tainted",
+                format!("{}\n", 1u64 << bit).as_bytes(),
+            );
+            assert_eq!(
+                collect(&r)["kernel_tainted"].secure,
+                Some(false),
+                "bit {bit}"
+            );
+            let _ = std::fs::remove_dir_all(&r);
+        }
+        // proprietary (0), out-of-specification SMP (2), out-of-tree (12)
+        for bit in [0u32, 2, 12] {
+            let r = tree();
+            put(
+                &r,
+                "proc/sys/kernel/tainted",
+                format!("{}\n", 1u64 << bit).as_bytes(),
+            );
+            assert_eq!(
+                collect(&r)["kernel_tainted"].secure,
+                Some(true),
+                "bit {bit}"
+            );
+            let _ = std::fs::remove_dir_all(&r);
+        }
     }
 
     #[test]
