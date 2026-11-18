@@ -17,8 +17,27 @@ use std::time::{Duration, Instant};
 struct Pending {
     pid: i32,
     path: String,
+    /// The child's start time (clock ticks since boot) when it could be read: its identity apart from
+    /// the pid, which the OS reuses.
+    start: Option<u64>,
     deadline: Instant,
     observed: bool,
+}
+
+/// The start time of process `pid` in clock ticks since boot (Linux: field 22 of `/proc/<pid>/stat`).
+/// `None` when the process does not exist or the platform cannot tell.
+#[cfg(target_os = "linux")]
+pub fn process_start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name is in parentheses and may contain spaces and parentheses: the fields
+    // after the LAST ')' are fixed. starttime is field 22 overall, i.e. index 19 after "state".
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_start_time(_pid: i32) -> Option<u64> {
+    None
 }
 
 /// A finished test whose late sensor events may still arrive.
@@ -26,6 +45,8 @@ struct Pending {
 struct Retained {
     pid: i32,
     path: String,
+    /// Required: a finished test is only remembered when the child's identity is known.
+    start: u64,
     until: Instant,
 }
 
@@ -57,6 +78,7 @@ pub fn arm(pid: i32, path: &str, ttl: Duration) -> bool {
     *lock() = Some(Pending {
         pid,
         path: path.to_string(),
+        start: process_start_time(pid),
         deadline: Instant::now() + ttl,
         observed: false,
     });
@@ -82,7 +104,12 @@ pub fn claim(pid: i32, path: &str) -> bool {
     let now = Instant::now();
     let mut retained = lock_retained();
     retained.retain(|r| r.until > now);
-    retained.iter().any(|r| r.pid == pid && r.path == path)
+    // The pid may have been reused by an unrelated process: that one has another start time. A
+    // child that is gone (a delayed event of the finished test) has none; only then does the pid
+    // and path alone identify the test.
+    retained.iter().any(|r| {
+        r.pid == pid && r.path == path && process_start_time(pid).is_none_or(|now| now == r.start)
+    })
 }
 
 /// The armed `(pid, path)`, for the agent's own tests that stand in for a sensor.
@@ -100,6 +127,11 @@ pub fn observed() -> bool {
 /// test ends, whatever its outcome.
 pub fn finish() {
     if let Some(done) = lock().take() {
+        // Without the child's identity (a platform that cannot tell) nothing is retained: a pid
+        // alone is not enough to attribute a later access.
+        let Some(start) = done.start else {
+            return;
+        };
         let mut retained = lock_retained();
         retained.retain(|r| r.until > Instant::now());
         if retained.len() >= MAX_RETAINED {
@@ -108,6 +140,7 @@ pub fn finish() {
         retained.push(Retained {
             pid: done.pid,
             path: done.path,
+            start,
             until: Instant::now() + RETAIN,
         });
     }
@@ -144,29 +177,80 @@ mod tests {
         assert!(observed());
         finish();
         assert!(!observed(), "no longer running");
-        // A late sensor event of the same child is still the test; another pid or path is not.
-        assert!(
-            claim(10, "/a"),
-            "delayed events of the finished test stay marked"
-        );
-        assert!(!claim(11, "/a"));
-        assert!(!claim(10, "/b"));
         reset();
         assert!(!claim(10, "/a"));
     }
 
+    // Retention needs a real process (its start time is its identity), so these tests use this one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_finished_test_keeps_marking_delayed_events_of_the_same_process_only() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let me = std::process::id() as i32;
+        assert!(arm(me, "/a", Duration::from_secs(30)));
+        finish();
+        assert!(!observed(), "no longer running");
+        assert!(
+            claim(me, "/a"),
+            "a delayed event of the finished test stays marked"
+        );
+        assert!(!claim(me, "/b"), "another path is not");
+        assert!(!claim(me + 1, "/a"), "another pid is not");
+        reset();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reused_pid_is_not_the_test() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let me = std::process::id() as i32;
+        let start = process_start_time(me).expect("own start time");
+        // A test child that had this pid but another start time: the pid was reused since.
+        lock_retained().push(Retained {
+            pid: me,
+            path: "/a".into(),
+            start: start.wrapping_add(1),
+            until: Instant::now() + RETAIN,
+        });
+        assert!(
+            !claim(me, "/a"),
+            "same pid, different process: a real access"
+        );
+        reset();
+    }
+
+    #[test]
+    fn without_a_known_identity_nothing_is_retained() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        // A pid that cannot exist: no start time, so the finished test is simply forgotten.
+        assert!(arm(i32::MAX, "/a", Duration::from_secs(30)));
+        finish();
+        assert!(!claim(i32::MAX, "/a"));
+        reset();
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn retention_is_bounded() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
-        for pid in 1..=(MAX_RETAINED as i32 + 4) {
-            assert!(arm(pid, "/a", Duration::from_secs(30)));
+        let me = std::process::id() as i32;
+        for _ in 0..(MAX_RETAINED + 4) {
+            assert!(arm(me, "/a", Duration::from_secs(30)));
             finish();
         }
         assert!(lock_retained().len() <= MAX_RETAINED);
-        assert!(!claim(1, "/a"), "the oldest was dropped");
-        assert!(claim(MAX_RETAINED as i32 + 4, "/a"));
         reset();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn own_start_time_is_readable() {
+        assert!(process_start_time(std::process::id() as i32).is_some());
+        assert_eq!(process_start_time(i32::MAX), None);
     }
 
     #[test]
