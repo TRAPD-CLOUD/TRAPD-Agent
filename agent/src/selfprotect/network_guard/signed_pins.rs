@@ -232,6 +232,19 @@ impl PinState {
     }
 }
 
+/// Apply the last verified signed config's pins (or, without one, the persisted high-water record,
+/// so a removal cannot slip through) to `state`. Called when the process-wide state is created.
+pub fn apply_persisted(state: &PinState) {
+    let signed = match crate::config::load_persisted() {
+        Ok(cfg) => SignedPins::from_config(&cfg),
+        Err(e) => {
+            warn!(error = %e, "TLS: persisted config unreadable; applying the pin high-water record only");
+            SignedPins::default()
+        }
+    };
+    state.apply_signed(&signed, &high_water_path());
+}
+
 /// Apply the pin fields of `cfg` to the process-wide pin state.
 pub fn apply_signed_config(cfg: &AgentConfig) {
     super::tls_pin::global().apply_signed(&SignedPins::from_config(cfg), &high_water_path());

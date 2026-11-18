@@ -350,7 +350,13 @@ pub fn global() -> &'static Arc<PinState> {
         } else {
             tracing::info!("TLS: no SPKI pins configured, running in report-only mode");
         }
-        PinState::with_policy(policy)
+        let state = PinState::with_policy(policy);
+        // Pins delivered through the signed config apply from the first connection of the process,
+        // whichever code path makes it: binary-integrity failure reports and standalone CLI
+        // commands open backend connections long before (or without) the normal start-up path
+        // that applies the config.
+        super::signed_pins::apply_persisted(&state);
+        state
     })
 }
 
