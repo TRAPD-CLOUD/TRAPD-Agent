@@ -25,6 +25,46 @@ fn never_signal_self_or_init(pid: u32) -> bool {
     pid > 1 && pid != std::process::id()
 }
 
+/// A peer process as it was when the authenticated channel first showed it: the pid and the
+/// start (creation) time that makes the pid stable. Signalling a bare pid is unsafe after the peer
+/// had time to exit, because the pid can be reused by an unrelated process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    /// `None` when the start time could not be read: the process is then never signalled.
+    pub start: Option<u64>,
+}
+
+impl ProcessIdentity {
+    /// Identity of `pid` right now; call it when the pid is first observed.
+    pub fn observe(pid: u32) -> Self {
+        Self {
+            pid,
+            start: crate::telemetry::identity::process_start_time(pid as i32),
+        }
+    }
+}
+
+/// Kill a hung peer, bound to the observed process generation (pidfd / process handle opened before
+/// the start time is compared), so a pid reused during the settle delay is never hit.
+fn kill_hung_peer(id: ProcessIdentity) {
+    if !never_signal_self_or_init(id.pid) {
+        return;
+    }
+    let Some(start) = id.start else {
+        tracing::warn!(
+            pid = id.pid,
+            "the hung peer's start time is unknown; not signalling a bare pid"
+        );
+        return;
+    };
+    if let Err(e) = crate::prevention::process::kill_observed(id.pid as i32, Some(start)) {
+        // Typically "gone already" or "pid belongs to a different process": exactly the cases in
+        // which nothing must be signalled.
+        tracing::debug!(pid = id.pid, error = %e, "hung peer not killed");
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*;
@@ -93,12 +133,9 @@ mod imp {
     /// works on a stopped process, a stop request would stay pending forever.
     /// `start`, never `restart`: the agent unit is `PartOf` the other way round
     /// and a restart of one would take the restarter down with it.
-    pub fn restart(peer: Peer, kill_pid: Option<u32>) -> Result<()> {
-        if let Some(pid) = kill_pid.filter(|p| never_signal_self_or_init(*p)) {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+    pub fn restart(peer: Peer, kill: Option<ProcessIdentity>) -> Result<()> {
+        if let Some(id) = kill {
+            kill_hung_peer(id);
         }
         let status = Command::new("systemctl")
             .args([
@@ -118,9 +155,7 @@ mod imp {
     use windows_service::service::{ServiceAccess, ServiceState};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_TERMINATE,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
 
     const SYNCHRONIZE: u32 = 0x0010_0000;
 
@@ -167,17 +202,9 @@ mod imp {
         ended
     }
 
-    pub fn restart(peer: Peer, kill_pid: Option<u32>) -> Result<()> {
-        if let Some(pid) = kill_pid.filter(|p| never_signal_self_or_init(*p)) {
-            // SAFETY: handle closed below. Both services run as SYSTEM, which
-            // the peer's process DACL grants full access.
-            unsafe {
-                let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-                if !handle.is_null() {
-                    TerminateProcess(handle, 1);
-                    CloseHandle(handle);
-                }
-            }
+    pub fn restart(peer: Peer, kill: Option<ProcessIdentity>) -> Result<()> {
+        if let Some(id) = kill {
+            kill_hung_peer(id);
         }
         let service = open(peer, ServiceAccess::START | ServiceAccess::QUERY_STATUS)?;
         // A just-terminated service needs a moment to report Stopped.
@@ -235,5 +262,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(ended);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod kill_tests {
+    use super::*;
+
+    #[test]
+    fn a_hung_peer_is_killed_only_as_the_generation_that_was_observed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let id = ProcessIdentity::observe(child.id());
+        let start = id.start.expect("start time of a live child");
+
+        // A pid that now belongs to a different process generation must not be signalled.
+        kill_hung_peer(ProcessIdentity {
+            pid: child.id(),
+            start: Some(start + 1),
+        });
+        // Nor one whose start time was never known.
+        kill_hung_peer(ProcessIdentity {
+            pid: child.id(),
+            start: None,
+        });
+        assert!(child.try_wait().unwrap().is_none(), "signalled a stranger");
+
+        kill_hung_peer(id);
+        assert!(
+            !child.wait().unwrap().success(),
+            "the observed process is killed"
+        );
+    }
+
+    #[test]
+    fn never_signals_self_or_init() {
+        assert!(!never_signal_self_or_init(0));
+        assert!(!never_signal_self_or_init(1));
+        assert!(!never_signal_self_or_init(std::process::id()));
     }
 }

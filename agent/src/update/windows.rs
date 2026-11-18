@@ -27,9 +27,14 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use super::apply::Platform;
 
 const SERVICE_NAME: &str = "trapd-agent";
+/// Second service of the guard pair (MSI: it depends on the agent service, so the SCM refuses to stop
+/// the agent while the guard runs).
+const GUARD_SERVICE_NAME: &str = "trapd-guard";
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 /// `ERROR_SERVICE_ALREADY_RUNNING`.
 const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
+/// `ERROR_SERVICE_DOES_NOT_EXIST`.
+const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 /// `CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`.
 const HELPER_CREATION_FLAGS: u32 = 0x0800_0000 | 0x0000_0008 | 0x0000_0200;
 
@@ -107,27 +112,75 @@ impl ScmPlatform {
         }
         Ok(())
     }
+
+    /// The guard service, or `None` where it is not installed (installs that predate the pair).
+    fn open_guard(access: ServiceAccess) -> Result<Option<windows_service::service::Service>> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .context("update: connect to the service manager")?;
+        match manager.open_service(GUARD_SERVICE_NAME, access) {
+            Ok(service) => Ok(Some(service)),
+            Err(windows_service::Error::Winapi(e))
+                if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e).context("update: open the guard service"),
+        }
+    }
+
+    /// Stop the guard first: it depends on the agent service, so the SCM rejects the agent's stop
+    /// with `ERROR_DEPENDENT_SERVICES_RUNNING` while it runs, and a running guard would restart the
+    /// agent while its files are replaced. The agent stop follows immediately, before the agent's
+    /// own watch of the guard acts on the loss (it checks its shutdown flag after the settle delay).
+    fn stop_guard() -> Result<()> {
+        if let Some(guard) = Self::open_guard(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)? {
+            Self::stop_and_wait(&guard).context("update: stop the guard service")?;
+        }
+        Ok(())
+    }
+
+    /// Start the guard again after the agent. Its failure never fails an update that has already
+    /// succeeded: the agent runs, and the guard's own failure actions retry.
+    fn start_guard() {
+        let started = Self::open_guard(ServiceAccess::START | ServiceAccess::QUERY_STATUS)
+            .and_then(|g| match g {
+                Some(guard) => match guard.start::<&std::ffi::OsStr>(&[]) {
+                    Ok(()) => Ok(()),
+                    Err(windows_service::Error::Winapi(e))
+                        if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING) =>
+                    {
+                        Ok(())
+                    }
+                    Err(e) => Err(anyhow::Error::from(e)),
+                },
+                None => Ok(()),
+            });
+        if let Err(e) = started {
+            tracing::warn!(error = %e, "update: the guard service did not start after the update");
+        }
+    }
 }
 
 impl Platform for ScmPlatform {
     fn stop_service(&self) -> Result<()> {
+        Self::stop_guard()?;
         let service = Self::open(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
         Self::stop_and_wait(&service)
     }
 
     fn restart_service(&self) -> Result<()> {
+        Self::stop_guard()?;
         let service =
             Self::open(ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::QUERY_STATUS)?;
         Self::stop_and_wait(&service)?;
         match service.start::<&std::ffi::OsStr>(&[]) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(windows_service::Error::Winapi(e))
-                if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING) =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(e).context("update: start the agent service"),
+                if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING) => {}
+            Err(e) => return Err(e).context("update: start the agent service"),
         }
+        Self::start_guard();
+        Ok(())
     }
 }
 

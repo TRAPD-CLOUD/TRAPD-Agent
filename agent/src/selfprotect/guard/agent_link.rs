@@ -114,6 +114,7 @@ async fn link_loop() {
         supervise::SystemActions,
     );
     let mut monitor = PeerMonitor::new(Instant::now());
+    let mut peer_proc: Option<control::ProcessIdentity> = None;
     let mut watch: Option<(
         u32,
         std::sync::Arc<AtomicBool>,
@@ -142,6 +143,8 @@ async fn link_loop() {
                 monitor.observe(Instant::now(), pid, class);
                 if let Some(pid) = pid {
                     if watch.as_ref().map(|(p, _, _)| *p) != Some(pid) {
+                        // Pin the pid to its process generation while it is freshly authenticated.
+                        peer_proc = Some(control::ProcessIdentity::observe(pid));
                         if let Some((_, cancel, _)) = watch.take() {
                             cancel.store(true, Ordering::Relaxed);
                         }
@@ -167,7 +170,9 @@ async fn link_loop() {
         }
         if let Some(loss) = monitor.poll(Instant::now()) {
             // An authorized stop of the guard never ends the agent.
-            let _ = supervisor.handle(loss, monitor.pid()).await;
+            let _ = supervisor
+                .handle(loss, peer_proc.filter(|p| Some(p.pid) == monitor.pid()))
+                .await;
         }
         if let Some(sink) = SINK.get() {
             drain(sink, &state_dir).await;
