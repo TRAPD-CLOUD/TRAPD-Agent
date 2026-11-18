@@ -110,6 +110,22 @@ pub fn parse_pin(s: &str) -> Result<Pin, String> {
         .map_err(|_| format!("pin {raw:?} is not a 32-byte SHA-256"))
 }
 
+/// Strict form used for pins from the signed config: exactly the canonical
+/// standard-base64 encoding of 32 bytes (no prefix, whitespace or alternate
+/// padding), so the backend and agent agree on what is a valid pin.
+pub fn parse_canonical_pin(s: &str) -> Result<Pin, String> {
+    let bytes = B64
+        .decode(s)
+        .map_err(|_| "pin is not standard base64".to_string())?;
+    let pin: Pin = bytes
+        .try_into()
+        .map_err(|_| "pin is not a 32-byte SHA-256".to_string())?;
+    if encode_pin(&pin) != s {
+        return Err("pin is not canonical base64".into());
+    }
+    Ok(pin)
+}
+
 pub fn parse_pins(list: &[String]) -> Result<HashSet<Pin>, String> {
     list.iter().map(|s| parse_pin(s)).collect()
 }
@@ -197,6 +213,11 @@ struct MismatchSlot {
 #[derive(Default)]
 pub struct PinState {
     policy: RwLock<PinPolicy>,
+    /// Pins from the local sources (env / `network_guard.json`) as loaded at
+    /// start. They can only add to what the signed config delivers.
+    local: PinPolicy,
+    /// Set when the signed pins were cleared without an explicit disable.
+    pub(super) pins_removed: Mutex<Option<super::signed_pins::RemovalNotice>>,
     observed: Mutex<BTreeSet<String>>,
     mismatches: Mutex<HashMap<(String, Vec<String>), MismatchSlot>>,
 }
@@ -204,12 +225,17 @@ pub struct PinState {
 impl PinState {
     pub fn with_policy(policy: PinPolicy) -> Arc<Self> {
         Arc::new(Self {
-            policy: RwLock::new(policy),
+            policy: RwLock::new(policy.clone()),
+            local: policy,
             ..Default::default()
         })
     }
 
-    /// Replace the policy (signed-config hook).
+    pub(super) fn local_policy(&self) -> &PinPolicy {
+        &self.local
+    }
+
+    /// Replace the effective policy (used by the signed-config resolution).
     pub fn set_policy(&self, policy: PinPolicy) {
         if let Ok(mut p) = self.policy.write() {
             *p = policy;

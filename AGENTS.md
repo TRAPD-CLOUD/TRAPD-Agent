@@ -1665,6 +1665,19 @@ The `ETag` / `304 Not Modified` flow is unchanged, except the agent caches the
 returned `ETag` **only after the body verifies**, so a bad/unsigned response
 cannot latch it into `304`s and block a later good update.
 
+**Backend TLS pins in the signed config.** `backend_spki_pins` and
+`tls_inspection_ca_pins` (base64 SHA-256 SPKI, exactly 32 bytes, at most 8 each,
+inspection pins only with backend pins) and `tls_pinning_disabled` are trailing
+config fields, in this order, each omitted while empty/false so older agents keep
+verifying. A config that carries invalid pins is rejected as a whole. Signed pins
+replace `TRAPD_BACKEND_SPKI_PINS` / `network_guard.json`; the local inspection CA
+pins only add. The last signed set is kept in `<state>/tls_pins_high_water.json`:
+a later config without pins (and without `tls_pinning_disabled: true`) does not
+switch pinning off, the agent keeps enforcing the last set and reports
+`selfprotect.tls_pin_mismatch` with reason `pins_removed` once. Only a signed
+`tls_pinning_disabled: true` clears it. Details and limits (a local admin can still
+wipe the state dir) in `agent/src/selfprotect/network_guard/signed_pins.rs`.
+
 This is independent of, and must not be conflated with, **#30**
 (release-artifact / `install.sh` supply-chain signing): #30 anchors trust in
 the *binary* shipped to a host, whereas this note anchors trust in the

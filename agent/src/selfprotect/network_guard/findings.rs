@@ -40,6 +40,11 @@ pub enum Finding {
         severity: Severity,
     },
     PinMismatch(PinMismatch),
+    /// The signed backend pins disappeared without a signed explicit disable.
+    PinsRemoved {
+        /// Pins of the last known signed set that stay enforced (0: unknown).
+        enforced_pins: usize,
+    },
     UnreachableSelective {
         backend: String,
         probe: String,
@@ -62,6 +67,7 @@ impl Finding {
                 vector, subject, ..
             } => format!("redirected|{vector}|{subject}"),
             Finding::PinMismatch(m) => format!("pin|{}|{}", m.host, m.observed.join(",")),
+            Finding::PinsRemoved { .. } => "pins_removed".to_string(),
             Finding::UnreachableSelective { backend, .. } => format!("selective|{backend}"),
         }
     }
@@ -75,13 +81,17 @@ impl Finding {
             Finding::Redirected { allow_keys, .. } => allow_keys.clone(),
             // Pin and reachability findings are never allowlisted: pins are
             // already an explicit operator decision.
-            Finding::PinMismatch(_) | Finding::UnreachableSelective { .. } => vec![],
+            Finding::PinMismatch(_)
+            | Finding::PinsRemoved { .. }
+            | Finding::UnreachableSelective { .. } => vec![],
         }
     }
 
     pub fn severity(&self) -> Severity {
         match self {
-            Finding::Silenced { .. } | Finding::PinMismatch(_) => Severity::High,
+            Finding::Silenced { .. } | Finding::PinMismatch(_) | Finding::PinsRemoved { .. } => {
+                Severity::High
+            }
             Finding::Redirected { severity, .. } => *severity,
             Finding::UnreachableSelective { .. } => Severity::Medium,
         }
@@ -152,6 +162,25 @@ impl Finding {
                     "host": clip(&m.host),
                     "observed_spki_sha256": m.observed,
                     "refused_handshakes": m.count,
+                    "reason": "no_pin_match",
+                }),
+                ..Default::default()
+            },
+            Finding::PinsRemoved { enforced_pins } => DetectionData {
+                rule_id: RULE_PIN_MISMATCH.into(),
+                title: "Signed backend TLS pins were removed from the agent configuration".into(),
+                category: "defense_evasion".into(),
+                mitre_tactic: Some("TA0005 Defense Evasion".into()),
+                mitre_technique: Some("T1562".into()),
+                confidence: 80,
+                subject: "backend TLS pins".into(),
+                detail: "Pins were delivered earlier but the current signed configuration \
+                         carries none and does not disable pinning explicitly. The agent \
+                         keeps enforcing the last known signed set."
+                    .into(),
+                evidence: serde_json::json!({
+                    "reason": "pins_removed",
+                    "enforced_pins": enforced_pins,
                 }),
                 ..Default::default()
             },
@@ -316,5 +345,18 @@ mod tests {
         assert_eq!(d.rule_id, RULE_PIN_MISMATCH);
         assert_eq!(d.evidence["refused_handshakes"], 3);
         assert!(f.allow_keys().is_empty());
+        assert_eq!(d.evidence["reason"], "no_pin_match");
+    }
+
+    #[test]
+    fn pins_removed_event() {
+        let f = Finding::PinsRemoved { enforced_pins: 2 };
+        let d = f.detection();
+        assert_eq!(d.rule_id, RULE_PIN_MISMATCH);
+        assert_eq!(d.evidence["reason"], "pins_removed");
+        assert_eq!(d.evidence["enforced_pins"], 2);
+        assert_eq!(f.severity(), Severity::High);
+        assert!(f.allow_keys().is_empty());
+        assert_eq!(f.fingerprint(), "pins_removed");
     }
 }
