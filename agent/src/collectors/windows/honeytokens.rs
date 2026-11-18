@@ -1214,6 +1214,7 @@ fn emit_fs_event(
         session: None,
         allowlisted_accessor: false,
         scheduled_sweep: false,
+        selftest: false,
     };
     send_detection(tx, agent_id, hostname, severity, data);
     warn!(path = %path.display(), access_kind, "HONEYTOKEN TRIGGERED (filesystem)");

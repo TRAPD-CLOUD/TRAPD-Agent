@@ -20,6 +20,7 @@ pub mod fs_heuristics;
 pub mod honeytoken;
 pub mod honeytoken_policy;
 pub mod legacy_config;
+pub mod selftest;
 pub mod sensitive_files;
 pub mod sensor_policy;
 #[cfg(any(windows, test))]

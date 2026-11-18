@@ -1176,6 +1176,7 @@ fn access(allowlisted: bool, tty: Option<&str>) -> crate::schema::HoneytokenAcce
         }),
         allowlisted_accessor: allowlisted,
         scheduled_sweep: allowlisted && tty.is_none(),
+        selftest: false,
     }
 }
 

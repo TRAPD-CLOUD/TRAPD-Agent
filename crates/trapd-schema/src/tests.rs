@@ -510,6 +510,7 @@ fn test_honeytoken_access_event_with_session_roundtrip() {
         session: Some(session),
         allowlisted_accessor: false,
         scheduled_sweep: false,
+        selftest: false,
     };
     let event = AgentEvent::new(
         Uuid::new_v4().to_string(),

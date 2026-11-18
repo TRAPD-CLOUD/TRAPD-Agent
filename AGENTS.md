@@ -1498,6 +1498,7 @@ Discriminated by `kind`.
 { "kind": "upgrade_package", "name": "string, optional" }
 { "kind": "deploy_honeytoken", "path": "string", "content_b64": "base64 string", "mode": "u32 octal, optional, default 0", "mimic_neighbor": "bool, optional, default false", "canary_marker": "string, optional", "out_of_band": { "channel": "aws_cloudtrail|dns|http|kube_api|ssh_honeypot", "tracking_id": "string", "markers": ["string"] }, "token_kind": "string, optional", "breadcrumbs": [ { "path": "string", "content_b64": "base64 string", "mode": "u32 octal, optional", "append": "bool, optional" } ] }
 { "kind": "revoke_honeytoken", "path": "string" }
+{ "kind": "selftest_honeytoken", "path": "string" }
 { "kind": "freeze_pid", "pid": "i32" }
 { "kind": "thaw_pid", "pid": "i32" }
 ```
@@ -1510,6 +1511,29 @@ Discriminated by `kind`.
   "freeze, snapshot, then decide". Resume with `thaw_pid` (SIGCONT) or terminate
   with `kill_pid`. Both are best-effort: a process that already exited audits
   `success=false` rather than erroring.
+
+#### `selftest_honeytoken` semantics
+
+- Proves the alarm path of one deployed token end to end. A child process of the
+  agent (a plain `sh`/`cmd` that waits for one input byte, then opens the file)
+  touches the token; the sensor reports it through the normal pipeline. The
+  access carries `selftest: true` because the sensor asks
+  `trapd_detection::selftest`, which only `deception::selftest` arms, for exactly
+  that child pid and path. Nothing a monitored process does can set the mark.
+- A self-test never freezes, kills or isolates (`respond_honeytoken` skips it) and
+  raises no alert in the backend (`honeytoken_selftest_record` honours it).
+- Only a path in the agent's own register is tested. If the file is gone the
+  report says `file_missing`; if the agent's own sensor does not report the child's
+  access within 10 s the report says `sensor_silent`. A pass needs no report of its
+  own: the marked access reaching the backend is the proof.
+- Failures are reported as a `prevention.honeytoken_health` event whose
+  `details.selftest = { ok, reason, latency_ms }`; the file-status fields are not
+  touched by it.
+- The agent also runs the test itself for every token: first within 10 minutes to
+  6 hours after start (jittered), then every `honeytoken_selftest_interval_secs`
+  (config; `0` = one week; clamped to 1 hour .. 90 days) with ±10 % jitter, one
+  token at a time. Windows uses `cmd /C "pause & type <path>"` and needs the audit
+  sensor (`windows_audit`); a decoy without it reports `sensor_silent`.
 
 #### `deploy_honeytoken` / `revoke_honeytoken` semantics
 

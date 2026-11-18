@@ -56,6 +56,9 @@ fn skip_if_true(v: &bool) -> bool {
 fn skip_if_false(v: &bool) -> bool {
     !*v
 }
+fn skip_if_zero(v: &u64) -> bool {
+    *v == 0
+}
 fn default_prevention_enabled() -> bool {
     true
 }
@@ -401,9 +404,32 @@ pub struct AgentConfig {
     /// by a per-agent salted hash in `device_id`.
     #[serde(default, skip_serializing_if = "skip_if_false")]
     pub device_serial_capture_enabled: bool,
+    /// Seconds between the agent's own end-to-end self-tests of each deployed
+    /// honeytoken. `0` (the default, and omitted from the signed bytes) means the
+    /// built-in weekly interval; the backend sends a value only when the project
+    /// chose another one. Out-of-range values are clamped on use.
+    #[serde(default, skip_serializing_if = "skip_if_zero")]
+    pub honeytoken_selftest_interval_secs: u64,
 }
 
 pub use trapd_detection::RuleModeOverride;
+
+/// Built-in self-test interval, and the bounds the agent enforces on a configured one
+/// (a typo must neither spam the host nor silently switch the test off).
+pub const DEFAULT_SELFTEST_INTERVAL_SECS: u64 = 7 * 86_400;
+const MIN_SELFTEST_INTERVAL_SECS: u64 = 3_600;
+const MAX_SELFTEST_INTERVAL_SECS: u64 = 90 * 86_400;
+
+impl AgentConfig {
+    /// The self-test interval in effect.
+    pub fn honeytoken_selftest_interval(&self) -> std::time::Duration {
+        let secs = match self.honeytoken_selftest_interval_secs {
+            0 => DEFAULT_SELFTEST_INTERVAL_SECS,
+            n => n.clamp(MIN_SELFTEST_INTERVAL_SECS, MAX_SELFTEST_INTERVAL_SECS),
+        };
+        std::time::Duration::from_secs(secs)
+    }
+}
 
 /// An approved adaptive decoy: which candidate (`id` from the recon profile),
 /// of which kind, for which user.
@@ -471,6 +497,7 @@ impl Default for AgentConfig {
             user_response_notifications_enabled: false,
             sensitive_file_read_enabled: true,
             device_serial_capture_enabled: false,
+            honeytoken_selftest_interval_secs: 0,
         }
     }
 }
@@ -1230,6 +1257,38 @@ mod signed_config_tests {
         assert!(serde_json::to_string(&on)
             .unwrap()
             .contains("\"device_serial_capture_enabled\":true"));
+    }
+
+    #[test]
+    fn selftest_interval_defaults_to_a_week_is_clamped_and_stays_out_of_the_signed_bytes() {
+        let config = AgentConfig::default();
+        assert_eq!(config.honeytoken_selftest_interval().as_secs(), 7 * 86_400);
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("honeytoken_selftest_interval_secs"));
+        let at = |secs| AgentConfig {
+            honeytoken_selftest_interval_secs: secs,
+            ..AgentConfig::default()
+        };
+        assert_eq!(at(86_400).honeytoken_selftest_interval().as_secs(), 86_400);
+        assert_eq!(at(5).honeytoken_selftest_interval().as_secs(), 3_600);
+        assert_eq!(
+            at(u64::MAX).honeytoken_selftest_interval().as_secs(),
+            90 * 86_400
+        );
+        let json = serde_json::to_string(&at(86_400)).unwrap();
+        let device = AgentConfig {
+            device_serial_capture_enabled: true,
+            honeytoken_selftest_interval_secs: 86_400,
+            ..AgentConfig::default()
+        };
+        let json2 = serde_json::to_string(&device).unwrap();
+        assert!(json.contains("\"honeytoken_selftest_interval_secs\":86400"));
+        assert!(
+            json2.find("\"device_serial_capture_enabled\"").unwrap()
+                < json2.find("\"honeytoken_selftest_interval_secs\"").unwrap(),
+            "the interval is the last field, after device_serial_capture_enabled"
+        );
     }
 
     /// The backend signs the config in its own key order (TRAPD

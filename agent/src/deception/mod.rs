@@ -47,6 +47,7 @@
 
 pub mod profiler;
 pub mod registry;
+pub mod selftest;
 pub mod validate;
 #[cfg(any(windows, test))]
 pub mod windows_bait;
