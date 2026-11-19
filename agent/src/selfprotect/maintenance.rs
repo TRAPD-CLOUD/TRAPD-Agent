@@ -1635,10 +1635,14 @@ mod tests {
         assert!(!wxs.contains("MarkUpgradeStop"));
         // The new package writes the marker before the old product is removed.
         let stage = line("StageUpgradeMarker");
-        assert!(stage.contains("Before=\"RemoveExistingProducts\""));
+        assert!(stage.contains("After=\"RollbackUpgradeMarker\""));
+        // Deferred actions need a slot between InstallInitialize and
+        // RemoveExistingProducts; <MajorUpgrade Schedule=...> leaves none (MSI 2613).
+        assert!(!wxs.contains("<MajorUpgrade"));
+        assert!(wxs.contains("<RemoveExistingProducts After=\"StageUpgradeMarker\" />"));
         assert!(stage.contains("NOT Installed") && stage.contains("WIX_UPGRADE_DETECTED"));
         assert!(!stage.contains("REMOVE~="));
-        assert!(line("RollbackUpgradeMarker").contains("Before=\"StageUpgradeMarker\""));
+        assert!(line("RollbackUpgradeMarker").contains("After=\"InstallInitialize\""));
         // Install, repair and the new product of a major upgrade never gate.
         assert!(!gate.contains("NOT REMOVE") && !gate.contains("Installed"));
         for id in ["RequireUninstallToken", "StageUpgradeMarker"] {

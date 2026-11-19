@@ -3,7 +3,20 @@
   <Package Name="TRAPD Agent" Manufacturer="TRAPD" Version="$(var.Version)"
            UpgradeCode="0D18AC24-8CE9-4513-A1E5-889FD2A01D93" Scope="perMachine" InstallerVersion="500">
     <SummaryInformation Description="TRAPD Windows telemetry agent (x64)" />
-    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer TRAPD Agent is already installed." />
+    <!-- Major upgrade, authored explicitly instead of the MajorUpgrade element: the upgrade
+         marker (StageUpgradeMarker, deferred) must run after InstallInitialize and
+         before RemoveExistingProducts. MajorUpgrade Schedule="afterInstallInitialize"
+         pins RemoveExistingProducts directly behind InstallInitialize, so there is
+         no slot in between and "Before=RemoveExistingProducts" lands the deferred
+         actions on/before InstallInitialize (MSI error 2613, upgrade fails 1603).
+         Semantics match the previous MajorUpgrade: same property names, same-version
+         installs are not an upgrade, downgrades are refused, a failed upgrade rolls
+         back the removal of the old product. -->
+    <Upgrade Id="0D18AC24-8CE9-4513-A1E5-889FD2A01D93">
+      <UpgradeVersion Property="WIX_UPGRADE_DETECTED" Maximum="$(var.Version)" IncludeMaximum="no" MigrateFeatures="yes" />
+      <UpgradeVersion Property="WIX_DOWNGRADE_DETECTED" Minimum="$(var.Version)" IncludeMinimum="no" OnlyDetect="yes" />
+    </Upgrade>
+    <Launch Condition="NOT WIX_DOWNGRADE_DETECTED" Message="A newer TRAPD Agent is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Launch Condition="VersionNT64" Message="TRAPD requires 64-bit Windows." />
 
@@ -280,8 +293,9 @@
     <InstallExecuteSequence>
       <Custom Action="RollbackStopMarker" Before="RequireUninstallToken" Condition="REMOVE~=&quot;ALL&quot;" />
       <Custom Action="RequireUninstallToken" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot;" />
-      <Custom Action="RollbackUpgradeMarker" Before="StageUpgradeMarker" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
-      <Custom Action="StageUpgradeMarker" Before="RemoveExistingProducts" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+      <Custom Action="RollbackUpgradeMarker" After="InstallInitialize" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+      <Custom Action="StageUpgradeMarker" After="RollbackUpgradeMarker" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+      <RemoveExistingProducts After="StageUpgradeMarker" />
       <Custom Action="RollbackEnrollToken" After="WriteRegistryValues" Condition="ENROLLTOKENFILE AND NOT REMOVE" />
       <Custom Action="ImportEnrollToken" After="RollbackEnrollToken" Condition="ENROLLTOKENFILE AND NOT REMOVE" />
       <Custom Action="ApplyAcls" After="InstallServices" Condition="NOT REMOVE AND NOT TRAPD_LEGACY_ACLS=&quot;1&quot;" />
