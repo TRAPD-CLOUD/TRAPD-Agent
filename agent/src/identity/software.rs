@@ -69,7 +69,7 @@ mod file {
 
     impl IdentityKey for SoftwareKey {
         fn public_key_spki_der(&self) -> Vec<u8> {
-            let point = self.key.verifying_key().to_encoded_point(false);
+            let point = self.key.verifying_key().to_sec1_point(false);
             let x: [u8; 32] = point
                 .x()
                 .expect("uncompressed")
