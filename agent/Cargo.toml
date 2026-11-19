@@ -37,7 +37,7 @@ globset            = "0.4"
 ipnet              = { version = "2", features = ["serde"] }
 getrandom          = "0.3"
 zeroize            = { version = "1", features = ["derive"] }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 # Custom ServerCertVerifier for SPKI pinning (selfprotect::network_guard::tls_pin).
 # Both crates are already in the tree through reqwest's rustls-tls; they are
 # direct dependencies only so the verifier and root store can be built by hand.

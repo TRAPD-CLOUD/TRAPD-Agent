@@ -20,7 +20,7 @@ impl TestKey {
 
 impl IdentityKey for TestKey {
     fn public_key_spki_der(&self) -> Vec<u8> {
-        let p = self.0.verifying_key().to_encoded_point(false);
+        let p = self.0.verifying_key().to_sec1_point(false);
         crate::identity::spki_from_xy(
             p.x().unwrap().as_slice().try_into().unwrap(),
             p.y().unwrap().as_slice().try_into().unwrap(),
