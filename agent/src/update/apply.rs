@@ -1006,7 +1006,23 @@ mod tests {
         setup_full(artifact, tamper_staged, None)
     }
 
+    /// Point the release key directory at an empty per-process directory.
+    /// On Windows `release_key_dir()` defaults to the machine's real agent
+    /// config dir; on a host with an installed agent the tests then resolved
+    /// the real `release_signing.pub` instead of their own key and failed
+    /// ("invalid binary signature"). No test here wants a host key.
+    fn isolate_release_key_dir() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("trapd-apply-release-keys-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::env::set_var("TRAPD_RELEASE_KEY_DIR", &dir);
+        });
+    }
+
     fn setup_full(artifact: &[u8], tamper_staged: Option<&[u8]>, ebpf: Option<Ebpf<'_>>) -> Env {
+        isolate_release_key_dir();
         let root = std::env::temp_dir().join(format!("trapd-apply-test-{}", uuid::Uuid::new_v4()));
         let bin_dir = root.join("bin");
         let paths = StagingPaths::new(&root.join("state"));
