@@ -12,6 +12,7 @@
 
 pub mod echo;
 pub mod lifecycle;
+pub mod suspend;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -40,8 +41,9 @@ struct HeartbeatPayload {
     agent_last_restart: String,
     /// How the previous run ended: clean, unclean (killed/crashed) or unknown.
     previous_shutdown: lifecycle::PreviousShutdown,
-    /// Set only on the final beat of an orderly host shutdown (reboot, power
-    /// off). Tells the backend the coming silence is expected. A hint from an
+    /// Set only on the final beat before the host goes quiet on purpose: an
+    /// orderly shutdown (reboot, power off) or a suspend (see [`suspend`]).
+    /// Tells the backend the coming silence is expected. A hint from an
     /// untrusted source: the backend may only use it to keep its long silence
     /// threshold, never to suppress a finding.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -196,6 +198,10 @@ async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Option<Vec<u8
     Some(body)
 }
 
+/// Serializes beats of all `Heartbeat` instances (regular loop, suspend announcement, stop
+/// announcement); see [`Heartbeat::send_beat`].
+static BEAT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub struct Heartbeat {
     client: reqwest::Client,
     heartbeat_url: String,
@@ -266,8 +272,11 @@ impl Heartbeat {
         }
     }
 
-    /// Final beat of a host shutdown. Returns whether the backend accepted it.
+    /// Final beat before a host shutdown or suspend. Returns whether the
+    /// backend accepted it.
     pub async fn send_host_shutdown(&self) -> bool {
+        // Hold regular beats first, so none can follow the announcement and become the last word.
+        suspend::hold();
         self.send_beat(true).await
     }
 
@@ -276,6 +285,14 @@ impl Heartbeat {
     }
 
     async fn send_beat(&self, host_shutdown: bool) -> bool {
+        // One beat at a time, across every Heartbeat instance of the process: the announcement then
+        // waits for a regular beat that is already in flight (which would otherwise land after it),
+        // and a regular beat that was waiting sees the hold and stays quiet.
+        let _serial = BEAT_LOCK.lock().await;
+        if !host_shutdown && suspend::holding() {
+            debug!("Heartbeat held back: a host suspend was announced");
+            return false;
+        }
         let metrics = self.sample_metrics();
         let life = lifecycle::begin_process();
         let payload = HeartbeatPayload {

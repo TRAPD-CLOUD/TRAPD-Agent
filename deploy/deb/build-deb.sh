@@ -81,7 +81,7 @@ ROOT="$(mktemp -d)"
 trap 'rm -rf "$ROOT"' EXIT
 
 install -d -m 0755 "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/lib/trapd-agent" \
-    "$ROOT/usr/lib/systemd/system" "$ROOT/etc/trapd" "$ROOT/etc/trapd-release" \
+    "$ROOT/usr/lib/systemd/system" "$ROOT/usr/lib/systemd/system-sleep" "$ROOT/etc/trapd" "$ROOT/etc/trapd-release" \
     "$ROOT/etc/logrotate.d" "$ROOT/usr/share/trapd-agent"
 
 install -m 0755 "$AGENT_BIN" "$ROOT/usr/bin/trapd-agent"
@@ -107,6 +107,8 @@ grep -v '^[[:space:]]*#' "$ROOT/usr/lib/systemd/system/trapd-guard.service" | gr
     && die "trapd-guard.service still references /usr/local/bin outside comments"
 install -m 0644 "$HERE/trapd-agent-update.service" "$ROOT/usr/lib/systemd/system/trapd-agent-update.service"
 install -m 0644 "$HERE/trapd-agent-update.path" "$ROOT/usr/lib/systemd/system/trapd-agent-update.path"
+# Suspend announcement (SIGUSR2 -> final heartbeat), see deploy/trapd-agent-sleep.
+install -m 0755 "$DEPLOY_DIR/trapd-agent-sleep" "$ROOT/usr/lib/systemd/system-sleep/trapd-agent"
 
 install -m 0644 "$TRUST_DIR/ca.crt" "$ROOT/etc/trapd/ca.crt"
 install -m 0644 "$TRUST_DIR/command_signing.pub" "$ROOT/etc/trapd/command_signing.pub"

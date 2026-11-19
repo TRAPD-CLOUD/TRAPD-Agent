@@ -60,9 +60,14 @@ LIST="$(dpkg-deb --contents "$DEB1")"
 for p in ./usr/bin/trapd-agent ./usr/lib/trapd-agent/trapd-agent-exec ./etc/trapd/ca.crt \
          ./etc/trapd/command_signing.pub ./etc/trapd-release/release_signing.pub \
          ./usr/lib/systemd/system/trapd-agent.service ./usr/lib/systemd/system/trapd-guard.service ./usr/lib/systemd/system/trapd-agent-update.path \
-         ./usr/lib/systemd/system/trapd-agent-update.service ./etc/logrotate.d/trapd ./usr/share/trapd-agent/deception.conf; do
+         ./usr/lib/systemd/system/trapd-agent-update.service ./usr/lib/systemd/system-sleep/trapd-agent \
+         ./etc/logrotate.d/trapd ./usr/share/trapd-agent/deception.conf; do
     grep -q " ${p}\$" <<<"$LIST" && ok "contains $p" || fail "missing $p"
 done
+grep -qE '^-rwxr-xr-x .* \./usr/lib/systemd/system-sleep/trapd-agent$' <<<"$LIST" && ok "sleep hook is executable" || fail "sleep hook mode"
+# install.sh writes the same hook inline (it ships no extra release asset).
+diff -q <(sed -n "/^cat > \"\$SLEEP_HOOK_FILE\" <<'HOOK'\$/,/^HOOK\$/p" "$HERE/../install.sh" | sed '1d;$d') "$HERE/../trapd-agent-sleep" >/dev/null \
+    && ok "install.sh sleep hook matches deploy/trapd-agent-sleep" || fail "install.sh sleep hook drifted from deploy/trapd-agent-sleep"
 ! grep -q "systemd/system/trapd-agent.service.d" <<<"$LIST" && ok "deception drop-in is not enabled by the package" || fail "package enables the deception drop-in"
 ! grep -qE ' \./.*(agent\.key|credentials|\.env|\.pem|\.key)$' <<<"$LIST" && ok "no key/credential/env file shipped" || fail "unexpected sensitive file in package"
 ! grep -qE '^[-d]......[sS]|^[-d].....[sS]' <<<"$LIST" && ok "no setuid/setgid entries" || fail "setuid entry"

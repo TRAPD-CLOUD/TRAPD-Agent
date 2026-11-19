@@ -1,0 +1,14 @@
+#!/bin/sh
+# systemd-sleep hook: tell the TRAPD agent the host is about to suspend, so the
+# backend expects the coming silence instead of reporting a silent agent.
+# The agent sends one final heartbeat on SIGUSR2 (bounded to 1.5 s); the short
+# wait gives it that time before the host suspends. Never blocks suspend: the
+# hook always exits 0.
+case "$1" in
+pre)
+    if systemctl is-active --quiet trapd-agent.service; then
+        systemctl kill --signal=SIGUSR2 --kill-whom=main trapd-agent.service 2>/dev/null && sleep 2
+    fi
+    ;;
+esac
+exit 0

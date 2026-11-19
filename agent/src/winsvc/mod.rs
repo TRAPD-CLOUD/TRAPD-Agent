@@ -29,8 +29,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceDependency, ServiceErrorControl,
-    ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    PowerEventParam, ServiceAccess, ServiceControl, ServiceControlAccept, ServiceDependency,
+    ServiceErrorControl, ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState,
+    ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{
     self, ServiceControlHandlerResult, ServiceStatusHandle,
@@ -259,7 +260,14 @@ fn run_console() -> Result<()> {
                 claimed_token_nonce: None,
             });
         });
-        run::run_agent(stop_rx, || {}, false).await
+        // Console mode: no SCM, so no power events (the receiver ends at once).
+        run::run_agent(
+            stop_rx,
+            crate::heartbeat::suspend::channel().1,
+            || {},
+            false,
+        )
+        .await
     });
     rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     result
@@ -309,7 +317,9 @@ fn status_for(phase: Phase, checkpoint: u32, exit: ServiceExitCode) -> ServiceSt
         ),
         Phase::Running => (
             ServiceState::Running,
-            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            ServiceControlAccept::STOP
+                | ServiceControlAccept::SHUTDOWN
+                | ServiceControlAccept::POWER_EVENT,
             Duration::default(),
         ),
         Phase::Stopping => (
@@ -378,6 +388,7 @@ fn run_service() -> Result<()> {
 
     let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
     let (phase_tx, phase_rx) = mpsc::channel::<Phase>();
+    let (suspend, suspend_rx) = crate::heartbeat::suspend::channel();
 
     let handler_phase_tx = phase_tx.clone();
     let event_handler = move |control| -> ServiceControlHandlerResult {
@@ -388,6 +399,13 @@ fn run_service() -> Result<()> {
         }
         match control {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            // The host is about to suspend: announce it before returning (the
+            // system suspends once the handler returns or ~2 s have passed).
+            ServiceControl::PowerEvent(PowerEventParam::Suspend) => {
+                suspend.announce_blocking(crate::heartbeat::suspend::ACK_WAIT);
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::PowerEvent(_) => ServiceControlHandlerResult::NoError,
             // `maintenance` asked the service to look at a pending, token-bearing
             // stop request. The control itself carries nothing and proves nothing:
             // the stop happens only if a request verifies and is claimed.
@@ -437,6 +455,7 @@ fn run_service() -> Result<()> {
     let ready_tx = phase_tx.clone();
     let result = rt.block_on(run::run_agent(
         stop_rx,
+        suspend_rx,
         move || {
             // Past the integrity check: only now is the service Running.
             let _ = ready_tx.send(Phase::Running);
