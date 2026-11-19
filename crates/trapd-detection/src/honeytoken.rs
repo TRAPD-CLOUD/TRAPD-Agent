@@ -567,6 +567,7 @@ fn build_event(
         session: proc.session(hit.pid),
         allowlisted_accessor: allowlisted,
         scheduled_sweep: false,
+        selftest: crate::selftest::claim(hit.pid, hit.path),
     };
 
     // A backup/AV tool reading the bait on its schedule is expected. The same

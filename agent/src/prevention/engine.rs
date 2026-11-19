@@ -387,7 +387,8 @@ impl Engine {
     /// backend sees exactly what was done (and gets the hit telemetry for the
     /// ML feedback loop).
     async fn respond_honeytoken(&self, data: &HoneytokenAccessData) {
-        if !self.prevention_enabled() {
+        // The agent's own self-test must never freeze, kill or isolate anything.
+        if data.selftest || !self.prevention_enabled() {
             return;
         }
         let Some(level) = self.honeytoken_response_level().for_access(data) else {
@@ -1017,6 +1018,12 @@ impl Engine {
             }
             CommandPayload::RevokeHoneytoken { path } => {
                 self.cmd_revoke_honeytoken(path, &cmd_id);
+            }
+            CommandPayload::SelftestHoneytoken { path } => {
+                // The result (pass or failure) is reported under the command id.
+                let _ =
+                    deception::selftest::run(&self.honeytokens, &self.audit, path, Some(&cmd_id))
+                        .await;
             }
             CommandPayload::FreezePid {
                 pid,
