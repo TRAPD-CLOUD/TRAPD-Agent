@@ -305,7 +305,7 @@ try {
     'during outage' | Set-Content $queuedMarker
     Wait-Until { @(Read-Events | Where-Object { $_.data.path -eq $queuedMarker }).Count -gt 0 } 'Outage event was not collected.'
     $queuedIds = @(Read-Events | Where-Object { $_.data.path -eq $queuedMarker } | ForEach-Object event_id)
-    Invoke-AsSystem 'Restart-Service trapd-agent'
+    Stop-AgentService; Start-AgentService
     Remove-Item (Join-Path $root 'pause-ingest')
     Wait-Until {
         $accepted = @(Read-Requests | Where-Object { $_.path -eq '/api/v1/ingest/events' -and $_.status -eq 200 } | ForEach-Object { $_.body } | ForEach-Object event_id)
