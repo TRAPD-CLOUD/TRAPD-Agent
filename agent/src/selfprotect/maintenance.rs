@@ -1628,20 +1628,37 @@ mod tests {
         assert!(gate.contains("Condition=\"REMOVE~=&quot;ALL&quot;\""));
         assert!(gate.contains("Before=\"StopServices\""));
         for l in &seq {
-            if l.contains("RequireUninstallToken") || l.contains("StageUpgradeMarker") {
+            if l.contains("RequireUninstallToken")
+                || l.contains("UpgradeMarker")
+                || l.contains("UpgradeGateMarker")
+            {
                 assert!(!l.contains("UPGRADINGPRODUCTCODE"), "{l}");
             }
         }
         assert!(!wxs.contains("MarkUpgradeStop"));
         // The new package writes the marker before the old product is removed.
         let stage = line("StageUpgradeMarker");
-        assert!(stage.contains("Before=\"RemoveExistingProducts\""));
+        // First marker: before this package's own StopServices (consumed by
+        // that stop). Second: for the old product's gate, after the service is
+        // back. Cleared right after the old product is removed.
+        assert!(stage.contains("Before=\"StopServices\""));
+        assert!(line("StageUpgradeGateMarker").contains("Before=\"InstallExecute\""));
+        assert!(line("ClearUpgradeMarker").contains("After=\"RemoveExistingProducts\""));
+        // The old product is removed only after InstallExecute, so the marker
+        // exists before its gate runs. A deferred action before an
+        // afterInstallInitialize RemoveExistingProducts is MSI error 2613.
+        assert!(wxs.contains("<MajorUpgrade Schedule=\"afterInstallExecute\""));
         assert!(stage.contains("NOT Installed") && stage.contains("WIX_UPGRADE_DETECTED"));
         assert!(!stage.contains("REMOVE~="));
         assert!(line("RollbackUpgradeMarker").contains("Before=\"StageUpgradeMarker\""));
         // Install, repair and the new product of a major upgrade never gate.
         assert!(!gate.contains("NOT REMOVE") && !gate.contains("Installed"));
-        for id in ["RequireUninstallToken", "StageUpgradeMarker"] {
+        for id in [
+            "RequireUninstallToken",
+            "StageUpgradeMarker",
+            "StageUpgradeGateMarker",
+            "ClearUpgradeMarker",
+        ] {
             let ca = wxs
                 .lines()
                 .find(|l| l.contains("<CustomAction") && l.contains(&format!("Id=\"{id}\"")))
