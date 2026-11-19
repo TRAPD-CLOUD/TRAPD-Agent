@@ -5,8 +5,31 @@ systemd_active() {
     [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
 }
 
+# Uninstall protection: only when this package shipped the maintenance key
+# (build-deb.sh writes the marker then). The gate refuses the removal of an
+# enrolled agent without a valid single-use maintenance token, and fails closed
+# if the shipped key was deleted. Recovery: `apt-get install --reinstall
+# trapd-agent` restores the key. A non-zero exit here aborts the removal.
+uninstall_gate() {
+    [ -f /usr/share/trapd-agent/uninstall_protected ] || return 0
+    token_file="${TRAPD_MAINTENANCE_TOKEN_FILE:-/etc/trapd/uninstall.token}"
+    if [ -f "$token_file" ]; then
+        /usr/bin/trapd-agent uninstall-gate --token-file "$token_file" || return 1
+        # Single use: the token is consumed now, do not leave it behind.
+        [ "$token_file" = /etc/trapd/uninstall.token ] && rm -f "$token_file"
+    else
+        /usr/bin/trapd-agent uninstall-gate || return 1
+    fi
+    return 0
+}
+
 case "$1" in
 remove|deconfigure)
+    if ! uninstall_gate; then
+        echo "trapd-agent: removal refused. Place a maintenance token for this agent in" >&2
+        echo "/etc/trapd/uninstall.token (or set TRAPD_MAINTENANCE_TOKEN_FILE) and retry." >&2
+        exit 1
+    fi
     if systemd_active; then
         # Path unit first so no new apply run starts while the agent goes down.
         # The guard goes first so it cannot restart the agent while it is removed.

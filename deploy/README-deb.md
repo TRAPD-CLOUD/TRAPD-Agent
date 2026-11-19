@@ -32,6 +32,12 @@ only (see *Limits*).
 | `release_signing.pub` | raw 32-byte Ed25519 **public** key | `/etc/trapd-release/release_signing.pub` |
 | `backend_url` | one line, `https://host[:port][/path]` | `/usr/share/trapd-agent/backend_url`, copied into `agent.env` on first install |
 
+Optional: `maintenance_signing.pub` (raw 32-byte Ed25519 **public** key of the
+backend's maintenance-token signer) is installed to
+`/etc/trapd-release/maintenance_signing.pub` and turns on **uninstall protection**
+(see *Lifecycle*). The release workflow adds it from the repository variable
+`TRAPD_HOSTED_MAINTENANCE_PUBKEY` and warns when it is not set.
+
 Only public material belongs here. The build rejects a PEM private key in
 `ca.crt`, but it **cannot** tell a raw 32-byte Ed25519 public key from a raw
 32-byte private seed: stage the derived public keys, never the signing secrets.
@@ -86,6 +92,16 @@ Interaction between dpkg and the self-update:
   steps; credentials in `/var/lib/trapd` are reused.
 - **remove**: stops and disables the units, keeps `/var/lib/trapd`
   (credentials) and `/etc/trapd/agent.env`, so a reinstall keeps the device identity.
+- **uninstall protection** (only packages built with `maintenance_signing.pub`):
+  removing an enrolled agent needs a single-use maintenance token for this agent
+  (purpose `uninstall`, issued in the console). Put it in
+  `/etc/trapd/uninstall.token` (deleted after use) or point
+  `TRAPD_MAINTENANCE_TOKEN_FILE` at it (`sudo TRAPD_MAINTENANCE_TOKEN_FILE=… apt-get remove trapd-agent`).
+  Without a valid token `prerm` refuses and the package stays installed. The
+  gate fails closed if the shipped key was deleted; `apt-get install --reinstall
+  trapd-agent` restores it. Upgrades are never gated. A root user can still
+  bypass a package script; the honest promise is that an unauthorized stop or
+  removal is reported (`selfprotect.service_stop_requested`), not prevented.
 - **purge**: deletes `/var/lib/trapd`, `/var/log/trapd`, `/etc/trapd` and
   `/etc/trapd-release`. **This removes the device credentials and the mTLS key;
   the device has to pair again.** Symlinked data directories are unlinked, never followed.
