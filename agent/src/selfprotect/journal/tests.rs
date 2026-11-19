@@ -473,11 +473,13 @@ fn a_failed_append_restores_the_file_boundary() {
     let dir = Dir::new("rollback");
     let path = dir.0.join("record");
     std::fs::write(&path, b"complete line\n").unwrap();
-    let f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap();
-    let start = f.metadata().unwrap().len();
+    // Opened like `append_to_file` (write + seek, not append mode: Windows
+    // cannot truncate through an append-only handle).
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let start = {
+        use std::io::Seek as _;
+        f.seek(std::io::SeekFrom::End(0)).unwrap()
+    };
     {
         use std::io::Write as _;
         (&f).write_all(b"partial reco").unwrap(); // the disk filled up mid-record

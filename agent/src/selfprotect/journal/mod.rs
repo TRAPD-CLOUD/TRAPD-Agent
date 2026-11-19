@@ -456,8 +456,11 @@ impl Journal {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // Write + explicit seek instead of append mode: on Windows an append-only
+        // handle lacks FILE_WRITE_DATA, so `set_len` in `rollback_on_error` could
+        // not cut off a partial record. Appends are serialized by the journal lock.
         let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).append(true);
+        opts.create(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -466,7 +469,10 @@ impl Journal {
         let mut f = opts
             .open(&self.path)
             .with_context(|| format!("open {}", self.path.display()))?;
-        let start = f.metadata()?.len();
+        let start = {
+            use std::io::Seek as _;
+            f.seek(std::io::SeekFrom::End(0))?
+        };
         let result = f.write_all(bytes).and_then(|()| f.sync_data());
         rollback_on_error(&f, start, result)?;
         Ok(())
