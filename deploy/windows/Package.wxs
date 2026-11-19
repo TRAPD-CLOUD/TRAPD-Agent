@@ -86,6 +86,31 @@
             <ServiceDependency Id="EventLog" />
           </ServiceInstall>
           <ServiceControl Id="ManageService" Name="trapd-agent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+          <!-- Second service of the guard pair (phase 09 L2): the same signed
+               executable started as `trapd-agent.exe guard`. It watches the agent
+               and the agent watches it; each restarts the other and reports the
+               loss (agent/src/selfprotect/guard). It carries the same protected
+               DACL as the agent service, so only SYSTEM can stop or reconfigure
+               it. It depends on the agent service: the SCM starts the agent first,
+               and every MSI stop/removal stops the guard first, so the guard
+               cannot restart the agent while its files are being replaced. The
+               signed self-update does the same (update/windows.rs stops the guard
+               before the agent and starts it after it): the SCM rejects the agent's
+               stop while its dependent is running. An
+               authorized stop (uninstall gate / maintenance token) is announced to
+               the guard by the agent and ends both. Failure actions match the
+               agent's. Keep the DACL in sync with
+               selfprotect::acl_policy::SERVICE_DACL_SDDL. -->
+          <ServiceInstall Id="InstallGuardService" Name="trapd-guard" DisplayName="TRAPD Guard"
+                          Description="Watches the TRAPD Agent service and restarts it if it is stopped or hangs"
+                          Arguments="guard"
+                          Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" Vital="yes">
+            <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                                ThirdFailureActionType="restart" ResetPeriodInDays="1" RestartServiceDelayInSeconds="10" />
+            <PermissionEx Sddl="D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCLCSWRPLOCRRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RC;;;OW)" />
+            <ServiceDependency Id="trapd-agent" />
+          </ServiceInstall>
+          <ServiceControl Id="ManageGuardService" Name="trapd-guard" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
           <!-- MSI authorizes replacement, not the executable's claimed
                version. Remove the old baseline inside its rollback-enabled
                transaction, after stopping the service and before installing

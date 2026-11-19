@@ -59,10 +59,15 @@ dpkg --compare-versions "0.6.0~beta.1" lt "0.6.0" && ok "pre-release sorts befor
 LIST="$(dpkg-deb --contents "$DEB1")"
 for p in ./usr/bin/trapd-agent ./usr/lib/trapd-agent/trapd-agent-exec ./etc/trapd/ca.crt \
          ./etc/trapd/command_signing.pub ./etc/trapd-release/release_signing.pub \
-         ./usr/lib/systemd/system/trapd-agent.service ./usr/lib/systemd/system/trapd-agent-update.path \
-         ./usr/lib/systemd/system/trapd-agent-update.service ./etc/logrotate.d/trapd ./usr/share/trapd-agent/deception.conf; do
+         ./usr/lib/systemd/system/trapd-agent.service ./usr/lib/systemd/system/trapd-guard.service ./usr/lib/systemd/system/trapd-agent-update.path \
+         ./usr/lib/systemd/system/trapd-agent-update.service ./usr/lib/systemd/system-sleep/trapd-agent \
+         ./etc/logrotate.d/trapd ./usr/share/trapd-agent/deception.conf; do
     grep -q " ${p}\$" <<<"$LIST" && ok "contains $p" || fail "missing $p"
 done
+grep -qE '^-rwxr-xr-x .* \./usr/lib/systemd/system-sleep/trapd-agent$' <<<"$LIST" && ok "sleep hook is executable" || fail "sleep hook mode"
+# install.sh writes the same hook inline (it ships no extra release asset).
+diff -q <(sed -n "/^cat > \"\$SLEEP_HOOK_FILE\" <<'HOOK'\$/,/^HOOK\$/p" "$HERE/../install.sh" | sed '1d;$d') "$HERE/../trapd-agent-sleep" >/dev/null \
+    && ok "install.sh sleep hook matches deploy/trapd-agent-sleep" || fail "install.sh sleep hook drifted from deploy/trapd-agent-sleep"
 ! grep -q "systemd/system/trapd-agent.service.d" <<<"$LIST" && ok "deception drop-in is not enabled by the package" || fail "package enables the deception drop-in"
 ! grep -qE ' \./.*(agent\.key|credentials|\.env|\.pem|\.key)$' <<<"$LIST" && ok "no key/credential/env file shipped" || fail "unexpected sensitive file in package"
 ! grep -qE '^[-d]......[sS]|^[-d].....[sS]' <<<"$LIST" && ok "no setuid/setgid entries" || fail "setuid entry"
@@ -94,15 +99,30 @@ echo 'not elf' > "$TMP/notelf"
 expect_fail "non-ELF agent binary" "not an ELF" "$BUILD" 0.5.0 "$TMP/notelf" "$TMP/ebpf" "$TMP/trust" "$TMP/out-x"
 expect_fail "wrong ELF machine for the agent" "ELF machine" "$BUILD" 0.5.0 "$TMP/ebpf" "$TMP/ebpf" "$TMP/trust" "$TMP/out-x"
 expect_fail "bad version" "not MAJOR" "$BUILD" 'latest' "$TMP/agent1" "$TMP/ebpf" "$TMP/trust" "$TMP/out-x"
+cp -r "$TMP/trust" "$TMP/trust-mshort"; head -c 31 /dev/zero > "$TMP/trust-mshort/maintenance_signing.pub"
+expect_fail "31-byte maintenance key" "32-byte" "$BUILD" 0.5.0 "$TMP/agent1" "$TMP/ebpf" "$TMP/trust-mshort" "$TMP/out-x"
 [[ ! -e "$TMP/out-x" ]] && ok "failed builds leave no output" || fail "failed build created output"
+
+echo "== uninstall protection"
+! grep -qE ' \./(etc/trapd-release/maintenance_signing\.pub|usr/share/trapd-agent/uninstall_protected)$' <<<"$LIST" \
+    && ok "no maintenance key: no uninstall protection" || fail "unprotected build ships protection files"
+cp -r "$TMP/trust" "$TMP/trust-maint"; head -c 32 /dev/zero | tr '\0' 'm' > "$TMP/trust-maint/maintenance_signing.pub"
+mkdir -p "$TMP/out-maint"
+DEBM="$("$BUILD" 0.5.0 "$TMP/agent1" "$TMP/ebpf" "$TMP/trust-maint" "$TMP/out-maint")"
+LISTM="$(dpkg-deb --contents "$DEBM")"
+for p in ./etc/trapd-release/maintenance_signing.pub ./usr/share/trapd-agent/uninstall_protected; do
+    grep -q " ${p}\$" <<<"$LISTM" && ok "protected build contains $p" || fail "protected build misses $p"
+done
 
 echo "== install in containers"
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     [[ -z "${REQUIRE_DOCKER:-}" ]] && echo "  SKIP docker not available" || fail "docker not available"
 else
     mkdir -p "$TMP/work"
-    cp "$DEB1" "$TMP/work/v1.deb"; cp "$DEB2" "$TMP/work/v2.deb"; cp "$HERE/test-in-container.sh" "$TMP/work/"
+    cp "$DEB1" "$TMP/work/v1.deb"; cp "$DEB2" "$TMP/work/v2.deb"; cp "$DEBM" "$TMP/work/protected.deb"
+    cp "$HERE/test-in-container.sh" "$TMP/work/"
     cp "$HERE/../install.sh" "$TMP/work/install.sh"
+    cp "$HERE/../trapd-guard.service" "$TMP/work/trapd-guard.service"
     # Reuse the real Ed25519 fixture builder used by the standalone verifier tests.
     python3 - "$HERE/../test-release-verification.py" "$TMP/work" <<'PYFIXTURE'
 import importlib.util

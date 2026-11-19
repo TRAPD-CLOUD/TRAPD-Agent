@@ -126,6 +126,7 @@ jobs:
           TRAPD_HOSTED_CA_PEM: ${{ vars.TRAPD_HOSTED_CA_PEM }}
           TRAPD_HOSTED_COMMAND_PUBKEY: ${{ vars.TRAPD_HOSTED_COMMAND_PUBKEY }}
           TRAPD_HOSTED_RELEASE_PUBKEY: ${{ vars.TRAPD_HOSTED_RELEASE_PUBKEY }}
+          TRAPD_HOSTED_MAINTENANCE_PUBKEY: ${{ vars.TRAPD_HOSTED_MAINTENANCE_PUBKEY }}
         run: |
           for v in TRAPD_HOSTED_BACKEND_URL TRAPD_HOSTED_CA_PEM TRAPD_HOSTED_COMMAND_PUBKEY TRAPD_HOSTED_RELEASE_PUBKEY; do
             if [ -z "${!v}" ]; then
@@ -139,6 +140,12 @@ jobs:
           printf '%s\n' "${TRAPD_HOSTED_CA_PEM}" > trust/ca.crt
           printf '%s' "${TRAPD_HOSTED_COMMAND_PUBKEY}" | base64 -d > trust/command_signing.pub
           printf '%s' "${TRAPD_HOSTED_RELEASE_PUBKEY}" | base64 -d > trust/release_signing.pub
+          # Optional: enables uninstall protection (maintenance tokens) in the package.
+          if [ -n "${TRAPD_HOSTED_MAINTENANCE_PUBKEY}" ]; then
+            printf '%s' "${TRAPD_HOSTED_MAINTENANCE_PUBKEY}" | base64 -d > trust/maintenance_signing.pub
+          else
+            echo "::warning::TRAPD_HOSTED_MAINTENANCE_PUBKEY not set: the Debian package has no uninstall protection"
+          fi
           # build-deb.sh fails on malformed anchors (key sizes, private keys, URL).
           deploy/deb/build-deb.sh "${GITHUB_REF_NAME#v}" trapd-agent-linux-x86_64 trapd-agent-exec trust deb-out
           deb_files=(deb-out/*.deb)

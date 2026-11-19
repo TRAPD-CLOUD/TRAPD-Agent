@@ -191,6 +191,10 @@ pub enum CommandPayload {
     /// that is present in its local register, so this can never remove a real
     /// file the agent did not plant.
     RevokeHoneytoken { path: String },
+    /// Prove the alarm path of one deployed honeytoken: a child process of the
+    /// agent opens the token and the sensor must report it (see
+    /// `deception::selftest`). Only a path in the agent's own register is tested.
+    SelftestHoneytoken { path: String },
     // ── Forensic response (issue #32, point 5) ───────────────────────────────
     /// Freeze a process by SIGSTOP — suspend it (without killing) so it cannot
     /// react or destroy evidence while it is investigated. A forensic snapshot is

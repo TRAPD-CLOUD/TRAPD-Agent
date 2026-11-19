@@ -102,7 +102,7 @@ These need direct host access and therefore stay in the agent:
 
 `kill_pid`, `freeze_pid`, `thaw_pid`, `quarantine_file`, `restore_file`,
 `isolate_network`, `deisolate_network`, `block_ip` / `unblock_ip` (optional
-TTL), `update_policy`, `deploy_honeytoken`, `revoke_honeytoken`,
+TTL), `update_policy`, `deploy_honeytoken`, `revoke_honeytoken`, `selftest_honeytoken`,
 `install_package` / `remove_package` / `upgrade_package` (Linux only), and the
 RTR commands `run_script`, `collect_file`, `list_directory`,
 `collect_process_memory` (only with `rtr_enabled`).

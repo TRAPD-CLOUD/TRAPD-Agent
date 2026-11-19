@@ -10,7 +10,9 @@
 //! The metrics struct is OS-neutral so the future Windows agent reports the
 //! same shape.
 
+pub mod echo;
 pub mod lifecycle;
+pub mod suspend;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -39,8 +41,9 @@ struct HeartbeatPayload {
     agent_last_restart: String,
     /// How the previous run ended: clean, unclean (killed/crashed) or unknown.
     previous_shutdown: lifecycle::PreviousShutdown,
-    /// Set only on the final beat of an orderly host shutdown (reboot, power
-    /// off). Tells the backend the coming silence is expected. A hint from an
+    /// Set only on the final beat before the host goes quiet on purpose: an
+    /// orderly shutdown (reboot, power off) or a suspend (see [`suspend`]).
+    /// Tells the backend the coming silence is expected. A hint from an
     /// untrusted source: the backend may only use it to keep its long silence
     /// threshold, never to suppress a finding.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -52,6 +55,10 @@ struct HeartbeatPayload {
     /// Findings of shadow-mode rules since the last accepted beat.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     shadow_hits: std::collections::BTreeMap<String, u64>,
+    /// Latest platform posture snapshot and boot id (L5); absent until the
+    /// first snapshot exists or when posture checks are disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform_posture: Option<crate::selfprotect::posture::PostureReport>,
 }
 
 /// Process-local event accounting; recovered records belong to the previous
@@ -174,10 +181,31 @@ struct Metrics {
     process_count: usize,
 }
 
+/// Read a response body of at most `limit` bytes, chunk by chunk. A larger body (also a chunked
+/// one without a `Content-Length`) is abandoned as soon as it exceeds the limit instead of being
+/// buffered whole; `None` then, and on a transport error.
+async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n as usize > limit) {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        if body.len() + chunk.len() > limit {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
+
+/// Serializes beats of all `Heartbeat` instances (regular loop, suspend announcement, stop
+/// announcement); see [`Heartbeat::send_beat`].
+static BEAT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub struct Heartbeat {
     client: reqwest::Client,
     heartbeat_url: String,
-    token: String,
+    tokens: Arc<crate::identity::SessionTokens>,
     agent_id: String,
     hostname: String,
     /// Live agent config; `heartbeat_interval_secs` is re-read every beat so a
@@ -185,13 +213,17 @@ pub struct Heartbeat {
     config: Arc<RwLock<AgentConfig>>,
     /// `System` is reused across beats so CPU deltas are meaningful.
     sys: Mutex<System>,
+    /// Answers liveness challenges in heartbeat responses through the event
+    /// pipeline. Only the periodic beat has one; the final host-shutdown beat
+    /// does not need it.
+    echo: Option<echo::LivenessEcho>,
 }
 
 impl Heartbeat {
     pub fn new(
         backend_url: &str,
         agent_id: String,
-        token: String,
+        tokens: Arc<crate::identity::SessionTokens>,
         hostname: String,
         config: Arc<RwLock<AgentConfig>>,
     ) -> anyhow::Result<Self> {
@@ -202,12 +234,27 @@ impl Heartbeat {
         Ok(Self {
             client: crate::http::control_client()?,
             heartbeat_url: format!("{base}/api/v1/agents/{agent_id}/heartbeat"),
-            token,
+            tokens,
             agent_id,
             hostname,
             config,
             sys: Mutex::new(System::new()),
+            echo: None,
         })
+    }
+
+    /// Answer backend liveness challenges with `agent.liveness_echo` events
+    /// sent through `tx`, the normal telemetry channel (not the heartbeat).
+    pub fn with_liveness_echo(
+        mut self,
+        tx: tokio::sync::mpsc::WeakSender<trapd_schema::AgentEvent>,
+    ) -> Self {
+        self.echo = Some(echo::LivenessEcho::new(
+            self.agent_id.clone(),
+            self.hostname.clone(),
+            tx,
+        ));
+        self
     }
 
     pub async fn run(self) {
@@ -225,8 +272,11 @@ impl Heartbeat {
         }
     }
 
-    /// Final beat of a host shutdown. Returns whether the backend accepted it.
+    /// Final beat before a host shutdown or suspend. Returns whether the
+    /// backend accepted it.
     pub async fn send_host_shutdown(&self) -> bool {
+        // Hold regular beats first, so none can follow the announcement and become the last word.
+        suspend::hold();
         self.send_beat(true).await
     }
 
@@ -235,6 +285,14 @@ impl Heartbeat {
     }
 
     async fn send_beat(&self, host_shutdown: bool) -> bool {
+        // One beat at a time, across every Heartbeat instance of the process: the announcement then
+        // waits for a regular beat that is already in flight (which would otherwise land after it),
+        // and a regular beat that was waiting sees the hold and stays quiet.
+        let _serial = BEAT_LOCK.lock().await;
+        if !host_shutdown && suspend::holding() {
+            debug!("Heartbeat held back: a host suspend was announced");
+            return false;
+        }
         let metrics = self.sample_metrics();
         let life = lifecycle::begin_process();
         let payload = HeartbeatPayload {
@@ -252,11 +310,13 @@ impl Heartbeat {
             ),
             coverage: crate::telemetry::coverage::snapshot(),
             shadow_hits: crate::telemetry::coverage::take_shadow_hits(),
+            platform_posture: crate::selfprotect::posture::heartbeat_report(),
         };
+        let bearer = self.tokens.current().await;
         match self
             .client
             .post(&self.heartbeat_url)
-            .bearer_auth(&self.token)
+            .bearer_auth(&bearer)
             .json(&payload)
             .send()
             .await
@@ -264,9 +324,17 @@ impl Heartbeat {
             Ok(resp) if resp.status().is_success() => {
                 debug!("Heartbeat sent successfully");
                 crate::update::confirm_healthy();
+                if let Some(echo) = &self.echo {
+                    if let Some(body) = read_capped(resp, echo::MAX_RESPONSE_BYTES).await {
+                        echo.handle(&body);
+                    }
+                }
                 return true;
             }
             Ok(resp) => {
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    self.tokens.report_unauthorized(&bearer).await;
+                }
                 warn!("Heartbeat rejected by backend: HTTP {}", resp.status());
                 crate::telemetry::coverage::restore_shadow_hits(payload.shadow_hits);
             }
@@ -376,6 +444,50 @@ fn count_processes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One-shot HTTP server answering with a chunked body (no Content-Length).
+    async fn chunked_response(chunks: Vec<Vec<u8>>) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            for c in chunks {
+                let _ = sock
+                    .write_all(format!("{:x}\r\n", c.len()).as_bytes())
+                    .await;
+                let _ = sock.write_all(&c).await;
+                let _ = sock.write_all(b"\r\n").await;
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_is_cut_off_at_the_limit_not_buffered_whole() {
+        let big = chunked_response(vec![vec![b'x'; 3000], vec![b'y'; 3000]]).await;
+        assert_eq!(read_capped(big, 4096).await, None);
+        let small = chunked_response(vec![b"{\"ok\":".to_vec(), b"true}".to_vec()]).await;
+        assert_eq!(
+            read_capped(small, 4096).await.as_deref(),
+            Some(&b"{\"ok\":true}"[..])
+        );
+    }
     use crate::telemetry::metrics::MetricsSnapshot;
 
     #[test]
@@ -427,6 +539,7 @@ mod tests {
                 pipeline: PipelineCounters::from_snapshot(&MetricsSnapshot::default()),
                 coverage: Default::default(),
                 shadow_hits: Default::default(),
+                platform_posture: None,
             })
             .unwrap()
         };

@@ -414,7 +414,11 @@ struct ConsumeRequest<'a> {
 
 /// Tell the backend which tokens were used. 201 (recorded) and 409 (already
 /// recorded) are final; anything else keeps the record pending for a retry.
-pub async fn report_pending(backend_url: &str, agent_id: &str, secret: &str) {
+pub async fn report_pending(
+    backend_url: &str,
+    agent_id: &str,
+    tokens: &crate::identity::SessionTokens,
+) {
     let store = ConsumedStore::new(paths::state_dir());
     let pending = store.pending();
     if pending.is_empty() {
@@ -436,9 +440,10 @@ pub async fn report_pending(backend_url: &str, agent_id: &str, secret: &str) {
             purpose: record.purpose.as_str(),
             used_at,
         };
+        let bearer = tokens.current().await;
         let result = client
             .post(&url)
-            .bearer_auth(secret)
+            .bearer_auth(&bearer)
             .json(&body)
             .send()
             .await;
@@ -456,10 +461,14 @@ pub async fn report_pending(backend_url: &str, agent_id: &str, secret: &str) {
 }
 
 /// Background retry of unreported uses (offline hosts report on reconnect).
-pub fn spawn_pending_report(backend_url: String, agent_id: String, secret: String) {
+pub fn spawn_pending_report(
+    backend_url: String,
+    agent_id: String,
+    tokens: std::sync::Arc<crate::identity::SessionTokens>,
+) {
     tokio::spawn(async move {
         loop {
-            report_pending(&backend_url, &agent_id, &secret).await;
+            report_pending(&backend_url, &agent_id, &tokens).await;
             tokio::time::sleep(Duration::from_secs(300)).await;
         }
     });
@@ -540,7 +549,8 @@ pub(crate) fn uninstall_gate_decision(
     let KeyState::Present(key) = key else {
         bail!(
             "uninstall refused: the maintenance signing key ({KEY_FILE}) is missing on an \
-             enrolled agent, so no token can be verified; restore it (MSI repair) and retry"
+             enrolled agent, so no token can be verified; restore it (Windows: MSI repair; Debian: \
+             apt-get install --reinstall trapd-agent) and retry"
         );
     };
     let token = token.context(
@@ -558,8 +568,8 @@ pub(crate) fn uninstall_gate_decision(
 /// upgrade. The only way past it without a token is a verified upgrade
 /// (`stop_marker::upgrade_authorizes`): `UPGRADINGPRODUCTCODE` is a public
 /// property any administrator can set on the command line, so it is merely a
-/// claim that must match the marker the new package wrote as SYSTEM.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// claim that must match the marker the new package wrote as SYSTEM. On Linux
+/// the deb's prerm calls it only for a removal (an upgrade runs no gate).
 pub fn run_uninstall_gate(args: &[String]) -> Result<()> {
     let GateArgs {
         token_file,
@@ -748,7 +758,11 @@ fn report_consumption_now() {
                     Ok(rt) => rt.block_on(async {
                         if tokio::time::timeout(
                             IMMEDIATE_REPORT_BUDGET,
-                            report_pending(&url, &creds.agent_id, &creds.agent_secret),
+                            report_pending(
+                                &url,
+                                &creds.agent_id,
+                                &crate::identity::SessionTokens::for_cli(&url, &creds),
+                            ),
                         )
                         .await
                         .is_err()

@@ -32,6 +32,12 @@ only (see *Limits*).
 | `release_signing.pub` | raw 32-byte Ed25519 **public** key | `/etc/trapd-release/release_signing.pub` |
 | `backend_url` | one line, `https://host[:port][/path]` | `/usr/share/trapd-agent/backend_url`, copied into `agent.env` on first install |
 
+Optional: `maintenance_signing.pub` (raw 32-byte Ed25519 **public** key of the
+backend's maintenance-token signer) is installed to
+`/etc/trapd-release/maintenance_signing.pub` and turns on **uninstall protection**
+(see *Lifecycle*). The release workflow adds it from the repository variable
+`TRAPD_HOSTED_MAINTENANCE_PUBKEY` and warns when it is not set.
+
 Only public material belongs here. The build rejects a PEM private key in
 `ca.crt`, but it **cannot** tell a raw 32-byte Ed25519 public key from a raw
 32-byte private seed: stage the derived public keys, never the signing secrets.
@@ -86,11 +92,35 @@ Interaction between dpkg and the self-update:
   steps; credentials in `/var/lib/trapd` are reused.
 - **remove**: stops and disables the units, keeps `/var/lib/trapd`
   (credentials) and `/etc/trapd/agent.env`, so a reinstall keeps the device identity.
+- **uninstall protection** (only packages built with `maintenance_signing.pub`):
+  removing an enrolled agent needs a single-use maintenance token for this agent
+  (purpose `uninstall`, issued in the console). Put it in
+  `/etc/trapd/uninstall.token` (deleted after use) or point
+  `TRAPD_MAINTENANCE_TOKEN_FILE` at it (`sudo TRAPD_MAINTENANCE_TOKEN_FILE=… apt-get remove trapd-agent`).
+  Without a valid token `prerm` refuses and the package stays installed. The
+  gate fails closed if the shipped key was deleted; `apt-get install --reinstall
+  trapd-agent` restores it. Upgrades are never gated. A root user can still
+  bypass a package script; the honest promise is that an unauthorized stop or
+  removal is reported (`selfprotect.service_stop_requested`), not prevented.
 - **purge**: deletes `/var/lib/trapd`, `/var/log/trapd`, `/etc/trapd` and
   `/etc/trapd-release`. **This removes the device credentials and the mTLS key;
   the device has to pair again.** Symlinked data directories are unlinked, never followed.
 - Without systemd (containers, chroots) or when `policy-rc.d` denies, units are
   not started; nothing fails.
+
+## Guard pair
+
+`trapd-guard.service` runs `trapd-agent guard` beside the agent (phase 09 L2). It is
+`PartOf=trapd-agent.service` (stopping or restarting the agent does the same to the guard),
+the agent `Wants=` it, and the guard only ever *starts* the agent (`systemctl start`, never
+`restart`, which would propagate back). Each watches the other through
+`/run/trapd/guard.sock` (root, `0600`, in the root-only runtime directory both units keep)
+and a pidfd; a silent peer (`kill -STOP`) is killed and restarted after 10 s, a dead one at
+once, with at most 3 restarts per 10 minutes. The guard unit has no network, one
+capability (`CAP_KILL`) and `Restart=on-failure`, so an authorized stop stays stopped.
+Findings are `selfprotect.peer_lost` / `selfprotect.peer_binary_tampered`; the guard leaves
+them in `/var/lib/trapd/guard-events/` for the agent to ship. `TRAPD_GUARD=0` in
+`agent.env` switches the pair off.
 
 ## Limits and open points
 
@@ -100,6 +130,8 @@ Interaction between dpkg and the self-update:
   fetched from (an apt repository with a signed `Release` file would be the next step).
 - No `copyright` file (the repository has no license file yet), so `lintian`
   would warn; `lintian` was not run.
+- The guard pair (restart through `systemctl start`, the `PartOf` propagation, the unit
+  sandbox with `CAP_KILL` only) was not run under a real systemd either.
 - Not tested against a real systemd: the units pass `systemd-analyze verify`
   syntax-wise, the install paths were tested with a stubbed `systemctl`.
 

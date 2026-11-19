@@ -1498,6 +1498,7 @@ Discriminated by `kind`.
 { "kind": "upgrade_package", "name": "string, optional" }
 { "kind": "deploy_honeytoken", "path": "string", "content_b64": "base64 string", "mode": "u32 octal, optional, default 0", "mimic_neighbor": "bool, optional, default false", "canary_marker": "string, optional", "out_of_band": { "channel": "aws_cloudtrail|dns|http|kube_api|ssh_honeypot", "tracking_id": "string", "markers": ["string"] }, "token_kind": "string, optional", "breadcrumbs": [ { "path": "string", "content_b64": "base64 string", "mode": "u32 octal, optional", "append": "bool, optional" } ] }
 { "kind": "revoke_honeytoken", "path": "string" }
+{ "kind": "selftest_honeytoken", "path": "string" }
 { "kind": "freeze_pid", "pid": "i32" }
 { "kind": "thaw_pid", "pid": "i32" }
 ```
@@ -1510,6 +1511,40 @@ Discriminated by `kind`.
   "freeze, snapshot, then decide". Resume with `thaw_pid` (SIGCONT) or terminate
   with `kill_pid`. Both are best-effort: a process that already exited audits
   `success=false` rather than erroring.
+
+#### Living decoys (`honeytoken_living_enabled`)
+
+- Opt-in (signed config, default off). The agent moves only the **access time** of its
+  own registered tokens now and then, to a plausible moment (about once a day per token,
+  jittered, most days nothing), so a decoy does not stand out as a file nobody ever
+  opened. Content and modification time stay as deployed; the integrity digest is
+  unaffected. It never follows a symlink and skips a file whose size changed. Each touch is announced to the token-FIM watcher (`trapd_detection::self_touch`, 3 s, exact path, attribute changes only) so it is not reported as tamper. The agent's
+  own process is excluded from the honeytoken sensor, so this raises no alert. Reads no
+  user data. See `agent/src/deception/living.rs`.
+
+#### `selftest_honeytoken` semantics
+
+- Proves the alarm path of one deployed token end to end. A child process of the
+  agent (a plain `sh`/`cmd` that waits for one input byte, then opens the file)
+  touches the token; the sensor reports it through the normal pipeline. The
+  access carries `selftest: true` because the sensor asks
+  `trapd_detection::selftest`, which only `deception::selftest` arms, for exactly
+  that child pid and path. Nothing a monitored process does can set the mark.
+- A self-test never freezes, kills or isolates (`respond_honeytoken` skips it) and
+  raises no alert in the backend (`honeytoken_selftest_record` honours it).
+- Only a path in the agent's own register is tested. If the file is gone the
+  report says `file_missing`; if the agent's own sensor does not report the child's
+  access within 10 s the report says `sensor_silent`. A pass needs no report of its
+  own: the marked access reaching the backend is the proof.
+- Failures are reported as a `prevention.honeytoken_health` event whose
+  `details.selftest = { ok, reason, latency_ms }`; the file-status fields are not
+  touched by it.
+- A finished test stays attributable (same pid and path) for 120 s, so delayed sensor events of the child are still marked.
+- The agent also runs the test itself for every token: first within 10 minutes to
+  6 hours after start (jittered), then every `honeytoken_selftest_interval_secs`
+  (config; `0` = one week; clamped to 1 hour .. 90 days) with ±10 % jitter, one
+  token at a time. Windows uses `cmd /C "pause & type <path>"` and needs the audit
+  sensor (`windows_audit`); a decoy without it reports `sensor_silent`.
 
 #### `deploy_honeytoken` / `revoke_honeytoken` semantics
 
@@ -1664,6 +1699,19 @@ the backend MUST emit `SignedConfig`. Two requirements:
 The `ETag` / `304 Not Modified` flow is unchanged, except the agent caches the
 returned `ETag` **only after the body verifies**, so a bad/unsigned response
 cannot latch it into `304`s and block a later good update.
+
+**Backend TLS pins in the signed config.** `backend_spki_pins` and
+`tls_inspection_ca_pins` (base64 SHA-256 SPKI, exactly 32 bytes, at most 8 each,
+inspection pins only with backend pins) and `tls_pinning_disabled` are trailing
+config fields, in this order, each omitted while empty/false so older agents keep
+verifying. A config that carries invalid pins is rejected as a whole. Signed pins
+replace `TRAPD_BACKEND_SPKI_PINS` / `network_guard.json`; the local inspection CA
+pins only add. The last signed set is kept in `<state>/tls_pins_high_water.json`:
+a later config without pins (and without `tls_pinning_disabled: true`) does not
+switch pinning off, the agent keeps enforcing the last set and reports
+`selfprotect.tls_pin_mismatch` with reason `pins_removed` once. Only a signed
+`tls_pinning_disabled: true` clears it. Details and limits (a local admin can still
+wipe the state dir) in `agent/src/selfprotect/network_guard/signed_pins.rs`.
 
 This is independent of, and must not be conflated with, **#30**
 (release-artifact / `install.sh` supply-chain signing): #30 anchors trust in

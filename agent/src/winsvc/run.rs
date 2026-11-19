@@ -41,7 +41,13 @@ pub fn init_tracing_stderr() {
 /// event log is a separate file, written by [`crate::output`]). The file is
 /// size-rotated so a long-running service cannot fill the disk.
 pub fn init_tracing_file() {
-    let path = paths::log_dir().join("agent.log");
+    init_tracing_file_named("agent.log");
+}
+
+/// The guard service logs to its own file: two processes must not share one
+/// rotating log.
+pub fn init_tracing_file_named(name: &str) {
+    let path = paths::log_dir().join(name);
     let _ = std::fs::create_dir_all(paths::log_dir());
     let file = RotatingFile::open(
         &path,
@@ -214,6 +220,7 @@ async fn reconcile_pending_firewall_expiry() -> Vec<crate::prevention::winfirewa
 /// must already be loaded via [`load_config_env`].
 pub(super) async fn run_agent(
     mut stop: tokio::sync::mpsc::UnboundedReceiver<super::StopRequest>,
+    suspend: tokio::sync::mpsc::UnboundedReceiver<crate::heartbeat::suspend::Request>,
     on_ready: impl FnOnce(),
     as_service: bool,
 ) -> Result<()> {
@@ -248,6 +255,8 @@ pub(super) async fn run_agent(
         return Err(e);
     }
     on_ready();
+    // Pair with the guard service before anything that can wait (enrollment).
+    crate::selfprotect::guard::agent_link::start(as_service);
 
     // Expired rules may be what prevents enrollment reaching the backend.
     // Recover before ANY backend request, including pending pairing.
@@ -267,7 +276,7 @@ pub(super) async fn run_agent(
         .unwrap_or(false);
     let offline = env_truthy("TRAPD_OFFLINE") || !backend_configured;
 
-    let (backend_url, agent_id, token) = if offline {
+    let (backend_url, agent_id, tokens) = if offline {
         if !backend_configured {
             warn!(
                 "TRAPD_BACKEND_URL is not set — starting in OFFLINE mode. Telemetry is \
@@ -278,7 +287,11 @@ pub(super) async fn run_agent(
         } else {
             warn!("TRAPD_OFFLINE set — backend communication disabled (telemetry is local only).");
         }
-        (String::new(), device_id.clone(), String::new())
+        (
+            String::new(),
+            device_id.clone(),
+            crate::identity::SessionTokens::fixed(String::new()),
+        )
     } else {
         let backend_url = crate::http::normalize_base_url(
             &std::env::var("TRAPD_BACKEND_URL").unwrap_or_default(),
@@ -307,11 +320,9 @@ pub(super) async fn run_agent(
                 }
             }
         };
-        (
-            backend_url,
-            creds.agent_id.clone(),
-            creds.agent_secret.clone(),
-        )
+        let tokens = crate::identity::SessionTokens::bootstrap(&backend_url, &creds);
+        crate::selfprotect::journal::upload::start(&tokens, &backend_url, &creds.agent_id);
+        (backend_url, creds.agent_id.clone(), tokens)
     };
 
     let output_mode = OutputMode::from_env();
@@ -325,6 +336,10 @@ pub(super) async fn run_agent(
     );
 
     let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()?));
+    // Pins from the last verified signed config apply before the first connection.
+    if let Ok(cfg) = agent_config.read() {
+        crate::selfprotect::network_guard::signed_pins::apply_signed_config(&cfg);
+    }
     let spool = if offline {
         Spool::in_memory(pipeline::SPOOL_MAX_MEMORY)
     } else {
@@ -352,12 +367,14 @@ pub(super) async fn run_agent(
             &mut spool,
         );
     }
+    crate::selfprotect::guard::agent_link::attach(tx.clone(), agent_id.clone(), hostname.clone());
     tokio::spawn(crate::selfprotect::restart_forensics::run(
         tx.clone(),
         agent_id.clone(),
         hostname.clone(),
         offline,
     ));
+    crate::selfprotect::posture::spawn(tx.clone(), agent_id.clone(), hostname.clone());
     // Service/registry ACL guard (WP2/WP3): checks and re-asserts at start, then
     // watches. Only the SYSTEM service can apply the ACLs; a console run skips it.
     if as_service {
@@ -395,7 +412,7 @@ pub(super) async fn run_agent(
         match crate::prevention::runtime::start(
             &backend_url,
             &agent_id,
-            &token,
+            Arc::clone(&tokens),
             &hostname,
             tx.clone(),
             Arc::clone(&agent_config),
@@ -483,6 +500,11 @@ pub(super) async fn run_agent(
     // Runtime self-protection: periodic binary recheck and a health watchdog
     // over the liveness beats (consumer, event log, ETW).
     spawn_collector!(crate::selfprotect::runtime_guard::BinaryIntegrityMonitor);
+    spawn_collector!(crate::selfprotect::process_integrity::ProcessIntegrityMonitor::new());
+    // L4: WFP/firewall blocks, hosts/proxy/NRPT redirects, TLS pin mismatches.
+    spawn_collector!(crate::selfprotect::network_guard::NetworkGuard::new(
+        &backend_url
+    ));
     handles.push(tokio::spawn(
         crate::selfprotect::runtime_guard::run_health_watchdog(),
     ));
@@ -515,8 +537,11 @@ pub(super) async fn run_agent(
     // Registry persistence watcher (Run keys, services, IFEO, Winlogon, ...).
     spawn_collector!(crate::collectors::windows::regwatch::RegistryWatchCollector::new(!offline));
 
+    // Weak: the liveness echo must not keep the pipeline open at shutdown.
+    let echo_tx = tx.downgrade();
     drop(tx);
 
+    crate::selfprotect::local_log::init_policy(Arc::clone(&agent_config));
     if let Ok(cfg) = agent_config.read() {
         crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
         crate::detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
@@ -640,7 +665,7 @@ pub(super) async fn run_agent(
         &backend_url,
         agent_id.clone(),
         device_id.clone(),
-        token.clone(),
+        Arc::clone(&tokens),
         hostname.clone(),
         offline,
         Arc::clone(&agent_config),
@@ -655,41 +680,64 @@ pub(super) async fn run_agent(
     );
 
     // Backend access for reporting a consumed maintenance token before exit.
-    let mut maintenance_report: Option<(String, String, String)> = None;
+    let mut maintenance_report: Option<(String, String, Arc<crate::identity::SessionTokens>)> =
+        None;
     if !offline {
-        maintenance_report = Some((backend_url.clone(), agent_id.clone(), token.clone()));
-        let transport =
-            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
+        maintenance_report = Some((backend_url.clone(), agent_id.clone(), Arc::clone(&tokens)));
+        let transport = Transport::new(
+            Arc::clone(&ring_buffer),
+            backend_url.clone(),
+            Arc::clone(&tokens),
+        )?;
         handles.push(tokio::spawn(async move { transport.run().await }));
 
         let config_puller = ConfigPuller::new(
             Arc::clone(&agent_config),
             &backend_url,
             &agent_id,
-            token.clone(),
+            Arc::clone(&tokens),
         )?
         .with_apply_hook(Arc::new(move |cfg: &AgentConfig| {
+            crate::selfprotect::network_guard::signed_pins::apply_signed_config(cfg);
             crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
             crate::detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
             crate::detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
         }));
         handles.push(tokio::spawn(async move { config_puller.run().await }));
 
-        let token_for_update = token.clone();
         let heartbeat = Heartbeat::new(
             &backend_url,
             agent_id.clone(),
-            token.clone(),
+            Arc::clone(&tokens),
             hostname.clone(),
             Arc::clone(&agent_config),
-        )?;
+        )?
+        .with_liveness_echo(echo_tx);
         handles.push(tokio::spawn(async move { heartbeat.run().await }));
+        let suspend_beat = Arc::new(Heartbeat::new(
+            &backend_url,
+            agent_id.clone(),
+            Arc::clone(&tokens),
+            hostname.clone(),
+            Arc::clone(&agent_config),
+        )?);
+        handles.push(tokio::spawn(crate::heartbeat::suspend::serve(
+            suspend,
+            move || {
+                let beat = Arc::clone(&suspend_beat);
+                async move { beat.send_host_shutdown().await }
+            },
+        )));
         stop_announcer = stop_announcer.with_backend(
-            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?,
+            Transport::new(
+                Arc::clone(&ring_buffer),
+                backend_url.clone(),
+                Arc::clone(&tokens),
+            )?,
             Heartbeat::new(
                 &backend_url,
                 agent_id.clone(),
-                token,
+                Arc::clone(&tokens),
                 hostname.clone(),
                 Arc::clone(&agent_config),
             )?,
@@ -699,12 +747,12 @@ pub(super) async fn run_agent(
         crate::selfprotect::maintenance::spawn_pending_report(
             backend_url.clone(),
             agent_id.clone(),
-            token_for_update.clone(),
+            tokens.clone(),
         );
 
         // Signed self-update. Opt-in by key provisioning: without the pinned
         // release and command keys no update can be verified, so it is not started.
-        match crate::update::Updater::new(&backend_url, agent_id.clone(), token_for_update) {
+        match crate::update::Updater::new(&backend_url, agent_id.clone(), tokens) {
             Ok(updater) => handles.push(tokio::spawn(async move { updater.run().await })),
             Err(e) => info!(error = %e, "Self-update disabled"),
         }
@@ -735,10 +783,10 @@ pub(super) async fn run_agent(
         // A token the service just claimed must reach the backend before the
         // stop notice does, so the backend can correlate the two. Bounded.
         if request.source == crate::selfprotect::stop::StopSource::MaintenanceToken {
-            if let Some((url, id, secret)) = &maintenance_report {
+            if let Some((url, id, tokens)) = &maintenance_report {
                 let _ = tokio::time::timeout(
                     crate::selfprotect::stop::STOP_FLUSH_BUDGET,
-                    crate::selfprotect::maintenance::report_pending(url, id, secret),
+                    crate::selfprotect::maintenance::report_pending(url, id, tokens),
                 )
                 .await;
             }

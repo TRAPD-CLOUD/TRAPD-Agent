@@ -35,6 +35,7 @@ expect_mode /etc/trapd/binary.sha256 "600 root:root"
 expect_mode /var/lib/trapd "700 root:root"
 expect_mode /var/log/trapd "700 root:root"
 expect_mode /usr/lib/systemd/system/trapd-agent.service "644 root:root"
+expect_mode /usr/lib/systemd/system/trapd-guard.service "644 root:root"
 check "no setuid/setgid or world-writable file in the package" \
     bash -c '! dpkg -L trapd-agent | while read -r p; do [ -f "$p" ] && stat -c "%a" "$p"; done | grep -Eq "^[0-7]{4}$|[2367]$"'
 check "agent.env points at the baked backend and has no token" \
@@ -42,10 +43,18 @@ check "agent.env points at the baked backend and has no token" \
 check "baseline matches the installed binary" \
     bash -c '[ "$(cat /etc/trapd/binary.sha256)" = "sha256:$(sha256sum /usr/bin/trapd-agent | cut -d" " -f1)" ]'
 check "main unit runs /usr/bin/trapd-agent" grep -qx 'ExecStart=/usr/bin/trapd-agent' /usr/lib/systemd/system/trapd-agent.service
+check "guard unit runs the same binary with the guard argument" \
+    grep -qx 'ExecStart=/usr/bin/trapd-agent guard' /usr/lib/systemd/system/trapd-guard.service
+check "guard unit is PartOf the agent and the agent wants the guard" \
+    bash -c 'grep -qx "PartOf=trapd-agent.service" /usr/lib/systemd/system/trapd-guard.service && grep -qx "Wants=trapd-guard.service" /usr/lib/systemd/system/trapd-agent.service'
+check "guard unit is hardened and has no network" \
+    bash -c 'grep -qx "NoNewPrivileges=true" /usr/lib/systemd/system/trapd-guard.service && grep -qx "PrivateNetwork=true" /usr/lib/systemd/system/trapd-guard.service && grep -qx "CapabilityBoundingSet=CAP_KILL" /usr/lib/systemd/system/trapd-guard.service'
+check "both units keep the shared runtime directory" \
+    bash -c 'for u in agent guard; do grep -qx "RuntimeDirectoryPreserve=yes" /usr/lib/systemd/system/trapd-$u.service || exit 1; done'
 check "apply unit runs /usr/bin and may write /usr/bin" \
     bash -c 'grep -qx "ExecStart=/usr/bin/trapd-agent --apply-update" /usr/lib/systemd/system/trapd-agent-update.service && grep -q "^ReadWritePaths=/usr/bin " /usr/lib/systemd/system/trapd-agent-update.service'
 check "no active /usr/local/bin reference in any unit" \
-    bash -c '! grep -hv "^[[:space:]]*#" /usr/lib/systemd/system/trapd-agent*.service /usr/lib/systemd/system/trapd-agent-update.path | grep -q /usr/local/bin'
+    bash -c '! grep -hv "^[[:space:]]*#" /usr/lib/systemd/system/trapd-agent*.service /usr/lib/systemd/system/trapd-guard.service /usr/lib/systemd/system/trapd-agent-update.path | grep -q /usr/local/bin'
 check "logrotate conffile registered" bash -c 'dpkg-query -W -f="\${Conffiles}" trapd-agent | grep -q /etc/logrotate.d/trapd'
 check "postinst printed the pairing hint" grep -q 'pairing.txt' /tmp/install1.log
 
@@ -62,7 +71,7 @@ mkdir -p /run/systemd/system
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; chmod +x /usr/sbin/policy-rc.d
 : > /tmp/systemctl.log
 PATH="$STUB:$PATH" dpkg -i "$V1" >/dev/null 2>&1 && ok "install under a denying policy succeeds" || fail "install under policy"
-check "units still enabled" grep -qx 'enable trapd-agent.service trapd-agent-update.path' /tmp/systemctl.log
+check "units still enabled" grep -qx 'enable trapd-agent.service trapd-guard.service trapd-agent-update.path' /tmp/systemctl.log
 check "no start/restart under policy" bash -c '! grep -Eq "^(start|try-restart) " /tmp/systemctl.log'
 rm -f /usr/sbin/policy-rc.d
 
@@ -76,8 +85,9 @@ check "baseline follows the new binary" \
 check "upgrade removes prior self-update signature" test ! -e /etc/trapd/binary.sig
 check "upgrade preserves the release verification key" test -f /etc/trapd-release/release_signing.pub
 check "daemon-reload called" grep -qx 'daemon-reload' /tmp/systemctl.log
-check "units enabled" grep -qx 'enable trapd-agent.service trapd-agent-update.path' /tmp/systemctl.log
+check "units enabled" grep -qx 'enable trapd-agent.service trapd-guard.service trapd-agent-update.path' /tmp/systemctl.log
 check "agent restarted on upgrade" grep -qx 'try-restart trapd-agent.service' /tmp/systemctl.log
+check "guard started on upgrade (older packages had none)" grep -qx 'start trapd-guard.service' /tmp/systemctl.log
 check "operator edit still there after upgrade" grep -qx '# local edit' /etc/trapd/agent.env
 
 echo "== signed updater leftovers are cleaned on remove"
@@ -85,8 +95,8 @@ touch /usr/bin/trapd-agent.prev /usr/bin/.trapd-agent.new /usr/lib/trapd-agent/t
 echo EXPIRED-CODE > /var/lib/trapd/pairing.txt
 : > /tmp/systemctl.log
 PATH="$STUB:$PATH" dpkg -r trapd-agent >/dev/null 2>&1 && ok "remove succeeds" || fail "remove"
-check "agent and path unit stopped" grep -qx 'stop trapd-agent-update.path trapd-agent.service' /tmp/systemctl.log
-check "units disabled" grep -qx 'disable trapd-agent.service trapd-agent-update.path' /tmp/systemctl.log
+check "guard, agent and path unit stopped (guard first)" grep -qx 'stop trapd-agent-update.path trapd-guard.service trapd-agent.service' /tmp/systemctl.log
+check "units disabled" grep -qx 'disable trapd-agent.service trapd-guard.service trapd-agent-update.path' /tmp/systemctl.log
 check "binary removed" bash -c '[ ! -e /usr/bin/trapd-agent ]'
 check ".prev/.new leftovers removed" \
     bash -c '[ ! -e /usr/bin/trapd-agent.prev ] && [ ! -e /usr/bin/.trapd-agent.new ] && [ ! -e /usr/lib/trapd-agent ]'
@@ -104,6 +114,24 @@ echo secret > /etc/trapd/agent.key
 dpkg -P trapd-agent >/dev/null 2>&1 && ok "purge succeeds" || fail "purge"
 check "state, log and config directories gone" \
     bash -c '[ ! -e /var/lib/trapd ] && [ ! -e /var/log/trapd ] && [ ! -e /etc/trapd ] && [ ! -e /etc/trapd-release ]'
+
+echo "== uninstall protection: the gate decides a removal"
+dpkg -i /work/protected.deb >/dev/null 2>&1
+# The fixture agent cannot execute: the gate fails, so the removal must fail.
+! dpkg -r trapd-agent >/dev/null 2>&1 && ok "removal refused when the gate fails" || fail "removal went through a failing gate"
+check "package still installed" dpkg -s trapd-agent
+# A gate that authorizes: it gets the token file and the used token is removed.
+cat > /usr/bin/trapd-agent <<'GATE'
+#!/bin/sh
+[ "$1" = uninstall-gate ] && echo "$*" > /tmp/gate-args
+exit 0
+GATE
+chmod 0755 /usr/bin/trapd-agent
+echo token > /etc/trapd/uninstall.token
+dpkg -r trapd-agent >/dev/null 2>&1 && ok "removal allowed when the gate passes" || fail "removal with a passing gate"
+check "gate got the default token file" grep -qx 'uninstall-gate --token-file /etc/trapd/uninstall.token' /tmp/gate-args
+check "used token file removed" test ! -e /etc/trapd/uninstall.token
+dpkg -P trapd-agent >/dev/null 2>&1; rm -rf /etc/trapd /var/lib/trapd /var/log/trapd /tmp/gate-args
 
 echo "== purge does not follow a symlinked data directory"
 dpkg -i "$V1" >/dev/null 2>&1
@@ -123,6 +151,9 @@ rm -f /usr/local/bin/trapd-agent
 echo x > /etc/systemd/system/trapd-agent.service 2>/dev/null || { mkdir -p /etc/systemd/system && echo x > /etc/systemd/system/trapd-agent.service; }
 if dpkg -i "$V1" >/dev/null 2>&1; then fail "install over install.sh unit must fail"; else ok "install over install.sh unit fails"; fi
 rm -f /etc/systemd/system/trapd-agent.service
+echo x > /etc/systemd/system/trapd-guard.service
+if dpkg -i "$V1" >/dev/null 2>&1; then fail "install over an install.sh guard unit must fail"; else ok "install over an install.sh guard unit fails"; fi
+rm -f /etc/systemd/system/trapd-guard.service
 
 echo "== script installer upgrade after signed self-update (offline fixtures)"
 # Run the actual full installer in this disposable container. Only network and
@@ -165,6 +196,11 @@ check "script removes prior self-update signature" test ! -e /etc/trapd/binary.s
 check "script preserves release verification key" cmp /work/release_signing.pub /etc/trapd-release/release_signing.pub
 check "script preserves operator config" grep -qx '# operator config' /etc/trapd/agent.env
 check "script preserves device identity" grep -qx 'identity' /var/lib/trapd/device_id
+check "script installs the guard unit, identical to deploy/trapd-guard.service" \
+    cmp /work/trapd-guard.service /etc/systemd/system/trapd-guard.service
+check "script enables agent and guard together" grep -q 'enable --now trapd-agent trapd-guard' /tmp/systemctl.log
+check "script's agent unit wants the guard and keeps the runtime directory" \
+    bash -c 'grep -qx "Wants=trapd-guard.service" /etc/systemd/system/trapd-agent.service && grep -qx "RuntimeDirectoryPreserve=yes" /etc/systemd/system/trapd-agent.service'
 head -c 64 /dev/zero > /etc/trapd/binary.sig
 before_baseline="$(cat /etc/trapd/binary.sha256)"
 if PATH="$STUB:$PATH" TRAPD_INSTALL_TEST_BAD_CHECKSUM=1 bash /work/install.sh >/tmp/script-rejected.log 2>&1; then

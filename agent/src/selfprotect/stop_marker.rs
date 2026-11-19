@@ -247,6 +247,18 @@ pub fn clear(state_dir: &Path) {
     let _ = std::fs::remove_file(marker_path(state_dir));
 }
 
+/// Read the marker without consuming it (the guard looks at it to learn that a
+/// planned stop is under way; only the agent's own stop announcer consumes it).
+/// Returns `None` for a missing, unusable or invalid marker and never removes
+/// anything.
+pub fn peek(state_dir: &Path, now: i64) -> Option<StopMarker> {
+    let bytes =
+        crate::paths::bounded_regular_bytes(&marker_path(state_dir), MAX_MARKER_BYTES).ok()?;
+    serde_json::from_slice::<StopMarker>(&bytes)
+        .ok()
+        .filter(|m| validate(m, now).is_ok())
+}
+
 /// Take the marker for the stop that is happening now. Single use: the file
 /// must be removed successfully for the marker to count, so two consumers (or a
 /// replay) cannot both succeed. Returns `None` when there is no usable marker;
@@ -306,6 +318,18 @@ mod tests {
         assert_eq!(got.token_nonce.as_deref(), Some(NONCE));
         assert!(consume(&d.0, NOW + 11).is_none(), "single use");
         assert!(!marker_path(&d.0).exists());
+    }
+
+    #[test]
+    fn peek_reads_a_valid_marker_without_consuming_it() {
+        let d = tmp();
+        write(&d.0, &uninstall()).unwrap();
+        assert_eq!(peek(&d.0, NOW + 1), Some(uninstall()));
+        assert_eq!(peek(&d.0, NOW + 1), Some(uninstall()));
+        assert!(marker_path(&d.0).exists());
+        // Expired: not returned, and still not removed by a peek.
+        assert_eq!(peek(&d.0, NOW + MAX_TTL_SECS + 1), None);
+        assert!(marker_path(&d.0).exists());
     }
 
     #[test]

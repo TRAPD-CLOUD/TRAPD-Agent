@@ -461,6 +461,13 @@ fn run_token_fim(tx: tokio::sync::mpsc::Sender<AgentEvent>, agent_id: String, ho
                         continue;
                     };
 
+                    // An attribute change the agent announced itself (living-decoy upkeep).
+                    if event.mask == EventMask::ATTRIB
+                        && trapd_detection::self_touch::is_expected(&path)
+                    {
+                        continue;
+                    }
+
                     let (indicator, technique, tactic) = if event.mask.contains(EventMask::ATTRIB) {
                         ("attribute_change", "T1070.006", "TA0005 Defense Evasion")
                     } else {

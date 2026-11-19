@@ -242,6 +242,19 @@ pub fn recheck() -> Result<Drift> {
     compare_to_baseline(&hash_store_path(), &baseline_line(&hash_hex))
 }
 
+/// Like [`recheck`], for a process that may outlive a binary replacement (the
+/// guard). On Linux `/proc/self/exe` then reads `<path> (deleted)`; the path
+/// without that suffix is the installed file, which is what a restart would run.
+pub fn recheck_installed() -> Result<Drift> {
+    let exe = exe_path()?;
+    let text = exe.to_string_lossy();
+    let installed = text
+        .strip_suffix(" (deleted)")
+        .map_or(exe.clone(), PathBuf::from);
+    let (hash_hex, _) = sha256_of_file(&installed)?;
+    compare_to_baseline(&hash_store_path(), &baseline_line(&hash_hex))
+}
+
 fn compare_to_baseline(hash_file: &Path, current: &str) -> Result<Drift> {
     let stored = match std::fs::read_to_string(hash_file) {
         Ok(s) => s,

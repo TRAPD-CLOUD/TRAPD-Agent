@@ -139,6 +139,10 @@ pub fn begin_process() -> &'static Lifecycle {
 pub fn mark_clean_shutdown() {
     if let Some(l) = LIFECYCLE.get() {
         l.mark_clean();
+        crate::selfprotect::journal::record(
+            "service_stop",
+            serde_json::json!({ "uptime_seconds": l.uptime_seconds() }),
+        );
     }
 }
 

@@ -1275,6 +1275,12 @@ pub struct HoneytokenAccessData {
     /// Recorded as info-level evidence; never alerted on or acted upon.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scheduled_sweep: bool,
+    /// This access is the agent's own scheduled self-test: a child process of the
+    /// agent opened the token to prove the alarm path works. Set only by the
+    /// sensor, from the agent's in-process self-test registry — never from the
+    /// accessor. Backends must not alert on it; it is omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub selftest: bool,
 }
 
 /// Session / execution context of a process, captured from `/proc` at detection

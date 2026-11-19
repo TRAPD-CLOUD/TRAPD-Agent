@@ -92,7 +92,7 @@ sys.exit(subprocess.call(["/usr/bin/install", *clean]))
     def run_script(self, name):
         text = (HERE / name).read_text()
         # Redirect all deployment paths; bypass only the entrypoint root check.
-        for prefix in ["/usr/local/bin", "/usr/lib/trapd-agent", "/etc", "/var/log", "/var/lib"]:
+        for prefix in ["/usr/local/bin", "/usr/lib/trapd-agent", "/usr/lib/systemd/system-sleep", "/etc", "/var/log", "/var/lib"]:
             text = text.replace(prefix, str(self.host) + prefix)
         text = text.replace('if [[ $EUID -ne 0 ]]; then', 'if false; then')
         script = self.root / name

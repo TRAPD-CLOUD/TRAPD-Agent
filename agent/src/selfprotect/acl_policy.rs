@@ -61,6 +61,10 @@ pub const SERVICE_KEY_PATH: &str = "SYSTEM\\CurrentControlSet\\Services\\trapd-a
 /// one the service DACL has.
 pub const SERVICE_SECURITY_KEY_PATH: &str =
     "SYSTEM\\CurrentControlSet\\Services\\trapd-agent\\Security";
+/// The guard service (`trapd-guard`, phase 09 L2) carries the same service
+/// descriptor and service-key descriptor as the agent.
+pub const GUARD_SERVICE_NAME: &str = "trapd-guard";
+pub const GUARD_SERVICE_KEY_PATH: &str = "SYSTEM\\CurrentControlSet\\Services\\trapd-guard";
 pub const AGENT_KEY_PATH: &str = "SOFTWARE\\TRAPD\\Agent";
 
 // ── Directories ───────────────────────────────────────────────────────────────

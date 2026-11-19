@@ -67,6 +67,15 @@ fi
 for f in command_signing.pub release_signing.pub; do
     [[ "$(stat -c %s "$TRUST_DIR/$f")" == 32 ]] || die "$f must be a raw 32-byte Ed25519 public key"
 done
+# Optional: the maintenance-token key turns on uninstall protection (prerm gate).
+MAINTENANCE_KEY=""
+if [[ -e "$TRUST_DIR/maintenance_signing.pub" ]]; then
+    [[ -f "$TRUST_DIR/maintenance_signing.pub" && ! -L "$TRUST_DIR/maintenance_signing.pub" ]] \
+        || die "maintenance_signing.pub must be a regular file"
+    [[ "$(stat -c %s "$TRUST_DIR/maintenance_signing.pub")" == 32 ]] \
+        || die "maintenance_signing.pub must be a raw 32-byte Ed25519 public key"
+    MAINTENANCE_KEY="$TRUST_DIR/maintenance_signing.pub"
+fi
 
 BACKEND_URL="$(cat "$TRUST_DIR/backend_url")"
 BACKEND_URL="${BACKEND_URL%$'\n'}"
@@ -81,7 +90,7 @@ ROOT="$(mktemp -d)"
 trap 'rm -rf "$ROOT"' EXIT
 
 install -d -m 0755 "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/lib/trapd-agent" \
-    "$ROOT/usr/lib/systemd/system" "$ROOT/etc/trapd" "$ROOT/etc/trapd-release" \
+    "$ROOT/usr/lib/systemd/system" "$ROOT/usr/lib/systemd/system-sleep" "$ROOT/etc/trapd" "$ROOT/etc/trapd-release" \
     "$ROOT/etc/logrotate.d" "$ROOT/usr/share/trapd-agent"
 
 install -m 0755 "$AGENT_BIN" "$ROOT/usr/bin/trapd-agent"
@@ -98,12 +107,28 @@ if grep -q '/usr/local/bin' "$ROOT/usr/lib/systemd/system/trapd-agent.service"; 
     grep -v '^[[:space:]]*#' "$ROOT/usr/lib/systemd/system/trapd-agent.service" | grep -q '/usr/local/bin' \
         && die "trapd-agent.service still references /usr/local/bin outside comments"
 fi
+# The guard unit (second service of the guard pair): same binary, `guard` argument.
+sed 's#/usr/local/bin/trapd-agent#/usr/bin/trapd-agent#g' "$DEPLOY_DIR/trapd-guard.service" \
+    > "$ROOT/usr/lib/systemd/system/trapd-guard.service"
+grep -qx 'ExecStart=/usr/bin/trapd-agent guard' "$ROOT/usr/lib/systemd/system/trapd-guard.service" \
+    || die "could not derive the unit: deploy/trapd-guard.service has no 'ExecStart=/usr/local/bin/trapd-agent guard' line"
+grep -v '^[[:space:]]*#' "$ROOT/usr/lib/systemd/system/trapd-guard.service" | grep -q '/usr/local/bin' \
+    && die "trapd-guard.service still references /usr/local/bin outside comments"
 install -m 0644 "$HERE/trapd-agent-update.service" "$ROOT/usr/lib/systemd/system/trapd-agent-update.service"
 install -m 0644 "$HERE/trapd-agent-update.path" "$ROOT/usr/lib/systemd/system/trapd-agent-update.path"
+# Suspend announcement (SIGUSR2 -> final heartbeat), see deploy/trapd-agent-sleep.
+install -m 0755 "$DEPLOY_DIR/trapd-agent-sleep" "$ROOT/usr/lib/systemd/system-sleep/trapd-agent"
 
 install -m 0644 "$TRUST_DIR/ca.crt" "$ROOT/etc/trapd/ca.crt"
 install -m 0644 "$TRUST_DIR/command_signing.pub" "$ROOT/etc/trapd/command_signing.pub"
 install -m 0644 "$TRUST_DIR/release_signing.pub" "$ROOT/etc/trapd-release/release_signing.pub"
+if [[ -n "$MAINTENANCE_KEY" ]]; then
+    install -m 0644 "$MAINTENANCE_KEY" "$ROOT/etc/trapd-release/maintenance_signing.pub"
+    # Read by prerm: the package promised uninstall protection, so a missing
+    # key later means it was removed and the gate fails closed.
+    : > "$ROOT/usr/share/trapd-agent/uninstall_protected"
+    chmod 0644 "$ROOT/usr/share/trapd-agent/uninstall_protected"
+fi
 printf '%s\n' "$BACKEND_URL" > "$ROOT/usr/share/trapd-agent/backend_url"
 chmod 0644 "$ROOT/usr/share/trapd-agent/backend_url"
 install -m 0644 "$DEPLOY_DIR/trapd.logrotate" "$ROOT/etc/logrotate.d/trapd"

@@ -11,7 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+from cryptography.exceptions import InvalidSignature
+import secrets
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 parser = argparse.ArgumentParser()
@@ -63,6 +65,7 @@ canonical = json.dumps(envelope, separators=(',', ':'), ensure_ascii=False).enco
 signed = {'envelope': envelope, 'signature': base64.b64encode(signing_key.sign(canonical)).decode()}
 # SignedConfig uses the same envelope wrapper as commands.
 lock = threading.Lock()
+identity = {'key': None, 'nonces': set(), 'sessions': set()}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
@@ -76,8 +79,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def authorized(self):
+        # Legacy secret, or a session token issued after a signed challenge
+        # (identity key, Phase 09 WP1). The secret stays accepted after a bind
+        # so later lifecycle steps (re-enrolment, upgrade) keep working.
+        auth = self.headers.get('Authorization') or ''
+        with lock:
+            return auth == 'Bearer test-agent-secret' or auth.removeprefix('Bearer ') in identity['sessions']
+
     def do_GET(self):
-        if self.headers.get('Authorization') != 'Bearer test-agent-secret':
+        if not self.authorized():
             self.reply(401)
             return
         if self.path.endswith('/config'):
@@ -110,9 +121,50 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.reply(400, {'error': 'authorization_pending'})
             return
+        if self.path.endswith('/identity/bind'):
+            if not self.authorized():
+                self.reply(401)
+                return
+            key = serialization.load_der_public_key(base64.b64decode(body['public_key']))
+            if not isinstance(key, ec.EllipticCurvePublicKey) or key.curve.name != 'secp256r1':
+                self.reply(400)
+                return
+            with lock:
+                identity['key'] = key
+                with (args.root / 'requests.ndjson').open('a', encoding='utf-8') as stream:
+                    stream.write(json.dumps({'path': self.path, 'body': body, 'status': 200}) + '\n')
+            self.reply(200, {'bound': True})
+            return
+        if self.path.endswith('/session/challenge'):
+            nonce = base64.b64encode(secrets.token_bytes(32)).decode()
+            with lock:
+                identity['nonces'].add(nonce)
+            self.reply(200, {'nonce': nonce})
+            return
+        if self.path.endswith('/session'):
+            agent_id = self.path.split('/agents/', 1)[1].split('/', 1)[0]
+            with lock:
+                key = identity['key']
+                fresh = body.get('nonce') in identity['nonces']
+                identity['nonces'].discard(body.get('nonce'))
+            if key is None or not fresh:
+                self.reply(401)
+                return
+            msg = f"trapd-agent-session-v1\n{agent_id}\n{body['nonce']}".encode()
+            try:
+                key.verify(base64.b64decode(body['signature']), msg, ec.ECDSA(hashes.SHA256()))
+            except (InvalidSignature, ValueError):
+                self.reply(401)
+                return
+            token = 'session-' + secrets.token_hex(16)
+            expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+            with lock:
+                identity['sessions'].add(token)
+            self.reply(200, {'token': token, 'expires_at': expires.isoformat()})
+            return
         status = 500 if ((self.path.endswith('/ingest/events') and (args.root / 'pause-ingest').exists())
                          or (self.path.endswith('/heartbeat') and (args.root / 'pause-heartbeat').exists())) else 200
-        if not self.path.endswith('/enroll') and self.headers.get('Authorization') != 'Bearer test-agent-secret':
+        if not self.path.endswith('/enroll') and not self.authorized():
             status = 401
         with lock:
             with (args.root / 'requests.ndjson').open('a', encoding='utf-8') as stream:

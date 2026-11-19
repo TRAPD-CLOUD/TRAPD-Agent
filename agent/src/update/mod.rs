@@ -88,7 +88,7 @@ pub struct Updater {
     control: reqwest::Client,
     download: reqwest::Client,
     update_url: String,
-    token: String,
+    tokens: std::sync::Arc<crate::identity::SessionTokens>,
     agent_id: String,
     release_key: ed25519_dalek::VerifyingKey,
     command_key: ed25519_dalek::VerifyingKey,
@@ -98,7 +98,11 @@ pub struct Updater {
 impl Updater {
     /// Fails closed: without both pinned keys no update is ever accepted, and
     /// the caller should simply not start the updater.
-    pub fn new(backend_url: &str, agent_id: String, token: String) -> Result<Self> {
+    pub fn new(
+        backend_url: &str,
+        agent_id: String,
+        tokens: std::sync::Arc<crate::identity::SessionTokens>,
+    ) -> Result<Self> {
         let release_key = crate::prevention::commands::load_verifying_key(&release_pubkey_path())
             .context("update: release signing key unavailable")?;
         let command_key = crate::prevention::commands::load_verifying_key(
@@ -110,7 +114,7 @@ impl Updater {
             control: crate::http::control_client()?,
             download: download::download_client()?,
             update_url: format!("{base}/api/v1/agents/{agent_id}/update"),
-            token,
+            tokens,
             agent_id,
             release_key,
             command_key,
@@ -166,10 +170,11 @@ impl Updater {
             return Ok(());
         }
         let state = UpdateState::load(&self.paths);
+        let bearer = self.tokens.current().await;
         let mut req = self
             .control
             .get(&self.update_url)
-            .bearer_auth(&self.token)
+            .bearer_auth(&bearer)
             .query(&[
                 ("version", env!("CARGO_PKG_VERSION")),
                 ("os", std::env::consts::OS),
@@ -183,6 +188,10 @@ impl Updater {
         match resp.status().as_u16() {
             204 => return Ok(()),
             200 => {}
+            401 => {
+                self.tokens.report_unauthorized(&bearer).await;
+                anyhow::bail!("update: offer endpoint returned HTTP 401")
+            }
             s => anyhow::bail!("update: offer endpoint returned HTTP {s}"),
         }
         let offer: UpdateOffer = resp.json().await.context("update: malformed offer")?;
@@ -486,7 +495,7 @@ mod tests {
             control: reqwest::Client::builder().no_proxy().build().unwrap(),
             download: reqwest::Client::builder().no_proxy().build().unwrap(),
             update_url: url,
-            token: "test-token".into(),
+            tokens: crate::identity::SessionTokens::fixed("test-token"),
             agent_id: "agent-1".into(),
             release_key: key,
             command_key: key,

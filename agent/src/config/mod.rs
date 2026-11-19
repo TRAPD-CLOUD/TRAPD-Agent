@@ -56,6 +56,9 @@ fn skip_if_true(v: &bool) -> bool {
 fn skip_if_false(v: &bool) -> bool {
     !*v
 }
+fn skip_if_zero(v: &u64) -> bool {
+    *v == 0
+}
 fn default_prevention_enabled() -> bool {
     true
 }
@@ -388,6 +391,10 @@ pub struct AgentConfig {
     /// device. Off by default: the notice also reaches an attacker at the keyboard.
     #[serde(default, skip_serializing_if = "skip_if_false")]
     pub user_response_notifications_enabled: bool,
+    /// Windows: tell the signed-in user when the agent detects tampering with
+    /// itself. Off by default, for the same reason as the response notices.
+    #[serde(default, skip_serializing_if = "skip_if_false")]
+    pub tamper_user_notification: bool,
     /// Linux: report opens of real credential files (`/etc/shadow`, SSH host
     /// keys, sudoers, root's SSH private keys) as `filesystem`/`open` events.
     /// Inode-filtered in the kernel and rate-limited per `(exe, path)`, so it is
@@ -401,9 +408,82 @@ pub struct AgentConfig {
     /// by a per-agent salted hash in `device_id`.
     #[serde(default, skip_serializing_if = "skip_if_false")]
     pub device_serial_capture_enabled: bool,
+    /// SHA-256 SPKI pins (standard base64 of 32 bytes, at most
+    /// [`MAX_SIGNED_PINS`]) of the backend TLS chain. Delivered in the signed
+    /// config so a local administrator cannot silently remove them; see
+    /// `selfprotect::network_guard::signed_pins`. Omitted while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backend_spki_pins: Vec<String>,
+    /// Pins of a tenant-approved TLS-inspection CA, accepted like a backend
+    /// pin. Only valid together with `backend_spki_pins`. Omitted while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tls_inspection_ca_pins: Vec<String>,
+    /// Explicit, signed switch-off of pinning: the only way to clear
+    /// previously received pins. Excludes both pin lists. Omitted while false.
+    #[serde(default, skip_serializing_if = "skip_if_false")]
+    pub tls_pinning_disabled: bool,
+    /// Seconds between the agent's own end-to-end self-tests of each deployed
+    /// honeytoken. `0` (the default, and omitted from the signed bytes) means the
+    /// built-in weekly interval; the backend sends a value only when the project
+    /// chose another one. Out-of-range values are clamped on use.
+    #[serde(default, skip_serializing_if = "skip_if_zero")]
+    pub honeytoken_selftest_interval_secs: u64,
+    /// Let the agent move the access time of its own honeytokens now and then so they do not
+    /// stand out as files nobody ever opened (`deception::living`). Off by default and omitted
+    /// from the signed bytes while off. Declared after `honeytoken_selftest_interval_secs`.
+    #[serde(default, skip_serializing_if = "skip_if_false")]
+    pub honeytoken_living_enabled: bool,
+}
+
+/// Upper bound per pin list in the signed config.
+pub const MAX_SIGNED_PINS: usize = 8;
+
+impl AgentConfig {
+    /// Strict check of the TLS pin fields. A signed config that fails it is
+    /// rejected as a whole (the agent keeps its last-known-good config).
+    pub fn validate_tls_pins(&self) -> std::result::Result<(), String> {
+        use crate::selfprotect::network_guard::tls_pin::parse_canonical_pin;
+        for (name, list) in [
+            ("backend_spki_pins", &self.backend_spki_pins),
+            ("tls_inspection_ca_pins", &self.tls_inspection_ca_pins),
+        ] {
+            if list.len() > MAX_SIGNED_PINS {
+                return Err(format!("{name}: more than {MAX_SIGNED_PINS} pins"));
+            }
+            for p in list {
+                parse_canonical_pin(p).map_err(|e| format!("{name}: {e}"))?;
+            }
+        }
+        if !self.tls_inspection_ca_pins.is_empty() && self.backend_spki_pins.is_empty() {
+            return Err("tls_inspection_ca_pins require backend_spki_pins".into());
+        }
+        if self.tls_pinning_disabled
+            && (!self.backend_spki_pins.is_empty() || !self.tls_inspection_ca_pins.is_empty())
+        {
+            return Err("tls_pinning_disabled excludes pins".into());
+        }
+        Ok(())
+    }
 }
 
 pub use trapd_detection::RuleModeOverride;
+
+/// Built-in self-test interval, and the bounds the agent enforces on a configured one
+/// (a typo must neither spam the host nor silently switch the test off).
+pub const DEFAULT_SELFTEST_INTERVAL_SECS: u64 = 7 * 86_400;
+const MIN_SELFTEST_INTERVAL_SECS: u64 = 3_600;
+const MAX_SELFTEST_INTERVAL_SECS: u64 = 90 * 86_400;
+
+impl AgentConfig {
+    /// The self-test interval in effect.
+    pub fn honeytoken_selftest_interval(&self) -> std::time::Duration {
+        let secs = match self.honeytoken_selftest_interval_secs {
+            0 => DEFAULT_SELFTEST_INTERVAL_SECS,
+            n => n.clamp(MIN_SELFTEST_INTERVAL_SECS, MAX_SELFTEST_INTERVAL_SECS),
+        };
+        std::time::Duration::from_secs(secs)
+    }
+}
 
 /// An approved adaptive decoy: which candidate (`id` from the recon profile),
 /// of which kind, for which user.
@@ -469,8 +549,14 @@ impl Default for AgentConfig {
             adaptive_decoys: Vec::new(),
             script_block_capture_enabled: false,
             user_response_notifications_enabled: false,
+            tamper_user_notification: false,
             sensitive_file_read_enabled: true,
             device_serial_capture_enabled: false,
+            backend_spki_pins: Vec::new(),
+            tls_inspection_ca_pins: Vec::new(),
+            tls_pinning_disabled: false,
+            honeytoken_selftest_interval_secs: 0,
+            honeytoken_living_enabled: false,
         }
     }
 }
@@ -542,6 +628,8 @@ impl ConfigVerifier {
         // the response-command channel via `verify_canonical`, so an unsigned or
         // tampered config is rejected identically to an unsigned/tampered command.
         verify_canonical(&self.key, &signed.envelope, &signed.signature)?;
+
+        signed.envelope.config.validate_tls_pins()?;
 
         if signed.envelope.agent_id != self.agent_id {
             return Err(format!(
@@ -699,6 +787,17 @@ fn persist_config(cfg: &AgentConfig) {
             if let Err(e) = crate::paths::write_atomic(&persisted_config_path(), &bytes, 0o600) {
                 warn!(error = %e, "cannot persist last-known-good config");
             }
+            // The adopted (signed) policy changed: journal its digest.
+            {
+                use sha2::{Digest as _, Sha256};
+                crate::selfprotect::journal::record(
+                    "config_changed",
+                    serde_json::json!({
+                        "config_sha256": hex::encode(Sha256::digest(&bytes)),
+                        "bytes": bytes.len(),
+                    }),
+                );
+            }
         }
         Err(e) => warn!(error = %e, "cannot serialise config for persistence"),
     }
@@ -713,7 +812,7 @@ pub struct ConfigPuller {
     config: Arc<RwLock<AgentConfig>>,
     client: reqwest::Client,
     config_url: String,
-    token: String,
+    tokens: std::sync::Arc<crate::identity::SessionTokens>,
     etag: Option<String>,
     verifier: Option<ConfigVerifier>,
     on_apply: Option<ApplyHook>,
@@ -724,7 +823,7 @@ impl ConfigPuller {
         config: Arc<RwLock<AgentConfig>>,
         backend_url: &str,
         agent_id: &str,
-        token: String,
+        tokens: std::sync::Arc<crate::identity::SessionTokens>,
     ) -> Result<Self> {
         let base = crate::http::normalize_base_url(backend_url);
         // Config updates must be signed with the pinned command-signing key. If
@@ -751,7 +850,7 @@ impl ConfigPuller {
             // without a provisioned `<config>/ca.crt`.
             client: crate::http::control_client()?,
             config_url: format!("{base}/api/v1/agents/{agent_id}/config"),
-            token,
+            tokens,
             etag: None,
             verifier,
             on_apply: None,
@@ -782,7 +881,8 @@ impl ConfigPuller {
     }
 
     async fn pull(&mut self) {
-        let mut req = self.client.get(&self.config_url).bearer_auth(&self.token);
+        let bearer = self.tokens.current().await;
+        let mut req = self.client.get(&self.config_url).bearer_auth(&bearer);
 
         if let Some(etag) = &self.etag {
             req = req.header("If-None-Match", etag.as_str());
@@ -795,6 +895,10 @@ impl ConfigPuller {
                 return;
             }
         };
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.tokens.report_unauthorized(&bearer).await;
+        }
 
         match resp.status().as_u16() {
             304 => {
@@ -1217,6 +1321,15 @@ mod signed_config_tests {
     }
 
     #[test]
+    fn tamper_notification_defaults_off_and_stays_out_of_the_signed_bytes() {
+        let config = AgentConfig::default();
+        assert!(!config.tamper_user_notification);
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("tamper_user_notification"));
+    }
+
+    #[test]
     fn device_serial_capture_defaults_off_and_stays_out_of_the_signed_bytes() {
         let config = AgentConfig::default();
         assert!(!config.device_serial_capture_enabled);
@@ -1232,6 +1345,58 @@ mod signed_config_tests {
             .contains("\"device_serial_capture_enabled\":true"));
     }
 
+    #[test]
+    fn selftest_interval_defaults_to_a_week_is_clamped_and_stays_out_of_the_signed_bytes() {
+        let config = AgentConfig::default();
+        assert_eq!(config.honeytoken_selftest_interval().as_secs(), 7 * 86_400);
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("honeytoken_selftest_interval_secs"));
+        let at = |secs| AgentConfig {
+            honeytoken_selftest_interval_secs: secs,
+            ..AgentConfig::default()
+        };
+        assert_eq!(at(86_400).honeytoken_selftest_interval().as_secs(), 86_400);
+        assert_eq!(at(5).honeytoken_selftest_interval().as_secs(), 3_600);
+        assert_eq!(
+            at(u64::MAX).honeytoken_selftest_interval().as_secs(),
+            90 * 86_400
+        );
+        let json = serde_json::to_string(&at(86_400)).unwrap();
+        let device = AgentConfig {
+            device_serial_capture_enabled: true,
+            honeytoken_selftest_interval_secs: 86_400,
+            ..AgentConfig::default()
+        };
+        let json2 = serde_json::to_string(&device).unwrap();
+        assert!(json.contains("\"honeytoken_selftest_interval_secs\":86400"));
+        assert!(
+            json2.find("\"device_serial_capture_enabled\"").unwrap()
+                < json2.find("\"honeytoken_selftest_interval_secs\"").unwrap(),
+            "the interval is the last field, after device_serial_capture_enabled"
+        );
+    }
+
+    #[test]
+    fn living_decoys_default_off_and_follow_the_selftest_interval_in_the_signed_bytes() {
+        let config = AgentConfig::default();
+        assert!(!config.honeytoken_living_enabled);
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("honeytoken_living_enabled"));
+        let on = AgentConfig {
+            honeytoken_selftest_interval_secs: 86_400,
+            honeytoken_living_enabled: true,
+            ..AgentConfig::default()
+        };
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(
+            json.find("\"honeytoken_selftest_interval_secs\"").unwrap()
+                < json.find("\"honeytoken_living_enabled\":true").unwrap(),
+            "{json}"
+        );
+    }
+
     /// The backend signs the config in its own key order (TRAPD
     /// `frontend/lib/api/config/sign.ts`) and the agent verifies its
     /// re-serialised struct, so the opt-in fields must keep this order.
@@ -1240,6 +1405,7 @@ mod signed_config_tests {
         let config = AgentConfig {
             script_block_capture_enabled: true,
             user_response_notifications_enabled: true,
+            tamper_user_notification: true,
             sensitive_file_read_enabled: false,
             device_serial_capture_enabled: true,
             ..AgentConfig::default()
@@ -1248,6 +1414,7 @@ mod signed_config_tests {
         let order: Vec<usize> = [
             "\"script_block_capture_enabled\":true",
             "\"user_response_notifications_enabled\":true",
+            "\"tamper_user_notification\":true",
             "\"sensitive_file_read_enabled\":false",
             "\"device_serial_capture_enabled\":true",
         ]
@@ -1255,6 +1422,146 @@ mod signed_config_tests {
         .map(|k| json.find(k).unwrap_or_else(|| panic!("{k} missing")))
         .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{json}");
+    }
+
+    // Generated by the backend signer (lib/api/config/sign.ts) with the fixed
+    // seed of the other vectors: signed pins, inspection CA pins, explicit disable.
+    const XLANG_PINS_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"heartbeat_interval_secs":30,"config_poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"honeytoken_paths":[],"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768,"sigma_enabled":true,"sigma_rules":[],"anomaly_detection_enabled":true,"vuln_scan_enabled":true,"cis_benchmark_enabled":true,"siem_enabled":false,"siem_format":"cef","siem_syslog_address":"","siem_hec_url":"","siem_hec_token":"","cve_feed":[],"backend_spki_pins":["80DnfYEFSfic/R4K/U8B7OAJ9dZwj/hvQu4YmIIF0/c=","tIQn31OoLmnaS0vIiY6tNIGq8Da+KtFNbK1NGmLN5D8="],"tls_inspection_ca_pins":["RgIEHp8ygo95bEkxO3IrSBWdm8cGy1/QoyyqFCtJ6wo="]}}"#;
+    const XLANG_PINS_SIG: &str =
+        "8rQKrMpmI0BSuYNbv27m+cIFhxA+YH841IbJGeCGAnm3y8aaSSKUx06QsvvutJWcvOItAOzFoK6FshvzTi60Bg==";
+    const XLANG_PINS_OFF_ENV: &str = r#"{"issued_at":"2020-01-01T00:00:00Z","agent_id":"agent-test","config":{"poll_interval_secs":60,"heartbeat_interval_secs":30,"config_poll_interval_secs":60,"enabled_collectors":["process","network","system","authlog","filesystem"],"fs_watch_paths":["/etc","/bin","/tmp"],"prevention_enabled":true,"command_poll_interval_secs":10,"isolation_allowlist_ips":[],"fim_enabled":true,"fim_paths":["/etc","/usr/bin","/usr/sbin","/bin","/sbin","/boot"],"fim_interval_secs":900,"inventory_enabled":true,"honeytoken_detection_enabled":true,"honeytoken_response":"alert","honeytoken_accessor_allowlist":[],"honeytoken_deception_escalation":false,"honeytoken_paths":[],"auto_response_enabled":false,"auto_response_action":"alert","auto_response_min_severity":"critical","auto_response_min_confidence":90,"auto_response_allowlist":[],"memory_scan_enabled":true,"memory_scan_interval_secs":120,"rtr_enabled":false,"rtr_max_artifact_bytes":32768,"sigma_enabled":true,"sigma_rules":[],"anomaly_detection_enabled":true,"vuln_scan_enabled":true,"cis_benchmark_enabled":true,"siem_enabled":false,"siem_format":"cef","siem_syslog_address":"","siem_hec_url":"","siem_hec_token":"","cve_feed":[],"tls_pinning_disabled":true}}"#;
+    const XLANG_PINS_OFF_SIG: &str =
+        "cQV6/Y7CJPdmoFE/qReqlzPwsEHf9L/qX9fSnzXQ0lUJjb9U2Kr7NvTYNDwyeIgtzbIvUs7n1DFH5aCgChUaDw==";
+
+    fn xlang_verify(env: &str, sig: &str, tag: &str) -> std::result::Result<AgentConfig, String> {
+        let pub_path = tmp(&format!("xlang_{tag}_pub"));
+        let wm_path = tmp(&format!("xlang_{tag}_issued.json"));
+        std::fs::write(&pub_path, hex::decode(XLANG_PUB_HEX).unwrap()).unwrap();
+        let mut v = ConfigVerifier::new(&pub_path, "agent-test".into(), &wm_path).unwrap();
+        let signed: SignedConfig =
+            serde_json::from_str(&format!(r#"{{"envelope":{env},"signature":"{sig}"}}"#)).unwrap();
+        let r = v.verify(&signed);
+        cleanup(pub_path, wm_path);
+        r
+    }
+
+    #[test]
+    fn accepts_ts_signed_config_with_tls_pins() {
+        let cfg =
+            xlang_verify(XLANG_PINS_ENV, XLANG_PINS_SIG, "pins").expect("TS-signed pins rejected");
+        assert_eq!(cfg.backend_spki_pins.len(), 2);
+        assert_eq!(cfg.tls_inspection_ca_pins.len(), 1);
+        assert!(!cfg.tls_pinning_disabled);
+        let off = xlang_verify(XLANG_PINS_OFF_ENV, XLANG_PINS_OFF_SIG, "pinsoff")
+            .expect("TS-signed disable rejected");
+        assert!(off.tls_pinning_disabled && off.backend_spki_pins.is_empty());
+    }
+
+    #[test]
+    fn tls_pin_fields_default_empty_and_stay_out_of_the_signed_bytes() {
+        let json = serde_json::to_string(&AgentConfig::default()).unwrap();
+        for f in [
+            "backend_spki_pins",
+            "tls_inspection_ca_pins",
+            "tls_pinning_disabled",
+        ] {
+            assert!(!json.contains(f), "{f}");
+        }
+    }
+
+    #[test]
+    fn tls_pin_fields_serialise_last_in_the_backend_signing_order() {
+        let config = AgentConfig {
+            device_serial_capture_enabled: true,
+            backend_spki_pins: vec!["80DnfYEFSfic/R4K/U8B7OAJ9dZwj/hvQu4YmIIF0/c=".into()],
+            tls_inspection_ca_pins: vec!["tIQn31OoLmnaS0vIiY6tNIGq8Da+KtFNbK1NGmLN5D8=".into()],
+            ..AgentConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let at = |k: &str| json.find(k).unwrap_or_else(|| panic!("{k} missing"));
+        assert!(at("\"device_serial_capture_enabled\"") < at("\"backend_spki_pins\""));
+        assert!(at("\"backend_spki_pins\"") < at("\"tls_inspection_ca_pins\""));
+        let off = serde_json::to_string(&AgentConfig {
+            tls_pinning_disabled: true,
+            ..AgentConfig::default()
+        })
+        .unwrap();
+        assert!(off.ends_with(",\"tls_pinning_disabled\":true}"), "{off}");
+    }
+
+    const PIN_A: &str = "80DnfYEFSfic/R4K/U8B7OAJ9dZwj/hvQu4YmIIF0/c=";
+
+    #[test]
+    fn validate_tls_pins_is_strict() {
+        assert!(AgentConfig::default().validate_tls_pins().is_ok());
+        let eight = AgentConfig {
+            backend_spki_pins: vec![PIN_A.into(); 8],
+            ..AgentConfig::default()
+        };
+        assert!(eight.validate_tls_pins().is_ok());
+        let off = AgentConfig {
+            tls_pinning_disabled: true,
+            ..AgentConfig::default()
+        };
+        assert!(off.validate_tls_pins().is_ok());
+        let pin = || PIN_A.to_string();
+        let bad = [
+            AgentConfig {
+                backend_spki_pins: vec!["nope".into()],
+                ..AgentConfig::default()
+            },
+            AgentConfig {
+                backend_spki_pins: vec![format!("sha256/{PIN_A}")],
+                ..AgentConfig::default()
+            },
+            AgentConfig {
+                backend_spki_pins: vec![format!(" {PIN_A}")],
+                ..AgentConfig::default()
+            },
+            AgentConfig {
+                backend_spki_pins: vec!["AAAAAAAAAAAAAAAAAAAAAA==".into()],
+                ..AgentConfig::default()
+            },
+            AgentConfig {
+                backend_spki_pins: vec![PIN_A.replace("c=", "d=")],
+                ..AgentConfig::default()
+            },
+            AgentConfig {
+                backend_spki_pins: vec![pin(); 9],
+                ..AgentConfig::default()
+            },
+            AgentConfig {
+                tls_inspection_ca_pins: vec![pin()],
+                ..AgentConfig::default()
+            },
+            AgentConfig {
+                backend_spki_pins: vec![pin()],
+                tls_pinning_disabled: true,
+                ..AgentConfig::default()
+            },
+        ];
+        for (i, c) in bad.iter().enumerate() {
+            assert!(c.validate_tls_pins().is_err(), "case {i} accepted");
+        }
+    }
+
+    #[test]
+    fn verifier_rejects_a_signed_config_with_invalid_pins_and_keeps_the_watermark() {
+        let key = signing_key();
+        let (mut v, p, w) = verifier(&key, "agent-1");
+        let mut bad = make_signed(&key, "agent-1", Utc::now());
+        bad.envelope.config.backend_spki_pins = vec!["nope".into()];
+        bad.signature = base64::engine::general_purpose::STANDARD.encode(
+            key.sign(&serde_json::to_vec(&bad.envelope).unwrap())
+                .to_bytes(),
+        );
+        assert!(v.verify(&bad).unwrap_err().contains("backend_spki_pins"));
+        let good = make_signed(&key, "agent-1", Utc::now());
+        assert!(
+            v.verify(&good).is_ok(),
+            "a rejected config must not advance the watermark"
+        );
+        cleanup(p, w);
     }
 
     #[test]

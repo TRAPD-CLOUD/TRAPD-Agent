@@ -28,7 +28,7 @@ use crate::config::AgentConfig;
 pub async fn start(
     backend_url: &str,
     agent_id: &str,
-    token: &str,
+    tokens: Arc<crate::identity::SessionTokens>,
     hostname: &str,
     pipeline_tx: tokio::sync::mpsc::Sender<crate::schema::AgentEvent>,
     cfg_handle: Arc<RwLock<AgentConfig>>,
@@ -80,6 +80,17 @@ pub async fn start(
         Arc::clone(&reconcile_signal),
     );
 
+    // The agent proves its own alarm path: every deployed token is opened by a
+    // child process now and then and the sensor has to report it.
+    spawn_honeytoken_selftest(
+        audit.clone(),
+        Arc::clone(&honeytokens),
+        Arc::clone(&cfg_handle),
+    );
+
+    // Living decoys: keep the access time of the tokens plausible (opt-in).
+    spawn_honeytoken_living(Arc::clone(&honeytokens), Arc::clone(&cfg_handle));
+
     let engine = Arc::new(
         Engine::new(
             policy.clone(),
@@ -105,7 +116,7 @@ pub async fn start(
         let puller = CommandPuller::new(
             backend_url,
             agent_id,
-            token.to_string(),
+            tokens,
             v,
             audit.clone(),
             cmd_tx,
@@ -199,6 +210,115 @@ fn spawn_honeytoken_health(
                         "detection": detection_mode(),
                     }),
                 );
+            }
+        }
+    });
+}
+
+/// Scheduled end-to-end self-test of every deployed honeytoken (see
+/// `deception::selftest`). Each token has its own due time: the first one is
+/// jittered after start so a fleet that restarts together does not test together,
+/// later ones follow the configured interval with ±10 % jitter. Tokens are tested
+/// one after another, never in parallel.
+fn spawn_honeytoken_selftest(
+    audit: AuditEmitter,
+    store: Arc<crate::deception::HoneytokenStore>,
+    cfg_handle: Arc<RwLock<AgentConfig>>,
+) {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    // A uniformly distributed value in `0..bound` from a random UUID: enough for
+    // jitter, and it avoids a dependency for it.
+    fn jitter(bound: u64) -> u64 {
+        if bound == 0 {
+            return 0;
+        }
+        let bytes = uuid::Uuid::new_v4().into_bytes();
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bytes[..8]);
+        u64::from_le_bytes(word) % bound
+    }
+
+    tokio::spawn(async move {
+        let mut due: HashMap<String, Instant> = HashMap::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let interval = cfg_handle
+                .read()
+                .map(|c| c.honeytoken_selftest_interval())
+                .unwrap_or_else(|_| {
+                    Duration::from_secs(crate::config::DEFAULT_SELFTEST_INTERVAL_SECS)
+                });
+            let now = Instant::now();
+            let tokens = crate::deception::selftest::targets(&store);
+            due.retain(|path, _| tokens.iter().any(|t| &t.path == path));
+            for token in tokens {
+                let at = *due.entry(token.path.clone()).or_insert_with(|| {
+                    // First test: within the first 10 minutes to 6 hours, never later
+                    // than one interval.
+                    let window = Duration::from_secs(6 * 3600).min(interval);
+                    now + Duration::from_secs(600).min(window)
+                        + Duration::from_secs(jitter(window.as_secs().saturating_sub(600).max(1)))
+                });
+                if now < at {
+                    continue;
+                }
+                let _ = crate::deception::selftest::run(&store, &audit, &token.path, None).await;
+                let spread = interval.as_secs() / 10;
+                let next = interval.as_secs() - spread + jitter(spread * 2 + 1);
+                due.insert(token.path, Instant::now() + Duration::from_secs(next));
+            }
+        }
+    });
+}
+
+/// Opt-in upkeep of the tokens' access times (see `deception::living`). Checks every six
+/// hours; each token is looked at about once a day, with jitter, and the planner itself
+/// decides on most of those days that nothing should change.
+fn spawn_honeytoken_living(
+    store: Arc<crate::deception::HoneytokenStore>,
+    cfg_handle: Arc<RwLock<AgentConfig>>,
+) {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant, SystemTime};
+
+    tokio::spawn(async move {
+        let mut due: HashMap<String, Instant> = HashMap::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(6 * 3600));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if !cfg_handle
+                .read()
+                .map(|c| c.honeytoken_living_enabled)
+                .unwrap_or(false)
+            {
+                due.clear();
+                continue;
+            }
+            let now = Instant::now();
+            let tokens = store.list();
+            due.retain(|path, _| tokens.iter().any(|t| &t.path == path));
+            for token in tokens {
+                let at = *due.entry(token.path.clone()).or_insert(now);
+                if now < at {
+                    continue;
+                }
+                let bytes = uuid::Uuid::new_v4().into_bytes();
+                let mut word = [0u8; 8];
+                word.copy_from_slice(&bytes[..8]);
+                let roll = u64::from_le_bytes(word);
+                let rec = token.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::deception::living::apply(&rec, SystemTime::now(), roll)
+                })
+                .await;
+                // Next look in 20..28 hours.
+                let next = 20 * 3600 + roll % (8 * 3600);
+                due.insert(token.path, Instant::now() + Duration::from_secs(next));
             }
         }
     });

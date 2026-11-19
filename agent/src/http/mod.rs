@@ -25,13 +25,17 @@
 //! kill/isolate/install command channel) unless the operator explicitly accepts
 //! the system trust store via `TRAPD_TLS_ALLOW_SYSTEM_ROOTS=1`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::ClientBuilder;
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls::RootCertStore;
 use tracing::{info, warn};
 
 use crate::paths;
+use crate::selfprotect::network_guard::tls_pin::{self, PinningVerifier};
 
 const USER_AGENT: &str = concat!("trapd-agent/", env!("CARGO_PKG_VERSION"));
 
@@ -76,6 +80,8 @@ fn system_roots_opt_in() -> bool {
 ///   - rustls TLS backend (memory-safe, no OpenSSL dependency)
 ///   - **mandatory** CA certificate pinning (`<config>/ca.crt`), unless the
 ///     operator opts into the system trust store via `TRAPD_TLS_ALLOW_SYSTEM_ROOTS`
+///   - optional SPKI pinning / observation of the presented chain
+///     ([`crate::selfprotect::network_guard::tls_pin`])
 ///   - optional mTLS client identity (`<config>/agent.{crt,key}`)
 ///   - bounded total + connect timeouts
 ///   - a stable `User-Agent` carrying the agent version
@@ -84,25 +90,63 @@ fn system_roots_opt_in() -> bool {
 /// instead of degrading to a plain `reqwest::Client::new()`. A remote-control
 /// agent must never ship commands/telemetry over a channel it could not pin.
 pub fn build_client(total_timeout: Duration, connect_timeout: Duration) -> Result<reqwest::Client> {
-    let builder = ClientBuilder::new()
-        .use_rustls_tls()
-        .user_agent(USER_AGENT)
-        .timeout(total_timeout)
-        .connect_timeout(connect_timeout);
-
-    let builder = apply_ca_pinning(builder)?;
-    let builder = apply_mtls_identity(builder);
-
-    builder.build().context("http: failed to build TLS client")
+    base_builder(total_timeout, connect_timeout)
+        .use_preconfigured_tls(tls_config()?)
+        .build()
+        .context("http: failed to build TLS client")
 }
 
-/// Add `<config>/ca.crt` as the *only* trusted root certificate, pinning the
-/// backend to that CA (equivalent to HPKP without the header mechanism).
+/// Settings shared by every backend client, apart from TLS.
+///
+/// No idle connection is kept: SPKI pins are checked when a connection is *established*, never on
+/// a reused one, and a signed config can add, change or remove pins at any time. A pooled
+/// connection would otherwise keep serving requests under the old policy for as long as it stays
+/// busy (the heartbeat and transport reuse theirs every few seconds). A fresh handshake per
+/// request makes every policy change take effect on the next request; the control channels are
+/// low-rate, so the extra handshake is the price of that guarantee.
+fn base_builder(total_timeout: Duration, connect_timeout: Duration) -> ClientBuilder {
+    ClientBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout(total_timeout)
+        .connect_timeout(connect_timeout)
+        .pool_max_idle_per_host(0)
+}
+
+/// rustls configuration shared by every backend client: trust anchors, the
+/// pinning verifier and the optional client identity.
+fn tls_config() -> Result<rustls::ClientConfig> {
+    let roots = trust_anchors()?;
+    let verifier = PinningVerifier::new(roots, Arc::clone(tls_pin::global()))?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("TLS: unsupported protocol version set")?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+    let mut cfg = match mtls_identity() {
+        Some((certs, key)) => match builder.clone().with_client_auth_cert(certs, key) {
+            Ok(cfg) => {
+                info!("mTLS: client identity loaded — mutual TLS enabled");
+                cfg
+            }
+            Err(e) => {
+                warn!("mTLS: client identity rejected: {e}");
+                builder.with_no_client_auth()
+            }
+        },
+        None => builder.with_no_client_auth(),
+    };
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(cfg)
+}
+
+/// `<config>/ca.crt` as the *only* trusted root, pinning the backend to that CA
+/// (equivalent to HPKP without the header mechanism).
 ///
 /// Fail-closed: a missing `ca.crt` is an error unless `TRAPD_TLS_ALLOW_SYSTEM_ROOTS`
 /// is set; a present-but-unreadable/unparseable `ca.crt` is *always* an error
 /// (never a silent fall-back to system roots, which would defeat pinning).
-fn apply_ca_pinning(builder: ClientBuilder) -> Result<ClientBuilder> {
+fn trust_anchors() -> Result<RootCertStore> {
     let path = paths::config_dir().join("ca.crt");
     if !pin_required(path.exists(), system_roots_opt_in()).with_context(|| {
         format!(
@@ -121,17 +165,31 @@ fn apply_ca_pinning(builder: ClientBuilder) -> Result<ClientBuilder> {
             "TLS: no pinned CA — {ALLOW_SYSTEM_ROOTS_ENV} is set, trusting the system root \
              store for the command channel. This is INSECURE; provision ca.crt to pin."
         );
-        return Ok(builder);
+        return Ok(RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        });
     }
 
     let pem = std::fs::read(&path)
         .with_context(|| format!("TLS: cannot read pinned CA {}", path.display()))?;
-    let cert = reqwest::Certificate::from_pem(&pem)
-        .with_context(|| format!("TLS: cannot parse pinned CA {}", path.display()))?;
+    let mut roots = RootCertStore::empty();
+    let mut count = 0usize;
+    for cert in CertificateDer::pem_slice_iter(&pem) {
+        let cert =
+            cert.with_context(|| format!("TLS: cannot parse pinned CA {}", path.display()))?;
+        roots
+            .add(cert)
+            .with_context(|| format!("TLS: cannot use pinned CA {}", path.display()))?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(anyhow!(
+            "TLS: pinned CA {} contains no certificate",
+            path.display()
+        ));
+    }
     info!(ca = %path.display(), "TLS: pinning backend to custom CA");
-    Ok(builder
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(cert))
+    Ok(roots)
 }
 
 /// Pure pinning decision (factored out so it is testable without touching the
@@ -151,51 +209,33 @@ fn pin_required(ca_exists: bool, opt_in: bool) -> Result<bool> {
     }
 }
 
-/// Load a PEM client certificate + key for mutual TLS authentication.  Both
-/// files must be present; otherwise mTLS is skipped (TLS still applies).
-fn apply_mtls_identity(builder: ClientBuilder) -> ClientBuilder {
+/// Load a PEM client certificate chain + key for mutual TLS. Both files must be
+/// present and parse; otherwise mTLS is skipped (TLS still applies).
+fn mtls_identity() -> Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let cert_path = paths::config_dir().join("agent.crt");
     let key_path = paths::config_dir().join("agent.key");
 
     if !cert_path.exists() || !key_path.exists() {
-        return builder;
+        return None;
     }
-
-    let cert_pem = match std::fs::read(&cert_path) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("mTLS: cannot read {}: {e}", cert_path.display());
-            return builder;
-        }
-    };
-    let key_pem = match std::fs::read(&key_path) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("mTLS: cannot read {}: {e}", key_path.display());
-            return builder;
-        }
-    };
-
-    // `Identity::from_pem` expects the certificate chain and private key
-    // concatenated in a single PEM buffer.
-    let mut combined = cert_pem;
-    combined.extend_from_slice(b"\n");
-    combined.extend_from_slice(&key_pem);
-
-    match reqwest::Identity::from_pem(&combined) {
-        Ok(identity) => {
-            info!("mTLS: client identity loaded — mutual TLS enabled");
-            builder.identity(identity)
-        }
-        Err(e) => {
-            warn!(
-                "mTLS: cannot build identity from {} + {}: {e}",
-                cert_path.display(),
-                key_path.display()
-            );
-            builder
-        }
+    let cert_pem = std::fs::read(&cert_path)
+        .map_err(|e| warn!("mTLS: cannot read {}: {e}", cert_path.display()))
+        .ok()?;
+    let key_pem = std::fs::read(&key_path)
+        .map_err(|e| warn!("mTLS: cannot read {}: {e}", key_path.display()))
+        .ok()?;
+    let certs = CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| warn!("mTLS: cannot parse {}: {e}", cert_path.display()))
+        .ok()?;
+    if certs.is_empty() {
+        warn!("mTLS: {} contains no certificate", cert_path.display());
+        return None;
     }
+    let key = PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|e| warn!("mTLS: cannot parse {}: {e}", key_path.display()))
+        .ok()?;
+    Some((certs, key))
 }
 
 /// Normalise a backend base URL: trim whitespace and any trailing slashes so
@@ -206,6 +246,47 @@ pub fn normalize_base_url(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn every_request_opens_a_new_connection_so_a_pin_change_takes_effect_at_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    // keep-alive offered: a pooled client would reuse this connection
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await;
+                    }
+                });
+            }
+        });
+        let client = super::base_builder(Duration::from_secs(5), Duration::from_secs(2))
+            .no_proxy()
+            .build()
+            .unwrap();
+        for _ in 0..3 {
+            let r = client.get(format!("http://{addr}/")).send().await.unwrap();
+            assert_eq!(r.text().await.unwrap(), "ok");
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
     use super::{normalize_base_url, pin_required};
 
     #[test]

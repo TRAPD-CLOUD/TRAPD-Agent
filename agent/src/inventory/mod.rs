@@ -231,7 +231,7 @@ pub struct UserAccount {
 pub struct InventoryReporter {
     client: reqwest::Client,
     url: String,
-    token: String,
+    tokens: std::sync::Arc<crate::identity::SessionTokens>,
     agent_id: String,
     device_id: String,
     hostname: String,
@@ -245,7 +245,7 @@ impl InventoryReporter {
         backend_url: &str,
         agent_id: String,
         device_id: String,
-        token: String,
+        tokens: std::sync::Arc<crate::identity::SessionTokens>,
         hostname: String,
         offline: bool,
         config: Arc<RwLock<AgentConfig>>,
@@ -263,7 +263,7 @@ impl InventoryReporter {
         Ok(Self {
             client,
             url: format!("{base}/api/v1/agents/{agent_id}/inventory"),
-            token,
+            tokens,
             agent_id,
             device_id,
             hostname,
@@ -344,10 +344,11 @@ impl InventoryReporter {
     }
 
     async fn post(&self, snapshot: &InventorySnapshot) {
+        let bearer = self.tokens.current().await;
         match self
             .client
             .post(&self.url)
-            .bearer_auth(&self.token)
+            .bearer_auth(&bearer)
             .json(snapshot)
             .send()
             .await
@@ -355,10 +356,15 @@ impl InventoryReporter {
             Ok(resp) if resp.status().is_success() => {
                 info!("inventory: snapshot sent to backend");
             }
-            Ok(resp) => warn!(
-                "inventory: backend rejected snapshot: HTTP {}",
-                resp.status()
-            ),
+            Ok(resp) => {
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    self.tokens.report_unauthorized(&bearer).await;
+                }
+                warn!(
+                    "inventory: backend rejected snapshot: HTTP {}",
+                    resp.status()
+                )
+            }
             Err(e) => warn!("inventory: send failed: {e}"),
         }
     }

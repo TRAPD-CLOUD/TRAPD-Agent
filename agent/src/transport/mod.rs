@@ -75,7 +75,7 @@ pub struct Transport {
     buffer: Arc<Mutex<Spool>>,
     client: reqwest::Client,
     ingest_url: String,
-    token: String,
+    tokens: Arc<crate::identity::SessionTokens>,
     /// Set once the backend has advertised `Accept-Encoding: gzip`. Compressing
     /// before that would hand an older backend a body it cannot parse, which it
     /// rejects with a permanent 4xx, and the batch would be dropped.
@@ -93,7 +93,7 @@ impl Transport {
     pub fn new(
         buffer: Arc<Mutex<Spool>>,
         backend_url: String,
-        token: String,
+        tokens: Arc<crate::identity::SessionTokens>,
     ) -> anyhow::Result<Self> {
         let base = crate::http::normalize_base_url(&backend_url);
         let ingest_url = format!("{base}/api/v1/ingest/events");
@@ -109,7 +109,7 @@ impl Transport {
             priority_wake,
             client,
             ingest_url,
-            token,
+            tokens,
             gzip_ok: AtomicBool::new(false),
             ocsf_ok: AtomicBool::new(false),
             retry_after_secs: AtomicU64::new(0),
@@ -230,10 +230,24 @@ impl Transport {
         let n = batch.len();
         let seqs: Vec<u64> = batch.iter().map(|e| e.seq).collect();
         let (body, compressed) = encode_body(raw, self.gzip_ok.load(Ordering::Relaxed));
+        let bearer = self.tokens.current().await;
+        if bearer.is_empty() {
+            // No usable session (acquisition failed or the identity is stopped). Sending would only
+            // earn a 401; keep the batch queued and try again after the session is back.
+            warn!(
+                events = n,
+                "Transport: no session token available — will retry"
+            );
+            metrics().transport_batch_failed();
+            if let Ok(mut buf) = self.buffer.lock() {
+                buf.nack(&seqs);
+            }
+            return FlushOutcome::Failed;
+        }
         let mut request = self
             .client
             .post(&self.ingest_url)
-            .bearer_auth(&self.token)
+            .bearer_auth(&bearer)
             .header(reqwest::header::CONTENT_TYPE, "application/json");
         if compressed {
             request = request.header(reqwest::header::CONTENT_ENCODING, "gzip");
@@ -249,6 +263,9 @@ impl Transport {
         );
 
         if let Ok(resp) = &response {
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                self.tokens.report_unauthorized(&bearer).await;
+            }
             if advertises_gzip(resp.headers()) {
                 self.gzip_ok.store(true, Ordering::Relaxed);
             }
@@ -333,6 +350,17 @@ impl Transport {
                     // A rollout may route the next request to an older gateway.
                     // Retry its legacy contract once, preserving every event ID.
                     self.ocsf_ok.store(false, Ordering::Relaxed);
+                    if let Ok(mut buf) = self.buffer.lock() {
+                        buf.nack(&seqs);
+                    }
+                    FlushOutcome::Failed
+                } else if status == reqwest::StatusCode::UNAUTHORIZED {
+                    // An expired or rejected session says nothing about the events: the renewal is
+                    // already scheduled (report_unauthorized), so keep the batch for the next try.
+                    warn!(
+                        events = n,
+                        "Transport: session rejected (401) — will retry after renewal"
+                    );
                     if let Ok(mut buf) = self.buffer.lock() {
                         buf.nack(&seqs);
                     }
@@ -717,6 +745,34 @@ mod tests {
         assert_eq!(flush_with_response("200 OK", true, true).await.0, 0);
     }
 
+    #[tokio::test]
+    async fn an_expired_session_keeps_the_batch_queued() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
+        let buffer = Arc::new(Mutex::new(Spool::in_memory(2)));
+        buffer.lock().unwrap().push(event()).unwrap();
+        let body = "{}";
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        let (url, backend) = mock_backend_with(vec![response], || {}).await;
+        let mut transport = transport_for(url, 0);
+        transport.priority_wake = buffer.lock().unwrap().priority_wake();
+        transport.buffer = Arc::clone(&buffer);
+        let before = metrics().snapshot();
+        assert_eq!(transport.flush(false).await, FlushOutcome::Failed);
+        backend.await.unwrap();
+        assert_eq!(
+            buffer.lock().unwrap().len(),
+            1,
+            "a 401 is a session problem, not a verdict on the events"
+        );
+        assert_eq!(
+            metrics().snapshot().backend_rejected_events_total,
+            before.backend_rejected_events_total
+        );
+    }
+
     // ── Retryable vs permanent statuses ─────────────────────────────────────
 
     #[test]
@@ -1057,7 +1113,7 @@ mod tests {
             buffer: Arc::new(Mutex::new(spool)),
             client: reqwest::Client::new(),
             ingest_url: url,
-            token: "secret_test".into(),
+            tokens: crate::identity::SessionTokens::fixed("secret_test"),
             gzip_ok: AtomicBool::new(false),
             ocsf_ok: AtomicBool::new(false),
             retry_after_secs: AtomicU64::new(0),
@@ -1381,7 +1437,7 @@ mod tests {
                 buffer: Arc::new(Mutex::new(spool)),
                 client: reqwest::Client::new(),
                 ingest_url: var("TRAPD_E2E_INGEST_URL"),
-                token: var("TRAPD_E2E_TOKEN"),
+                tokens: crate::identity::SessionTokens::fixed(var("TRAPD_E2E_TOKEN")),
                 gzip_ok: AtomicBool::new(false),
                 ocsf_ok: AtomicBool::new(false),
                 retry_after_secs: AtomicU64::new(0),

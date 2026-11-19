@@ -67,7 +67,11 @@ pub fn sanitize(msg: &str) -> String {
 
 /// Create the event source registration if it is missing. Best effort.
 pub fn register_source() -> Result<(), u32> {
-    let key = wide(SOURCE_KEY);
+    register_source_key(SOURCE_KEY)
+}
+
+fn register_source_key(source_key: &str) -> Result<(), u32> {
+    let key = wide(source_key);
     let mut hkey: HKEY = std::ptr::null_mut();
     // SAFETY: NUL-terminated key name; `hkey` is a valid out pointer.
     let status = unsafe {
@@ -119,7 +123,11 @@ pub fn register_source() -> Result<(), u32> {
 /// Write one entry to the Application log. Failures are returned, never
 /// panicked on; callers log and continue.
 pub fn report(event: Event, message: &str) -> Result<(), u32> {
-    let source = wide(SOURCE);
+    report_raw(SOURCE, event.id(), event.kind(), message)
+}
+
+fn report_raw(source: &str, id: u32, kind: u16, message: &str) -> Result<(), u32> {
+    let source = wide(source);
     let text = wide(&sanitize(message));
     // SAFETY: NUL-terminated source name.
     let handle = unsafe { RegisterEventSourceW(std::ptr::null(), source.as_ptr()) };
@@ -132,9 +140,9 @@ pub fn report(event: Event, message: &str) -> Result<(), u32> {
     let ok = unsafe {
         ReportEventW(
             handle,
-            event.kind(),
+            kind,
             0,
-            event.id(),
+            id,
             std::ptr::null_mut(),
             1,
             0,
@@ -159,6 +167,29 @@ pub fn notify(event: Event, message: &str) {
     }
     if let Err(code) = report(event, message) {
         tracing::warn!(code, "could not write Application event log entry");
+    }
+}
+
+/// Dedicated custom log for `selfprotect.*` findings (see
+/// `selfprotect::local_log`). `id` must be in 1..=1000 for the message file.
+pub fn security_event(id: u32, severity: &trapd_schema::Severity, message: &str) {
+    use trapd_schema::Severity;
+    use windows_sys::Win32::System::EventLog::EVENTLOG_WARNING_TYPE;
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    let source = crate::selfprotect::local_log::LOG_NAME;
+    REGISTERED.call_once(|| {
+        let key = format!("SYSTEM\\CurrentControlSet\\Services\\EventLog\\{source}\\{source}");
+        if let Err(code) = register_source_key(&key) {
+            tracing::debug!(code, "security event source registration failed");
+        }
+    });
+    let kind = match severity {
+        Severity::Critical | Severity::High => EVENTLOG_ERROR_TYPE,
+        Severity::Medium | Severity::Low => EVENTLOG_WARNING_TYPE,
+        Severity::Info => EVENTLOG_INFORMATION_TYPE,
+    };
+    if let Err(code) = report_raw(source, id, kind, message) {
+        tracing::warn!(code, "could not write security event log entry");
     }
 }
 

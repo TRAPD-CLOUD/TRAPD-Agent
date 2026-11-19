@@ -24,6 +24,7 @@ mod enrollment;
 mod forensics;
 mod heartbeat;
 mod http;
+mod identity;
 mod inventory;
 mod output;
 mod paths;
@@ -92,6 +93,10 @@ async fn main() -> Result<()> {
         println!("trapd-agent v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // Before anything that can take time: the sleep hook's SIGUSR2 would
+    // otherwise terminate the agent (default action).
+    let (suspend, suspend_requests) = heartbeat::suspend::channel();
+    heartbeat::suspend::install_sleep_signal(suspend);
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -100,6 +105,13 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // `trapd-agent guard` — the second service of the guard pair (`trapd-guard`):
+    // watches the agent and restarts it; holds no backend credentials.
+    if std::env::args().nth(1).as_deref() == Some("guard") {
+        paths::init_state_dir();
+        return selfprotect::guard::run::run_until_signal().await;
+    }
 
     // `trapd-agent --apply-update` — helper started by the root-owned
     // `trapd-agent-update.service`; applies (or rolls back) a staged update.
@@ -125,6 +137,17 @@ async fn main() -> Result<()> {
         #[cfg(not(target_os = "windows"))]
         info!("Uninstall: no local honeytoken artifacts on this platform — nothing to do");
         return Ok(());
+    }
+
+    // `trapd-agent uninstall-gate [--token-file <path>]`, run by the deb's
+    // prerm before the service is stopped for a removal: a failure (non-zero
+    // exit) aborts the removal. Same gate as the Windows MSI action.
+    if std::env::args().nth(1).as_deref() == Some("uninstall-gate") {
+        paths::load_agent_env_file();
+        paths::init_state_dir();
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return selfprotect::maintenance::run_uninstall_gate(&args)
+            .inspect_err(|e| error!("uninstall refused: {e:#}"));
     }
 
     // `trapd-agent maintenance --purpose stop --token-file <path>` — sanctioned
@@ -180,6 +203,7 @@ async fn main() -> Result<()> {
     }
 
     selfprotect::kernel_hardening::audit();
+    selfprotect::process_integrity::linux::harden();
 
     if let Err(e) = selfprotect::binary_integrity::check() {
         error!("{e:#}");
@@ -197,6 +221,9 @@ async fn main() -> Result<()> {
     // Resolve & create the (HOME-independent) state directory up front so every
     // later component agrees on where identity/credentials live.
     paths::init_state_dir();
+    // Pair with the guard service before enrollment: pairing can wait for a
+    // human, and the guard must see pings in the meantime.
+    selfprotect::guard::agent_link::start(true);
     // Enrollment can wait indefinitely; claim the run before credentials exist.
     heartbeat::lifecycle::begin_process();
 
@@ -219,7 +246,7 @@ async fn main() -> Result<()> {
         .unwrap_or(false);
     let offline = env_truthy("TRAPD_OFFLINE") || !backend_configured;
 
-    let (backend_url, agent_id, token, project_id) = if offline {
+    let (backend_url, agent_id, tokens, project_id) = if offline {
         if !backend_configured {
             warn!(
                 "TRAPD_BACKEND_URL is not set — starting in OFFLINE mode. Telemetry is \
@@ -233,7 +260,7 @@ async fn main() -> Result<()> {
         (
             String::new(),
             device_id.clone(),
-            String::new(),
+            identity::SessionTokens::fixed(String::new()),
             "offline".to_string(),
         )
     } else {
@@ -256,9 +283,10 @@ async fn main() -> Result<()> {
             }
         };
         let agent_id = creds.agent_id.clone();
-        let token = creds.agent_secret.clone();
+        let tokens = identity::SessionTokens::bootstrap(&backend_url, &creds);
+        selfprotect::journal::upload::start(&tokens, &backend_url, &creds.agent_id);
         let project_id = creds.project_id.clone();
-        (backend_url, agent_id, token, project_id)
+        (backend_url, agent_id, tokens, project_id)
     };
 
     let output_mode = OutputMode::from_env();
@@ -282,6 +310,12 @@ async fn main() -> Result<()> {
     // restart keeps the real configuration even though the signed-config channel
     // re-serves it with an already-accepted (and thus replay-rejected) issued_at.
     let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()?));
+    // Pins from the last verified signed config apply before the first connection.
+    if let Ok(cfg) = agent_config.read() {
+        selfprotect::network_guard::signed_pins::apply_signed_config(&cfg);
+    }
+    #[cfg(windows)]
+    selfprotect::local_log::init_policy(Arc::clone(&agent_config));
     if let Ok(cfg) = agent_config.read() {
         detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
         detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
@@ -321,6 +355,10 @@ async fn main() -> Result<()> {
         );
     }
 
+    // What the guard (or this process, about the guard) recorded while no agent
+    // was shipping events; later ones are picked up by the link itself.
+    selfprotect::guard::agent_link::attach(tx.clone(), agent_id.clone(), hostname.clone());
+
     // A start after a kill/crash/power loss is worth one low-severity signal.
     if let Some(finding) = heartbeat::lifecycle::unclean_shutdown_finding(
         heartbeat::lifecycle::begin_process().previous_shutdown(),
@@ -335,6 +373,9 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Platform posture (Secure Boot, lockdown, ...), measured boot and clock jumps.
+    selfprotect::posture::spawn(tx.clone(), agent_id.clone(), hostname.clone());
+
     // ── Prevention subsystem (active response) ────────────────────────────────
     // Requires the backend (signed command channel), so it is skipped offline.
     // Keep the runtime available online even when initially disabled: each
@@ -347,7 +388,7 @@ async fn main() -> Result<()> {
         match prevention::runtime::start(
             &backend_url,
             &agent_id,
-            &token,
+            Arc::clone(&tokens),
             &hostname,
             tx.clone(),
             Arc::clone(&agent_config),
@@ -421,6 +462,7 @@ async fn main() -> Result<()> {
         spawn_collector!(LogCollector::new(Arc::clone(&agent_config)));
         spawn_collector!(FilesystemCollector::new(Arc::clone(&agent_config)));
         spawn_collector!(AgentProtectCollector::new());
+        spawn_collector!(selfprotect::network_guard::NetworkGuard::new(&backend_url));
         spawn_collector!(collectors::linux::modscan::ModScanCollector::new());
         spawn_collector!(collectors::linux::containerwatch::ContainerWatchCollector::new());
         spawn_collector!(collectors::linux::memscan::MemScanCollector::new(
@@ -440,6 +482,9 @@ async fn main() -> Result<()> {
         handles.push(tokio::spawn(async move {
             selfprotect::anti_ptrace::run(tx_ap, aid, host).await;
         }));
+        // L3: periodic process-integrity self-checks (mappings, preload,
+        // tracer). `anti_ptrace` above stays the 10 s fast path for TracerPid.
+        spawn_collector!(selfprotect::process_integrity::ProcessIntegrityMonitor::new());
     }
 
     // Windows: OS-neutral system snapshots, a sysinfo-based process collector
@@ -473,6 +518,8 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Weak: the liveness echo must not keep the pipeline open at shutdown.
+    let echo_tx = tx.downgrade();
     drop(tx);
 
     // SIEM forwarder — best-effort export of every event (and detection) to
@@ -555,7 +602,7 @@ async fn main() -> Result<()> {
             &backend_url,
             agent_id.clone(),
             device_id.clone(),
-            token.clone(),
+            Arc::clone(&tokens),
             hostname.clone(),
             offline,
             Arc::clone(&agent_config),
@@ -579,37 +626,59 @@ async fn main() -> Result<()> {
         // All three open the (fail-closed) pinned control channel; a pinning
         // misconfig surfaces here as a hard error rather than a silent
         // fall-back to the system trust store.
-        let transport =
-            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?;
+        let transport = Transport::new(
+            Arc::clone(&ring_buffer),
+            backend_url.clone(),
+            Arc::clone(&tokens),
+        )?;
         backend_tasks.push(tokio::spawn(async move { transport.run().await }));
 
         let config_puller = ConfigPuller::new(
             Arc::clone(&agent_config),
             &backend_url,
             &agent_id,
-            token.clone(),
+            Arc::clone(&tokens),
         )?
         .with_apply_hook(std::sync::Arc::new(|cfg: &AgentConfig| {
+            selfprotect::network_guard::signed_pins::apply_signed_config(cfg);
             detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
             detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
         }));
         tokio::spawn(async move { config_puller.run().await });
 
-        let token_for_update = token.clone();
         let heartbeat = Heartbeat::new(
             &backend_url,
             agent_id.clone(),
-            token.clone(),
+            Arc::clone(&tokens),
             hostname.clone(),
             Arc::clone(&agent_config),
-        )?;
+        )?
+        .with_liveness_echo(echo_tx);
         backend_tasks.push(tokio::spawn(async move { heartbeat.run().await }));
+        let suspend_beat = std::sync::Arc::new(Heartbeat::new(
+            &backend_url,
+            agent_id.clone(),
+            Arc::clone(&tokens),
+            hostname.clone(),
+            Arc::clone(&agent_config),
+        )?);
+        backend_tasks.push(tokio::spawn(heartbeat::suspend::serve(
+            suspend_requests,
+            move || {
+                let beat = std::sync::Arc::clone(&suspend_beat);
+                async move { beat.send_host_shutdown().await }
+            },
+        )));
         stop_announcer = stop_announcer.with_backend(
-            Transport::new(Arc::clone(&ring_buffer), backend_url.clone(), token.clone())?,
+            Transport::new(
+                Arc::clone(&ring_buffer),
+                backend_url.clone(),
+                Arc::clone(&tokens),
+            )?,
             Heartbeat::new(
                 &backend_url,
                 agent_id.clone(),
-                token,
+                Arc::clone(&tokens),
                 hostname.clone(),
                 Arc::clone(&agent_config),
             )?,
@@ -619,12 +688,12 @@ async fn main() -> Result<()> {
         selfprotect::maintenance::spawn_pending_report(
             backend_url.clone(),
             agent_id.clone(),
-            token_for_update.clone(),
+            tokens.clone(),
         );
 
         // Self-update is opt-in by key provisioning: without both pinned signing
         // keys no update can be verified, so the updater is not started.
-        match update::Updater::new(&backend_url, agent_id.clone(), token_for_update) {
+        match update::Updater::new(&backend_url, agent_id.clone(), tokens) {
             Ok(updater) => {
                 tokio::spawn(async move { updater.run().await });
             }
@@ -836,6 +905,7 @@ pub(crate) async fn consume_batch_with(
             telemetry::metrics::metrics()
                 .set_detection_queue_depth(p.max_capacity().saturating_sub(p.capacity()) as u64);
         }
+        selfprotect::local_log::record(&event);
         pipeline::accepted(&event);
         fresh.push(event);
     }
