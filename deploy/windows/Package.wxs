@@ -3,7 +3,14 @@
   <Package Name="TRAPD Agent" Manufacturer="TRAPD" Version="$(var.Version)"
            UpgradeCode="0D18AC24-8CE9-4513-A1E5-889FD2A01D93" Scope="perMachine" InstallerVersion="500">
     <SummaryInformation Description="TRAPD Windows telemetry agent (x64)" />
-    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer TRAPD Agent is already installed." />
+    <!-- RemoveExistingProducts runs after InstallExecute: the new product is
+         installed first, then the old one is removed. The upgrade marker
+         (StageUpgradeMarker, deferred, SYSTEM) must exist before the old
+         product's uninstall gate runs. Windows Installer refuses any
+         script-generating action before RemoveExistingProducts when it sits
+         right after InstallInitialize (MSI error 2613), so the earlier
+         afterInstallInitialize schedule could not host the marker. -->
+    <MajorUpgrade Schedule="afterInstallExecute" DowngradeErrorMessage="A newer TRAPD Agent is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Launch Condition="VersionNT64" Message="TRAPD requires 64-bit Windows." />
 
@@ -270,8 +277,8 @@
          empty string, which would make the gate see "no token". An unset
          property formats to "", which the gate treats as absent. -->
     <CustomAction Id="RequireUninstallToken" FileRef="AgentExe" ExeCommand="uninstall-gate --token-file &quot;[MAINTENANCE_TOKEN_FILE]&quot; --upgrading-product &quot;[UPGRADINGPRODUCTCODE]&quot;" Execute="deferred" Impersonate="no" Return="check" />
-    <!-- New package of a major upgrade: before RemoveExistingProducts folds the
-         old product's removal into this transaction, write the upgrade marker
+    <!-- New package of a major upgrade: before its own StopServices stops the
+         running agent, write the upgrade marker
          bound to THIS package's ProductCode (the value Windows Installer will
          later report to the old product as UPGRADINGPRODUCTCODE). It runs as
          SYSTEM from the already installed executable, and `stop-marker` refuses
@@ -280,6 +287,14 @@
          token. [ProductCode] is formatted at scheduling time, as above. -->
     <CustomAction Id="StageUpgradeMarker" FileRef="AgentExe" ExeCommand="stop-marker upgrade --product &quot;[ProductCode]&quot;" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="RollbackUpgradeMarker" FileRef="AgentExe" ExeCommand="stop-marker clear" Execute="rollback" Impersonate="no" Return="ignore" />
+    <!-- Second marker for the old product's uninstall gate. The first one is
+         consumed (single use) by the service stop in this package's own
+         StopServices; RemoveExistingProducts runs after InstallExecute, so the
+         gate needs a fresh one, written by the executable this package just
+         installed. ClearUpgradeMarker removes it right after the old product is
+         gone so it cannot authorize a later plain uninstall within its TTL. -->
+    <CustomAction Id="StageUpgradeGateMarker" FileRef="AgentExe" ExeCommand="stop-marker upgrade --product &quot;[ProductCode]&quot;" Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="ClearUpgradeMarker" FileRef="AgentExe" ExeCommand="stop-marker clear" Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="RollbackStopMarker" FileRef="AgentExe" ExeCommand="stop-marker clear" Execute="rollback" Impersonate="no" Return="ignore" />
     <!-- ACLs the declarative tables cannot express: the service-key descriptor
          (the key belongs to the SCM, so the MSI cannot own it) and, with
@@ -306,7 +321,9 @@
       <Custom Action="RollbackStopMarker" Before="RequireUninstallToken" Condition="REMOVE~=&quot;ALL&quot;" />
       <Custom Action="RequireUninstallToken" Before="StopServices" Condition="REMOVE~=&quot;ALL&quot;" />
       <Custom Action="RollbackUpgradeMarker" Before="StageUpgradeMarker" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
-      <Custom Action="StageUpgradeMarker" Before="RemoveExistingProducts" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+      <Custom Action="StageUpgradeMarker" Before="StopServices" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+      <Custom Action="StageUpgradeGateMarker" Before="InstallExecute" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+      <Custom Action="ClearUpgradeMarker" After="RemoveExistingProducts" Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
       <Custom Action="RollbackEnrollToken" After="WriteRegistryValues" Condition="ENROLLTOKENFILE AND NOT REMOVE" />
       <Custom Action="ImportEnrollToken" After="RollbackEnrollToken" Condition="ENROLLTOKENFILE AND NOT REMOVE" />
       <Custom Action="ApplyAcls" After="InstallServices" Condition="NOT REMOVE AND NOT TRAPD_LEGACY_ACLS=&quot;1&quot;" />
