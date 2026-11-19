@@ -6,9 +6,12 @@ struct TestKey(SigningKey);
 
 impl TestKey {
     fn new() -> Self {
-        Self(SigningKey::random(
-            &mut p256::elliptic_curve::rand_core::OsRng,
-        ))
+        // Distinct key per instance (some tests need a foreign key); small
+        // non-zero scalars are valid P-256 secret keys.
+        static NEXT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+        let mut secret = [0u8; 32];
+        secret[31] = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(SigningKey::from_slice(&secret).unwrap())
     }
 }
 

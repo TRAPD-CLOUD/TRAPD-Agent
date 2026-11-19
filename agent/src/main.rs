@@ -658,7 +658,7 @@ async fn main() -> Result<()> {
         let suspend_beat = std::sync::Arc::new(Heartbeat::new(
             &backend_url,
             agent_id.clone(),
-            token.clone(),
+            Arc::clone(&tokens),
             hostname.clone(),
             Arc::clone(&agent_config),
         )?);
