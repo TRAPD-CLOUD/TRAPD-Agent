@@ -12,9 +12,11 @@
 //! | `allow` / `TRAPD_NETWORK_GUARD_ALLOW`               | filter/rule names, providers, proxy servers, hosts-file IPs to ignore |
 //! | `probe_url` / `TRAPD_NETWORK_PROBE_URL`             | neutral URL for the selective-unreachability check (default: none) |
 //!
-//! The signed agent config does not carry these yet (that needs a matching
-//! change to the backend's canonical signing order); `tls_pin::PinState`
-//! already has the setter for it.
+//! The signed agent config also carries `backend_spki_pins` and
+//! `tls_inspection_ca_pins` (see [`super::signed_pins`]). Signed backend pins
+//! replace `spki_pins` from here; signed inspection CA pins are merged with
+//! `inspection_ca_pins`. These local sources can therefore only add to what
+//! was signed, never remove it.
 
 use std::path::Path;
 

@@ -336,6 +336,10 @@ pub(super) async fn run_agent(
     );
 
     let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()?));
+    // Pins from the last verified signed config apply before the first connection.
+    if let Ok(cfg) = agent_config.read() {
+        crate::selfprotect::network_guard::signed_pins::apply_signed_config(&cfg);
+    }
     let spool = if offline {
         Spool::in_memory(pipeline::SPOOL_MAX_MEMORY)
     } else {
@@ -694,6 +698,7 @@ pub(super) async fn run_agent(
             Arc::clone(&tokens),
         )?
         .with_apply_hook(Arc::new(move |cfg: &AgentConfig| {
+            crate::selfprotect::network_guard::signed_pins::apply_signed_config(cfg);
             crate::deception::activity::set_enabled(cfg.deception_activity_learning_enabled);
             crate::detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
             crate::detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);

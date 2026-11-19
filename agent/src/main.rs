@@ -310,6 +310,10 @@ async fn main() -> Result<()> {
     // restart keeps the real configuration even though the signed-config channel
     // re-serves it with an already-accepted (and thus replay-rejected) issued_at.
     let agent_config: Arc<RwLock<AgentConfig>> = Arc::new(RwLock::new(config::load_persisted()?));
+    // Pins from the last verified signed config apply before the first connection.
+    if let Ok(cfg) = agent_config.read() {
+        selfprotect::network_guard::signed_pins::apply_signed_config(&cfg);
+    }
     #[cfg(windows)]
     selfprotect::local_log::init_policy(Arc::clone(&agent_config));
     if let Ok(cfg) = agent_config.read() {
@@ -636,6 +640,7 @@ async fn main() -> Result<()> {
             Arc::clone(&tokens),
         )?
         .with_apply_hook(std::sync::Arc::new(|cfg: &AgentConfig| {
+            selfprotect::network_guard::signed_pins::apply_signed_config(cfg);
             detection::sensor_policy::set_rule_modes(&cfg.rule_modes);
             detection::sensor_policy::set_suppressions(&cfg.detection_suppressions);
         }));

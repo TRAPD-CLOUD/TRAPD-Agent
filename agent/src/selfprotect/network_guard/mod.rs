@@ -33,6 +33,7 @@ pub mod linux_fw;
 pub mod matching;
 pub mod redirect;
 pub mod settings;
+pub mod signed_pins;
 pub mod tls_pin;
 #[cfg(windows)]
 mod windows_net;
@@ -167,6 +168,11 @@ impl Collector for NetworkGuard {
             let mut found = scan(&settings, &backend, &targets).await;
             for m in tls_pin::global().take_mismatches() {
                 found.push(Finding::PinMismatch(m));
+            }
+            if let Some(n) = tls_pin::global().take_pins_removed(&signed_pins::high_water_path()) {
+                found.push(Finding::PinsRemoved {
+                    enforced_pins: n.enforced_pins,
+                });
             }
             if let Some(probe) = &probe {
                 let backend_ok = backend_reachable(&backend).await;

@@ -90,13 +90,26 @@ fn system_roots_opt_in() -> bool {
 /// instead of degrading to a plain `reqwest::Client::new()`. A remote-control
 /// agent must never ship commands/telemetry over a channel it could not pin.
 pub fn build_client(total_timeout: Duration, connect_timeout: Duration) -> Result<reqwest::Client> {
-    ClientBuilder::new()
+    base_builder(total_timeout, connect_timeout)
         .use_preconfigured_tls(tls_config()?)
+        .build()
+        .context("http: failed to build TLS client")
+}
+
+/// Settings shared by every backend client, apart from TLS.
+///
+/// No idle connection is kept: SPKI pins are checked when a connection is *established*, never on
+/// a reused one, and a signed config can add, change or remove pins at any time. A pooled
+/// connection would otherwise keep serving requests under the old policy for as long as it stays
+/// busy (the heartbeat and transport reuse theirs every few seconds). A fresh handshake per
+/// request makes every policy change take effect on the next request; the control channels are
+/// low-rate, so the extra handshake is the price of that guarantee.
+fn base_builder(total_timeout: Duration, connect_timeout: Duration) -> ClientBuilder {
+    ClientBuilder::new()
         .user_agent(USER_AGENT)
         .timeout(total_timeout)
         .connect_timeout(connect_timeout)
-        .build()
-        .context("http: failed to build TLS client")
+        .pool_max_idle_per_host(0)
 }
 
 /// rustls configuration shared by every backend client: trust anchors, the
@@ -233,6 +246,47 @@ pub fn normalize_base_url(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn every_request_opens_a_new_connection_so_a_pin_change_takes_effect_at_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    // keep-alive offered: a pooled client would reuse this connection
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await;
+                    }
+                });
+            }
+        });
+        let client = super::base_builder(Duration::from_secs(5), Duration::from_secs(2))
+            .no_proxy()
+            .build()
+            .unwrap();
+        for _ in 0..3 {
+            let r = client.get(format!("http://{addr}/")).send().await.unwrap();
+            assert_eq!(r.text().await.unwrap(), "ok");
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
     use super::{normalize_base_url, pin_required};
 
     #[test]
