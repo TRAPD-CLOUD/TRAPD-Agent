@@ -1169,7 +1169,13 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let d = std::env::temp_dir().join(format!("trapd_deception_{nanos}"));
+        // The clock alone is too coarse on Windows: parallel tests got the same directory.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "trapd_deception_{}_{nanos}_{n}",
+            std::process::id()
+        ));
         fs::create_dir_all(&d).unwrap();
         d
     }
