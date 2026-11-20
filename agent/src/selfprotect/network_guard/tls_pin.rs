@@ -220,6 +220,9 @@ pub struct PinState {
     local: PinPolicy,
     /// Set when the signed pins were cleared without an explicit disable.
     pub(super) pins_removed: Mutex<Option<super::signed_pins::RemovalNotice>>,
+    /// Last signed pin set adopted in this process, kept independently of the
+    /// high-water file so a failed write cannot enable a later implicit downgrade.
+    pub(super) signed_memory: Mutex<Option<super::signed_pins::HighWater>>,
     observed: Mutex<BTreeSet<String>>,
     mismatches: Mutex<HashMap<(String, Vec<String>), MismatchSlot>>,
 }

@@ -187,8 +187,25 @@ impl PinState {
     /// Apply the pin fields of a verified signed config. `hw_path` is the
     /// high-water file.
     pub fn apply_signed(&self, signed: &SignedPins, hw_path: &Path) {
-        let hw = load_high_water(hw_path);
+        let file = load_high_water(hw_path);
+        let remembered = self.signed_memory.lock().ok().and_then(|m| m.clone());
+        let hw = match (file, remembered) {
+            // The file is gone or damaged but this process already adopted a signed set: that
+            // set stays authoritative (persistence may have failed, e.g. read-only state dir).
+            (HighWaterState::Absent | HighWaterState::Unreadable, Some(k)) => {
+                HighWaterState::Known(k)
+            }
+            (file, _) => file,
+        };
         let res = resolve(self.local_policy(), signed, &hw);
+        if let Ok(mut mem) = self.signed_memory.lock() {
+            match (&res.store, &hw) {
+                (StoreAction::Write(new), _) => *mem = Some(new.clone()),
+                (StoreAction::Clear, _) => *mem = None,
+                (StoreAction::Keep, HighWaterState::Known(k)) => *mem = Some(k.clone()),
+                (StoreAction::Keep, _) => {}
+            }
+        }
         match &res.store {
             StoreAction::Keep => {}
             StoreAction::Write(new) => match serde_json::to_vec(new)
@@ -219,6 +236,11 @@ impl PinState {
     /// file so a restart does not repeat it.
     pub fn take_pins_removed(&self, hw_path: &Path) -> Option<RemovalNotice> {
         let notice = self.pins_removed.lock().ok()?.take()?;
+        if let Ok(mut mem) = self.signed_memory.lock() {
+            if let Some(k) = mem.as_mut() {
+                k.removal_reported = true;
+            }
+        }
         if let HighWaterState::Known(mut k) = load_high_water(hw_path) {
             k.removal_reported = true;
             let written = serde_json::to_vec(&k)
@@ -480,5 +502,29 @@ mod tests {
             }),
         );
         assert_eq!(again.store, StoreAction::Keep);
+    }
+
+    #[test]
+    fn failed_high_water_write_still_blocks_an_implicit_downgrade() {
+        // The parent "directory" is a regular file, so every write fails.
+        let blocker = tmp("unwritable");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("hw.json");
+        let state = PinState::with_policy(PinPolicy::default());
+        state.apply_signed(&signed(&[A], &[], false), &path);
+        assert!(!matches!(load_high_water(&path), HighWaterState::Known(_)));
+        state.apply_signed(&SignedPins::default(), &path);
+        assert_eq!(decide(&state.policy(), &chain(&[B])), PinDecision::Mismatch);
+        assert_eq!(decide(&state.policy(), &chain(&[A])), PinDecision::Match);
+        assert_eq!(
+            state.take_pins_removed(&path),
+            Some(RemovalNotice { enforced_pins: 1 })
+        );
+        // An explicit signed disable still clears it.
+        state.apply_signed(&signed(&[], &[], true), &path);
+        assert_eq!(
+            decide(&state.policy(), &chain(&[B])),
+            PinDecision::ReportOnly
+        );
     }
 }

@@ -353,7 +353,7 @@ mod tests {
         let sensor = tokio::spawn(async {
             for _ in 0..200 {
                 if let Some((pid, path)) = trapd_detection::selftest::armed() {
-                    assert!(trapd_detection::selftest::claim(pid, &path));
+                    assert!(trapd_detection::selftest::claim(pid, &path, None));
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
