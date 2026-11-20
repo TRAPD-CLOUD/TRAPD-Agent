@@ -61,15 +61,84 @@ fn generate_recording(
             "'.{ext}' files are binary containers; a believable decoy cannot be generated for them, choose a text file (.txt, .csv, .ini, …)"
         )));
     }
+    // Files whose real counterpart has a fixed format (an .rdp file, WinSCP.ini,
+    // appsettings.json, …) get exactly that format.
+    if let Some(kind) = kind_for_name(&lower) {
+        return generate_kind_recording(kind, host, secrets);
+    }
     let mut rng = Rng;
     let persona = Persona::new(host, &mut rng);
-    let theme = Theme::for_name(&lower);
-    Ok(match theme {
+    let lang = Lang::of_name(&lower);
+    Ok(match Theme::for_name(&lower) {
         Theme::RecoveryKey => bitlocker_recovery(&mut rng, secrets),
+        Theme::Vpn => vpn_access(&persona, &mut rng, lang, secrets).into_bytes(),
         Theme::CredentialTable => credential_table(&persona, &mut rng, ext, secrets).into_bytes(),
-        Theme::PasswordList => password_list(&persona, &mut rng, false, secrets).into_bytes(),
-        Theme::BackupNotes => password_list(&persona, &mut rng, true, secrets).into_bytes(),
+        Theme::PasswordList => password_list(&persona, &mut rng, false, lang, secrets).into_bytes(),
+        Theme::BackupNotes => password_list(&persona, &mut rng, true, lang, secrets).into_bytes(),
     })
+}
+
+/// The fixed-format artefact a file name stands for, if any. Matches the real
+/// file names (and extensions) these tools write.
+fn kind_for_name(lower: &str) -> Option<&'static str> {
+    let ext = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    Some(match () {
+        _ if ext == "rdp" => "rdp_connection",
+        _ if lower == "winscp.ini" => "winscp_ini",
+        _ if lower == "sitemanager.xml" || (lower.contains("filezilla") && ext == "xml") => {
+            "filezilla_sitemanager"
+        }
+        _ if ext == "bat" || ext == "cmd" => "map_drives_script",
+        _ if lower.contains("unattend") && ext == "xml" => "unattend_xml",
+        _ if lower.starts_with("appsettings") && ext == "json" => "appsettings_json",
+        _ if lower == "web.config" => "web_config",
+        _ if lower == ".env" || lower.starts_with(".env.") || ext == "env" => "env_file",
+        _ if lower == "credentials"
+            || lower.starts_with("aws-credentials")
+            || lower.starts_with("aws_credentials") =>
+        {
+            "aws_credentials_backup"
+        }
+        _ => return None,
+    })
+}
+
+/// Language of the file's text, taken from its name: a decoy called
+/// `VPN-Zugang.txt` that is written in English gives itself away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    De,
+    En,
+}
+
+impl Lang {
+    fn of_name(lower: &str) -> Self {
+        const GERMAN: &[&str] = &[
+            "zugang",
+            "passw",
+            "kennw",
+            "sicherung",
+            "wiederherstell",
+            "notiz",
+            "konto",
+            "zugaeng",
+            "benutzer",
+            "anmeld",
+            "liste",
+            "server-",
+            "verbindung",
+            "daten",
+            "ä",
+            "ö",
+            "ü",
+            "ß",
+        ];
+        if GERMAN.iter().any(|w| lower.contains(w)) {
+            Self::De
+        } else {
+            Self::En
+        }
+    }
 }
 
 /// Generate bait for an explicitly chosen decoy *kind* (the adaptive-decoy
@@ -88,9 +157,10 @@ fn generate_kind_recording(
     let mut rng = Rng;
     let p = Persona::new(host, &mut rng);
     let out = match kind {
-        "password_note" => password_list(&p, &mut rng, false, secrets),
+        "password_note" => password_list(&p, &mut rng, false, Lang::En, secrets),
         "credential_csv" => credential_table(&p, &mut rng, "csv", secrets),
-        "db_connection_notes" => password_list(&p, &mut rng, false, secrets),
+        "db_connection_notes" => password_list(&p, &mut rng, false, Lang::En, secrets),
+        "vpn_access" => vpn_access(&p, &mut rng, Lang::En, secrets),
         "recovery_key" => return Ok(bitlocker_recovery(&mut rng, secrets)),
         "rdp_connection" => rdp_connection(&p, &mut rng),
         "winscp_ini" => winscp_ini(&p, &mut rng, secrets),
@@ -273,6 +343,7 @@ fn base64_like(_seed: &str, rng: &mut Rng) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Theme {
     RecoveryKey,
+    Vpn,
     CredentialTable,
     PasswordList,
     BackupNotes,
@@ -283,7 +354,15 @@ impl Theme {
         let has = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
         if has(&["bitlocker", "recovery", "wiederherstellung"]) {
             Self::RecoveryKey
-        } else if lower.ends_with(".csv") || has(&["credential", "account", "login", "zugang"]) {
+        } else if has(&[
+            "vpn",
+            "remote-access",
+            "fernzugriff",
+            "homeoffice",
+            "home-office",
+        ]) {
+            Self::Vpn
+        } else if lower.ends_with(".csv") {
             Self::CredentialTable
         } else if has(&["backup", "sicherung"]) {
             Self::BackupNotes
@@ -545,6 +624,22 @@ struct Entry {
     note: &'static str,
 }
 
+const NOTES_DE: &[&str] = &[
+    "",
+    "",
+    "",
+    "prod",
+    "Test",
+    "alt - pruefen",
+    "neu seit Migration",
+    "nicht aendern",
+    "geaendert",
+    "temporaer",
+    "Dienstleister",
+    "Notfall",
+    "nur lesen",
+];
+
 const NOTES: &[&str] = &[
     "",
     "",
@@ -565,10 +660,12 @@ fn entries(
     persona: &Persona,
     rng: &mut Rng,
     backup: bool,
+    lang: Lang,
     secrets: &mut Vec<String>,
 ) -> Vec<Entry> {
     let pool = if backup { BACKUP_SERVICES } else { SERVICES };
-    let count = rng.range(3, 7);
+    let notes = if lang == Lang::De { NOTES_DE } else { NOTES };
+    let count = rng.range(4, 9).min(pool.len());
     let mut used = Vec::new();
     let mut out = Vec::new();
     while out.len() < count && used.len() < pool.len() {
@@ -585,7 +682,7 @@ fn entries(
         // Bind first: with an expected `&str` type, older rustc infers
         // `T = str` for `pick` and rejects the call.
         let base_user = *rng.pick(users);
-        let note = *rng.pick(NOTES);
+        let note = *rng.pick(notes);
         out.push(Entry {
             host: persona.server(role, rng),
             user: persona.account(base_user, rng),
@@ -599,9 +696,16 @@ fn entries(
 const LIST_HEADERS: &[&str] = &[
     "",
     "Server / User / PW\r\n\r\n",
-    "Zugangsdaten\r\n\r\n",
     "accounts\r\n-------\r\n",
     "IT logins (keep updated)\r\n\r\n",
+    "server passwords\r\n================\r\n",
+];
+
+const LIST_HEADERS_DE: &[&str] = &[
+    "",
+    "Server / Benutzer / PW\r\n\r\n",
+    "Zugangsdaten\r\n\r\n",
+    "Zugaenge IT (aktuell halten!)\r\n\r\n",
     "Passwoerter Server\r\n==================\r\n",
 ];
 
@@ -610,11 +714,17 @@ fn password_list(
     persona: &Persona,
     rng: &mut Rng,
     backup: bool,
+    lang: Lang,
     secrets: &mut Vec<String>,
 ) -> String {
-    let mut out = String::from(*rng.pick(LIST_HEADERS));
+    let headers = if lang == Lang::De {
+        LIST_HEADERS_DE
+    } else {
+        LIST_HEADERS
+    };
+    let mut out = String::from(*rng.pick(headers));
     let style = rng.below(3);
-    for e in entries(persona, rng, backup, secrets) {
+    for e in entries(persona, rng, backup, lang, secrets) {
         let line = match style {
             0 => format!("{}\t{}\t{}", e.host, e.user, e.password),
             1 => format!("{} - {} / {}", e.host, e.user, e.password),
@@ -631,7 +741,12 @@ fn password_list(
     }
     if rng.chance(40) {
         out.push_str(&format!(
-            "\r\nlast change {}\r\n",
+            "\r\n{} {}\r\n",
+            if lang == Lang::De {
+                "Stand"
+            } else {
+                "last change"
+            },
             past_date(rng).format(if rng.chance(50) {
                 "%d.%m.%Y"
             } else {
@@ -639,6 +754,131 @@ fn password_list(
             })
         ));
     }
+    out
+}
+
+/// VPN clients people actually get handed, with the protocol and port their
+/// gateways use.
+const VPN_CLIENTS: &[(&str, &str, u16, bool)] = &[
+    // (client, protocol, port, pre-shared key)
+    ("FortiClient", "SSL-VPN", 443, false),
+    ("FortiClient", "IPsec/IKEv2", 500, true),
+    ("Cisco Secure Client (AnyConnect)", "SSL/DTLS", 443, false),
+    ("GlobalProtect", "SSL/IPsec", 443, false),
+    ("Sophos Connect", "IPsec", 500, true),
+    ("OpenVPN Connect", "OpenVPN UDP", 1194, false),
+    ("Windows (eingebaut)", "L2TP/IPsec", 1701, true),
+];
+
+/// Remote-access notes as an IT department hands them out (or a user keeps
+/// them): gateway, client, account, password, sometimes a pre-shared key.
+fn vpn_access(p: &Persona, rng: &mut Rng, lang: Lang, secrets: &mut Vec<String>) -> String {
+    let &(client, protocol, port, psk) = rng.pick(VPN_CLIENTS);
+    let client = if lang == Lang::En {
+        client.replace("(eingebaut)", "(built-in)")
+    } else {
+        client.to_string()
+    };
+    let gateway = match &p.dns_domain {
+        Some(d) => format!("{}.{d}", rng.pick(&["vpn", "remote", "gw", "sslvpn"])),
+        None => p.server("VPN", rng),
+    };
+    let base_user = *rng.pick(&[
+        "vpn.admin",
+        "svc_vpn",
+        "administrator",
+        "it-support",
+        "fernwartung",
+    ]);
+    let user = p.account(base_user, rng);
+    let (pw, generated) = password(rng);
+    if generated {
+        secrets.push(pw.clone());
+    }
+    let psk_value = psk.then(|| {
+        let len = rng.range(20, 32);
+        let v = rng.chars(
+            b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789",
+            len,
+        );
+        secrets.push(v.clone());
+        v
+    });
+    let date = past_date(rng).format(if lang == Lang::De {
+        "%d.%m.%Y"
+    } else {
+        "%Y-%m-%d"
+    });
+    let de = lang == Lang::De;
+    let mut out = String::new();
+    out.push_str(if de {
+        rng.pick(&[
+            "VPN-Zugang\r\n==========\r\n\r\n",
+            "VPN Zugang Homeoffice\r\n\r\n",
+            "Fernzugriff (VPN)\r\n-----------------\r\n\r\n",
+        ])
+    } else {
+        rng.pick(&[
+            "VPN access\r\n==========\r\n\r\n",
+            "Remote access (VPN)\r\n\r\n",
+            "VPN - home office\r\n-----------------\r\n\r\n",
+        ])
+    });
+    let rows: Vec<(&str, String)> = vec![
+        ("Client", client),
+        ("Gateway", gateway),
+        (
+            if de { "Protokoll" } else { "Protocol" },
+            format!("{protocol} (Port {port})"),
+        ),
+        (if de { "Benutzer" } else { "Username" }, user),
+        (if de { "Passwort" } else { "Password" }, pw),
+    ];
+    for (k, v) in rows {
+        out.push_str(&format!("{:<16}{v}\r\n", format!("{k}:")));
+    }
+    if let Some(psk) = psk_value {
+        out.push_str(&format!("{:<16}{psk}\r\n", "Pre-Shared Key:"));
+    }
+    if rng.chance(60) {
+        out.push_str(&format!(
+            "{:<16}{}\r\n",
+            "MFA:",
+            if de {
+                *rng.pick(&[
+                    "Authenticator-App, Code nach dem Passwort eingeben",
+                    "SMS-Code aufs Diensthandy",
+                    "keine (Ausnahme bis Umstellung)",
+                ])
+            } else {
+                *rng.pick(&[
+                    "authenticator app, enter the code after the password",
+                    "SMS code to the work phone",
+                    "none (exception until migration)",
+                ])
+            }
+        ));
+    }
+    out.push_str("\r\n");
+    out.push_str(if de {
+        rng.pick(&[
+            "Nach dem Verbinden Laufwerke mit Netzlaufwerke.bat verbinden.\r\n",
+            "Bei Problemen: IT-Hotline, nicht das Passwort aendern (Dienstkonto).\r\n",
+            "Zugang nicht weitergeben. Wird quartalsweise geaendert.\r\n",
+            "",
+        ])
+    } else {
+        rng.pick(&[
+            "Run map-drives.bat after connecting.\r\n",
+            "Problems: call the IT hotline, do not change the password (service account).\r\n",
+            "Do not share. Rotated every quarter.\r\n",
+            "",
+        ])
+    });
+    out.push_str(&format!(
+        "{} {date}\r\n",
+        if de { "Stand:" } else { "Updated:" }
+    ));
     out
 }
 
@@ -659,7 +899,7 @@ fn credential_table(
     let mut out = columns.join(&sep.to_string());
     out.push_str("\r\n");
     let backup = rng.chance(25);
-    for e in entries(persona, rng, backup, secrets) {
+    for e in entries(persona, rng, backup, Lang::En, secrets) {
         let row: Vec<String> = columns
             .iter()
             .map(|c| match c.to_ascii_lowercase().as_str() {
@@ -974,6 +1214,85 @@ mod tests {
         for _ in 0..20 {
             let bait = text(&generate("credentials.csv", &hostile).unwrap());
             assert!(!bait.contains('<') && !bait.contains('"') && !bait.contains("rm -rf"));
+        }
+    }
+
+    /// The file names the console offers (TRAPD frontend
+    /// `lib/api/honeytoken/windows-templates.ts`). Each must get the content
+    /// its name promises; keep both lists in lockstep.
+    const TEMPLATE_NAMES: &[(&str, &str)] = &[
+        ("VPN-Zugang.txt", "vpn"),
+        ("VPN Zugangsdaten.txt", "vpn"),
+        ("vpn-access.txt", "vpn"),
+        ("VPN login.txt", "vpn"),
+        ("Passwoerter Server.txt", "list"),
+        ("Zugangsdaten IT.txt", "list"),
+        ("server-passwords.txt", "list"),
+        ("admin logins.txt", "list"),
+        ("Passwoerter-Export.csv", "csv"),
+        ("keepass-export.csv", "csv"),
+        ("passwords.csv", "csv"),
+        ("Backup Zugaenge.txt", "backup"),
+        ("backup-accounts.txt", "backup"),
+        ("BitLocker-Wiederherstellungsschluessel.txt", "recovery"),
+        ("BitLocker Recovery Key.txt", "recovery"),
+        ("Terminalserver.rdp", "rdp_connection"),
+        ("admin-server.rdp", "rdp_connection"),
+        ("Netzlaufwerke.bat", "map_drives_script"),
+        ("map-drives.bat", "map_drives_script"),
+        ("WinSCP.ini", "winscp_ini"),
+        ("sitemanager.xml", "filezilla_sitemanager"),
+        ("appsettings.Production.json", "appsettings_json"),
+        ("web.config", "web_config"),
+        (".env", "env_file"),
+        ("credentials", "aws_credentials_backup"),
+    ];
+
+    #[test]
+    fn every_template_name_gets_the_content_it_promises() {
+        for (name, want) in TEMPLATE_NAMES {
+            let lower = name.to_ascii_lowercase();
+            let got = match kind_for_name(&lower) {
+                Some(kind) => kind,
+                None => match Theme::for_name(&lower) {
+                    Theme::Vpn => "vpn",
+                    Theme::PasswordList => "list",
+                    Theme::CredentialTable => "csv",
+                    Theme::BackupNotes => "backup",
+                    Theme::RecoveryKey => "recovery",
+                },
+            };
+            assert_eq!(got, *want, "{name}");
+            let bait = generate(name, &host()).expect(name);
+            assert!(bait.len() > 80, "{name}: only {} bytes", bait.len());
+        }
+    }
+
+    #[test]
+    fn german_names_get_german_text_and_english_names_english() {
+        for _ in 0..20 {
+            let de = text(&generate("VPN-Zugang.txt", &host()).unwrap());
+            assert!(de.contains("Passwort:") && de.contains("Benutzer:"), "{de}");
+            let en = text(&generate("vpn-access.txt", &host()).unwrap());
+            assert!(en.contains("Password:") && en.contains("Username:"), "{en}");
+            assert!(!en.contains("eingebaut"), "{en}");
+            let list = text(&generate("Zugangsdaten IT.txt", &host()).unwrap());
+            assert!(
+                !list.contains("last change") && !list.contains("do not change"),
+                "{list}"
+            );
+        }
+    }
+
+    #[test]
+    fn vpn_bait_uses_the_host_domain_and_embeds_its_secrets() {
+        for _ in 0..20 {
+            let mut secrets = Vec::new();
+            let bait = text(&generate_recording("VPN-Zugang.txt", &host(), &mut secrets).unwrap());
+            assert!(bait.contains(".corp.example.eu"), "{bait}");
+            for s in &secrets {
+                assert!(bait.contains(s.as_str()), "secret {s} missing");
+            }
         }
     }
 
