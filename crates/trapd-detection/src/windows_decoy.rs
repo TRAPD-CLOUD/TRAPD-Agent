@@ -315,7 +315,8 @@ pub fn to_access_data(decoy: &DecoyInfo, a: &Accessor, verdict: &Verdict) -> Hon
         session: None,
         allowlisted_accessor: is_sweeper(a),
         scheduled_sweep: verdict.grade == Grade::Signal && is_sweeper(a),
-        selftest: crate::selftest::claim(a.pid, &decoy.path),
+        // Windows events carry no process start time and no test is retained there.
+        selftest: crate::selftest::claim(a.pid, &decoy.path, None),
     }
 }
 

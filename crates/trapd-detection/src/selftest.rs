@@ -88,28 +88,47 @@ pub fn arm(pid: i32, path: &str, ttl: Duration) -> bool {
 /// Called by a sensor for every access it reports. `true` marks the access as the
 /// self-test (the registry stays armed so every access of the child, e.g. an open
 /// followed by a metadata call, is marked as part of the same test).
-pub fn claim(pid: i32, path: &str) -> bool {
+///
+/// `observed_start` is the accessor's start time as the sensor established it for the
+/// access itself (`None` when the sensor cannot tell). A process identity that cannot be
+/// established never matches a finished test: an unknown process stays uncorrelated.
+pub fn claim(pid: i32, path: &str, observed_start: Option<u64>) -> bool {
     {
         let mut guard = lock();
         if let Some(pending) = guard.as_mut() {
             if Instant::now() > pending.deadline {
                 *guard = None;
-            } else if pending.pid == pid && pending.path == path {
+            } else if pending.pid == pid
+                && pending.path == path
+                && generation_compatible(pending.start, observed_start)
+            {
                 pending.observed = true;
                 return true;
             }
         }
     }
-    // A finished test whose delayed events are still arriving.
+    // A finished test whose delayed events are still arriving. The pid may have been reused by
+    // an unrelated process, so the accessor's identity must be proven to be the child's: by the
+    // sensor's own observation, or else by the still-running process. A process that is gone
+    // and was never identified proves nothing.
+    let identity = observed_start.or_else(|| process_start_time(pid));
+    let Some(identity) = identity else {
+        return false;
+    };
     let now = Instant::now();
     let mut retained = lock_retained();
     retained.retain(|r| r.until > now);
-    // The pid may have been reused by an unrelated process: that one has another start time. A
-    // child that is gone (a delayed event of the finished test) has none; only then does the pid
-    // and path alone identify the test.
-    retained.iter().any(|r| {
-        r.pid == pid && r.path == path && process_start_time(pid).is_none_or(|now| now == r.start)
-    })
+    retained
+        .iter()
+        .any(|r| r.pid == pid && r.path == path && r.start == identity)
+}
+
+/// While the test runs, the armed pid is the child unless both start times are known and differ.
+fn generation_compatible(armed: Option<u64>, observed: Option<u64>) -> bool {
+    match (armed, observed) {
+        (Some(a), Some(o)) => a == o,
+        _ => true,
+    }
 }
 
 /// The armed `(pid, path)`, for the agent's own tests that stand in for a sensor.
@@ -164,21 +183,21 @@ mod tests {
     fn only_the_armed_pid_and_path_are_marked() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
-        assert!(!claim(10, "/a"), "nothing armed");
+        assert!(!claim(10, "/a", None), "nothing armed");
         assert!(arm(10, "/a", Duration::from_secs(30)));
-        assert!(!claim(11, "/a"), "another process is a real access");
-        assert!(!claim(10, "/b"), "another path is a real access");
+        assert!(!claim(11, "/a", None), "another process is a real access");
+        assert!(!claim(10, "/b", None), "another path is a real access");
         assert!(!observed());
-        assert!(claim(10, "/a"));
+        assert!(claim(10, "/a", None));
         assert!(
-            claim(10, "/a"),
+            claim(10, "/a", None),
             "every access of the child belongs to the test"
         );
         assert!(observed());
         finish();
         assert!(!observed(), "no longer running");
         reset();
-        assert!(!claim(10, "/a"));
+        assert!(!claim(10, "/a", None));
     }
 
     // Retention needs a real process (its start time is its identity), so these tests use this one.
@@ -192,11 +211,11 @@ mod tests {
         finish();
         assert!(!observed(), "no longer running");
         assert!(
-            claim(me, "/a"),
+            claim(me, "/a", None),
             "a delayed event of the finished test stays marked"
         );
-        assert!(!claim(me, "/b"), "another path is not");
-        assert!(!claim(me + 1, "/a"), "another pid is not");
+        assert!(!claim(me, "/b", None), "another path is not");
+        assert!(!claim(me + 1, "/a", None), "another pid is not");
         reset();
     }
 
@@ -215,7 +234,7 @@ mod tests {
             until: Instant::now() + RETAIN,
         });
         assert!(
-            !claim(me, "/a"),
+            !claim(me, "/a", None),
             "same pid, different process: a real access"
         );
         reset();
@@ -228,7 +247,7 @@ mod tests {
         // A pid that cannot exist: no start time, so the finished test is simply forgotten.
         assert!(arm(i32::MAX, "/a", Duration::from_secs(30)));
         finish();
-        assert!(!claim(i32::MAX, "/a"));
+        assert!(!claim(i32::MAX, "/a", None));
         reset();
     }
 
@@ -262,7 +281,48 @@ mod tests {
         assert!(!arm(5, "", Duration::from_secs(1)));
         assert!(arm(5, "/a", Duration::from_millis(0)));
         std::thread::sleep(Duration::from_millis(5));
-        assert!(!claim(5, "/a"), "an expired test marks nothing");
+        assert!(!claim(5, "/a", None), "an expired test marks nothing");
         assert!(!observed());
+    }
+
+    #[test]
+    fn a_gone_process_without_sensor_identity_is_not_the_test() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        // The child finished and its pid is free (or reused by a process that also exited).
+        let gone = i32::MAX - 1;
+        lock_retained().push(Retained {
+            pid: gone,
+            path: "/a".into(),
+            start: 42,
+            until: Instant::now() + RETAIN,
+        });
+        assert!(
+            !claim(gone, "/a", None),
+            "an access whose process identity is unknown stays a real access"
+        );
+        assert!(
+            !claim(gone, "/a", Some(43)),
+            "the sensor saw another process generation"
+        );
+        assert!(
+            claim(gone, "/a", Some(42)),
+            "the sensor proves the delayed event is the child's"
+        );
+        reset();
+    }
+
+    #[test]
+    fn a_running_test_rejects_a_different_observed_generation() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        assert!(arm(10, "/a", Duration::from_secs(30)));
+        if let Some(p) = lock().as_mut() {
+            p.start = Some(7);
+        }
+        assert!(!claim(10, "/a", Some(8)));
+        assert!(claim(10, "/a", Some(7)));
+        assert!(claim(10, "/a", None));
+        reset();
     }
 }

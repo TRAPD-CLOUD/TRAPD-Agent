@@ -136,8 +136,15 @@ fn tls_config() -> Result<rustls::ClientConfig> {
         },
         None => builder.with_no_client_auth(),
     };
-    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    finish_tls_config(&mut cfg);
     Ok(cfg)
+}
+
+fn finish_tls_config(cfg: &mut rustls::ClientConfig) {
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // rustls skips `verify_server_cert` on resumed handshakes, so a cached session would bypass a
+    // pin policy that changed after it was established. Every handshake must run the verifier.
+    cfg.resumption = rustls::client::Resumption::disabled();
 }
 
 /// `<config>/ca.crt` as the *only* trusted root, pinning the backend to that CA
@@ -288,6 +295,21 @@ mod tests {
     }
 
     use super::{normalize_base_url, pin_required};
+
+    #[test]
+    fn tls_session_resumption_is_disabled_so_every_handshake_checks_the_pins() {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        super::finish_tls_config(&mut cfg);
+        let dbg = format!("{:?}", cfg.resumption);
+        let disabled = format!("{:?}", rustls::client::Resumption::disabled());
+        assert_eq!(dbg, disabled);
+        assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
 
     #[test]
     fn pins_when_ca_present() {
