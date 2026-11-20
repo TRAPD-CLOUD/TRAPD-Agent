@@ -583,6 +583,35 @@ mod tests {
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Logon type of a 4663 subject session. The built-in service accounts
+/// (SYSTEM 0x3e7, NetworkService 0x3e4, LocalService 0x3e5) log on at boot,
+/// before the agent reads the Security log, so no 4624 for them is ever seen.
+/// They are service sessions (type 5) when the logon id AND the account SID
+/// agree; everything else comes from the observed 4624 records (`seen`).
+/// This only feeds the sweeper check, which still requires a verified image.
+pub fn resolve_logon_type(
+    logon_id: &str,
+    subject_sid: &str,
+    seen: impl Fn(&str) -> Option<u32>,
+) -> Option<u32> {
+    let id = logon_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let luid = id
+        .strip_prefix("0x")
+        .or_else(|| id.strip_prefix("0X"))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok());
+    let well_known = matches!(
+        (luid, subject_sid.trim()),
+        (Some(0x3e7), "S-1-5-18") | (Some(0x3e4), "S-1-5-20") | (Some(0x3e5), "S-1-5-19")
+    );
+    if well_known {
+        return Some(5);
+    }
+    seen(id)
+}
+
 /// Build an [`Accessor`] from a 4663 event's `Data` fields and a logon-type
 /// looked up from the subject's logon id (4624 correlation; `None` if unknown).
 pub fn accessor_from_4663(
@@ -670,6 +699,62 @@ pub fn lookup_decoy(path: &str) -> Option<DecoyInfo> {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn built_in_service_sessions_resolve_to_service_logons() {
+        let none = |_: &str| None;
+        assert_eq!(resolve_logon_type("0x3e7", "S-1-5-18", none), Some(5));
+        assert_eq!(resolve_logon_type("0x3E4", "S-1-5-20", none), Some(5));
+        assert_eq!(resolve_logon_type("0x3e5", "S-1-5-19", none), Some(5));
+    }
+
+    #[test]
+    fn well_known_logon_id_with_a_foreign_sid_is_not_trusted() {
+        let none = |_: &str| None;
+        // A user SID on the SYSTEM logon id is inconsistent: not a service.
+        assert_eq!(
+            resolve_logon_type("0x3e7", "S-1-5-21-1-2-3-1001", none),
+            None
+        );
+        assert_eq!(resolve_logon_type("0x3e7", "S-1-5-20", none), None);
+        assert_eq!(resolve_logon_type("", "S-1-5-18", none), None);
+    }
+
+    #[test]
+    fn other_sessions_use_the_observed_4624_type() {
+        let seen = |id: &str| (id == "0x5a1b2").then_some(2);
+        assert_eq!(
+            resolve_logon_type("0x5a1b2", "S-1-5-21-1-2-3-1001", seen),
+            Some(2)
+        );
+        assert_eq!(
+            resolve_logon_type("0x99", "S-1-5-21-1-2-3-1001", seen),
+            None
+        );
+    }
+
+    #[test]
+    fn signed_indexer_on_the_system_session_is_a_sweeper_signal() {
+        let f = |k: &str| match k {
+            "ProcessName" => "C:\\Windows\\System32\\SearchProtocolHost.exe".to_string(),
+            "ProcessId" => "0xdfc".to_string(),
+            "SubjectUserName" => "CLT$".to_string(),
+            "SubjectDomainName" => "WORKGROUP".to_string(),
+            "SubjectUserSid" => "S-1-5-18".to_string(),
+            "SubjectLogonId" => "0x3e7".to_string(),
+            "AccessMask" => "0x1".to_string(),
+            _ => String::new(),
+        };
+        let lt = resolve_logon_type(&f("SubjectLogonId"), &f("SubjectUserSid"), |_| None);
+        let a = accessor_from_4663(f, lt, true);
+        assert!(is_sweeper(&a));
+        // Without the verified signature it is never downgraded.
+        let unsigned = Accessor {
+            signed_trusted: false,
+            ..a
+        };
+        assert!(!is_sweeper(&unsigned));
+    }
 
     #[test]
     fn decimal_pid_and_unknown_access_mask_are_not_misparsed() {

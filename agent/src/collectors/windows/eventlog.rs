@@ -456,12 +456,10 @@ fn decoy_access(
         return None;
     }
     let decoy = windows_decoy::lookup_decoy(&object)?;
-    let logon_type = {
-        let id = get("SubjectLogonId");
-        (!id.is_empty())
-            .then(|| logon_types.get(&id).copied())
-            .flatten()
-    };
+    let logon_type =
+        windows_decoy::resolve_logon_type(&get("SubjectLogonId"), &get("SubjectUserSid"), |id| {
+            logon_types.get(id).copied()
+        });
     let mut accessor = windows_decoy::accessor_from_4663(|k| get(k), logon_type, false);
     // Security auditing can report an NT device image while current_exe and
     // live process queries return DOS paths. Compare the full mapped identity.

@@ -53,14 +53,23 @@ pub fn verified(a: &Accessor, observed: Option<u64>) -> bool {
         return false;
     };
     use std::os::windows::io::AsRawHandle;
+    let handle = protected.last().unwrap().as_raw_handle();
     let path: Vec<u16> = image.encode_utf16().chain(Some(0)).collect();
+    // Windows components (Search, Defender platform files) are mostly
+    // catalog-signed, not embedded-signed; accept either, as Windows does.
+    let trusted = embedded_trusted(&path, handle) || catalog_trusted(&path, handle);
+    trusted && crate::telemetry::identity::process_start_time(a.pid) == Some(start)
+}
+
+/// Embedded Authenticode signature of the locked image.
+fn embedded_trusted(path: &[u16], handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
     // SAFETY: structures and NUL-terminated path outlive the synchronous trust operation;
     // its state is closed on all return paths. No UI or external network request.
-    let trusted = unsafe {
+    unsafe {
         let mut file = WINTRUST_FILE_INFO {
             cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
             pcwszFilePath: path.as_ptr(),
-            hFile: protected.last().unwrap().as_raw_handle(),
+            hFile: handle,
             ..Default::default()
         };
         let mut data = WINTRUST_DATA {
@@ -73,21 +82,105 @@ pub fn verified(a: &Accessor, observed: Option<u64>) -> bool {
             dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
             ..Default::default()
         };
-        let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-        let rc = WinVerifyTrust(
-            windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
-            &mut action,
-            (&mut data as *mut WINTRUST_DATA).cast(),
-        );
-        data.dwStateAction = WTD_STATEACTION_CLOSE;
-        let _ = WinVerifyTrust(
-            windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
-            &mut action,
-            (&mut data as *mut WINTRUST_DATA).cast(),
-        );
-        rc == 0
-    };
-    trusted && crate::telemetry::identity::process_start_time(a.pid) == Some(start)
+        verify(&mut data)
+    }
+}
+
+/// Signature of the locked image through a system catalog: hash the open
+/// handle (SHA-256), find the catalog that lists that hash, and verify the
+/// member against it. Fails closed on every error.
+fn catalog_trusted(path: &[u16], handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use windows_sys::Win32::Security::Cryptography::Catalog::*;
+    use windows_sys::Win32::Security::Cryptography::BCRYPT_SHA256_ALGORITHM;
+    // SAFETY: every out-pointer refers to a live local; the catalog admin and
+    // catalog contexts are released on all paths; buffers outlive the calls.
+    unsafe {
+        let mut admin: isize = 0;
+        if CryptCATAdminAcquireContext2(
+            &mut admin,
+            std::ptr::null(),
+            BCRYPT_SHA256_ALGORITHM,
+            std::ptr::null(),
+            0,
+        ) == 0
+        {
+            return false;
+        }
+        let mut hash = [0u8; 64];
+        let mut len = hash.len() as u32;
+        let mut trusted = false;
+        if CryptCATAdminCalcHashFromFileHandle2(admin, handle, &mut len, hash.as_mut_ptr(), 0) != 0
+            && (len as usize) <= hash.len()
+        {
+            let hash = &hash[..len as usize];
+            let catalog = CryptCATAdminEnumCatalogFromHash(
+                admin,
+                hash.as_ptr(),
+                len,
+                0,
+                std::ptr::null_mut(),
+            );
+            if catalog != 0 {
+                let mut info = CATALOG_INFO {
+                    cbStruct: std::mem::size_of::<CATALOG_INFO>() as u32,
+                    wszCatalogFile: [0; 260],
+                };
+                if CryptCATCatalogInfoFromContext(catalog, &mut info, 0) != 0 {
+                    let tag: Vec<u16> = hash
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<String>()
+                        .encode_utf16()
+                        .chain(Some(0))
+                        .collect();
+                    let mut member = WINTRUST_CATALOG_INFO {
+                        cbStruct: std::mem::size_of::<WINTRUST_CATALOG_INFO>() as u32,
+                        pcwszCatalogFilePath: info.wszCatalogFile.as_ptr(),
+                        pcwszMemberTag: tag.as_ptr(),
+                        pcwszMemberFilePath: path.as_ptr(),
+                        hMemberFile: handle,
+                        pbCalculatedFileHash: hash.as_ptr().cast_mut(),
+                        cbCalculatedFileHash: len,
+                        hCatAdmin: admin,
+                        ..Default::default()
+                    };
+                    let mut data = WINTRUST_DATA {
+                        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+                        dwUIChoice: WTD_UI_NONE,
+                        fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
+                        dwUnionChoice: WTD_CHOICE_CATALOG,
+                        Anonymous: WINTRUST_DATA_0 {
+                            pCatalog: &mut member,
+                        },
+                        dwStateAction: WTD_STATEACTION_VERIFY,
+                        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+                        ..Default::default()
+                    };
+                    trusted = verify(&mut data);
+                }
+                CryptCATAdminReleaseCatalogContext(admin, catalog, 0);
+            }
+        }
+        CryptCATAdminReleaseContext(admin, 0);
+        trusted
+    }
+}
+
+/// Run one WinVerifyTrust verification and always close its state.
+unsafe fn verify(data: &mut WINTRUST_DATA) -> bool {
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let rc = WinVerifyTrust(
+        windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+        &mut action,
+        (data as *mut WINTRUST_DATA).cast(),
+    );
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    let _ = WinVerifyTrust(
+        windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+        &mut action,
+        (data as *mut WINTRUST_DATA).cast(),
+    );
+    rc == 0
 }
 
 // Fail closed for writable/custom ACLs. Trusted directory names alone are not a trust boundary.
@@ -283,5 +376,40 @@ mod tests {
         assert!(!verified(&a, Some(u64::MAX)));
         a.logon_type = Some(2);
         assert!(!verified(&a, Some(u64::MAX)));
+    }
+    #[test]
+    fn catalog_signed_search_indexer_image_is_trusted() {
+        // Windows Search binaries carry no embedded signature; they are
+        // trusted only through the system catalog (real-host regression).
+        let image = format!(
+            "{}\\System32\\SearchProtocolHost.exe",
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into())
+        );
+        if !std::path::Path::new(&image).exists() {
+            return; // Server Core / Search not installed.
+        }
+        let locked = protected_image(&image).expect("System32 image must be protected");
+        use std::os::windows::io::AsRawHandle;
+        let handle = locked.last().unwrap().as_raw_handle();
+        let path: Vec<u16> = image.encode_utf16().chain(Some(0)).collect();
+        assert!(catalog_trusted(&path, handle) || embedded_trusted(&path, handle));
+    }
+
+    #[test]
+    fn unsigned_file_is_neither_embedded_nor_catalog_trusted() {
+        let file =
+            std::env::temp_dir().join(format!("trapd-unsigned-{}.exe", uuid::Uuid::new_v4()));
+        std::fs::write(&file, b"MZ not a signed image").unwrap();
+        let open = std::fs::File::open(&file).unwrap();
+        use std::os::windows::io::AsRawHandle;
+        let path: Vec<u16> = file
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        assert!(!embedded_trusted(&path, open.as_raw_handle()));
+        assert!(!catalog_trusted(&path, open.as_raw_handle()));
+        drop(open);
+        std::fs::remove_file(file).unwrap();
     }
 }
