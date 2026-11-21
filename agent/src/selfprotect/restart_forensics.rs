@@ -61,6 +61,9 @@ const SCM_PROVIDER: &str = "Service Control Manager";
 const EVENTLOG_PROVIDER: &str = "EventLog";
 /// Service key name and display name of this agent (MSI `ServiceInstall`).
 const OWN_SERVICE_NAMES: [&str; 2] = ["trapd-agent", "TRAPD Agent"];
+/// Service key name and display name of the guard. Only its unexpected end
+/// (7031/7034) is judged: a regular stop is part of every MSI upgrade.
+const GUARD_SERVICE_NAMES: [&str; 2] = ["trapd-guard", "TRAPD Guard"];
 /// State words of 7036 `param2` meaning "stopped". The SCM inserts the
 /// localized word, so other locales produce no 7036 finding; the heartbeat gap
 /// and the 7040/7045 findings still apply there.
@@ -149,6 +152,12 @@ pub struct Finding {
     pub severity: Severity,
     pub record_id: u64,
     pub detection: DetectionData,
+}
+
+fn is_guard_service(name: &str) -> bool {
+    GUARD_SERVICE_NAMES
+        .iter()
+        .any(|own| own.eq_ignore_ascii_case(name.trim()))
 }
 
 fn is_own_service(name: &str) -> bool {
@@ -247,6 +256,29 @@ pub fn classify(record: &Record, own_exe: Option<&str>) -> Option<Finding> {
                     record,
                     // No actor: the SCM writes 7036 itself, not the requester.
                     serde_json::json!({ "service": record.field("param1"), "state": record.field("param2") }),
+                ),
+            )
+        }
+        (SCM_PROVIDER, 7031 | 7034) => {
+            // A hard kill (or crash) never passes through "stopped": the SCM
+            // logs 7031 (recovery restarts it) or 7034 (no recovery). With
+            // agent and guard killed together nobody is alive to see it, so
+            // this record is the only evidence.
+            let name = record.field("param1");
+            if !is_own_service(name) && !is_guard_service(name) {
+                return None;
+            }
+            (
+                Severity::High,
+                base(
+                    "selfprotect.service_terminated_while_down",
+                    "Agent service was terminated unexpectedly",
+                    "T1562.001",
+                    75,
+                    "trapd-agent".into(),
+                    "The Service Control Manager recorded a TRAPD service ending unexpectedly (killed or crashed) before this start".into(),
+                    record,
+                    serde_json::json!({ "service": record.field("param1"), "occurrences": record.field("param2") }),
                 ),
             )
         }
@@ -534,8 +566,9 @@ pub fn queries(since: DateTime<Utc>) -> Vec<(String, usize)> {
     vec![
         (
             format!(
-                "*[System[Provider[@Name='{SCM_PROVIDER}'] and (EventID=7036 or EventID=7040) and {time}]] \
+                "*[System[Provider[@Name='{SCM_PROVIDER}'] and (EventID=7031 or EventID=7034 or EventID=7036 or EventID=7040) and {time}]] \
                  and *[EventData[Data[@Name='param1']='trapd-agent' or Data[@Name='param1']='TRAPD Agent' \
+                 or Data[@Name='param1']='trapd-guard' or Data[@Name='param1']='TRAPD Guard' \
                  or Data[@Name='param4']='trapd-agent']]"
             ),
             64,
@@ -744,6 +777,49 @@ mod tests {
 
     fn rec(provider: &str, id: u32, rec: u64, data: &[(&str, &str)]) -> Record {
         Record::from_xml(&xml(provider, id, rec, "S-1-5-21-1-2-3-1001", data)).unwrap()
+    }
+
+    #[test]
+    fn killed_agent_or_guard_is_reported_from_the_crash_record() {
+        for (id, name) in [
+            (7031, "TRAPD Agent"),
+            (7031, "TRAPD Guard"),
+            (7034, "trapd-guard"),
+        ] {
+            let r = rec(SCM_PROVIDER, id, 20, &[("param1", name), ("param2", "2")]);
+            let f = classify(&r, None).unwrap();
+            assert_eq!(
+                f.detection.rule_id,
+                "selfprotect.service_terminated_while_down"
+            );
+            assert_eq!(f.severity, Severity::High);
+        }
+        let other = rec(
+            SCM_PROVIDER,
+            7031,
+            21,
+            &[("param1", "Print Spooler"), ("param2", "1")],
+        );
+        assert!(classify(&other, None).is_none());
+        let spoofed = rec(
+            "Evil",
+            7031,
+            22,
+            &[("param1", "TRAPD Agent"), ("param2", "1")],
+        );
+        assert!(classify(&spoofed, None).is_none());
+    }
+
+    #[test]
+    fn a_regular_guard_stop_is_not_reported() {
+        // Every MSI upgrade stops the guard first; only its unexpected end counts.
+        let r = rec(
+            SCM_PROVIDER,
+            7036,
+            23,
+            &[("param1", "TRAPD Guard"), ("param2", "stopped")],
+        );
+        assert!(classify(&r, None).is_none());
     }
 
     #[test]
@@ -1079,7 +1155,10 @@ mod tests {
             assert!(text.contains("TimeCreated[@SystemTime>='2026-11-14T10:00:00.500Z']"));
             assert!(*limit <= 128);
         }
-        assert!(q[0].0.contains("EventID=7036 or EventID=7040"));
+        assert!(q[0]
+            .0
+            .contains("EventID=7031 or EventID=7034 or EventID=7036 or EventID=7040"));
+        assert!(q[0].0.contains("TRAPD Guard"));
     }
 
     #[test]
