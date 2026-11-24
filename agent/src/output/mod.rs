@@ -190,7 +190,7 @@ fn open_secure_log(
     create: bool,
 ) -> std::io::Result<std::fs::File> {
     use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
     let name = std::ffi::CString::new(name)?;
     let flags = libc::O_WRONLY
         | libc::O_APPEND
