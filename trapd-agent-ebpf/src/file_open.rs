@@ -282,11 +282,24 @@ fn stash_open_pending(path: &[u8; PATH_LEN], flags: u64) {
 #[inline(always)]
 fn resolve_open_exit(ctx: &TracePointContext) {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let inode = (unsafe { HT_INODE_PENDING.get(&pid_tgid) }).copied();
-    let path = (unsafe { HT_OPEN_PENDING.get(&pid_tgid) }).copied();
+    // Fully initialised token filled field by field. Copying an
+    // `Option<FdToken>` (`.copied()`) makes LLVM move a partly uninitialised
+    // option with 8-byte loads, which the 5.15 verifier rejects ("invalid read
+    // from stack"). An inode candidate wins over the path candidate.
+    let mut tok = FdToken { token_id: 0, kind: 0, _pad: 0, flags: 0, ino: 0 };
+    let mut found = false;
+    let mut inode = false;
+    if let Some(p) = unsafe { HT_INODE_PENDING.get(&pid_tgid) } {
+        tok = FdToken { token_id: p.token_id, kind: p.kind, _pad: 0, flags: p.flags, ino: p.ino };
+        found = true;
+        inode = true;
+    } else if let Some(p) = unsafe { HT_OPEN_PENDING.get(&pid_tgid) } {
+        tok = FdToken { token_id: p.token_id, kind: p.kind, _pad: 0, flags: p.flags, ino: p.ino };
+        found = true;
+    }
     let _ = HT_INODE_PENDING.remove(&pid_tgid);
     let _ = HT_OPEN_PENDING.remove(&pid_tgid);
-    let Some(tok) = inode.or(path) else { return; };
+    if !found { return; }
     let ret: i64 = match unsafe { ctx.read_at(16) } {
         Ok(v) => v,
         Err(_) => return,
@@ -297,7 +310,7 @@ fn resolve_open_exit(ctx: &TracePointContext) {
     let tgid = (pid_tgid >> 32) & 0xFFFF_FFFF;
     let key = (tgid << 32) | (ret as u64 & 0xFFFF_FFFF);
     let _ = HONEYTOKEN_FDS.insert(&key, &tok, 0);
-    if tok.kind == FD_KIND_FILE && (inode.is_some() || HONEYTOKEN_LAYOUT.get(6).copied().unwrap_or(0) == 0 || tok.flags & 0x20_0000 != 0) {
+    if tok.kind == FD_KIND_FILE && (inode || HONEYTOKEN_LAYOUT.get(6).copied().unwrap_or(0) == 0 || tok.flags & 0x20_0000 != 0) {
         // Positive syscall result is required; a failed open is not a read.
         emit_honeytoken_token(tok.token_id, tok.flags, tok.ino, ACCESS_OPENAT);
     }
@@ -311,12 +324,13 @@ fn lookup_fd_and_emit(fd_raw: u64, want_kind: u32, access_kind: u32) {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) & 0xFFFF_FFFF;
     let key = (tgid << 32) | (fd_raw & 0xFFFF_FFFF);
-    if let Some(tok) = (unsafe { HONEYTOKEN_FDS.get(&key) }).copied() {
+    // Read through the map reference; see `resolve_open_exit` for why no copy.
+    if let Some(tok) = unsafe { HONEYTOKEN_FDS.get(&key) } {
         if tok.kind == want_kind {
             if access_kind == ACCESS_MMAP {
                 // O_PATH and write-only FDs cannot be read through mmap.
                 if tok.flags & 0x20_0000 != 0 || tok.flags & 3 == 1 { return; }
-                if HT_MMAP_PENDING.insert(&pid_tgid, &tok, 0).is_err() {
+                if HT_MMAP_PENDING.insert(&pid_tgid, tok, 0).is_err() {
                     crate::dropcount::record_drop(crate::dropcount::SLOT_HONEYTOKEN);
                 }
             } else {
@@ -766,10 +780,9 @@ pub fn honeytoken_enter_exec(ctx: TracePointContext) -> u32 {
 pub fn honeytoken_process_exec(ctx: TracePointContext) -> u32 {
     let old_pid: u32 = match unsafe { ctx.read_at(16) } { Ok(v) => v, Err(_) => return 0 };
     let key = (bpf_get_current_pid_tgid() & 0xffff_ffff_0000_0000) | old_pid as u64;
-    let candidate = (unsafe { HT_INODE_PENDING.get(&key) }).copied();
-    let _ = HT_INODE_PENDING.remove(&key);
-    if let Some(tok) = candidate {
+    if let Some(tok) = unsafe { HT_INODE_PENDING.get(&key) } {
         emit_honeytoken_token(tok.token_id, tok.flags, tok.ino, ACCESS_EXEC);
+        let _ = HT_INODE_PENDING.remove(&key);
     } else {
         let location: u32 = match unsafe { ctx.read_at(8) } { Ok(v) => v, Err(_) => return 0 };
         let address = (ctx.as_ptr() as usize) + (location & 0xffff) as usize;
@@ -801,13 +814,18 @@ pub fn honeytoken_process_exit(_ctx: TracePointContext) -> u32 {
 #[tracepoint]
 pub fn sys_exit_mmap(ctx: TracePointContext) -> u32 {
     let key = bpf_get_current_pid_tgid();
-    let candidate = (unsafe { HT_MMAP_PENDING.get(&key) }).copied();
-    let _ = HT_MMAP_PENDING.remove(&key);
-    let result: i64 = match unsafe { ctx.read_at(16) } { Ok(v) => v, Err(_) => return 0 };
+    let result: i64 = match unsafe { ctx.read_at(16) } {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = HT_MMAP_PENDING.remove(&key);
+            return 0;
+        }
+    };
     if result >= 0 {
-        if let Some(tok) = candidate {
+        if let Some(tok) = unsafe { HT_MMAP_PENDING.get(&key) } {
             emit_honeytoken_token(tok.token_id, tok.flags, tok.ino, ACCESS_MMAP);
         }
     }
+    let _ = HT_MMAP_PENDING.remove(&key);
     0
 }
