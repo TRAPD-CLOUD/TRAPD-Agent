@@ -174,7 +174,7 @@ fn secure_log_dir(path: &std::path::Path) -> Result<std::fs::File> {
     if directory.metadata()?.uid() != unsafe { libc::geteuid() } {
         anyhow::bail!("log directory is not owned by the agent user");
     }
-    directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    ensure_mode(&directory, 0o700)?;
     Ok(directory)
 }
 
@@ -212,8 +212,20 @@ fn open_secure_log(
             "log must be a regular, single-link file owned by the agent user",
         ));
     }
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    ensure_mode(&file, 0o600)?;
     Ok(file)
+}
+
+/// Set `mode` only when it differs. An unconditional `fchmod` raises
+/// `IN_ATTRIB` on every write, which the agent's own tamper watch reports as a
+/// critical `chmod` of its log (a self-inflicted feedback loop).
+#[cfg(target_os = "linux")]
+fn ensure_mode(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if file.metadata()?.permissions().mode() & 0o7777 != mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -239,6 +251,26 @@ mod tests {
             directory.metadata().unwrap().permissions().mode() & 0o777,
             0o700
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn reopening_a_compliant_log_does_not_touch_its_attributes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = scratch();
+        let directory = secure_log_dir(&dir).unwrap();
+        secure_log_file(&directory, "events.ndjson").unwrap();
+        let key = |m: std::fs::Metadata| (m.ctime(), m.ctime_nsec());
+        let file_before = key(std::fs::metadata(dir.join("events.ndjson")).unwrap());
+        let dir_before = key(std::fs::metadata(&dir).unwrap());
+        // fchmod, even to the same mode, bumps ctime and raises IN_ATTRIB, which
+        // the tamper watch reports as a critical chmod of the agent's own log.
+        secure_log_dir(&dir).unwrap();
+        secure_log_file(&directory, "events.ndjson").unwrap();
+        assert_eq!(
+            file_before,
+            key(std::fs::metadata(dir.join("events.ndjson")).unwrap())
+        );
+        assert_eq!(dir_before, key(std::fs::metadata(&dir).unwrap()));
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
