@@ -257,7 +257,12 @@ impl Collector for EbpfExecCollector {
             prog.load()
                 .context("BPF verifier rejected sched_process_exec")?;
             prog.attach("sched", "sched_process_exec")
-                .context("failed to attach to sched/sched_process_exec")?;
+                .with_context(|| {
+                    format!(
+                        "failed to attach to sched/sched_process_exec{}",
+                        perf_paranoid_hint()
+                    )
+                })?;
         }
 
         // Load + attach sys_enter_execve (fires before exec; scans envp for LD_PRELOAD)
@@ -454,5 +459,23 @@ impl Collector for EbpfExecCollector {
 
             guard.clear_ready();
         }
+    }
+}
+
+/// Extra context for attach failures: Ubuntu's `kernel.perf_event_paranoid=4`
+/// denies tracepoint perf events without CAP_SYS_ADMIN, which the packaged
+/// unit does not grant (see issue #216). Surfacing the value makes the cause
+/// visible in the error instead of a bare EACCES.
+fn perf_paranoid_hint() -> String {
+    match std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+    {
+        Some(level) if level >= 4 => format!(
+            " (kernel.perf_event_paranoid={level} requires CAP_SYS_ADMIN for tracepoints; \
+             lower it with `sysctl kernel.perf_event_paranoid=3` or grant CAP_SYS_ADMIN \
+             to the unit via a drop-in)"
+        ),
+        _ => String::new(),
     }
 }
