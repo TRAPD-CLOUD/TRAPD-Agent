@@ -236,8 +236,13 @@ fn stash_open_pending(path: &[u8; PATH_LEN]) {
 #[inline(always)]
 fn resolve_open_exit(ctx: &TracePointContext) {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let Some(tok) = (unsafe { HT_OPEN_PENDING.get(&pid_tgid) }).copied() else {
-        return;
+    // Build `tok` field by field instead of `.copied()`: copying an
+    // `Option<FdToken>` makes LLVM move the whole (partly uninitialised) option
+    // with 8-byte loads, which the 5.15 verifier rejects as an invalid read
+    // from uninitialised stack ("invalid read from stack off -112+0 size 8").
+    let tok = match unsafe { HT_OPEN_PENDING.get(&pid_tgid) } {
+        Some(p) => FdToken { token_id: p.token_id, kind: p.kind, _pad: 0 },
+        None => return,
     };
     // Consume the pending slot regardless of the syscall's outcome.
     let _ = HT_OPEN_PENDING.remove(&pid_tgid);
@@ -261,7 +266,8 @@ fn lookup_fd_and_emit(fd_raw: u64, want_kind: u32, access_kind: u32) {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) & 0xFFFF_FFFF;
     let key = (tgid << 32) | (fd_raw & 0xFFFF_FFFF);
-    if let Some(tok) = (unsafe { HONEYTOKEN_FDS.get(&key) }).copied() {
+    // Read through the map reference; see `resolve_open_exit` for why no copy.
+    if let Some(tok) = unsafe { HONEYTOKEN_FDS.get(&key) } {
         if tok.kind == want_kind {
             emit_honeytoken_token(tok.token_id, access_kind);
         }
