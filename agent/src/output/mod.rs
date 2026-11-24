@@ -165,7 +165,7 @@ async fn rotate_log(log_file: &std::path::Path) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn secure_log_dir(path: &std::path::Path) -> Result<std::fs::File> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     std::fs::create_dir_all(path)?;
     let directory = std::fs::OpenOptions::new()
         .read(true)
