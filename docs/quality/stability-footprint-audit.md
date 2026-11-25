@@ -128,3 +128,26 @@ Locations refer to the audited baseline. Paths starting with `windows/` are unde
 **Verified structural invariants.** FIM checks scanned file count, cumulative bytes, individual bytes, and elapsed work before committing a complete snapshot. Ordinary filesystem callback admission is bounded, prefiltered and counted. WTS rejects null nonempty lists and caps native strings and counts. Registry notifications coalesce at capacity one and retain periodic fallback. The native pending-record map accepts five fixed channels and prepares the entry under exclusive access before looking it up. Map indexing in process reconciliation uses keys from that same immutable snapshot. The winacl token-selection unwrap follows mutually exclusive successful token acquisition branches. These internal invariants do not depend on external data values. Static inspection cannot establish Windows idle CPU, P99 latency, private working set, suspend behavior or handle counts.
 
 Each ETW session now has 6 MiB of weighted capacity, shared by queued and in-flight records. Windows Event Log rendered batches retain up to 4 MiB of strings, with a separate bounded scratch record. Polling retains the last complete flow snapshot if more than 8,192 active sockets are observed. The retry preserves existing flow history and the lost observation is counted. The legacy decoy worker can take up to five seconds to release idle native watches after cancellation.
+
+### Remaining explicit panic sites
+
+A syntax-tree pass over the Rust source supplemented the review of parser boundaries and task lifetimes. The table groups direct calls by the condition that makes the operation valid. Locations here refer to the revised code at `7a9086f`. Unit-test assertions and fixture construction are excluded.
+
+| Revised location | Invariant |
+|---|---|
+| `agent/src/detection_host.rs:26`, `crates/trapd-detection/src/sensor_policy.rs:43` | Runtime installation precedes event creation in both entry points. The rule catalog is embedded at build time. |
+| `agent/src/enrollment/mod.rs:321`, `agent/src/paths/mod.rs:458` | All eight failed credential reads set the last error. Atomic replacement receives the same path whose parent the caller already required. |
+| `agent/src/identity/software.rs:76`, `agent/src/identity/windows_cng.rs:251` | The software key is encoded as an uncompressed P-256 point. The native decoder checks blob size, magic and coordinate width before fixed-size conversion. |
+| `agent/src/selfprotect/process_integrity/handles.rs:37`, `agent/src/selfprotect/process_integrity/pe.rs:70,252` | Handle records have a checked fixed stride. PE scalar reads and relocation writes use slices of exactly the conversion width. |
+| `agent/src/winacl.rs:553`, `agent/src/collectors/windows/sweeper_identity.rs:56`, `agent/src/collectors/windows/honeytokens.rs:1736` | Token selection follows successful acquisition. The protected path helper only returns a nonempty handle chain. The digest prefix is eight bytes of a 32-byte SHA-256 result. |
+| `agent/src/collectors/windows/filesystem.rs:601,631`, `agent/src/winsvc/run.rs:579` | The collector owns the only writer of its scope and callbacks take read locks. The timer future is polled only in the branch guarded by the same deadline's presence. |
+| `agent/src/collectors/device.rs:318`, `agent/src/collectors/windows_native.rs:510` | The previous operation established the device snapshot or inserted the native record under exclusive ownership. |
+| `agent/src/collectors/linux/authlog.rs:53`, `agent/src/collectors/linux/filesystem.rs:306` | File selection guarantees the selected file. The private inotify mapper produces only the three filesystem actions handled by its caller. |
+| `agent/src/collectors/logs/parser.rs:712`, `agent/src/collectors/logs/mod.rs:322` | The same immutable string passed the delimiter check. A previous-end checkpoint is used only after its presence is established. |
+| `crates/trapd-schema/src/ocsf.rs:271,393,426` | Class IDs come from the local mapping. Field removal operates on the object just constructed by the encoder. |
+
+## Verification
+
+The final Rust source passed `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (1,943 passed, 14 ignored), and `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu`. The Windows check used MinGW on Linux. The preceding revision also passed native Windows packaging and sensor acceptance, the Linux release build including optional YARA, RustSec and CodeQL. [CI run at 3f35694](https://github.com/TRAPD-CLOUD/TRAPD-Agent/actions/runs/45648348510).
+
+Real-host idle CPU, steady-state RSS, power interruption, sleep/resume and physical storage exhaustion were not measured. Simulated storage and network errors exercise recovery code; native endpoint measurements remain necessary to establish the fleet budget.
