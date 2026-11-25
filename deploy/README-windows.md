@@ -103,7 +103,11 @@ download until the publisher has reputation.
 | File changes | ReadDirectoryChangesW via notify, with live configuration reload |
 | File integrity | Periodic SHA256 baseline, content changes and deletion in the shared filesystem schema |
 | Authentication | Security events 4624/4625, target user and remote IP/port when the event supplies them; requires Windows audit policy |
-| Native logs | Security, System and Application event XML plus structured fields and persisted record cursors |
+| Native logs | Security, System, Application, Sysmon, WMI-Activity and PowerShell channel reads have individual status in heartbeat coverage. Persisted cursors track record IDs |
+| Application log files | Shared file readers discover IIS/HTTPERR, Apache, nginx and database logs. Operators can configure file sources and a UDP syslog listener. The systemd journal and Unix datagram socket are Linux sources. |
+| Additional ETW providers | Driver loads, named pipes and AMSI depend on provider availability. Heartbeat coverage includes provider state and ETW loss. Script content capture requires opt-in. |
+| Device changes | SetupAPI compares USB snapshots every five seconds. An attachment and removal between snapshots can be missed. Serial capture defaults off. |
+| Process memory | The Windows sweep inspects live processes for memory findings when memory scanning is enabled. OS access rights limit inspection. |
 | Interactive sessions | Session open/close via native Terminal Services API |
 | Inventory | OS/hardware, disks, native adapter addresses/MAC/status, machine software from both registry views, local users, TCP listeners, SBOM and CVE correlation |
 | Detection | Shared IOC, behaviour, IOA and Sigma engine, plus Windows LOLBin / persistence / defense-evasion / credential-access rules (`detection/windows_rules.rs`); Windows process events project to product `windows`; signed config reloads Sigma, anomaly switches, suppressions and per-rule modes |
@@ -111,6 +115,8 @@ download until the publisher has reputation.
 | Backend | Shared enrollment, signed config, heartbeat, inventory and authenticated event ingest |
 | Delivery diagnostics | Persistent queue with restart recovery, telemetry report and `diagnostics telemetry` |
 | Honeytokens | Operator-listed file decoys **and** operator-approved adaptive decoys that fit each user (role, naming style, a cold directory the user owns but has not touched for weeks — never the desktop or a synced folder). Per-host generated bait, timestamp camouflage, not-content-indexed. Reads attributed to a process/account via a read-audit SACL + 4663 and graded (owner-interactive vs. foreign) to keep false alarms down. Deployment/health events and ownership-verified cleanup during MSI removal; legacy registry decoys removed, no longer planted. Adaptive learning is opt-in (`deception_activity_learning_enabled`), local-only, purged on disable/uninstall. |
+
+See the [Linux and Windows parity matrix](../docs/quality/telemetry-verification-audit.md#coverage-visibility-and-parity) for collector limits.
 
 Windows honeytoken ownership is persisted in `<state>/windows_honeytoken_deployments.json`.
 Cleanup removes only registered, unchanged artifacts; file identity and content are
@@ -126,11 +132,11 @@ not install its driver or claim complete kernel coverage. An attacker with
 administrator rights can stop
 the `TRAPD-Agent` session itself — that stop is detected and reported, but not
 prevented. There is also no packet/TLS sensor, no Linux rootkit/memory scanner,
-no Linux CIS audit, no generic file/journal/syslog log-source readers, no Linux
+no Linux CIS audit, no systemd journal reader, no Linux
 session forensics, and no Linux prevention/response enforcement in this package.
 When ETW is disabled, process polling falls back to its documented short-event
-gaps; cross-view gap detection between ETW and polling is not yet wired (polling
-is simply off while ETW runs). The current fallback boot ID changes on agent
+gaps. While ETW provides process events, the poller maintains a baseline.
+It does not report a cross-view gap count. The current fallback boot ID changes on agent
 restart; native process creation time still distinguishes PID reuse within a run.
 
 ETW process-creation command lines are read from the live process, so a process

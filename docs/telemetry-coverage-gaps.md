@@ -1,5 +1,9 @@
 # Telemetry coverage gaps (after moving detection to the backend)
 
+This document records the backend-migration review at its original baseline.
+For current agent implementations of module loads, file attribution, devices,
+named pipes and AMSI, consult the [collector parity matrix](quality/telemetry-verification-audit.md#coverage-visibility-and-parity).
+
 Status: 2026-11-04. The agent no longer evaluates detection rules; the backend
 receives raw telemetry in the canonical schema and detects there. This file
 lists what the agent still does not capture, and what the move itself costs.
