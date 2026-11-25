@@ -148,6 +148,8 @@ pub struct Engine {
     reconcile_signal: Option<Arc<Notify>>,
     /// Owns the attached kernel program for the full prevention runtime.
     kernel_blocker: LsmHandle,
+    /// Durable record of each signed command's intent and result. `None` in tests.
+    result_outbox: Option<Arc<super::result_outbox::ResultOutbox>>,
 }
 
 impl Engine {
@@ -168,6 +170,7 @@ impl Engine {
             recorder: Arc::new(FlightRecorder::new(forensics::recorder::DEFAULT_CAPACITY)),
             auto_cooldown: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             reconcile_signal: None,
+            result_outbox: None,
             kernel_blocker: LsmHandle::disabled(),
         }
     }
@@ -175,6 +178,11 @@ impl Engine {
     /// Attach the shared reconcile/health kick. Pulsed after every honeytoken
     /// deploy/revoke so the eBPF reconciler arms/disarms and the health checker
     /// re-verifies the affected token within ms.
+    pub fn with_result_outbox(mut self, outbox: Arc<super::result_outbox::ResultOutbox>) -> Self {
+        self.result_outbox = Some(outbox);
+        self
+    }
+
     pub fn with_reconcile_signal(mut self, signal: Arc<Notify>) -> Self {
         self.reconcile_signal = Some(signal);
         self
@@ -930,9 +938,43 @@ impl Engine {
                     warn!(command_id = %cmd.command_id, "audit channel closed before dispatch");
                     return;
                 };
+                // The intent is durable before anything runs; without it a crash
+                // could leave an action whose outcome nobody ever learns.
+                let record = match &self.result_outbox {
+                    Some(outbox) => {
+                        if let Err(error) =
+                            outbox.begin(cmd.command_id, &payload_kind(&cmd.payload))
+                        {
+                            warn!(command_id = %cmd.command_id, %error, "command not run: intent not persisted");
+                            AuditEmitter::with_result_slot(slot, None, async {
+                                self.audit.emit(
+                                    EventAction::CommandRejected,
+                                    Severity::Medium,
+                                    "command_rejected",
+                                    "<command>",
+                                    false,
+                                    "cannot persist the command intent",
+                                    None,
+                                    Some(cmd.command_id.to_string()),
+                                    serde_json::Value::Null,
+                                );
+                            })
+                            .await;
+                            continue;
+                        }
+                        Some((Arc::clone(outbox), cmd.command_id))
+                    }
+                    None => None,
+                };
                 let me = Arc::clone(&self);
                 tokio::spawn(async move {
-                    AuditEmitter::with_result_slot(slot, me.handle(cmd)).await;
+                    let command_id = cmd.command_id;
+                    AuditEmitter::with_result_slot(slot, record, me.handle(cmd)).await;
+                    if let Some(outbox) = &me.result_outbox {
+                        if outbox.is_open(command_id) {
+                            outbox.finish_without_result(command_id);
+                        }
+                    }
                 });
             }
         });
@@ -2102,3 +2144,11 @@ impl Engine {
 
 #[cfg(test)]
 mod tests;
+
+/// The wire name of a command kind (`kill_pid`, `isolate_network`, ...).
+fn payload_kind(payload: &CommandPayload) -> String {
+    serde_json::to_value(payload)
+        .ok()
+        .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}

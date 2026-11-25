@@ -91,23 +91,44 @@ pub async fn start(
     // Living decoys: keep the access time of the tokens plausible (opt-in).
     spawn_honeytoken_living(Arc::clone(&honeytokens), Arc::clone(&cfg_handle));
 
-    let engine = Arc::new(
-        Engine::new(
-            policy.clone(),
-            audit.clone(),
-            engine_cfg,
-            Arc::clone(&honeytokens),
-            Arc::clone(&cfg_handle),
-        )
-        .with_reconcile_signal(reconcile_signal),
-    );
+    // Results of signed commands, kept until the backend acknowledged them.
+    // Without a durable outbox no signed command runs (fail closed).
+    let outbox = verifier.as_ref().and_then(|_| {
+        match super::result_outbox::ResultOutbox::load(&super::command_result_outbox()) {
+            Ok(outbox) => Some(Arc::new(outbox)),
+            Err(e) => {
+                warn!(error = %e, "command result outbox unavailable — backend commands will not be processed");
+                None
+            }
+        }
+    });
+
+    let mut engine = Engine::new(
+        policy.clone(),
+        audit.clone(),
+        engine_cfg,
+        Arc::clone(&honeytokens),
+        Arc::clone(&cfg_handle),
+    )
+    .with_reconcile_signal(reconcile_signal);
+    if let Some(outbox) = &outbox {
+        engine = engine.with_result_outbox(Arc::clone(outbox));
+    }
+    let engine = Arc::new(engine);
     #[cfg(windows)]
     Arc::clone(&engine).start_firewall_expiry().await;
     #[cfg(not(windows))]
     engine.restore_isolation().await;
     Arc::clone(&engine).spawn_event_loop(event_rx);
 
-    if let Some(v) = verifier {
+    if let (Some(v), Some(outbox)) = (verifier, outbox) {
+        let reporter = super::result_reporter::ResultReporter::new(
+            backend_url,
+            agent_id,
+            Arc::clone(&tokens),
+            Arc::clone(&outbox),
+        )?;
+        tokio::spawn(async move { reporter.run().await });
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
         let poll_secs = cfg_handle
             .read()
