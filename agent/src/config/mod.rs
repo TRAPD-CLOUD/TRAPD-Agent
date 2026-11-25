@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
+
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
@@ -913,7 +915,7 @@ impl ConfigPuller {
                     .get("etag")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
-                let body = match resp.bytes().await {
+                let body = match crate::http::bounded_body(resp, MAX_CONFIG_BYTES).await {
                     Ok(b) => b,
                     Err(e) => {
                         warn!("Failed to read config response body: {e}");

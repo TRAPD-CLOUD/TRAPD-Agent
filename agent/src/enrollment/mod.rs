@@ -231,7 +231,7 @@ async fn try_enroll(
 
     let status = resp.status();
     if status.is_success() {
-        return match resp.json::<EnrollResponse>().await {
+        return match crate::http::control_json::<EnrollResponse>(resp).await {
             Ok(body) => {
                 let creds = Credentials {
                     agent_id: body.agent_id,
@@ -257,7 +257,10 @@ async fn try_enroll(
 
     // Non-2xx: decide transient vs permanent.
     let retry_after = parse_retry_after(&resp);
-    let body = resp.text().await.unwrap_or_default();
+    let body = crate::http::bounded_body(resp, crate::http::CONTROL_REPLY_BYTES)
+        .await
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&body);
     let snippet = body.chars().take(300).collect::<String>();
     let code = status.as_u16();
 

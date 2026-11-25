@@ -398,8 +398,8 @@ async fn poll_once(client: &reqwest::Client, url: &str, device_code: &str) -> Po
     };
     let status = resp.status().as_u16();
     let retry_after = parse_retry_after(&resp);
-    match resp.text().await {
-        Ok(body) => classify_poll(status, &body, retry_after),
+    match crate::http::bounded_body(resp, crate::http::CONTROL_REPLY_BYTES).await {
+        Ok(body) => classify_poll(status, &String::from_utf8_lossy(&body), retry_after),
         Err(e) => PollOutcome::Transient(format!("could not read response: {e}")),
     }
 }
@@ -458,8 +458,7 @@ async fn try_start(
     let status = resp.status();
     if status.is_success() {
         // The 200 body holds the device_code: parse errors must not echo it.
-        let body = resp
-            .json::<StartResponse>()
+        let body = crate::http::control_json::<StartResponse>(resp)
             .await
             .map_err(|_| AttemptError::Transient {
                 reason: "could not parse pairing response".into(),
@@ -473,7 +472,10 @@ async fn try_start(
 
     let retry_after = parse_retry_after(&resp);
     let code = status.as_u16();
-    let body = resp.text().await.unwrap_or_default();
+    let body = crate::http::bounded_body(resp, crate::http::CONTROL_REPLY_BYTES)
+        .await
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&body);
     let reason = format!("HTTP {status} — {}", snippet(&body));
     if status.is_server_error() || matches!(code, 408 | 425 | 429) {
         Err(AttemptError::Transient {
