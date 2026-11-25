@@ -3,4 +3,5 @@
 # and requires a different toolchain (nightly + bpf-linker). Build it with:
 #   cargo xtask build-ebpf --release
 members  = ["agent", "crates/trapd-schema", "crates/trapd-detection", "xtask"]
+exclude = ["fuzz"]
 resolver = "2"

@@ -22,6 +22,29 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  telemetry-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-08-15
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Verify generated log fields and queue replay
+        run: |
+          cargo fuzz build
+          targets=$(cargo fuzz list)
+          for target in $targets; do
+            mkdir -p "fuzz/corpus/$target"
+            cargo fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- -max_total_time=15
+          done
+
   windows-msi:
     uses: ./.github/workflows/windows-package.yml
 
