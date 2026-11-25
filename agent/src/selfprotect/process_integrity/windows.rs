@@ -111,11 +111,7 @@ fn read_process_memory(addr: u64, buf: &mut [u8]) -> bool {
 }
 
 fn read_file_capped(path: &Path) -> Option<Vec<u8>> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > MAX_IMAGE_BYTES {
-        return None;
-    }
-    std::fs::read(path).ok()
+    crate::paths::bounded_regular_bytes(path, MAX_IMAGE_BYTES).ok()
 }
 
 fn hex(b: &[u8]) -> String {

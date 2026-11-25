@@ -156,8 +156,7 @@ pub fn export_rva(b: &[u8], info: &PeInfo, name: &str) -> Option<u32> {
     for i in 0..n_names.min(65_536) {
         let name_off = info.rva_to_offset(u32_at(b, names + i * 4).ok()?)?;
         let tail = b.get(name_off..)?;
-        let end = tail.iter().position(|&c| c == 0)?;
-        if &tail[..end] == name.as_bytes() {
+        if tail.starts_with(name.as_bytes()) && tail.get(name.len()) == Some(&0) {
             let ord = u16_at(b, ords + i * 2).ok()? as usize;
             let rva = u32_at(b, funcs + ord * 4).ok()?;
             // A function RVA inside the export directory is a forwarder string.
@@ -222,6 +221,12 @@ pub struct TextImage {
     pub ignore: Vec<(usize, usize)>,
 }
 
+// Budget the expanded image independently from the size of the file on disk.
+// Unknown relocations are consulted for every page in subsequent scans.
+const MAX_TEXT_BYTES: u32 = 32 * 1024 * 1024;
+const MAX_RELOCATION_BYTES: u32 = 1024 * 1024;
+const MAX_IGNORED_RELOCATIONS: usize = 256;
+
 /// Section bytes from the file with the base relocations applied for a load
 /// at `base`. `bytes` is zero-padded to the virtual size, like the mapping.
 pub fn expected_text(
@@ -230,6 +235,10 @@ pub fn expected_text(
     section: &Section,
     base: u64,
 ) -> Option<TextImage> {
+    if section.virtual_size > MAX_TEXT_BYTES || info.reloc_dir.1 > MAX_RELOCATION_BYTES {
+        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+        return None;
+    }
     let raw_len = section.raw_size.min(section.virtual_size) as usize;
     let raw = file.get(section.raw_ptr as usize..section.raw_ptr as usize + raw_len)?;
     let mut bytes = raw.to_vec();
@@ -250,7 +259,11 @@ pub fn expected_text(
                     slot.copy_from_slice(&v.wrapping_add(delta as u32).to_le_bytes());
                 }
             }
-            _ => ignore.push((r.offset, 8)),
+            _ if ignore.len() < MAX_IGNORED_RELOCATIONS => ignore.push((r.offset, 8)),
+            _ => {
+                crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                return None;
+            }
         }
     }
     Some(TextImage { bytes, ignore })
@@ -472,6 +485,18 @@ mod tests {
         assert_eq!(export_rva(&file, &info, "Other"), Some(0x1200));
         assert_eq!(export_rva(&file, &info, "Fwd"), None, "forwarder");
         assert_eq!(export_rva(&file, &info, "Missing"), None);
+    }
+
+    #[test]
+    fn reconstruction_rejects_sizes_beyond_its_transient_memory_budget() {
+        let file = sample();
+        let mut info = parse(&file).unwrap();
+        let mut section = info.text().unwrap().clone();
+        section.virtual_size = MAX_TEXT_BYTES + 1;
+        assert!(expected_text(&file, &info, &section, IMAGE_BASE).is_none());
+        section = info.text().unwrap().clone();
+        info.reloc_dir.1 = MAX_RELOCATION_BYTES + 1;
+        assert!(expected_text(&file, &info, &section, IMAGE_BASE).is_none());
     }
 
     #[test]
