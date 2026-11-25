@@ -123,7 +123,7 @@ pub(crate) fn binary_baseline_line(hash_hex: &str) -> String {
 
 /// Open an untrusted on-disk file for bounded reading. Links, reparse points
 /// and special files are refused before any content is read.
-fn open_bounded_regular(path: &Path, max_bytes: u64) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_bounded_regular(path: &Path, max_bytes: u64) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

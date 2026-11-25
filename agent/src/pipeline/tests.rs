@@ -534,6 +534,56 @@ fn without_a_checkpoint_delivery_is_at_least_once() {
 }
 
 #[test]
+fn replay_skips_duplicate_and_out_of_range_handles_and_honours_byte_budget() {
+    let dir = TempDir::new("replay_handles");
+    let mut data = Vec::new();
+    for seq in [1, 1, u64::MAX, 2, 3] {
+        data.extend(journal::encode(&JournalRecord::new(seq, dummy_event())).unwrap());
+    }
+    std::fs::write(dir.journal(), data).unwrap();
+    let mut spool = Spool::open_at(dir.journal(), 100, 1100);
+    assert_eq!(spool.corrupt_records(), 2);
+    assert!(spool.bytes() <= 1100);
+    let new = spool.push(dummy_event()).unwrap();
+    assert_eq!(new, 4);
+}
+
+#[test]
+fn count_limited_legacy_replay_preserves_original_even_when_bytes_fit() {
+    let dir = TempDir::new("archive_count");
+    let mut original = Vec::new();
+    for seq in 1..=3 {
+        original.extend(journal::encode(&JournalRecord::new(seq, dummy_event())).unwrap());
+    }
+    std::fs::write(dir.journal(), &original).unwrap();
+    let s = Spool::durable_at(dir.journal(), 1);
+    assert!(s.is_durable());
+    assert_eq!(s.len(), 1);
+    drop(s);
+    let archive = dir.journal().with_extension("journal.pre-budget");
+    assert_eq!(std::fs::read(&archive).unwrap(), original);
+    let mut other = original.clone();
+    other.extend(journal::encode(&JournalRecord::new(4, dummy_event())).unwrap());
+    std::fs::write(dir.journal(), &other).unwrap();
+    let s = Spool::durable_at(dir.journal(), 1);
+    assert!(s.is_degraded());
+    assert!(!s.is_durable());
+    assert_eq!(std::fs::read(&archive).unwrap(), original);
+    assert_eq!(std::fs::read(dir.journal()).unwrap(), other);
+}
+
+#[cfg(unix)]
+#[test]
+fn replay_refuses_special_files_without_replacing_them() {
+    let dir = TempDir::new("replay_special");
+    std::os::unix::fs::symlink("/dev/null", dir.journal()).unwrap();
+    let spool = Spool::durable_at(dir.journal(), 100);
+    assert!(spool.is_degraded());
+    assert!(dir.journal().is_symlink());
+    assert!(!spool.is_durable());
+}
+
+#[test]
 fn handles_are_not_reissued_after_recovery() {
     let dir = TempDir::new("seq_continuity");
     let last = {

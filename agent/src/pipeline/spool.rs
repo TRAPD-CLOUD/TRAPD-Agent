@@ -53,7 +53,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Write as _};
+use std::io::{BufReader, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,13 +73,13 @@ use crate::telemetry::{metrics::metrics, DropReason};
 /// Default in-memory capacity (offline, or when the journal is unavailable).
 pub const SPOOL_MAX_MEMORY: usize = 10_000;
 
-/// Default durable capacity — larger, because it is bounded by disk not RAM.
-pub const SPOOL_MAX_DURABLE: usize = 50_000;
+/// Hard entry ceiling for the resident queue on both platforms.
+pub const SPOOL_MAX_DURABLE: usize = 16_384;
 
 /// Default byte ceiling for the queue. Enforced alongside the event count
-/// because the two constrain different things: 50 000 tiny events are fine,
-/// 50 000 events carrying 16 KiB command lines are 800 MiB.
-pub const SPOOL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// to bound resident payloads during outages.
+/// Deserialized envelopes and short-lived wire buffers add overhead.
+pub const SPOOL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Compact the journal after this many appends.
 const COMPACT_EVERY: usize = 5_000;
@@ -169,6 +169,8 @@ struct Reserve {
 pub struct Spool {
     mem: VecDeque<SpoolEntry>,
     max_events: usize,
+    recovery_path: Option<PathBuf>,
+    last_storage_retry: Option<Instant>,
     max_bytes: u64,
     bytes: u64,
     next_seq: u64,
@@ -209,7 +211,9 @@ impl Spool {
     pub fn in_memory(max_events: usize) -> Self {
         let spool = Self {
             mem: VecDeque::with_capacity(max_events.min(1024)),
-            max_events,
+            max_events: max_events.min(SPOOL_MAX_DURABLE),
+            recovery_path: None,
+            last_storage_retry: None,
             max_bytes: SPOOL_MAX_BYTES,
             bytes: 0,
             next_seq: 1,
@@ -244,12 +248,15 @@ impl Spool {
         let path = crate::paths::state_dir()
             .join("spool")
             .join("queue.journal");
-        Self::durable_at(path, max_events).with_reserve_bytes(spool_reserve_bytes_from_env())
+        Self::open_at(path, max_events, spool_max_bytes_from_env())
+            .with_reserve_bytes(spool_reserve_bytes_from_env())
     }
 
     /// Byte ceiling override, for tests and for `TRAPD_SPOOL_MAX_BYTES`.
+    #[cfg(test)]
     pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
-        self.max_bytes = max_bytes;
+        self.max_bytes = max_bytes.min(SPOOL_MAX_BYTES);
+        self.enforce_caps();
         self.publish_capacity();
         self
     }
@@ -303,8 +310,15 @@ impl Spool {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn durable_at(path: PathBuf, max_events: usize) -> Self {
+        Self::open_at(path, max_events, SPOOL_MAX_BYTES)
+    }
+
+    pub(super) fn open_at(path: PathBuf, max_events: usize, max_bytes: u64) -> Self {
         let mut spool = Self::in_memory(max_events);
+        spool.max_bytes = max_bytes.min(SPOOL_MAX_BYTES);
+        spool.publish_capacity();
 
         if let Some(parent) = path.parent() {
             if let Err(e) = create_private_dir(parent) {
@@ -319,14 +333,43 @@ impl Spool {
             }
         }
 
-        let replayed = spool.replay(&path);
+        let (replayed, legacy_layout) = spool.replay(&path);
+        if spool.degraded {
+            // A partial read cannot establish which records are safe to replace.
+            spool.publish();
+            return spool;
+        }
+        let preserve_legacy = spool.dropped_total > 0 && legacy_layout;
+        if preserve_legacy {
+            // Preserve the original when upgrading a larger historical journal.
+            // A fixed archive name bounds disk use across repeated restarts.
+            let archive = path.with_extension("journal.pre-budget");
+            match std::fs::hard_link(&path, &archive) {
+                Ok(()) => {
+                    warn!(path = %archive.display(), "preserved pre-budget journal for operator recovery")
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not preserve pre-budget journal; leaving original intact");
+                    spool.degraded = true;
+                    spool.publish();
+                    return spool;
+                }
+            }
+        }
+        spool.recovery_path = Some(path.clone());
 
         match open_private_append(&path) {
             Ok(handle) => {
                 spool.file = Some(JournalFile::new(path.clone(), handle));
                 // Rewrite from the recovered set so the file starts clean:
                 // corrupt lines and over-cap records are not carried forward.
-                spool.compact();
+                if !spool.compact() && preserve_legacy {
+                    // The archive still shares the active inode. No subsequent
+                    // write may alter the preserved historical journal.
+                    spool.file = None;
+                    spool.recovery_path = None;
+                    spool.degraded = true;
+                }
                 if replayed > 0 {
                     info!(
                         events = replayed,
@@ -432,7 +475,16 @@ impl Spool {
             return Err(DropReason::EventTooLarge);
         }
 
-        self.next_seq += 1;
+        let Some(next) = seq.checked_add(1) else {
+            metrics().event_dropped(DropReason::InternalError);
+            #[cfg(any(windows, test))]
+            if wants_receipt {
+                super::receipt::complete(receipt_id, false);
+            }
+            return Err(DropReason::InternalError);
+        };
+        self.next_seq = next;
+        self.retry_storage();
         self.append_to_journal(&encoded);
         // Tamper journal: every event, from the consumer and from the direct
         // stop/tamper alerts alike, passes here. Self-protection findings are
@@ -460,7 +512,7 @@ impl Spool {
 
         self.enforce_caps();
 
-        if self.file.is_some() && self.appends_since_compact >= COMPACT_EVERY {
+        if self.file.is_some() && self.appends_since_compact >= COMPACT_EVERY && self.retry_due() {
             self.compact();
         }
         self.maybe_rearm(false);
@@ -537,7 +589,50 @@ impl Spool {
         }
     }
 
+    fn retry_due(&self) -> bool {
+        self.last_storage_retry
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
+    }
+
+    fn retry_storage(&mut self) {
+        if self.file.is_some() || !self.degraded || !self.retry_due() {
+            return;
+        }
+        let Some(path) = self.recovery_path.clone() else {
+            return;
+        };
+        self.last_storage_retry = Some(Instant::now());
+        if let Ok(handle) = open_private_append(&path) {
+            self.file = Some(JournalFile::new(path, handle));
+            self.compact();
+            if self.degraded {
+                self.file = None;
+            }
+        }
+    }
+
     fn append_to_journal(&mut self, encoded: &[u8]) {
+        // Count-based compaction alone permits gigabytes of stale disk records
+        // between compactions when individual events approach their size limit.
+        let journal_limit = self
+            .max_bytes
+            .saturating_mul(2)
+            .max(MAX_RECORD_BYTES as u64 * 2);
+        let exceeds_limit = |file: &JournalFile| {
+            file.len
+                .is_some_and(|len| len.saturating_add(encoded.len() as u64) > journal_limit)
+        };
+        if self.file.as_ref().is_some_and(exceeds_limit) {
+            if self.retry_due() {
+                self.compact();
+            }
+            if self.file.as_ref().is_some_and(exceeds_limit) {
+                self.file = None;
+                self.last_storage_retry = Some(Instant::now());
+                self.degraded = true;
+                warn!("spool: unable to reclaim journal space, collecting in memory");
+            }
+        }
         if self.file.is_none() {
             return;
         }
@@ -555,6 +650,7 @@ impl Spool {
                 "spool: journal append failed — durability lost, continuing in memory"
             );
             self.file = None;
+            self.last_storage_retry = Some(Instant::now());
             self.degraded = true;
             return;
         }
@@ -568,6 +664,7 @@ impl Spool {
             if let Err(e) = self.sync_journal() {
                 warn!(error = %e, "spool: periodic journal fsync failed — durability lost, continuing in memory");
                 self.file = None;
+                self.last_storage_retry = Some(Instant::now());
                 self.degraded = true;
                 return;
             }
@@ -615,7 +712,9 @@ impl Spool {
             }
             Err(e) => {
                 let Some(len) = f.len else {
-                    return Err(e);
+                    return Err(std::io::Error::other(
+                        "unknown journal end after partial append",
+                    ));
                 };
                 // A separate write handle: the append handle may lack
                 // `FILE_WRITE_DATA` (Windows), which truncation needs.
@@ -626,6 +725,7 @@ impl Spool {
                 if let Err(cut_err) = cut {
                     warn!(error = %cut_err, "spool: cannot trim a partial journal record");
                     f.len = None;
+                    return Err(std::io::Error::other(cut_err));
                 }
                 Err(e)
             }
@@ -898,15 +998,15 @@ impl Spool {
     /// records are counted (and surfaced as `recovery_required` health) rather
     /// than silently skipped: a checksum failure means telemetry was destroyed,
     /// and that has to reach an operator.
-    fn replay(&mut self, path: &Path) -> usize {
-        let file = match File::open(path) {
+    fn replay(&mut self, path: &Path) -> (usize, bool) {
+        let file = match crate::paths::open_bounded_regular(path, 3 * 1024 * 1024 * 1024) {
             Ok(f) => f,
             // No journal yet is the normal first-run case.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, false),
             Err(e) => {
                 warn!(error = %e, path = %path.display(), "spool: cannot read journal");
                 self.degraded = true;
-                return 0;
+                return (0, true);
             }
         };
 
@@ -917,6 +1017,8 @@ impl Spool {
         let mut torn = 0u64;
         let mut unsupported = 0u64;
         let mut first_line = true;
+        let mut after_header = false;
+        let mut legacy_layout = true;
         let mut max_seq = 0u64;
 
         loop {
@@ -945,13 +1047,24 @@ impl Spool {
             if first_line {
                 first_line = false;
                 if line == journal::JOURNAL_HEADER.as_bytes() {
+                    after_header = true;
                     continue;
                 }
             }
 
+            if after_header {
+                // Writers using the resident budget put a blank line after the
+                // header. Previous agents already accept blank journal records.
+                legacy_layout = !line.is_empty();
+                after_header = false;
+            }
             match journal::decode(&line, terminated) {
                 RecordOutcome::Valid(rec) => {
-                    max_seq = max_seq.max(rec.seq);
+                    if rec.seq <= max_seq || rec.seq > i64::MAX as u64 {
+                        corrupt += 1;
+                        continue;
+                    }
+                    max_seq = rec.seq;
                     let bytes = line.len() + 1;
                     self.bytes += bytes as u64;
                     self.mem.push_back(SpoolEntry {
@@ -1012,7 +1125,7 @@ impl Spool {
         if recovered > 0 {
             metrics().spool_recovered_records(recovered as u64);
         }
-        recovered
+        (recovered, legacy_layout)
     }
 
     /// Rewrite the journal from the live set: temp file, fsync, atomic rename.
@@ -1020,34 +1133,27 @@ impl Spool {
     /// The rename is what makes this crash-safe — a reader (this agent on its
     /// next start) sees either the old complete journal or the new one, never a
     /// partially rewritten file.
-    pub(crate) fn compact(&mut self) {
+    pub(crate) fn compact(&mut self) -> bool {
         let Some(path) = self.file.as_ref().map(|f| f.path.clone()) else {
-            return;
+            return false;
         };
 
         let tmp = path.with_extension(format!("journal.tmp.{}", std::process::id()));
-        let mut buf = Vec::with_capacity(self.bytes as usize + 64);
-        buf.extend_from_slice(journal::JOURNAL_HEADER.as_bytes());
-        buf.push(b'\n');
-        for entry in &self.mem {
-            let rec = JournalRecord {
-                v: journal::RECORD_VERSION,
-                seq: entry.seq,
-                attempts: entry.attempts,
-                event: entry.event.clone(),
-            };
-            match journal::encode(&rec) {
-                Ok(line) => buf.extend_from_slice(&line),
-                Err(e) => {
-                    warn!(error = %e, "spool: skipping unserializable entry during compaction")
-                }
-            }
-        }
-
         let result = (|| -> std::io::Result<()> {
-            let mut f = open_private_write(&tmp)?;
-            f.write_all(&buf)?;
-            f.sync_all()?;
+            let mut f = BufWriter::new(open_private_write(&tmp)?);
+            writeln!(f, "{}\n", journal::JOURNAL_HEADER)?;
+            for entry in &self.mem {
+                let rec = JournalRecord {
+                    v: journal::RECORD_VERSION,
+                    seq: entry.seq,
+                    attempts: entry.attempts,
+                    event: entry.event.clone(),
+                };
+                f.write_all(&journal::encode(&rec)?)?;
+            }
+            f.flush()?;
+            f.get_ref().sync_all()?;
+            drop(f);
             std::fs::rename(&tmp, &path)
         })();
 
@@ -1055,23 +1161,29 @@ impl Spool {
             Ok(()) => match open_private_append(&path) {
                 Ok(handle) => {
                     self.file = Some(JournalFile::new(path, handle));
+                    self.degraded = false;
+                    self.last_storage_retry = None;
                     self.appends_since_compact = 0;
                     // Compaction just fsync'd the rewritten journal, so the
                     // periodic-fsync clock also resets here.
                     self.appends_since_fsync = 0;
                     self.maybe_rearm(true);
+                    true
                 }
                 Err(e) => {
                     warn!(error = %e, "spool: reopen after compaction failed — memory only");
                     self.file = None;
                     self.degraded = true;
+                    false
                 }
             },
             Err(e) => {
+                self.last_storage_retry = Some(Instant::now());
                 let _ = std::fs::remove_file(&tmp);
                 warn!(error = %e, "spool: compaction failed — journal left as-is");
                 // The existing journal is still valid, so durability is intact;
                 // only the space reclamation was lost.
+                false
             }
         }
     }
@@ -1083,6 +1195,7 @@ impl Spool {
             if let Err(e) = self.sync_journal() {
                 warn!(error = %e, "spool: final journal fsync failed — durability lost, continuing in memory");
                 self.file = None;
+                self.last_storage_retry = Some(Instant::now());
                 self.degraded = true;
                 self.publish();
                 return;
@@ -1307,6 +1420,7 @@ pub fn spool_max_from_env() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(SPOOL_MAX_DURABLE)
+        .min(SPOOL_MAX_DURABLE)
 }
 
 /// Resolve the durable byte capacity, honouring `TRAPD_SPOOL_MAX_BYTES`.
@@ -1316,6 +1430,7 @@ pub fn spool_max_bytes_from_env() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(SPOOL_MAX_BYTES)
+        .min(SPOOL_MAX_BYTES)
 }
 
 /// Resolve the emergency reserve size in bytes, honouring
@@ -1573,6 +1688,28 @@ mod reserve_tests {
         assert_eq!(replayed.len(), 3);
         assert_eq!(replayed.corrupt_records(), 0);
         drop(replayed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recovered_storage_rejournals_volatile_events_before_reporting_durable() {
+        let dir = temp_dir();
+        let path = dir.join("queue.journal");
+        let mut spool = Spool::durable_at(path.clone(), 10);
+        let first = event();
+        let id = first.event_id;
+        spool.inject_write_disk_full = 1;
+        spool.push(first).unwrap();
+        assert!(spool.is_degraded());
+        spool.last_storage_retry = None;
+        spool.push(event()).unwrap();
+        assert!(spool.is_durable());
+        assert!(!spool.is_degraded());
+        drop(spool);
+        let restored = Spool::durable_at(path, 10);
+        assert_eq!(restored.len(), 2);
+        assert!(restored.mem.iter().any(|entry| entry.event.event_id == id));
+        drop(restored);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
