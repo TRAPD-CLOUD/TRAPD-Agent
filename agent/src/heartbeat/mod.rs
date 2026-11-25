@@ -88,6 +88,10 @@ struct PipelineCounters {
     dropped_by_reason: BTreeMap<String, u64>,
     /// Detection/prevention events lost to queue overflow (subset of dropped).
     priority_evicted: u64,
+    /// Cache entries evicted or refused when a tracker reached capacity.
+    local_mirror_misses_total: u64,
+    siem_delivery_misses_total: u64,
+    state_capacity_drops_total: u64,
     /// Valid records replayed at startup, including those evicted by recovery
     /// capacity limits. Corrupt/unsupported records are excluded.
     replayed_from_disk: u64,
@@ -117,6 +121,9 @@ impl PipelineCounters {
             dropped_total: s.collector_events_dropped_total,
             dropped_by_reason: s.collector_events_dropped_by_reason.clone(),
             priority_evicted: s.spool_priority_evicted_total,
+            local_mirror_misses_total: s.local_mirror_misses_total,
+            siem_delivery_misses_total: s.siem_delivery_misses_total,
+            state_capacity_drops_total: s.state_capacity_drops_total,
             replayed_from_disk: s.spool_recovered_records_total,
             durability_lost: s.spool_durability_lost,
             spool_reserve_state: s.spool_reserve_state,
@@ -164,7 +171,7 @@ mod durability_tests {
 }
 
 /// Live host resource utilisation sampled at beat time.
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, Clone)]
 struct Metrics {
     cpu_usage_pct: f32,
     cpu_logical_cores: usize,
@@ -179,23 +186,15 @@ struct Metrics {
     load_avg: [f64; 3],
     uptime_secs: u64,
     process_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_guard_capacity_sample: Option<crate::telemetry::snapshot::GuardCapacitySample>,
 }
 
 /// Read a response body of at most `limit` bytes, chunk by chunk. A larger body (also a chunked
 /// one without a `Content-Length`) is abandoned as soon as it exceeds the limit instead of being
 /// buffered whole; `None` then, and on a transport error.
-async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
-    if resp.content_length().is_some_and(|n| n as usize > limit) {
-        return None;
-    }
-    let mut body = Vec::new();
-    while let Ok(Some(chunk)) = resp.chunk().await {
-        if body.len() + chunk.len() > limit {
-            return None;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Some(body)
+async fn read_capped(resp: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
+    crate::http::bounded_body(resp, limit).await.ok()
 }
 
 /// Serializes beats of all `Heartbeat` instances (regular loop, suspend announcement, stop
@@ -212,7 +211,7 @@ pub struct Heartbeat {
     /// backend-delivered change takes effect without a restart.
     config: Arc<RwLock<AgentConfig>>,
     /// `System` is reused across beats so CPU deltas are meaningful.
-    sys: Mutex<System>,
+    sys: Arc<Mutex<System>>,
     /// Answers liveness challenges in heartbeat responses through the event
     /// pipeline. Only the periodic beat has one; the final host-shutdown beat
     /// does not need it.
@@ -238,7 +237,7 @@ impl Heartbeat {
             agent_id,
             hostname,
             config,
-            sys: Mutex::new(System::new()),
+            sys: Arc::new(Mutex::new(System::new())),
             echo: None,
         })
     }
@@ -288,12 +287,27 @@ impl Heartbeat {
         // One beat at a time, across every Heartbeat instance of the process: the announcement then
         // waits for a regular beat that is already in flight (which would otherwise land after it),
         // and a regular beat that was waiting sees the hold and stays quiet.
+        // The power hook must not wait for an unavailable mount. The periodic
+        // task is the only sampling producer and waits for its one blocking job.
+        static LAST_SAMPLE: std::sync::OnceLock<Mutex<Metrics>> = std::sync::OnceLock::new();
+        let cache = LAST_SAMPLE.get_or_init(Mutex::default);
+        let metrics = if host_shutdown {
+            cache.lock().map(|m| m.clone()).unwrap_or_default()
+        } else {
+            let sys = Arc::clone(&self.sys);
+            let sample = tokio::task::spawn_blocking(move || Self::sample_metrics(&sys))
+                .await
+                .unwrap_or_default();
+            if let Ok(mut last) = cache.lock() {
+                *last = sample.clone();
+            }
+            sample
+        };
         let _serial = BEAT_LOCK.lock().await;
         if !host_shutdown && suspend::holding() {
             debug!("Heartbeat held back: a host suspend was announced");
             return false;
         }
-        let metrics = self.sample_metrics();
         let life = lifecycle::begin_process();
         let payload = HeartbeatPayload {
             agent_id: self.agent_id.clone(),
@@ -346,8 +360,8 @@ impl Heartbeat {
         false
     }
 
-    fn sample_metrics(&self) -> Metrics {
-        let mut sys = match self.sys.lock() {
+    fn sample_metrics(sys: &Mutex<System>) -> Metrics {
+        let mut sys = match sys.lock() {
             Ok(s) => s,
             Err(_) => return Metrics::default(),
         };
@@ -384,6 +398,9 @@ impl Heartbeat {
             load_avg: [load.one, load.five, load.fifteen],
             uptime_secs: System::uptime(),
             process_count: proc_count,
+            last_guard_capacity_sample: crate::telemetry::snapshot::GuardCapacitySample::read(
+                crate::paths::state_dir(),
+            ),
         }
     }
 }

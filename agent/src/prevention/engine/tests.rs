@@ -516,9 +516,9 @@ async fn memory_command_early_refusals_preserve_the_requested_generation() {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
-async fn memory_commands_reject_missing_generation_on_windows_without_an_artifact() {
+async fn memory_commands_reject_missing_generation_without_an_artifact() {
     let child = ChildFixture::new();
     let (engine, mut rx) = test_engine();
     engine.cfg_handle.write().unwrap().rtr_enabled = true;
@@ -541,33 +541,27 @@ async fn memory_commands_reject_missing_generation_on_windows_without_an_artifac
 async fn memory_commands_read_the_observed_child_and_audit_the_generation() {
     let child = ChildFixture::new();
     let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
-    let generations = if cfg!(windows) {
-        vec![Some(start)]
-    } else {
-        vec![Some(start), None]
+    let generation = Some(start);
+    let (engine, mut rx) = test_engine();
+    engine.cfg_handle.write().unwrap().rtr_enabled = true;
+    engine.handle(memory_command(child.pid(), generation)).await;
+    let event = rx.try_recv().unwrap();
+    assert!(matches!(event.action, EventAction::CommandAccepted));
+    let EventData::Prevention(audit) = event.data else {
+        panic!("audit")
     };
-    for generation in generations {
-        let (engine, mut rx) = test_engine();
-        engine.cfg_handle.write().unwrap().rtr_enabled = true;
-        engine.handle(memory_command(child.pid(), generation)).await;
-        let event = rx.try_recv().unwrap();
-        assert!(matches!(event.action, EventAction::CommandAccepted));
-        let EventData::Prevention(audit) = event.data else {
-            panic!("audit")
-        };
-        assert!(audit.success);
-        assert_eq!(
-            audit.details["process_start_time"],
-            serde_json::json!(generation)
-        );
-        let memory = audit.details["memory_b64"].as_str().unwrap();
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(memory)
-            .unwrap();
-        assert!(!bytes.is_empty());
-        assert!(bytes.len() <= 4096);
-    }
+    assert!(audit.success);
+    assert_eq!(
+        audit.details["process_start_time"],
+        serde_json::json!(generation)
+    );
+    let memory = audit.details["memory_b64"].as_str().unwrap();
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(memory)
+        .unwrap();
+    assert!(!bytes.is_empty());
+    assert!(bytes.len() <= 4096);
 }
 
 #[cfg(unix)]
@@ -637,6 +631,47 @@ fn process_command(
 
 #[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
+async fn backpressured_dispatch_preserves_the_result_and_rechecks_expiry() {
+    let (engine, mut results) = test_engine();
+    for _ in 0..results.max_capacity() {
+        engine.audit.emit(
+            EventAction::CommandRejected,
+            crate::schema::Severity::Info,
+            "test",
+            "fixture",
+            false,
+            "fixture",
+            None,
+            None,
+            serde_json::Value::Null,
+        );
+    }
+    let mut child = ChildFixture::new();
+    let generation = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+    let mut cmd = process_command("kill_pid", child.pid(), Some(generation));
+    cmd.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let id = cmd.command_id.to_string();
+    let (tx, rx) = mpsc::channel(1);
+    Arc::new(engine).spawn_command_loop(rx);
+    tx.send(cmd).await.unwrap();
+    for _ in 0..results.max_capacity() {
+        results.recv().await.unwrap();
+    }
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), results.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let EventData::Prevention(result) = event.data else {
+        panic!("missing result")
+    };
+    assert_eq!(result.command_id.as_deref(), Some(id.as_str()));
+    assert!(!result.success);
+    assert!(result.reason.contains("expired"));
+    assert!(child.0.try_wait().unwrap().is_none());
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[tokio::test]
 async fn manual_process_commands_reject_wrong_generations_without_collecting_snapshots() {
     for kind in ["kill_pid", "freeze_pid", "thaw_pid"] {
         for stale in [false, true] {
@@ -663,9 +698,9 @@ async fn manual_process_commands_reject_wrong_generations_without_collecting_sna
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
-async fn manual_process_commands_reject_missing_windows_generations() {
+async fn manual_process_commands_reject_missing_generations() {
     for kind in ["kill_pid", "freeze_pid", "thaw_pid"] {
         let mut child = ChildFixture::new();
         let (engine, mut rx) = test_engine();
@@ -689,101 +724,94 @@ async fn manual_process_commands_reject_missing_windows_generations() {
 
 #[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
-async fn manual_process_commands_control_the_observed_child_and_preserve_linux_legacy() {
-    let legacy_modes = if cfg!(windows) {
-        vec![false]
-    } else {
-        vec![false, true]
+async fn manual_process_commands_control_the_observed_child() {
+    // This child would exit in one second unless freeze actually stops it.
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = std::process::Command::new("ping");
+        c.args(["-n", "2", "127.0.0.1"]);
+        c
     };
-    for legacy in legacy_modes {
-        // This child would exit in one second unless freeze actually stops it.
-        #[cfg(windows)]
-        let mut command = {
-            let mut c = std::process::Command::new("ping");
-            c.args(["-n", "2", "127.0.0.1"]);
-            c
-        };
-        #[cfg(target_os = "linux")]
-        let mut command = {
-            let mut c = std::process::Command::new("sleep");
-            c.arg("1");
-            c
-        };
-        let mut child = ChildFixture(
-            command
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
-        let generation = (!legacy).then_some(start);
-        let (engine, mut rx) = test_engine();
-        engine
-            .handle(process_command("freeze_pid", child.pid(), generation))
-            .await;
-        let event = rx.try_recv().unwrap();
-        assert!(matches!(event.action, EventAction::ProcessFrozen));
-        let EventData::Prevention(audit) = event.data else {
-            panic!("audit")
-        };
-        assert!(audit.success);
-        assert_eq!(
-            audit.details["process_start_time"],
-            serde_json::json!(generation)
-        );
-        assert_eq!(audit.details["snapshot"]["frozen"], true);
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        assert!(
-            child.0.try_wait().unwrap().is_none(),
-            "freeze must stop the short-lived child"
-        );
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut c = std::process::Command::new("sleep");
+        c.arg("1");
+        c
+    };
+    let mut child = ChildFixture(
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+    let generation = Some(start);
+    let (engine, mut rx) = test_engine();
+    engine
+        .handle(process_command("freeze_pid", child.pid(), generation))
+        .await;
+    let event = rx.try_recv().unwrap();
+    assert!(matches!(event.action, EventAction::ProcessFrozen));
+    let EventData::Prevention(audit) = event.data else {
+        panic!("audit")
+    };
+    assert!(audit.success);
+    assert_eq!(
+        audit.details["process_start_time"],
+        serde_json::json!(generation)
+    );
+    assert_eq!(audit.details["snapshot"]["frozen"], true);
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "freeze must stop the short-lived child"
+    );
 
-        engine
-            .handle(process_command("thaw_pid", child.pid(), generation))
-            .await;
-        let event = rx.try_recv().unwrap();
-        assert!(matches!(event.action, EventAction::ProcessThawed));
-        let EventData::Prevention(audit) = event.data else {
-            panic!("audit")
-        };
-        assert!(audit.success);
-        assert_eq!(
-            audit.details["process_start_time"],
-            serde_json::json!(generation)
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while child.0.try_wait().unwrap().is_none() {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("thaw must allow the child to exit");
+    engine
+        .handle(process_command("thaw_pid", child.pid(), generation))
+        .await;
+    let event = rx.try_recv().unwrap();
+    assert!(matches!(event.action, EventAction::ProcessThawed));
+    let EventData::Prevention(audit) = event.data else {
+        panic!("audit")
+    };
+    assert!(audit.success);
+    assert_eq!(
+        audit.details["process_start_time"],
+        serde_json::json!(generation)
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while child.0.try_wait().unwrap().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("thaw must allow the child to exit");
 
-        let mut target = ChildFixture::new();
-        let start = crate::telemetry::identity::process_start_time(target.pid()).unwrap();
-        let generation = (!legacy).then_some(start);
-        engine
-            .handle(process_command("kill_pid", target.pid(), generation))
-            .await;
-        let event = rx.try_recv().unwrap();
-        assert!(matches!(event.action, EventAction::ProcessBlocked));
-        let EventData::Prevention(audit) = event.data else {
-            panic!("audit")
-        };
-        assert!(audit.success);
-        assert_eq!(
-            audit.details["process_start_time"],
-            serde_json::json!(generation)
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while target.0.try_wait().unwrap().is_none() {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("kill must terminate the observed child");
-    }
+    let mut target = ChildFixture::new();
+    let start = crate::telemetry::identity::process_start_time(target.pid()).unwrap();
+    let generation = Some(start);
+    engine
+        .handle(process_command("kill_pid", target.pid(), generation))
+        .await;
+    let event = rx.try_recv().unwrap();
+    assert!(matches!(event.action, EventAction::ProcessBlocked));
+    let EventData::Prevention(audit) = event.data else {
+        panic!("audit")
+    };
+    assert!(audit.success);
+    assert_eq!(
+        audit.details["process_start_time"],
+        serde_json::json!(generation)
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while target.0.try_wait().unwrap().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("kill must terminate the observed child");
 }
 
 #[cfg(any(target_os = "linux", windows))]

@@ -232,26 +232,27 @@ impl Journal {
             }
         };
         let torn_tail = !raw.is_empty() && !raw.ends_with(b"\n");
-        let text = String::from_utf8_lossy(&raw).into_owned();
-        let lines: Vec<&str> = text.lines().collect();
+        let mut lines = raw.split_inclusive(|&byte| byte == b'\n').peekable();
         let mut good: Vec<Stored> = Vec::new();
-        let mut bad_from: Option<usize> = None;
-        for (i, l) in lines.iter().enumerate() {
-            match self.verify_line(l, good.last()) {
+        let mut lost_lines = None;
+        while let Some(line) = lines.next() {
+            let i = good.len();
+            let decoded = String::from_utf8_lossy(line);
+            match self.verify_line(&decoded, good.last()) {
                 Ok(s) => good.push(s),
                 Err(e) => {
-                    let is_torn_tail = torn_tail && i + 1 == lines.len();
+                    let is_torn_tail = torn_tail && lines.peek().is_none();
                     if is_torn_tail {
                         warn!("tamper journal: dropping a torn last line");
                     } else {
                         warn!(line = i + 1, error = %e, "tamper journal: damaged entry");
-                        bad_from = Some(i);
+                        lost_lines = Some(1 + lines.count());
                     }
                     break;
                 }
             }
         }
-        match bad_from {
+        match lost_lines {
             None => {
                 let rewrite = torn_tail;
                 self.install(good);
@@ -260,8 +261,7 @@ impl Journal {
                 }
                 Ok(())
             }
-            Some(i) => {
-                let lost = lines.len() - i;
+            Some(lost) => {
                 let q = self.quarantine().ok();
                 self.after_corruption(good, lost, q)
             }

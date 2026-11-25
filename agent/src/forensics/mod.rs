@@ -116,7 +116,12 @@ impl snapshot::SnapshotProc for RealProc {
             .map(|p| p.to_string_lossy().into_owned())
     }
     fn cmdline(&self, pid: i32) -> Option<String> {
-        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        // An argv beyond the budget keeps its prefix as evidence.
+        let (raw, _) = crate::collectors::read_prefix(
+            format!("/proc/{pid}/cmdline"),
+            crate::telemetry::limits::MAX_CMDLINE_BYTES,
+        )
+        .ok()?;
         let s: String = raw
             .split(|&b| b == 0)
             .filter(|p| !p.is_empty())
@@ -125,32 +130,37 @@ impl snapshot::SnapshotProc for RealProc {
             .join(" ");
         (!s.is_empty()).then_some(s)
     }
-    fn open_fds(&self, pid: i32) -> Vec<String> {
+    fn open_fds(&self, pid: i32) -> (Vec<String>, usize) {
         let mut out = Vec::new();
+        let mut total = 0;
         if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
             for e in entries.flatten() {
+                total += 1;
+                if out.len() >= snapshot::MAX_OPEN_FILES {
+                    continue;
+                }
                 if let Ok(target) = std::fs::read_link(e.path()) {
                     out.push(target.to_string_lossy().into_owned());
                 }
             }
         }
-        out
+        (out, total)
     }
 }
 
 /// Resolve a username from `/etc/passwd` (shared by the readers).
 #[cfg(not(windows))]
 fn username_for_uid(uid: u32) -> Option<String> {
-    std::fs::read_to_string("/etc/passwd")
-        .ok()?
-        .lines()
-        .find_map(|line| {
-            let mut f = line.splitn(7, ':');
-            let name = f.next()?;
-            let _ = f.next();
-            let u = f.next()?.parse::<u32>().ok()?;
-            (u == uid).then(|| name.to_string())
-        })
+    let bytes =
+        crate::paths::bounded_regular_bytes(std::path::Path::new("/etc/passwd"), 1024 * 1024)
+            .ok()?;
+    std::str::from_utf8(&bytes).ok()?.lines().find_map(|line| {
+        let mut f = line.splitn(7, ':');
+        let name = f.next()?;
+        let _ = f.next();
+        let u = f.next()?.parse::<u32>().ok()?;
+        (u == uid).then(|| name.to_string())
+    })
 }
 
 /// Windows readers. There is no `/proc`: process facts come from the process
@@ -227,8 +237,8 @@ mod win {
                 (!joined.is_empty()).then_some(joined)
             })
         }
-        fn open_fds(&self, _: i32) -> Vec<String> {
-            Vec::new()
+        fn open_fds(&self, _: i32) -> (Vec<String>, usize) {
+            (Vec::new(), 0)
         }
     }
 }

@@ -10,7 +10,6 @@ use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use tokio::fs;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -73,6 +72,7 @@ use transport::Transport;
 /// from the same modules the Linux agent uses.
 #[cfg(windows)]
 fn main() -> Result<()> {
+    validate_arguments(std::env::args_os())?;
     // One-shot toast helper in the user's session: runs none of the agent.
     if std::env::args().nth(1).as_deref() == Some(prevention::usernotify::NOTIFY_FLAG) {
         return prevention::usernotify::run_helper(std::env::args().nth(2).as_deref());
@@ -84,6 +84,7 @@ fn main() -> Result<()> {
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<()> {
+    validate_arguments(std::env::args_os())?;
     detection_host::initialize();
     if let Some(monitored_pid) = selfprotect::watchdog::detect() {
         selfprotect::watchdog::run_watchdog(monitored_pid);
@@ -109,7 +110,7 @@ async fn main() -> Result<()> {
     // `trapd-agent guard` — the second service of the guard pair (`trapd-guard`):
     // watches the agent and restarts it; holds no backend credentials.
     if std::env::args().nth(1).as_deref() == Some("guard") {
-        paths::init_state_dir();
+        paths::init_state_dir()?;
         return selfprotect::guard::run::run_until_signal().await;
     }
 
@@ -117,6 +118,7 @@ async fn main() -> Result<()> {
     // `trapd-agent-update.service`; applies (or rolls back) a staged update.
     // The service itself cannot write its own binary (`ProtectSystem=strict`).
     if std::env::args().nth(1).as_deref() == Some("--apply-update") {
+        paths::init_state_dir()?;
         return update::run_apply_helper();
     }
 
@@ -127,7 +129,7 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("uninstall") {
         #[cfg(target_os = "windows")]
         {
-            paths::init_state_dir();
+            paths::init_state_dir()?;
             collectors::windows::honeytokens::uninstall();
             crate::deception::activity::ActivityStore::purge(
                 &crate::deception::activity::state_path(),
@@ -144,7 +146,7 @@ async fn main() -> Result<()> {
     // exit) aborts the removal. Same gate as the Windows MSI action.
     if std::env::args().nth(1).as_deref() == Some("uninstall-gate") {
         paths::load_agent_env_file();
-        paths::init_state_dir();
+        paths::init_state_dir()?;
         let args: Vec<String> = std::env::args().skip(2).collect();
         return selfprotect::maintenance::run_uninstall_gate(&args)
             .inspect_err(|e| error!("uninstall refused: {e:#}"));
@@ -157,7 +159,7 @@ async fn main() -> Result<()> {
         // via EnvironmentFile, a shell does not. Load it before the (cached)
         // state dir is resolved.
         paths::load_agent_env_file();
-        paths::init_state_dir();
+        paths::init_state_dir()?;
         let args: Vec<String> = std::env::args().skip(2).collect();
         return selfprotect::maintenance::run_cli(&args, || {
             let status = std::process::Command::new("systemctl")
@@ -176,7 +178,7 @@ async fn main() -> Result<()> {
     {
         let args: Vec<String> = std::env::args().collect();
         if args.get(1).map(String::as_str) == Some("diagnostics") {
-            paths::init_state_dir();
+            paths::init_state_dir()?;
             return match args.get(2).map(String::as_str) {
                 Some("telemetry") => {
                     print!("{}", telemetry::diagnostics::run());
@@ -202,6 +204,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    paths::init_state_dir()?;
     selfprotect::kernel_hardening::audit();
     selfprotect::process_integrity::linux::harden();
 
@@ -218,9 +221,6 @@ async fn main() -> Result<()> {
 
     selfprotect::watchdog::spawn_detached();
 
-    // Resolve & create the (HOME-independent) state directory up front so every
-    // later component agrees on where identity/credentials live.
-    paths::init_state_dir();
     // Pair with the guard service before enrollment: pairing can wait for a
     // human, and the guard must see pings in the meantime.
     selfprotect::guard::agent_link::start(true);
@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
         if !backend_configured {
             warn!(
                 "TRAPD_BACKEND_URL is not set — starting in OFFLINE mode. Telemetry is \
-                 emitted locally only. Set TRAPD_BACKEND_URL + TRAPD_ENROLL_TOKEN in {}/agent.env \
+                 emitted locally only. Set TRAPD_BACKEND_URL in {}/agent.env \
                  for a backend-connected agent.",
                 paths::config_dir().display()
             );
@@ -294,6 +294,7 @@ async fn main() -> Result<()> {
         OutputMode::Stdout => "stdout",
         OutputMode::File => "file",
         OutputMode::Off => "off",
+        OutputMode::Buffered(_) => "buffered",
     };
 
     info!(
@@ -327,7 +328,6 @@ async fn main() -> Result<()> {
         Spool::in_memory(pipeline::SPOOL_MAX_MEMORY)
     } else {
         Spool::durable(pipeline::spool_max_from_env())
-            .with_max_bytes(pipeline::spool_max_bytes_from_env())
     };
     if spool.is_degraded() {
         warn!("spool has no durable backing — unacknowledged events will not survive a restart");
@@ -422,11 +422,12 @@ async fn main() -> Result<()> {
             let host = hostname.clone();
             let cname = c.name();
             handles.push(tokio::spawn(async move {
+                let _observe_panic = collectors::ObservePanic(cname);
                 if let Err(e) = c.run(tx2, aid, host).await {
                     // A collector that exits is a blind spot, so it is counted
                     // and surfaced in health rather than only logged.
                     error!("{cname} exited with error: {e:#}");
-                    telemetry::metrics::metrics().collector_failed();
+                    collectors::report_failure(cname);
                 }
             }));
         }};
@@ -541,7 +542,12 @@ async fn main() -> Result<()> {
     };
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
-    let mode = output_mode;
+    let mirror = if offline {
+        output_mode
+    } else {
+        output_mode.buffered()
+    };
+    let mode = mirror.clone();
     let prev_tx = prev_event_tx.clone();
     let siem_fwd = siem.clone();
     let mut consumer = tokio::spawn(async move {
@@ -563,36 +569,7 @@ async fn main() -> Result<()> {
     // Publish the telemetry report the `diagnostics telemetry` command reads.
     // Runs in both modes: an offline agent still needs its queue and drop
     // counters to be inspectable.
-    {
-        let started = std::time::Instant::now();
-        let report_path = telemetry::TelemetryReport::default_path();
-        #[cfg(windows)]
-        let learning_config = Arc::clone(&agent_config);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
-            loop {
-                ticker.tick().await;
-                #[cfg(windows)]
-                {
-                    let enabled = learning_config
-                        .read()
-                        .map(|c| c.deception_activity_learning_enabled)
-                        .unwrap_or(false);
-                    if crate::deception::activity::enabled() != enabled {
-                        crate::deception::activity::set_enabled(enabled);
-                    }
-                    crate::deception::activity::persist();
-                }
-                let report =
-                    telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
-                if let Err(e) = report.write_atomic(&report_path) {
-                    // Losing the report costs visibility, not telemetry, so it
-                    // must never take the agent down with it.
-                    warn!(error = %e, "could not publish the telemetry report");
-                }
-            }
-        });
-    }
+    tokio::spawn(telemetry::snapshot::publish_periodically(offline));
 
     // Asset inventory reporter — runs in BOTH modes.  Online it POSTs to
     // `/api/v1/agents/{id}/inventory`; offline it writes <state>/inventory.json
@@ -757,6 +734,8 @@ async fn main() -> Result<()> {
         );
         consumer.abort();
     }
+
+    mirror.drain().await;
 
     // Reconcile the journal to exactly the un-acknowledged set, so the next
     // start replays those and nothing else.
@@ -947,6 +926,16 @@ async fn spool_events(events: Vec<schema::AgentEvent>, buf: &Arc<Mutex<Spool>>) 
     }
 }
 
+/// All CLI dispatchers use Unicode strings. Check the immutable process argv
+/// before dispatch, including the watchdog and the Windows helper entry point.
+fn validate_arguments(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<()> {
+    anyhow::ensure!(
+        args.into_iter().all(|arg| arg.to_str().is_some()),
+        "command-line argument contains invalid Unicode"
+    );
+    Ok(())
+}
+
 /// Interpret an environment variable as a boolean flag.
 /// True for `1`, `true`, `yes`, `on` (case-insensitive); false otherwise.
 fn env_truthy(key: &str) -> bool {
@@ -966,33 +955,55 @@ fn env_truthy(key: &str) -> bool {
 /// resolved independently of `$HOME`, so this works under a hardened systemd
 /// unit where `HOME` may be unset.  Written atomically at mode `0600`.
 async fn load_or_create_device_id() -> Result<String> {
-    let file = paths::device_id_file();
+    tokio::task::spawn_blocking(|| device_id_at(&paths::device_id_file()))
+        .await
+        .context("join device identity task")?
+}
 
-    if file.exists() {
-        let raw = fs::read_to_string(&file)
-            .await
-            .context("Failed to read device_id file")?;
-        let trimmed = raw.trim();
-        if Uuid::parse_str(trimmed).is_ok() {
-            return Ok(trimmed.to_string());
+fn device_id_at(file: &std::path::Path) -> Result<String> {
+    match paths::bounded_regular_bytes(file, 4096) {
+        Ok(raw) => {
+            let text = std::str::from_utf8(&raw).context("invalid device_id encoding")?;
+            let trimmed = text.trim();
+            if Uuid::parse_str(trimmed).is_ok() {
+                return Ok(trimmed.to_owned());
+            }
+            warn!("device_id file invalid — regenerating");
         }
-        warn!(path = %file.display(), "device_id file invalid — regenerating");
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("Failed to read device_id file"),
     }
 
     let id = Uuid::new_v4().to_string();
-    let bytes = id.as_bytes().to_vec();
-    let path = file.clone();
-    tokio::task::spawn_blocking(move || paths::write_atomic(&path, &bytes, 0o600))
-        .await
-        .context("join device_id write task")?
-        .context("Failed to write device_id file")?;
-    info!("Generated new device_id: {id}");
+    paths::write_atomic(file, id.as_bytes(), 0o600).context("Failed to write device_id file")?;
+    info!("Generated new device_id");
     Ok(id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_device_identity_is_preserved_after_failed_read() {
+        let file = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        std::fs::write(&file, [b'a'; 4097]).unwrap();
+        assert!(device_id_at(&file).is_err());
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), 4097);
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_os_argument_returns_a_fixed_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let bad = std::ffi::OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            validate_arguments([bad]).unwrap_err().to_string(),
+            "command-line argument contains invalid Unicode"
+        );
+    }
 
     #[test]
     fn env_truthy_recognises_true_values() {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::Instant;
 
@@ -17,8 +17,8 @@ use crate::schema::{
 pub struct NetworkCollector {
     /// Connection key → flow facts (incl. first-observed time). Doubles as the
     /// "known" set: a key leaving this map between polls is a closed flow.
-    known_tcp: [HashMap<String, FlowInfo>; 2],
-    known_udp: [HashMap<String, FlowInfo>; 2],
+    known_tcp: HashMap<String, FlowInfo>,
+    known_udp: HashMap<String, FlowInfo>,
 }
 
 impl NetworkCollector {
@@ -36,7 +36,7 @@ impl Default for NetworkCollector {
     }
 }
 
-fn build_inode_pid_map() -> HashMap<u64, (i32, u64)> {
+fn build_inode_pid_map(wanted: &HashSet<u64>) -> HashMap<u64, (i32, u64)> {
     let mut map = HashMap::new();
 
     let proc_dir = match fs::read_dir("/proc") {
@@ -44,7 +44,15 @@ fn build_inode_pid_map() -> HashMap<u64, (i32, u64)> {
         Err(_) => return map,
     };
 
+    let mut remaining_fds = 65_536;
     for entry in proc_dir.flatten() {
+        if map.len() == wanted.len() {
+            break;
+        }
+        if remaining_fds == 0 {
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            break;
+        }
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         let pid: i32 = match name_str.parse() {
@@ -55,14 +63,15 @@ fn build_inode_pid_map() -> HashMap<u64, (i32, u64)> {
         let Some(start) = crate::telemetry::identity::process_start_time(pid) else {
             continue;
         };
-        let mut inodes = Vec::new();
+        let mut inodes = HashSet::new();
         let fd_path = format!("/proc/{pid}/fd");
         let fd_dir = match fs::read_dir(&fd_path) {
             Ok(d) => d,
             Err(_) => continue,
         };
 
-        for fd_entry in fd_dir.flatten() {
+        for fd_entry in fd_dir.flatten().take(remaining_fds) {
+            remaining_fds -= 1;
             let link = match fs::read_link(fd_entry.path()) {
                 Ok(l) => l,
                 Err(_) => continue,
@@ -74,7 +83,9 @@ fn build_inode_pid_map() -> HashMap<u64, (i32, u64)> {
                 .and_then(|s| s.strip_suffix(']'))
             {
                 if let Ok(inode) = inode_str.parse::<u64>() {
-                    inodes.push(inode);
+                    if wanted.contains(&inode) {
+                        inodes.insert(inode);
+                    }
                 }
             }
         }
@@ -179,6 +190,32 @@ impl FlowInfo {
     }
 }
 
+/// A missing IPv6 table is normal on IPv4-only hosts. Other failures leave
+/// the previous observation intact so unreadable sockets never appear closed.
+fn read_family<T: procfs::FromReadSI>(path: &str) -> anyhow::Result<Option<T>> {
+    let bytes = match crate::collectors::read_capped(path, 1024 * 1024) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && path.ends_with('6') => {
+            return Ok(None)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(Some(T::from_read(
+        bytes.as_slice(),
+        procfs::current_system_info(),
+    )?))
+}
+
+fn read_tables<T: procfs::FromReadSI>(paths: [&str; 2]) -> anyhow::Result<Vec<T>> {
+    let mut tables = Vec::new();
+    for path in paths {
+        if let Some(table) = read_family(path)? {
+            tables.push(table);
+        }
+    }
+    Ok(tables)
+}
+
 #[async_trait]
 impl Collector for NetworkCollector {
     fn name(&self) -> &'static str {
@@ -192,34 +229,53 @@ impl Collector for NetworkCollector {
         hostname: String,
     ) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Self-exclusion: never report the agent's own sockets (e.g. its uplink
         // to the backend) as host network activity.
         let agent_pid = std::process::id() as i32;
 
-        let mut tcp_coverage = ["tcp", "tcp6"].map(table_coverage);
-        let mut udp_coverage = ["udp", "udp6"].map(table_coverage);
+        let mut tcp_coverage = table_coverage("tcp");
+        let mut udp_coverage = table_coverage("udp");
 
         loop {
             ticker.tick().await;
 
-            let inode_map = tokio::task::spawn_blocking(build_inode_pid_map)
-                .await
-                .unwrap_or_default();
-
-            // Per-socket byte/packet/rtt counters (best-effort; empty without
-            // privilege). Keyed by socket inode, joined onto TCP flows below.
-            let diag = tokio::task::spawn_blocking(super::inet_diag::query_tcp)
-                .await
-                .unwrap_or_default();
-
-            // ── TCP (established only) ──────────────────────────────────────
-            for (family, table) in [procfs::net::tcp(), procfs::net::tcp6()]
-                .into_iter()
-                .enumerate()
-            {
-                let Some(tcp_entries) = observed_table(table, &mut tcp_coverage[family]) else {
-                    continue;
+            let (tcp_entries, udp_entries, inode_map, diag) = tokio::task::spawn_blocking(|| {
+                let tcp =
+                    read_tables::<procfs::net::TcpNetEntries>(["/proc/net/tcp", "/proc/net/tcp6"])
+                        .map(|tables| {
+                            tables
+                                .into_iter()
+                                .flat_map(|table| table.0)
+                                .filter(|entry| entry.state == TcpState::Established)
+                                .collect::<Vec<_>>()
+                        });
+                let udp =
+                    read_tables::<procfs::net::UdpNetEntries>(["/proc/net/udp", "/proc/net/udp6"])
+                        .map(|tables| {
+                            tables
+                                .into_iter()
+                                .flat_map(|table| table.0)
+                                .collect::<Vec<_>>()
+                        });
+                let wanted = tcp
+                    .iter()
+                    .flatten()
+                    .map(|entry| entry.inode)
+                    .chain(udp.iter().flatten().map(|entry| entry.inode))
+                    .collect();
+                let inode_map = build_inode_pid_map(&wanted);
+                let diag = if tcp.as_ref().is_ok_and(|t| !t.is_empty()) {
+                    super::inet_diag::query_tcp()
+                } else {
+                    HashMap::new()
                 };
+                (tcp, udp, inode_map, diag)
+            })
+            .await?;
+            tcp_coverage.set_failed(tcp_entries.is_err());
+            udp_coverage.set_failed(udp_entries.is_err());
+            if let Ok(tcp_entries) = tcp_entries {
                 let mut new_tcp: HashMap<String, FlowInfo> = HashMap::new();
                 for entry in &tcp_entries {
                     if entry.state != TcpState::Established {
@@ -248,7 +304,7 @@ impl Collector for NetworkCollector {
                     new_tcp.insert(key, flow);
                 }
                 if reconcile(
-                    &mut self.known_tcp[family],
+                    &mut self.known_tcp,
                     new_tcp,
                     "established",
                     &tx,
@@ -260,16 +316,10 @@ impl Collector for NetworkCollector {
                 {
                     return Ok(());
                 }
+            } else {
+                warn!("TCP table incomplete; retaining previous observations");
             }
-
-            // ── UDP (all sockets) ────────────────────────────────────────────
-            for (family, table) in [procfs::net::udp(), procfs::net::udp6()]
-                .into_iter()
-                .enumerate()
-            {
-                let Some(udp_entries) = observed_table(table, &mut udp_coverage[family]) else {
-                    continue;
-                };
+            if let Ok(udp_entries) = udp_entries {
                 let mut new_udp: HashMap<String, FlowInfo> = HashMap::new();
                 for entry in &udp_entries {
                     let (pid, process_start_time, process) =
@@ -295,7 +345,7 @@ impl Collector for NetworkCollector {
                     new_udp.insert(key, flow);
                 }
                 if reconcile(
-                    &mut self.known_udp[family],
+                    &mut self.known_udp,
                     new_udp,
                     "open",
                     &tx,
@@ -307,6 +357,8 @@ impl Collector for NetworkCollector {
                 {
                     return Ok(());
                 }
+            } else {
+                warn!("UDP table incomplete; retaining previous observations");
             }
         }
     }
@@ -314,21 +366,6 @@ impl Collector for NetworkCollector {
 
 fn table_coverage(table: &str) -> crate::telemetry::coverage::SourceCoverage {
     crate::telemetry::coverage::SourceCoverage::new(format!("NetworkCollector/{table}"))
-}
-
-/// A failed read provides no evidence that the sockets in this family closed.
-fn observed_table<T>(
-    table: procfs::ProcResult<Vec<T>>,
-    coverage: &mut crate::telemetry::coverage::SourceCoverage,
-) -> Option<Vec<T>> {
-    coverage.set_failed(table.is_err());
-    match table {
-        Ok(entries) => Some(entries),
-        Err(error) => {
-            warn!(%error, "Network socket table unavailable");
-            None
-        }
-    }
 }
 
 /// Stable socket key (protocol, 4-tuple and inode). Built from parsed fields, so it
@@ -421,20 +458,6 @@ async fn emit(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn failed_table_is_distinct_from_an_empty_snapshot() {
-        let mut coverage = table_coverage("unit-test");
-        assert!(observed_table::<u8>(
-            Err(procfs::ProcError::PermissionDenied(None)),
-            &mut coverage
-        )
-        .is_none());
-        assert_eq!(
-            observed_table::<u8>(Ok(vec![]), &mut coverage),
-            Some(vec![])
-        );
-    }
 
     #[test]
     fn flow_start_and_close_keep_the_observed_process_generation() {

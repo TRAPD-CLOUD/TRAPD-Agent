@@ -51,10 +51,11 @@ const MAX_ENV_VAL: usize = 512;
 /// sorted and deduplicated, capped at [`MAX_LIBS`]. Best-effort: an empty list
 /// just means the process exited or had no file-backed mappings yet.
 pub fn loaded_libraries(pid: u32) -> Vec<String> {
-    let maps = match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
-        Ok(m) => m,
-        Err(_) => return Vec::new(),
-    };
+    let maps =
+        match crate::collectors::read_text_capped(format!("/proc/{pid}/maps"), 2 * 1024 * 1024) {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
     let mut libs = std::collections::BTreeSet::new();
     for line in maps.lines() {
         // Format: addr perms offset dev inode  pathname
@@ -137,7 +138,7 @@ const SECRET_MARKERS: &[&str] = &[
 /// telemetry never exfiltrates live credentials. Returned map is empty when the
 /// process exited or `environ` was unreadable (it is root-readable only).
 pub fn curated_env(pid: u32) -> BTreeMap<String, String> {
-    let raw = match std::fs::read(format!("/proc/{pid}/environ")) {
+    let raw = match crate::collectors::read_capped(format!("/proc/{pid}/environ"), 128 * 1024) {
         Ok(b) => b,
         Err(_) => return BTreeMap::new(),
     };
@@ -368,7 +369,8 @@ pub struct ContainerFacts {
 /// runtime state files (see [`super::container`]), falling back to the process
 /// environment / downward API when the runtime metadata is unreadable.
 pub fn container_context(pid: u32, env: &BTreeMap<String, String>) -> ContainerFacts {
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    let cgroup = crate::collectors::read_text_capped(format!("/proc/{pid}/cgroup"), 64 * 1024)
+        .unwrap_or_default();
     let (container_id, runtime, mut pod_uid) = parse_cgroup(&cgroup);
 
     // Enrich from the runtime state: image name/digest + k8s labels.

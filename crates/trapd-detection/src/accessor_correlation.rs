@@ -107,6 +107,9 @@ fn file_name(norm_path: &str) -> &str {
 /// `needle` occurs in `haystack` delimited by start/end, whitespace, a path
 /// separator or `=`/`,`/`;` on both sides (so `a.txt` does not match `data.txt`).
 fn contains_token(haystack: &str, needle: &str) -> bool {
+    let Some(first) = needle.chars().next() else {
+        return false;
+    };
     let is_boundary = |c: char| c.is_whitespace() || matches!(c, '\\' | '=' | ',' | ';' | '\'');
     let mut from = 0;
     while let Some(i) = haystack[from..].find(needle) {
@@ -122,7 +125,8 @@ fn contains_token(haystack: &str, needle: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        from = start + 1;
+        // Preserve overlapping occurrences while keeping the next slice on a scalar boundary.
+        from = start + first.len_utf8();
         if from >= haystack.len() {
             break;
         }
@@ -135,15 +139,27 @@ impl RecentProcesses {
         self.expire(now);
         if self.entries.len() >= MAX_ENTRIES {
             self.entries.pop_front();
+            trapd_schema::runtime::runtime().state_capacity_dropped(1);
         }
-        let mut data = p.clone();
-        if data.cmdline.len() > MAX_CMDLINE {
-            let mut cut = MAX_CMDLINE;
-            while !data.cmdline.is_char_boundary(cut) {
-                cut -= 1;
+        // Clone only the bounded evidence retained for lookup and lineage.
+        let bounded = |s: &str, limit| {
+            let (value, truncated) = trapd_schema::limits::truncate_str(s, limit);
+            if truncated.is_some() {
+                trapd_schema::runtime::runtime().enrichment_truncation();
             }
-            data.cmdline.truncate(cut);
-        }
+            value
+        };
+        let data = ProcessCreateData {
+            pid: p.pid,
+            ppid: p.ppid,
+            process_start_time: p.process_start_time,
+            uid: p.uid,
+            name: bounded(&p.name, MAX_CMDLINE),
+            username: bounded(&p.username, MAX_CMDLINE),
+            exe: bounded(&p.exe, 4096),
+            cmdline: bounded(&p.cmdline, MAX_CMDLINE),
+            ..Default::default()
+        };
         let norm_cmdline = normalise(&data.cmdline);
         self.entries.push_back(Entry {
             seen: now,
@@ -407,6 +423,22 @@ mod tests {
         assert_eq!(m.lineage.username, "CORP\\bob");
         assert_eq!(m.lineage.ancestors[0].comm, "explorer.exe");
         assert!(m.reason().contains("inferred"));
+    }
+
+    #[test]
+    fn unicode_token_can_follow_a_partial_match() {
+        assert!(contains_token("xécole école", "école"));
+        assert!(!contains_token("précole", "école"));
+    }
+
+    #[test]
+    fn cache_only_allocates_space_for_captured_command_line() {
+        let mut recent = RecentProcesses::default();
+        let oversized = "é".repeat(65_536);
+        recent.record(&proc(42, 1, "worker", &oversized), Instant::now());
+        let stored = &recent.entries[0].data.cmdline;
+        assert_eq!(stored, &oversized[..MAX_CMDLINE]);
+        assert!(stored.capacity() < 2 * MAX_CMDLINE);
     }
 
     #[test]

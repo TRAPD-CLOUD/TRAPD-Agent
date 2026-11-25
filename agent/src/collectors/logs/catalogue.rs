@@ -311,8 +311,18 @@ pub fn resolve(cfg: &crate::config::AgentConfig) -> Vec<LogSourceConfig> {
         out.extend(discover());
     }
     for src in &cfg.logs {
+        if out.len() >= 24 && !out.iter().any(|s| s.name == src.name) {
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            continue;
+        }
         out.retain(|s| s.name != src.name);
-        out.push(src.clone());
+        let mut src = src.clone();
+        src.max_line_bytes = src.max_line_bytes.min(64 * 1024);
+        if let Some(ml) = &mut src.multiline {
+            ml.max_bytes = ml.max_bytes.min(64 * 1024);
+            ml.max_lines = ml.max_lines.min(128);
+        }
+        out.push(src);
     }
     out
 }

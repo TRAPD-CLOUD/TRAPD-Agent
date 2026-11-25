@@ -223,11 +223,12 @@ async fn run_file_source(
     hostname: String,
 ) {
     let mut coverage = SourceCoverage::new(format!("log:{}", src.name));
-    let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
+    const MAX_TAILS: usize = 8;
     let mut watches: Vec<FileWatch> = Vec::new();
     let mut limiter = RateLimiter::new(src.max_eps);
     let mut last_glob = std::time::Instant::now() - GLOB_REFRESH;
     let mut ticker = tokio::time::interval(FILE_POLL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         if tx.is_closed() {
@@ -235,11 +236,19 @@ async fn run_file_source(
         }
         ticker.tick().await;
 
-        if last_glob.elapsed() >= GLOB_REFRESH || watches.is_empty() {
+        if last_glob.elapsed() >= GLOB_REFRESH {
             last_glob = std::time::Instant::now();
             let paths = expand_paths(&src.path, &src.exclude);
+            watches.retain(|w| {
+                !w.tail.can_retire() || paths.contains(&w.tail.path) || w.framer.has_pending()
+            });
+            let mut refused = 0;
             for p in paths {
-                if seen.insert(p.clone()) {
+                if !watches.iter().any(|w| w.tail.path == p) {
+                    if watches.len() == MAX_TAILS {
+                        refused += 1;
+                        continue;
+                    }
                     let key = file_key(&src.name, &p.to_string_lossy());
                     let cp = store.lock().ok().and_then(|s| s.get_file(&key).cloned());
                     info!(source = %src.name, path = %p.display(), "file tail armed");
@@ -251,6 +260,7 @@ async fn run_file_source(
                     });
                 }
             }
+            metrics().state_capacity_dropped(refused);
         }
 
         let mut poll_failed = false;
@@ -488,7 +498,13 @@ async fn run_journal_source(
             }
         }
     }
-    tail.kill().await;
+    if tail.finish().await && cursor.is_some() {
+        metrics().event_dropped(DropReason::InternalError);
+        if let Ok(mut store) = store.lock() {
+            store.forget_journal(&key);
+            store.flush(Duration::ZERO, true);
+        }
+    }
 }
 
 async fn run_syslog_source(

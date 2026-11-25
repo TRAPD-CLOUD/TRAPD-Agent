@@ -106,10 +106,8 @@ impl Settings {
 }
 
 fn read_capped(path: &Path) -> Option<String> {
-    if std::fs::metadata(path).ok()?.len() > MAX_FILE_BYTES {
-        return None;
-    }
-    std::fs::read_to_string(path).ok()
+    let resolved = std::fs::canonicalize(path).ok()?;
+    String::from_utf8(crate::paths::bounded_regular_bytes(&resolved, MAX_FILE_BYTES).ok()?).ok()
 }
 
 #[cfg(test)]

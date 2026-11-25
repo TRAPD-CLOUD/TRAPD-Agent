@@ -24,6 +24,8 @@ mod collect;
 #[path = "windows.rs"]
 pub(crate) mod collect;
 pub mod compliance;
+#[cfg(target_os = "linux")]
+pub(crate) mod host_command;
 pub mod windows_drivers;
 pub mod windows_hardening;
 
@@ -281,6 +283,7 @@ impl InventoryReporter {
             INVENTORY_INTERVAL,
         );
 
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             self.collect_and_report().await;
@@ -306,7 +309,7 @@ impl InventoryReporter {
                         vuln_scan: c.vuln_scan_enabled,
                         cis: c.cis_benchmark_enabled,
                     },
-                    c.cve_feed.clone(),
+                    compliance::bounded_feed(&c.cve_feed),
                 )
             })
             .unwrap_or_default();

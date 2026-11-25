@@ -71,7 +71,7 @@ struct SiemSink {
     syslog: Option<SyslogSink>,
     hec_url: Option<String>,
     hec_token: Option<String>,
-    http: Arc<reqwest::Client>,
+    http: Option<reqwest::Client>,
 }
 
 impl SiemForwarder {
@@ -88,7 +88,7 @@ impl SiemForwarder {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_default();
+            .ok();
         Self {
             queue: Arc::new(OnceCell::new()),
             misses: Arc::new(AtomicU64::new(0)),
@@ -99,7 +99,7 @@ impl SiemForwarder {
                 syslog,
                 hec_url: Some(cfg.siem_hec_url.clone()).filter(|s| !s.is_empty()),
                 hec_token: Some(cfg.siem_hec_token.clone()).filter(|s| !s.is_empty()),
-                http: Arc::new(http),
+                http,
             }),
         }
     }
@@ -122,37 +122,51 @@ impl SiemForwarder {
             .get_or_init(|| async {
                 let (tx, mut rx) = mpsc::channel::<AgentEvent>(FORWARD_QUEUE_CAPACITY);
                 let sink = Arc::clone(&self.sink);
+                let misses = Arc::clone(&self.misses);
                 tokio::spawn(async move {
                     while let Some(event) = rx.recv().await {
-                        sink.deliver(&event).await;
+                        sink.deliver(&event, &misses).await;
                     }
                 });
                 tx
             })
             .await;
-        if sender.try_send(event.clone()).is_err() {
-            let total = self.misses.fetch_add(1, Ordering::Relaxed) + 1;
-            if total == 1 || total.is_multiple_of(1000) {
-                warn!(
-                    forwarding_misses = total,
-                    "SIEM forwarding queue full or closed — optional delivery skipped"
-                );
+        match sender.try_reserve() {
+            Ok(slot) => {
+                slot.send(event.clone());
             }
+            Err(_) => record_miss(&self.misses),
         }
     }
 }
 
+fn record_miss(misses: &AtomicU64) {
+    crate::telemetry::metrics::metrics().siem_delivery_misses();
+    let total = misses.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if total == 1 || total.is_multiple_of(1000) {
+        warn!(forwarding_misses = total, "optional SIEM delivery missed");
+    }
+}
+
 impl SiemSink {
-    async fn deliver(&self, event: &AgentEvent) {
+    async fn deliver(&self, event: &AgentEvent, misses: &AtomicU64) {
         let line = format_line(event, self.fmt, &self.version);
         if let Some(sink) = &self.syslog {
             let framed = rfc5424(event, &line);
-            if let Err(e) = self.send_syslog(sink, framed.as_bytes()).await {
-                debug!(error = %e, "syslog forward failed");
+            if !matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    self.send_syslog(sink, framed.as_bytes())
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                record_miss(misses);
             }
         }
         if let (Some(url), Some(token)) = (&self.hec_url, &self.hec_token) {
             if let Err(e) = self.send_hec(url, token, event, &line).await {
+                record_miss(misses);
                 debug!(error = %e, "HEC forward failed");
             }
         }
@@ -198,13 +212,15 @@ impl SiemSink {
         });
         let resp = self
             .http
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("HEC client unavailable"))?
             .post(url)
             .header("Authorization", format!("Splunk {token}"))
             .json(&body)
             .send()
             .await?;
         if !resp.status().is_success() {
-            warn!(status = %resp.status(), "HEC endpoint rejected event");
+            anyhow::bail!("HEC endpoint rejected event with {}", resp.status());
         }
         Ok(())
     }

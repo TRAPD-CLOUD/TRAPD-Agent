@@ -82,10 +82,10 @@ pub async fn send_durable_outcome(
         let mut waiters = waiters()
             .lock()
             .map_err(|_| anyhow::anyhow!("durable handoff unavailable"))?;
-        anyhow::ensure!(
-            waiters.len() < super::CHANNEL_CAPACITY,
-            "too many durable handoffs"
-        );
+        if waiters.len() >= super::CHANNEL_CAPACITY {
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            anyhow::bail!("too many durable handoffs");
+        }
         anyhow::ensure!(
             !waiters.contains_key(&event.event_id),
             "duplicate durable handoff"

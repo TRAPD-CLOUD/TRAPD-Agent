@@ -105,34 +105,68 @@ async fn tail_file(
     // Start at the end — ignore historical entries.
     let mut offset = reader.seek(std::io::SeekFrom::End(0)).await?;
     let mut ticker = interval(Duration::from_secs(2));
-    let mut line = String::new();
+    use std::os::unix::fs::MetadataExt;
+    let mut identity = reader.get_ref().metadata().await?;
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut line = Vec::new();
+    let mut discarding = false;
 
     loop {
         ticker.tick().await;
 
-        // Handle log rotation / truncation: if the file shrank, logrotate
-        // rotated or truncated it — reopen the path from the start.
+        if tx.is_closed() {
+            return Ok(());
+        }
         if let Ok(meta) = tokio::fs::metadata(&path).await {
-            if meta.len() < offset {
-                if let Ok(f) = File::open(&path).await {
-                    reader = BufReader::new(f);
+            let replaced = (meta.dev(), meta.ino()) != (identity.dev(), identity.ino());
+            if (replaced && reader.get_ref().metadata().await?.len() <= offset)
+                || (!replaced && meta.len() < offset)
+            {
+                if let Ok(file) = File::open(&path).await {
+                    identity = file.metadata().await?;
+                    reader = BufReader::new(file);
+                    if !line.is_empty() {
+                        crate::telemetry::metrics::metrics()
+                            .event_dropped(crate::telemetry::DropReason::InternalError);
+                    }
+                    line.clear();
+                    discarding = false;
                     offset = 0;
                 }
             }
         }
-
         loop {
-            line.clear();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                break; // no new data yet
+            let chunk = reader.fill_buf().await?;
+            if chunk.is_empty() {
+                break;
             }
-            offset += n as u64;
-            let trimmed = line.trim_end();
-            if let Some(event) = parse_auth_line(trimmed, agent_id.clone(), hostname.clone()) {
-                if tx.send(event).await.is_err() {
-                    return Ok(()); // channel closed
+            let newline = chunk.iter().position(|b| *b == b'\n');
+            let n = newline.map_or(chunk.len(), |i| i + 1);
+            if !discarding {
+                if n > JOURNAL_MAX_LINE.saturating_sub(line.len()) {
+                    discarding = true;
+                    line.clear();
+                    crate::telemetry::metrics::metrics()
+                        .event_dropped(crate::telemetry::DropReason::EventTooLarge);
+                } else {
+                    line.extend_from_slice(&chunk[..n]);
                 }
+            }
+            reader.consume(n);
+            offset = offset.saturating_add(n as u64);
+            if newline.is_some() {
+                if !discarding {
+                    let text = String::from_utf8_lossy(&line);
+                    if let Some(event) =
+                        parse_auth_line(text.trim_end(), agent_id.clone(), hostname.clone())
+                    {
+                        if tx.send(event).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+                line.clear();
+                discarding = false;
             }
         }
     }

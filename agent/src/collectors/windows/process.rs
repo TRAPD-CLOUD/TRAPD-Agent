@@ -140,6 +140,7 @@ impl Collector for ProcessCollector {
         hostname: String,
     ) -> Result<()> {
         let mut ticker = interval(POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         info!("WindowsProcessCollector: polling process table every 3s");
         crate::telemetry::metrics::metrics()
             .set_collector_mode(crate::telemetry::metrics::CollectorMode::WindowsPolling);

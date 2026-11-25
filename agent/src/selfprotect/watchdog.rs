@@ -132,7 +132,10 @@ pub fn stop() {
 pub fn run_watchdog(monitored_pid: u32) -> ! {
     info!(monitored_pid, "Watchdog mode: monitoring agent process");
 
-    let exe = std::env::current_exe().expect("Watchdog: cannot resolve current executable path");
+    let exe = std::env::current_exe().unwrap_or_else(|error| {
+        warn!(%error, "Watchdog cannot resolve the executable to restart");
+        process::exit(1);
+    });
 
     let proc_dir = format!("/proc/{monitored_pid}");
 

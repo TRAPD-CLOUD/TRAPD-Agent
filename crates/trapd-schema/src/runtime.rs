@@ -16,6 +16,7 @@ pub trait Runtime: Send + Sync {
     fn enrichment_failure(&self) {}
     fn enrichment_truncation(&self) {}
     fn enrichment_partial(&self) {}
+    fn state_capacity_dropped(&self, _n: u64) {}
 }
 struct DefaultRuntime {
     boot_id: String,

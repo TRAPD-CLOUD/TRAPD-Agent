@@ -374,6 +374,9 @@ impl Collector for HoneytokenCollector {
                 .context("spawn legacy registry decoy cleanup thread")?;
         }
 
+        // The receiver sees disconnection even if a supervisor drops this run
+        // while its output pipeline is still open.
+        let (_watch_lifetime, watch_stop) = std::sync::mpsc::sync_channel::<()>(0);
         // Filesystem watcher (ReadDirectoryChangesW via `notify`), rebuilt when
         // the configured token set changes.
         {
@@ -384,7 +387,7 @@ impl Collector for HoneytokenCollector {
             let state = Arc::clone(&state);
             std::thread::Builder::new()
                 .name("trapd-fs-honeytokens".into())
-                .spawn(move || fs_watch_loop(tx, agent_id, hostname, config, state))
+                .spawn(move || fs_watch_loop(tx, agent_id, hostname, config, state, watch_stop))
                 .context("spawn filesystem honeytoken watcher thread")?;
         }
 
@@ -628,11 +631,13 @@ fn fs_watch_loop(
     hostname: String,
     config: Arc<RwLock<AgentConfig>>,
     state: Arc<FsState>,
+    stop: std::sync::mpsc::Receiver<()>,
 ) {
-    loop {
+    use std::sync::mpsc::RecvTimeoutError;
+    while !tx.is_closed() && stop.try_recv() == Err(std::sync::mpsc::TryRecvError::Empty) {
         let paths = configured_paths(&config);
         if paths.is_empty() {
-            std::thread::sleep(Duration::from_secs(30));
+            let _ = stop.recv_timeout(Duration::from_secs(30));
             continue;
         }
         let tokens: HashSet<PathBuf> = paths
@@ -645,14 +650,15 @@ fn fs_watch_loop(
             .filter_map(|p| p.parent().map(Path::to_path_buf))
             .collect();
 
-        let (ntx, nrx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let (ntx, nrx) = std::sync::mpsc::sync_channel(128);
+        let callback_tokens = tokens.clone();
         let mut watcher = match notify::recommended_watcher(move |res| {
-            let _ = ntx.send(res);
+            enqueue_decoy_change(res, &callback_tokens, &ntx);
         }) {
             Ok(w) => w,
             Err(e) => {
                 warn!(error = %e, "honeytoken: cannot create filesystem watcher — retrying");
-                std::thread::sleep(Duration::from_secs(60));
+                let _ = stop.recv_timeout(Duration::from_secs(60));
                 continue;
             }
         };
@@ -671,29 +677,51 @@ fn fs_watch_loop(
             "filesystem honeytoken watch armed"
         );
 
+        let mut check = Instant::now() + Duration::from_secs(5);
         loop {
-            match nrx.recv_timeout(Duration::from_secs(5)) {
+            if tx.is_closed() || stop.try_recv() != Err(std::sync::mpsc::TryRecvError::Empty) {
+                return;
+            }
+            if Instant::now() >= check {
+                let current = configured_paths(&config);
+                let current_tokens: HashSet<_> =
+                    current.iter().filter(|p| owns_path(p)).cloned().collect();
+                if watched < dirs.len() || current != paths || current_tokens != tokens {
+                    break;
+                }
+                check = Instant::now() + Duration::from_secs(5);
+            }
+            match nrx.recv_timeout(check.saturating_duration_since(Instant::now())) {
                 Ok(Ok(event)) => {
                     handle_fs_event(&event, &tokens, &tx, &agent_id, &hostname, &state)
                 }
-                Ok(Err(e)) => warn!(error = %e, "honeytoken: watcher reported an error"),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // Pick up a config-delivered change to the token set.
-                    let current = configured_paths(&config);
-                    let current_tokens: HashSet<PathBuf> = current
-                        .iter()
-                        .filter(|path| owns_path(path))
-                        .cloned()
-                        .collect();
-                    if current != paths || current_tokens != tokens {
-                        info!("honeytoken paths changed — rebuilding filesystem watch");
-                        break;
-                    }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "honeytoken: watcher reported an error");
+                    let _ = stop.recv_timeout(Duration::from_secs(5));
+                    break;
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         drop(watcher);
+    }
+}
+
+fn enqueue_decoy_change(
+    mut event: notify::Result<notify::Event>,
+    tokens: &HashSet<PathBuf>,
+    tx: &std::sync::mpsc::SyncSender<notify::Result<notify::Event>>,
+) {
+    if let Ok(event) = &mut event {
+        event.paths.retain(|p| tokens.contains(p));
+        if event.paths.is_empty() {
+            return;
+        }
+    }
+    if tx.try_send(event).is_err() {
+        crate::telemetry::metrics::metrics()
+            .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
     }
 }
 
@@ -1769,4 +1797,25 @@ fn plant_adaptive_file(path: &Path, bait: &[u8], mimic_unix: i64) -> Result<()> 
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod watcher_queue_tests {
+    use super::*;
+
+    #[test]
+    fn unrelated_paths_never_fill_the_decoy_queue() {
+        let watched = PathBuf::from("decoy");
+        let tokens = HashSet::from([watched.clone()]);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        for path in [PathBuf::from("sibling"), watched.clone(), watched.clone()] {
+            enqueue_decoy_change(
+                Ok(notify::Event::new(notify::EventKind::Any).add_path(path)),
+                &tokens,
+                &tx,
+            );
+        }
+        assert_eq!(rx.try_recv().unwrap().unwrap().paths, vec![watched]);
+        assert!(rx.try_recv().is_err());
+    }
 }

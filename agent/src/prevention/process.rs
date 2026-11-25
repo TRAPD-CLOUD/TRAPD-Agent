@@ -25,19 +25,6 @@ use crate::schema::ExecEventData;
 use super::audit::AuditEmitter;
 use super::policy::{Match, PolicyHandle, RuleAction};
 
-/// Send SIGKILL to the given PID.  Errors if the process is gone or we lack
-/// permission (in which case the audit event records `success=false`).
-pub fn kill_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if observed_start.is_none() {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        return kill(Pid::from_raw(pid), Signal::SIGKILL)
-            .with_context(|| format!("SIGKILL pid={pid} failed"));
-    }
-    kill_observed(pid, observed_start)
-}
-
 /// Kill the process an exec event describes. Where the event carries the
 /// process start time (Windows) the kill is bound to that identity, so a PID
 /// reused since the event cannot be hit.
@@ -113,8 +100,13 @@ fn signal_observed(pid: i32, observed_start: Option<u64>, signal: i32) -> Result
     }
     // SAFETY: successful pidfd_open transferred one valid owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let stat = procfs::process::Process::new(pid)?.stat()?;
     anyhow::ensure!(
-        crate::telemetry::identity::process_start_time(pid) == Some(expected),
+        !crate::collectors::linux::process::is_kernel_thread(&stat),
+        "refusing to signal a kernel thread"
+    );
+    anyhow::ensure!(
+        stat.starttime == expected,
         "pid {pid} belongs to a different or unknown process; refusing"
     );
     // SAFETY: valid pidfd, signal, no siginfo and no flags.
@@ -131,33 +123,6 @@ fn signal_observed(pid: i32, observed_start: Option<u64>, signal: i32) -> Result
         return Err(std::io::Error::last_os_error()).context("pidfd_send_signal");
     }
     Ok(())
-}
-
-/// Freeze a process by sending SIGSTOP — the "jail" response. The process is
-/// suspended (not killed), so it cannot react or destroy evidence while a
-/// snapshot is taken and an operator decides what to do ("freeze, snapshot, then
-/// decide" — issue #32, point 5). Resume with [`thaw_pid`].
-pub fn freeze_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if observed_start.is_none() {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        return kill(Pid::from_raw(pid), Signal::SIGSTOP)
-            .with_context(|| format!("SIGSTOP pid={pid} failed"));
-    }
-    freeze_observed(pid, observed_start)
-}
-
-/// Resume a previously-frozen process by sending SIGCONT.
-pub fn thaw_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if observed_start.is_none() {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        return kill(Pid::from_raw(pid), Signal::SIGCONT)
-            .with_context(|| format!("SIGCONT pid={pid} failed"));
-    }
-    thaw_observed(pid, observed_start)
 }
 
 /// Look up the parent's comm by PPID.
@@ -310,6 +275,15 @@ pub fn enforce_exec(
 mod tests {
     use super::super::policy::{IocRule, PolicyStore};
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_thread_guard_uses_the_kernel_flag() {
+        let mut stat = procfs::process::Process::myself().unwrap().stat().unwrap();
+        assert!(!crate::collectors::linux::process::is_kernel_thread(&stat));
+        stat.flags |= 0x0020_0000;
+        assert!(crate::collectors::linux::process::is_kernel_thread(&stat));
+    }
 
     #[test]
     fn process_create_policy_view_preserves_observed_parent_generation() {

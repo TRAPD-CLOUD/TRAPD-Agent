@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::warn;
 
 #[cfg(not(target_os = "windows"))]
 const DEFAULT_STATE_DIR: &str = "/var/lib/trapd";
@@ -123,7 +123,7 @@ pub(crate) fn binary_baseline_line(hash_hex: &str) -> String {
 
 /// Open an untrusted on-disk file for bounded reading. Links, reparse points
 /// and special files are refused before any content is read.
-fn open_bounded_regular(path: &Path, max_bytes: u64) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_bounded_regular(path: &Path, max_bytes: u64) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -222,7 +222,14 @@ fn dir_from_env(env: &str, default: PathBuf) -> PathBuf {
 /// Falling back then would silently discard identity and replay protection.
 /// Developer fallbacks are only considered for locations that do not exist.
 fn resolve_state_dir() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    let privileged = nix::unistd::Uid::effective().is_root();
+    #[cfg(windows)]
+    let privileged = crate::winacl::is_elevated();
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let privileged = false;
     resolve_state_dir_from(
+        privileged,
         std::env::var("TRAPD_STATE_DIR")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -234,6 +241,7 @@ fn resolve_state_dir() -> PathBuf {
 }
 
 fn resolve_state_dir_from(
+    privileged: bool,
     explicit: Option<PathBuf>,
     canonical: PathBuf,
     fallbacks: Vec<PathBuf>,
@@ -245,7 +253,7 @@ fn resolve_state_dir_from(
     }
 
     // 2. Canonical system location.
-    if existing_or_inaccessible(&canonical) || ensure_writable(&canonical) {
+    if privileged || existing_or_inaccessible(&canonical) || ensure_writable(&canonical) {
         return canonical;
     }
 
@@ -296,8 +304,13 @@ fn ensure_writable(dir: &Path) -> bool {
     }
     // Probe with a temp file; some paths exist but are not writable for us.
     let probe = dir.join(".trapd_write_probe");
-    match std::fs::write(&probe, b"") {
-        Ok(_) => {
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
             let _ = std::fs::remove_file(&probe);
             true
         }
@@ -319,6 +332,13 @@ fn current_uid() -> u32 {
 
 /// Ensure the state directory exists and is owner-only (`0700`).  Called once at
 /// startup; logs but does not fail on permission errors.
+#[cfg(target_os = "linux")]
+pub fn init_state_dir() -> Result<()> {
+    private_directory(state_dir()).context("cannot secure agent state directory")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn init_state_dir() {
     let dir = state_dir();
     if let Err(e) = std::fs::create_dir_all(dir) {
@@ -326,17 +346,76 @@ pub fn init_state_dir() {
         return;
     }
     harden_dir_perms(dir);
-    info!(state = %dir.display(), config = %config_dir().display(), "filesystem layout resolved");
+    tracing::info!(state = %dir.display(), config = %config_dir().display(), "filesystem layout resolved");
 }
 
+/// A privileged writer must be able to trust each parent for the lifetime
+/// of subsequent pathname opens. A root-owned sticky directory allows an
+/// owned child (e.g. a private test/service directory below /tmp).
 #[cfg(target_os = "linux")]
-fn harden_dir_perms(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(dir) {
-        let mut perms = meta.permissions();
-        perms.set_mode(0o700);
-        let _ = std::fs::set_permissions(dir, perms);
+pub(crate) fn private_directory(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    let path = std::path::absolute(path)?;
+    anyhow::ensure!(
+        path.file_name().is_some()
+            && !path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir),
+        "invalid private directory path"
+    );
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        let std::path::Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&current)
+        };
+        let directory = match open() {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::DirBuilder::new().mode(0o700).create(&current) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e).context("create private directory component"),
+                }
+                open()?
+            }
+            Err(e) => return Err(e).context("open private directory component"),
+        };
+        let meta = directory.metadata()?;
+        if current == path {
+            anyhow::ensure!(
+                meta.uid() == uid && meta.mode() & 0o1000 == 0,
+                "unsafe private directory owner or sticky bit"
+            );
+            ensure_mode(&directory, 0o700)?;
+            return Ok(directory);
+        }
+        anyhow::ensure!(
+            (meta.uid() == 0 || meta.uid() == uid)
+                && (meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0),
+            "untrusted ancestor of private directory"
+        );
     }
+    anyhow::bail!("missing private directory component")
+}
+
+/// Set `mode` only when it differs. An unconditional `fchmod` raises
+/// `IN_ATTRIB` on every write, which the agent's own tamper watch reports as a
+/// critical `chmod` of its log (a self-inflicted feedback loop).
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_mode(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if file.metadata()?.permissions().mode() & 0o7777 != mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
 }
 
 /// Windows: restrict the directory to `SYSTEM` + `Administrators`, the analogue
@@ -421,8 +500,10 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     let tmp = parent.join(format!(
         ".{}.tmp.{}",
         path.file_name().and_then(|s| s.to_str()).unwrap_or("trapd"),
-        std::process::id()
+        uuid::Uuid::new_v4()
     ));
+    let mut f = create_secure_tmp(&tmp, mode)
+        .with_context(|| format!("create secure temp {}", tmp.display()))?;
 
     let write_result = (|| -> Result<()> {
         // The temp file is created *already* restricted to `mode` — never
@@ -430,8 +511,6 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
         // (umask-derived) mode and chmod'ing afterward leaves a window where a
         // co-resident local user can read secrets (e.g. credentials.json)
         // mid-write.
-        let mut f = create_secure_tmp(&tmp, mode)
-            .with_context(|| format!("create secure temp {}", tmp.display()))?;
         use std::io::Write as _;
         f.write_all(contents)
             .with_context(|| format!("write temp {}", tmp.display()))?;
@@ -504,29 +583,18 @@ fn durable_replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
 /// requested mode — no separate `chmod` step, so no window where the file is
 /// readable at the umask-derived default mode).
 ///
-/// Any stale leftover at `path` (e.g. from a previous crashed run) is removed
-/// first: reusing an existing file via a plain `create(true)` would silently
-/// keep its old — possibly permissive — mode bits, since `mode()` only
-/// applies when the file is actually created.
-#[cfg(target_os = "linux")]
+/// A collision belongs to another writer. Never truncate or unlink its file.
 fn create_secure_tmp(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let _ = std::fs::remove_file(path);
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn create_secure_tmp(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
-    let _ = std::fs::remove_file(path);
-    let f = std::fs::File::create(path)?;
-    let _ = mode; // no portable mode-on-create outside unix targets
-    Ok(f)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    options.open(path)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -574,6 +642,7 @@ mod tests {
         let fallback = root.join("fallback");
         assert_eq!(
             resolve_state_dir_from(
+                false,
                 Some(blocked.clone()),
                 root.join("canonical"),
                 vec![fallback.clone()],
@@ -583,6 +652,7 @@ mod tests {
         );
         assert_eq!(
             resolve_state_dir_from(
+                false,
                 None,
                 blocked.clone(),
                 vec![fallback.clone()],
@@ -592,9 +662,54 @@ mod tests {
         );
         let inaccessible = blocked.join("state");
         assert_eq!(
-            resolve_state_dir_from(None, inaccessible.clone(), vec![fallback], root.join("tmp")),
+            resolve_state_dir_from(
+                false,
+                None,
+                inaccessible.clone(),
+                vec![fallback],
+                root.join("tmp")
+            ),
             inaccessible
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn privileged_state_resolution_never_uses_developer_paths() {
+        let root = scratch_dir("privileged-state");
+        let canonical = root.join("missing");
+        let fallback = root.join("developer");
+        assert_eq!(
+            resolve_state_dir_from(
+                true,
+                None,
+                canonical.clone(),
+                vec![fallback.clone()],
+                root.join("temporary")
+            ),
+            canonical
+        );
+        assert!(!fallback.exists());
+        std::fs::write(root.join(".trapd_write_probe"), "occupied").unwrap();
+        assert!(!ensure_writable(&root));
+        assert_eq!(
+            std::fs::read(root.join(".trapd_write_probe")).unwrap(),
+            b"occupied"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_state_ancestor_is_rejected_without_creating_or_chmodding_target() {
+        let root = scratch_dir("linked-state");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("alias")).unwrap();
+        assert!(private_directory(&root.join("alias/state")).is_err());
+        assert!(!real.join("state").exists());
+        assert!(private_directory(&root.join("alias")).is_err());
+        assert!(private_directory(&root.join("safe/state")).is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -622,18 +737,24 @@ mod tests {
     /// permissions) must never be silently reused — `create(true)` without
     /// `create_new` would keep the pre-existing (wrong) mode bits.
     #[test]
-    fn create_secure_tmp_discards_stale_leftover_with_wrong_mode() {
+    fn create_secure_tmp_refuses_stale_leftover_with_wrong_mode() {
         let dir = scratch_dir("stale_leftover");
         let path = dir.join("secret.tmp");
 
         std::fs::write(&path, b"stale").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let f = create_secure_tmp(&path, 0o600).expect("create secure tmp");
-        let mode = f.metadata().unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "stale leftover mode must not survive");
-
-        drop(f);
+        assert_eq!(
+            create_secure_tmp(&path, 0o600).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"stale");
+        let dest = dir.join("secret");
+        write_atomic(&dest, b"fresh", 0o600).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -683,7 +804,7 @@ pub fn load_agent_env_file() {
         return;
     };
     for (key, value) in parse_agent_env(&contents) {
-        if std::env::var_os(&key).is_none() {
+        if key != "TRAPD_ENROLL_TOKEN" && std::env::var_os(&key).is_none() {
             std::env::set_var(key, value);
         }
     }
@@ -691,7 +812,7 @@ pub fn load_agent_env_file() {
 }
 
 /// `KEY=value` lines; blank lines and `#` comments skipped, surrounding quotes trimmed.
-fn parse_agent_env(contents: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_agent_env(contents: &str) -> Vec<(String, String)> {
     contents
         .lines()
         .map(str::trim)

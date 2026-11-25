@@ -89,6 +89,11 @@ impl FimCollector {
     }
 }
 
+fn size_delta(current: u64, previous: u64) -> i64 {
+    (i128::from(current) - i128::from(previous)).clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+        as i64
+}
+
 /// Pure diff of two path→state maps.  Kept separate from I/O so it is trivially
 /// unit-testable.  Returns modifications, additions and removals.
 fn diff(known: &HashMap<String, FileState>, current: &HashMap<String, FileState>) -> Vec<Change> {
@@ -100,7 +105,7 @@ fn diff(known: &HashMap<String, FileState>, current: &HashMap<String, FileState>
                 kind: ChangeKind::Modified,
                 expected: prev.sha256.clone(),
                 actual: cur.sha256.clone(),
-                size_delta: cur.size as i64 - prev.size as i64,
+                size_delta: size_delta(cur.size, prev.size),
             }),
             Some(_) => {}
             None => out.push(Change {
@@ -108,7 +113,7 @@ fn diff(known: &HashMap<String, FileState>, current: &HashMap<String, FileState>
                 kind: ChangeKind::Added,
                 expected: String::new(),
                 actual: cur.sha256.clone(),
-                size_delta: cur.size as i64,
+                size_delta: size_delta(cur.size, 0),
             }),
         }
     }
@@ -119,7 +124,7 @@ fn diff(known: &HashMap<String, FileState>, current: &HashMap<String, FileState>
                 kind: ChangeKind::Removed,
                 expected: prev.sha256.clone(),
                 actual: String::new(),
-                size_delta: -(prev.size as i64),
+                size_delta: size_delta(0, prev.size),
             });
         }
     }
@@ -224,16 +229,17 @@ fn preserve_unobserved(
 }
 
 fn load_baseline(path: &Path) -> Option<HashMap<String, FileState>> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::collectors::read_capped(path, 8 * 1024 * 1024).ok()?;
     let baseline: Baseline = serde_json::from_slice(&bytes).ok()?;
-    Some(baseline.files)
+    (baseline.files.len() <= MAX_FILES).then_some(baseline.files)
 }
 
 fn save_baseline(path: &Path, files: &HashMap<String, FileState>) {
-    let baseline = Baseline {
-        files: files.clone(),
-    };
-    let result = serde_json::to_vec(&baseline)
+    #[derive(Serialize)]
+    struct Snapshot<'a> {
+        files: &'a HashMap<String, FileState>,
+    }
+    let result = serde_json::to_vec(&Snapshot { files })
         .map_err(anyhow::Error::from)
         .and_then(|bytes| crate::paths::write_atomic(path, &bytes, 0o600));
     crate::telemetry::coverage::set_collector_failed("FimCollector/persistence", result.is_err());
@@ -300,7 +306,10 @@ impl Collector for FimCollector {
 
         let mut scan_status =
             crate::telemetry::coverage::SourceCoverage::new("FimCollector/scan".into());
-        let mut ticker = interval(Duration::from_secs(interval_secs.max(60)));
+        let mut ticker = interval(Duration::from_secs(
+            interval_secs.clamp(60, 365 * 24 * 3600),
+        ));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
 
@@ -383,6 +392,12 @@ impl Collector for FimCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_sizes_saturate_in_both_directions() {
+        assert_eq!(size_delta(u64::MAX, 1), i64::MAX);
+        assert_eq!(size_delta(0, 1u64 << 63), i64::MIN);
+    }
 
     fn state(sha: &str, size: u64) -> FileState {
         FileState {

@@ -21,8 +21,10 @@ root:root 0755, file root:root 0644), or supply its base64 encoding on first ins
 less install.sh
 sudo TRAPD_RELEASE_PUBKEY_B64='<independently obtained public key>' \
   TRAPD_BACKEND_URL=https://api.example.com \
-  TRAPD_ENROLL_TOKEN='<enrollment token>' bash install.sh
+  bash install.sh
 ```
+
+Device pairing is the default. For unattended enrollment, provision a root-owned mode-0600 file at `/etc/trapd/enrollment.token` and remove it after enrollment.
 
 The installer verifies all three artifacts before replacing any executable:
 

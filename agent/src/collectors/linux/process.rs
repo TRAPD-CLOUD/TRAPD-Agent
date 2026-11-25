@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
-use tracing::{info, warn};
+use tracing::warn;
 use walkdir::WalkDir;
 
 use crate::collectors::process_baseline::{
@@ -19,7 +19,6 @@ use crate::schema::{
     ProcessCreateData, ProcessTerminateData, Severity,
 };
 use crate::telemetry::identity::parent_generation_before_child;
-use crate::telemetry::limits::{truncate_str, MAX_CMDLINE_BYTES};
 use crate::telemetry::metrics::{metrics, CollectorMode};
 use crate::telemetry::{Enrichment, EnrichmentError};
 
@@ -55,16 +54,11 @@ pub struct ProcessCollector {
 
 impl ProcessCollector {
     pub fn new() -> Self {
-        let suid_baseline = scan_suid_baseline();
-        info!(
-            "ProcessCollector: SUID baseline ready — {} binaries",
-            suid_baseline.len()
-        );
         Self {
             initialized: false,
             known: HashMap::new(),
             uid_to_user: load_passwd().unwrap_or_default(),
-            suid_baseline,
+            suid_baseline: HashSet::new(),
         }
     }
 }
@@ -127,7 +121,7 @@ const PF_KTHREAD: u32 = 0x0020_0000;
 
 /// Whether this task is a kernel thread, and therefore legitimately has no
 /// executable image and no command line.
-fn is_kernel_thread(stat: &procfs::process::Stat) -> bool {
+pub(crate) fn is_kernel_thread(stat: &procfs::process::Stat) -> bool {
     stat.flags & PF_KTHREAD != 0
 }
 
@@ -155,6 +149,10 @@ fn scan_suid_baseline() -> HashSet<PathBuf> {
         }
         if let Ok(meta) = entry.metadata() {
             if meta.permissions().mode() & 0o4000 != 0 {
+                if set.len() == 4096 {
+                    metrics().state_capacity_dropped(1);
+                    break;
+                }
                 set.insert(entry.path().to_path_buf());
             }
         }
@@ -169,7 +167,7 @@ impl Default for ProcessCollector {
 }
 
 fn load_passwd() -> Result<HashMap<u32, String>> {
-    let content = fs::read_to_string("/etc/passwd")?;
+    let content = crate::collectors::read_text_capped("/etc/passwd", 512 * 1024)?;
     let mut map = HashMap::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.splitn(7, ':').collect();
@@ -184,10 +182,11 @@ fn load_passwd() -> Result<HashMap<u32, String>> {
 
 /// Parse /proc/{pid}/maps and return (region, perms) pairs for rwx anonymous mappings.
 fn check_rwx_maps(pid: i32) -> Vec<(String, String)> {
-    let content = match fs::read_to_string(format!("/proc/{pid}/maps")) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    let content =
+        match crate::collectors::read_text_capped(format!("/proc/{pid}/maps"), 2 * 1024 * 1024) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
     let mut results = Vec::new();
     for line in content.lines() {
         let mut fields = line.split_whitespace();
@@ -218,12 +217,25 @@ fn check_rwx_maps(pid: i32) -> Vec<(String, String)> {
     results
 }
 
+const MAX_PROCESSES: usize = 2048;
+
 fn collect_processes(
     uid_map: &HashMap<u32, String>,
-) -> procfs::ProcResult<HashMap<i32, ProcessCreateData>> {
+    known: &HashMap<i32, KnownProcess>,
+) -> Result<HashMap<i32, ProcessCreateData>> {
     let mut out = HashMap::new();
+    // Reserve slots for previous observations until a complete enumeration
+    // confirms which ones departed. New processes cannot evict live identities.
+    let mut new_slots = MAX_PROCESSES.saturating_sub(known.len());
+    let mut omitted = 0;
 
-    let all = procfs::process::all_processes()?;
+    let all = match procfs::process::all_processes() {
+        Ok(iter) => iter,
+        Err(e) => {
+            warn!("Failed to list processes: {e}");
+            return Err(e.into());
+        }
+    };
 
     for proc_result in all {
         let proc = match proc_result {
@@ -231,11 +243,44 @@ fn collect_processes(
             Err(_) => continue,
         };
 
+        let previous = known.get(&proc.pid);
+        if previous.is_none() && new_slots == 0 {
+            omitted += 1;
+            continue;
+        }
         let stat = match proc.stat() {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => {
+                if let Some(old) = previous {
+                    out.insert(
+                        proc.pid,
+                        ProcessCreateData {
+                            pid: proc.pid,
+                            name: old.name.clone(),
+                            process_start_time: old.start_time,
+                            ..Default::default()
+                        },
+                    );
+                }
+                continue;
+            }
         };
-
+        if known
+            .get(&stat.pid)
+            .is_some_and(|old| old.start_time == Some(stat.starttime))
+        {
+            out.insert(
+                stat.pid,
+                ProcessCreateData {
+                    pid: stat.pid,
+                    ppid: stat.ppid,
+                    name: stat.comm,
+                    process_start_time: Some(stat.starttime),
+                    ..Default::default()
+                },
+            );
+            continue;
+        }
         let status = match proc.status() {
             Ok(s) => s,
             Err(_) => continue,
@@ -262,15 +307,14 @@ fn collect_processes(
             }
         };
 
-        let cmdline = match proc.cmdline() {
-            Ok(args) => {
-                let (value, truncation) = truncate_str(&args.join(" "), MAX_CMDLINE_BYTES);
+        let cmdline = match super::ebpf_exec::proc_cmdline(stat.pid as u32) {
+            Ok((value, truncation)) => {
                 notes.truncated("cmdline", truncation);
                 value
             }
-            Err(_) => {
+            Err(reason) => {
                 if !kthread {
-                    notes.fail("cmdline", EnrichmentError::ProcessExited);
+                    notes.fail("cmdline", reason);
                 }
                 String::new()
             }
@@ -297,8 +341,12 @@ fn collect_processes(
             parent_exe: None,
             enrichment: notes.finish(if kthread { 0 } else { 2 }),
         };
+        if previous.is_none() {
+            new_slots -= 1;
+        }
         out.insert(stat.pid, data);
     }
+    metrics().state_capacity_dropped(omitted);
     Ok(out)
 }
 
@@ -314,7 +362,9 @@ impl Collector for ProcessCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
+        self.suid_baseline = tokio::task::spawn_blocking(scan_suid_baseline).await?;
         let mut ticker = interval(Duration::from_secs(3));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         metrics().add_collector_mode(CollectorMode::ProcPolling);
         let mut coverage =
             crate::telemetry::coverage::SourceCoverage::new("ProcessCollector/proc".into());
@@ -322,9 +372,17 @@ impl Collector for ProcessCollector {
         loop {
             ticker.tick().await;
 
-            let snapshot = collect_processes(&self.uid_to_user);
-            coverage.set_failed(snapshot.is_err());
-            let current = match snapshot {
+            let users = std::mem::take(&mut self.uid_to_user);
+            let known = std::mem::take(&mut self.known);
+            let (users, known, observed) = tokio::task::spawn_blocking(move || {
+                let observed = collect_processes(&users, &known);
+                (users, known, observed)
+            })
+            .await?;
+            self.uid_to_user = users;
+            self.known = known;
+            coverage.set_failed(observed.is_err());
+            let current = match observed {
                 Ok(processes) => processes,
                 Err(error) => {
                     warn!(%error, "Process list unavailable; retaining last snapshot");

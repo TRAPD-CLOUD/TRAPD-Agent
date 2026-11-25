@@ -16,24 +16,23 @@ param(
     [ValidateSet('stable', 'beta')][string]$Channel = 'stable',
     [string]$BackendUrl = $env:TRAPD_BACKEND_URL,
     [string]$EnrollTokenFile,
-    [string]$EnrollToken = $env:TRAPD_ENROLL_TOKEN,
-    # Expected MSI signer. At least one is required unless -AllowUnsigned is given.
+    # Independently provisioned signer certificate pin.
     [string]$ExpectedThumbprint = $env:TRAPD_SIGNER_THUMBPRINT,
-    [string]$ExpectedPublisher = $env:TRAPD_SIGNER_SUBJECT,
-    # Explicit, loud opt-out for self-built or pre-signing packages.
-    [switch]$AllowUnsigned
+    [string]$ExpectedPublisher = $env:TRAPD_SIGNER_SUBJECT
 )
 $ErrorActionPreference = 'Stop'
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Run this installer from an elevated PowerShell prompt.'
 }
 if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne 'X64') { throw 'Only x64 Windows is supported.' }
+if ($env:TRAPD_ENROLL_TOKEN) { throw 'Supply -EnrollTokenFile or use device pairing.' }
+$EnrollToken = $null
 if ($EnrollTokenFile) {
-    if ($EnrollToken) { throw 'Use either -EnrollTokenFile or -EnrollToken, not both.' }
     $EnrollToken = ([string](Get-Content -LiteralPath $EnrollTokenFile -TotalCount 1)).Trim()
 }
-if (-not $AllowUnsigned -and -not $ExpectedThumbprint -and -not $ExpectedPublisher) {
-    throw 'Specify -ExpectedThumbprint or -ExpectedPublisher (the signer of the TRAPD MSI), or -AllowUnsigned to accept an unsigned package explicitly.'
+$ExpectedThumbprint = ($ExpectedThumbprint -replace '\s', '').ToUpperInvariant()
+if ($ExpectedThumbprint -notmatch '^[0-9A-F]{40}$') {
+    throw 'A pinned Authenticode signer thumbprint is required.'
 }
 if ($BackendUrl -match '["\r\n]' -or $EnrollToken -match '["\r\n\s]') { throw 'Invalid MSI configuration value.' }
 
@@ -61,15 +60,11 @@ try {
     if ($expected -notmatch '^[0-9a-fA-F]{64}$' -or (Get-FileHash -Algorithm SHA256 $msi).Hash -ne $expected) { throw 'MSI checksum mismatch.' }
     # The checksum comes from the same release, so it proves integrity only.
     # Authenticity requires a valid signature by the expected signer (fail closed).
-    if ($AllowUnsigned) {
-        Write-Warning 'MSI signature verification skipped (-AllowUnsigned).'
-    } else {
-        $sig = Get-AuthenticodeSignature -LiteralPath $msi
-        if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate) { throw "MSI Authenticode signature is not valid ($($sig.Status))." }
-        $cert = $sig.SignerCertificate
-        if ($ExpectedThumbprint -and $cert.Thumbprint -ne ($ExpectedThumbprint -replace '\s', '').ToUpperInvariant()) { throw 'MSI signer thumbprint does not match -ExpectedThumbprint.' }
-        if ($ExpectedPublisher -and $cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -ne $ExpectedPublisher) { throw 'MSI publisher does not match -ExpectedPublisher.' }
-    }
+    $sig = Get-AuthenticodeSignature -LiteralPath $msi
+    if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate) { throw "MSI Authenticode signature is not valid ($($sig.Status))." }
+    $cert = $sig.SignerCertificate
+    if ($cert.Thumbprint -ne $ExpectedThumbprint) { throw 'MSI signer thumbprint does not match -ExpectedThumbprint.' }
+    if ($ExpectedPublisher -and $cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -ne $ExpectedPublisher) { throw 'MSI publisher does not match -ExpectedPublisher.' }
     $arguments = @('/i', "`"$msi`"", '/qn', '/norestart')
     if ($BackendUrl) { $arguments += "BACKENDURL=`"$BackendUrl`"" }
     if ($EnrollToken) {

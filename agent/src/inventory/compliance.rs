@@ -148,16 +148,50 @@ pub struct CveFeed {
     pub entries: Vec<CveEntry>,
 }
 
+const MAX_FEED_ENTRIES: usize = 32_768;
+const MAX_CVE_FINDINGS: usize = 4096;
+
+pub(super) fn bounded_feed(entries: &[CveEntry]) -> Vec<CveEntry> {
+    let kept: Vec<_> = entries
+        .iter()
+        .take(MAX_FEED_ENTRIES)
+        .filter(|entry| {
+            [&entry.product, &entry.fixed_in, &entry.cve, &entry.severity]
+                .iter()
+                .all(|s| s.len() <= 256)
+        })
+        .cloned()
+        .collect();
+    crate::telemetry::metrics::metrics()
+        .state_capacity_dropped((entries.len() - kept.len()) as u64);
+    kept
+}
+
 /// Correlate installed packages against the CVE feed. A package matches a feed
 /// entry by exact (case-insensitive) name; it is reported when its version is
 /// strictly below `fixed_in`.
 pub fn correlate_cves(packages: &[SoftwarePackage], feed: &CveFeed) -> Vec<VulnFinding> {
     let mut out = Vec::new();
-    for entry in &feed.entries {
-        for pkg in packages {
-            if pkg.name.eq_ignore_ascii_case(&entry.product)
-                && version_less_than(&pkg.version, &entry.fixed_in)
-            {
+    let mut by_product = std::collections::HashMap::<String, Vec<&SoftwarePackage>>::new();
+    for package in packages {
+        by_product
+            .entry(package.name.to_ascii_lowercase())
+            .or_default()
+            .push(package);
+    }
+    let mut comparisons = 0usize;
+    for entry in feed.entries.iter().take(MAX_FEED_ENTRIES) {
+        let Some(installed) = by_product.get(&entry.product.to_ascii_lowercase()) else {
+            continue;
+        };
+        for pkg in installed {
+            comparisons += 1;
+            if comparisons > 262_144 || out.len() == MAX_CVE_FINDINGS {
+                crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                tracing::warn!("inventory CVE comparison incomplete: scan budget reached");
+                return out;
+            }
+            if version_less_than(&pkg.version, &entry.fixed_in) {
                 out.push(VulnFinding {
                     package: pkg.name.clone(),
                     installed_version: pkg.version.clone(),
@@ -416,9 +450,22 @@ fn perm_check(id: &str, title: &str, path: &str, max_mode: u32) -> CisFinding {
 /// Load the CVE feed from the config dir (absent → empty).
 fn load_cve_feed() -> CveFeed {
     let path = crate::paths::config_dir().join("cve_feed.json");
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => CveFeed::default(),
+    match crate::paths::bounded_regular_bytes(&path, 2 * 1024 * 1024) {
+        Ok(bytes) => match serde_json::from_slice::<CveFeed>(&bytes) {
+            Ok(feed) => CveFeed {
+                entries: bounded_feed(&feed.entries),
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "local inventory CVE feed invalid");
+                CveFeed::default()
+            }
+        },
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, "local inventory CVE feed unavailable");
+            }
+            CveFeed::default()
+        }
     }
 }
 
@@ -437,7 +484,10 @@ pub fn assess(
 
     let vulnerabilities = if flags.vuln_scan {
         let mut feed = load_cve_feed();
-        feed.entries.extend(config_cve.iter().cloned());
+        let room = MAX_FEED_ENTRIES.saturating_sub(feed.entries.len());
+        feed.entries.extend(config_cve.iter().take(room).cloned());
+        crate::telemetry::metrics::metrics()
+            .state_capacity_dropped(config_cve.len().saturating_sub(room) as u64);
         correlate_cves(packages, &feed)
     } else {
         Vec::new()
@@ -473,6 +523,17 @@ mod tests {
             architecture: Some("amd64".into()),
             product_code: None,
         }
+    }
+
+    #[test]
+    fn oversized_feed_fields_are_refused_before_retention() {
+        let entry = CveEntry {
+            product: "pkg".into(),
+            fixed_in: "2".into(),
+            cve: "x".repeat(257),
+            severity: "low".into(),
+        };
+        assert!(bounded_feed(&[entry]).is_empty());
     }
 
     #[test]

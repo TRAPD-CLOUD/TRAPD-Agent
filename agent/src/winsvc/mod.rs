@@ -249,12 +249,12 @@ fn run_console() -> Result<()> {
     run::load_config_env();
     let rt = tokio::runtime::Runtime::new().context("build tokio runtime")?;
     let result = rt.block_on(async {
-        let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             // Ctrl-C on a console run ends the agent on purpose, but it is
             // still someone stopping the sensor: report it like a service stop.
-            let _ = stop_tx.send(StopRequest {
+            let _ = stop_tx.try_send(StopRequest {
                 kind: StopKind::ServiceStop,
                 source: StopSource::Interrupt,
                 claimed_token_nonce: None,
@@ -364,7 +364,14 @@ fn spawn_status_reporter(
         let mut checkpoint = 1u32;
         report_status(&handle, status_for(phase, checkpoint, ok));
         loop {
-            match phases.recv_timeout(CHECKPOINT_INTERVAL) {
+            let next = if phase == Phase::Running {
+                phases
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+            } else {
+                phases.recv_timeout(CHECKPOINT_INTERVAL)
+            };
+            match next {
                 Ok(Phase::Done) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Ok(next) => {
                     // Never leave Stopping once entered (a late Running must not win).
@@ -374,11 +381,28 @@ fn spawn_status_reporter(
                     phase = next;
                     checkpoint = 1;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => checkpoint += 1,
+                Err(mpsc::RecvTimeoutError::Timeout) => checkpoint = checkpoint.saturating_add(1),
             }
             report_status(&handle, status_for(phase, checkpoint, ok));
         }
     })
+}
+
+/// The control handler owns the sender. After its first valid stop no later
+/// control can claim a token or enqueue another status notification.
+fn send_first_stop<T>(
+    pending: &mut Option<tokio::sync::mpsc::Sender<T>>,
+    request: impl FnOnce() -> Option<T>,
+) -> bool {
+    if pending.as_ref().is_none_or(|tx| tx.is_closed()) {
+        return false;
+    }
+    let Some(request) = request() else {
+        return false;
+    };
+    pending
+        .take()
+        .is_some_and(|tx| tx.try_send(request).is_ok())
 }
 
 fn run_service() -> Result<()> {
@@ -386,15 +410,17 @@ fn run_service() -> Result<()> {
     // handler thread and the Tokio runtime exist.
     run::load_config_env();
 
-    let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
     let (phase_tx, phase_rx) = mpsc::channel::<Phase>();
     let (suspend, suspend_rx) = crate::heartbeat::suspend::channel();
 
+    let mut pending_stop = Some(stop_tx);
     let handler_phase_tx = phase_tx.clone();
     let event_handler = move |control| -> ServiceControlHandlerResult {
         if let Some(request) = stop_request_for(&control) {
-            let _ = handler_phase_tx.send(Phase::Stopping);
-            let _ = stop_tx.send(request);
+            if send_first_stop(&mut pending_stop, || Some(request)) {
+                let _ = handler_phase_tx.send(Phase::Stopping);
+            }
             return ServiceControlHandlerResult::NoError;
         }
         match control {
@@ -412,13 +438,16 @@ fn run_service() -> Result<()> {
             ServiceControl::UserEvent(code)
                 if code.to_raw() == crate::selfprotect::maintenance::STOP_REQUEST_CONTROL =>
             {
-                if let Some(claims) = crate::selfprotect::maintenance::authorize_pending_stop() {
+                if send_first_stop(&mut pending_stop, || {
+                    crate::selfprotect::maintenance::authorize_pending_stop().map(|claims| {
+                        StopRequest {
+                            kind: StopKind::ServiceStop,
+                            source: StopSource::MaintenanceToken,
+                            claimed_token_nonce: Some(claims.nonce),
+                        }
+                    })
+                }) {
                     let _ = handler_phase_tx.send(Phase::Stopping);
-                    let _ = stop_tx.send(StopRequest {
-                        kind: StopKind::ServiceStop,
-                        source: StopSource::MaintenanceToken,
-                        claimed_token_nonce: Some(claims.nonce),
-                    });
                 }
                 ServiceControlHandlerResult::NoError
             }
@@ -517,20 +546,23 @@ fn run_guard_console() -> Result<()> {
 fn run_guard_service() -> Result<()> {
     use crate::selfprotect::guard::NoticeKind;
     run::load_config_env();
-    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<NoticeKind>();
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<NoticeKind>(1);
     let (phase_tx, phase_rx) = mpsc::channel::<Phase>();
 
+    let mut pending_stop = Some(stop_tx);
     let handler_phase_tx = phase_tx.clone();
     let event_handler = move |control| -> ServiceControlHandlerResult {
         match control {
             ServiceControl::Stop => {
-                let _ = handler_phase_tx.send(Phase::Stopping);
-                let _ = stop_tx.send(NoticeKind::ServiceStop);
+                if send_first_stop(&mut pending_stop, || Some(NoticeKind::ServiceStop)) {
+                    let _ = handler_phase_tx.send(Phase::Stopping);
+                }
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Shutdown | ServiceControl::Preshutdown => {
-                let _ = handler_phase_tx.send(Phase::Stopping);
-                let _ = stop_tx.send(NoticeKind::HostShutdown);
+                if send_first_stop(&mut pending_stop, || Some(NoticeKind::HostShutdown)) {
+                    let _ = handler_phase_tx.send(Phase::Stopping);
+                }
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -783,5 +815,20 @@ mod tests {
         ] {
             assert_eq!(stop_request_for(&control), None, "{control:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod stop_channel_tests {
+    #[test]
+    fn invalid_stop_leaves_room_for_the_first_valid_request_only() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut pending = Some(tx);
+        assert!(!super::send_first_stop(&mut pending, || None));
+        assert!(super::send_first_stop(&mut pending, || Some(17)));
+        assert_eq!(rx.try_recv().unwrap(), 17);
+        assert!(!super::send_first_stop(&mut pending, || panic!(
+            "duplicate claimed"
+        )));
     }
 }

@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
+
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
@@ -697,7 +699,7 @@ struct IssuedAtStore {
 
 impl IssuedAtStore {
     fn load(path: &Path) -> Result<Self> {
-        let last = match std::fs::read(path) {
+        let last = match crate::paths::bounded_regular_bytes(path, MAX_CONFIG_BYTES as u64) {
             Ok(bytes) => Some(
                 serde_json::from_slice::<IssuedAtRecord>(&bytes)
                     .context("invalid config issued_at high-water mark")?
@@ -725,6 +727,10 @@ impl IssuedAtStore {
             issued_at,
             config: Some(config.clone()),
         })?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_CONFIG_BYTES,
+            "normalized config exceeds the stored size limit"
+        );
         crate::paths::write_atomic(&self.path, &bytes, 0o600)?;
         self.last = Some(issued_at);
         Ok(())
@@ -751,20 +757,21 @@ pub fn load_persisted() -> Result<AgentConfig> {
 }
 
 fn load_persisted_from(watermark_path: &Path, cache_path: &Path) -> Result<AgentConfig> {
-    let has_watermark = match std::fs::read(watermark_path) {
-        Ok(bytes) => {
-            let record: IssuedAtRecord =
-                serde_json::from_slice(&bytes).context("invalid config replay state at startup")?;
-            if let Some(cfg) = record.config {
-                info!("Loaded last-known-good config from atomic replay state");
-                return Ok(cfg);
+    let has_watermark =
+        match crate::paths::bounded_regular_bytes(watermark_path, MAX_CONFIG_BYTES as u64) {
+            Ok(bytes) => {
+                let record: IssuedAtRecord = serde_json::from_slice(&bytes)
+                    .context("invalid config replay state at startup")?;
+                if let Some(cfg) = record.config {
+                    info!("Loaded last-known-good config from atomic replay state");
+                    return Ok(cfg);
+                }
+                true
             }
-            true
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e).context("cannot read config replay state at startup"),
-    };
-    match std::fs::read(cache_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e).context("cannot read config replay state at startup"),
+        };
+    match crate::paths::bounded_regular_bytes(cache_path, MAX_CONFIG_BYTES as u64) {
         Ok(bytes) => {
             anyhow::ensure!(
                 has_watermark,
@@ -913,7 +920,7 @@ impl ConfigPuller {
                     .get("etag")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
-                let body = match resp.bytes().await {
+                let body = match crate::http::bounded_body(resp, MAX_CONFIG_BYTES).await {
                     Ok(b) => b,
                     Err(e) => {
                         warn!("Failed to read config response body: {e}");

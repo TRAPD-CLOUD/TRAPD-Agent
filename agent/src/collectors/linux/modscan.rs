@@ -113,6 +113,7 @@ pub struct Tracker {
     procs: HashMap<(i32, u64), HashSet<String>>,
     dedup: HashMap<(String, String), Instant>,
     cursor: usize,
+    known_bytes: usize,
 }
 
 impl Tracker {
@@ -130,9 +131,13 @@ impl Tracker {
             if path == snap.exe || known.contains(&path) {
                 continue;
             }
-            if known.len() >= MAX_PATHS_PER_PROC {
+            if known.len() >= MAX_PATHS_PER_PROC
+                || self.known_bytes.saturating_add(path.len() + 64) > 2 * 1024 * 1024
+            {
+                metrics().state_capacity_dropped(1);
                 break;
             }
+            self.known_bytes += path.len() + 64;
             known.insert(path.clone());
             if !is_notable(&path) {
                 continue;
@@ -150,6 +155,10 @@ impl Tracker {
             }
             if self.dedup.len() < MAX_DEDUP {
                 self.dedup.insert(key, now);
+            }
+            if out.len() >= MAX_EVENTS_PER_SWEEP {
+                metrics().event_dropped(DropReason::RateLimitApplied);
+                continue;
             }
             out.push(Load {
                 pid,
@@ -194,22 +203,28 @@ impl Tracker {
                 self.observe(pid, &snap, now, &mut out);
             }
         }
-        // Only forget processes when the whole table was seen, otherwise a
-        // partial sweep would re-report everything it did not reach.
-        if visited == n {
-            self.procs.retain(|k, _| live.contains(k));
-        }
+        // pids contains the enumerated host identities even on a partial maps sweep.
+        let listed: HashSet<_> = pids.iter().copied().collect();
+        let generations: HashMap<_, _> = live.iter().copied().collect();
+        self.procs.retain(|key, paths| {
+            let keep = if visited == n {
+                live.contains(key)
+            } else {
+                listed.contains(&key.0)
+                    && generations
+                        .get(&key.0)
+                        .is_none_or(|generation| *generation == key.1)
+            };
+            if !keep {
+                self.known_bytes -= paths.iter().map(|p| p.len() + 64).sum::<usize>();
+            }
+            keep
+        });
         self.cursor = if n > 0 {
             (self.cursor + visited) % n
         } else {
             0
         };
-        if out.len() > MAX_EVENTS_PER_SWEEP {
-            for _ in MAX_EVENTS_PER_SWEEP..out.len() {
-                metrics().event_dropped(DropReason::RateLimitApplied);
-            }
-            out.truncate(MAX_EVENTS_PER_SWEEP);
-        }
         out
     }
 }
@@ -273,6 +288,7 @@ fn list_pids(own: i32) -> Vec<i32> {
             rd.flatten()
                 .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
                 .filter(|p| *p != own)
+                .take(MAX_TRACKED_PROCS)
                 .collect()
         })
         .unwrap_or_default()

@@ -190,7 +190,9 @@ impl Uploader {
         match resp {
             Ok(r) => {
                 let status = r.status().as_u16();
-                let body = r.bytes().await.unwrap_or_default();
+                let body = crate::http::bounded_body(r, crate::http::CONTROL_REPLY_BYTES)
+                    .await
+                    .unwrap_or_default();
                 let next = handle_response(&self.journal, status, &body, fails);
                 if next == Next::Reauth {
                     self.tokens.report_unauthorized(&bearer).await;

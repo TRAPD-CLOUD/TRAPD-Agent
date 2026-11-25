@@ -65,41 +65,45 @@ impl Collector for FilesystemCollector {
         // unlink/rename honeytoken gates, so this layer deliberately alerts only
         // on MODIFY/ATTRIB — that also sidesteps a false positive when the agent
         // itself revokes (deletes) a token.
-        {
-            let tok_tx = fs_tx.clone();
-            let aid = agent_id.clone();
-            let host = hostname.clone();
-            std::thread::spawn(move || {
-                run_token_fim(tok_tx, aid, host);
-            });
-        }
-
-        let realtime_tx = fs_tx.clone();
-        let realtime_agent_id = agent_id.clone();
-        let realtime_hostname = hostname.clone();
+        let mut workers = tokio::task::JoinSet::new();
+        let tok_tx = fs_tx.clone();
+        let aid = agent_id.clone();
+        let host = hostname.clone();
+        workers.spawn_blocking(move || run_token_fim(tok_tx, aid, host));
         let fim_paths = self
             .cfg
             .read()
             .map(|cfg| cfg.fim_paths.clone())
             .unwrap_or_default();
-        std::thread::spawn(move || {
-            run_sync(realtime_tx, realtime_agent_id, realtime_hostname, fim_paths);
-        });
-        // Both sources feed one outward stream and use FilesystemEventData.
+        let realtime_tx = fs_tx.clone();
+        let aid = agent_id.clone();
+        let host = hostname.clone();
+        workers.spawn_blocking(move || run_sync(realtime_tx, aid, host, fim_paths));
         let mut fim = super::fim::FimCollector::new(Arc::clone(&self.cfg));
-        tokio::spawn(async move {
-            if let Err(error) = fim.run(fs_tx, agent_id, hostname).await {
-                crate::telemetry::coverage::set_collector_failed(
-                    "FilesystemCollector/periodic-FIM",
-                    true,
-                );
-                warn!(%error, "FilesystemCollector: periodic FIM stopped");
+        let periodic = fim.run(fs_tx, agent_id, hostname);
+        tokio::pin!(periodic);
+        let mut periodic_active = true;
+        loop {
+            if !periodic_active && workers.is_empty() {
+                anyhow::bail!("all filesystem sensors stopped");
             }
-        });
-
-        while let Some(event) = fs_rx.recv().await {
-            if tx.send(event).await.is_err() {
-                return Ok(());
+            tokio::select! {
+                _ = tx.closed() => break,
+                res = &mut periodic, if periodic_active => {
+                    if let Err(e) = res {
+                        crate::collectors::report_failure("FimCollector");
+                        warn!(error=%e, "periodic FIM exited");
+                    }
+                    periodic_active = false; // Disabled by configuration.
+                }
+                res = workers.join_next(), if !workers.is_empty() => {
+                    crate::collectors::report_failure("FilesystemWatcher");
+                    warn!(?res, "filesystem watcher exited");
+                }
+                ev = fs_rx.recv() => match ev {
+                    Some(event) => { crate::pipeline::try_emit(&tx, event, "filesystem"); }
+                    None => break,
+                },
             }
         }
         Ok(())
@@ -171,8 +175,15 @@ fn run_sync(
 
     let mut buf = [0u8; 4096];
     loop {
-        let events = match inotify.read_events_blocking(&mut buf) {
+        if tx.is_closed() {
+            return;
+        }
+        if !super::agent_protect::wait_readable(&inotify) {
+            continue;
+        }
+        let events = match inotify.read_events(&mut buf) {
             Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => {
                 crate::telemetry::coverage::set_collector_failed(
                     "FilesystemCollector/inotify",
@@ -373,7 +384,7 @@ fn is_security_critical_path(path: &str) -> bool {
 /// Returns `true` if the receiver was dropped (agent shutting down).
 #[inline]
 fn send(tx: &tokio::sync::mpsc::Sender<AgentEvent>, event: AgentEvent) -> bool {
-    tx.blocking_send(event).is_err()
+    !crate::pipeline::try_emit(tx, event, "filesystem") && tx.is_closed()
 }
 
 // ── Honeytoken FIM ──────────────────────────────────────────────────────────
@@ -396,12 +407,16 @@ fn token_fim_mask() -> WatchMask {
 /// a side effect we must not trigger from a read-only poller.
 fn current_token_paths() -> Vec<String> {
     let path = crate::deception::registry::registry_path();
-    std::fs::read(&path)
+    crate::collectors::read_capped(&path, 2 * 1024 * 1024)
         .ok()
         .and_then(|b| {
             serde_json::from_slice::<crate::deception::registry::HoneytokenRegistry>(&b).ok()
         })
-        .map(|r| r.tokens.into_iter().map(|t| t.path).collect())
+        .map(|r| {
+            crate::telemetry::metrics::metrics()
+                .state_capacity_dropped(r.tokens.len().saturating_sub(512) as u64);
+            r.tokens.into_iter().take(512).map(|t| t.path).collect()
+        })
         .unwrap_or_default()
 }
 
@@ -430,6 +445,9 @@ fn run_token_fim(tx: tokio::sync::mpsc::Sender<AgentEvent>, agent_id: String, ho
 
     let mut buf = [0u8; 4096];
     loop {
+        if tx.is_closed() {
+            return;
+        }
         // ── Reconcile the watch set from the register ────────────────────────
         if last_reload.elapsed() >= Duration::from_secs(TOKEN_FIM_RELOAD_SECS) {
             last_reload = Instant::now();
@@ -551,7 +569,7 @@ fn run_token_fim(tx: tokio::sync::mpsc::Sender<AgentEvent>, agent_id: String, ho
 
         // Poll cadence: tamper is rare, sub-second latency is plenty and keeps
         // the thread near-idle.
-        std::thread::sleep(Duration::from_millis(500));
+        super::agent_protect::wait_readable(&inotify);
     }
 }
 

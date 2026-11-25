@@ -61,14 +61,14 @@ pub fn resolve(container_id: &str) -> ContainerImage {
 
 fn read_docker(id: &str) -> Option<ContainerImage> {
     let path = format!("{DOCKER_STATE}/{id}/config.v2.json");
-    let json = std::fs::read_to_string(path).ok()?;
+    let json = crate::collectors::read_text_capped(path, 512 * 1024).ok()?;
     Some(parse_docker_config(&json))
 }
 
 fn read_containerd(id: &str) -> Option<ContainerImage> {
     for root in CONTAINERD_CRI_STATE {
         let path = format!("{root}/{id}/config.json");
-        if let Ok(json) = std::fs::read_to_string(&path) {
+        if let Ok(json) = crate::collectors::read_text_capped(&path, 512 * 1024) {
             return Some(parse_oci_config(&json));
         }
     }

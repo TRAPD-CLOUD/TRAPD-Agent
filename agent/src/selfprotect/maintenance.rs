@@ -295,7 +295,7 @@ impl ConsumedStore {
     }
 
     fn read(&self, nonce: &str) -> Option<ConsumedRecord> {
-        let bytes = std::fs::read(self.path_for(nonce).ok()?).ok()?;
+        let bytes = paths::bounded_regular_bytes(&self.path_for(nonce).ok()?, 4096).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
@@ -307,18 +307,16 @@ impl ConsumedStore {
     }
 
     /// Consumed tokens whose use the backend has not been told about yet.
-    fn pending(&self) -> Vec<(String, ConsumedRecord)> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Vec::new();
-        };
-        entries
+    fn pending(&self) -> impl Iterator<Item = (String, ConsumedRecord)> + '_ {
+        std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_str()?.to_owned();
                 let record = self.read(&name)?;
                 (!record.reported).then_some((name, record))
             })
-            .collect()
     }
 
     /// Drop records of long-expired tokens that the backend already knows about.
@@ -331,7 +329,7 @@ impl ConsumedStore {
                 continue;
             };
             if let Some(r) = self.read(&name) {
-                if r.reported && r.exp + RECORD_RETENTION_SECS < now {
+                if r.reported && r.exp.saturating_add(RECORD_RETENTION_SECS) < now {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -420,8 +418,8 @@ pub async fn report_pending(
     tokens: &crate::identity::SessionTokens,
 ) {
     let store = ConsumedStore::new(paths::state_dir());
-    let pending = store.pending();
-    if pending.is_empty() {
+    let mut pending = store.pending().peekable();
+    if pending.peek().is_none() {
         return;
     }
     let Ok(client) = crate::http::control_client() else {
@@ -778,7 +776,7 @@ fn report_consumption_now() {
             tracing::warn!("maintenance report thread panicked; the service retries");
         }
     }
-    let unreported = ConsumedStore::new(paths::state_dir()).pending().len();
+    let unreported = ConsumedStore::new(paths::state_dir()).pending().count();
     if unreported > 0 {
         warn!(
             unreported,
@@ -1302,9 +1300,29 @@ mod tests {
             immediate_report_url(true, Some("https://b.example".into())),
             None
         );
-        let pending = store.pending();
+        let pending: Vec<_> = store.pending().collect();
         assert_eq!(pending.len(), 1);
         assert!(!pending[0].1.reported);
+    }
+
+    #[test]
+    fn extreme_or_oversized_consumed_records_do_not_break_recovery() {
+        let dir = tmp();
+        let store = ConsumedStore::new(dir.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let path = store.path_for(nonce()).unwrap();
+        let record = ConsumedRecord {
+            purpose: Purpose::Stop,
+            consumed_at: 0,
+            exp: i64::MAX,
+            reported: true,
+        };
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        store.prune(i64::MAX);
+        assert!(path.exists());
+        std::fs::write(&path, vec![b' '; 4097]).unwrap();
+        assert!(store.pending().next().is_none());
+        assert!(path.exists(), "preserve the consumed nonce");
     }
 
     #[cfg(unix)]
@@ -1342,16 +1360,16 @@ mod tests {
         let store = ConsumedStore::new(dir.path());
         let c = claims_of(&token("stop", NOW, NOW + 900));
         store.claim(&c, NOW).unwrap();
-        assert_eq!(store.pending().len(), 1);
+        assert_eq!(store.pending().count(), 1);
         let far = NOW + 900 + RECORD_RETENTION_SECS + 10;
         store.prune(far);
         assert_eq!(
-            store.pending().len(),
+            store.pending().count(),
             1,
             "unreported records are never pruned"
         );
         store.mark_reported(nonce()).unwrap();
-        assert!(store.pending().is_empty());
+        assert!(store.pending().next().is_none());
         store.prune(NOW + 1000);
         assert!(store.read(nonce()).is_some(), "recent reported record kept");
         store.prune(far);

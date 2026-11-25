@@ -103,27 +103,25 @@ impl HealthState {
 
         // Shedding for capacity reasons is backpressure; other drop reasons are
         // faults and only reach `degraded`.
-        let backpressure_drops = snap
-            .collector_events_dropped_by_reason
-            .get("userspace_channel_full")
-            .copied()
-            .unwrap_or(0)
-            + snap
-                .collector_events_dropped_by_reason
-                .get("persistent_queue_full")
+        let has_backpressure_drops = [
+            "userspace_channel_full",
+            "persistent_queue_full",
+            "rate_limit_applied",
+        ]
+        .iter()
+        .any(|key| {
+            snap.collector_events_dropped_by_reason
+                .get(*key)
                 .copied()
                 .unwrap_or(0)
-            + snap
-                .collector_events_dropped_by_reason
-                .get("rate_limit_applied")
-                .copied()
-                .unwrap_or(0);
+                > 0
+        });
 
         if utilization >= QUEUE_NEAR_CAPACITY {
             return HealthState::QueueNearCapacity;
         }
 
-        if backpressure_drops > 0 {
+        if has_backpressure_drops {
             return HealthState::Backpressured;
         }
 

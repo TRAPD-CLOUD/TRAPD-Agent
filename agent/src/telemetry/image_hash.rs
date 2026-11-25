@@ -100,10 +100,24 @@ fn hash_uncached(path: &Path, max: u64, len: u64) -> HashOutcome {
     if len > max {
         return HashOutcome::TooLarge;
     }
-    let file = match std::fs::File::open(path) {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        // A path can become a FIFO after the metadata lookup. Preserve
+        // ordinary executable symlinks while avoiding a blocking FIFO open.
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match opts.open(path) {
         Ok(f) => f,
         Err(e) => return HashOutcome::Unreadable(classify_io(&e)),
     };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() && meta.len() <= max => {}
+        Ok(_) => return HashOutcome::TooLarge,
+        Err(e) => return HashOutcome::Unreadable(classify_io(&e)),
+    }
     match stream_sha256(file, max) {
         Ok(Some(h)) => HashOutcome::Hashed(h),
         Ok(None) => HashOutcome::TooLarge,
@@ -155,7 +169,8 @@ fn hash_image_with(path: &Path, max: u64, cache: &Mutex<Cache>) -> HashOutcome {
     let outcome = hash_uncached(path, max, meta.len());
     if cacheable && !matches!(outcome, HashOutcome::Unreadable(_)) {
         if let Ok(mut guard) = cache.lock() {
-            if guard.0.len() >= MAX_CACHE_ENTRIES {
+            if guard.0.len() >= MAX_CACHE_ENTRIES && !guard.0.contains_key(path) {
+                super::metrics::metrics().state_capacity_dropped(guard.0.len() as u64);
                 guard.0.clear();
             }
             guard.0.insert(path.to_path_buf(), (key, outcome.clone()));

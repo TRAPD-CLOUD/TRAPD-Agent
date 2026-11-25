@@ -26,6 +26,7 @@ use super::parser::ParsedLog;
 pub struct JournalTail {
     child: Option<Child>,
     reader: Option<BufReader<tokio::process::ChildStdout>>,
+    stderr: tokio::task::JoinHandle<bool>,
     source: String,
     max_line: usize,
 }
@@ -35,20 +36,17 @@ impl JournalTail {
         source: &LogSourceConfig,
         cursor: Option<&JournalCheckpoint>,
     ) -> Option<Self> {
-        if !journalctl_available() {
-            warn!(
-                source = %source.name,
-                "journalctl not found — skipping journal source"
-            );
-            return None;
-        }
-        let mut cmd = Command::new("journalctl");
+        let bin = ["/usr/bin/journalctl", "/bin/journalctl"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file())?;
+        let mut cmd = Command::new(bin);
+        cmd.env("LC_ALL", "C");
         cmd.arg("--output=json")
             .arg("--no-pager")
             .arg("--utc")
             .arg("--follow")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(cp) = cursor.filter(|c| !c.cursor.is_empty()) {
             cmd.arg(format!("--after-cursor={}", cp.cursor));
@@ -62,6 +60,7 @@ impl JournalTail {
         match cmd.spawn() {
             Ok(mut child) => {
                 let stdout = child.stdout.take()?;
+                let stderr = tokio::spawn(rejected_cursor(child.stderr.take()?));
                 info!(
                     source = %source.name,
                     units = ?source.units,
@@ -69,6 +68,7 @@ impl JournalTail {
                 );
                 Some(Self {
                     child: Some(child),
+                    stderr,
                     reader: Some(BufReader::with_capacity(max_line.min(256 * 1024), stdout)),
                     source: source.name.clone(),
                     max_line,
@@ -94,10 +94,11 @@ impl JournalTail {
         }
     }
 
-    pub async fn kill(&mut self) {
+    pub async fn finish(&mut self) -> bool {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
         }
+        (&mut self.stderr).await.unwrap_or(false)
     }
 }
 
@@ -173,14 +174,22 @@ async fn read_line_bounded<R: AsyncBufRead + Unpin>(
     }
 }
 
-fn journalctl_available() -> bool {
-    std::process::Command::new("journalctl")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+// Keep a rolling suffix so the diagnostic can straddle two pipe reads.
+async fn rejected_cursor(mut stderr: impl tokio::io::AsyncRead + Unpin) -> bool {
+    use tokio::io::AsyncReadExt;
+    let marker = b"Failed to seek to cursor";
+    let mut recent = Vec::new();
+    let mut chunk = [0; 1024];
+    let mut rejected = false;
+    while let Ok(n) = stderr.read(&mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        recent.extend_from_slice(&chunk[..n]);
+        rejected |= recent.windows(marker.len()).any(|s| s == marker);
+        recent.drain(..recent.len().saturating_sub(marker.len() - 1));
+    }
+    rejected
 }
 
 /// Turn a `journalctl --output=json` line into a [`ParsedLog`] plus the cursor.
@@ -255,6 +264,12 @@ fn priority_name(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn distinguishes_stale_cursor_from_unrelated_child_failure() {
+        assert!(rejected_cursor(&b"Failed to seek to cursor: stale"[..]).await);
+        assert!(!rejected_cursor(&b"Permission denied"[..]).await);
+    }
 
     #[tokio::test]
     async fn bounded_read_keeps_short_line() {

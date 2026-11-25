@@ -52,6 +52,8 @@ const CATCH_UP_PACING: Duration = Duration::from_millis(25);
 const PRIORITY_MIN_GAP: Duration = Duration::from_millis(50);
 /// Bodies below this are sent as-is: gzip overhead outweighs the saving.
 const COMPRESS_MIN_BYTES: usize = 1024;
+// At most MAX_BATCH_EVENTS UUIDs plus JSON framing for accepted/rejected.
+const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 /// Upper bound honoured for a server-sent `Retry-After`, so a bad value cannot
 /// park the transport for hours.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
@@ -140,7 +142,7 @@ impl Transport {
                     metrics().set_transport_catching_up(false);
                     self.wait(NORMAL_FLUSH_INTERVAL).await;
                 }
-                FlushOutcome::Delivered => {
+                FlushOutcome::Delivered | FlushOutcome::TargetConfirmed => {
                     consecutive_failures = 0;
                     // Sequential requests deliberately bound inflight memory to
                     // one batch. In catch-up mode this still permits up to 40
@@ -166,14 +168,13 @@ impl Transport {
     /// `seq` was delivered. The caller bounds the total time.
     pub async fn deliver(&self, seq: u64) -> bool {
         loop {
-            if !self.buffer.lock().is_ok_and(|b| b.contains_seq(seq)) {
-                return true;
+            if !self.lock_spool().await.is_ok_and(|b| b.contains_seq(seq)) {
+                return false;
             }
-            match self.flush(false).await {
+            match self.flush_for(false, Some(seq)).await {
+                FlushOutcome::TargetConfirmed => return true,
                 FlushOutcome::Delivered => {}
-                FlushOutcome::Idle | FlushOutcome::Failed => {
-                    return !self.buffer.lock().is_ok_and(|b| b.contains_seq(seq));
-                }
+                FlushOutcome::Idle | FlushOutcome::Failed => return false,
             }
         }
     }
@@ -191,11 +192,26 @@ impl Transport {
     }
 
     fn queue_depth(&self) -> usize {
-        self.buffer.lock().map_or(0, |b| b.len())
+        self.buffer.try_lock().map_or(0, |b| b.len())
+    }
+
+    async fn lock_spool(&self) -> Result<std::sync::MutexGuard<'_, Spool>, &'static str> {
+        loop {
+            match self.buffer.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err("poisoned spool"),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn flush(&self, catching_up: bool) -> FlushOutcome {
-        let batch = match self.buffer.lock() {
+        self.flush_for(catching_up, None).await
+    }
+
+    async fn flush_for(&self, catching_up: bool, target: Option<u64>) -> FlushOutcome {
+        let batch = match self.lock_spool().await {
             Ok(buf) => buf.peek_batch(MAX_BATCH_EVENTS),
             Err(e) => {
                 warn!("Transport: spool mutex poisoned: {e}");
@@ -221,7 +237,7 @@ impl Transport {
             Err(e) => {
                 warn!(error = %e, "Transport: batch encoding failed — will retry");
                 metrics().transport_batch_failed();
-                if let Ok(mut buf) = self.buffer.lock() {
+                if let Ok(mut buf) = self.lock_spool().await {
                     buf.nack(&all_seqs);
                 }
                 return FlushOutcome::Failed;
@@ -239,7 +255,7 @@ impl Transport {
                 "Transport: no session token available — will retry"
             );
             metrics().transport_batch_failed();
-            if let Ok(mut buf) = self.buffer.lock() {
+            if let Ok(mut buf) = self.lock_spool().await {
                 buf.nack(&seqs);
             }
             return FlushOutcome::Failed;
@@ -281,14 +297,14 @@ impl Transport {
             Ok(resp) if resp.status().is_success() => {
                 // A 2xx only counts with the backend's receipt. A proxy error
                 // page or a cut-off body is not one: keep the batch and retry.
-                let body = resp.bytes().await;
+                let body = crate::http::bounded_body(resp, MAX_RECEIPT_BYTES).await;
                 let Some(report) = body.as_deref().ok().and_then(parse_ack) else {
                     warn!(
                         events = n,
                         "Transport: 2xx without a valid receipt — will retry"
                     );
                     metrics().transport_batch_failed();
-                    if let Ok(mut buf) = self.buffer.lock() {
+                    if let Ok(mut buf) = self.lock_spool().await {
                         buf.nack(&seqs);
                     }
                     return FlushOutcome::Failed;
@@ -300,7 +316,7 @@ impl Transport {
 
                 self.record_latency(&batch, &acked_seqs);
 
-                if let Ok(mut buf) = self.buffer.lock() {
+                if let Ok(mut buf) = self.lock_spool().await {
                     // Count only records still queued. Overflow may have
                     // already evicted an in-flight record while awaiting HTTP.
                     let rejected = buf.ack(&rejected_seqs);
@@ -323,7 +339,11 @@ impl Transport {
                         requeue_seqs.len()
                     );
                 }
-                FlushOutcome::Delivered
+                if target.is_some_and(|seq| acked_seqs.contains(&seq)) {
+                    FlushOutcome::TargetConfirmed
+                } else {
+                    FlushOutcome::Delivered
+                }
             }
 
             Ok(resp) => {
@@ -339,7 +359,7 @@ impl Transport {
                         "Transport: gzip refused (415) — disabling compression and retrying"
                     );
                     self.gzip_ok.store(false, Ordering::Relaxed);
-                    if let Ok(mut buf) = self.buffer.lock() {
+                    if let Ok(mut buf) = self.lock_spool().await {
                         buf.nack(&seqs);
                     }
                     FlushOutcome::Failed
@@ -350,7 +370,7 @@ impl Transport {
                     // A rollout may route the next request to an older gateway.
                     // Retry its legacy contract once, preserving every event ID.
                     self.ocsf_ok.store(false, Ordering::Relaxed);
-                    if let Ok(mut buf) = self.buffer.lock() {
+                    if let Ok(mut buf) = self.lock_spool().await {
                         buf.nack(&seqs);
                     }
                     FlushOutcome::Failed
@@ -361,7 +381,7 @@ impl Transport {
                         events = n,
                         "Transport: session rejected (401) — will retry after renewal"
                     );
-                    if let Ok(mut buf) = self.buffer.lock() {
+                    if let Ok(mut buf) = self.lock_spool().await {
                         buf.nack(&seqs);
                     }
                     FlushOutcome::Failed
@@ -374,14 +394,14 @@ impl Transport {
                         "Transport: backend permanently rejected this batch — \
                          dropping it (backend_rejected)"
                     );
-                    if let Ok(mut buf) = self.buffer.lock() {
+                    if let Ok(mut buf) = self.lock_spool().await {
                         let removed = buf.ack(&seqs);
                         metrics().backend_rejected_events(removed as u64);
                     }
                     FlushOutcome::Failed
                 } else {
                     warn!(%status, events = n, "Transport: transient backend error — will retry");
-                    if let Ok(mut buf) = self.buffer.lock() {
+                    if let Ok(mut buf) = self.lock_spool().await {
                         buf.nack(&seqs);
                     }
                     FlushOutcome::Failed
@@ -392,7 +412,7 @@ impl Transport {
                 metrics().transport_batch_failed();
                 metrics().set_backend_connected(false);
                 warn!(error = %e, events = n, "Transport: request failed — will retry");
-                if let Ok(mut buf) = self.buffer.lock() {
+                if let Ok(mut buf) = self.lock_spool().await {
                     buf.nack(&seqs);
                 }
                 FlushOutcome::Failed
@@ -475,7 +495,7 @@ pub async fn send_once(
     if !resp.status().is_success() {
         anyhow::bail!("backend answered {}", resp.status());
     }
-    let report = parse_ack(&resp.bytes().await?)
+    let report = parse_ack(&crate::http::bounded_body(resp, MAX_RECEIPT_BYTES).await?)
         .ok_or_else(|| anyhow::anyhow!("2xx without a valid receipt"))?;
     receipt_confirms_all(events, &report)
 }
@@ -627,6 +647,8 @@ enum FlushOutcome {
     Idle,
     /// At least part of the batch was accepted.
     Delivered,
+    /// The shutdown caller received positive acknowledgement of its own record.
+    TargetConfirmed,
     /// The batch was not delivered.
     Failed,
 }
@@ -1272,6 +1294,32 @@ mod tests {
             spool.push(event()).unwrap();
         }
         spool.push(detection_event()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejection_is_not_a_shutdown_receipt() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
+        let (url, server) = mock_backend(vec![http("422 Unprocessable Entity", "")]).await;
+        let transport = transport_for(url, 0);
+        let seq = queue_with_detection(&transport, 0);
+        assert!(!transport.deliver(seq).await);
+        assert!(!transport.buffer.lock().unwrap().contains_seq(seq));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_receipt_keeps_the_batch() {
+        let _guard = RESPONSE_TEST_LOCK.lock().await;
+        let body = format!(r#"{{"x":"{}"}}"#, "a".repeat(MAX_RECEIPT_BYTES));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (url, server) = mock_backend(vec![response]).await;
+        let transport = transport_for(url, 1);
+        assert_eq!(transport.flush(false).await, FlushOutcome::Failed);
+        assert_eq!(transport.buffer.lock().unwrap().len(), 1);
+        server.await.unwrap();
     }
 
     #[tokio::test]

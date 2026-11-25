@@ -44,16 +44,12 @@
          hardens the host. The agent skips its ACL drift check while the marker
          value below exists. -->
     <Property Id="TRAPD_LEGACY_ACLS" Secure="yes" />
-    <Property Id="ENROLLTOKEN" Secure="yes" Hidden="yes">
-      <RegistrySearch Id="ExistingEnrollToken" Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="raw" Bitness="always64" />
-    </Property>
-
     <!-- Path (never the token) of a file holding a one-time enrollment token.
          install.ps1 -EnrollTokenFile passes it: the deferred SYSTEM action
          ImportEnrollToken reads it with the bounded no-link reader and stages the
          token in the protected registry key, so the token is on no command line,
          in no MSI log and does not need write access to the hardened key for an
-         elevated administrator. Prefer this over ENROLLTOKEN=. -->
+         elevated administrator. -->
     <Property Id="ENROLLTOKENFILE" Secure="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -154,7 +150,7 @@
          read and execute. The service writes; an administrator only reads, so
          agent.env (backend URL, offline switch), the trust anchors and the
          binary baseline cannot be edited from an elevated shell. Configure
-         through the BACKENDURL/ENROLLTOKEN properties or provision files before
+         through the BACKENDURL/ENROLLTOKENFILE properties or provision files before
          the install. Same string as acl_policy::DIR_SDDL. -->
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="DATADIR" Name="TRAPD">
@@ -229,12 +225,6 @@
         <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KR;;;BA)(A;CI;RC;;;OW)" />
       </RegistryValue>
     </Component>
-    <Component Id="EnrollmentConfig" Directory="INSTALLFOLDER" Guid="91605497-3A06-4D6A-90AA-C6857E11B074" Permanent="yes" Bitness="always64" Condition="ENROLLTOKEN">
-      <RegistryValue Root="HKLM" Key="SOFTWARE\TRAPD\Agent" Name="EnrollToken" Type="string" Value="[ENROLLTOKEN]" KeyPath="yes">
-        <PermissionEx Sddl="D:P(A;CI;KA;;;SY)(A;CI;KR;;;BA)(A;CI;RC;;;OW)" />
-      </RegistryValue>
-    </Component>
-
     <!-- MSI owns service registration. Remove persistent containment and
          decoys after StopServices, before DeleteServices; upgrades preserve both. -->
     <!-- Return="check" is deliberate and narrow. `trapd-agent.exe cleanup`
@@ -337,7 +327,7 @@
     <Feature Id="Agent" Title="TRAPD Agent" Level="1">
       <ComponentRef Id="AgentService" /><ComponentRef Id="DataDirectory" /><ComponentRef Id="ConfigDirectory" />
       <ComponentRef Id="DefaultConfig" /><ComponentRef Id="StateDirectory" /><ComponentRef Id="LogDirectory" />
-      <ComponentRef Id="RegistryConfig" /><ComponentRef Id="BackendConfig" /><ComponentRef Id="EnrollmentConfig" />
+      <ComponentRef Id="RegistryConfig" /><ComponentRef Id="BackendConfig" />
       <ComponentRef Id="LegacyAclMarker" />
       <ComponentRef Id="PairScript" /><ComponentRef Id="PairShortcut" />
       <?ifdef TrustDir?>

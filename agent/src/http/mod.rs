@@ -47,6 +47,33 @@ const USER_AGENT: &str = concat!("trapd-agent/", env!("CARGO_PKG_VERSION"));
 /// publicly-trusted CA and pinning is deliberately not used.
 const ALLOW_SYSTEM_ROOTS_ENV: &str = "TRAPD_TLS_ALLOW_SYSTEM_ROOTS";
 
+/// Buffer a control-plane reply only while it fits the endpoint's budget.
+/// Enforce the limit on received chunks too, including replies without a length.
+pub(crate) async fn bounded_body(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    if response.content_length().is_some_and(|n| n > max as u64) {
+        anyhow::bail!("HTTP response exceeds the {max}-byte limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > max - body.len() {
+            anyhow::bail!("HTTP response exceeds the {max}-byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Small JSON replies from enrollment, session and audit endpoints.
+pub(crate) const CONTROL_REPLY_BYTES: usize = 64 * 1024;
+
+pub(crate) async fn control_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T> {
+    Ok(serde_json::from_slice(
+        &bounded_body(response, CONTROL_REPLY_BYTES).await?,
+    )?)
+}
+
 /// Client tuned for the **enrollment / control plane**: short, bounded timeouts
 /// so a stalled backend never hangs startup indefinitely.
 ///
@@ -106,6 +133,8 @@ pub fn build_client(total_timeout: Duration, connect_timeout: Duration) -> Resul
 /// low-rate, so the extra handshake is the price of that guarantee.
 fn base_builder(total_timeout: Duration, connect_timeout: Duration) -> ClientBuilder {
     ClientBuilder::new()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(USER_AGENT)
         .timeout(total_timeout)
         .connect_timeout(connect_timeout)
@@ -123,17 +152,14 @@ fn tls_config() -> Result<rustls::ClientConfig> {
         .context("TLS: unsupported protocol version set")?
         .dangerous()
         .with_custom_certificate_verifier(verifier);
-    let mut cfg = match mtls_identity() {
-        Some((certs, key)) => match builder.clone().with_client_auth_cert(certs, key) {
-            Ok(cfg) => {
-                info!("mTLS: client identity loaded — mutual TLS enabled");
-                cfg
-            }
-            Err(e) => {
-                warn!("mTLS: client identity rejected: {e}");
-                builder.with_no_client_auth()
-            }
-        },
+    let mut cfg = match mtls_identity(paths::config_dir())? {
+        Some((certs, key)) => {
+            let config = builder
+                .with_client_auth_cert(certs, key)
+                .context("mTLS: invalid client identity")?;
+            info!("mTLS: client identity loaded");
+            config
+        }
         None => builder.with_no_client_auth(),
     };
     finish_tls_config(&mut cfg);
@@ -155,7 +181,7 @@ fn finish_tls_config(cfg: &mut rustls::ClientConfig) {
 /// (never a silent fall-back to system roots, which would defeat pinning).
 fn trust_anchors() -> Result<RootCertStore> {
     let path = paths::config_dir().join("ca.crt");
-    if !pin_required(path.exists(), system_roots_opt_in()).with_context(|| {
+    if !pin_required(!matches!(std::fs::symlink_metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound), system_roots_opt_in()).with_context(|| {
         format!(
             "TLS: no pinned CA at {} — refusing to open the control channel over the system \
              trust store (any host-trusted CA could MITM kill/isolate/install commands). \
@@ -177,7 +203,7 @@ fn trust_anchors() -> Result<RootCertStore> {
         });
     }
 
-    let pem = std::fs::read(&path)
+    let pem = crate::paths::bounded_regular_bytes(&path, 1024 * 1024)
         .with_context(|| format!("TLS: cannot read pinned CA {}", path.display()))?;
     let mut roots = RootCertStore::empty();
     let mut count = 0usize;
@@ -216,33 +242,32 @@ fn pin_required(ca_exists: bool, opt_in: bool) -> Result<bool> {
     }
 }
 
-/// Load a PEM client certificate chain + key for mutual TLS. Both files must be
-/// present and parse; otherwise mTLS is skipped (TLS still applies).
-fn mtls_identity() -> Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let cert_path = paths::config_dir().join("agent.crt");
-    let key_path = paths::config_dir().join("agent.key");
+type ClientIdentity = (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>);
 
-    if !cert_path.exists() || !key_path.exists() {
-        return None;
+/// Only a wholly absent identity permits bearer-only authentication.
+fn mtls_identity(dir: &std::path::Path) -> Result<Option<ClientIdentity>> {
+    fn absent(path: &std::path::Path) -> Result<bool> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e).context("mTLS: cannot inspect identity file"),
+        }
     }
-    let cert_pem = std::fs::read(&cert_path)
-        .map_err(|e| warn!("mTLS: cannot read {}: {e}", cert_path.display()))
-        .ok()?;
-    let key_pem = std::fs::read(&key_path)
-        .map_err(|e| warn!("mTLS: cannot read {}: {e}", key_path.display()))
-        .ok()?;
+    let cert_path = dir.join("agent.crt");
+    let key_path = dir.join("agent.key");
+    if absent(&cert_path)? && absent(&key_path)? {
+        return Ok(None);
+    }
+    let cert_pem = paths::bounded_regular_bytes(&cert_path, 1024 * 1024)
+        .context("mTLS: cannot read certificate")?;
+    let key_pem = paths::bounded_regular_bytes(&key_path, 64 * 1024)
+        .context("mTLS: cannot read client key")?;
     let certs = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| warn!("mTLS: cannot parse {}: {e}", cert_path.display()))
-        .ok()?;
-    if certs.is_empty() {
-        warn!("mTLS: {} contains no certificate", cert_path.display());
-        return None;
-    }
-    let key = PrivateKeyDer::from_pem_slice(&key_pem)
-        .map_err(|e| warn!("mTLS: cannot parse {}: {e}", key_path.display()))
-        .ok()?;
-    Some((certs, key))
+        .context("mTLS: invalid certificate chain")?;
+    anyhow::ensure!(!certs.is_empty(), "mTLS: empty certificate chain");
+    let key = PrivateKeyDer::from_pem_slice(&key_pem).context("mTLS: invalid client key")?;
+    Ok(Some((certs, key)))
 }
 
 /// Normalise a backend base URL: trim whitespace and any trailing slashes so
@@ -284,6 +309,7 @@ mod tests {
             }
         });
         let client = super::base_builder(Duration::from_secs(5), Duration::from_secs(2))
+            .https_only(false) // loopback fixture tests connection reuse only
             .no_proxy()
             .build()
             .unwrap();
@@ -292,6 +318,66 @@ mod tests {
             assert_eq!(r.text().await.unwrap(), "ok");
         }
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn body_budget_applies_to_chunked_and_declared_lengths() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn reply(framing: &'static [u8]) -> reqwest::Response {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 1024];
+                assert!(socket.read(&mut buf).await.unwrap() > 0);
+                socket.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+                socket.write_all(framing).await.unwrap();
+            });
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{addr}/"))
+                .send()
+                .await
+                .unwrap()
+        }
+        let chunked = b"Transfer-Encoding: chunked\r\n\r\n2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n";
+        assert_eq!(
+            super::bounded_body(reply(chunked).await, 4).await.unwrap(),
+            b"abcd"
+        );
+        assert!(super::bounded_body(reply(chunked).await, 3).await.is_err());
+        let declared = b"Content-Length: 4\r\n\r\nabcd";
+        assert!(super::bounded_body(reply(declared).await, 3).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn backend_client_rejects_plain_http_before_connecting() {
+        let client = super::base_builder(Duration::from_secs(2), Duration::from_secs(1))
+            .build()
+            .unwrap();
+        assert!(client
+            .post("http://127.0.0.1/")
+            .send()
+            .await
+            .unwrap_err()
+            .is_builder());
+    }
+
+    #[test]
+    fn partial_or_corrupt_identity_is_an_error() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        assert!(super::mtls_identity(&dir).unwrap().is_none());
+        let key = dir.join("agent.key");
+        std::fs::write(&key, "invalid").unwrap();
+        assert!(super::mtls_identity(&dir).is_err());
+        std::fs::write(dir.join("agent.crt"), "invalid").unwrap();
+        assert!(super::mtls_identity(&dir).is_err());
+        std::fs::remove_file(key).unwrap();
+        assert!(super::mtls_identity(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     use super::{normalize_base_url, pin_required};
