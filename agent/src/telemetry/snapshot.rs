@@ -119,7 +119,7 @@ impl TelemetryReport {
 
     /// Read a report from disk.
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        let body = std::fs::read(path)?;
+        let body = crate::paths::bounded_regular_bytes(path, 1024 * 1024)?;
         let report: TelemetryReport = serde_json::from_slice(&body)?;
         if report.version > REPORT_VERSION {
             anyhow::bail!(

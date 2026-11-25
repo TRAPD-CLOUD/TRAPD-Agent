@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::selfprotect::stop::{within, Delivery};
@@ -73,16 +73,24 @@ pub type Request = std_mpsc::Sender<()>;
 
 /// The platform side (SCM control handler, signal listener) of the channel.
 #[derive(Clone)]
-pub struct SuspendNotifier(UnboundedSender<Request>);
+pub struct SuspendNotifier(mpsc::Sender<Request>);
 
 impl SuspendNotifier {
+    fn enqueue(&self, request: Request) -> Result<(), mpsc::error::TrySendError<Request>> {
+        self.0.try_send(request).inspect_err(|err| {
+            if matches!(err, mpsc::error::TrySendError::Full(_)) {
+                crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            }
+        })
+    }
+
     /// Request an announcement and block for at most `wait` until it is done.
     /// Blocking: call it from the SCM control handler thread, never from a
     /// Tokio worker. Returns whether it finished in time.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn announce_blocking(&self, wait: Duration) -> bool {
         let (ack, done) = std_mpsc::channel();
-        if self.0.send(ack).is_err() {
+        if self.enqueue(ack).is_err() {
             return false;
         }
         done.recv_timeout(wait).is_ok()
@@ -92,18 +100,18 @@ impl SuspendNotifier {
     #[cfg_attr(windows, allow(dead_code))]
     pub fn announce(&self) {
         let (ack, _done) = std_mpsc::channel();
-        let _ = self.0.send(ack);
+        let _ = self.enqueue(ack);
     }
 }
 
-pub fn channel() -> (SuspendNotifier, UnboundedReceiver<Request>) {
-    let (tx, rx) = unbounded_channel();
+pub fn channel() -> (SuspendNotifier, mpsc::Receiver<Request>) {
+    let (tx, rx) = mpsc::channel(1);
     (SuspendNotifier(tx), rx)
 }
 
 /// Serve announcement requests until every notifier is dropped. `announce`
 /// sends the beat and reports whether the backend accepted it.
-pub async fn serve<F, Fut>(mut requests: UnboundedReceiver<Request>, mut announce: F)
+pub async fn serve<F, Fut>(mut requests: mpsc::Receiver<Request>, mut announce: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -193,6 +201,16 @@ mod tests {
         assert!(took >= ANNOUNCE_BUDGET, "not before the budget: {took:?}");
         drop(notifier);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn repeated_notifications_coalesce_with_a_bounded_queue() {
+        let (notifier, requests) = channel();
+        for _ in 0..100 {
+            notifier.announce();
+        }
+        assert_eq!(requests.len(), 1);
+        assert!(!notifier.announce_blocking(Duration::ZERO));
     }
 
     #[test]

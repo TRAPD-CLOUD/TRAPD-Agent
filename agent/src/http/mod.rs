@@ -204,7 +204,7 @@ fn trust_anchors() -> Result<RootCertStore> {
         });
     }
 
-    let pem = std::fs::read(&path)
+    let pem = crate::paths::bounded_regular_bytes(&path, 1024 * 1024)
         .with_context(|| format!("TLS: cannot read pinned CA {}", path.display()))?;
     let mut roots = RootCertStore::empty();
     let mut count = 0usize;
@@ -252,10 +252,10 @@ fn mtls_identity() -> Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'stati
     if !cert_path.exists() || !key_path.exists() {
         return None;
     }
-    let cert_pem = std::fs::read(&cert_path)
+    let cert_pem = crate::paths::bounded_regular_bytes(&cert_path, 1024 * 1024)
         .map_err(|e| warn!("mTLS: cannot read {}: {e}", cert_path.display()))
         .ok()?;
-    let key_pem = std::fs::read(&key_path)
+    let key_pem = crate::paths::bounded_regular_bytes(&key_path, 64 * 1024)
         .map_err(|e| warn!("mTLS: cannot read {}: {e}", key_path.display()))
         .ok()?;
     let certs = CertificateDer::pem_slice_iter(&cert_pem)

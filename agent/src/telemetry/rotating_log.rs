@@ -8,8 +8,8 @@
 //!
 //! Failure policy: logging must never take the service down. If a rotation
 //! step fails (for example an AV scanner holds `agent.log.1`), the writer keeps
-//! appending to the current file and retries after [`RETRY_AFTER_BYTES`] more
-//! bytes instead of dropping log lines.
+//! appending within a 1 MiB headroom and retries after five seconds. Further
+//! writes fail and are counted when the headroom is exhausted.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -29,7 +29,7 @@ pub struct RotatingFile {
     max_bytes: u64,
     keep: usize,
     /// Do not attempt rotation before `size` reaches this (backoff after failure).
-    next_rotation_at: u64,
+    next_rotation_at: Option<std::time::Instant>,
 }
 
 fn open_append(path: &Path) -> std::io::Result<File> {
@@ -54,7 +54,7 @@ impl RotatingFile {
             size,
             max_bytes: max_bytes.max(1),
             keep: keep.max(1),
-            next_rotation_at: 0,
+            next_rotation_at: None,
         })
     }
 
@@ -71,7 +71,7 @@ impl RotatingFile {
         std::fs::rename(&self.path, generation(&self.path, 1))?;
         self.file = open_append(&self.path)?;
         self.size = 0;
-        self.next_rotation_at = 0;
+        self.next_rotation_at = None;
         Ok(())
     }
 }
@@ -79,14 +79,23 @@ impl RotatingFile {
 impl Write for RotatingFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.size.saturating_add(buf.len() as u64) > self.max_bytes
-            && self.size >= self.next_rotation_at
+            && self
+                .next_rotation_at
+                .is_none_or(|retry| std::time::Instant::now() >= retry)
             && self.rotate().is_err()
         {
             // Keep logging into the current file; try again later.
-            self.next_rotation_at = self.size.saturating_add(RETRY_AFTER_BYTES);
+            self.next_rotation_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
             // A half-finished rotation may have renamed the live file away
             // while the open handle still points at it: that is fine, the
             // handle keeps working and the next success re-creates the path.
+        }
+        if self.size.saturating_add(buf.len() as u64)
+            > self.max_bytes.saturating_add(RETRY_AFTER_BYTES)
+        {
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
         }
         let n = self.file.write(buf)?;
         self.size = self.size.saturating_add(n as u64);
@@ -153,6 +162,8 @@ mod tests {
         w.write_all(&[b'a'; 8]).unwrap();
         w.write_all(&[b'b'; 8]).unwrap();
         w.write_all(&[b'c'; 8]).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 24);
+        assert!(w.write_all(&vec![0; RETRY_AFTER_BYTES as usize]).is_err());
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 24);
         let _ = std::fs::remove_dir_all(&d);
     }
