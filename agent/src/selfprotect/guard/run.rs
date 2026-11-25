@@ -33,6 +33,17 @@ pub enum Exit {
     AuthorizedStopOfThePair,
 }
 
+// The guard has its own process-local metrics. Its service log carries a
+// cumulative count too, at powers of two to avoid flooding under overload.
+fn report_exchange_drop() {
+    static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+    let total = DROPPED.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if total.is_power_of_two() {
+        warn!(total, "guard exchanges or observations refused at capacity");
+    }
+}
+
 struct Observation {
     pid: Option<u32>,
     notice: Option<StopNotice>,
@@ -138,7 +149,7 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
                     }
                 };
                 let Ok(permit) = Arc::clone(&exchanges).try_acquire_owned() else {
-                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                    report_exchange_drop();
                     continue;
                 };
                 let tx = obs_tx.clone();
@@ -160,7 +171,7 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
                             delivered.store(true, Ordering::SeqCst);
                         }
                         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Observation { pid, notice: ping.stop }) {
-                            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                            report_exchange_drop();
                         }
                     }
                 });
@@ -217,7 +228,6 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
         let wait = async {
             while !delivered.load(Ordering::SeqCst) {
                 if let Ok((mut stream, _)) = listener.accept().await {
-                    let _permit = permit;
                     let notice = stopping.lock().ok().and_then(|g| g.clone());
                     let ok = tokio::time::timeout(
                         EXCHANGE_TIMEOUT,

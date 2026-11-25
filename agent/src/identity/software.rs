@@ -126,6 +126,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn refuses_oversized_identity_state_without_replacing_it() {
+        let dir = scratch("oversized");
+        let path = dir.join("identity.key");
+        std::fs::write(&path, vec![0; 4097]).unwrap();
+        assert!(SoftwareKey::load_or_create_at(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4097);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn key_file_is_0600_and_reloads_to_same_public_key() {
         let dir = scratch("reload");
         let path = dir.join("identity.key");

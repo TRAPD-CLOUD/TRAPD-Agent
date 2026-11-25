@@ -1305,6 +1305,26 @@ mod tests {
         assert!(!pending[0].1.reported);
     }
 
+    #[test]
+    fn extreme_or_oversized_consumed_records_do_not_break_recovery() {
+        let dir = tmp();
+        let store = ConsumedStore::new(dir.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let path = store.path_for(nonce()).unwrap();
+        let record = ConsumedRecord {
+            purpose: Purpose::Stop,
+            consumed_at: 0,
+            exp: i64::MAX,
+            reported: true,
+        };
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        store.prune(i64::MAX);
+        assert!(path.exists());
+        std::fs::write(&path, vec![b' '; 4097]).unwrap();
+        assert!(store.pending().next().is_none());
+        assert!(path.exists(), "preserve the consumed nonce");
+    }
+
     #[cfg(unix)]
     #[test]
     fn claim_creates_missing_directories_and_persists_the_record() {
