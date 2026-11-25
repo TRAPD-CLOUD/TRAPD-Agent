@@ -19,12 +19,31 @@ const MAX_TOKEN_FILE_BYTES: u64 = 512;
 /// Read the token: bounded regular file (no links, reparse points or devices),
 /// first line only, printable ASCII without whitespace or quotes.
 pub(crate) fn read(path: &Path) -> Result<String> {
-    let bytes = paths::bounded_regular_bytes(path, MAX_TOKEN_FILE_BYTES)
+    use std::io::Read;
+    let file = paths::open_bounded_regular(path, MAX_TOKEN_FILE_BYTES)
         .with_context(|| format!("cannot read enrollment token file {}", path.display()))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        anyhow::ensure!(
+            meta.uid() == nix::unistd::Uid::effective().as_raw()
+                && meta.mode() & 0o077 == 0
+                && meta.nlink() == 1,
+            "enrollment token file needs private ownership and permissions"
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_TOKEN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_TOKEN_FILE_BYTES as usize,
+        "oversized enrollment token"
+    );
     parse(&bytes)
 }
 
-fn parse(bytes: &[u8]) -> Result<String> {
+pub(super) fn parse(bytes: &[u8]) -> Result<String> {
     let text = std::str::from_utf8(bytes).context("enrollment token file is not text")?;
     let token = text.lines().next().unwrap_or("").trim();
     if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic() && b != b'"') {
@@ -114,6 +133,13 @@ mod tests {
         assert!(read(&dir.0).is_err());
         let ok = dir.0.join("ok");
         std::fs::write(&ok, "tok-1\n").unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(read(&ok).is_err());
+            std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert_eq!(read(&ok).unwrap(), "tok-1");
     }
 

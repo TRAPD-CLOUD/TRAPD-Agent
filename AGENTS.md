@@ -46,7 +46,7 @@ This repository contains the Linux TRAPD telemetry and response agent. Use this 
 
 ## Runtime Modes
 
-- Online mode requires `TRAPD_BACKEND_URL`; first run also requires `TRAPD_ENROLL_TOKEN`.
+- Online mode requires `TRAPD_BACKEND_URL`; first run uses device pairing or a protected `enrollment.token` file in the config directory. Windows MSI can stage the token with `ENROLLTOKENFILE`.
 - Offline mode is enabled by `TRAPD_OFFLINE=1` or by missing `TRAPD_BACKEND_URL`.
 - Offline mode skips enrollment, ingest, heartbeat, config pull, and command pull; telemetry is emitted locally.
 - Output mode is controlled by `TRAPD_OUTPUT`: `file` writes to `<log_dir>/events.ndjson`, `stdout` prints, `off` writes nothing locally. Unset: stdout on a terminal, otherwise off.

@@ -123,7 +123,7 @@ pub(crate) fn binary_baseline_line(hash_hex: &str) -> String {
 
 /// Open an untrusted on-disk file for bounded reading. Links, reparse points
 /// and special files are refused before any content is read.
-fn open_bounded_regular(path: &Path, max_bytes: u64) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_bounded_regular(path: &Path, max_bytes: u64) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -804,7 +804,7 @@ pub fn load_agent_env_file() {
         return;
     };
     for (key, value) in parse_agent_env(&contents) {
-        if std::env::var_os(&key).is_none() {
+        if key != "TRAPD_ENROLL_TOKEN" && std::env::var_os(&key).is_none() {
             std::env::set_var(key, value);
         }
     }
@@ -812,7 +812,7 @@ pub fn load_agent_env_file() {
 }
 
 /// `KEY=value` lines; blank lines and `#` comments skipped, surrounding quotes trimmed.
-fn parse_agent_env(contents: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_agent_env(contents: &str) -> Vec<(String, String)> {
     contents
         .lines()
         .map(str::trim)

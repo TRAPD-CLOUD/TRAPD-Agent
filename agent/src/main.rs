@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
         if !backend_configured {
             warn!(
                 "TRAPD_BACKEND_URL is not set — starting in OFFLINE mode. Telemetry is \
-                 emitted locally only. Set TRAPD_BACKEND_URL + TRAPD_ENROLL_TOKEN in {}/agent.env \
+                 emitted locally only. Set TRAPD_BACKEND_URL in {}/agent.env \
                  for a backend-connected agent.",
                 paths::config_dir().display()
             );

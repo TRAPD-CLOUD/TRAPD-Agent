@@ -16,7 +16,6 @@ param(
     [ValidateSet('stable', 'beta')][string]$Channel = 'stable',
     [string]$BackendUrl = $env:TRAPD_BACKEND_URL,
     [string]$EnrollTokenFile,
-    [string]$EnrollToken = $env:TRAPD_ENROLL_TOKEN,
     # Expected MSI signer. At least one is required unless -AllowUnsigned is given.
     [string]$ExpectedThumbprint = $env:TRAPD_SIGNER_THUMBPRINT,
     [string]$ExpectedPublisher = $env:TRAPD_SIGNER_SUBJECT,
@@ -28,8 +27,9 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
     throw 'Run this installer from an elevated PowerShell prompt.'
 }
 if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne 'X64') { throw 'Only x64 Windows is supported.' }
+if ($env:TRAPD_ENROLL_TOKEN) { throw 'Supply -EnrollTokenFile or use device pairing.' }
+$EnrollToken = $null
 if ($EnrollTokenFile) {
-    if ($EnrollToken) { throw 'Use either -EnrollTokenFile or -EnrollToken, not both.' }
     $EnrollToken = ([string](Get-Content -LiteralPath $EnrollTokenFile -TotalCount 1)).Trim()
 }
 if (-not $AllowUnsigned -and -not $ExpectedThumbprint -and -not $ExpectedPublisher) {
