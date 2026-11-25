@@ -95,6 +95,9 @@ impl Collector for RegistryWatchCollector {
             .as_ref()
             .and_then(|loaded| encode_baseline(loaded).ok());
         let mut gate = StormGate::default();
+        let mut scan_status = crate::telemetry::coverage::SourceCoverage::new(
+            "WindowsRegistryCollector/snapshot".into(),
+        );
         let mut last_omitted_users = 0usize;
         let mut ticker = interval(POLL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -134,10 +137,14 @@ impl Collector for RegistryWatchCollector {
                 {
                     Ok(s) => s,
                     Err(e) => {
+                        scan_status.set_failed(true);
                         warn!(error = %e, "registry snapshot panicked; skipping poll");
                         continue;
                     }
                 };
+                let partial = current.incomplete
+                    || current.omitted_users > 0
+                    || !current.unavailable.is_empty();
                 if !current.unavailable.contains("HKU")
                     && current.omitted_users != last_omitted_users
                 {
@@ -149,6 +156,7 @@ impl Collector for RegistryWatchCollector {
                     last_omitted_users = current.omitted_users;
                 }
                 if current.incomplete {
+                    scan_status.set_failed(true);
                     warn!("registry snapshot exceeded tracking limit; preserving baseline and skipping poll");
                     continue;
                 }
@@ -162,6 +170,7 @@ impl Collector for RegistryWatchCollector {
                     Some(prev) => match retain_unavailable(prev, current) {
                         Ok(next) => next,
                         Err(_) => {
+                            scan_status.set_failed(true);
                             warn!("registry retained baseline exceeded limits; preserving previous baseline and skipping poll");
                             continue;
                         }
@@ -174,10 +183,12 @@ impl Collector for RegistryWatchCollector {
                 let saved = match encode_baseline(&next) {
                     Ok(saved) => saved,
                     Err(_) => {
+                        scan_status.set_failed(true);
                         warn!("registry snapshot cannot be persisted within limits; preserving baseline and skipping poll");
                         continue;
                     }
                 };
+                scan_status.set_failed(partial);
                 let mut next_gate = gate.clone();
                 let planned = previous
                     .as_ref()

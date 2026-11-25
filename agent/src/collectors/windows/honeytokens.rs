@@ -1179,9 +1179,7 @@ fn send_prevention(
             details,
         }),
     );
-    if let Err(e) = tx.try_send(event) {
-        warn!(error = %e, "honeytoken: lifecycle event dropped (pipeline full/closed)");
-    }
+    crate::pipeline::try_emit(tx, event, "WindowsHoneytokenCollector");
 }
 
 /// Build and ship one filesystem honeytoken detection event.
@@ -1265,9 +1263,7 @@ fn send_detection(
     );
     // Called from plain threads and from async context via spawn_blocking-free
     // sync paths; try_send never blocks the watcher on a full pipeline.
-    if let Err(e) = tx.try_send(event) {
-        warn!(error = %e, "honeytoken: detection event dropped (pipeline full/closed)");
-    }
+    crate::pipeline::try_emit(tx, event, "WindowsHoneytokenCollector");
 }
 
 // ── Legacy registry decoys (retired) ──────────────────────────────────────────
