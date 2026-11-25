@@ -557,6 +557,27 @@ mod tests {
     }
 
     #[test]
+    fn coalescing_long_paths_uses_a_byte_budget_and_forwards_displaced_paths() {
+        let now = Instant::now();
+        let mut recent = Coalescer::default();
+        let suffix = "x".repeat(64 * 1024);
+        for n in 0..70 {
+            assert!(!recent.suppress(&format!("{n}{suffix}"), "write", false, false, now));
+        }
+        assert!(recent.path_bytes <= 4 * 1024 * 1024);
+        assert!(recent.suppress(&format!("69{suffix}"), "write", false, false, now));
+        assert!(!recent.suppress(&format!("0{suffix}"), "write", false, false, now));
+        assert!(!recent.suppress(
+            "fresh",
+            "write",
+            false,
+            false,
+            now + GENERIC_COALESCE_WINDOW
+        ));
+        assert_eq!(recent.path_bytes, "fresh".len());
+    }
+
+    #[test]
     fn entropy_separates_text_from_random_bytes() {
         assert_eq!(shannon_entropy(&[]), 0.0);
         assert!(shannon_entropy(b"aaaaaaaaaaaaaaaa") < 0.01);
