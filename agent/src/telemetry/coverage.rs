@@ -235,6 +235,8 @@ pub fn shadow_hit(rule_id: &str) {
             *n = n.saturating_add(1);
         } else if m.len() < MAX_SHADOW_RULES {
             m.insert(rule_id.to_string(), 1);
+        } else {
+            super::metrics::metrics().state_capacity_dropped(1);
         }
     }
 }
@@ -254,6 +256,8 @@ pub fn restore_shadow_hits(hits: BTreeMap<String, u64>) {
             if m.len() < MAX_SHADOW_RULES || m.contains_key(&rule) {
                 let e = m.entry(rule).or_insert(0);
                 *e = e.saturating_add(n);
+            } else {
+                super::metrics::metrics().state_capacity_dropped(n);
             }
         }
     }

@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// Default number of rotated generations kept besides the live file.
 pub const DEFAULT_KEEP: usize = 3;
-/// After a failed rotation, how much more may be written before retrying.
-const RETRY_AFTER_BYTES: u64 = 1024 * 1024;
+/// Hard limit on additional bytes retained while a rotation is failing.
+const ROTATION_HEADROOM_BYTES: u64 = 1024 * 1024;
 
 pub struct RotatingFile {
     path: PathBuf,
@@ -28,7 +28,7 @@ pub struct RotatingFile {
     size: u64,
     max_bytes: u64,
     keep: usize,
-    /// Do not attempt rotation before `size` reaches this (backoff after failure).
+    /// Earliest retry after a failed rotation.
     next_rotation_at: Option<std::time::Instant>,
 }
 
@@ -92,7 +92,7 @@ impl Write for RotatingFile {
             // handle keeps working and the next success re-creates the path.
         }
         if self.size.saturating_add(buf.len() as u64)
-            > self.max_bytes.saturating_add(RETRY_AFTER_BYTES)
+            > self.max_bytes.saturating_add(ROTATION_HEADROOM_BYTES)
         {
             crate::telemetry::metrics::metrics().state_capacity_dropped(1);
             return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
@@ -163,7 +163,9 @@ mod tests {
         w.write_all(&[b'b'; 8]).unwrap();
         w.write_all(&[b'c'; 8]).unwrap();
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 24);
-        assert!(w.write_all(&vec![0; RETRY_AFTER_BYTES as usize]).is_err());
+        assert!(w
+            .write_all(&vec![0; ROTATION_HEADROOM_BYTES as usize])
+            .is_err());
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 24);
         let _ = std::fs::remove_dir_all(&d);
     }
