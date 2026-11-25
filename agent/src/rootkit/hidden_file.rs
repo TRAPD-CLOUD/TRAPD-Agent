@@ -375,8 +375,29 @@ fn open_dir(path: &Path, follow: bool) -> Option<DirFd> {
     (fd >= 0).then_some(DirFd(fd))
 }
 
+// Counts names before retention, including both directory views. Linux NAME_MAX
+// bounds each dirent name. A separate byte limit applies to full candidate paths.
+const DIRECTORY_ENTRIES: usize = 64_000;
+const CANDIDATE_ENTRIES: usize = 2_048;
+const CANDIDATE_PATH_BYTES: usize = 2 * 1024 * 1024;
+const PROC_WORK: usize = 16_384;
+
+fn charge(remaining: &mut usize, amount: usize) -> bool {
+    if amount > *remaining {
+        *remaining = 0;
+        false
+    } else {
+        *remaining -= amount;
+        true
+    }
+}
+
 /// Enumerate a directory by issuing `getdents64` directly.
-fn read_dir_syscall(path: &Path, follow: bool) -> Option<Vec<(Vec<u8>, u8)>> {
+fn read_dir_syscall(
+    path: &Path,
+    follow: bool,
+    remaining: &mut usize,
+) -> Option<Vec<(Vec<u8>, u8)>> {
     let fd = open_dir(path, follow)?;
     let mut buf = vec![0u8; 32 * 1024];
     let mut out = Vec::new();
@@ -393,7 +414,13 @@ fn read_dir_syscall(path: &Path, follow: bool) -> Option<Vec<(Vec<u8>, u8)>> {
         match n {
             0 => break,
             n if n < 0 => return None,
-            n => out.extend(parse_dirents64(&buf[..n as usize])),
+            n => {
+                let chunk = parse_dirents64(buf.get(..n as usize)?);
+                if !charge(remaining, chunk.len()) {
+                    return None;
+                }
+                out.extend(chunk);
+            }
         }
     }
     Some(out)
@@ -401,14 +428,15 @@ fn read_dir_syscall(path: &Path, follow: bool) -> Option<Vec<(Vec<u8>, u8)>> {
 
 /// Enumerate a directory through libc, which is what an `LD_PRELOAD` rootkit
 /// interposes. `std::fs::read_dir` uses `opendir`/`readdir` underneath.
-fn read_dir_libc(path: &Path) -> Option<BTreeSet<Vec<u8>>> {
-    let entries = std::fs::read_dir(path).ok()?;
-    Some(
-        entries
-            .flatten()
-            .map(|e| e.file_name().as_bytes().to_vec())
-            .collect(),
-    )
+fn read_dir_libc(path: &Path, remaining: &mut usize) -> Option<BTreeSet<Vec<u8>>> {
+    let mut names = BTreeSet::new();
+    for entry in std::fs::read_dir(path).ok()? {
+        if !charge(remaining, 1) {
+            return None;
+        }
+        names.insert(entry.ok()?.file_name().as_bytes().to_vec());
+    }
+    Some(names)
 }
 
 // ── Filesystem classification ───────────────────────────────────────────────
@@ -501,17 +529,23 @@ pub fn gather(
     let mut summary = FileScanSummary::default();
     let mut dirs = Vec::new();
 
-    for root in canonical_roots(&cfg.file_roots) {
+    let roots = canonical_roots(&cfg.file_roots);
+    let per_root = DIRECTORY_ENTRIES / roots.len().max(1);
+    for root in roots {
         if dirs.len() >= cfg.dir_scan_max {
             summary.truncated = true;
             break;
         }
-        walk(&root, cfg, &mut dirs, &mut summary);
+        walk(&root, cfg, &mut dirs, &mut summary, per_root);
     }
     summary.directories = dirs.len();
     summary.nlink_checked = dirs.iter().filter(|d| d.nlink.is_some()).count();
 
-    let candidates = resolve_candidates(collect_candidate_names(kernel_paths));
+    let names = collect_candidate_names(kernel_paths, &mut summary.truncated);
+    let candidates = resolve_candidates(names, &mut summary.truncated);
+    if summary.truncated {
+        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+    }
     summary.candidates = candidates.len();
 
     (dirs, candidates, summary)
@@ -544,6 +578,7 @@ fn walk(
     cfg: &RootkitConfig,
     out: &mut Vec<DirectoryViews>,
     sum: &mut FileScanSummary,
+    mut remaining: usize,
 ) {
     let Some(root_st) = lstat(root) else { return };
     if root_st.st_mode & libc::S_IFMT != libc::S_IFDIR {
@@ -558,11 +593,16 @@ fn walk(
 
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
-        if out.len() >= cfg.dir_scan_max {
+        if out.len() >= cfg.dir_scan_max || !charge(&mut remaining, 1) {
             sum.truncated = true;
             return;
         }
-        let Some(entries) = read_dir_syscall(&dir, false) else {
+        let Some(entries) = read_dir_syscall(&dir, false, &mut remaining) else {
+            sum.truncated |= remaining == 0;
+            continue;
+        };
+        let Some(libc) = read_dir_libc(&dir, &mut remaining) else {
+            sum.truncated |= remaining == 0;
             continue;
         };
 
@@ -576,7 +616,9 @@ fn walk(
                     subdirs += 1;
                     if depth < cfg.dir_scan_depth {
                         let child = dir.join(std::ffi::OsStr::from_bytes(name));
-                        if lstat(&child).is_some_and(|st| st.st_dev == device) {
+                        if stack.len() >= 512 {
+                            sum.truncated = true;
+                        } else if lstat(&child).is_some_and(|st| st.st_dev == device) {
                             stack.push((child, depth + 1));
                         }
                     }
@@ -598,7 +640,7 @@ fn walk(
         };
 
         out.push(DirectoryViews {
-            libc: read_dir_libc(&dir).unwrap_or_default(),
+            libc,
             syscall,
             nlink,
             subdirs,
@@ -610,14 +652,25 @@ fn walk(
 /// Gather candidate names from the sources a filtered listing cannot suppress.
 fn collect_candidate_names(
     kernel_paths: &[(String, PathSighting)],
+    truncated: &mut bool,
 ) -> BTreeMap<PathBuf, CandidateName> {
     let mut out: BTreeMap<PathBuf, CandidateName> = BTreeMap::new();
 
+    let mut names_left = CANDIDATE_ENTRIES;
+    let mut bytes_left = CANDIDATE_PATH_BYTES;
+    let mut accept = |p: &Path, truncated: &mut bool| {
+        let fits = charge(&mut names_left, 1) && charge(&mut bytes_left, p.as_os_str().len());
+        *truncated |= !fits;
+        fits
+    };
     // eBPF sightings come first and are never displaced: they were observed
     // below every interface userspace can hook, which makes them the strongest
     // provenance a candidate can have.
     for (path, sighting) in kernel_paths {
         if let Some(p) = usable_candidate(Path::new(path)) {
+            if !accept(&p, truncated) {
+                return out;
+            }
             out.insert(
                 p,
                 CandidateName {
@@ -632,20 +685,34 @@ fn collect_candidate_names(
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return out;
     };
+    use std::io::Read;
+    let mut work = PROC_WORK;
+    let mut maps_bytes = 2 * 1024 * 1024;
     for pid in entries
         .flatten()
         .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
     {
+        if !charge(&mut work, 1) {
+            *truncated = true;
+            return out;
+        }
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .ok()
             .map(|s| s.trim().to_string());
 
         if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
-            for target in fds
-                .flatten()
-                .filter_map(|e| std::fs::read_link(e.path()).ok())
-            {
+            for fd in fds {
+                if !charge(&mut work, 1) {
+                    *truncated = true;
+                    return out;
+                }
+                let Some(target) = fd.ok().and_then(|e| std::fs::read_link(e.path()).ok()) else {
+                    continue;
+                };
                 if let Some(p) = usable_candidate(&target) {
+                    if !out.contains_key(&p) && !accept(&p, truncated) {
+                        return out;
+                    }
                     out.entry(p).or_insert_with(|| CandidateName {
                         source: "proc_fd",
                         revealed_by: comm.clone(),
@@ -655,9 +722,28 @@ fn collect_candidate_names(
             }
         }
 
-        if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+        if let Ok(file) = std::fs::File::open(format!("/proc/{pid}/maps")) {
+            let cap = maps_bytes.min(128 * 1024);
+            if cap == 0 {
+                *truncated = true;
+                return out;
+            }
+            let mut bytes = Vec::new();
+            let Ok(n) = file.take(cap as u64 + 1).read_to_end(&mut bytes) else {
+                continue;
+            };
+            let mut maps = String::from_utf8_lossy(&bytes).into_owned();
+            maps_bytes -= n.min(cap);
+            if n > cap {
+                *truncated = true;
+                // A clipped line is not an observed path.
+                maps.truncate(maps.rfind('\n').unwrap_or(0));
+            }
             for path in mapped_paths(&maps) {
                 if let Some(p) = usable_candidate(Path::new(&path)) {
+                    if !out.contains_key(&p) && !accept(&p, truncated) {
+                        return out;
+                    }
                     out.entry(p).or_insert_with(|| CandidateName {
                         source: "proc_maps",
                         revealed_by: comm.clone(),
@@ -717,7 +803,10 @@ pub fn usable_candidate(path: &Path) -> Option<PathBuf> {
 /// Candidates are grouped by parent so one listing read serves all of them, and
 /// each is `lstat`-ed before and after that read: identical inodes on both sides
 /// prove the file was present for the whole window the listing was taken in.
-fn resolve_candidates(names: BTreeMap<PathBuf, CandidateName>) -> Vec<ResolvedCandidate> {
+fn resolve_candidates(
+    names: BTreeMap<PathBuf, CandidateName>,
+    truncated: &mut bool,
+) -> Vec<ResolvedCandidate> {
     let mut by_parent: BTreeMap<PathBuf, Vec<(PathBuf, CandidateName)>> = BTreeMap::new();
     for (path, name) in names {
         if let Some(parent) = path.parent() {
@@ -729,7 +818,12 @@ fn resolve_candidates(names: BTreeMap<PathBuf, CandidateName>) -> Vec<ResolvedCa
     }
 
     let mut out = Vec::new();
+    let mut remaining = DIRECTORY_ENTRIES;
     for (parent, children) in by_parent {
+        if remaining == 0 {
+            *truncated = true;
+            break;
+        }
         if fs_type(&parent).is_none_or(is_synthetic) {
             continue;
         }
@@ -738,7 +832,8 @@ fn resolve_candidates(names: BTreeMap<PathBuf, CandidateName>) -> Vec<ResolvedCa
             .iter()
             .map(|(p, _)| lstat(p).map(|st| st.st_ino))
             .collect();
-        let Some(listing) = read_dir_syscall(&parent, true) else {
+        let Some(listing) = read_dir_syscall(&parent, true, &mut remaining) else {
+            *truncated |= remaining == 0;
             continue;
         };
         let listed: BTreeSet<Vec<u8>> = listing.into_iter().map(|(name, _)| name).collect();
@@ -766,6 +861,18 @@ fn resolve_candidates(names: BTreeMap<PathBuf, CandidateName>) -> Vec<ResolvedCa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_directory_is_unavailable_to_both_comparisons() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(dir.join(name), []).unwrap();
+        }
+        assert!(read_dir_syscall(&dir, false, &mut 1).is_none());
+        assert!(read_dir_libc(&dir, &mut 1).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn dir(path: &str, libc: &[&str], syscall: &[&str]) -> DirectoryViews {
         DirectoryViews {
@@ -1093,12 +1200,14 @@ mod tests {
     #[test]
     #[ignore = "reads the live filesystem"]
     fn both_enumerations_agree_on_a_real_directory() {
-        let libc = read_dir_libc(Path::new("/etc")).expect("libc readdir");
-        let syscall: BTreeSet<Vec<u8>> = read_dir_syscall(Path::new("/etc"), true)
-            .expect("getdents64")
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect();
+        let libc =
+            read_dir_libc(Path::new("/etc"), &mut { DIRECTORY_ENTRIES }).expect("libc readdir");
+        let syscall: BTreeSet<Vec<u8>> =
+            read_dir_syscall(Path::new("/etc"), true, &mut { DIRECTORY_ENTRIES })
+                .expect("getdents64")
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
         assert!(!syscall.is_empty());
         assert!(
             syscall.difference(&libc).next().is_none(),
@@ -1124,7 +1233,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let resolved = resolve_candidates(names);
+        let resolved = resolve_candidates(names, &mut false);
 
         assert_eq!(resolved.len(), 1);
         assert!(
