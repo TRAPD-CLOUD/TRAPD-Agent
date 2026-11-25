@@ -33,7 +33,17 @@ impl Sandbox {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(root.join("state")).unwrap();
+        // Model the private parent of an installed agent even with a group-writable umask.
+        let mut directory = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory
+            .recursive(true)
+            .create(root.join("state"))
+            .unwrap();
         std::fs::create_dir_all(root.join("config")).unwrap();
         std::fs::create_dir_all(root.join("log")).unwrap();
         Self { root }
@@ -56,6 +66,11 @@ impl Sandbox {
             .env("TRAPD_LOG_DIR", self.root.join("log"))
             .output()
             .expect("diagnostics must run");
+        assert!(
+            out.status.success(),
+            "diagnostics failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 }
