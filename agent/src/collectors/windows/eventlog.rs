@@ -76,6 +76,20 @@ fn render(event: EVT_HANDLE) -> Result<String> {
 const EVT_BATCH: usize = 64;
 /// Events fetched and rendered by one blocking read.
 const READ_LIMIT: usize = 512;
+const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const CURSOR_FILE_LIMIT: u64 = 16 * 1024;
+const CHANNELS: [&str; 6] = [
+    "Security",
+    "System",
+    "Application",
+    windows_native::SYSMON_CHANNEL,
+    windows_native::WMI_CHANNEL,
+    windows_native::POWERSHELL_CHANNEL,
+];
+
+fn fits_batch(retained: usize, next: usize) -> bool {
+    next <= MAX_BATCH_BYTES.saturating_sub(retained)
+}
 /// Events drained per channel in one tick before yielding to the other
 /// channels and persisting the cursor. A backlog continues on the next pass
 /// without waiting for the timer.
@@ -167,7 +181,8 @@ fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<
     }
     let mut out = Vec::with_capacity(limit.min(EVT_BATCH));
     let mut exhausted = false;
-    while out.len() < limit {
+    let mut retained = 0usize;
+    'query: while out.len() < limit {
         let want = (limit - out.len()).min(EVT_BATCH);
         let mut events: [EVT_HANDLE; EVT_BATCH] = [0; EVT_BATCH];
         let mut returned = 0u32;
@@ -192,13 +207,21 @@ fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<
             bail!("EvtNext failed: {error}");
         }
         // Own every returned handle first so none leaks on a render failure.
-        let handles: Vec<Handle> = events[..returned as usize]
+        let handles: Vec<Handle> = events
+            .get(..returned as usize)
+            .context("invalid EvtNext handle count")?
             .iter()
             .map(|h| Handle(*h))
             .collect();
         for event in &handles {
             match render(event.0) {
-                Ok(xml) => out.push(xml),
+                Ok(xml) => {
+                    if !fits_batch(retained, xml.capacity()) {
+                        break 'query;
+                    }
+                    retained += xml.capacity();
+                    out.push(xml);
+                }
                 // One unrenderable record must not wedge the channel.
                 Err(e) => {
                     tracing::warn!(error = %e, "skipping unrenderable event-log record");
@@ -622,10 +645,29 @@ impl Collector for EventLogCollector {
     ) -> Result<()> {
         let _coverage_guard = CoverageGuard;
         let path = crate::paths::state_dir().join("windows_eventlog_cursors.json");
-        let mut cursors: HashMap<String, u64> = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let mut cursors: HashMap<String, u64> = match crate::paths::bounded_regular_bytes(
+            &path,
+            CURSOR_FILE_LIMIT,
+        ) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    tracing::warn!(%error, "invalid Windows event-log cursor; restarting at newest record");
+                    crate::telemetry::metrics::metrics()
+                        .event_dropped(crate::telemetry::DropReason::InternalError);
+                    HashMap::new()
+                }
+            },
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%error, "Windows event-log cursor unavailable; restarting at newest record");
+                    crate::telemetry::metrics::metrics()
+                        .event_dropped(crate::telemetry::DropReason::InternalError);
+                }
+                HashMap::new()
+            }
+        };
+        cursors.retain(|channel, _| CHANNELS.contains(&channel.as_str()));
         // Recent (SubjectLogonId -> LogonType) from 4624, so a 4663 decoy read
         // can be graded by how its subject logged on (interactive vs. RDP vs.
         // service). Bounded; oldest dropped on overflow.
@@ -636,6 +678,7 @@ impl Collector for EventLogCollector {
         let devices = super::etw::device_map();
         let mut unavailable = HashSet::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // A channel hit the per-tick cap: read again without waiting.
         let mut backlog = false;
         crate::telemetry::liveness::expect(self.name(), std::time::Duration::from_secs(120));
@@ -682,14 +725,8 @@ impl Collector for EventLogCollector {
                 c.audit_command_line = policy.1;
                 c.audit_registry = policy.2;
             });
-            for channel in [
-                "Security",
-                "System",
-                "Application",
-                windows_native::SYSMON_CHANNEL,
-                windows_native::WMI_CHANNEL,
-                windows_native::POWERSHELL_CHANNEL,
-            ] {
+            for channel in CHANNELS {
+                let previous_cursor = cursors.get(channel).copied();
                 let mut drained = 0usize;
                 loop {
                     // A long drain must not look like a stall.
@@ -929,7 +966,9 @@ impl Collector for EventLogCollector {
                         }
                     }
                 }
-                crate::paths::write_atomic(&path, &serde_json::to_vec(&cursors)?, 0o600)?;
+                if cursors.get(channel).copied() != previous_cursor {
+                    crate::paths::write_atomic(&path, &serde_json::to_vec(&cursors)?, 0o600)?;
+                }
             }
         }
     }
@@ -937,6 +976,13 @@ impl Collector for EventLogCollector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn batch_byte_limit_defers_records_without_overflow() {
+        assert!(super::fits_batch(super::MAX_BATCH_BYTES - 1, 1));
+        assert!(!super::fits_batch(super::MAX_BATCH_BYTES, 1));
+        assert!(!super::fits_batch(0, usize::MAX));
+    }
+
     #[test]
     fn audit_tamper_folds_per_event_id() {
         let fields = |id: u64| {

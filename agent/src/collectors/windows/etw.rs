@@ -45,6 +45,35 @@ use crate::telemetry::image_hash::{self, HashOutcome};
 const SESSION_NAME: &str = "TRAPD-Agent";
 /// Cap on a single property's decoded size (defensive).
 const MAX_PROP_BYTES: usize = 64 * 1024;
+// Per session, at most 64 queued records and 32 being mapped. String and
+// byte-vector capacity counts, including context captured after TDH decoding.
+const QUEUE_RECORDS: usize = 64;
+const MAX_RECORD_BYTES: usize = 96 * 1024;
+
+fn record_fits(record: &EtwRecord) -> bool {
+    let mut bytes = std::mem::size_of::<EtwRecord>()
+        + record.props.capacity() * (std::mem::size_of::<(String, EtwValue)>() + 2);
+    for (name, value) in &record.props {
+        bytes += name.capacity()
+            + match value {
+                EtwValue::Str(text) => text.capacity(),
+                EtwValue::Int(_, raw) | EtwValue::Bytes(raw) => raw.capacity(),
+            };
+    }
+    if let Some(context) = &record.captured {
+        bytes += [
+            &context.exe,
+            &context.cmdline,
+            &context.username,
+            &context.exe_sha256,
+        ]
+        .into_iter()
+        .flatten()
+        .map(String::capacity)
+        .sum::<usize>();
+    }
+    bytes <= MAX_RECORD_BYTES
+}
 
 /// Shared sink the C callback writes decoded records into, drained by the async
 /// side. A plain channel keeps the `unsafe extern "system"` callback tiny.
@@ -130,7 +159,7 @@ impl Collector for EtwCollector {
     ) -> Result<()> {
         // The opt-in must hold before the first record is decoded.
         sync_amsi_capture(&self.config);
-        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<EtwRecord>(8192);
+        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<EtwRecord>(QUEUE_RECORDS);
         let sink = Arc::new(Sink {
             tx: rec_tx,
             lost: std::sync::atomic::AtomicU64::new(0),
@@ -324,7 +353,7 @@ impl Collector for EtwFileActorCollector {
         _agent_id: String,
         _hostname: String,
     ) -> Result<()> {
-        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<EtwRecord>(8192);
+        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<EtwRecord>(QUEUE_RECORDS);
         let sink = Arc::new(Sink {
             tx: rec_tx,
             lost: std::sync::atomic::AtomicU64::new(0),
@@ -392,7 +421,7 @@ fn sync_amsi_capture(config: &std::sync::RwLock<crate::config::AgentConfig>) {
 const PIPE_SHED_AFTER_LOST: u64 = 2000;
 
 /// Records decoded per blocking task.
-const DECODE_BATCH: usize = 256;
+const DECODE_BATCH: usize = 32;
 
 /// Decode `records` in order with one shared state.
 fn map_batch(
@@ -441,7 +470,7 @@ impl Session {
             let name = utf16(session);
             // EVENT_TRACE_PROPERTIES is followed in memory by the logger name.
             let buf_len = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name.len() * 2;
-            let mut buf = vec![0u8; buf_len];
+            let mut buf = vec![0u64; buf_len.div_ceil(8)];
             let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
             (*props).Wnode.BufferSize = buf_len as u32;
             (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
@@ -549,18 +578,19 @@ impl Drop for Session {
 }
 
 unsafe fn stop_control(control: CONTROLTRACE_HANDLE) -> u32 {
-    let mut buf =
-        vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 2 * (MAX_PATH as usize)];
+    let buf_len = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 2 * (MAX_PATH as usize);
+    let mut buf = vec![0u64; buf_len.div_ceil(8)];
     let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-    (*props).Wnode.BufferSize = buf.len() as u32;
+    (*props).Wnode.BufferSize = buf_len as u32;
     ControlTraceW(control, std::ptr::null(), props, EVENT_TRACE_CONTROL_STOP)
 }
 
 unsafe fn stop_named(name: &str) -> u32 {
     let wname = utf16(name);
-    let mut buf = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + wname.len() * 2];
+    let buf_len = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + wname.len() * 2;
+    let mut buf = vec![0u64; buf_len.div_ceil(8)];
     let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-    (*props).Wnode.BufferSize = buf.len() as u32;
+    (*props).Wnode.BufferSize = buf_len as u32;
     (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
     ControlTraceW(
         CONTROLTRACE_HANDLE { Value: 0 },
@@ -618,15 +648,20 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
             return;
         }
     }
+    let Ok(slot) = sink.tx.try_reserve() else {
+        crate::telemetry::metrics::metrics()
+            .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
+        return;
+    };
     if let Some(mut decoded) = decode_record(record) {
         if decoded.provider == etw_map::KERNEL_PROCESS && decoded.id == 1 {
             decoded.captured = Some(capture_at_start(&decoded));
         }
-        // Full and Closed (consumer gone while ProcessTrace still delivers) both lose
-        // the record; neither may vanish without a named counter.
-        if sink.tx.try_send(decoded).is_err() {
+        if record_fits(&decoded) {
+            slot.send(decoded);
+        } else {
             crate::telemetry::metrics::metrics()
-                .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
+                .event_dropped(crate::telemetry::DropReason::EventTooLarge);
         }
     } else if [
         etw_map::KERNEL_PROCESS,
@@ -700,20 +735,23 @@ unsafe fn decode_record(record: &EVENT_RECORD) -> Option<EtwRecord> {
     if TdhGetEventInformation(record, 0, std::ptr::null(), info, &mut size) != ERROR_SUCCESS {
         return None;
     }
-    if size as usize > allocated {
+    let returned = size as usize;
+    let prop_offset = std::mem::offset_of!(TRACE_EVENT_INFO, EventPropertyInfoArray);
+    if returned < prop_offset || returned > allocated {
         return None;
     }
     let count = (*info).TopLevelPropertyCount as usize;
-    let prop_offset = std::mem::offset_of!(TRACE_EVENT_INFO, EventPropertyInfoArray);
     if count > 128
         || prop_offset
             .checked_add(count.checked_mul(std::mem::size_of::<EVENT_PROPERTY_INFO>())?)?
-            > allocated
+            > returned
     {
         return None;
     }
-    let props_base =
-        std::ptr::addr_of!((*info).EventPropertyInfoArray) as *const EVENT_PROPERTY_INFO;
+    let props_base = info
+        .cast::<u8>()
+        .add(prop_offset)
+        .cast::<EVENT_PROPERTY_INFO>();
     let mut props = HashMap::new();
     for i in 0..count {
         let pi = &*props_base.add(i);
@@ -722,12 +760,12 @@ unsafe fn decode_record(record: &EVENT_RECORD) -> Option<EtwRecord> {
             continue;
         }
         let offset = pi.NameOffset as usize;
-        if !offset.is_multiple_of(2) || offset >= allocated {
+        if !offset.is_multiple_of(2) || offset >= returned {
             continue;
         }
         let raw = std::slice::from_raw_parts(
             (info as *const u8).add(offset) as *const u16,
-            ((allocated - offset) / 2).min(512),
+            ((returned - offset) / 2).min(512),
         );
         let Some(end) = raw.iter().position(|c| *c == 0) else {
             continue;
@@ -1496,5 +1534,24 @@ mod native_tests {
                 "new session did not deliver the process start"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod record_budget_tests {
+    use super::*;
+
+    #[test]
+    fn multiple_admissible_properties_can_exceed_record_budget() {
+        let mut record = EtwRecord::default();
+        record
+            .props
+            .insert("one".into(), EtwValue::Bytes(vec![0; MAX_PROP_BYTES]));
+        assert!(record_fits(&record));
+        record.captured = Some(ProcessEnrichment {
+            cmdline: Some("x".repeat(MAX_PROP_BYTES)),
+            ..Default::default()
+        });
+        assert!(!record_fits(&record));
     }
 }

@@ -30,6 +30,8 @@ use crate::schema::{AgentEvent, EventAction, EventClass, EventData, Severity};
 
 /// Upper bound on candidate regions inspected per process per sweep.
 const MAX_REGIONS_PER_PROCESS: usize = 256;
+const MAX_TRACKED_FINDINGS: usize = 8192;
+const MAX_SWEEP_FINDINGS: usize = 256;
 type SweepFindings = Vec<(Severity, crate::schema::DetectionData)>;
 type LiveGenerations = HashSet<(i32, u64)>;
 
@@ -148,9 +150,17 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
         // hollowed process; it is the same trust level as the path itself.
         let mut image_hash: Option<Option<String>> = None;
         for (key, f, writable, mut det) in process_findings {
-            if !seen.insert(key) {
+            if seen.contains(&key) {
                 continue;
             }
+            if findings.len() >= MAX_SWEEP_FINDINGS {
+                crate::telemetry::metrics::metrics()
+                    .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
+                continue;
+            }
+            // An eviction can at worst cause a repeated finding. Never suppress a
+            // new finding forever because a long-running process filled the cache.
+            remember_finding(seen, key, MAX_TRACKED_FINDINGS);
             if let (Some(path), Some(corr)) = (&image, det.correlation.as_mut()) {
                 let hash = image_hash.get_or_insert_with(|| {
                     crate::paths::bounded_regular_sha256_label(
@@ -171,6 +181,16 @@ fn sweep(own_pid: i32, seen: &mut HashSet<MemFindingKey>) -> (SweepFindings, Liv
         }
     }
     (findings, live)
+}
+
+fn remember_finding(seen: &mut HashSet<MemFindingKey>, key: MemFindingKey, limit: usize) {
+    if seen.len() >= limit {
+        if let Some(previous) = seen.iter().next().cloned() {
+            seen.remove(&previous);
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+        }
+    }
+    seen.insert(key);
 }
 
 #[async_trait]
@@ -309,6 +329,13 @@ mod tests {
             rule_id: "memory.injected_pe",
             ..rwx.clone()
         };
+        let mut seen = HashSet::new();
+        for address in 1..100 {
+            let key = MemFindingKey::new(7, 100, &pe, address, true);
+            remember_finding(&mut seen, key.clone(), 4);
+            assert!(seen.contains(&key));
+            assert!(seen.len() <= 4);
+        }
         assert_ne!(
             MemFindingKey::new(7, 100, &pe, 0x1000, true),
             MemFindingKey::new(7, 100, &pe, 0x9000, true)
