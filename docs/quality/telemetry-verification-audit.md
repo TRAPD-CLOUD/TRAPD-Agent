@@ -151,7 +151,7 @@ contract decisions. TV-7 requires a downstream usage audit.
 | cargo build | Passed on Linux |
 | cargo check --all-targets --target x86_64-pc-windows-gnu | Passed using a worktree-local MinGW toolchain |
 | scripts/ocsf_validate.sh | 802 fixtures, 780 class/action pairs and nine OCSF classes passed |
-| cargo fuzz build | All four targets built under nightly-2025-08-15 |
+| cargo fuzz build --target x86_64-unknown-linux-gnu | All eight targets built under nightly-2025-08-15 |
 
 Native real-host resource measurements and Atomic Red Team runs require separate
 host evidence. No detection behavior, command handling, signing or update change
@@ -186,18 +186,44 @@ The seed files encode fixture field values in the generators' input layouts.
 To reproduce a run from the repository root with cargo-fuzz 0.13.2:
 
 ```sh
-cargo +nightly-2025-08-15 fuzz build
+cargo +nightly-2025-08-15 fuzz build --target x86_64-unknown-linux-gnu
 for name in $(cargo +nightly-2025-08-15 fuzz list); do
     mkdir -p "fuzz/corpus/$name"
-    cargo +nightly-2025-08-15 fuzz run "$name" "fuzz/corpus/$name" "fuzz/seeds/$name" -- -max_total_time=300 -print_final_stats=1
+    cargo +nightly-2025-08-15 fuzz run --target x86_64-unknown-linux-gnu "$name" "fuzz/corpus/$name" "fuzz/seeds/$name" -- -max_total_time=300 -print_final_stats=1
 done
 ```
 
-The CI smoke job uses 15 seconds per target. These properties cover selected
-entry points. Arbitrary-input fuzzing, crash reproduction, and campaigns over
-journalctl JSON, Event Log XML, packet/eBPF records and control-plane
-deserializers remain outside this PR's verification evidence.
+### Arbitrary-input targets
 
+These targets take raw bytes, not generated well-formed records. The journal
+and Event Log parsers moved unchanged into I/O-free files
+(`collectors/logs/journal_json.rs`, `collectors/windows/eventlog_xml.rs`) so the
+fuzz crate can include them by path. `parse_frame` in `packet_capture.rs` is
+now `pub(super)` for the same reason.
+
+| Target | Input | Checked property |
+|---|---|---|
+| journal_json | Any `journalctl --output=json` line | No panic; `__CURSOR` never stays in forwarded fields |
+| eventlog_xml | Any rendered event XML on four channels | No panic; message ≤ 64 KiB, ≤ 258 fields, each ≤ 16 KiB, offset = record ID |
+| packet_frames | Up to 64 length-prefixed IP frames through one TLS tracker | No panic in IPv4/IPv6, UDP/DNS, TCP reassembly and TLS hello parsing |
+| signed_command | Any polled command batch | No panic; nothing verifies without the signing key; a decoded envelope re-signed after an encode/decode round trip still verifies |
+
+Local run, same toolchain, address sanitizer:
+
+| Target | Seconds | Executions | Result |
+|---|---:|---:|---|
+| journal_json | 121 | 4,443,301 | Passed |
+| eventlog_xml | 121 | 2,257,556 | Passed |
+| packet_frames | 181 | 3,639,461 | Passed |
+| signed_command | 121 | 1,668,334 | Passed |
+
+The CI job runs every target for 15 seconds with
+`--target x86_64-unknown-linux-gnu`. The prebuilt cargo-fuzz otherwise
+defaults to musl, which the address sanitizer cannot use. eBPF ring buffer
+records are not fuzzed: they come from the agent's own kernel programs and are
+accepted only after a size check and a plausibility canary. Signed
+configuration shares `verify_canonical` with commands but its decoder is not
+a separate target.
 
 ## Source function index
 

@@ -38,11 +38,13 @@ jobs:
           tool: cargo-fuzz@0.13.2
       - name: Verify generated log fields and queue replay
         run: |
-          cargo fuzz build
-          targets=$(cargo fuzz list)
-          for target in $targets; do
-            mkdir -p "fuzz/corpus/$target"
-            cargo fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- -max_total_time=15
+          # The prebuilt cargo-fuzz defaults to its own (musl) target, which
+          # AddressSanitizer cannot use; name the runner's target explicitly.
+          target=x86_64-unknown-linux-gnu
+          cargo fuzz build --target "$target"
+          for fuzz_target in $(cargo fuzz list); do
+            mkdir -p "fuzz/corpus/$fuzz_target" "fuzz/seeds/$fuzz_target"
+            cargo fuzz run --target "$target" "$fuzz_target" "fuzz/corpus/$fuzz_target" "fuzz/seeds/$fuzz_target" -- -max_total_time=15
           done
 
   windows-msi:
