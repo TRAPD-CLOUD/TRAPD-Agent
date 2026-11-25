@@ -52,18 +52,8 @@ mod process {
                 .map(|p| p.to_string_lossy().into_owned())
         }
         fn cmdline(&self, pid: i32) -> Option<String> {
-            let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-            if raw.is_empty() {
-                return None;
-            }
-            // argv is NUL-separated; render as a space-joined command line.
-            let s: String = raw
-                .split(|&b| b == 0)
-                .filter(|p| !p.is_empty())
-                .map(|p| String::from_utf8_lossy(p))
-                .collect::<Vec<_>>()
-                .join(" ");
-            (!s.is_empty()).then_some(s)
+            let file = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
+            bounded_cmdline(file)
         }
         fn username(&self, uid: u32) -> String {
             username_for_uid(uid)
@@ -73,8 +63,45 @@ mod process {
         }
     }
 
+    fn bounded_cmdline(reader: impl std::io::Read) -> Option<String> {
+        use std::io::Read;
+        use trapd_schema::limits::MAX_CMDLINE_BYTES;
+        let mut raw = Vec::new();
+        reader
+            .take(MAX_CMDLINE_BYTES as u64 + 1)
+            .read_to_end(&mut raw)
+            .ok()?;
+        let mut truncated = raw.len() > MAX_CMDLINE_BYTES;
+        raw.truncate(MAX_CMDLINE_BYTES);
+        let mut joined = String::with_capacity(raw.len());
+        for arg in raw.split(|&byte| byte == 0).filter(|arg| !arg.is_empty()) {
+            if !joined.is_empty() {
+                if joined.len() == MAX_CMDLINE_BYTES {
+                    truncated = true;
+                    break;
+                }
+                joined.push(' ');
+            }
+            let arg = String::from_utf8_lossy(arg);
+            let remaining = MAX_CMDLINE_BYTES - joined.len();
+            if arg.len() > remaining {
+                joined.push_str(&arg[..arg.floor_char_boundary(remaining)]);
+                truncated = true;
+                break;
+            }
+            joined.push_str(&arg);
+        }
+        if truncated {
+            trapd_schema::runtime::runtime().enrichment_truncation();
+        }
+        (!joined.is_empty()).then_some(joined)
+    }
+
     fn username_for_uid(uid: u32) -> String {
-        std::fs::read_to_string("/etc/passwd")
+        let passwd =
+            crate::paths::bounded_regular_bytes(std::path::Path::new("/etc/passwd"), 1024 * 1024)
+                .unwrap_or_default();
+        std::str::from_utf8(&passwd)
             .unwrap_or_default()
             .lines()
             .find_map(|line| {
@@ -85,6 +112,25 @@ mod process {
                 (u == uid).then(|| name.to_string())
             })
             .unwrap_or_else(|| format!("uid:{uid}"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::bounded_cmdline;
+        use trapd_schema::limits::MAX_CMDLINE_BYTES;
+
+        #[test]
+        fn argv_limits_raw_reads_and_lossy_output() {
+            let mut source = std::io::Cursor::new(vec![0xff; MAX_CMDLINE_BYTES * 4]);
+            let result = bounded_cmdline(&mut source).unwrap();
+            assert_eq!(source.position(), MAX_CMDLINE_BYTES as u64 + 1);
+            assert!(result.len() <= MAX_CMDLINE_BYTES);
+            assert_eq!(
+                bounded_cmdline(&b"one\0\0two three\0"[..]).as_deref(),
+                Some("one two three")
+            );
+            assert_eq!(bounded_cmdline(&b"\0"[..]), None);
+        }
     }
 }
 #[cfg(target_os = "linux")]
