@@ -61,17 +61,24 @@ fn table(family: u32) -> Result<Vec<u32>> {
     bail!("TCP table changed repeatedly during read")
 }
 
+const MAX_TRACKED_SOCKETS: usize = 8192;
+
+fn table_rows(table: &[u32], row_words: usize) -> Result<std::slice::ChunksExact<'_, u32>> {
+    let (&count, rows) = table
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("missing TCP table header"))?;
+    let words = (count as usize)
+        .checked_mul(row_words)
+        .ok_or_else(|| anyhow::anyhow!("invalid TCP row count"))?;
+    Ok(rows
+        .get(..words)
+        .ok_or_else(|| anyhow::anyhow!("short TCP table"))?
+        .chunks_exact(row_words))
+}
+
 pub fn snapshot() -> Result<Vec<NetworkConnectionData>> {
-    let mut system = sysinfo::System::new();
-    system.refresh_processes();
-    let starts: HashMap<i32, u64> = system
-        .processes()
-        .keys()
-        .filter_map(|pid| {
-            let pid = pid.as_u32() as i32;
-            crate::telemetry::identity::process_start_time(pid).map(|start| (pid, start))
-        })
-        .collect();
+    let mut starts = HashMap::new();
+    let mut verified = HashMap::new();
     let mut out = Vec::new();
     for (family, row_size) in [
         (AF_INET as u32, std::mem::size_of::<MIB_TCPROW_OWNER_PID>()),
@@ -80,15 +87,48 @@ pub fn snapshot() -> Result<Vec<NetworkConnectionData>> {
             std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>(),
         ),
     ] {
-        let data = table(family)?;
-        let count = data[0] as usize;
-        if count > (data.len() * 4 - 4) / row_size {
-            bail!("invalid TCP table row count");
+        // Bracket the authoritative snapshot by process generation. Enumerate
+        // socket owners only; several thousand flows can belong to one PID.
+        let ipv4 = family == AF_INET as u32;
+        let (state_offset, pid_offset) = if ipv4 {
+            (
+                std::mem::offset_of!(MIB_TCPROW_OWNER_PID, dwState),
+                std::mem::offset_of!(MIB_TCPROW_OWNER_PID, dwOwningPid),
+            )
+        } else {
+            (
+                std::mem::offset_of!(MIB_TCP6ROW_OWNER_PID, dwState),
+                std::mem::offset_of!(MIB_TCP6ROW_OWNER_PID, dwOwningPid),
+            )
+        };
+        starts.clear();
+        verified.clear();
+        for row in table_rows(&table(family)?, row_size / 4)? {
+            let state = row[state_offset / 4];
+            if matches!(state, 2 | 5) {
+                if let Ok(pid) = i32::try_from(row[pid_offset / 4]) {
+                    if starts.len() >= MAX_TRACKED_SOCKETS && !starts.contains_key(&pid) {
+                        crate::telemetry::metrics::metrics()
+                            .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
+                        bail!("TCP owner snapshot exceeds capacity");
+                    }
+                    starts
+                        .entry(pid)
+                        .or_insert_with(|| crate::telemetry::identity::process_start_time(pid));
+                }
+            }
         }
-        for index in 0..count {
-            // SAFETY: count and row size were checked against the buffer. Copy
-            // each C row out rather than borrowing a flexible array member.
-            let row = unsafe { data.as_ptr().cast::<u8>().add(4 + index * row_size) };
+        let data = table(family)?;
+        for words in table_rows(&data, row_size / 4)? {
+            if !matches!(words[state_offset / 4], 2 | 5) {
+                continue;
+            }
+            if out.len() == MAX_TRACKED_SOCKETS {
+                crate::telemetry::metrics::metrics()
+                    .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
+                bail!("TCP socket snapshot exceeds capacity; retaining the previous complete snapshot");
+            }
+            let row = words.as_ptr();
             let (state, pid, src_addr, src_port, dst_addr, dst_port) = if family == AF_INET as u32 {
                 let row = unsafe { std::ptr::read_unaligned(row.cast::<MIB_TCPROW_OWNER_PID>()) };
                 (
@@ -110,9 +150,6 @@ pub fn snapshot() -> Result<Vec<NetworkConnectionData>> {
                     u16::from_be(row.dwRemotePort as u16),
                 )
             };
-            if state != 2 && state != 5 {
-                continue;
-            }
             out.push(NetworkConnectionData {
                 protocol: if family == AF_INET as u32 {
                     "tcp"
@@ -127,8 +164,10 @@ pub fn snapshot() -> Result<Vec<NetworkConnectionData>> {
                 state: if state == 2 { "listen" } else { "established" }.into(),
                 pid: i32::try_from(pid).ok(),
                 process_start_time: i32::try_from(pid).ok().and_then(|pid| {
-                    starts.get(&pid).copied().filter(|start| {
-                        crate::telemetry::identity::process_start_time(pid) == Some(*start)
+                    *verified.entry(pid).or_insert_with(|| {
+                        starts.get(&pid).copied().flatten().filter(|start| {
+                            crate::telemetry::identity::process_start_time(pid) == Some(*start)
+                        })
                     })
                 }),
                 process: None,
@@ -296,6 +335,7 @@ impl Collector for NetworkCollector {
     ) -> Result<()> {
         let mut known = HashMap::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             let etw_active = crate::telemetry::coverage::snapshot().etw_network_active();
@@ -416,5 +456,15 @@ mod tests {
             .find(|row| row.pid == Some(pid) && row.src_port == port)
             .expect("own TCP listener is visible in the native owner-PID table");
         assert_eq!(row.process_start_time, Some(expected));
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    #[test]
+    fn short_or_invalid_native_tables_are_errors() {
+        assert!(super::table_rows(&[], 6).is_err());
+        assert!(super::table_rows(&[u32::MAX, 1], 6).is_err());
+        assert_eq!(super::table_rows(&[1, 0, 0], 2).unwrap().len(), 1);
     }
 }
