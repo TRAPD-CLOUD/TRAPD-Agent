@@ -550,7 +550,11 @@ pub(super) async fn run_agent(
     };
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
-    let mirror = if offline { output_mode } else { output_mode.buffered() };
+    let mirror = if offline {
+        output_mode
+    } else {
+        output_mode.buffered()
+    };
     let mode = mirror.clone();
     let prev_tx = prev_event_tx.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
