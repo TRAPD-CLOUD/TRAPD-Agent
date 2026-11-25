@@ -653,6 +653,17 @@ struct Registry {
     by_path: HashMap<String, DecoyInfo>,
 }
 
+impl Registry {
+    fn register(&mut self, info: DecoyInfo) -> bool {
+        let key = info.path.to_ascii_lowercase();
+        if self.by_path.len() >= 1024 && !self.by_path.contains_key(&key) {
+            return false;
+        }
+        self.by_path.insert(key, info);
+        true
+    }
+}
+
 fn registry() -> &'static Mutex<Registry> {
     static R: std::sync::OnceLock<Mutex<Registry>> = std::sync::OnceLock::new();
     R.get_or_init(|| Mutex::new(Registry::default()))
@@ -663,8 +674,8 @@ fn registry() -> &'static Mutex<Registry> {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn register_decoy(info: DecoyInfo) {
     if let Ok(mut r) = registry().lock() {
-        if r.by_path.len() < 1024 || r.by_path.contains_key(&info.path.to_ascii_lowercase()) {
-            r.by_path.insert(info.path.to_ascii_lowercase(), info);
+        if !r.register(info) {
+            trapd_schema::runtime::runtime().state_capacity_dropped(1);
         }
     }
 }
@@ -786,6 +797,24 @@ mod registry_tests {
         assert_eq!(a.pid, 0x10a4);
         assert_eq!(a.subject_user, "CORP\\anna");
         assert_eq!(a.access_mask, FILE_READ_DATA);
+    }
+
+    #[test]
+    fn a_full_registry_can_refresh_an_existing_decoy() {
+        let mut r = Registry::default();
+        let info = |slot: usize| DecoyInfo {
+            token_id: slot.to_string(),
+            path: format!(r"C:\decoys\{slot}"),
+            kind: "note".into(),
+            audit_ready: false,
+            owner_sid: String::new(),
+        };
+        for slot in 0..1024 {
+            assert!(r.register(info(slot)));
+        }
+        assert!(!r.register(info(1024)));
+        assert!(r.register(info(0)));
+        assert_eq!(r.by_path.len(), 1024);
     }
 
     #[test]
