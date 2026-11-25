@@ -295,6 +295,7 @@ async fn main() -> Result<()> {
         OutputMode::Stdout => "stdout",
         OutputMode::File => "file",
         OutputMode::Off => "off",
+        OutputMode::Buffered(_) => "buffered",
     };
 
     info!(
@@ -542,7 +543,12 @@ async fn main() -> Result<()> {
     };
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
-    let mode = output_mode;
+    let mirror = if offline {
+        output_mode
+    } else {
+        output_mode.buffered()
+    };
+    let mode = mirror.clone();
     let prev_tx = prev_event_tx.clone();
     let siem_fwd = siem.clone();
     let mut consumer = tokio::spawn(async move {
@@ -729,6 +735,8 @@ async fn main() -> Result<()> {
         );
         consumer.abort();
     }
+
+    mirror.drain().await;
 
     // Reconcile the journal to exactly the un-acknowledged set, so the next
     // start replays those and nothing else.
