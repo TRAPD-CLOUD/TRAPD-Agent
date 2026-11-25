@@ -73,6 +73,7 @@ use transport::Transport;
 /// from the same modules the Linux agent uses.
 #[cfg(windows)]
 fn main() -> Result<()> {
+    validate_arguments(std::env::args_os())?;
     // One-shot toast helper in the user's session: runs none of the agent.
     if std::env::args().nth(1).as_deref() == Some(prevention::usernotify::NOTIFY_FLAG) {
         return prevention::usernotify::run_helper(std::env::args().nth(2).as_deref());
@@ -84,6 +85,7 @@ fn main() -> Result<()> {
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<()> {
+    validate_arguments(std::env::args_os())?;
     detection_host::initialize();
     if let Some(monitored_pid) = selfprotect::watchdog::detect() {
         selfprotect::watchdog::run_watchdog(monitored_pid);
@@ -947,6 +949,16 @@ async fn spool_events(events: Vec<schema::AgentEvent>, buf: &Arc<Mutex<Spool>>) 
     }
 }
 
+/// All CLI dispatchers use Unicode strings. Check the immutable process argv
+/// before dispatch, including the watchdog and the Windows helper entry point.
+fn validate_arguments(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<()> {
+    anyhow::ensure!(
+        args.into_iter().all(|arg| arg.to_str().is_some()),
+        "command-line argument contains invalid Unicode"
+    );
+    Ok(())
+}
+
 /// Interpret an environment variable as a boolean flag.
 /// True for `1`, `true`, `yes`, `on` (case-insensitive); false otherwise.
 fn env_truthy(key: &str) -> bool {
@@ -993,6 +1005,18 @@ async fn load_or_create_device_id() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_os_argument_returns_a_fixed_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let bad = std::ffi::OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            validate_arguments([bad]).unwrap_err().to_string(),
+            "command-line argument contains invalid Unicode"
+        );
+    }
 
     #[test]
     fn env_truthy_recognises_true_values() {
