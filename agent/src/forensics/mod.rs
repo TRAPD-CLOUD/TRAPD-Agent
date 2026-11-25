@@ -116,9 +116,10 @@ impl snapshot::SnapshotProc for RealProc {
             .map(|p| p.to_string_lossy().into_owned())
     }
     fn cmdline(&self, pid: i32) -> Option<String> {
-        let raw = crate::paths::bounded_regular_bytes(
-            std::path::Path::new(&format!("/proc/{pid}/cmdline")),
-            crate::telemetry::limits::MAX_CMDLINE_BYTES as u64,
+        // An argv beyond the budget keeps its prefix as evidence.
+        let (raw, _) = crate::collectors::read_prefix(
+            format!("/proc/{pid}/cmdline"),
+            crate::telemetry::limits::MAX_CMDLINE_BYTES,
         )
         .ok()?;
         let s: String = raw

@@ -475,11 +475,23 @@ impl Collector for MemScanCollector {
                 let mut pids = live_pids();
                 pids.sort_unstable();
                 let live: HashSet<_> = pids.iter().copied().collect();
+                // Keys are `pid:start_time:...`; a recycled pid must not keep its
+                // previous occupant's keys. One start-time read per tracked pid.
+                let mut generation: std::collections::HashMap<i32, Option<u64>> =
+                    std::collections::HashMap::new();
                 worker.seen.retain(|k| {
-                    k.split(':')
-                        .next()
-                        .and_then(|p| p.parse::<i32>().ok())
-                        .is_some_and(|p| live.contains(&p))
+                    let mut fields = k.split(':');
+                    let (Some(pid), Some(start)) = (
+                        fields.next().and_then(|p| p.parse::<i32>().ok()),
+                        fields.next().and_then(|s| s.parse::<u64>().ok()),
+                    ) else {
+                        return false;
+                    };
+                    live.contains(&pid)
+                        && *generation
+                            .entry(pid)
+                            .or_insert_with(|| crate::telemetry::identity::process_start_time(pid))
+                            == Some(start)
                 });
                 let began = std::time::Instant::now();
                 let mut visited = 0;
@@ -630,19 +642,13 @@ impl MemScanCollector {
         if crate::telemetry::identity::process_start_time(pid) != Some(start) {
             return Vec::new();
         }
-        #[cfg(feature = "yara")]
-        {
-            let room = 8192usize.saturating_sub(self.seen.len());
-            crate::telemetry::metrics::metrics()
-                .state_capacity_dropped(yara_scanned.len().saturating_sub(room) as u64);
-            self.seen.extend(yara_scanned.into_iter().take(room));
-        }
         // Carry the image path and hash so suppressions can match the binary
         // (hashed once per process, only when a finding is new; the hash is
         // cached and size-capped by `exehash`).
         let image = exe.starts_with('/').then_some(exe.as_str());
         let mut image_hash: Option<Option<String>> = None;
-        out.into_iter()
+        let findings: Vec<_> = out
+            .into_iter()
             .filter_map(|(key, severity, mut finding, anon_writable)| {
                 if self.seen.len() >= 8192 && !self.seen.contains(&key) {
                     crate::telemetry::metrics::metrics().state_capacity_dropped(1);
@@ -673,7 +679,17 @@ impl MemScanCollector {
                 }
                 Some((severity, finding))
             })
-            .collect()
+            .collect();
+        // Scan markers only save rescans; admit them after the detections so
+        // they never take the last capacity a positive hit needs.
+        #[cfg(feature = "yara")]
+        {
+            let room = 8192usize.saturating_sub(self.seen.len());
+            crate::telemetry::metrics::metrics()
+                .state_capacity_dropped(yara_scanned.len().saturating_sub(room) as u64);
+            self.seen.extend(yara_scanned.into_iter().take(room));
+        }
+        findings
     }
 }
 
