@@ -422,11 +422,12 @@ async fn main() -> Result<()> {
             let host = hostname.clone();
             let cname = c.name();
             handles.push(tokio::spawn(async move {
+                let _observe_panic = collectors::ObservePanic(cname);
                 if let Err(e) = c.run(tx2, aid, host).await {
                     // A collector that exits is a blind spot, so it is counted
                     // and surfaced in health rather than only logged.
                     error!("{cname} exited with error: {e:#}");
-                    telemetry::metrics::metrics().collector_failed();
+                    collectors::report_failure(cname);
                 }
             }));
         }};
