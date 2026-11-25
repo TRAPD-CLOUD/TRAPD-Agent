@@ -156,7 +156,9 @@ impl FileTail {
             Err(e) => return Err(e),
         };
         let framed = frame_bytes(&buf[..n], self.max_line, &mut self.rest);
-        let pos = file.stream_position().unwrap_or(self.offset + n as u64);
+        let pos = file
+            .stream_position()
+            .unwrap_or(self.offset.saturating_add(n as u64));
         self.offset = pos;
         let inode = self.open_inode.map(|(_, i)| i).unwrap_or(0);
         let template = self
@@ -171,7 +173,7 @@ impl FileTail {
                 }
             }
             let start_offset = cursor;
-            cursor += line.consumed_len as u64;
+            cursor = cursor.saturating_add(line.consumed_len as u64);
             let mut checkpoint = template.clone();
             checkpoint.offset = cursor;
             out.push(TailedLine {
@@ -183,6 +185,10 @@ impl FileTail {
             });
         }
         Ok(out)
+    }
+
+    pub(super) fn can_retire(&self) -> bool {
+        self.file.is_none() || (self.reached_eof && self.rest.is_empty())
     }
 
     pub fn checkpoint(&self) -> Option<FileCheckpoint> {
@@ -329,7 +335,7 @@ impl FileTail {
         ident: (u64, u64),
         fp: String,
     ) -> std::io::Result<()> {
-        let mut f = OpenOptions::new().read(true).open(path)?;
+        let mut f = open_log_file(path)?;
         let len = f.metadata()?.len();
         let pos = offset.min(len);
         if self.w3c_fields.is_some() {
@@ -434,9 +440,27 @@ fn file_ident(_path: &Path, meta: &Metadata) -> (u64, u64) {
     (0, meta.len())
 }
 
+fn open_log_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let f = options.open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "log is not a regular file",
+        ));
+    }
+    Ok(f)
+}
+
 fn read_fingerprint(path: &Path) -> String {
     let mut buf = vec![0u8; FINGERPRINT_BYTES];
-    let Ok(mut f) = File::open(path) else {
+    let Ok(mut f) = open_log_file(path) else {
         return String::new();
     };
     let n = f.read(&mut buf).unwrap_or(0);
@@ -475,6 +499,7 @@ fn hunt_inode(dir: Option<&Path>, ident: (u64, u64)) -> Option<PathBuf> {
 /// Entries inspected per directory while expanding one glob component. A bound,
 /// not an expectation: log directories hold dozens of entries.
 const MAX_GLOB_DIR_ENTRIES: usize = 50_000;
+const MAX_GLOB_PATHS: usize = 256;
 
 #[cfg(test)]
 thread_local! {
@@ -536,6 +561,7 @@ fn component_expand(pattern: &str) -> Vec<PathBuf> {
     }
     let last = comps.len() - 1;
     let mut frontier = vec![base];
+    let mut remaining = MAX_GLOB_DIR_ENTRIES;
     for (i, comp) in comps.iter().enumerate().skip(first_glob) {
         let segment = comp.as_os_str().to_string_lossy();
         let wanted = |p: &Path| if i == last { p.is_file() } else { p.is_dir() };
@@ -555,13 +581,21 @@ fn component_expand(pattern: &str) -> Vec<PathBuf> {
                 let Ok(entries) = std::fs::read_dir(dir) else {
                     continue;
                 };
-                for entry in entries.flatten().take(MAX_GLOB_DIR_ENTRIES) {
+                if remaining == 0 || next.len() == MAX_GLOB_PATHS {
+                    break;
+                }
+                for entry in entries.flatten().take(remaining) {
+                    remaining -= 1;
                     if !matcher.is_match(Path::new(&entry.file_name())) {
                         continue;
                     }
                     let path = entry.path();
                     if wanted(&path) {
                         next.push(path);
+                        if next.len() == MAX_GLOB_PATHS {
+                            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                            break;
+                        }
                     }
                 }
             }
@@ -593,7 +627,9 @@ fn walk_expand(pattern: &str) -> Vec<PathBuf> {
         .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
+        .take(MAX_GLOB_DIR_ENTRIES)
         .filter(|ent| ent.file_type().is_file() && matcher.is_match(ent.path()))
+        .take(MAX_GLOB_PATHS)
         .map(|ent| ent.path().to_path_buf())
         .collect()
 }

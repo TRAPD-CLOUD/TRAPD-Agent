@@ -69,7 +69,7 @@ pub struct CheckpointStore {
 
 impl CheckpointStore {
     pub fn load(path: PathBuf) -> Self {
-        let inner = match std::fs::read(&path) {
+        let mut inner = match crate::collectors::read_capped(&path, 4 * 1024 * 1024) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 warn!(error = %e, path = %path.display(), "log checkpoint unreadable — starting fresh");
                 CheckpointFile {
@@ -89,6 +89,14 @@ impl CheckpointStore {
                 }
             }
         };
+        while inner.files.len() > 1024 {
+            inner.files.pop_first();
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+        }
+        while inner.journals.len() > 64 {
+            inner.journals.pop_first();
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+        }
         Self {
             path,
             inner,
@@ -106,11 +114,44 @@ impl CheckpointStore {
     }
 
     pub fn put_file(&mut self, key: String, cp: FileCheckpoint) {
+        if self.inner.files.get(&key).is_some_and(|prev| {
+            prev.inode == cp.inode
+                && prev.dev == cp.dev
+                && prev.offset == cp.offset
+                && prev.fingerprint == cp.fingerprint
+                && prev.size == cp.size
+        }) {
+            return;
+        }
+        if self.inner.files.len() >= 1024 && !self.inner.files.contains_key(&key) {
+            if let Some(old) = self
+                .inner
+                .files
+                .iter()
+                .min_by_key(|(_, cp)| cp.updated_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.inner.files.remove(&old);
+                crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            }
+        }
         self.inner.files.insert(key, cp);
         self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn put_journal(&mut self, key: String, cp: JournalCheckpoint) {
+        if self.inner.journals.len() >= 64 && !self.inner.journals.contains_key(&key) {
+            if let Some(old) = self
+                .inner
+                .journals
+                .iter()
+                .min_by_key(|(_, cp)| cp.updated_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.inner.journals.remove(&old);
+                crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            }
+        }
         self.inner.journals.insert(key, cp);
         self.dirty.store(true, Ordering::Relaxed);
     }
