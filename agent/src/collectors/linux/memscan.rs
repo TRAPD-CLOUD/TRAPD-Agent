@@ -308,7 +308,7 @@ pub struct MemScanCollector {
     /// so a region is read once per process generation, not every sweep.
     seen: HashSet<String>,
     #[cfg(feature = "yara")]
-    yara: crate::detection::yara_scanner::YaraScanner,
+    yara: Arc<crate::detection::yara_scanner::YaraScanner>,
 }
 
 impl MemScanCollector {
@@ -317,9 +317,9 @@ impl MemScanCollector {
             cfg,
             seen: HashSet::new(),
             #[cfg(feature = "yara")]
-            yara: crate::detection::yara_scanner::YaraScanner::load_from(
+            yara: Arc::new(crate::detection::yara_scanner::YaraScanner::load_from(
                 &crate::paths::config_dir().join("rules"),
-            ),
+            )),
         }
     }
 }
@@ -443,8 +443,17 @@ impl Collector for MemScanCollector {
             return Ok(());
         }
 
+        let mut worker = Self {
+            cfg: Arc::clone(&self.cfg),
+            seen: std::mem::take(&mut self.seen),
+            #[cfg(feature = "yara")]
+            yara: Arc::clone(&self.yara),
+        };
+        let mut cursor = 0;
         let own_pid = std::process::id() as i32;
-        let mut ticker = interval(Duration::from_secs(interval_secs.max(30)));
+        let mut ticker = interval(Duration::from_secs(
+            interval_secs.clamp(30, 365 * 24 * 3600),
+        ));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
@@ -459,37 +468,51 @@ impl Collector for MemScanCollector {
                 continue;
             }
 
-            let mut live: HashSet<(i32, u64)> = HashSet::new();
-            for pid in live_pids() {
-                if pid == own_pid {
-                    continue;
-                }
-                if let Some(start) = crate::telemetry::identity::process_start_time(pid) {
-                    live.insert((pid, start));
-                }
-                for (severity, det) in self.scan_pid(pid) {
-                    let event = AgentEvent::new(
-                        agent_id.clone(),
-                        hostname.clone(),
-                        EventClass::Detection,
-                        EventAction::Detected,
-                        severity,
-                        EventData::Detection(Box::new(det)),
-                    );
-                    if tx.send(event).await.is_err() {
-                        return Ok(());
+            let tx = tx.clone();
+            let aid = agent_id.clone();
+            let host = hostname.clone();
+            let sweep = tokio::task::spawn_blocking(move || {
+                let mut pids = live_pids();
+                pids.sort_unstable();
+                let live: HashSet<_> = pids.iter().copied().collect();
+                worker.seen.retain(|k| {
+                    k.split(':')
+                        .next()
+                        .and_then(|p| p.parse::<i32>().ok())
+                        .is_some_and(|p| live.contains(&p))
+                });
+                let began = std::time::Instant::now();
+                let mut visited = 0;
+                let n = pids.len();
+                let start = if n == 0 { 0 } else { cursor % n };
+                for pid in pids.iter().cycle().skip(start).take(n) {
+                    if tx.is_closed() || began.elapsed() >= Duration::from_millis(250) {
+                        break;
+                    }
+                    visited += 1;
+                    if *pid == own_pid {
+                        continue;
+                    }
+                    for (severity, det) in worker.scan_pid(*pid) {
+                        let event = AgentEvent::new(
+                            aid.clone(),
+                            host.clone(),
+                            EventClass::Detection,
+                            EventAction::Detected,
+                            severity,
+                            EventData::Detection(Box::new(det)),
+                        );
+                        crate::pipeline::try_emit(&tx, event, "memscan");
                     }
                 }
+                (worker, start + visited, tx.is_closed())
+            })
+            .await?;
+            worker = sweep.0;
+            cursor = sweep.1;
+            if sweep.2 {
+                return Ok(());
             }
-            // Forget findings for processes that have since exited.
-            self.seen.retain(|k| {
-                let mut fields = k.split(':');
-                fields
-                    .next()
-                    .and_then(|p| p.parse::<i32>().ok())
-                    .zip(fields.next().and_then(|s| s.parse::<u64>().ok()))
-                    .is_some_and(|generation| live.contains(&generation))
-            });
         }
     }
 }

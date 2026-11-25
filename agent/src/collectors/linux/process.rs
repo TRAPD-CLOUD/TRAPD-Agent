@@ -54,16 +54,11 @@ pub struct ProcessCollector {
 
 impl ProcessCollector {
     pub fn new() -> Self {
-        let suid_baseline = scan_suid_baseline();
-        info!(
-            "ProcessCollector: SUID baseline ready — {} binaries",
-            suid_baseline.len()
-        );
         Self {
             initialized: false,
             known: HashMap::new(),
             uid_to_user: load_passwd().unwrap_or_default(),
-            suid_baseline,
+            suid_baseline: HashSet::new(),
         }
     }
 }
@@ -222,11 +217,17 @@ fn check_rwx_maps(pid: i32) -> Vec<(String, String)> {
     results
 }
 
+const MAX_PROCESSES: usize = 2048;
+
 fn collect_processes(
     uid_map: &HashMap<u32, String>,
     known: &HashMap<i32, KnownProcess>,
 ) -> Result<HashMap<i32, ProcessCreateData>> {
     let mut out = HashMap::new();
+    // Reserve slots for previous observations until a complete enumeration
+    // confirms which ones departed. New processes cannot evict live identities.
+    let mut new_slots = MAX_PROCESSES.saturating_sub(known.len());
+    let mut omitted = 0;
 
     let all = match procfs::process::all_processes() {
         Ok(iter) => iter,
@@ -242,15 +243,28 @@ fn collect_processes(
             Err(_) => continue,
         };
 
+        let previous = known.get(&proc.pid);
+        if previous.is_none() && new_slots == 0 {
+            omitted += 1;
+            continue;
+        }
         let stat = match proc.stat() {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => {
+                if let Some(old) = previous {
+                    out.insert(
+                        proc.pid,
+                        ProcessCreateData {
+                            pid: proc.pid,
+                            name: old.name.clone(),
+                            process_start_time: old.start_time,
+                            ..Default::default()
+                        },
+                    );
+                }
+                continue;
+            }
         };
-
-        if out.len() >= 2048 {
-            metrics().state_capacity_dropped(1);
-            break;
-        }
         if known
             .get(&stat.pid)
             .is_some_and(|old| old.start_time == Some(stat.starttime))
@@ -327,8 +341,12 @@ fn collect_processes(
             parent_exe: None,
             enrichment: notes.finish(if kthread { 0 } else { 2 }),
         };
+        if previous.is_none() {
+            new_slots -= 1;
+        }
         out.insert(stat.pid, data);
     }
+    metrics().state_capacity_dropped(omitted);
     Ok(out)
 }
 
@@ -344,6 +362,7 @@ impl Collector for ProcessCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
+        self.suid_baseline = tokio::task::spawn_blocking(scan_suid_baseline).await?;
         let mut ticker = interval(Duration::from_secs(3));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         metrics().add_collector_mode(CollectorMode::ProcPolling);
@@ -466,14 +485,6 @@ impl Collector for ProcessCollector {
 
             // Terminated processes
             for (pid, name) in diff.terminated {
-                if current.len() == 2048
-                    && !current.contains_key(&pid)
-                    && self.known.get(&pid).is_some_and(|old| {
-                        old.start_time == crate::telemetry::identity::process_start_time(pid)
-                    })
-                {
-                    continue;
-                }
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),

@@ -319,7 +319,6 @@ impl Collector for ModScanCollector {
         let mut tracker = Tracker::default();
         let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             // Blocking /proc reads stay off the async workers.

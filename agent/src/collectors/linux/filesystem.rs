@@ -84,13 +84,22 @@ impl Collector for FilesystemCollector {
         tokio::pin!(periodic);
         let mut periodic_active = true;
         loop {
+            if !periodic_active && workers.is_empty() {
+                anyhow::bail!("all filesystem sensors stopped");
+            }
             tokio::select! {
                 _ = tx.closed() => break,
                 res = &mut periodic, if periodic_active => {
-                    res?;
+                    if let Err(e) = res {
+                        crate::collectors::report_failure("FimCollector");
+                        warn!(error=%e, "periodic FIM exited");
+                    }
                     periodic_active = false; // Disabled by configuration.
                 }
-                res = workers.join_next() => anyhow::bail!("filesystem watcher exited: {res:?}"),
+                res = workers.join_next(), if !workers.is_empty() => {
+                    crate::collectors::report_failure("FilesystemWatcher");
+                    warn!(?res, "filesystem watcher exited");
+                }
                 ev = fs_rx.recv() => match ev {
                     Some(event) => { crate::pipeline::try_emit(&tx, event, "filesystem"); }
                     None => break,
