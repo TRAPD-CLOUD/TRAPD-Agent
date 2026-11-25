@@ -34,7 +34,7 @@ mod file {
 
     impl SoftwareKey {
         pub fn load_at(path: &Path) -> Result<Option<Self>> {
-            let der = match std::fs::read(path) {
+            let der = match crate::paths::bounded_regular_bytes(path, 4096) {
                 Ok(d) => Zeroizing::new(d),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),

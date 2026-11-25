@@ -126,6 +126,16 @@ fn restart_keeps_seq_and_chain() {
 }
 
 #[test]
+fn recovery_counts_dense_blank_lines_without_indexing_each_line() {
+    let dir = Dir::new("many-lines");
+    let key = Arc::new(TestKey::new());
+    std::fs::write(dir.0.join(FILE_NAME), vec![b'\n'; 100_000]).unwrap();
+    let journal = open(&dir, &key);
+    let pending = journal.pending(1);
+    assert_eq!(body(&pending[0]).payload["discarded_lines"], 100_000);
+}
+
+#[test]
 fn torn_last_line_is_dropped_without_a_corruption_entry() {
     let dir = Dir::new("torn");
     let key = Arc::new(TestKey::new());
