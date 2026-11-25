@@ -5,6 +5,17 @@ param([Parameter(Mandatory)][string]$Msi, [Parameter(Mandatory)][string]$AgentEx
 $ErrorActionPreference = 'Stop'
 $Msi = (Resolve-Path $Msi).Path
 $AgentExe = (Resolve-Path $AgentExe).Path
+# The release selector must stop before downloading anything without a signer pin.
+$selector = Join-Path $PSScriptRoot '../install.ps1'
+if ((Get-Command $selector).Parameters.ContainsKey('AllowUnsigned')) {
+    throw 'The release selector accepts unsigned packages.'
+}
+try {
+    & $selector -ExpectedThumbprint '' -ExpectedPublisher 'Test Publisher'
+    throw 'The release selector accepted a publisher name without a signer pin.'
+} catch {
+    if ($_.Exception.Message -ne 'A pinned Authenticode signer thumbprint is required.') { throw }
+}
 $root = Join-Path $env:RUNNER_TEMP ('trapd-msi-' + [guid]::NewGuid())
 $data = Join-Path $env:ProgramData 'TRAPD'
 $config = Join-Path $data 'config'

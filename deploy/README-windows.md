@@ -75,9 +75,9 @@ Windows Installer; it does not replace service binaries independently. The
 SHA256 file comes from the same release, so it proves integrity only. The script
 therefore also requires a valid Authenticode signature (`Get-AuthenticodeSignature`
 status `Valid`) and fails closed unless the signer matches `-ExpectedThumbprint`
-(or env `TRAPD_SIGNER_THUMBPRINT`) and/or `-ExpectedPublisher` (or
-`TRAPD_SIGNER_SUBJECT`, the certificate's simple name). One of them is mandatory;
-`-AllowUnsigned` is an explicit, warned opt-out for self-built packages.
+(or env `TRAPD_SIGNER_THUMBPRINT`). Obtain this certificate pin through a
+trusted provisioning channel. An optional `-ExpectedPublisher` adds a publisher
+name check. Update the pin before distributing a release with a rotated certificate.
 Release builds are signed (see "Signing" below); SmartScreen still warns on a
 download until the publisher has reputation.
 
