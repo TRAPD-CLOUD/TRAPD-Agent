@@ -9,6 +9,8 @@ tokio::task_local! {
     /// A signed command holds a queue slot from dispatch until its result.
     /// Background events and TTL callbacks run in separate tasks.
     static RESULT_SLOT: std::cell::RefCell<Option<OwnedPermit<AgentEvent>>>;
+    /// The durable outbox entry the command's first result also goes to.
+    static RESULT_RECORD: Option<(std::sync::Arc<super::result_outbox::ResultOutbox>, uuid::Uuid)>;
 }
 use tracing::warn;
 
@@ -42,10 +44,17 @@ impl AuditEmitter {
 
     pub(super) async fn with_result_slot(
         permit: OwnedPermit<AgentEvent>,
+        record: Option<(
+            std::sync::Arc<super::result_outbox::ResultOutbox>,
+            uuid::Uuid,
+        )>,
         action: impl std::future::Future<Output = ()>,
     ) {
         RESULT_SLOT
-            .scope(std::cell::RefCell::new(Some(permit)), action)
+            .scope(
+                std::cell::RefCell::new(Some(permit)),
+                RESULT_RECORD.scope(record, action),
+            )
             .await;
     }
 
@@ -85,6 +94,16 @@ impl AuditEmitter {
         }) {
             super::usernotify::notify(&action, kind, success, &details);
         }
+        let reason = reason.into();
+        if let Some(id) = command_id.as_deref() {
+            let _ = RESULT_RECORD.try_with(|record| {
+                if let Some((outbox, expected)) = record {
+                    if expected.to_string() == id {
+                        outbox.finish(*expected, success, &reason, &details);
+                    }
+                }
+            });
+        }
         let slot = command_id.as_ref().and_then(|_| {
             RESULT_SLOT
                 .try_with(|slot| slot.borrow_mut().take())
@@ -101,7 +120,7 @@ impl AuditEmitter {
                 kind: kind.into(),
                 target: target.into(),
                 success,
-                reason: reason.into(),
+                reason,
                 rule_id,
                 command_id,
                 details,

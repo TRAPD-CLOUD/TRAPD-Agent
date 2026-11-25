@@ -33,6 +33,8 @@ pub mod network;
 pub mod process;
 pub mod quarantine;
 pub mod response;
+pub mod result_outbox;
+pub mod result_reporter;
 pub mod rtr;
 pub mod runtime;
 pub mod software;
@@ -62,6 +64,10 @@ pub fn quarantine_index() -> PathBuf {
     quarantine_dir().join("index.json")
 }
 /// Replay-protection store — JSON list of accepted command-nonces.
+/// Durable outbox of command results awaiting backend acknowledgement.
+pub fn command_result_outbox() -> PathBuf {
+    crate::paths::state_dir().join("command_results.json")
+}
 pub fn nonce_store() -> PathBuf {
     crate::paths::state_dir().join("command_nonces.json")
 }

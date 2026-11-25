@@ -1230,3 +1230,78 @@ fn verified_sweepers_are_never_disrupted_automatically() {
         Some(ResponseLevel::None)
     );
 }
+
+#[cfg(any(target_os = "linux", windows))]
+#[tokio::test]
+async fn command_result_reaches_the_durable_outbox() {
+    use crate::prevention::result_outbox::{ResultOutbox, ResultStatus};
+    let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir(&dir).unwrap();
+    let outbox = Arc::new(ResultOutbox::load(&dir.join("command_results.json")).unwrap());
+    let (engine, mut results) = test_engine();
+    let engine = engine.with_result_outbox(Arc::clone(&outbox));
+    let mut child = ChildFixture::new();
+    let generation = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+    let mut cmd = process_command("kill_pid", child.pid(), Some(generation));
+    cmd.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let id = cmd.command_id;
+    let (tx, rx) = mpsc::channel(1);
+    Arc::new(engine).spawn_command_loop(rx);
+    tx.send(cmd).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), results.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let pending = outbox.pending();
+            if !pending.is_empty() {
+                return pending;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].command_id, id);
+    assert_eq!(pending[0].kind, "kill_pid");
+    let outcome = pending[0].outcome.as_ref().unwrap();
+    assert_eq!(outcome.status, ResultStatus::Failed);
+    assert!(outcome.reason.contains("expired"));
+    assert!(child.0.try_wait().unwrap().is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[tokio::test]
+async fn command_without_a_durable_intent_never_runs() {
+    use crate::prevention::result_outbox::ResultOutbox;
+    let blocked = std::env::temp_dir()
+        .join(uuid::Uuid::new_v4().to_string())
+        .join("command_results.json");
+    let outbox = Arc::new(ResultOutbox::load(&blocked).unwrap());
+    // A directory where the file belongs: the intent cannot be written.
+    std::fs::create_dir_all(&blocked).unwrap();
+    let (engine, mut results) = test_engine();
+    let engine = engine.with_result_outbox(outbox);
+    let mut child = ChildFixture::new();
+    let generation = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+    let cmd = process_command("kill_pid", child.pid(), Some(generation));
+    let (tx, rx) = mpsc::channel(1);
+    Arc::new(engine).spawn_command_loop(rx);
+    tx.send(cmd).await.unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), results.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event.action, EventAction::CommandRejected));
+    let EventData::Prevention(result) = event.data else {
+        panic!("missing result")
+    };
+    assert!(result.reason.contains("intent"));
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the process must survive"
+    );
+}
