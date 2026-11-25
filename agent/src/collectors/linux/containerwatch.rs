@@ -515,6 +515,9 @@ impl Collector for ContainerWatchCollector {
                 "containerwatch: watching cgroup tree"
             );
             loop {
+                if ctx.is_closed() {
+                    return;
+                }
                 let mut fd = libc::pollfd {
                     fd: w.as_raw_fd(),
                     events: libc::POLLIN,
@@ -523,9 +526,11 @@ impl Collector for ContainerWatchCollector {
                 // SAFETY: `fd` is a valid pollfd for the duration of the call.
                 unsafe { libc::poll(&mut fd, 1, POLL_MS) };
                 for l in w.step(Instant::now()) {
-                    if ctx
-                        .blocking_send(to_event(&agent_id, &hostname, &root2, &l))
-                        .is_err()
+                    if !crate::pipeline::try_emit(
+                        &ctx,
+                        to_event(&agent_id, &hostname, &root2, &l),
+                        "containerwatch",
+                    ) && ctx.is_closed()
                     {
                         return;
                     }

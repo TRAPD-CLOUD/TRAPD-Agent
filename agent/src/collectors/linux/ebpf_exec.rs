@@ -303,7 +303,13 @@ impl Collector for EbpfExecCollector {
             let mut guard = async_fd.readable_mut().await?;
             let rb = guard.get_inner_mut();
 
-            while let Some(item) = rb.next() {
+            let mut drained = false;
+
+            for _ in 0..64 {
+                let Some(item) = rb.next() else {
+                    drained = true;
+                    break;
+                };
                 let bytes: &[u8] = &item;
 
                 if bytes.len() < std::mem::size_of::<RawExecEvent>() {
@@ -457,7 +463,9 @@ impl Collector for EbpfExecCollector {
                 crate::pipeline::try_emit(&tx, event, SOURCE);
             }
 
-            guard.clear_ready();
+            if drained {
+                guard.clear_ready();
+            }
         }
     }
 }
