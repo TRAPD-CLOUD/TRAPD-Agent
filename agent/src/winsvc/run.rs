@@ -220,7 +220,7 @@ async fn reconcile_pending_firewall_expiry() -> Vec<crate::prevention::winfirewa
 /// must already be loaded via [`load_config_env`].
 pub(super) async fn run_agent(
     mut stop: tokio::sync::mpsc::Receiver<super::StopRequest>,
-    suspend: tokio::sync::mpsc::UnboundedReceiver<crate::heartbeat::suspend::Request>,
+    suspend: tokio::sync::mpsc::Receiver<crate::heartbeat::suspend::Request>,
     on_ready: impl FnOnce(),
     as_service: bool,
 ) -> Result<()> {
@@ -550,7 +550,8 @@ pub(super) async fn run_agent(
     };
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
-    let mode = output_mode;
+    let mirror = if offline { output_mode } else { output_mode.buffered() };
+    let mode = mirror.clone();
     let prev_tx = prev_event_tx.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     crate::telemetry::liveness::expect("pipeline_consumer", std::time::Duration::from_secs(180));
@@ -793,6 +794,7 @@ pub(super) async fn run_agent(
             .event_dropped(crate::telemetry::DropReason::InternalError);
         warn!("event consumer did not drain before shutdown deadline");
     }
+    mirror.drain().await;
     if let Ok(mut spool) = ring_buffer.lock() {
         spool.checkpoint();
     }
