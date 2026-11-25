@@ -248,8 +248,8 @@ async fn try_enroll(
                     })
                 }
             }
-            Err(e) => Err(AttemptError::Transient {
-                reason: format!("could not parse enrollment response: {e}"),
+            Err(_) => Err(AttemptError::Transient {
+                reason: "could not parse enrollment response".into(),
                 retry_after: None,
             }),
         };
@@ -257,8 +257,6 @@ async fn try_enroll(
 
     // Non-2xx: decide transient vs permanent.
     let retry_after = parse_retry_after(&resp);
-    let body = resp.text().await.unwrap_or_default();
-    let snippet = body.chars().take(300).collect::<String>();
     let code = status.as_u16();
 
     let transient = status.is_server_error() // 5xx
@@ -268,13 +266,11 @@ async fn try_enroll(
 
     if transient {
         Err(AttemptError::Transient {
-            reason: format!("HTTP {status} — {snippet}"),
+            reason: format!("HTTP {status}"),
             retry_after,
         })
     } else {
-        Err(AttemptError::Permanent(format!(
-            "HTTP {status} — {snippet}"
-        )))
+        Err(AttemptError::Permanent(format!("HTTP {status}")))
     }
 }
 
