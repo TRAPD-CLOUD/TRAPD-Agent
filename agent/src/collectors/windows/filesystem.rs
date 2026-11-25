@@ -612,10 +612,8 @@ impl Collector for FilesystemCollector {
             }
         }
         let baseline_path = crate::paths::state_dir().join("windows_fim_baseline.json");
-        let saved: Baseline = std::fs::metadata(&baseline_path)
+        let saved: Baseline = crate::paths::bounded_regular_bytes(&baseline_path, 8 * 1024 * 1024)
             .ok()
-            .filter(|m| m.len() <= 8 * 1024 * 1024)
-            .and_then(|_| std::fs::read(&baseline_path).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
         let mut baseline = saved.files;

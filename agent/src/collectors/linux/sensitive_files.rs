@@ -153,13 +153,20 @@ fn push_dir(
     let Ok(read) = std::fs::read_dir(root.join(rel)) else {
         return;
     };
-    let mut names: Vec<String> = read
+    let mut names = std::collections::BTreeSet::new();
+    let mut omitted = 0;
+    for name in read
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| accept(n))
-        .collect();
-    names.sort();
-    names.truncate(MAX_DIR_ENTRIES);
+    {
+        names.insert(name);
+        if names.len() > MAX_DIR_ENTRIES {
+            names.pop_last();
+            omitted += 1;
+        }
+    }
+    crate::telemetry::metrics::metrics().state_capacity_dropped(omitted);
     for name in names {
         out.push(Candidate {
             display: format!("{dir}/{name}"),
@@ -633,7 +640,9 @@ pub fn spawn(
                             return;
                         };
                         let rb = guard.get_inner_mut();
-                        while let Some(item) = rb.next() {
+                        let mut drained = false;
+                        for _ in 0..64 {
+                            let Some(item) = rb.next() else { drained = true; break; };
                             let Some(ev) = decode(&item) else { continue };
                             if !enabled(&cfg) || ev.pid == agent_pid {
                                 // Disabled by config, or the agent's own read:
@@ -668,7 +677,7 @@ pub fn spawn(
                             }
                             crate::pipeline::try_emit(&tx, event, "sensitive_file_read");
                         }
-                        guard.clear_ready();
+                        if drained { guard.clear_ready(); }
                     }
                 }
             }

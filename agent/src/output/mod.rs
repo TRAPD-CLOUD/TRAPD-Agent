@@ -22,6 +22,12 @@ fn log_file() -> PathBuf {
     crate::paths::log_dir().join("events.ndjson")
 }
 
+#[derive(Debug)]
+pub enum MirrorMessage {
+    Event(Box<AgentEvent>),
+    Drain(tokio::sync::oneshot::Sender<()>),
+}
+
 #[derive(Debug, Clone)]
 pub enum OutputMode {
     Stdout,
@@ -29,9 +35,52 @@ pub enum OutputMode {
     /// No local mirror. Events still go to the spool and the backend; nothing
     /// is serialised for local output.
     Off,
+    Buffered(tokio::sync::mpsc::Sender<MirrorMessage>),
 }
 
 impl OutputMode {
+    pub fn buffered(self) -> Self {
+        if matches!(self, Self::Off | Self::Buffered(_)) {
+            return self;
+        }
+        // A blocked mirror may retain at most 32 queued events and one writer.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                match message {
+                    MirrorMessage::Event(event) => {
+                        if let Err(err) =
+                            write_events(std::slice::from_ref(event.as_ref()), &self).await
+                        {
+                            record_mirror_miss();
+                            tracing::debug!(error = %err, "local mirror write failed");
+                        }
+                    }
+                    MirrorMessage::Drain(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        Self::Buffered(tx)
+    }
+
+    pub async fn drain(&self) {
+        let Self::Buffered(tx) = self else { return };
+        let (done, ack) = tokio::sync::oneshot::channel();
+        let wait = async {
+            if tx.send(MirrorMessage::Drain(done)).await.is_ok() {
+                let _ = ack.await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+            .await
+            .is_err()
+        {
+            tracing::warn!("local mirror did not drain before shutdown");
+        }
+    }
+
     /// `TRAPD_OUTPUT=file|stdout|off`. Unset: stdout when attached to a
     /// terminal (interactive runs), otherwise off. A service must not pay for
     /// converting every event to OCSF just to write it into a journal or log
@@ -45,6 +94,13 @@ impl OutputMode {
             _ if std::io::stdout().is_terminal() => OutputMode::Stdout,
             _ => OutputMode::Off,
         }
+    }
+}
+
+fn record_mirror_miss() {
+    let total = crate::telemetry::metrics::metrics().local_mirror_misses();
+    if total == 1 || total.is_multiple_of(1000) {
+        tracing::warn!(mirror_misses = total, "local mirror missed an event");
     }
 }
 
@@ -62,6 +118,17 @@ pub async fn write_events(events: &[AgentEvent], mode: &OutputMode) -> Result<()
     if matches!(mode, OutputMode::Off) || events.is_empty() {
         return Ok(());
     }
+    if let OutputMode::Buffered(tx) = mode {
+        for event in events {
+            match tx.try_reserve() {
+                Ok(slot) => {
+                    slot.send(MirrorMessage::Event(Box::new(event.clone())));
+                }
+                Err(_) => record_mirror_miss(),
+            }
+        }
+        return Ok(());
+    }
     let mut payload = String::with_capacity(events.len() * 1024);
     for event in events {
         match serialize_event(event) {
@@ -70,6 +137,7 @@ pub async fn write_events(events: &[AgentEvent], mode: &OutputMode) -> Result<()
                 payload.push('\n');
             }
             Err(err) => {
+                record_mirror_miss();
                 tracing::error!(event_id = %event.event_id, "event not serialisable for local output: {err}")
             }
         }
@@ -78,7 +146,7 @@ pub async fn write_events(events: &[AgentEvent], mode: &OutputMode) -> Result<()
         return Ok(());
     }
     match mode {
-        OutputMode::Off => {}
+        OutputMode::Off | OutputMode::Buffered(_) => {}
         OutputMode::Stdout => {
             let mut out = tokio::io::stdout();
             out.write_all(payload.as_bytes()).await?;
@@ -320,9 +388,26 @@ mod tests {
 #[cfg(test)]
 mod ocsf_tests {
     use super::*;
-    #[test]
-    fn local_output_is_ocsf_and_replays_losslessly() {
-        let event = AgentEvent::new(
+    #[tokio::test]
+    async fn blocked_optional_mirror_accounts_for_capacity_misses() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let mode = OutputMode::Buffered(sender);
+        let before = crate::telemetry::metrics::metrics()
+            .snapshot()
+            .local_mirror_misses_total;
+        let events = [local_event(), local_event()];
+        write_events(&events, &mode).await.unwrap();
+        assert_eq!(receiver.len(), 1);
+        assert!(
+            crate::telemetry::metrics::metrics()
+                .snapshot()
+                .local_mirror_misses_total
+                > before
+        );
+    }
+
+    fn local_event() -> AgentEvent {
+        AgentEvent::new(
             "agent".into(),
             "host".into(),
             crate::schema::EventClass::Process,
@@ -332,7 +417,12 @@ mod ocsf_tests {
                 pid: 42,
                 ..Default::default()
             }),
-        );
+        )
+    }
+
+    #[test]
+    fn local_output_is_ocsf_and_replays_losslessly() {
+        let event = local_event();
         let wire: serde_json::Value =
             serde_json::from_str(&serialize_event(&event).unwrap()).unwrap();
         assert_eq!(wire["class_uid"], 1007);

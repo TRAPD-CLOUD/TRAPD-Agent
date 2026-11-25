@@ -120,7 +120,6 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
 
     let mut suid = Vec::new();
     let mut caps = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     let mut budget = MAX_SCAN_ENTRIES;
 
     for &root in POSTURE_SCAN_ROOTS {
@@ -141,10 +140,6 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
                 continue;
             }
             let path = entry.path();
-            // Deduplicate hardlinked/aliased paths visited via multiple roots.
-            if !seen.insert(path.to_path_buf()) {
-                continue;
-            }
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -155,19 +150,27 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
             let path_str = path.to_string_lossy().into_owned();
 
             if setuid || setgid {
-                suid.push(SuidSgidBinary {
-                    mode: format!("{:04o}", mode & 0o7777),
-                    setuid,
-                    setgid,
-                    owner_uid: meta.uid(),
-                    owner_gid: meta.gid(),
-                    size: meta.len(),
-                    sha256: sha256_path(&path_str),
-                    path: path_str.clone(),
-                });
+                if suid.len() >= 2048 {
+                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                } else {
+                    suid.push(SuidSgidBinary {
+                        mode: format!("{:04o}", mode & 0o7777),
+                        setuid,
+                        setgid,
+                        owner_uid: meta.uid(),
+                        owner_gid: meta.gid(),
+                        size: meta.len(),
+                        sha256: sha256_path(&path_str),
+                        path: path_str.clone(),
+                    });
+                }
             }
 
             if let Some(c) = read_file_capability(&path_str) {
+                if caps.len() >= 2048 {
+                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                    continue;
+                }
                 caps.push(FileCapability {
                     path: path_str,
                     capabilities: c,
@@ -178,26 +181,15 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
 
     suid.sort_by(|a, b| a.path.cmp(&b.path));
     caps.sort_by(|a, b| a.path.cmp(&b.path));
+    suid.dedup_by(|a, b| a.path == b.path);
+    caps.dedup_by(|a, b| a.path == b.path);
     (suid, caps)
 }
 
 /// SHA256 of a file, formatted `sha256:<hex>`; `None` on any IO error.
 #[cfg(target_os = "linux")]
 fn sha256_path(path: &str) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65_536];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buf[..n]),
-            Err(_) => return None,
-        }
-    }
-    Some(format!("sha256:{}", hex::encode(hasher.finalize())))
+    crate::paths::bounded_regular_sha256_label(std::path::Path::new(path), 64 * 1024 * 1024).ok()
 }
 
 /// Read and decode the `security.capability` xattr into a `getcap`-style string,
@@ -423,7 +415,12 @@ fn build_inode_pid_map() -> std::collections::HashMap<u64, i32> {
     let Ok(proc_dir) = std::fs::read_dir("/proc") else {
         return map;
     };
+    let mut remaining = 65_536usize;
     for entry in proc_dir.flatten() {
+        if remaining == 0 {
+            break;
+        }
+        remaining -= 1;
         let name = entry.file_name();
         let Ok(pid) = name.to_string_lossy().parse::<i32>() else {
             continue;
@@ -432,6 +429,10 @@ fn build_inode_pid_map() -> std::collections::HashMap<u64, i32> {
             continue;
         };
         for fd in fd_dir.flatten() {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
             if let Ok(link) = std::fs::read_link(fd.path()) {
                 let s = link.to_string_lossy();
                 if let Some(inode) = s
@@ -443,6 +444,10 @@ fn build_inode_pid_map() -> std::collections::HashMap<u64, i32> {
                 }
             }
         }
+    }
+    if remaining == 0 {
+        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+        tracing::warn!("inventory socket owner lookup incomplete: FD sweep budget reached");
     }
     map
 }
@@ -867,11 +872,17 @@ fn read_trim(path: &str) -> Option<String> {
 
 /// Run a command and capture trimmed stdout, or None if it is missing/fails.
 fn run_capture(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).output().ok()?;
-    if !out.status.success() {
+    let (status, out) = super::host_command::capture(
+        Command::new(cmd).args(args),
+        2 * 1024 * 1024,
+        std::time::Duration::from_secs(15),
+    )
+    .map_err(|e| tracing::warn!(helper = cmd, error = %e, "inventory helper unavailable"))
+    .ok()?;
+    if !status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]

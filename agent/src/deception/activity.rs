@@ -272,16 +272,16 @@ impl ActivityStore {
 
     /// Drop everything older than the retention window.
     pub fn prune(&mut self, now: i64) {
-        let horizon_day = (now - RETENTION_DAYS * DAY) / DAY;
+        let horizon_day = (now.saturating_sub(RETENTION_DAYS * DAY)) / DAY;
         for u in self.users.values_mut() {
             for days in u.tools.values_mut() {
                 days.retain(|d, _| *d > horizon_day && *d <= now / DAY);
             }
             u.tools.retain(|_, days| !days.is_empty());
             u.dirs
-                .retain(|_, t| *t >= now - RETENTION_DAYS * DAY && *t <= now);
+                .retain(|_, t| *t >= now.saturating_sub(RETENTION_DAYS * DAY) && *t <= now);
             u.names
-                .retain(|(t, _)| *t >= now - RETENTION_DAYS * DAY && *t <= now);
+                .retain(|(t, _)| *t >= now.saturating_sub(RETENTION_DAYS * DAY) && *t <= now);
             u.hours
                 .retain(|day, _| *day > horizon_day && *day <= now / DAY);
         }
@@ -289,12 +289,12 @@ impl ActivityStore {
             !u.tools.is_empty() || !u.dirs.is_empty() || !u.names.is_empty() || !u.hours.is_empty()
         });
         self.hostnames
-            .retain(|_, t| *t >= now - RETENTION_DAYS * DAY && *t <= now);
+            .retain(|_, t| *t >= now.saturating_sub(RETENTION_DAYS * DAY) && *t <= now);
     }
 
     pub fn summary(&self, user: &str, now: i64) -> Option<UserActivitySummary> {
         let u = self.users.get(&user.to_lowercase())?;
-        let horizon_day = (now - RETENTION_DAYS * DAY) / DAY;
+        let horizon_day = (now.saturating_sub(RETENTION_DAYS * DAY)) / DAY;
         let tool_uses = u
             .tools
             .iter()
@@ -311,13 +311,13 @@ impl ActivityStore {
         let hot_dirs = u
             .dirs
             .iter()
-            .filter(|(_, t)| **t <= now && now - **t < COLD_AFTER_DAYS * DAY)
+            .filter(|(_, t)| **t <= now && now.saturating_sub(**t) < COLD_AFTER_DAYS * DAY)
             .map(|(d, _)| d.clone())
             .collect();
         let names: Vec<&String> = u
             .names
             .iter()
-            .filter(|(t, _)| *t <= now && *t >= now - RETENTION_DAYS * DAY)
+            .filter(|(t, _)| *t <= now && *t >= now.saturating_sub(RETENTION_DAYS * DAY))
             .map(|(_, name)| name)
             .collect();
         let mut hours = [0u32; 24];
@@ -335,7 +335,7 @@ impl ActivityStore {
             hot_dirs,
             naming: (!names.is_empty()).then(|| NamingStyle::infer(&names)),
             hours,
-            learning_days: ((now - u.first_seen_unix) / DAY).clamp(0, RETENTION_DAYS),
+            learning_days: ((now.saturating_sub(u.first_seen_unix)) / DAY).clamp(0, RETENTION_DAYS),
         })
     }
 
@@ -640,7 +640,7 @@ pub fn bootstrap_from_disk(store: &mut ActivityStore, user: &str, root: &Path, n
             };
             // Only recent writes mark a directory hot; older files still teach
             // the naming style.
-            if mtime <= now && now - mtime < RETENTION_DAYS * DAY {
+            if mtime <= now && now.saturating_sub(mtime) < RETENTION_DAYS * DAY {
                 store.observe_write(user, &entry.path(), mtime);
             } else if let Some(u) = store.user(user, now) {
                 let n = entry.file_name().to_string_lossy().into_owned();
@@ -657,6 +657,18 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_790_000_000;
+
+    #[test]
+    fn extreme_persisted_activity_dates_do_not_wrap() {
+        let mut store = ActivityStore::default();
+        store.observe_exec("anna", "tool.exe", NOW);
+        let user = store.users.get_mut("anna").unwrap();
+        user.first_seen_unix = i64::MIN;
+        user.dirs.insert("old".into(), i64::MIN);
+        let summary = store.summary("anna", NOW).unwrap();
+        assert_eq!(summary.learning_days, RETENTION_DAYS);
+        assert!(summary.hot_dirs.is_empty());
+    }
 
     #[test]
     fn legacy_state_file_is_migrated_not_discarded() {

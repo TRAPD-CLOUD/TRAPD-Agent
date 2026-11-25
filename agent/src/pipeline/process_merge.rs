@@ -275,6 +275,7 @@ impl ProcessCreateMerger {
 
     fn remember(&mut self, ident: Ident, now: Instant) {
         if self.seen.len() >= SEEN_CAP {
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
             self.seen.pop_front();
         }
         self.seen.push_back(Seen { ident, at: now });

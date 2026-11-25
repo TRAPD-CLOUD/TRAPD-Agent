@@ -336,7 +336,7 @@ agent logs which collectors did not start and keeps running.
 | `TRAPD_OFFLINE` | unset | `1` forces offline |
 | `TRAPD_OUTPUT` | `stdout` on a terminal, else `off` (Windows service: `file`) | local mirror: `file`, `stdout`, `off` |
 | `TRAPD_STATE_DIR`, `TRAPD_CONFIG_DIR`, `TRAPD_LOG_DIR` | `/var/lib/trapd`, `/etc/trapd`, `/var/log/trapd` | directories |
-| `TRAPD_SPOOL_MAX`, `TRAPD_SPOOL_MAX_BYTES` | 50 000 events, 1 GiB | spool limits; evictions are counted |
+| `TRAPD_SPOOL_MAX`, `TRAPD_SPOOL_MAX_BYTES` | 16 384 events, 16 MiB | resident spool ceilings; lower values are supported and FIFO evictions are counted. When replay of an older journal exceeds either new limit, its original is preserved beside it as `queue.journal.pre-budget` for operator recovery. If that archive already exists, the agent preserves both originals and reports degraded durability until the operator moves the archive and restarts |
 | `TRAPD_TLS_ALLOW_SYSTEM_ROOTS` | off | not recommended |
 | `TRAPD_EXEC_HASH` | on | `off` disables executable hashing |
 | `TRAPD_ROOTKIT*` | on | rootkit sweep knobs, CAPABILITIES.md §2b |

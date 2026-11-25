@@ -67,11 +67,10 @@ fn valid_hash(hash: &str) -> bool {
 
 pub fn read_state(dir: &Path) -> Option<AlertState> {
     let path = dir.join(STATE_FILE);
-    if std::fs::metadata(&path).ok()?.len() > MAX_STATE_BYTES {
-        return None;
-    }
     // A malformed `event_id` fails the parse like any other bad field.
-    let mut state: AlertState = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let mut state: AlertState =
+        serde_json::from_slice(&crate::paths::bounded_regular_bytes(&path, MAX_STATE_BYTES).ok()?)
+            .ok()?;
     if !valid_hash(&state.hash) {
         return None;
     }

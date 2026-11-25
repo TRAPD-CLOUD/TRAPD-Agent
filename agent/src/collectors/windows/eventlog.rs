@@ -34,7 +34,7 @@ impl Drop for Handle {
     }
 }
 
-fn render(event: EVT_HANDLE) -> Result<String> {
+fn render_as(event: EVT_HANDLE, format: EVT_RENDER_FLAGS) -> Result<String> {
     let mut bytes = 0;
     let mut properties = 0;
     // SAFETY: query size first; all out-pointers point to valid storage.
@@ -42,7 +42,7 @@ fn render(event: EVT_HANDLE) -> Result<String> {
         EvtRender(
             0,
             event,
-            EvtRenderEventXml,
+            format,
             0,
             std::ptr::null_mut(),
             &mut bytes,
@@ -58,7 +58,7 @@ fn render(event: EVT_HANDLE) -> Result<String> {
         EvtRender(
             0,
             event,
-            EvtRenderEventXml,
+            format,
             bytes,
             data.as_mut_ptr().cast(),
             &mut bytes,
@@ -72,10 +72,58 @@ fn render(event: EVT_HANDLE) -> Result<String> {
     Ok(String::from_utf16(&data[..length])?)
 }
 
+// The bookmark provides the record identity even when its event XML is too
+// large or impossible to render. Commit this position only after any preceding
+// deliverable records have been accepted.
+fn skipped_record_id(event: EVT_HANDLE) -> Option<u64> {
+    let bookmark = Handle(unsafe { EvtCreateBookmark(std::ptr::null()) });
+    if bookmark.0 == 0 || unsafe { EvtUpdateBookmark(bookmark.0, event) } == 0 {
+        return None;
+    }
+    let xml = render_as(bookmark.0, EvtRenderBookmark).ok()?;
+    bookmark_record_id(&xml)
+}
+
+fn warn_bad_record(channel: &str, operation: &str) {
+    use std::time::{Duration, Instant};
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let now = Instant::now();
+    if let Ok(mut last) = LAST.lock() {
+        if last.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(60)) {
+            *last = Some(now);
+            tracing::warn!(channel, operation, "skipping invalid Windows event-log record; further warnings limited to one per minute");
+        }
+    }
+}
+
+fn bookmark_record_id(xml: &str) -> Option<u64> {
+    roxmltree::Document::parse(xml)
+        .ok()?
+        .descendants()
+        .find(|node| node.has_tag_name("Bookmark"))?
+        .attribute("RecordId")?
+        .parse()
+        .ok()
+}
+
 /// Events requested from one `EvtNext` call.
 const EVT_BATCH: usize = 64;
 /// Events fetched and rendered by one blocking read.
 const READ_LIMIT: usize = 512;
+const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const CURSOR_FILE_LIMIT: u64 = 16 * 1024;
+const CHANNELS: [&str; 6] = [
+    "Security",
+    "System",
+    "Application",
+    windows_native::SYSMON_CHANNEL,
+    windows_native::WMI_CHANNEL,
+    windows_native::POWERSHELL_CHANNEL,
+];
+
+fn fits_batch(retained: usize, next: usize) -> bool {
+    next <= MAX_BATCH_BYTES.saturating_sub(retained)
+}
 /// Events drained per channel in one tick before yielding to the other
 /// channels and persisting the cursor. A backlog continues on the next pass
 /// without waiting for the timer.
@@ -84,6 +132,8 @@ const MAX_PER_TICK: usize = 8192;
 /// Result of one bounded read of a channel.
 struct Batch {
     records: Vec<String>,
+    examined: usize,
+    skipped_through: Option<u64>,
     /// The query reported no more items (`ERROR_NO_MORE_ITEMS`).
     exhausted: bool,
 }
@@ -146,13 +196,13 @@ pub(crate) fn read_matching(
 }
 
 fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<Batch> {
-    let channel: Vec<u16> = channel.encode_utf16().chain(Some(0)).collect();
+    let channel_wide: Vec<u16> = channel.encode_utf16().chain(Some(0)).collect();
     let query: Vec<u16> = query.encode_utf16().chain(Some(0)).collect();
     // SAFETY: terminated strings; zero session selects the local machine.
     let query = Handle(unsafe {
         EvtQuery(
             0,
-            channel.as_ptr(),
+            channel_wide.as_ptr(),
             query.as_ptr(),
             EvtQueryChannelPath
                 | if reverse {
@@ -167,8 +217,11 @@ fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<
     }
     let mut out = Vec::with_capacity(limit.min(EVT_BATCH));
     let mut exhausted = false;
-    while out.len() < limit {
-        let want = (limit - out.len()).min(EVT_BATCH);
+    let mut retained = 0usize;
+    let mut examined = 0usize;
+    let mut skipped_through = None;
+    'query: while examined < limit {
+        let want = (limit - examined).min(EVT_BATCH);
         let mut events: [EVT_HANDLE; EVT_BATCH] = [0; EVT_BATCH];
         let mut returned = 0u32;
         // SAFETY: `events` has room for `want` handles; EvtNext writes at most
@@ -191,26 +244,44 @@ fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<
             }
             bail!("EvtNext failed: {error}");
         }
+        if returned == 0 {
+            break;
+        }
         // Own every returned handle first so none leaks on a render failure.
-        let handles: Vec<Handle> = events[..returned as usize]
+        let handles: Vec<Handle> = events
+            .get(..returned as usize)
+            .context("invalid EvtNext handle count")?
             .iter()
             .map(|h| Handle(*h))
             .collect();
         for event in &handles {
-            match render(event.0) {
-                Ok(xml) => out.push(xml),
+            match render_as(event.0, EvtRenderEventXml) {
+                Ok(xml) => {
+                    if !fits_batch(retained, xml.capacity()) {
+                        break 'query;
+                    }
+                    skipped_through = None;
+                    retained += xml.capacity();
+                    out.push(xml);
+                }
                 // One unrenderable record must not wedge the channel.
-                Err(e) => {
-                    tracing::warn!(error = %e, "skipping unrenderable event-log record");
-                    // The cursor moves past this record, so the loss must be counted.
+                Err(_) => {
+                    warn_bad_record(channel, "render");
+                    if let Some(id) = skipped_record_id(event.0) {
+                        skipped_through = Some(id);
+                    }
+                    // Count the source loss independently of checkpoint persistence.
                     crate::telemetry::metrics::metrics()
                         .event_dropped(crate::telemetry::DropReason::InternalError);
                 }
             }
+            examined += 1;
         }
     }
     Ok(Batch {
         records: out,
+        examined,
+        skipped_through,
         exhausted,
     })
 }
@@ -425,6 +496,7 @@ fn capture_logon_type(
     if let Ok(t) = get("LogonType").parse::<u32>() {
         if !logon_id.is_empty() {
             if cache.len() >= 4096 {
+                crate::telemetry::metrics::metrics().state_capacity_dropped(cache.len() as u64);
                 cache.clear();
             }
             cache.insert(logon_id.to_string(), t);
@@ -622,10 +694,29 @@ impl Collector for EventLogCollector {
     ) -> Result<()> {
         let _coverage_guard = CoverageGuard;
         let path = crate::paths::state_dir().join("windows_eventlog_cursors.json");
-        let mut cursors: HashMap<String, u64> = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let mut cursors: HashMap<String, u64> = match crate::paths::bounded_regular_bytes(
+            &path,
+            CURSOR_FILE_LIMIT,
+        ) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    tracing::warn!(%error, "invalid Windows event-log cursor; restarting at newest record");
+                    crate::telemetry::metrics::metrics()
+                        .event_dropped(crate::telemetry::DropReason::InternalError);
+                    HashMap::new()
+                }
+            },
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%error, "Windows event-log cursor unavailable; restarting at newest record");
+                    crate::telemetry::metrics::metrics()
+                        .event_dropped(crate::telemetry::DropReason::InternalError);
+                }
+                HashMap::new()
+            }
+        };
+        cursors.retain(|channel, _| CHANNELS.contains(&channel.as_str()));
         // Recent (SubjectLogonId -> LogonType) from 4624, so a 4663 decoy read
         // can be graded by how its subject logged on (interactive vs. RDP vs.
         // service). Bounded; oldest dropped on overflow.
@@ -636,6 +727,7 @@ impl Collector for EventLogCollector {
         let devices = super::etw::device_map();
         let mut unavailable = HashSet::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // A channel hit the per-tick cap: read again without waiting.
         let mut backlog = false;
         crate::telemetry::liveness::expect(self.name(), std::time::Duration::from_secs(120));
@@ -682,14 +774,8 @@ impl Collector for EventLogCollector {
                 c.audit_command_line = policy.1;
                 c.audit_registry = policy.2;
             });
-            for channel in [
-                "Security",
-                "System",
-                "Application",
-                windows_native::SYSMON_CHANNEL,
-                windows_native::WMI_CHANNEL,
-                windows_native::POWERSHELL_CHANNEL,
-            ] {
+            for channel in CHANNELS {
+                let previous_cursor = cursors.get(channel).copied();
                 let mut drained = 0usize;
                 loop {
                     // A long drain must not look like a stall.
@@ -711,18 +797,22 @@ impl Collector for EventLogCollector {
                             break;
                         }
                     };
-                    let Batch { records, exhausted } = batch;
-                    let batch_len = records.len();
+                    let Batch {
+                        records,
+                        exhausted,
+                        examined,
+                        skipped_through,
+                    } = batch;
                     crate::telemetry::coverage::update(|c| c.set_eventlog_active(channel, true));
                     if unavailable.remove(channel) {
                         tracing::info!(channel, "Windows event log available again");
                     }
-                    if records.is_empty() && cursor.is_none() {
+                    if examined == 0 && cursor.is_none() {
                         cursors.insert(channel.into(), 0);
                     }
                     // A cleared log can restart record numbering. Rebase visibly
                     // instead of waiting forever for the previous high-water mark.
-                    if records.is_empty() && cursor.is_some() {
+                    if examined == 0 && cursor.is_some() {
                         if let Ok(latest) =
                             tokio::task::spawn_blocking(move || read(channel, None)).await?
                         {
@@ -748,8 +838,8 @@ impl Collector for EventLogCollector {
                     for xml in records {
                         let (record, data, auth) = match parse(&xml, channel) {
                             Ok(record) => record,
-                            Err(error) => {
-                                tracing::warn!(channel, %error, "Skipping malformed Windows event record");
+                            Err(_) => {
+                                warn_bad_record(channel, "parse");
                                 crate::telemetry::metrics::metrics()
                                     .event_dropped(crate::telemetry::DropReason::InternalError);
                                 // Native XML may have valid System identity but bad data.
@@ -915,12 +1005,20 @@ impl Collector for EventLogCollector {
                     if retry {
                         break;
                     }
-                    drained += batch_len;
+                    if let Some(id) = skipped_through {
+                        cursors.insert(channel.into(), id);
+                    }
+                    if cursors.get(channel).copied() == cursor {
+                        // No readable identity in this page. Retry on the next
+                        // poll without monopolizing the blocking pool.
+                        break;
+                    }
+                    drained += examined;
                     // The first start only records the newest id (one read).
                     if cursor.is_none() {
                         break;
                     }
-                    match after_batch(batch_len, exhausted, drained) {
+                    match after_batch(examined, exhausted, drained) {
                         Drain::Again => {}
                         Drain::Done => break,
                         Drain::Backlog => {
@@ -929,7 +1027,9 @@ impl Collector for EventLogCollector {
                         }
                     }
                 }
-                crate::paths::write_atomic(&path, &serde_json::to_vec(&cursors)?, 0o600)?;
+                if cursors.get(channel).copied() != previous_cursor {
+                    crate::paths::write_atomic(&path, &serde_json::to_vec(&cursors)?, 0o600)?;
+                }
             }
         }
     }
@@ -937,6 +1037,27 @@ impl Collector for EventLogCollector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bookmark_identity_survives_unrenderable_event_data() {
+        assert_eq!(
+            super::bookmark_record_id(
+                r#"<BookmarkList><Bookmark Channel="System" RecordId="765" IsCurrent="true"/></BookmarkList>"#
+            ),
+            Some(765)
+        );
+        assert_eq!(
+            super::bookmark_record_id("<Bookmark RecordId='bad'/>"),
+            None
+        );
+    }
+
+    #[test]
+    fn batch_byte_limit_defers_records_without_overflow() {
+        assert!(super::fits_batch(super::MAX_BATCH_BYTES - 1, 1));
+        assert!(!super::fits_batch(super::MAX_BATCH_BYTES, 1));
+        assert!(!super::fits_batch(0, usize::MAX));
+    }
+
     #[test]
     fn audit_tamper_folds_per_event_id() {
         let fields = |id: u64| {

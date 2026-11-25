@@ -12,8 +12,6 @@
 //!   agent runs, or the agent's own updated binary, is *not* flagged),
 //! * a file-backed library outside the trusted directories and the allowlist.
 
-use std::collections::HashSet;
-
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -205,28 +203,54 @@ pub fn parse_status(text: &str) -> Status {
 
 /// `(tracee pid, tracee status)` pairs whose tracer is somebody: restricted to
 /// the agent and its direct children (the watchdog subprocess).
-pub fn traced_agent_processes(statuses: &[(u32, Status)], own_pid: u32) -> Vec<(u32, Status)> {
-    statuses
-        .iter()
-        .filter(|(pid, s)| s.tracer_pid != 0 && (*pid == own_pid || s.ppid == own_pid))
-        .cloned()
-        .collect()
+fn traced_agent_processes(
+    statuses: impl IntoIterator<Item = (u32, Status)>,
+    own_pid: u32,
+) -> Vec<(u32, Status)> {
+    const MAX_TRACED: usize = 256;
+    let mut traced = Vec::new();
+    let mut skipped = 0;
+    for (pid, status) in statuses {
+        if status.tracer_pid != 0 && (pid == own_pid || status.ppid == own_pid) {
+            if traced.len() < MAX_TRACED {
+                traced.push((pid, status));
+            } else {
+                skipped += 1;
+            }
+        }
+    }
+    if skipped > 0 {
+        crate::telemetry::metrics::metrics().state_capacity_dropped(skipped);
+    }
+    traced
 }
 
 fn read(path: &str) -> Option<String> {
-    std::fs::read_to_string(path).ok()
+    let max_bytes = if path.ends_with("/maps") {
+        2 * 1024 * 1024
+    } else {
+        64 * 1024
+    };
+    let path = std::path::Path::new(path);
+    let resolved;
+    let source = if path == std::path::Path::new("/etc/ld.so.preload") {
+        resolved = std::fs::canonicalize(path).ok()?;
+        &resolved
+    } else {
+        path
+    };
+    String::from_utf8(crate::paths::bounded_regular_bytes(source, max_bytes).ok()?).ok()
 }
 
-fn proc_statuses() -> Vec<(u32, Status)> {
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    dir.flatten()
+fn proc_statuses() -> impl Iterator<Item = (u32, Status)> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
         .filter_map(|e| {
             let pid: u32 = e.file_name().to_str()?.parse().ok()?;
             Some((pid, parse_status(&read(&format!("/proc/{pid}/status"))?)))
         })
-        .collect()
 }
 
 /// Mark the process non-dumpable: no core dumps with agent memory, and a
@@ -322,7 +346,10 @@ impl Checker {
             }
         }
         let mut preload: Vec<(&'static str, String)> = Vec::new();
-        if let Ok(env) = std::fs::read("/proc/self/environ") {
+        if let Ok(env) = crate::paths::bounded_regular_bytes(
+            std::path::Path::new("/proc/self/environ"),
+            128 * 1024,
+        ) {
             preload.extend(
                 parse_environ_preload(&env)
                     .into_iter()
@@ -359,19 +386,14 @@ impl Checker {
 
     fn tracer_findings(&self) -> Vec<Finding> {
         let own = std::process::id();
-        let mut watched: Vec<(u32, Status)> = Vec::new();
-        if let Some(t) = read("/proc/self/status") {
-            watched.push((own, parse_status(&t)));
-        }
-        // Children (watchdog subprocess) need a /proc scan; skip it when no
-        // child exists, which is the common case for the agent process itself.
-        if self.cfg.debugger && has_children(own) {
-            watched.extend(proc_statuses());
-        }
-        let mut seen = HashSet::new();
-        traced_agent_processes(&watched, own)
+        let own_status = read("/proc/self/status").map(|text| (own, parse_status(&text)));
+        let children = (self.cfg.debugger && has_children(own))
+            .then(proc_statuses)
             .into_iter()
-            .filter(|(pid, _)| seen.insert(*pid))
+            .flatten()
+            .filter(|(pid, _)| *pid != own);
+        traced_agent_processes(own_status.into_iter().chain(children), own)
+            .into_iter()
             .map(|(pid, st)| {
                 let tracer = st.tracer_pid;
                 let comm = read(&format!("/proc/{tracer}/comm"))
@@ -402,8 +424,11 @@ impl Checker {
 
 fn has_children(pid: u32) -> bool {
     // `children` needs CONFIG_PROC_CHILDREN; when absent assume yes and scan.
-    match std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
-        Ok(s) => !s.trim().is_empty(),
+    use std::io::Read;
+    match std::fs::File::open(format!("/proc/{pid}/task/{pid}/children"))
+        .and_then(|mut file| file.read(&mut [0]))
+    {
+        Ok(n) => n != 0,
         Err(_) => true,
     }
 }
@@ -535,7 +560,7 @@ mod tests {
             ),
             (100 + 3, Status::default()),
         ];
-        let pids: Vec<u32> = traced_agent_processes(&list, 100)
+        let pids: Vec<u32> = traced_agent_processes(list, 100)
             .into_iter()
             .map(|(p, _)| p)
             .collect();
@@ -543,6 +568,21 @@ mod tests {
     }
 
     // ---- live checks against the running test process -------------------
+
+    #[test]
+    fn traced_children_are_bounded_even_on_a_large_host() {
+        let statuses = (1_000..1_500).map(|pid| {
+            (
+                pid,
+                Status {
+                    ppid: 99,
+                    tracer_pid: 100,
+                    ..Default::default()
+                },
+            )
+        });
+        assert_eq!(traced_agent_processes(statuses, 99).len(), 256);
+    }
 
     fn cfg() -> Config {
         Config::default()
@@ -617,7 +657,7 @@ mod tests {
         }
         let own = std::process::id();
         let statuses = proc_statuses();
-        let traced = traced_agent_processes(&statuses, own);
+        let traced = traced_agent_processes(statuses, own);
         // SAFETY: matching detach of the seized child.
         unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) };
         let _ = child.kill();
@@ -656,9 +696,9 @@ mod tests {
             std::hint::black_box(c.self_check());
         });
         let per_scan = cpu(&mut || {
-            std::hint::black_box(proc_statuses());
+            std::hint::black_box(proc_statuses().count());
         });
-        let procs = proc_statuses().len();
+        let procs = proc_statuses().count();
         println!(
             "self_check: {:.1} us per pass -> {:.5} % of one core at one pass / 30 s",
             per_check * 1e6,

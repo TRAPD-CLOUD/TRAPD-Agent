@@ -105,9 +105,9 @@ Declared lengths are validated against a hard ceiling *before* any allocation,
 and journal lines are read with a bounded reader, so a corrupt or hostile length
 prefix cannot drive an unbounded allocation during recovery.
 
-Bounded by both event count (`TRAPD_SPOOL_MAX`, default 50 000) and bytes
-(`TRAPD_SPOOL_MAX_BYTES`, default 1 GiB) — 50 000 events is fine until they each
-carry a 16 KiB command line. On overflow the **oldest** event is evicted and
+The durable spool retains at most 16,384 events and 16 MiB of serialized
+payload. Operators can lower either ceiling with `TRAPD_SPOOL_MAX` or
+`TRAPD_SPOOL_MAX_BYTES`. On overflow the **oldest** event is evicted and
 counted as `persistent_queue_full`: during an outage an operator investigating a
 live incident needs the last few minutes, and refusing new events would blind
 the agent for the rest of the outage.

@@ -28,19 +28,18 @@ pub mod spool;
 // runtime builds its spool through `winsvc::run`.
 #[allow(unused_imports)]
 pub use spool::{
-    spool_max_bytes_from_env, spool_max_from_env, spool_reserve_bytes_from_env, Spool, SpoolEntry,
-    SPOOL_MAX_MEMORY,
+    spool_max_from_env, spool_reserve_bytes_from_env, Spool, SpoolEntry, SPOOL_MAX_MEMORY,
 };
 
 /// Depth of the collector→consumer channel.
 ///
-/// Sized to absorb a burst (a build, a container start-up storm) without
-/// dropping, while still bounding worst-case memory to a few MiB.
-pub const CHANNEL_CAPACITY: usize = 4_096;
+/// At the 256 KiB wire-record limit, 64 queued records represent 16 MiB
+/// of payload before Rust object overhead. Overload follows `try_emit`'s
+/// counted full-channel path.
+pub const CHANNEL_CAPACITY: usize = 64;
 
-/// Most events one consumer pass handles together. Bounds the latency a single
-/// batch adds and the size of one spool write.
-pub const MAX_BATCH: usize = 256;
+/// A separate batch remains live while output and spool work completes.
+pub const MAX_BATCH: usize = 32;
 
 /// Wait for at least one event, then take everything already queued, up to
 /// [`MAX_BATCH`]. Returns `false` once the channel is closed and drained.

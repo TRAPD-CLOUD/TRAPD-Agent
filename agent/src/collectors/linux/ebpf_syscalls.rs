@@ -593,7 +593,12 @@ impl EbpfSyscallCollector {
                         }
                     };
                     let rb = guard.get_inner_mut();
-                    while let Some(item) = rb.next() {
+                    let mut drained = false;
+                    for _ in 0..64 {
+                        let Some(item) = rb.next() else {
+                            drained = true;
+                            break;
+                        };
                         let Some(ev) = (unsafe { read_raw::<RawHoneytokenAccessEvent>(&item) })
                         else {
                             continue;
@@ -644,12 +649,16 @@ impl EbpfSyscallCollector {
                         if let Some(event) = honeytoken::build_access_event(
                             &agent_id, &hostname, &hit, &allowlist, &RealProc,
                         ) {
-                            if tx.send(event).await.is_err() {
+                            if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls")
+                                && tx.is_closed()
+                            {
                                 return;
                             }
                         }
                     }
-                    guard.clear_ready();
+                    if drained {
+                        guard.clear_ready();
+                    }
                 }
             });
             owner.tasks.push(task.abort_handle());
@@ -690,7 +699,7 @@ fn cstr(buf: &[u8]) -> &str {
 }
 
 pub(super) fn proc_username(uid: u32) -> String {
-    fs::read_to_string("/etc/passwd")
+    crate::collectors::read_text_capped("/etc/passwd", 512 * 1024)
         .unwrap_or_default()
         .lines()
         .find_map(|line| {
@@ -1482,13 +1491,15 @@ impl Collector for EbpfSyscallCollector {
                                        Severity::Medium,
                                        EventData::EbpfDrops(data),
                                    );
-                                   if tx.send(event).await.is_err() { return Ok(()); }
+                                   if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                }
                            }
 
                            Ok(mut guard) = afd_file_open.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawFileOpenEvent>(&item) } {
                                        // Self-exclusion: the agent's own file opens are pure
                                        // monitor noise and, for its telemetry sink
@@ -1524,15 +1535,17 @@ impl Collector for EbpfSyscallCollector {
             suppressed_repeats: None,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_net.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawNetEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion (own uploads to backend)
                                        // A bind seen at the syscall layer, below both
@@ -1564,15 +1577,17 @@ impl Collector for EbpfSyscallCollector {
                                                port:   ev.port,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_fork.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawForkEvent>(&item) } {
                                        if ev.parent_pid == agent_pid || ev.child_pid == agent_pid { continue; } // self-exclusion
                                        crate::rootkit::kernel_view::kernel_view()
@@ -1588,15 +1603,17 @@ impl Collector for EbpfSyscallCollector {
                                                child_comm:  cstr(&ev.child_comm).to_string(),
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_unlink.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawFileUnlinkEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion
                                        crate::rootkit::kernel_view::kernel_view()
@@ -1615,15 +1632,17 @@ impl Collector for EbpfSyscallCollector {
                                                path: cstr(&ev.path).to_string(),
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_rename.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawFileRenameEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion
                                        let view = crate::rootkit::kernel_view::kernel_view();
@@ -1644,15 +1663,17 @@ impl Collector for EbpfSyscallCollector {
                                                new_path: cstr(&ev.new_path).to_string(),
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_chmod.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawFileChmodEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion
                                        let username = proc_username(ev.uid);
@@ -1670,15 +1691,17 @@ impl Collector for EbpfSyscallCollector {
                                                mode: ev.mode,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_chown.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawFileChownEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion
                                        let username = proc_username(ev.uid);
@@ -1697,15 +1720,17 @@ impl Collector for EbpfSyscallCollector {
                                                new_gid: ev.new_gid,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_mmap.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawMmapEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion
                                        let username = proc_username(ev.uid);
@@ -1727,15 +1752,17 @@ impl Collector for EbpfSyscallCollector {
                                                description: desc,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_ptrace.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawPtraceEvent>(&item) } {
                                        // self-exclusion for the agent AS tracer; an attacker
                                        // ptracing the agent (target_pid == us) still reports.
@@ -1755,15 +1782,17 @@ impl Collector for EbpfSyscallCollector {
                                                target_pid: ev.target_pid as i32,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_module.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawModuleLoadEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion
                                        // Recorded so a module that removes itself from
@@ -1791,15 +1820,17 @@ impl Collector for EbpfSyscallCollector {
                                                image_size: None,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_shm.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawShmEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion
                                        let username = proc_username(ev.uid);
@@ -1824,15 +1855,17 @@ impl Collector for EbpfSyscallCollector {
                                                flags:    ev.flags,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_ns.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawNsChangeEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion
                                        let username = proc_username(ev.uid);
@@ -1853,15 +1886,17 @@ impl Collector for EbpfSyscallCollector {
                                                flags:      ev.flags,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_dns.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawDnsEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion (own backend lookups)
                                        let username = proc_username(ev.uid);
@@ -1879,15 +1914,17 @@ impl Collector for EbpfSyscallCollector {
                                                dst_port: ev.dst_port,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_write_rate.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawWriteRateEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion (own NDJSON log writes)
                                        let username = proc_username(ev.uid);
@@ -1905,15 +1942,17 @@ impl Collector for EbpfSyscallCollector {
                                                burst_threshold: ev.burst_threshold,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_kill.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawKillSignalEvent>(&item) } {
                                        let sender_comm = cstr(&ev.comm).to_string();
                                        let signal_name = match ev.signal {
@@ -1944,15 +1983,17 @@ impl Collector for EbpfSyscallCollector {
                                                signal_name: signal_name.to_string(),
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_setuid.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawSetuidEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion
                                        let event = AgentEvent::new(
@@ -1966,7 +2007,7 @@ impl Collector for EbpfSyscallCollector {
                                                comm:    cstr(&ev.comm).to_string(),
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                        if privilege_change::is_candidate(ev.old_uid, ev.new_uid) {
                                            spawn_privilege_check(
                                                &priv_tracker, tx.clone(), agent_id.clone(),
@@ -1976,12 +2017,14 @@ impl Collector for EbpfSyscallCollector {
                                        }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
 
                            Ok(mut guard) = afd_memfd.readable_mut() => {
                                let rb = guard.get_inner_mut();
-                               while let Some(item) = rb.next() {
+                               let mut drained = false;
+                               for _ in 0..64 {
+                                   let Some(item) = rb.next() else { drained = true; break; };
                                    if let Some(ev) = unsafe { read_raw::<RawMemfdEvent>(&item) } {
                                        if ev.pid == agent_pid { continue; } // self-exclusion
                                        let event = AgentEvent::new(
@@ -1995,10 +2038,10 @@ impl Collector for EbpfSyscallCollector {
                                                flags: ev.flags,
                                            }),
                                        );
-                                       if tx.send(event).await.is_err() { return Ok(()); }
+                                       if !crate::pipeline::try_emit(&tx, event, "ebpf_syscalls") && tx.is_closed() { return Ok(()); }
                                    }
                                }
-                               guard.clear_ready();
+                               if drained { guard.clear_ready(); }
                            }
                        }
         }

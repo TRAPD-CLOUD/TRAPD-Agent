@@ -201,10 +201,14 @@ pub fn gather(cfg: &RootkitConfig, kernel: &[(i32, ProcessSighting)]) -> Process
     let mut alive = BTreeSet::new();
     let mut direct = BTreeSet::new();
 
-    let candidates = (1..=cfg.pid_scan_max).chain(kernel_pids.keys().copied());
-    let mut probed = BTreeSet::new();
+    let candidates = (1..=cfg.pid_scan_max).chain(
+        kernel_pids
+            .keys()
+            .copied()
+            .filter(|pid| *pid > cfg.pid_scan_max),
+    );
     for pid in candidates {
-        if pid <= 0 || listed_before.contains(&pid) || !probed.insert(pid) {
+        if pid <= 0 || listed_before.contains(&pid) {
             continue;
         }
         if !super::task_exists(pid) {

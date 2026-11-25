@@ -12,7 +12,7 @@
 //! certainly exited), and a registry that can grow without limit on a busy host
 //! is a liability in a process that must not be the reason a box falls over.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -43,41 +43,39 @@ const PATH_CAP: usize = 4_096;
 
 /// A bounded, expiring set of sightings.
 #[derive(Debug)]
-struct Recent<K: Eq + Hash + Clone, V> {
+struct Recent<K: Ord + Hash + Clone, V> {
     ttl: Duration,
     cap: usize,
     entries: HashMap<K, (Instant, V)>,
+    age: BTreeSet<(Instant, K)>,
 }
 
-impl<K: Eq + Hash + Clone, V: Clone> Recent<K, V> {
+impl<K: Ord + Hash + Clone, V: Clone> Recent<K, V> {
     fn new(ttl: Duration, cap: usize) -> Self {
         Self {
             ttl,
             cap,
             entries: HashMap::new(),
+            age: BTreeSet::new(),
         }
     }
 
     fn insert(&mut self, key: K, value: V, now: Instant) {
-        self.prune(now);
-        if self.entries.len() >= self.cap && !self.entries.contains_key(&key) {
-            // Full: the oldest sighting is the least useful one to keep.
-            if let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (seen, _))| *seen)
-                .map(|(k, _)| k.clone())
-            {
+        if let Some((old, _)) = self.entries.remove(&key) {
+            self.age.remove(&(old, key.clone()));
+        }
+        if self.entries.len() >= self.cap {
+            if let Some((seen, oldest)) = self.age.pop_first() {
                 self.entries.remove(&oldest);
+                if now.saturating_duration_since(seen) <= self.ttl {
+                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                }
             }
         }
+        // Expired entries are invisible to snapshot and naturally displaced
+        // first. No table walks occur on the eBPF consumer thread.
+        self.age.insert((now, key.clone()));
         self.entries.insert(key, (now, value));
-    }
-
-    fn prune(&mut self, now: Instant) {
-        let ttl = self.ttl;
-        self.entries
-            .retain(|_, (seen, _)| now.duration_since(*seen) <= ttl);
     }
 
     fn snapshot(&self, now: Instant) -> Vec<(K, V)> {
@@ -278,6 +276,7 @@ mod tests {
             r.insert(pid, (), t0 + Duration::from_millis(pid as u64));
         }
         assert!(r.entries.len() <= 4);
+        assert_eq!(r.age.len(), r.entries.len());
     }
 
     #[test]

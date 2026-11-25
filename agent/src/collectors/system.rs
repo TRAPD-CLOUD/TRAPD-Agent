@@ -1,6 +1,3 @@
-#[cfg(target_os = "linux")]
-use std::fs;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
@@ -27,7 +24,7 @@ impl Default for SystemCollector {
 fn read_distro() -> String {
     #[cfg(target_os = "linux")]
     {
-        let content = match fs::read_to_string("/etc/os-release") {
+        let content = match crate::collectors::read_text_capped("/etc/os-release", 64 * 1024) {
             Ok(c) => c,
             Err(_) => return String::new(),
         };
@@ -95,6 +92,7 @@ impl Collector for SystemCollector {
         hostname: String,
     ) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             ticker.tick().await;

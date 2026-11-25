@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// How many open-fd links we record before truncating (bounded so a process
 /// with thousands of fds cannot bloat the event).
-const MAX_OPEN_FILES: usize = 64;
+pub(super) const MAX_OPEN_FILES: usize = 64;
 
 /// A point-in-time forensic capture of a (usually frozen) process.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -44,7 +44,7 @@ pub trait SnapshotProc {
     fn cwd(&self, pid: i32) -> Option<String>;
     fn cmdline(&self, pid: i32) -> Option<String>;
     /// `readlink` targets of `/proc/<pid>/fd/*`.
-    fn open_fds(&self, pid: i32) -> Vec<String>;
+    fn open_fds(&self, pid: i32) -> (Vec<String>, usize);
 }
 
 /// Capture a snapshot of `pid` from `p`. `frozen` records whether the caller
@@ -56,9 +56,7 @@ pub fn capture(p: &dyn SnapshotProc, pid: i32, frozen: bool) -> ProcessSnapshot 
         .as_deref()
         .and_then(parse_state)
         .or_else(|| frozen.then(|| "suspended".to_string()));
-    let mut open_files = p.open_fds(pid);
-    let open_files_total = open_files.len();
-    open_files.truncate(MAX_OPEN_FILES);
+    let (open_files, open_files_total) = p.open_fds(pid);
 
     ProcessSnapshot {
         pid,
@@ -101,8 +99,11 @@ mod tests {
         fn cmdline(&self, _: i32) -> Option<String> {
             Some("cat /home/alice/.aws/credentials".into())
         }
-        fn open_fds(&self, _: i32) -> Vec<String> {
-            self.fds.clone()
+        fn open_fds(&self, _: i32) -> (Vec<String>, usize) {
+            (
+                self.fds.iter().take(MAX_OPEN_FILES).cloned().collect(),
+                self.fds.len(),
+            )
         }
     }
 
@@ -131,8 +132,8 @@ mod tests {
             fn cmdline(&self, _: i32) -> Option<String> {
                 None
             }
-            fn open_fds(&self, _: i32) -> Vec<String> {
-                Vec::new()
+            fn open_fds(&self, _: i32) -> (Vec<String>, usize) {
+                (Vec::new(), 0)
             }
         }
         assert_eq!(

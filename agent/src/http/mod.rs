@@ -47,6 +47,33 @@ const USER_AGENT: &str = concat!("trapd-agent/", env!("CARGO_PKG_VERSION"));
 /// publicly-trusted CA and pinning is deliberately not used.
 const ALLOW_SYSTEM_ROOTS_ENV: &str = "TRAPD_TLS_ALLOW_SYSTEM_ROOTS";
 
+/// Buffer a control-plane reply only while it fits the endpoint's budget.
+/// Enforce the limit on received chunks too, including replies without a length.
+pub(crate) async fn bounded_body(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    if response.content_length().is_some_and(|n| n > max as u64) {
+        anyhow::bail!("HTTP response exceeds the {max}-byte limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > max - body.len() {
+            anyhow::bail!("HTTP response exceeds the {max}-byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Small JSON replies from enrollment, session and audit endpoints.
+pub(crate) const CONTROL_REPLY_BYTES: usize = 64 * 1024;
+
+pub(crate) async fn control_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T> {
+    Ok(serde_json::from_slice(
+        &bounded_body(response, CONTROL_REPLY_BYTES).await?,
+    )?)
+}
+
 /// Client tuned for the **enrollment / control plane**: short, bounded timeouts
 /// so a stalled backend never hangs startup indefinitely.
 ///
@@ -176,7 +203,7 @@ fn trust_anchors() -> Result<RootCertStore> {
         });
     }
 
-    let pem = std::fs::read(&path)
+    let pem = crate::paths::bounded_regular_bytes(&path, 1024 * 1024)
         .with_context(|| format!("TLS: cannot read pinned CA {}", path.display()))?;
     let mut roots = RootCertStore::empty();
     let mut count = 0usize;
@@ -231,11 +258,15 @@ fn mtls_identity(dir: &std::path::Path) -> Result<Option<ClientIdentity>> {
     if absent(&cert_path)? && absent(&key_path)? {
         return Ok(None);
     }
-    let certs = CertificateDer::pem_file_iter(cert_path)?
+    let cert_pem = paths::bounded_regular_bytes(&cert_path, 1024 * 1024)
+        .context("mTLS: cannot read certificate")?;
+    let key_pem = paths::bounded_regular_bytes(&key_path, 64 * 1024)
+        .context("mTLS: cannot read client key")?;
+    let certs = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("mTLS: invalid certificate chain")?;
     anyhow::ensure!(!certs.is_empty(), "mTLS: empty certificate chain");
-    let key = PrivateKeyDer::from_pem_file(key_path).context("mTLS: invalid client key")?;
+    let key = PrivateKeyDer::from_pem_slice(&key_pem).context("mTLS: invalid client key")?;
     Ok(Some((certs, key)))
 }
 
@@ -287,6 +318,38 @@ mod tests {
             assert_eq!(r.text().await.unwrap(), "ok");
         }
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn body_budget_applies_to_chunked_and_declared_lengths() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn reply(framing: &'static [u8]) -> reqwest::Response {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 1024];
+                assert!(socket.read(&mut buf).await.unwrap() > 0);
+                socket.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+                socket.write_all(framing).await.unwrap();
+            });
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{addr}/"))
+                .send()
+                .await
+                .unwrap()
+        }
+        let chunked = b"Transfer-Encoding: chunked\r\n\r\n2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n";
+        assert_eq!(
+            super::bounded_body(reply(chunked).await, 4).await.unwrap(),
+            b"abcd"
+        );
+        assert!(super::bounded_body(reply(chunked).await, 3).await.is_err());
+        let declared = b"Content-Length: 4\r\n\r\nabcd";
+        assert!(super::bounded_body(reply(declared).await, 3).await.is_err());
     }
 
     #[tokio::test]

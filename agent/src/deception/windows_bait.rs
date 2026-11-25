@@ -66,16 +66,17 @@ fn generate_recording(
     if let Some(kind) = kind_for_name(&lower) {
         return generate_kind_recording(kind, host, secrets);
     }
-    let mut rng = Rng;
+    let mut rng = Rng::default();
     let persona = Persona::new(host, &mut rng);
     let lang = Lang::of_name(&lower);
-    Ok(match Theme::for_name(&lower) {
+    let content = match Theme::for_name(&lower) {
         Theme::RecoveryKey => bitlocker_recovery(&mut rng, secrets),
         Theme::Vpn => vpn_access(&persona, &mut rng, lang, secrets).into_bytes(),
         Theme::CredentialTable => credential_table(&persona, &mut rng, ext, secrets).into_bytes(),
         Theme::PasswordList => password_list(&persona, &mut rng, false, lang, secrets).into_bytes(),
         Theme::BackupNotes => password_list(&persona, &mut rng, true, lang, secrets).into_bytes(),
-    })
+    };
+    rng.finish(content)
 }
 
 /// The fixed-format artefact a file name stands for, if any. Matches the real
@@ -154,14 +155,17 @@ fn generate_kind_recording(
     host: &HostIdentity,
     secrets: &mut Vec<String>,
 ) -> Result<Vec<u8>, UnsupportedDecoy> {
-    let mut rng = Rng;
+    let mut rng = Rng::default();
     let p = Persona::new(host, &mut rng);
     let out = match kind {
         "password_note" => password_list(&p, &mut rng, false, Lang::En, secrets),
         "credential_csv" => credential_table(&p, &mut rng, "csv", secrets),
         "db_connection_notes" => password_list(&p, &mut rng, false, Lang::En, secrets),
         "vpn_access" => vpn_access(&p, &mut rng, Lang::En, secrets),
-        "recovery_key" => return Ok(bitlocker_recovery(&mut rng, secrets)),
+        "recovery_key" => {
+            let content = bitlocker_recovery(&mut rng, secrets);
+            return rng.finish(content);
+        }
         "rdp_connection" => rdp_connection(&p, &mut rng),
         "winscp_ini" => winscp_ini(&p, &mut rng, secrets),
         "filezilla_sitemanager" => filezilla_sitemanager(&p, &mut rng, secrets),
@@ -177,7 +181,7 @@ fn generate_kind_recording(
             )))
         }
     };
-    Ok(out.into_bytes())
+    rng.finish(out.into_bytes())
 }
 
 /// A saved Remote Desktop connection file. `.rdp` is plain text; a real file's
@@ -376,13 +380,29 @@ impl Theme {
 
 /// Thin CSPRNG wrapper. Bait generation must never fall back to a predictable
 /// source, so an unavailable OS RNG is a hard failure.
-struct Rng;
+#[derive(Default)]
+struct Rng {
+    failed: bool,
+}
 
 impl Rng {
     fn u64(&mut self) -> u64 {
         let mut b = [0u8; 8];
-        getrandom::fill(&mut b).expect("OS random number generator unavailable");
+        // Generation has no side effects. Discard the whole artifact if a
+        // draw failed, including draws made after that failure.
+        if self.failed || getrandom::fill(&mut b).is_err() {
+            self.failed = true;
+            return 0;
+        }
         u64::from_le_bytes(b)
+    }
+    fn finish(self, content: Vec<u8>) -> Result<Vec<u8>, UnsupportedDecoy> {
+        if self.failed {
+            return Err(UnsupportedDecoy(
+                "OS random number generator unavailable".into(),
+            ));
+        }
+        Ok(content)
     }
     /// Uniform in `0..n` (modulo bias is < 2^-50 for the small `n` used here).
     fn below(&mut self, n: usize) -> usize {
@@ -545,7 +565,7 @@ fn password(rng: &mut Rng) -> (String, bool) {
             format!(
                 "{}{}{suffix}{}",
                 rng.pick(WORDS),
-                rng.range(year - 4, year),
+                rng.range(year.saturating_sub(4), year),
                 *rng.pick(SYMBOLS) as char
             )
         }
@@ -666,14 +686,10 @@ fn entries(
     let pool = if backup { BACKUP_SERVICES } else { SERVICES };
     let notes = if lang == Lang::De { NOTES_DE } else { NOTES };
     let count = rng.range(4, 9).min(pool.len());
-    let mut used = Vec::new();
+    let mut available: Vec<_> = (0..pool.len()).collect();
     let mut out = Vec::new();
-    while out.len() < count && used.len() < pool.len() {
-        let idx = rng.below(pool.len());
-        if used.contains(&idx) {
-            continue;
-        }
-        used.push(idx);
+    for _ in 0..count {
+        let idx = available.swap_remove(rng.below(available.len()));
         let (role, users) = pool[idx];
         let (password, generated) = password(rng);
         if generated {
@@ -983,6 +999,14 @@ mod tests {
     use super::*;
     use crate::deception::validate::reject_shared_watermark;
 
+    #[test]
+    fn failed_entropy_discards_the_entire_artifact() {
+        let mut rng = Rng { failed: true };
+        let p = Persona::new(&host(), &mut rng);
+        let body = password_list(&p, &mut rng, false, Lang::En, &mut Vec::new());
+        assert!(rng.finish(body.into_bytes()).is_err());
+    }
+
     fn host() -> HostIdentity {
         HostIdentity {
             hostname: "BER-WS-0142".into(),
@@ -1151,7 +1175,7 @@ mod tests {
         let mut human = std::collections::HashSet::new();
         let mut total = 0;
         while total < 500 {
-            let (pw, generated) = password(&mut Rng);
+            let (pw, generated) = password(&mut Rng::default());
             if !generated {
                 human.insert(pw);
                 total += 1;
@@ -1164,7 +1188,7 @@ mod tests {
     #[test]
     fn recovery_key_follows_the_bitlocker_checksum_rule() {
         for _ in 0..200 {
-            let key = recovery_key(&mut Rng);
+            let key = recovery_key(&mut Rng::default());
             let blocks: Vec<&str> = key.split('-').collect();
             assert_eq!(blocks.len(), 8);
             for block in blocks {

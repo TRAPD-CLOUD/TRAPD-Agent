@@ -243,6 +243,7 @@ impl W3cAggregator {
 /// Groups consecutive audit records that share `msg=audit(epoch:serial)`.
 pub struct AuditAggregator {
     current_id: Option<String>,
+    bytes: usize,
     buf: Vec<String>,
     max_lines: usize,
 }
@@ -251,6 +252,7 @@ impl AuditAggregator {
     pub fn new(max_lines: usize) -> Self {
         Self {
             current_id: None,
+            bytes: 0,
             buf: Vec::new(),
             max_lines: max_lines.max(1),
         }
@@ -267,8 +269,9 @@ impl AuditAggregator {
                 }
                 self.current_id = Some(id);
             }
+            self.bytes = self.bytes.saturating_add(line.len() + 1);
             self.buf.push(line.to_string());
-            if is_eoe || self.buf.len() >= self.max_lines {
+            if is_eoe || self.bytes >= 64 * 1024 || self.buf.len() >= self.max_lines {
                 if let Some(current) = self.take() {
                     out.push(current);
                 }
@@ -293,6 +296,7 @@ impl AuditAggregator {
 
     fn take(&mut self) -> Option<String> {
         self.current_id = None;
+        self.bytes = 0;
         if self.buf.is_empty() {
             return None;
         }

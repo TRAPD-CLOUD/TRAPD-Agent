@@ -218,8 +218,8 @@ async fn reconcile_pending_firewall_expiry() -> Vec<crate::prevention::winfirewa
 /// where the service may report `SERVICE_RUNNING`). Environment configuration
 /// must already be loaded via [`load_config_env`].
 pub(super) async fn run_agent(
-    mut stop: tokio::sync::mpsc::UnboundedReceiver<super::StopRequest>,
-    suspend: tokio::sync::mpsc::UnboundedReceiver<crate::heartbeat::suspend::Request>,
+    mut stop: tokio::sync::mpsc::Receiver<super::StopRequest>,
+    suspend: tokio::sync::mpsc::Receiver<crate::heartbeat::suspend::Request>,
     on_ready: impl FnOnce(),
     as_service: bool,
 ) -> Result<()> {
@@ -459,39 +459,23 @@ pub(super) async fn run_agent(
         }));
     }
 
-    // Every collector runs under the generic supervisor: an error exit is
-    // counted, shown in coverage and followed by a capped exponential-backoff
-    // restart. `spawn_collector_once!` only observes (SensorSupervisor owns its
-    // restart logic).
-    macro_rules! spawn_supervised {
-        ($collector:expr, $restart:expr) => {{
-            let c = $collector;
-            let tx2 = tx.clone();
-            let aid = agent_id.clone();
-            let host = hostname.clone();
+    // Each sensor and fallback has an independent failure domain and backoff.
+    macro_rules! spawn_collector {
+        ($collector:expr) => {{
             handles.push(tokio::spawn(crate::collectors::supervisor::supervise(
-                c,
-                tx2,
-                aid,
-                host,
+                $collector,
+                tx.clone(),
+                agent_id.clone(),
+                hostname.clone(),
                 crate::collectors::supervisor::RestartPolicy::default(),
-                $restart,
+                true,
             )));
         }};
     }
-    macro_rules! spawn_collector {
-        ($collector:expr) => {
-            spawn_supervised!($collector, true)
-        };
-    }
-    macro_rules! spawn_collector_once {
-        ($collector:expr) => {
-            spawn_supervised!($collector, false)
-        };
-    }
-
     spawn_collector!(SystemCollector::new());
-    spawn_collector_once!(
+    spawn_collector!(crate::collectors::windows::process::ProcessCollector::new());
+    spawn_collector!(crate::collectors::windows::network::NetworkCollector);
+    spawn_collector!(
         crate::collectors::windows::sensor_supervisor::SensorSupervisor::new(Arc::clone(
             &agent_config
         ))
@@ -565,7 +549,12 @@ pub(super) async fn run_agent(
     };
 
     let buf_for_consumer = Arc::clone(&ring_buffer);
-    let mode = output_mode;
+    let mirror = if offline {
+        output_mode
+    } else {
+        output_mode.buffered()
+    };
+    let mode = mirror.clone();
     let prev_tx = prev_event_tx.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     crate::telemetry::liveness::expect("pipeline_consumer", std::time::Duration::from_secs(180));
@@ -645,20 +634,9 @@ pub(super) async fn run_agent(
         }
     });
 
-    let started = std::time::Instant::now();
-    handles.push(tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
-        loop {
-            ticker.tick().await;
-            crate::deception::activity::persist();
-            let report =
-                crate::telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
-            if let Err(e) = report.write_atomic(&crate::telemetry::TelemetryReport::default_path())
-            {
-                warn!(error = %e, "could not publish telemetry report");
-            }
-        }
-    }));
+    handles.push(tokio::spawn(
+        crate::telemetry::snapshot::publish_periodically(offline),
+    ));
 
     let inventory = crate::inventory::InventoryReporter::new(
         &backend_url,
@@ -819,6 +797,7 @@ pub(super) async fn run_agent(
             .event_dropped(crate::telemetry::DropReason::InternalError);
         warn!("event consumer did not drain before shutdown deadline");
     }
+    mirror.drain().await;
     if let Ok(mut spool) = ring_buffer.lock() {
         spool.checkpoint();
     }

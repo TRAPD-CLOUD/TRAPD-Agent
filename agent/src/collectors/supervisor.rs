@@ -52,16 +52,6 @@ impl RestartPolicy {
     }
 }
 
-/// Record a collector failure in metrics and coverage.
-fn report_failure(name: &str) {
-    crate::telemetry::metrics::metrics().collector_failed();
-    if name == "WindowsProcessCollector" {
-        crate::telemetry::metrics::metrics()
-            .set_collector_mode(crate::telemetry::metrics::CollectorMode::Failed);
-    }
-    crate::telemetry::coverage::set_collector_failed(name, true);
-}
-
 /// Run `collector` until it finishes on purpose or the pipeline closes,
 /// restarting it after errors. With `restart == false` a failure is only
 /// reported (used for collectors that own their restart logic).
@@ -76,6 +66,7 @@ pub async fn supervise<C: Collector>(
     let name = collector.name();
     let mut streak = 0u32;
     loop {
+        let _observe_panic = super::ObservePanic(name);
         let started = tokio::time::Instant::now();
         let outcome = {
             let run = collector.run(tx.clone(), agent_id.clone(), hostname.clone());
@@ -102,7 +93,7 @@ pub async fn supervise<C: Collector>(
                 return;
             }
             Err(e) => {
-                report_failure(name);
+                super::report_failure(name);
                 streak = policy.next_streak(streak, started.elapsed());
                 error!("{name} exited with error: {e:#}");
                 if !restart {

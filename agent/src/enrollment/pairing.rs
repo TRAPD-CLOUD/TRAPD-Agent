@@ -229,7 +229,7 @@ impl PollState {
             }
             PollOutcome::Restart => Step::Restart,
             PollOutcome::RateLimited(retry_after) => {
-                self.failures += 1;
+                self.failures = self.failures.saturating_add(1);
                 Step::Wait(
                     retry_after
                         .unwrap_or_else(|| backoff(self.failures))
@@ -237,7 +237,7 @@ impl PollState {
                 )
             }
             PollOutcome::Transient(_) => {
-                self.failures += 1;
+                self.failures = self.failures.saturating_add(1);
                 Step::Wait(backoff(self.failures).max(self.interval))
             }
         }
@@ -340,7 +340,7 @@ async fn obtain_with(
             }
             None => {
                 if started.elapsed() < RAPID_RESTART {
-                    rapid_restarts += 1;
+                    rapid_restarts = rapid_restarts.saturating_add(1);
                     let delay = backoff(rapid_restarts);
                     warn!(
                         retry_in_secs = delay.as_secs(),
@@ -377,7 +377,9 @@ async fn poll_until_done(
         match state.on_outcome(outcome) {
             Step::Approved(t) => return Some(t),
             Step::Restart => return None,
-            Step::Wait(d) => tokio::time::sleep(d).await,
+            Step::Wait(d) => {
+                tokio::time::sleep(d.min(deadline.saturating_duration_since(Instant::now()))).await
+            }
         }
     }
 }
@@ -394,8 +396,8 @@ async fn poll_once(client: &reqwest::Client, url: &str, device_code: &str) -> Po
     };
     let status = resp.status().as_u16();
     let retry_after = parse_retry_after(&resp);
-    match resp.text().await {
-        Ok(body) => classify_poll(status, &body, retry_after),
+    match crate::http::bounded_body(resp, crate::http::CONTROL_REPLY_BYTES).await {
+        Ok(body) => classify_poll(status, &String::from_utf8_lossy(&body), retry_after),
         Err(e) => PollOutcome::Transient(format!("could not read response: {e}")),
     }
 }
@@ -409,7 +411,7 @@ async fn start_with_retry(
     let url = format!("{base}/api/v1/agents/pair/start");
     let mut attempt: u32 = 0;
     loop {
-        attempt += 1;
+        attempt = attempt.saturating_add(1);
         match try_start(client, &url, base, device_id, hostname).await {
             Ok(s) => return Ok(s),
             Err(AttemptError::Permanent(msg)) => {
@@ -454,8 +456,7 @@ async fn try_start(
     let status = resp.status();
     if status.is_success() {
         // The 200 body holds the device_code: parse errors must not echo it.
-        let body = resp
-            .json::<StartResponse>()
+        let body = crate::http::control_json::<StartResponse>(resp)
             .await
             .map_err(|_| AttemptError::Transient {
                 reason: "could not parse pairing response".into(),

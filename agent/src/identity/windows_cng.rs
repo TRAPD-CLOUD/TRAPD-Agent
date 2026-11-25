@@ -229,21 +229,9 @@ impl CngKey {
     /// Public key as SPKI DER, built from the exported `ECCPUBLICBLOB`.
     fn export_spki(key: NCRYPT_KEY_HANDLE) -> Result<Vec<u8>> {
         let mut len: u32 = 0;
-        // SAFETY: size query (null output buffer) on a live handle.
-        check("NCryptExportKey(size)", unsafe {
-            NCryptExportKey(
-                key,
-                0,
-                BCRYPT_ECCPUBLIC_BLOB,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                0,
-                &mut len,
-                0,
-            )
-        })?;
-        let mut blob = vec![0u8; len as usize];
-        // SAFETY: `blob` is `len` bytes long.
+        const HEADER_BYTES: usize = std::mem::size_of::<BCRYPT_ECCKEY_BLOB>();
+        let mut blob = [0u8; HEADER_BYTES + 64];
+        // SAFETY: the P-256 public blob buffer is writable for the passed size.
         check("NCryptExportKey", unsafe {
             NCryptExportKey(
                 key,
@@ -251,14 +239,14 @@ impl CngKey {
                 BCRYPT_ECCPUBLIC_BLOB,
                 std::ptr::null(),
                 blob.as_mut_ptr(),
-                len,
+                blob.len() as u32,
                 &mut len,
                 0,
             )
         })?;
-        let hdr = std::mem::size_of::<BCRYPT_ECCKEY_BLOB>();
-        if blob.len() < hdr + 64 {
-            bail!("unexpected public key blob length {}", blob.len());
+        let hdr = HEADER_BYTES;
+        if len as usize != blob.len() {
+            bail!("unexpected public key blob length {len}");
         }
         let magic = u32::from_le_bytes(blob[0..4].try_into().unwrap());
         let cb_key = u32::from_le_bytes(blob[4..8].try_into().unwrap());
@@ -344,8 +332,8 @@ fn record_path() -> std::path::PathBuf {
 }
 
 fn read_record() -> Result<Option<Protection>> {
-    match std::fs::read_to_string(record_path()) {
-        Ok(raw) => super::select::parse_record(&raw).map(Some),
+    match crate::paths::bounded_regular_bytes(&record_path(), 1024) {
+        Ok(raw) => super::select::parse_record(std::str::from_utf8(&raw)?).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(anyhow!("read {}: {e}", record_path().display())),
     }

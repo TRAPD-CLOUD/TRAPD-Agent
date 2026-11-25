@@ -478,7 +478,9 @@ impl SessionTokens {
             .await
             .map_err(t)?;
         classify(resp.status().as_u16())?;
-        let challenge: ChallengeResponse = resp.json().await.map_err(t)?;
+        let challenge: ChallengeResponse = crate::http::control_json(resp)
+            .await
+            .map_err(|e| SessionError::Transient(e.to_string()))?;
 
         let msg = session_message(&net.agent_id, &challenge.nonce);
         let key = Arc::clone(key);
@@ -499,7 +501,9 @@ impl SessionTokens {
             .await
             .map_err(t)?;
         classify(resp.status().as_u16())?;
-        let body: SessionResponse = resp.json().await.map_err(t)?;
+        let body: SessionResponse = crate::http::control_json(resp)
+            .await
+            .map_err(|e| SessionError::Transient(e.to_string()))?;
         if body.token.is_empty() {
             return Err(SessionError::Transient("empty session token".into()));
         }

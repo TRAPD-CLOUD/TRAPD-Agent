@@ -358,7 +358,7 @@ fn arm(
     }
 }
 
-fn wait_readable(inotify: &Inotify) -> bool {
+pub(super) fn wait_readable(inotify: &Inotify) -> bool {
     let mut fd = libc::pollfd {
         fd: inotify.as_raw_fd(),
         events: libc::POLLIN,
@@ -394,6 +394,9 @@ fn run_protect_sync(
     loop {
         // Re-arm on a timer: a directory that did not exist at start (spool,
         // /etc/trapd/rules) or was replaced must not stay unwatched forever.
+        if tx.is_closed() {
+            return;
+        }
         if !wait_readable(&inotify) {
             arm(&inotify, &plan, &mut wd_map);
             continue;
@@ -476,7 +479,7 @@ fn run_protect_sync(
                     action: action.to_string(),
                 }),
             );
-            if tx.blocking_send(ev).is_err() {
+            if !crate::pipeline::try_emit(&tx, ev, "agent_protect") && tx.is_closed() {
                 return;
             }
 

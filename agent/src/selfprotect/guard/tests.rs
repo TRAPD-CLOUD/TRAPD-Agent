@@ -359,6 +359,20 @@ fn the_spool_is_bounded() {
     }
     assert!(write_record(&dir, &r()).is_err());
     assert_eq!(pending_count(&dir), MAX_SPOOL_RECORDS);
+    // A recovered spool may exceed the writer's normal ceiling. Each pass
+    // drains at most one batch, without dropping valid surplus records.
+    let extra = r();
+    std::fs::write(
+        spool_dir(&dir).join("extra.json"),
+        serde_json::to_vec(&extra).unwrap(),
+    )
+    .unwrap();
+    let first = read_records(&dir);
+    assert_eq!(first.len(), MAX_SPOOL_RECORDS);
+    for (path, _) in first {
+        remove_record(&path);
+    }
+    assert_eq!(read_records(&dir).len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

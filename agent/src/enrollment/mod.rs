@@ -194,7 +194,7 @@ pub async fn load_or_enroll(
 
     let mut attempt: u32 = 0;
     loop {
-        attempt += 1;
+        attempt = attempt.saturating_add(1);
         match try_enroll(&client, &enroll_url, &enroll_token, device_id, hostname).await {
             Ok(creds) => {
                 persist(&creds).await?;
@@ -263,7 +263,7 @@ async fn try_enroll(
 
     let status = resp.status();
     if status.is_success() {
-        return match resp.json::<EnrollResponse>().await {
+        return match crate::http::control_json::<EnrollResponse>(resp).await {
             Ok(body) => {
                 let creds = Credentials {
                     agent_id: body.agent_id,
@@ -308,10 +308,17 @@ async fn try_enroll(
 
 // ── Persistence ─────────────────────────────────────────────────────────────
 
+const MAX_CREDENTIAL_BYTES: u64 = 128 * 1024;
+
+fn read_credentials(path: &std::path::Path) -> std::io::Result<String> {
+    String::from_utf8(paths::bounded_regular_bytes(path, MAX_CREDENTIAL_BYTES)?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Synchronous read of the persisted identity for short-lived CLI verbs that
 /// must never enroll. `None` when absent or invalid.
 pub(crate) fn load_persisted_blocking() -> Option<Credentials> {
-    let raw = std::fs::read_to_string(paths::credentials_file()).ok()?;
+    let raw = read_credentials(&paths::credentials_file()).ok()?;
     serde_json::from_str::<Credentials>(&raw)
         .ok()
         .filter(Credentials::is_valid)
@@ -327,7 +334,7 @@ pub(crate) fn load_persisted_strict_blocking() -> anyhow::Result<Option<Credenti
     let path = paths::credentials_file();
     let mut last = None;
     for attempt in 0..ATTEMPTS {
-        match std::fs::read_to_string(&path) {
+        match read_credentials(&path) {
             Ok(raw) => return parse_persisted_strict(Ok(raw)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => last = Some(e),
@@ -360,7 +367,11 @@ pub(crate) async fn load_persisted() -> Option<Credentials> {
     if !path.exists() {
         return None;
     }
-    let raw = tokio::fs::read_to_string(&path).await.ok()?;
+    let read_path = path.clone();
+    let raw = tokio::task::spawn_blocking(move || read_credentials(&read_path))
+        .await
+        .ok()?
+        .ok()?;
     match serde_json::from_str::<Credentials>(&raw) {
         Ok(c) if c.is_valid() => Some(c),
         Ok(_) => {
@@ -438,7 +449,15 @@ fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
     let val = resp.headers().get(reqwest::header::RETRY_AFTER)?;
     let s = val.to_str().ok()?;
     // Only the "delta-seconds" form is supported (the common case for 429/503).
-    s.trim().parse::<u64>().ok().map(Duration::from_secs)
+    retry_delay(s)
+}
+
+fn retry_delay(value: &str) -> Option<Duration> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| Duration::from_secs(seconds).clamp(BACKOFF_BASE, BACKOFF_MAX))
 }
 
 #[cfg(target_os = "linux")]
@@ -472,6 +491,20 @@ fn read_os_version() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enrollment_retry_headers_stay_in_the_backoff_window() {
+        assert_eq!(super::retry_delay("0"), Some(super::BACKOFF_BASE));
+        assert_eq!(
+            super::retry_delay("18446744073709551615"),
+            Some(super::BACKOFF_MAX)
+        );
+        assert_eq!(
+            super::retry_delay("10"),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(super::retry_delay("unexpected"), None);
+    }
+
     use super::*;
 
     #[test]

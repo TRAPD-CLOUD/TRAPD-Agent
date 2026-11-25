@@ -82,7 +82,7 @@ impl Collector for PacketCaptureCollector {
                 guard = async_fd.readable() => {
                     let mut guard = guard?;
                     // Drain everything currently queued before re-arming readiness.
-                    loop {
+                    for _ in 0..32 {
                         let fd = guard.get_inner().0;
                         let n = unsafe {
                             libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
@@ -118,7 +118,7 @@ impl Collector for PacketCaptureCollector {
                         EventData::TlsHandshake(t),
                     ),
                 };
-                if tx.send(event).await.is_err() {
+                if !crate::pipeline::try_emit(&tx, event, "packet_capture") && tx.is_closed() {
                     return Ok(());
                 }
             }

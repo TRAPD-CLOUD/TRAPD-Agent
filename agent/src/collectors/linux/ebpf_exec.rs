@@ -137,7 +137,7 @@ fn cstr(buf: &[u8]) -> &str {
 /// indistinguishable from "the kernel reported PPid 0" and would quietly
 /// reparent an orphan onto the swapper task.
 fn proc_ppid(pid: u32) -> Result<u32, EnrichmentError> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status"))
+    let status = crate::collectors::read_text_capped(format!("/proc/{pid}/status"), 256 * 1024)
         .map_err(|e| EnrichmentError::from_io(&e))?;
     status
         .lines()
@@ -150,16 +150,39 @@ fn proc_ppid(pid: u32) -> Result<u32, EnrichmentError> {
 ///
 /// Capped at [`MAX_CMDLINE_BYTES`]; the returned [`Truncation`] is `Some` when
 /// the command line was longer, so a consumer can tell a complete command line
-/// from its prefix.
-fn proc_cmdline(pid: u32) -> Result<(String, Option<Truncation>), EnrichmentError> {
-    let bytes =
-        fs::read(format!("/proc/{pid}/cmdline")).map_err(|e| EnrichmentError::from_io(&e))?;
-    let joined = bytes
-        .split(|&b| b == 0)
-        .filter_map(|part| std::str::from_utf8(part).ok().filter(|s| !s.is_empty()))
+/// from its prefix. An argv beyond the read budget keeps its prefix; its
+/// `original_length` is then a lower bound.
+pub(super) fn proc_cmdline(pid: u32) -> Result<(String, Option<Truncation>), EnrichmentError> {
+    let (bytes, overflowed) =
+        crate::collectors::read_prefix(format!("/proc/{pid}/cmdline"), CMDLINE_READ_BYTES)
+            .map_err(|e| EnrichmentError::from_io(&e))?;
+    Ok(join_cmdline(&bytes, overflowed))
+}
+
+const CMDLINE_READ_BYTES: usize = 64 * 1024;
+
+fn join_cmdline(bytes: &[u8], overflowed: bool) -> (String, Option<Truncation>) {
+    let parts: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
+    let last = parts.len().saturating_sub(1);
+    let joined = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, part)| match std::str::from_utf8(part) {
+            Ok(s) => Some(s),
+            // The read cap may split a multibyte character of the final
+            // argument; keep its valid prefix instead of dropping it.
+            Err(e) if overflowed && i == last => std::str::from_utf8(&part[..e.valid_up_to()]).ok(),
+            Err(_) => None,
+        })
+        .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    Ok(truncate_str(&joined, MAX_CMDLINE_BYTES))
+    let (text, truncation) = truncate_str(&joined, MAX_CMDLINE_BYTES);
+    if overflowed {
+        let original = joined.len().max(bytes.len()).saturating_add(1);
+        return (text.clone(), Some(Truncation::new(original, text.len())));
+    }
+    (text, truncation)
 }
 
 /// Resolve the `/proc/<pid>/cwd` symlink to an absolute path.
@@ -176,7 +199,8 @@ fn proc_cwd(pid: u32) -> Result<String, EnrichmentError> {
 ///   `/system.slice/docker-<64hex>.scope`
 ///   `/kubepods/…/<64hex>`
 fn proc_container_id(pid: u32) -> Option<String> {
-    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let cgroup =
+        crate::collectors::read_text_capped(format!("/proc/{pid}/cgroup"), 64 * 1024).ok()?;
     for line in cgroup.lines() {
         // Format: `<hierarchy>:<subsystems>:<path>`
         let path = line.splitn(3, ':').nth(2)?;
@@ -208,7 +232,7 @@ fn proc_container_id(pid: u32) -> Option<String> {
 
 /// Resolve UID to username via /etc/passwd.
 fn proc_username(uid: u32) -> String {
-    fs::read_to_string("/etc/passwd")
+    crate::collectors::read_text_capped("/etc/passwd", 512 * 1024)
         .unwrap_or_default()
         .lines()
         .find_map(|line| {
@@ -303,7 +327,13 @@ impl Collector for EbpfExecCollector {
             let mut guard = async_fd.readable_mut().await?;
             let rb = guard.get_inner_mut();
 
-            while let Some(item) = rb.next() {
+            let mut drained = false;
+
+            for _ in 0..64 {
+                let Some(item) = rb.next() else {
+                    drained = true;
+                    break;
+                };
                 let bytes: &[u8] = &item;
 
                 if bytes.len() < std::mem::size_of::<RawExecEvent>() {
@@ -457,7 +487,9 @@ impl Collector for EbpfExecCollector {
                 crate::pipeline::try_emit(&tx, event, SOURCE);
             }
 
-            guard.clear_ready();
+            if drained {
+                guard.clear_ready();
+            }
         }
     }
 }
@@ -477,5 +509,33 @@ fn perf_paranoid_hint() -> String {
              to the unit via a drop-in)"
         ),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod cmdline_tests {
+
+    #[test]
+    fn oversized_cmdline_keeps_a_marked_prefix() {
+        let mut argv = b"python3\0-c\0".to_vec();
+        argv.extend(std::iter::repeat_n(b'a', super::CMDLINE_READ_BYTES));
+        argv.truncate(super::CMDLINE_READ_BYTES);
+        let (text, truncation) = super::join_cmdline(&argv, true);
+        assert!(text.starts_with("python3 -c aaa"));
+        assert_eq!(text.len(), super::MAX_CMDLINE_BYTES);
+        let truncation = truncation.expect("prefix must be marked");
+        assert!(truncation.original_length > super::CMDLINE_READ_BYTES - 2);
+        assert_eq!(truncation.captured_length, text.len());
+
+        let mut split = b"cat\0".to_vec();
+        split.extend_from_slice("ab\u{e4}".as_bytes());
+        split.pop(); // cap falls inside the two-byte character
+        let (text, truncation) = super::join_cmdline(&split, true);
+        assert_eq!(text, "cat ab");
+        assert!(truncation.is_some());
+
+        let (short, none) = super::join_cmdline(b"ls\0-l\0", false);
+        assert_eq!(short, "ls -l");
+        assert!(none.is_none());
     }
 }

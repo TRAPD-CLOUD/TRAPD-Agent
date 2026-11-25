@@ -56,7 +56,7 @@ pub struct FlightRecorder {
 impl FlightRecorder {
     pub fn new(cap: usize) -> Self {
         Self {
-            cap: cap.max(1),
+            cap: cap.clamp(1, DEFAULT_CAPACITY),
             events: Mutex::new(VecDeque::new()),
             logons: Mutex::new(VecDeque::new()),
         }
@@ -66,7 +66,11 @@ impl FlightRecorder {
     /// successful logons additionally join the correlation ring.
     pub fn record(&self, event: &AgentEvent) {
         if let EventData::UserLogon(d) = &event.data {
-            if d.success {
+            if d.success
+                && (d.username.len() > 256 || d.src_addr.as_ref().is_some_and(|a| a.len() > 256))
+            {
+                crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            } else if d.success {
                 if let Ok(mut logons) = self.logons.lock() {
                     push_capped(
                         &mut logons,
@@ -110,13 +114,12 @@ impl FlightRecorder {
         };
         let mut hits: Vec<FlightEvent> = buf
             .iter()
+            .rev()
             .filter(|e| e.pid.is_some_and(|p| pids.contains(&p)))
+            .take(max)
             .cloned()
             .collect();
-        if hits.len() > max {
-            // Keep the most recent `max`, preserving chronological order.
-            hits.drain(0..hits.len() - max);
-        }
+        hits.reverse();
         hits
     }
 
@@ -130,13 +133,14 @@ impl FlightRecorder {
             .iter()
             .filter(|l| l.username == user && l.timestamp >= cutoff && l.src_addr.is_some())
             .max_by_key(|l| l.timestamp)
-            .map(|l| (l.src_addr.clone().unwrap(), l.src_port))
+            .and_then(|l| l.src_addr.clone().map(|addr| (addr, l.src_port)))
     }
 }
 
 fn push_capped<T>(buf: &mut VecDeque<T>, item: T, cap: usize) {
     if buf.len() >= cap {
         buf.pop_front();
+        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
     }
     buf.push_back(item);
 }
@@ -149,39 +153,69 @@ fn label<T: Serialize>(v: &T) -> String {
     }
 }
 
+const MAX_SUMMARY_BYTES: usize = 1024;
+
+fn bounded_summary(args: std::fmt::Arguments<'_>) -> String {
+    struct Bounded(String);
+    impl std::fmt::Write for Bounded {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let remaining = MAX_SUMMARY_BYTES - self.0.len();
+            if s.len() <= remaining {
+                self.0.push_str(s);
+                return Ok(());
+            }
+            let mut end = remaining;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.0.push_str(&s[..end]);
+            Err(std::fmt::Error)
+        }
+    }
+    let mut out = Bounded(String::new());
+    if std::fmt::write(&mut out, args).is_err() {
+        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+    }
+    out.0
+}
+
 /// Extract `(pid, summary)` from event data for the history ring. Returns `None`
 /// for events with no associated pid (those are not process history).
 fn extract(data: &EventData) -> Option<(i32, String)> {
+    macro_rules! summary { ($($arg:tt)*) => { bounded_summary(format_args!($($arg)*)) }; }
     Some(match data {
-        EventData::ProcessCreate(d) => (d.pid, format!("exec {} ({})", d.name, d.cmdline)),
-        EventData::ProcessExec(d) => (d.pid, format!("exec {} [{}]", d.exe, d.cmdline)),
-        EventData::ProcessTerminate(d) => (d.pid, format!("exit {}", d.name)),
-        EventData::FileOpen(d) => (d.pid, format!("open {} (flags {:#x})", d.path, d.flags)),
-        EventData::FileUnlink(d) => (d.pid, format!("unlink {}", d.path)),
-        EventData::FileRename(d) => (d.pid, format!("rename {} -> {}", d.old_path, d.new_path)),
-        EventData::FileChmod(d) => (d.pid, format!("chmod {:o} {}", d.mode, d.path)),
+        EventData::ProcessCreate(d) => (d.pid, summary!("exec {} ({})", d.name, d.cmdline)),
+        EventData::ProcessExec(d) => (d.pid, summary!("exec {} [{}]", d.exe, d.cmdline)),
+        EventData::ProcessTerminate(d) => (d.pid, summary!("exit {}", d.name)),
+        EventData::FileOpen(d) => (d.pid, summary!("open {} (flags {:#x})", d.path, d.flags)),
+        EventData::FileUnlink(d) => (d.pid, summary!("unlink {}", d.path)),
+        EventData::FileRename(d) => (d.pid, summary!("rename {} -> {}", d.old_path, d.new_path)),
+        EventData::FileChmod(d) => (d.pid, summary!("chmod {:o} {}", d.mode, d.path)),
         EventData::FileChown(d) => (
             d.pid,
-            format!("chown {}:{} {}", d.new_uid, d.new_gid, d.path),
+            summary!("chown {}:{} {}", d.new_uid, d.new_gid, d.path),
         ),
-        EventData::Mmap(d) => (d.pid, format!("mmap {}", d.comm)),
+        EventData::Mmap(d) => (d.pid, summary!("mmap {}", d.comm)),
         EventData::PrivilegeChange(d) => (
             d.pid,
-            format!("privilege_change {} -> euid {}", d.old_uid, d.new_euid),
+            summary!("privilege_change {} -> euid {}", d.old_uid, d.new_euid),
         ),
-        EventData::Setuid(d) => (d.pid, format!("setuid {} -> {}", d.old_uid, d.new_uid)),
-        EventData::MemfdCreate(d) => (d.pid, format!("memfd_create {}", d.name)),
-        EventData::NetworkSocket(d) => (d.pid, format!("{} {}:{}", d.op, d.addr, d.port)),
+        EventData::Setuid(d) => (d.pid, summary!("setuid {} -> {}", d.old_uid, d.new_uid)),
+        EventData::MemfdCreate(d) => (d.pid, summary!("memfd_create {}", d.name)),
+        EventData::NetworkSocket(d) => (d.pid, summary!("{} {}:{}", d.op, d.addr, d.port)),
         EventData::NetworkConnection(d) => (
             d.pid?,
-            format!(
+            summary!(
                 "connect {}:{} -> {}:{}",
-                d.src_addr, d.src_port, d.dst_addr, d.dst_port
+                d.src_addr,
+                d.src_port,
+                d.dst_addr,
+                d.dst_port
             ),
         ),
         EventData::Fork(d) => (
             d.child_pid,
-            format!("fork {} -> {}", d.parent_comm, d.child_comm),
+            summary!("fork {} -> {}", d.parent_comm, d.child_comm),
         ),
         _ => return None,
     })
@@ -193,6 +227,15 @@ mod tests {
     use crate::schema::{
         EventAction, EventClass, ExecEventData, FileOpenData, Severity, UserLogonData,
     };
+
+    #[test]
+    fn long_multibyte_fields_are_bounded_before_storing_history() {
+        let recorder = FlightRecorder::new(2);
+        recorder.record(&exec_event(4, &"é".repeat(4096)));
+        let history = recorder.history_for(&[4], 1);
+        assert_eq!(history.len(), 1);
+        assert!(history[0].summary.len() <= MAX_SUMMARY_BYTES);
+    }
 
     fn exec_event(pid: i32, exe: &str) -> AgentEvent {
         AgentEvent::new(

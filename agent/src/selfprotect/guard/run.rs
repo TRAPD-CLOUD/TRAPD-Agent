@@ -19,6 +19,7 @@ use super::{
 };
 
 /// How often the monitor is evaluated.
+const MAX_EXCHANGES: usize = 8;
 const TICK: Duration = Duration::from_secs(1);
 /// On a stop the guard keeps answering for up to this long so the agent can
 /// read the stop notice from a pong (the agent pings every `PING_INTERVAL`).
@@ -30,6 +31,17 @@ pub enum Exit {
     Shutdown(NoticeKind),
     /// The agent was stopped with a maintenance authorization.
     AuthorizedStopOfThePair,
+}
+
+// The guard has its own process-local metrics. Its service log carries a
+// cumulative count too, at powers of two to avoid flooding under overload.
+fn report_exchange_drop() {
+    static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+    let total = DROPPED.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if total.is_power_of_two() {
+        warn!(total, "guard exchanges or observations refused at capacity");
+    }
 }
 
 struct Observation {
@@ -98,6 +110,8 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
 
     let stopping = Arc::new(Mutex::new(None::<StopNotice>));
     let delivered = Arc::new(AtomicBool::new(false));
+    let exchanges = Arc::new(tokio::sync::Semaphore::new(MAX_EXCHANGES));
+    let mut accept_after = tokio::time::Instant::now();
     let (obs_tx, mut obs_rx) = mpsc::channel::<Observation>(16);
     let shutting_down = Arc::new(AtomicBool::new(false));
     let mut supervisor = Supervisor::new(
@@ -111,6 +125,8 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
     let mut peer_proc: Option<control::ProcessIdentity> = None;
     let mut tick = tokio::time::interval(TICK);
     tokio::pin!(shutdown);
+    let publisher = crate::telemetry::snapshot::publish_guard(state_dir.clone());
+    tokio::pin!(publisher);
 
     let result = loop {
         // The exit watch resolves to `true` when the agent's process ended.
@@ -122,16 +138,29 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
         };
         tokio::select! {
             kind = &mut shutdown => break Exit::Shutdown(kind),
-            accepted = listener.accept() => {
+            _ = &mut publisher => anyhow::bail!("guard report publisher exited"),
+            accepted = async {
+                tokio::time::sleep_until(accept_after).await;
+                listener.accept().await
+            } => {
                 let (mut stream, pid) = match accepted {
                     Ok(x) => x,
-                    Err(e) => { warn!(error = %e, "guard channel accept failed"); continue; }
+                    Err(e) => {
+                        warn!(error = %e, "guard channel accept failed");
+                        accept_after = tokio::time::Instant::now() + TICK;
+                        continue;
+                    }
+                };
+                let Ok(permit) = Arc::clone(&exchanges).try_acquire_owned() else {
+                    report_exchange_drop();
+                    continue;
                 };
                 let tx = obs_tx.clone();
                 let state = state_dir.clone();
                 let stopping = Arc::clone(&stopping);
                 let delivered = Arc::clone(&delivered);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let notice = stopping.lock().ok().and_then(|g| g.clone());
                     let carries_notice = notice.is_some();
                     let served = tokio::time::timeout(EXCHANGE_TIMEOUT, ipc::serve(&mut stream, |p| Pong {
@@ -144,7 +173,9 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
                         if carries_notice {
                             delivered.store(true, Ordering::SeqCst);
                         }
-                        let _ = tx.send(Observation { pid, notice: ping.stop }).await;
+                        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Observation { pid, notice: ping.stop }) {
+                            report_exchange_drop();
+                        }
                     }
                 });
             }

@@ -34,7 +34,7 @@ mod file {
 
     impl SoftwareKey {
         pub fn load_at(path: &Path) -> Result<Option<Self>> {
-            let der = match std::fs::read(path) {
+            let der = match crate::paths::bounded_regular_bytes(path, 4096) {
                 Ok(d) => Zeroizing::new(d),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
@@ -123,6 +123,16 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn refuses_oversized_identity_state_without_replacing_it() {
+        let dir = scratch("oversized");
+        let path = dir.join("identity.key");
+        std::fs::write(&path, vec![0; 4097]).unwrap();
+        assert!(SoftwareKey::load_or_create_at(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 4097);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -157,7 +157,11 @@ fn subkeys_read(hive: Hive, path: &str, view: u32, strict: bool) -> Result<Vec<S
                 }
                 return Err(if status != 0 { status } else { 234 });
             }
-            names.push(String::from_utf16_lossy(&name[..len as usize]));
+            let Some(name) = name.get(..len as usize) else {
+                RegCloseKey(key);
+                return Err(234);
+            };
+            names.push(String::from_utf16_lossy(name));
         }
         RegCloseKey(key);
     }
@@ -216,6 +220,10 @@ pub fn values_checked(hive: Hive, path: &str, view: u32) -> Result<Vec<(String, 
     values_read(hive, path, view, true)
 }
 
+fn value_fits(retained: usize, bytes: usize) -> bool {
+    bytes <= (2usize * 1024 * 1024).saturating_sub(retained)
+}
+
 fn values_read(
     hive: Hive,
     path: &str,
@@ -228,6 +236,7 @@ fn values_read(
     let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
     let mut key = std::ptr::null_mut();
     let mut out = Vec::new();
+    let mut retained_bytes = 0usize;
     // SAFETY: key is a valid out-pointer and the handle is always closed; every
     // buffer length passed to RegEnumValueW matches its allocation.
     unsafe {
@@ -296,10 +305,21 @@ fn values_read(
                 RegCloseKey(key);
                 return if strict { Err(MORE_DATA) } else { Ok(out) };
             }
-            out.push((
-                String::from_utf16_lossy(&name[..name_len as usize]),
-                rendered,
-            ));
+            let Some(native_name) = name.get(..name_len as usize) else {
+                RegCloseKey(key);
+                return Err(MORE_DATA);
+            };
+            let name = String::from_utf16_lossy(native_name);
+            let rendered = crate::collectors::registry_watch::truncate_value(&rendered);
+            let bytes = name.capacity() + rendered.capacity();
+            if !value_fits(retained_bytes, bytes) {
+                RegCloseKey(key);
+                crate::telemetry::metrics::metrics()
+                    .event_dropped(crate::telemetry::DropReason::RateLimitApplied);
+                return if strict { Err(MORE_DATA) } else { Ok(out) };
+            }
+            retained_bytes += bytes;
+            out.push((name, rendered));
         }
         RegCloseKey(key);
     }
@@ -468,5 +488,14 @@ pub fn set_string(path: &str, name: &str, value: &str, view: u32) -> Result<(), 
         } else {
             Err(status)
         }
+    }
+}
+
+#[cfg(test)]
+mod value_budget_tests {
+    #[test]
+    fn aggregate_limit_applies_even_when_each_value_fits() {
+        assert!(super::value_fits(2 * 1024 * 1024 - 1, 1));
+        assert!(!super::value_fits(2 * 1024 * 1024, 1));
     }
 }

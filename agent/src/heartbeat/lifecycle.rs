@@ -81,7 +81,12 @@ pub struct Lifecycle {
 impl Lifecycle {
     /// Read the previous marker, then claim it for this run.
     fn begin(marker: PathBuf) -> Self {
-        let previous = PreviousShutdown::classify(std::fs::read_to_string(&marker).ok().as_deref());
+        let marker_bytes = crate::paths::bounded_regular_bytes(&marker, 64).ok();
+        let previous = PreviousShutdown::classify(
+            marker_bytes
+                .as_deref()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok()),
+        );
         let previous_marker_at = std::fs::metadata(&marker)
             .and_then(|m| m.modified())
             .ok()

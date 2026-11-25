@@ -300,24 +300,53 @@ async fn run_tool(name: &str, args: &[&str]) -> Option<String> {
         .iter()
         .map(|d| std::path::Path::new(d).join(name))
         .find(|p| p.is_file())?;
-    let out = tokio::time::timeout(
-        TOOL_TIMEOUT,
-        tokio::process::Command::new(bin)
-            .args(args)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !out.status.success() || out.stdout.len() > MAX_TOOL_OUTPUT {
-        debug!(
-            tool = name,
-            "network guard: firewall tool gave no usable output"
-        );
-        return None;
+    let mut child = tokio::process::Command::new(bin)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let result = tokio::time::timeout(TOOL_TIMEOUT, async {
+        let out = read_tool_output(stdout, MAX_TOOL_OUTPUT).await?;
+        child.wait().await.ok()?.success().then_some(out)
+    })
+    .await;
+    match result {
+        Ok(Some(bytes)) => String::from_utf8(bytes).ok(),
+        _ => {
+            let _ = child.kill().await;
+            debug!(
+                tool = name,
+                "network guard: firewall tool gave no usable output"
+            );
+            None
+        }
     }
-    String::from_utf8(out.stdout).ok()
+}
+
+#[cfg(target_os = "linux")]
+async fn read_tool_output(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    max: usize,
+) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut reader = reader;
+    let mut out = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let n = reader.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return Some(out);
+        }
+        if n > max - out.len() {
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            return None;
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
 }
 
 // --- redirect readers -----------------------------------------------------
@@ -345,8 +374,11 @@ fn redirect_findings_blocking(host: &str) -> Vec<Finding> {
     let mut out = Vec::new();
 
     let path = hosts_path();
-    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) <= MAX_HOSTS_BYTES {
-        if let Ok(text) = std::fs::read_to_string(&path) {
+    if let Ok(resolved) = std::fs::canonicalize(&path) {
+        if let Some(text) = crate::paths::bounded_regular_bytes(&resolved, MAX_HOSTS_BYTES)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
             let entries = redirect::parse_hosts(&text);
             for e in redirect::hosts_for(&entries, host) {
                 out.push(Finding::Redirected {
@@ -468,6 +500,16 @@ fn persist_observed_pins(written: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tool_reader_accepts_the_budget_and_refuses_an_excess() {
+        assert_eq!(
+            super::read_tool_output(&b"abc"[..], 3).await.as_deref(),
+            Some(&b"abc"[..])
+        );
+        assert!(super::read_tool_output(&b"abcd"[..], 3).await.is_none());
+    }
+
     use super::*;
 
     #[test]

@@ -144,6 +144,13 @@ pub struct HoneytokenRegistry {
     pub tokens: Vec<HoneytokenRecord>,
 }
 
+impl HoneytokenRegistry {
+    /// Consume a detached reconciliation snapshot without cloning or writing it.
+    pub fn list(self) -> Vec<HoneytokenRecord> {
+        self.tokens
+    }
+}
+
 /// Canonical location of the register.
 pub fn registry_path() -> PathBuf {
     crate::paths::state_dir().join("honeytokens.json")
@@ -171,12 +178,13 @@ impl HoneytokenStore {
     /// reconciler — must not treat a transient read failure as "no tokens",
     /// which would disarm every honeytoken until the next successful read.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn try_load() -> Result<Self> {
+    pub fn try_load() -> Result<HoneytokenRegistry> {
         Self::try_load_from(registry_path())
     }
 
-    pub fn try_load_from(path: PathBuf) -> Result<Self> {
-        let registry = match std::fs::read(&path) {
+    pub fn try_load_from(path: PathBuf) -> Result<HoneytokenRegistry> {
+        const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
+        let registry = match crate::paths::bounded_regular_bytes(&path, MAX_SNAPSHOT_BYTES) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse honeytoken register {}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HoneytokenRegistry::default(),
@@ -185,10 +193,7 @@ impl HoneytokenStore {
                     .with_context(|| format!("read honeytoken register {}", path.display()))
             }
         };
-        Ok(Self {
-            path,
-            inner: Mutex::new(registry),
-        })
+        Ok(registry)
     }
 
     pub fn load_from(path: PathBuf) -> Self {
@@ -337,6 +342,25 @@ mod tests {
         // The tolerant loader still starts empty so the agent keeps running.
         assert!(HoneytokenStore::load_from(path.clone()).list().is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_reconciliation_snapshot_cannot_overwrite_new_records() {
+        let store = tmp_registry();
+        store.insert(record("/first")).unwrap();
+        let old = HoneytokenStore::try_load_from(store.path.clone()).unwrap();
+        store.insert(record("/second")).unwrap();
+        drop(old);
+        assert_eq!(
+            HoneytokenStore::try_load_from(store.path.clone())
+                .unwrap()
+                .tokens
+                .len(),
+            2
+        );
+        let path = store.path.clone();
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn tmp_registry() -> HoneytokenStore {

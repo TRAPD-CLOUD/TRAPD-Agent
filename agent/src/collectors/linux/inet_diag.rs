@@ -118,6 +118,22 @@ fn dump<F: FnMut(&[u8])>(family: u8, protocol: u8, mut on_msg: F) -> std::io::Re
     }
     let guard = FdGuard(fd);
 
+    let timeout = libc::timeval {
+        tv_sec: 1,
+        tv_usec: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            guard.0,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&timeout as *const libc::timeval).cast(),
+            std::mem::size_of_val(&timeout) as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     let req = build_request(family, protocol);
     let sent = unsafe { libc::send(guard.0, req.as_ptr() as *const libc::c_void, req.len(), 0) };
     if sent < 0 {
@@ -125,6 +141,8 @@ fn dump<F: FnMut(&[u8])>(family: u8, protocol: u8, mut on_msg: F) -> std::io::Re
     }
 
     let mut buf = vec![0u8; 64 * 1024];
+    let began = std::time::Instant::now();
+    let mut accepted = 0usize;
     loop {
         let n = unsafe { libc::recv(guard.0, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if n < 0 {
@@ -133,10 +151,21 @@ fn dump<F: FnMut(&[u8])>(family: u8, protocol: u8, mut on_msg: F) -> std::io::Re
         if n == 0 {
             break;
         }
-        match parse_dump(&buf[..n as usize], &mut on_msg) {
+        match parse_dump(&buf[..n as usize], &mut |body| {
+            if accepted < 4096 {
+                on_msg(body);
+            }
+            accepted += 1;
+        }) {
             ParseOutcome::Done => break,
-            ParseOutcome::More => continue,
-            ParseOutcome::Error => break,
+            ParseOutcome::More => (),
+            ParseOutcome::Error => {
+                return Err(std::io::Error::other("netlink rejected socket dump"))
+            }
+        }
+        if accepted >= 4096 || began.elapsed() >= std::time::Duration::from_secs(1) {
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            break;
         }
     }
     Ok(())
