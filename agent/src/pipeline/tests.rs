@@ -922,3 +922,15 @@ async fn next_batch_takes_queued_events_up_to_the_limit_and_reports_close() {
     );
     assert!(batch.is_empty());
 }
+
+#[test]
+fn pipeline_and_consumer_batch_fit_the_large_record_payload_budget() {
+    // Slot counts alone mask the cost of valid large log records. This
+    // arithmetic budgets wire payload, not allocator overhead or host RSS.
+    let (tx, _rx) = super::create_pipeline();
+    let payload = crate::telemetry::limits::MAX_EVENT_BYTES;
+    assert!(tx.max_capacity() * payload <= 16 * 1024 * 1024);
+    const {
+        assert!(super::MAX_BATCH * crate::telemetry::limits::MAX_EVENT_BYTES <= 8 * 1024 * 1024);
+    }
+}
