@@ -84,6 +84,18 @@ fn skipped_record_id(event: EVT_HANDLE) -> Option<u64> {
     bookmark_record_id(&xml)
 }
 
+fn warn_bad_record(channel: &str, operation: &str) {
+    use std::time::{Duration, Instant};
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let now = Instant::now();
+    if let Ok(mut last) = LAST.lock() {
+        if last.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(60)) {
+            *last = Some(now);
+            tracing::warn!(channel, operation, "skipping invalid Windows event-log record; further warnings limited to one per minute");
+        }
+    }
+}
+
 fn bookmark_record_id(xml: &str) -> Option<u64> {
     roxmltree::Document::parse(xml)
         .ok()?
@@ -184,13 +196,13 @@ pub(crate) fn read_matching(
 }
 
 fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<Batch> {
-    let channel: Vec<u16> = channel.encode_utf16().chain(Some(0)).collect();
+    let channel_wide: Vec<u16> = channel.encode_utf16().chain(Some(0)).collect();
     let query: Vec<u16> = query.encode_utf16().chain(Some(0)).collect();
     // SAFETY: terminated strings; zero session selects the local machine.
     let query = Handle(unsafe {
         EvtQuery(
             0,
-            channel.as_ptr(),
+            channel_wide.as_ptr(),
             query.as_ptr(),
             EvtQueryChannelPath
                 | if reverse {
@@ -253,8 +265,8 @@ fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<
                     out.push(xml);
                 }
                 // One unrenderable record must not wedge the channel.
-                Err(e) => {
-                    tracing::warn!(error = %e, "skipping unrenderable event-log record");
+                Err(_) => {
+                    warn_bad_record(channel, "render");
                     if let Some(id) = skipped_record_id(event.0) {
                         skipped_through = Some(id);
                     }
@@ -826,8 +838,8 @@ impl Collector for EventLogCollector {
                     for xml in records {
                         let (record, data, auth) = match parse(&xml, channel) {
                             Ok(record) => record,
-                            Err(error) => {
-                                tracing::warn!(channel, %error, "Skipping malformed Windows event record");
+                            Err(_) => {
+                                warn_bad_record(channel, "parse");
                                 crate::telemetry::metrics::metrics()
                                     .event_dropped(crate::telemetry::DropReason::InternalError);
                                 // Native XML may have valid System identity but bad data.

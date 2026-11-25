@@ -388,6 +388,23 @@ fn spawn_status_reporter(
     })
 }
 
+/// The control handler owns the sender. After its first valid stop no later
+/// control can claim a token or enqueue another status notification.
+fn send_first_stop<T>(
+    pending: &mut Option<tokio::sync::mpsc::Sender<T>>,
+    request: impl FnOnce() -> Option<T>,
+) -> bool {
+    if pending.as_ref().is_none_or(|tx| tx.is_closed()) {
+        return false;
+    }
+    let Some(request) = request() else {
+        return false;
+    };
+    pending
+        .take()
+        .is_some_and(|tx| tx.try_send(request).is_ok())
+}
+
 fn run_service() -> Result<()> {
     // Still single-threaded: configure the environment before the control
     // handler thread and the Tokio runtime exist.
@@ -397,10 +414,11 @@ fn run_service() -> Result<()> {
     let (phase_tx, phase_rx) = mpsc::channel::<Phase>();
     let (suspend, suspend_rx) = crate::heartbeat::suspend::channel();
 
+    let mut pending_stop = Some(stop_tx);
     let handler_phase_tx = phase_tx.clone();
     let event_handler = move |control| -> ServiceControlHandlerResult {
         if let Some(request) = stop_request_for(&control) {
-            if stop_tx.try_send(request).is_ok() {
+            if send_first_stop(&mut pending_stop, || Some(request)) {
                 let _ = handler_phase_tx.send(Phase::Stopping);
             }
             return ServiceControlHandlerResult::NoError;
@@ -420,17 +438,16 @@ fn run_service() -> Result<()> {
             ServiceControl::UserEvent(code)
                 if code.to_raw() == crate::selfprotect::maintenance::STOP_REQUEST_CONTROL =>
             {
-                if let Some(claims) = crate::selfprotect::maintenance::authorize_pending_stop() {
-                    if stop_tx
-                        .try_send(StopRequest {
+                if send_first_stop(&mut pending_stop, || {
+                    crate::selfprotect::maintenance::authorize_pending_stop().map(|claims| {
+                        StopRequest {
                             kind: StopKind::ServiceStop,
                             source: StopSource::MaintenanceToken,
                             claimed_token_nonce: Some(claims.nonce),
-                        })
-                        .is_ok()
-                    {
-                        let _ = handler_phase_tx.send(Phase::Stopping);
-                    }
+                        }
+                    })
+                }) {
+                    let _ = handler_phase_tx.send(Phase::Stopping);
                 }
                 ServiceControlHandlerResult::NoError
             }
@@ -532,17 +549,18 @@ fn run_guard_service() -> Result<()> {
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<NoticeKind>(1);
     let (phase_tx, phase_rx) = mpsc::channel::<Phase>();
 
+    let mut pending_stop = Some(stop_tx);
     let handler_phase_tx = phase_tx.clone();
     let event_handler = move |control| -> ServiceControlHandlerResult {
         match control {
             ServiceControl::Stop => {
-                if stop_tx.try_send(NoticeKind::ServiceStop).is_ok() {
+                if send_first_stop(&mut pending_stop, || Some(NoticeKind::ServiceStop)) {
                     let _ = handler_phase_tx.send(Phase::Stopping);
                 }
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Shutdown | ServiceControl::Preshutdown => {
-                if stop_tx.try_send(NoticeKind::HostShutdown).is_ok() {
+                if send_first_stop(&mut pending_stop, || Some(NoticeKind::HostShutdown)) {
                     let _ = handler_phase_tx.send(Phase::Stopping);
                 }
                 ServiceControlHandlerResult::NoError
@@ -797,5 +815,20 @@ mod tests {
         ] {
             assert_eq!(stop_request_for(&control), None, "{control:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod stop_channel_tests {
+    #[test]
+    fn invalid_stop_leaves_room_for_the_first_valid_request_only() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut pending = Some(tx);
+        assert!(!super::send_first_stop(&mut pending, || None));
+        assert!(super::send_first_stop(&mut pending, || Some(17)));
+        assert_eq!(rx.try_recv().unwrap(), 17);
+        assert!(!super::send_first_stop(&mut pending, || panic!(
+            "duplicate claimed"
+        )));
     }
 }
