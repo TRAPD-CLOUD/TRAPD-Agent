@@ -1329,17 +1329,14 @@ impl Engine {
     ) -> anyhow::Result<(Vec<u8>, usize, &'static str)> {
         use std::io::{Read, Seek, SeekFrom};
 
+        let expected = expected_start
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("unknown observed identity for pid {pid}; refusing"))?;
         let verify_generation = || -> anyhow::Result<()> {
-            if let Some(expected) = expected_start {
-                anyhow::ensure!(
-                    expected > 0,
-                    "unknown observed identity for pid {pid}; refusing"
-                );
-                anyhow::ensure!(
-                    crate::telemetry::identity::process_start_time(pid) == Some(expected),
-                    "pid {pid} belongs to a different or unknown process; refusing"
-                );
-            }
+            anyhow::ensure!(
+                crate::telemetry::identity::process_start_time(pid) == Some(expected),
+                "pid {pid} belongs to a different or unknown process; refusing"
+            );
             Ok(())
         };
         verify_generation()?;

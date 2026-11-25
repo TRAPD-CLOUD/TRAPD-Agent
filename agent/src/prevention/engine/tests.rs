@@ -516,9 +516,9 @@ async fn memory_command_early_refusals_preserve_the_requested_generation() {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
-async fn memory_commands_reject_missing_generation_on_windows_without_an_artifact() {
+async fn memory_commands_reject_missing_generation_without_an_artifact() {
     let child = ChildFixture::new();
     let (engine, mut rx) = test_engine();
     engine.cfg_handle.write().unwrap().rtr_enabled = true;
@@ -541,33 +541,27 @@ async fn memory_commands_reject_missing_generation_on_windows_without_an_artifac
 async fn memory_commands_read_the_observed_child_and_audit_the_generation() {
     let child = ChildFixture::new();
     let start = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
-    let generations = if cfg!(windows) {
-        vec![Some(start)]
-    } else {
-        vec![Some(start), None]
+    let generation = Some(start);
+    let (engine, mut rx) = test_engine();
+    engine.cfg_handle.write().unwrap().rtr_enabled = true;
+    engine.handle(memory_command(child.pid(), generation)).await;
+    let event = rx.try_recv().unwrap();
+    assert!(matches!(event.action, EventAction::CommandAccepted));
+    let EventData::Prevention(audit) = event.data else {
+        panic!("audit")
     };
-    for generation in generations {
-        let (engine, mut rx) = test_engine();
-        engine.cfg_handle.write().unwrap().rtr_enabled = true;
-        engine.handle(memory_command(child.pid(), generation)).await;
-        let event = rx.try_recv().unwrap();
-        assert!(matches!(event.action, EventAction::CommandAccepted));
-        let EventData::Prevention(audit) = event.data else {
-            panic!("audit")
-        };
-        assert!(audit.success);
-        assert_eq!(
-            audit.details["process_start_time"],
-            serde_json::json!(generation)
-        );
-        let memory = audit.details["memory_b64"].as_str().unwrap();
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(memory)
-            .unwrap();
-        assert!(!bytes.is_empty());
-        assert!(bytes.len() <= 4096);
-    }
+    assert!(audit.success);
+    assert_eq!(
+        audit.details["process_start_time"],
+        serde_json::json!(generation)
+    );
+    let memory = audit.details["memory_b64"].as_str().unwrap();
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(memory)
+        .unwrap();
+    assert!(!bytes.is_empty());
+    assert!(bytes.len() <= 4096);
 }
 
 #[cfg(unix)]

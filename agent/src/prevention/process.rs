@@ -100,8 +100,13 @@ fn signal_observed(pid: i32, observed_start: Option<u64>, signal: i32) -> Result
     }
     // SAFETY: successful pidfd_open transferred one valid owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let stat = procfs::process::Process::new(pid)?.stat()?;
     anyhow::ensure!(
-        crate::telemetry::identity::process_start_time(pid) == Some(expected),
+        !crate::collectors::linux::process::is_kernel_thread(&stat),
+        "refusing to signal a kernel thread"
+    );
+    anyhow::ensure!(
+        stat.starttime == expected,
         "pid {pid} belongs to a different or unknown process; refusing"
     );
     // SAFETY: valid pidfd, signal, no siginfo and no flags.
@@ -270,6 +275,15 @@ pub fn enforce_exec(
 mod tests {
     use super::super::policy::{IocRule, PolicyStore};
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_thread_guard_uses_the_kernel_flag() {
+        let mut stat = procfs::process::Process::myself().unwrap().stat().unwrap();
+        assert!(!crate::collectors::linux::process::is_kernel_thread(&stat));
+        stat.flags |= 0x0020_0000;
+        assert!(crate::collectors::linux::process::is_kernel_thread(&stat));
+    }
 
     #[test]
     fn process_create_policy_view_preserves_observed_parent_generation() {
