@@ -492,7 +492,13 @@ async fn run_journal_source(
             }
         }
     }
-    tail.kill().await;
+    if tail.finish().await && cursor.is_some() {
+        metrics().event_dropped(DropReason::InternalError);
+        if let Ok(mut store) = store.lock() {
+            store.forget_journal(&key);
+            store.flush(Duration::ZERO, true);
+        }
+    }
 }
 
 async fn run_syslog_source(

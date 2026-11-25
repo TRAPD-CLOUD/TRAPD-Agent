@@ -139,6 +139,11 @@ impl CheckpointStore {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
+    pub fn forget_journal(&mut self, key: &str) {
+        self.inner.journals.remove(key);
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
     pub fn put_journal(&mut self, key: String, cp: JournalCheckpoint) {
         if self.inner.journals.len() >= 64 && !self.inner.journals.contains_key(&key) {
             if let Some(old) = self

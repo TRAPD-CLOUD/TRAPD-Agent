@@ -35,7 +35,10 @@ impl SyslogListen {
         {
             let path = addr.strip_prefix("unix://").unwrap_or(addr);
             if path.starts_with('/') {
-                let _ = std::fs::remove_file(path);
+                if let Err(e) = remove_stale_socket(std::path::Path::new(path)) {
+                    warn!(source = %source.name, error = %e, "syslog path already occupied");
+                    return None;
+                }
                 match tokio::net::UnixDatagram::bind(path) {
                     Ok(sock) => {
                         info!(source = %source.name, path, "syslog unix listener bound");
@@ -58,5 +61,60 @@ impl SyslogListen {
             #[cfg(unix)]
             Self::Unix(s) => s.recv(buf).await,
         }
+    }
+}
+
+#[cfg(unix)]
+fn remove_stale_socket(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let occupied = || {
+        Error::new(
+            ErrorKind::AddrInUse,
+            "existing syslog path is not a stale agent-owned socket",
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(target_os = "linux"))]
+    let uid = 0;
+    if !meta.file_type().is_socket() || meta.uid() != uid {
+        return Err(occupied());
+    }
+    // A writable or symlinked ancestor allows replacement between probe and unlink.
+    for dir in path.ancestors().skip(1) {
+        let m = std::fs::symlink_metadata(dir)?;
+        if !m.is_dir() || (m.uid() != uid && m.uid() != 0) || m.mode() & 0o022 != 0 {
+            return Err(occupied());
+        }
+    }
+    let probe = std::os::unix::net::UnixDatagram::unbound()?;
+    match probe.connect(path) {
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+            let now = std::fs::symlink_metadata(path)?;
+            if (now.dev(), now.ino()) != (meta.dev(), meta.ino()) {
+                return Err(occupied());
+            }
+            std::fs::remove_file(path)
+        }
+        _ => Err(occupied()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[test]
+    fn existing_regular_file_is_preserved() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("occupied");
+        std::fs::write(&path, b"preserve").unwrap();
+        assert!(remove_stale_socket(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
     }
 }
