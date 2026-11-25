@@ -162,9 +162,19 @@ pub(super) fn proc_cmdline(pid: u32) -> Result<(String, Option<Truncation>), Enr
 const CMDLINE_READ_BYTES: usize = 64 * 1024;
 
 fn join_cmdline(bytes: &[u8], overflowed: bool) -> (String, Option<Truncation>) {
-    let joined = bytes
-        .split(|&b| b == 0)
-        .filter_map(|part| std::str::from_utf8(part).ok().filter(|s| !s.is_empty()))
+    let parts: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
+    let last = parts.len().saturating_sub(1);
+    let joined = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, part)| match std::str::from_utf8(part) {
+            Ok(s) => Some(s),
+            // The read cap may split a multibyte character of the final
+            // argument; keep its valid prefix instead of dropping it.
+            Err(e) if overflowed && i == last => std::str::from_utf8(&part[..e.valid_up_to()]).ok(),
+            Err(_) => None,
+        })
+        .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
     let (text, truncation) = truncate_str(&joined, MAX_CMDLINE_BYTES);
@@ -516,6 +526,13 @@ mod cmdline_tests {
         let truncation = truncation.expect("prefix must be marked");
         assert!(truncation.original_length > super::CMDLINE_READ_BYTES - 2);
         assert_eq!(truncation.captured_length, text.len());
+
+        let mut split = b"cat\0".to_vec();
+        split.extend_from_slice("ab\u{e4}".as_bytes());
+        split.pop(); // cap falls inside the two-byte character
+        let (text, truncation) = super::join_cmdline(&split, true);
+        assert_eq!(text, "cat ab");
+        assert!(truncation.is_some());
 
         let (short, none) = super::join_cmdline(b"ls\0-l\0", false);
         assert_eq!(short, "ls -l");
