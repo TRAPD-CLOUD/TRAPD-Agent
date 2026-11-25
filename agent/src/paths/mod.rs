@@ -434,8 +434,10 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     let tmp = parent.join(format!(
         ".{}.tmp.{}",
         path.file_name().and_then(|s| s.to_str()).unwrap_or("trapd"),
-        std::process::id()
+        uuid::Uuid::new_v4()
     ));
+    let mut f = create_secure_tmp(&tmp, mode)
+        .with_context(|| format!("create secure temp {}", tmp.display()))?;
 
     let write_result = (|| -> Result<()> {
         // The temp file is created *already* restricted to `mode` — never
@@ -443,8 +445,6 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
         // (umask-derived) mode and chmod'ing afterward leaves a window where a
         // co-resident local user can read secrets (e.g. credentials.json)
         // mid-write.
-        let mut f = create_secure_tmp(&tmp, mode)
-            .with_context(|| format!("create secure temp {}", tmp.display()))?;
         use std::io::Write as _;
         f.write_all(contents)
             .with_context(|| format!("write temp {}", tmp.display()))?;
@@ -517,29 +517,18 @@ fn durable_replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
 /// requested mode — no separate `chmod` step, so no window where the file is
 /// readable at the umask-derived default mode).
 ///
-/// Any stale leftover at `path` (e.g. from a previous crashed run) is removed
-/// first: reusing an existing file via a plain `create(true)` would silently
-/// keep its old — possibly permissive — mode bits, since `mode()` only
-/// applies when the file is actually created.
-#[cfg(target_os = "linux")]
+/// A collision belongs to another writer. Never truncate or unlink its file.
 fn create_secure_tmp(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let _ = std::fs::remove_file(path);
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn create_secure_tmp(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
-    let _ = std::fs::remove_file(path);
-    let f = std::fs::File::create(path)?;
-    let _ = mode; // no portable mode-on-create outside unix targets
-    Ok(f)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    options.open(path)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -668,18 +657,24 @@ mod tests {
     /// permissions) must never be silently reused — `create(true)` without
     /// `create_new` would keep the pre-existing (wrong) mode bits.
     #[test]
-    fn create_secure_tmp_discards_stale_leftover_with_wrong_mode() {
+    fn create_secure_tmp_refuses_stale_leftover_with_wrong_mode() {
         let dir = scratch_dir("stale_leftover");
         let path = dir.join("secret.tmp");
 
         std::fs::write(&path, b"stale").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let f = create_secure_tmp(&path, 0o600).expect("create secure tmp");
-        let mode = f.metadata().unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "stale leftover mode must not survive");
-
-        drop(f);
+        assert_eq!(
+            create_secure_tmp(&path, 0o600).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"stale");
+        let dest = dir.join("secret");
+        write_atomic(&dest, b"fresh", 0o600).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
