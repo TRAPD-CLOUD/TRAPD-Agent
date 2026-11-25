@@ -283,7 +283,7 @@ fn dpkg_digests(wanted: &BTreeSet<PathBuf>) -> HashMap<PathBuf, String> {
         if path.extension().and_then(|e| e.to_str()) != Some("md5sums") {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&path) else {
+        let Some(content) = super::read_text(&path, 2 * 1024 * 1024) else {
             continue;
         };
         for (file, digest) in parse_md5sums(&content) {
@@ -456,8 +456,7 @@ pub struct Baseline {
 
 impl Baseline {
     pub fn load(state_dir: &Path) -> Self {
-        std::fs::read_to_string(state_dir.join(BASELINE_FILE))
-            .ok()
+        super::read_text(&state_dir.join(BASELINE_FILE), 1024 * 1024)
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default()
     }
@@ -597,7 +596,7 @@ pub fn analyze(observations: &[Observation]) -> Vec<Finding> {
 /// reporting regardless of content.
 pub fn ld_preload_finding() -> Option<Finding> {
     let path = "/etc/ld.so.preload";
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = super::read_text(Path::new(path), 64 * 1024)?;
     let entries: Vec<&str> = content
         .lines()
         .map(str::trim)

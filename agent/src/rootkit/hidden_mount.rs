@@ -285,13 +285,13 @@ pub fn parse_mountstats(body: &str) -> BTreeSet<String> {
 // ── Host collection ─────────────────────────────────────────────────────────
 
 pub fn gather() -> MountViews {
-    let mounts = std::fs::read_to_string("/proc/mounts")
+    let mounts = super::read_text(Path::new("/proc/self/mounts"), 2 * 1024 * 1024)
         .map(|b| parse_mounts(&b))
         .unwrap_or_default();
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+    let mountinfo = super::read_text(Path::new("/proc/self/mountinfo"), 2 * 1024 * 1024)
         .map(|b| parse_mountinfo(&b))
         .unwrap_or_default();
-    let stats_body = std::fs::read_to_string("/proc/self/mountstats").ok();
+    let stats_body = super::read_text(Path::new("/proc/self/mountstats"), 2 * 1024 * 1024);
 
     let file_mounts = mountinfo
         .values()

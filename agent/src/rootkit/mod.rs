@@ -533,6 +533,18 @@ fn env_disabled(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Budget descriptors even for virtual files that advertise zero length.
+fn read_text(path: &std::path::Path, limit: u64) -> Option<String> {
+    let bytes = crate::paths::bounded_regular_bytes(path, limit)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            }
+        })
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 fn env_usize(key: &str, fallback: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -545,7 +557,7 @@ fn env_secs(key: &str, fallback: Duration, floor: u64) -> Duration {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|secs| Duration::from_secs(secs.max(floor)))
+        .map(|secs| Duration::from_secs(secs.clamp(floor, 365 * 86_400)))
         .unwrap_or(fallback)
 }
 

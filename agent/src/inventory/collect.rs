@@ -120,7 +120,6 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
 
     let mut suid = Vec::new();
     let mut caps = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     let mut budget = MAX_SCAN_ENTRIES;
 
     for &root in POSTURE_SCAN_ROOTS {
@@ -141,10 +140,6 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
                 continue;
             }
             let path = entry.path();
-            // Deduplicate hardlinked/aliased paths visited via multiple roots.
-            if !seen.insert(path.to_path_buf()) {
-                continue;
-            }
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -155,6 +150,10 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
             let path_str = path.to_string_lossy().into_owned();
 
             if setuid || setgid {
+                if suid.len() >= 2048 {
+                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                    continue;
+                }
                 suid.push(SuidSgidBinary {
                     mode: format!("{:04o}", mode & 0o7777),
                     setuid,
@@ -168,6 +167,10 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
             }
 
             if let Some(c) = read_file_capability(&path_str) {
+                if caps.len() >= 2048 {
+                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                    continue;
+                }
                 caps.push(FileCapability {
                     path: path_str,
                     capabilities: c,
@@ -178,26 +181,15 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
 
     suid.sort_by(|a, b| a.path.cmp(&b.path));
     caps.sort_by(|a, b| a.path.cmp(&b.path));
+    suid.dedup_by(|a, b| a.path == b.path);
+    caps.dedup_by(|a, b| a.path == b.path);
     (suid, caps)
 }
 
 /// SHA256 of a file, formatted `sha256:<hex>`; `None` on any IO error.
 #[cfg(target_os = "linux")]
 fn sha256_path(path: &str) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65_536];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buf[..n]),
-            Err(_) => return None,
-        }
-    }
-    Some(format!("sha256:{}", hex::encode(hasher.finalize())))
+    crate::paths::bounded_regular_sha256_label(std::path::Path::new(path), 64 * 1024 * 1024).ok()
 }
 
 /// Read and decode the `security.capability` xattr into a `getcap`-style string,

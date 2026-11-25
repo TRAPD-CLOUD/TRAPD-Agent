@@ -565,7 +565,7 @@ fn password(rng: &mut Rng) -> (String, bool) {
             format!(
                 "{}{}{suffix}{}",
                 rng.pick(WORDS),
-                rng.range(year - 4, year),
+                rng.range(year.saturating_sub(4), year),
                 *rng.pick(SYMBOLS) as char
             )
         }

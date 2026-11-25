@@ -220,7 +220,9 @@ pub fn gather() -> LoginViews {
 
 fn read_utmp() -> Option<Vec<UtmpEntry>> {
     for path in ["/var/run/utmp", "/run/utmp"] {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(bytes) =
+            crate::paths::bounded_regular_bytes(std::path::Path::new(path), 2 * 1024 * 1024)
+        {
             return parse_utmp(&bytes);
         }
     }
