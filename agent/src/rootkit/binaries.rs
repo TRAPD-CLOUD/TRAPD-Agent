@@ -326,14 +326,24 @@ pub fn parse_rpm_verify(output: &str, target: &Path) -> PackageVerdict {
 fn rpm_verify(path: &Path) -> PackageVerdict {
     // rpm exits non-zero when verification fails, so the status is deliberately
     // ignored — the output is the answer.
-    let Ok(out) = Command::new("rpm").arg("-Vf").arg(path).output() else {
+    let Ok((status, stdout)) = crate::inventory::host_command::capture(
+        Command::new("rpm").arg("-Vf").arg(path),
+        256 * 1024,
+        std::time::Duration::from_secs(5),
+    ) else {
         return PackageVerdict::Unknown;
     };
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if stderr.contains("not owned by any package") {
+    let output = String::from_utf8_lossy(&stdout);
+    if !status.success()
+        && !output.lines().any(|line| {
+            line.split_whitespace()
+                .last()
+                .is_some_and(|value| Path::new(value) == path)
+        })
+    {
         return PackageVerdict::Unknown;
     }
-    parse_rpm_verify(&String::from_utf8_lossy(&out.stdout), path)
+    parse_rpm_verify(&output, path)
 }
 
 /// Which package database, if any, this host has.
@@ -396,9 +406,33 @@ impl PackageVerifier {
 
 fn md5_file(path: &Path) -> Option<String> {
     use md5::{Digest, Md5};
-    let bytes = std::fs::read(path).ok()?;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    const MAX_BYTES: u64 = 64 * 1024 * 1024;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_BYTES {
+        return None;
+    }
+    let mut reader = file.take(MAX_BYTES + 1);
     let mut hasher = Md5::new();
-    hasher.update(&bytes);
+    let mut block = [0u8; 16384];
+    let mut total = 0;
+    loop {
+        let n = reader.read(&mut block).ok()?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > MAX_BYTES {
+            return None;
+        }
+        hasher.update(&block[..n]);
+    }
     Some(hex::encode(hasher.finalize()))
 }
 
@@ -656,6 +690,9 @@ pub fn observe_in(dirs: &[PathBuf], state_dir: &Path, persist: bool) -> (Vec<Fin
             }
         }
 
+        if meta.len() > 64 * 1024 * 1024 {
+            continue;
+        }
         let Some(sha256) = crate::collectors::linux::exehash::sha256_file(&binary.path) else {
             continue;
         };

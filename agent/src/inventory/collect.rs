@@ -867,11 +867,17 @@ fn read_trim(path: &str) -> Option<String> {
 
 /// Run a command and capture trimmed stdout, or None if it is missing/fails.
 fn run_capture(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).output().ok()?;
-    if !out.status.success() {
+    let (status, out) = super::host_command::capture(
+        Command::new(cmd).args(args),
+        2 * 1024 * 1024,
+        std::time::Duration::from_secs(15),
+    )
+    .map_err(|e| tracing::warn!(helper = cmd, error = %e, "inventory helper unavailable"))
+    .ok()?;
+    if !status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]
