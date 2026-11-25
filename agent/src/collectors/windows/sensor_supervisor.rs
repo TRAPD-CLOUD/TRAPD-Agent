@@ -1,4 +1,4 @@
-//! Own one ETW attempt and the pollers that cover its unavailable providers.
+//! Run ETW independently of its supervised process and network polling fallbacks.
 use crate::{collectors::Collector, config::AgentConfig, schema::AgentEvent};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -32,19 +32,6 @@ impl Collector for SensorSupervisor {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
-        let mut pollers = tokio::task::JoinSet::new();
-        let ptx = tx.clone();
-        let aid = agent_id.clone();
-        let host = hostname.clone();
-        pollers.spawn(async move {
-            super::process::ProcessCollector::new()
-                .run(ptx, aid, host)
-                .await
-        });
-        let ntx = tx.clone();
-        let aid = agent_id.clone();
-        let host = hostname.clone();
-        pollers.spawn(async move { super::network::NetworkCollector.run(ntx, aid, host).await });
         // Separate session and restart loop: losing it must not take the
         // process/network sensors down. Aborted when this collector ends.
         let _file_actor = super::etw::file_actor_enabled().then(|| {
@@ -72,7 +59,6 @@ impl Collector for SensorSupervisor {
                             break;
                         }
                         _ = tx.closed() => return Ok(()),
-                        result = pollers.join_next() => return Err(anyhow::anyhow!("sensor fallback exited: {result:?}")),
                         _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                             if !self.config.read().map(|c| c.etw_enabled).unwrap_or(false) { break; }
                         }
@@ -85,7 +71,6 @@ impl Collector for SensorSupervisor {
             });
             tokio::select! {
                 _ = tx.closed() => return Ok(()),
-                result = pollers.join_next() => return Err(anyhow::anyhow!("sensor fallback exited: {result:?}")),
                 _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
             }
         }

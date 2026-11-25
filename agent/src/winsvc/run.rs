@@ -219,7 +219,7 @@ async fn reconcile_pending_firewall_expiry() -> Vec<crate::prevention::winfirewa
 /// where the service may report `SERVICE_RUNNING`). Environment configuration
 /// must already be loaded via [`load_config_env`].
 pub(super) async fn run_agent(
-    mut stop: tokio::sync::mpsc::UnboundedReceiver<super::StopRequest>,
+    mut stop: tokio::sync::mpsc::Receiver<super::StopRequest>,
     suspend: tokio::sync::mpsc::UnboundedReceiver<crate::heartbeat::suspend::Request>,
     on_ready: impl FnOnce(),
     as_service: bool,
@@ -460,39 +460,23 @@ pub(super) async fn run_agent(
         }));
     }
 
-    // Every collector runs under the generic supervisor: an error exit is
-    // counted, shown in coverage and followed by a capped exponential-backoff
-    // restart. `spawn_collector_once!` only observes (SensorSupervisor owns its
-    // restart logic).
-    macro_rules! spawn_supervised {
-        ($collector:expr, $restart:expr) => {{
-            let c = $collector;
-            let tx2 = tx.clone();
-            let aid = agent_id.clone();
-            let host = hostname.clone();
+    // Each sensor and fallback has an independent failure domain and backoff.
+    macro_rules! spawn_collector {
+        ($collector:expr) => {{
             handles.push(tokio::spawn(crate::collectors::supervisor::supervise(
-                c,
-                tx2,
-                aid,
-                host,
+                $collector,
+                tx.clone(),
+                agent_id.clone(),
+                hostname.clone(),
                 crate::collectors::supervisor::RestartPolicy::default(),
-                $restart,
+                true,
             )));
         }};
     }
-    macro_rules! spawn_collector {
-        ($collector:expr) => {
-            spawn_supervised!($collector, true)
-        };
-    }
-    macro_rules! spawn_collector_once {
-        ($collector:expr) => {
-            spawn_supervised!($collector, false)
-        };
-    }
-
     spawn_collector!(SystemCollector::new());
-    spawn_collector_once!(
+    spawn_collector!(crate::collectors::windows::process::ProcessCollector::new());
+    spawn_collector!(crate::collectors::windows::network::NetworkCollector);
+    spawn_collector!(
         crate::collectors::windows::sensor_supervisor::SensorSupervisor::new(Arc::clone(
             &agent_config
         ))

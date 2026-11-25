@@ -249,12 +249,12 @@ fn run_console() -> Result<()> {
     run::load_config_env();
     let rt = tokio::runtime::Runtime::new().context("build tokio runtime")?;
     let result = rt.block_on(async {
-        let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             // Ctrl-C on a console run ends the agent on purpose, but it is
             // still someone stopping the sensor: report it like a service stop.
-            let _ = stop_tx.send(StopRequest {
+            let _ = stop_tx.try_send(StopRequest {
                 kind: StopKind::ServiceStop,
                 source: StopSource::Interrupt,
                 claimed_token_nonce: None,
@@ -364,7 +364,14 @@ fn spawn_status_reporter(
         let mut checkpoint = 1u32;
         report_status(&handle, status_for(phase, checkpoint, ok));
         loop {
-            match phases.recv_timeout(CHECKPOINT_INTERVAL) {
+            let next = if phase == Phase::Running {
+                phases
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+            } else {
+                phases.recv_timeout(CHECKPOINT_INTERVAL)
+            };
+            match next {
                 Ok(Phase::Done) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Ok(next) => {
                     // Never leave Stopping once entered (a late Running must not win).
@@ -374,7 +381,7 @@ fn spawn_status_reporter(
                     phase = next;
                     checkpoint = 1;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => checkpoint += 1,
+                Err(mpsc::RecvTimeoutError::Timeout) => checkpoint = checkpoint.saturating_add(1),
             }
             report_status(&handle, status_for(phase, checkpoint, ok));
         }
@@ -386,15 +393,16 @@ fn run_service() -> Result<()> {
     // handler thread and the Tokio runtime exist.
     run::load_config_env();
 
-    let (stop_tx, stop_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
     let (phase_tx, phase_rx) = mpsc::channel::<Phase>();
     let (suspend, suspend_rx) = crate::heartbeat::suspend::channel();
 
     let handler_phase_tx = phase_tx.clone();
     let event_handler = move |control| -> ServiceControlHandlerResult {
         if let Some(request) = stop_request_for(&control) {
-            let _ = handler_phase_tx.send(Phase::Stopping);
-            let _ = stop_tx.send(request);
+            if stop_tx.try_send(request).is_ok() {
+                let _ = handler_phase_tx.send(Phase::Stopping);
+            }
             return ServiceControlHandlerResult::NoError;
         }
         match control {
@@ -413,12 +421,16 @@ fn run_service() -> Result<()> {
                 if code.to_raw() == crate::selfprotect::maintenance::STOP_REQUEST_CONTROL =>
             {
                 if let Some(claims) = crate::selfprotect::maintenance::authorize_pending_stop() {
-                    let _ = handler_phase_tx.send(Phase::Stopping);
-                    let _ = stop_tx.send(StopRequest {
-                        kind: StopKind::ServiceStop,
-                        source: StopSource::MaintenanceToken,
-                        claimed_token_nonce: Some(claims.nonce),
-                    });
+                    if stop_tx
+                        .try_send(StopRequest {
+                            kind: StopKind::ServiceStop,
+                            source: StopSource::MaintenanceToken,
+                            claimed_token_nonce: Some(claims.nonce),
+                        })
+                        .is_ok()
+                    {
+                        let _ = handler_phase_tx.send(Phase::Stopping);
+                    }
                 }
                 ServiceControlHandlerResult::NoError
             }
@@ -517,20 +529,22 @@ fn run_guard_console() -> Result<()> {
 fn run_guard_service() -> Result<()> {
     use crate::selfprotect::guard::NoticeKind;
     run::load_config_env();
-    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<NoticeKind>();
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<NoticeKind>(1);
     let (phase_tx, phase_rx) = mpsc::channel::<Phase>();
 
     let handler_phase_tx = phase_tx.clone();
     let event_handler = move |control| -> ServiceControlHandlerResult {
         match control {
             ServiceControl::Stop => {
-                let _ = handler_phase_tx.send(Phase::Stopping);
-                let _ = stop_tx.send(NoticeKind::ServiceStop);
+                if stop_tx.try_send(NoticeKind::ServiceStop).is_ok() {
+                    let _ = handler_phase_tx.send(Phase::Stopping);
+                }
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Shutdown | ServiceControl::Preshutdown => {
-                let _ = handler_phase_tx.send(Phase::Stopping);
-                let _ = stop_tx.send(NoticeKind::HostShutdown);
+                if stop_tx.try_send(NoticeKind::HostShutdown).is_ok() {
+                    let _ = handler_phase_tx.send(Phase::Stopping);
+                }
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
