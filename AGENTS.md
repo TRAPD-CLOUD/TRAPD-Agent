@@ -369,7 +369,7 @@ or a PID-stable pidfd (Linux); missing identity only permits an alert.
 also carry a signed `process_start_time`. Windows requires that exact observed
 creation FILETIME on the action or memory-read handle; missing, zero or stale
 generations are refused without an action, snapshot or memory artifact.
-Legacy commands still decode and verify, and Linux retains legacy omission.
+Legacy commands still decode and verify. Both platforms require a generation for kill, freeze and thaw.
 Command producers must preserve the observed u64 exactly when signing, rather
 than rounding it through a floating-point representation.
 

@@ -25,19 +25,6 @@ use crate::schema::ExecEventData;
 use super::audit::AuditEmitter;
 use super::policy::{Match, PolicyHandle, RuleAction};
 
-/// Send SIGKILL to the given PID.  Errors if the process is gone or we lack
-/// permission (in which case the audit event records `success=false`).
-pub fn kill_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if observed_start.is_none() {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        return kill(Pid::from_raw(pid), Signal::SIGKILL)
-            .with_context(|| format!("SIGKILL pid={pid} failed"));
-    }
-    kill_observed(pid, observed_start)
-}
-
 /// Kill the process an exec event describes. Where the event carries the
 /// process start time (Windows) the kill is bound to that identity, so a PID
 /// reused since the event cannot be hit.
@@ -131,33 +118,6 @@ fn signal_observed(pid: i32, observed_start: Option<u64>, signal: i32) -> Result
         return Err(std::io::Error::last_os_error()).context("pidfd_send_signal");
     }
     Ok(())
-}
-
-/// Freeze a process by sending SIGSTOP — the "jail" response. The process is
-/// suspended (not killed), so it cannot react or destroy evidence while a
-/// snapshot is taken and an operator decides what to do ("freeze, snapshot, then
-/// decide" — issue #32, point 5). Resume with [`thaw_pid`].
-pub fn freeze_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if observed_start.is_none() {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        return kill(Pid::from_raw(pid), Signal::SIGSTOP)
-            .with_context(|| format!("SIGSTOP pid={pid} failed"));
-    }
-    freeze_observed(pid, observed_start)
-}
-
-/// Resume a previously-frozen process by sending SIGCONT.
-pub fn thaw_pid(pid: i32, observed_start: Option<u64>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if observed_start.is_none() {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        return kill(Pid::from_raw(pid), Signal::SIGCONT)
-            .with_context(|| format!("SIGCONT pid={pid} failed"));
-    }
-    thaw_observed(pid, observed_start)
 }
 
 /// Look up the parent's comm by PPID.

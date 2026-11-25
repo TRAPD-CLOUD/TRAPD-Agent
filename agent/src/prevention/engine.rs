@@ -1446,7 +1446,7 @@ impl Engine {
             return;
         }
         if !self.process_action_succeeded(
-            process::freeze_pid(pid, process_start_time),
+            process::freeze_observed(pid, process_start_time),
             pid,
             process_start_time,
             "process_freeze",
@@ -1475,7 +1475,7 @@ impl Engine {
             return;
         }
         if !self.process_action_succeeded(
-            process::thaw_pid(pid, process_start_time),
+            process::thaw_observed(pid, process_start_time),
             pid,
             process_start_time,
             "process_thaw",
@@ -1722,7 +1722,7 @@ impl Engine {
             return;
         }
         if !self.process_action_succeeded(
-            process::kill_pid(pid, process_start_time),
+            process::kill_observed(pid, process_start_time),
             pid,
             process_start_time,
             "process_block",
