@@ -21,8 +21,7 @@ struct CoverageGuard;
 impl Drop for CoverageGuard {
     fn drop(&mut self) {
         crate::telemetry::coverage::update(|c| {
-            c.set_eventlog_active("Security", false);
-            c.set_eventlog_active(windows_native::SYSMON_CHANNEL, false);
+            c.disable_eventlog_channels();
         });
     }
 }
@@ -647,8 +646,7 @@ impl Collector for EventLogCollector {
             backlog = false;
             if !self.config.read().map(|c| c.logs_enabled).unwrap_or(true) {
                 crate::telemetry::coverage::update(|c| {
-                    c.set_eventlog_active("Security", false);
-                    c.set_eventlog_active(windows_native::SYSMON_CHANNEL, false);
+                    c.disable_eventlog_channels();
                 });
                 continue;
             }
@@ -682,14 +680,7 @@ impl Collector for EventLogCollector {
                 c.audit_command_line = policy.1;
                 c.audit_registry = policy.2;
             });
-            for channel in [
-                "Security",
-                "System",
-                "Application",
-                windows_native::SYSMON_CHANNEL,
-                windows_native::WMI_CHANNEL,
-                windows_native::POWERSHELL_CHANNEL,
-            ] {
+            for channel in windows_native::EVENTLOG_CHANNELS {
                 let mut drained = 0usize;
                 loop {
                     // A long drain must not look like a stall.
