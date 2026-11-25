@@ -222,7 +222,14 @@ fn dir_from_env(env: &str, default: PathBuf) -> PathBuf {
 /// Falling back then would silently discard identity and replay protection.
 /// Developer fallbacks are only considered for locations that do not exist.
 fn resolve_state_dir() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    let privileged = nix::unistd::Uid::effective().is_root();
+    #[cfg(windows)]
+    let privileged = crate::winacl::is_elevated();
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let privileged = false;
     resolve_state_dir_from(
+        privileged,
         std::env::var("TRAPD_STATE_DIR")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -234,6 +241,7 @@ fn resolve_state_dir() -> PathBuf {
 }
 
 fn resolve_state_dir_from(
+    privileged: bool,
     explicit: Option<PathBuf>,
     canonical: PathBuf,
     fallbacks: Vec<PathBuf>,
@@ -245,7 +253,7 @@ fn resolve_state_dir_from(
     }
 
     // 2. Canonical system location.
-    if existing_or_inaccessible(&canonical) || ensure_writable(&canonical) {
+    if privileged || existing_or_inaccessible(&canonical) || ensure_writable(&canonical) {
         return canonical;
     }
 
@@ -296,8 +304,13 @@ fn ensure_writable(dir: &Path) -> bool {
     }
     // Probe with a temp file; some paths exist but are not writable for us.
     let probe = dir.join(".trapd_write_probe");
-    match std::fs::write(&probe, b"") {
-        Ok(_) => {
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
             let _ = std::fs::remove_file(&probe);
             true
         }
@@ -574,6 +587,7 @@ mod tests {
         let fallback = root.join("fallback");
         assert_eq!(
             resolve_state_dir_from(
+                false,
                 Some(blocked.clone()),
                 root.join("canonical"),
                 vec![fallback.clone()],
@@ -583,6 +597,7 @@ mod tests {
         );
         assert_eq!(
             resolve_state_dir_from(
+                false,
                 None,
                 blocked.clone(),
                 vec![fallback.clone()],
@@ -592,8 +607,39 @@ mod tests {
         );
         let inaccessible = blocked.join("state");
         assert_eq!(
-            resolve_state_dir_from(None, inaccessible.clone(), vec![fallback], root.join("tmp")),
+            resolve_state_dir_from(
+                false,
+                None,
+                inaccessible.clone(),
+                vec![fallback],
+                root.join("tmp")
+            ),
             inaccessible
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn privileged_state_resolution_never_uses_developer_paths() {
+        let root = scratch_dir("privileged-state");
+        let canonical = root.join("missing");
+        let fallback = root.join("developer");
+        assert_eq!(
+            resolve_state_dir_from(
+                true,
+                None,
+                canonical.clone(),
+                vec![fallback.clone()],
+                root.join("temporary")
+            ),
+            canonical
+        );
+        assert!(!fallback.exists());
+        std::fs::write(root.join(".trapd_write_probe"), "occupied").unwrap();
+        assert!(!ensure_writable(&root));
+        assert_eq!(
+            std::fs::read(root.join(".trapd_write_probe")).unwrap(),
+            b"occupied"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
