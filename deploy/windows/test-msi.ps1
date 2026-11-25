@@ -268,9 +268,20 @@ try {
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'network' -and $_.data.dst_port -eq $listener.LocalEndpoint.Port }).Count -gt 0 } 'No native TCP telemetry.'
     $client.Dispose(); $peer.Dispose(); $listener.Stop()
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'filesystem' -and $_.data.path -eq $marker }).Count -gt 0 } 'No file-change telemetry.'
-    Start-Sleep -Seconds 12
+    $initialHash = 'sha256:' + (Get-FileHash -LiteralPath $marker -Algorithm SHA256).Hash.ToLowerInvariant()
+    Wait-Until {
+        @(Read-Events | Where-Object {
+            $_.data.path -eq $marker -and $_.data.integrity -eq 'baseline_added' -and $_.data.actual_hash -eq $initialHash
+        }).Count -gt 0
+    } 'No SHA256 FIM baseline for the initial content.'
     'changed content' | Set-Content $marker
-    Wait-Until { @(Read-Events | Where-Object { $_.data.path -eq $marker -and $_.data.integrity -eq 'violation' }).Count -gt 0 } 'No SHA256 FIM violation.'
+    $changedHash = 'sha256:' + (Get-FileHash -LiteralPath $marker -Algorithm SHA256).Hash.ToLowerInvariant()
+    Wait-Until {
+        @(Read-Events | Where-Object {
+            $_.data.path -eq $marker -and $_.data.integrity -eq 'violation' -and
+                $_.data.expected_hash -eq $initialHash -and $_.data.actual_hash -eq $changedHash
+        }).Count -gt 0
+    } 'No SHA256 FIM violation matching the old and new file hashes.'
     Wait-Until { @(Read-Events | Where-Object { $_.class -eq 'log' -and $_.data.message -like '*TRAPD_MSI_EVENTLOG_SMOKE*' }).Count -gt 0 } 'No native Windows event-log telemetry.'
     Wait-Until { @(Read-Requests | Where-Object { $_.path -like '*/inventory' -and $_.body.os.family -eq 'windows' }).Count -gt 0 } 'No Windows inventory at backend.'
     Wait-Until { @(Read-Requests | Where-Object { $_.path -like '*/heartbeat' -and $_.status -eq 200 }).Count -gt 0 } 'No authenticated heartbeat.'
