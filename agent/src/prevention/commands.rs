@@ -338,10 +338,7 @@ impl Verifier {
         }
 
         if cmd.envelope.agent_id != self.agent_id {
-            return Verdict::Rejected(format!(
-                "command addressed to {}, not us ({})",
-                cmd.envelope.agent_id, self.agent_id
-            ));
+            return Verdict::Rejected("command addressed to another agent".into());
         }
 
         let now = Utc::now();
@@ -381,7 +378,6 @@ impl Verifier {
 
         debug!(
             command_id = %cmd.envelope.command_id,
-            kind = ?cmd.envelope.payload,
             "signed command verified",
         );
 
