@@ -102,6 +102,7 @@ pub struct Metrics {
     enrichment_failures: AtomicU64,
     enrichment_partial: AtomicU64,
     enrichment_truncations: AtomicU64,
+    state_capacity_drops: AtomicU64,
     enrichment_duration: LatencyHistogram,
 
     // ── Detection ────────────────────────────────────────────────────────────
@@ -166,6 +167,7 @@ impl Metrics {
             enrichment_failures: AtomicU64::new(0),
             enrichment_partial: AtomicU64::new(0),
             enrichment_truncations: AtomicU64::new(0),
+            state_capacity_drops: AtomicU64::new(0),
             enrichment_duration: LatencyHistogram::new(),
             detection_queue_depth: AtomicU64::new(0),
             detections_suppressed: AtomicU64::new(0),
@@ -309,6 +311,11 @@ impl Metrics {
 
     pub fn enrichment_truncation(&self) {
         self.enrichment_truncations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cache or tracker entries evicted or refused at capacity, independent of event delivery.
+    pub fn state_capacity_dropped(&self, n: u64) {
+        self.state_capacity_drops.fetch_add(n, Ordering::Relaxed);
     }
 
     // ── Detection ────────────────────────────────────────────────────────────
@@ -517,6 +524,7 @@ impl Metrics {
             enrichment_failures_total: self.enrichment_failures.load(Ordering::Relaxed),
             enrichment_partial_total: self.enrichment_partial.load(Ordering::Relaxed),
             enrichment_truncations_total: self.enrichment_truncations.load(Ordering::Relaxed),
+            state_capacity_drops_total: self.state_capacity_drops.load(Ordering::Relaxed),
             enrichment_duration: self.enrichment_duration.snapshot(),
             detection_queue_depth: self.detection_queue_depth.load(Ordering::Relaxed),
             detections_suppressed_total: self.detections_suppressed.load(Ordering::Relaxed),
@@ -583,6 +591,7 @@ impl Metrics {
         self.enrichment_failures.store(0, Ordering::Relaxed);
         self.enrichment_partial.store(0, Ordering::Relaxed);
         self.enrichment_truncations.store(0, Ordering::Relaxed);
+        self.state_capacity_drops.store(0, Ordering::Relaxed);
         self.detection_queue_depth.store(0, Ordering::Relaxed);
         self.detections_suppressed.store(0, Ordering::Relaxed);
         self.detections_aggregated.store(0, Ordering::Relaxed);
@@ -699,6 +708,8 @@ pub struct MetricsSnapshot {
     pub enrichment_failures_total: u64,
     pub enrichment_partial_total: u64,
     pub enrichment_truncations_total: u64,
+    #[serde(default)]
+    pub state_capacity_drops_total: u64,
     #[serde(default)]
     pub enrichment_duration: LatencySnapshot,
     pub detection_queue_depth: u64,
@@ -983,7 +994,9 @@ mod tests {
         m.enrichment_attempt(3);
         m.enrichment_failure();
         m.enrichment_partial();
+        m.state_capacity_dropped(3);
         let snap = m.snapshot();
+        assert_eq!(snap.state_capacity_drops_total, 3);
         assert_eq!(snap.enrichment_failures_total, 1);
         assert_eq!(snap.enrichment_partial_total, 1);
         assert_eq!(

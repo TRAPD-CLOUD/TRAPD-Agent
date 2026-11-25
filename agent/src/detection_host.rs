@@ -14,6 +14,9 @@ impl trapd_schema::runtime::Runtime for HostRuntime {
     fn enrichment_truncation(&self) {
         crate::telemetry::metrics::metrics().enrichment_truncation();
     }
+    fn state_capacity_dropped(&self, n: u64) {
+        crate::telemetry::metrics::metrics().state_capacity_dropped(n);
+    }
     fn enrichment_partial(&self) {
         crate::telemetry::metrics::metrics().enrichment_partial();
     }

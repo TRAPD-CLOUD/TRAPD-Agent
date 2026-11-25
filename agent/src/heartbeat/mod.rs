@@ -88,6 +88,8 @@ struct PipelineCounters {
     dropped_by_reason: BTreeMap<String, u64>,
     /// Detection/prevention events lost to queue overflow (subset of dropped).
     priority_evicted: u64,
+    /// Cache entries evicted or refused when a tracker reached capacity.
+    state_capacity_drops_total: u64,
     /// Valid records replayed at startup, including those evicted by recovery
     /// capacity limits. Corrupt/unsupported records are excluded.
     replayed_from_disk: u64,
@@ -117,6 +119,7 @@ impl PipelineCounters {
             dropped_total: s.collector_events_dropped_total,
             dropped_by_reason: s.collector_events_dropped_by_reason.clone(),
             priority_evicted: s.spool_priority_evicted_total,
+            state_capacity_drops_total: s.state_capacity_drops_total,
             replayed_from_disk: s.spool_recovered_records_total,
             durability_lost: s.spool_durability_lost,
             spool_reserve_state: s.spool_reserve_state,
