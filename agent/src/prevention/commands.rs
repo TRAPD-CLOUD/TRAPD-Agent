@@ -375,9 +375,13 @@ impl Verifier {
             .nonces
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        match store.try_insert(cmd.envelope.nonce, cmd.envelope.expires_at) {
+        match store.try_insert(
+            cmd.envelope.command_id,
+            cmd.envelope.nonce,
+            cmd.envelope.expires_at,
+        ) {
             Ok(true) => {}
-            Ok(false) => return reject("command nonce already seen".into(), None),
+            Ok(false) => return reject("command or nonce already seen".into(), None),
             Err(e) => return reject(format!("cannot persist replay protection: {e:#}"), None),
         }
         drop(store);
@@ -393,6 +397,9 @@ impl Verifier {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NonceRecord {
+    // Older records carried only the nonce. Preserve its original replay protection.
+    #[serde(default)]
+    command_id: Option<Uuid>,
     nonce: Uuid,
     expires_at: DateTime<Utc>,
 }
@@ -418,12 +425,22 @@ impl NonceStore {
         })
     }
 
-    fn try_insert(&mut self, nonce: Uuid, expires_at: DateTime<Utc>) -> Result<bool> {
+    fn try_insert(
+        &mut self,
+        command_id: Uuid,
+        nonce: Uuid,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool> {
         anyhow::ensure!(
             self.path.parent().is_some_and(Path::is_dir),
             "command replay state directory is unavailable"
         );
-        if self.seen.contains(&nonce) {
+        if self.seen.contains(&nonce)
+            || self
+                .records
+                .iter()
+                .any(|r| r.command_id == Some(command_id))
+        {
             return Ok(false);
         }
         let now = Utc::now();
@@ -433,7 +450,11 @@ impl NonceStore {
             .filter(|r| r.expires_at > now)
             .cloned()
             .collect();
-        records.push(NonceRecord { nonce, expires_at });
+        records.push(NonceRecord {
+            command_id: Some(command_id),
+            nonce,
+            expires_at,
+        });
 
         // No command may execute before its nonce is durable. Stage changes so
         // a failed write does not consume the nonce and prevent a safe retry.
@@ -616,9 +637,36 @@ mod cross_lang_tests {
         let parent = temp_path("absent-state");
         let mut store = NonceStore::load(&parent.join("nonces.json")).unwrap();
         assert!(store
-            .try_insert(Uuid::new_v4(), Utc::now() + chrono::Duration::hours(1))
+            .try_insert(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Utc::now() + chrono::Duration::hours(1)
+            )
             .is_err());
         assert!(!parent.exists());
+    }
+
+    #[test]
+    fn replay_state_retains_legacy_nonces_and_new_command_ids_across_restart() {
+        let path = temp_path("command-ids");
+        let legacy = Uuid::new_v4();
+        let expiry = Utc::now() + chrono::Duration::minutes(15);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!([
+                {"nonce":legacy,"expires_at":expiry}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut store = NonceStore::load(&path).unwrap();
+        let id = Uuid::new_v4();
+        assert!(!store.try_insert(id, legacy, expiry).unwrap());
+        assert!(store.try_insert(id, Uuid::new_v4(), expiry).unwrap());
+        let mut reopened = NonceStore::load(&path).unwrap();
+        assert!(!reopened.try_insert(id, Uuid::new_v4(), expiry).unwrap());
+        assert!(!reopened.try_insert(Uuid::new_v4(), legacy, expiry).unwrap());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
