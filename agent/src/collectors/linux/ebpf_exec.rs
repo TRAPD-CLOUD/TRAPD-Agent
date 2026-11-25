@@ -150,16 +150,29 @@ fn proc_ppid(pid: u32) -> Result<u32, EnrichmentError> {
 ///
 /// Capped at [`MAX_CMDLINE_BYTES`]; the returned [`Truncation`] is `Some` when
 /// the command line was longer, so a consumer can tell a complete command line
-/// from its prefix.
+/// from its prefix. An argv beyond the read budget keeps its prefix; its
+/// `original_length` is then a lower bound.
 pub(super) fn proc_cmdline(pid: u32) -> Result<(String, Option<Truncation>), EnrichmentError> {
-    let bytes = crate::collectors::read_capped(format!("/proc/{pid}/cmdline"), 64 * 1024)
-        .map_err(|e| EnrichmentError::from_io(&e))?;
+    let (bytes, overflowed) =
+        crate::collectors::read_prefix(format!("/proc/{pid}/cmdline"), CMDLINE_READ_BYTES)
+            .map_err(|e| EnrichmentError::from_io(&e))?;
+    Ok(join_cmdline(&bytes, overflowed))
+}
+
+const CMDLINE_READ_BYTES: usize = 64 * 1024;
+
+fn join_cmdline(bytes: &[u8], overflowed: bool) -> (String, Option<Truncation>) {
     let joined = bytes
         .split(|&b| b == 0)
         .filter_map(|part| std::str::from_utf8(part).ok().filter(|s| !s.is_empty()))
         .collect::<Vec<_>>()
         .join(" ");
-    Ok(truncate_str(&joined, MAX_CMDLINE_BYTES))
+    let (text, truncation) = truncate_str(&joined, MAX_CMDLINE_BYTES);
+    if overflowed {
+        let original = joined.len().max(bytes.len()).saturating_add(1);
+        return (text.clone(), Some(Truncation::new(original, text.len())));
+    }
+    (text, truncation)
 }
 
 /// Resolve the `/proc/<pid>/cwd` symlink to an absolute path.
@@ -486,5 +499,26 @@ fn perf_paranoid_hint() -> String {
              to the unit via a drop-in)"
         ),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod cmdline_tests {
+
+    #[test]
+    fn oversized_cmdline_keeps_a_marked_prefix() {
+        let mut argv = b"python3\0-c\0".to_vec();
+        argv.extend(std::iter::repeat_n(b'a', super::CMDLINE_READ_BYTES));
+        argv.truncate(super::CMDLINE_READ_BYTES);
+        let (text, truncation) = super::join_cmdline(&argv, true);
+        assert!(text.starts_with("python3 -c aaa"));
+        assert_eq!(text.len(), super::MAX_CMDLINE_BYTES);
+        let truncation = truncation.expect("prefix must be marked");
+        assert!(truncation.original_length > super::CMDLINE_READ_BYTES - 2);
+        assert_eq!(truncation.captured_length, text.len());
+
+        let (short, none) = super::join_cmdline(b"ls\0-l\0", false);
+        assert_eq!(short, "ls -l");
+        assert!(none.is_none());
     }
 }

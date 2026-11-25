@@ -542,11 +542,10 @@ impl MemScanCollector {
             let regions = parse_maps(&maps);
             #[cfg(feature = "yara")]
             let mut suspicious: Vec<&MapRegion> = Vec::new();
+            // Budget counts only findings not reported before, so already-seen
+            // mappings can never hide later ones on the next sweep.
+            let mut pending: HashSet<String> = HashSet::new();
             for region in &regions {
-                if out.len() >= 128 {
-                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
-                    break;
-                }
                 if let Some(f) = classify_region(region) {
                     if jit && f.rule_id == "memory.anon_exec" {
                         continue;
@@ -566,6 +565,14 @@ impl MemScanCollector {
                     } else {
                         format!("{pid}:{start}:{}:{:#x}", f.rule_id, region.start)
                     };
+                    if self.seen.contains(&key) || pending.contains(&key) {
+                        continue;
+                    }
+                    if out.len() >= 128 {
+                        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                        break;
+                    }
+                    pending.insert(key.clone());
                     let anon_writable =
                         (f.rule_id == "memory.anon_exec").then(|| region.is_write());
                     out.push((

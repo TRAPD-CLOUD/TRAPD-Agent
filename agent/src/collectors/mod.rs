@@ -10,6 +10,23 @@ pub(crate) fn read_capped(
     path: impl AsRef<std::path::Path>,
     limit: usize,
 ) -> std::io::Result<Vec<u8>> {
+    let (bytes, overflowed) = read_prefix(path, limit)?;
+    if overflowed {
+        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds collector byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Like [`read_capped`], but a longer file yields its first `limit` bytes and
+/// `true` instead of an error. For evidence where a prefix is still useful.
+pub(crate) fn read_prefix(
+    path: impl AsRef<std::path::Path>,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -28,14 +45,9 @@ pub(crate) fn read_capped(
     let mut bytes = Vec::new();
     file.take((limit as u64).saturating_add(1))
         .read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "file exceeds collector byte limit",
-        ));
-    }
-    Ok(bytes)
+    let overflowed = bytes.len() > limit;
+    bytes.truncate(limit);
+    Ok((bytes, overflowed))
 }
 
 pub(crate) fn read_text_capped(
