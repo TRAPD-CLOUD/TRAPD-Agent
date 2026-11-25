@@ -301,8 +301,7 @@ enables "Audit Process Creation", command lines in event 4688 and "Audit File
 System" (needed for honeytoken reads). `AUDITBASELINE=0` opts out; uninstall
 reverts only what the MSI enabled.
 
-**Enrollment:** set `TRAPD_ENROLL_TOKEN`, or leave it empty to start device
-pairing (a short code is confirmed in the TRAPD web UI).
+**Enrollment:** confirm a device pairing code in the TRAPD web UI. For unattended enrollment, provision a private `enrollment.token` in the config directory or use the Windows MSI token-file import.
 
 **Removal:** revoke honeytokens from the backend first; planted decoys stay on
 disk until revoked.
@@ -334,7 +333,6 @@ agent logs which collectors did not start and keeps running.
 | Variable | Default | Purpose |
 |---|---|---|
 | `TRAPD_BACKEND_URL` | unset (offline) | backend base URL |
-| `TRAPD_ENROLL_TOKEN` | unset | one-time token; unset starts pairing |
 | `TRAPD_OFFLINE` | unset | `1` forces offline |
 | `TRAPD_OUTPUT` | `stdout` on a terminal, else `off` (Windows service: `file`) | local mirror: `file`, `stdout`, `off` |
 | `TRAPD_STATE_DIR`, `TRAPD_CONFIG_DIR`, `TRAPD_LOG_DIR` | `/var/lib/trapd`, `/etc/trapd`, `/var/log/trapd` | directories |

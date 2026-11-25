@@ -52,30 +52,20 @@ read-only for administrators, see Self-protection):
 
 - `ca.crt`: PEM certificate authority that pins the backend TLS connection.
 - `command_signing.pub`: raw 32-byte Ed25519 key for signed remote configuration.
-- `agent.env`: backend URL and enrollment token (the MSI preserves an existing file).
+- `agent.env`: backend URL (the MSI preserves an existing file).
 
 ```ini
 TRAPD_BACKEND_URL=https://backend.example.com
-TRAPD_ENROLL_TOKEN=enroll_xxxx
 TRAPD_OUTPUT=file
 RUST_LOG=info
 ```
 
-Prefer device pairing (no token). For managed deployments, `BACKENDURL` and
-`ENROLLTOKEN` MSI properties can be used instead of the corresponding `agent.env`
-entries. The MSI stores them in a 64-bit `HKLM\SOFTWARE\TRAPD\Agent` key that is
-restricted to SYSTEM and Administrators. Environment variables and then
-`agent.env` take precedence. Do not pass `ENROLLTOKEN=` to `msiexec` directly: a
-command line is visible to every local user and to process telemetry. Pass
-`ENROLLTOKENFILE=<path>` instead (this is what `install.ps1 -EnrollTokenFile
-<file>` or `-EnrollToken` does, via a private temporary file): a deferred SYSTEM
-custom action reads that file (bounded, no links) and stages the token in the
-protected registry key. Only the path appears on the command line and in the
-MSI log. Staging from the script itself is not possible on a hardened host,
-where an elevated administrator cannot write that key; delete the file after
-the install. The agent
-deletes the registry `EnrollToken` value as soon as enrollment succeeded (or
-persisted credentials exist), so the one-time token does not stay on disk.
+Device pairing is the default. For unattended enrollment pass
+`ENROLLTOKENFILE=<path>` to the MSI or `-EnrollTokenFile <path>` to install.ps1.
+The SYSTEM custom action reads the protected file and stages its token in the
+64-bit registry. The agent reads that registry value directly and clears it
+after enrollment. Only the file path belongs on the installer command line.
+Remove the source file after installation.
 TLS pinning fails closed unless `TRAPD_TLS_ALLOW_SYSTEM_ROOTS=1` is explicitly
 configured. First enrollment needs a reachable backend and a valid token.
 
@@ -85,9 +75,9 @@ Windows Installer; it does not replace service binaries independently. The
 SHA256 file comes from the same release, so it proves integrity only. The script
 therefore also requires a valid Authenticode signature (`Get-AuthenticodeSignature`
 status `Valid`) and fails closed unless the signer matches `-ExpectedThumbprint`
-(or env `TRAPD_SIGNER_THUMBPRINT`) and/or `-ExpectedPublisher` (or
-`TRAPD_SIGNER_SUBJECT`, the certificate's simple name). One of them is mandatory;
-`-AllowUnsigned` is an explicit, warned opt-out for self-built packages.
+(or env `TRAPD_SIGNER_THUMBPRINT`). Obtain this certificate pin through a
+trusted provisioning channel. An optional `-ExpectedPublisher` adds a publisher
+name check. Update the pin before distributing a release with a rotated certificate.
 Release builds are signed (see "Signing" below); SmartScreen still warns on a
 download until the publisher has reputation.
 

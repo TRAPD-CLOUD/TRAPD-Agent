@@ -25,6 +25,7 @@ Environment=TRAPD_CONFIG_DIR=/etc/trapd
 Environment=TRAPD_LOG_DIR=/var/log/trapd
 Environment=HOME=/var/lib/trapd
 EnvironmentFile=-/etc/trapd/agent.env
+UnsetEnvironment=TRAPD_ENROLL_TOKEN
 
 # systemd creates and owns these with the right permissions on every start:
 #   StateDirectory         -> /var/lib/trapd   (0700)  device_id, credentials

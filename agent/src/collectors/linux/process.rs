@@ -127,7 +127,7 @@ const PF_KTHREAD: u32 = 0x0020_0000;
 
 /// Whether this task is a kernel thread, and therefore legitimately has no
 /// executable image and no command line.
-fn is_kernel_thread(stat: &procfs::process::Stat) -> bool {
+pub(crate) fn is_kernel_thread(stat: &procfs::process::Stat) -> bool {
     stat.flags & PF_KTHREAD != 0
 }
 

@@ -72,7 +72,6 @@ enum Decoded {
     /// element still carries a well-formed one.
     Undecodable {
         command_id: Option<String>,
-        reason: String,
     },
 }
 
@@ -90,10 +89,7 @@ fn decode_batch(body: &[u8]) -> Result<Vec<Decoded>, serde_json::Error> {
                 .map(|id| id.to_string());
             match serde_json::from_value::<SignedCommand>(item) {
                 Ok(command) => Decoded::Command(Box::new(command)),
-                Err(error) => Decoded::Undecodable {
-                    command_id,
-                    reason: error.to_string(),
-                },
+                Err(_) => Decoded::Undecodable { command_id },
             }
         })
         .collect())
@@ -225,17 +221,17 @@ impl CommandPuller {
         for decoded in commands {
             let cmd = match decoded {
                 Decoded::Command(cmd) => *cmd,
-                Decoded::Undecodable { command_id, reason } => {
-                    warn!(command_id = ?command_id, "undecodable command skipped: {reason}");
+                Decoded::Undecodable { command_id } => {
+                    warn!(command_id = ?command_id, "undecodable command skipped");
                     self.audit.emit(
                         crate::schema::EventAction::CommandRejected,
                         crate::schema::Severity::Medium,
                         "command_rejected",
                         command_id.clone().unwrap_or_else(|| "<unknown>".into()),
                         false,
-                        format!("command could not be decoded by this agent version: {reason}"),
+                        "command could not be decoded by this agent version",
                         None,
-                        command_id,
+                        None,
                         serde_json::Value::Null,
                     );
                     continue;
@@ -249,18 +245,17 @@ impl CommandPuller {
                         return PollOutcome::Delivered;
                     }
                 }
-                Verdict::Rejected(reason) => {
+                Verdict::Rejected(rejection) => {
                     self.audit.emit(
                         crate::schema::EventAction::CommandRejected,
                         crate::schema::Severity::High,
                         "command_rejected",
                         cmd.envelope.command_id.to_string(),
                         false,
-                        reason,
+                        rejection.reason,
                         None,
-                        Some(cmd.envelope.command_id.to_string()),
-                        serde_json::to_value(&cmd.envelope.payload)
-                            .unwrap_or(serde_json::Value::Null),
+                        rejection.command_id.map(|id| id.to_string()),
+                        serde_json::Value::Null,
                     );
                 }
             }
@@ -351,6 +346,14 @@ mod tests {
             }
             other => panic!("expected the release command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn undecodable_command_diagnostics_discard_payload_text() {
+        let wire = serde_json::to_vec(&[command("private-test-content", UNKNOWN_ID)]).unwrap();
+        let decoded = decode_batch(&wire).unwrap();
+        assert!(matches!(decoded[0], Decoded::Undecodable { .. }));
+        assert!(!format!("{decoded:?}").contains("private-test-content"));
     }
 
     #[test]

@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
     // `trapd-agent guard` — the second service of the guard pair (`trapd-guard`):
     // watches the agent and restarts it; holds no backend credentials.
     if std::env::args().nth(1).as_deref() == Some("guard") {
-        paths::init_state_dir();
+        paths::init_state_dir()?;
         return selfprotect::guard::run::run_until_signal().await;
     }
 
@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
     // `trapd-agent-update.service`; applies (or rolls back) a staged update.
     // The service itself cannot write its own binary (`ProtectSystem=strict`).
     if std::env::args().nth(1).as_deref() == Some("--apply-update") {
+        paths::init_state_dir()?;
         return update::run_apply_helper();
     }
 
@@ -127,7 +128,7 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("uninstall") {
         #[cfg(target_os = "windows")]
         {
-            paths::init_state_dir();
+            paths::init_state_dir()?;
             collectors::windows::honeytokens::uninstall();
             crate::deception::activity::ActivityStore::purge(
                 &crate::deception::activity::state_path(),
@@ -144,7 +145,7 @@ async fn main() -> Result<()> {
     // exit) aborts the removal. Same gate as the Windows MSI action.
     if std::env::args().nth(1).as_deref() == Some("uninstall-gate") {
         paths::load_agent_env_file();
-        paths::init_state_dir();
+        paths::init_state_dir()?;
         let args: Vec<String> = std::env::args().skip(2).collect();
         return selfprotect::maintenance::run_uninstall_gate(&args)
             .inspect_err(|e| error!("uninstall refused: {e:#}"));
@@ -157,7 +158,7 @@ async fn main() -> Result<()> {
         // via EnvironmentFile, a shell does not. Load it before the (cached)
         // state dir is resolved.
         paths::load_agent_env_file();
-        paths::init_state_dir();
+        paths::init_state_dir()?;
         let args: Vec<String> = std::env::args().skip(2).collect();
         return selfprotect::maintenance::run_cli(&args, || {
             let status = std::process::Command::new("systemctl")
@@ -176,7 +177,7 @@ async fn main() -> Result<()> {
     {
         let args: Vec<String> = std::env::args().collect();
         if args.get(1).map(String::as_str) == Some("diagnostics") {
-            paths::init_state_dir();
+            paths::init_state_dir()?;
             return match args.get(2).map(String::as_str) {
                 Some("telemetry") => {
                     print!("{}", telemetry::diagnostics::run());
@@ -202,6 +203,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    paths::init_state_dir()?;
     selfprotect::kernel_hardening::audit();
     selfprotect::process_integrity::linux::harden();
 
@@ -218,9 +220,6 @@ async fn main() -> Result<()> {
 
     selfprotect::watchdog::spawn_detached();
 
-    // Resolve & create the (HOME-independent) state directory up front so every
-    // later component agrees on where identity/credentials live.
-    paths::init_state_dir();
     // Pair with the guard service before enrollment: pairing can wait for a
     // human, and the guard must see pings in the meantime.
     selfprotect::guard::agent_link::start(true);
@@ -250,7 +249,7 @@ async fn main() -> Result<()> {
         if !backend_configured {
             warn!(
                 "TRAPD_BACKEND_URL is not set — starting in OFFLINE mode. Telemetry is \
-                 emitted locally only. Set TRAPD_BACKEND_URL + TRAPD_ENROLL_TOKEN in {}/agent.env \
+                 emitted locally only. Set TRAPD_BACKEND_URL in {}/agent.env \
                  for a backend-connected agent.",
                 paths::config_dir().display()
             );

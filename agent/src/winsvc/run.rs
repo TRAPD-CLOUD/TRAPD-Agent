@@ -173,7 +173,6 @@ fn load_msi_config() {
     use windows_sys::Win32::System::Registry::RRF_SUBKEY_WOW6464KEY;
     for (value_name, env_name) in [
         ("BackendUrl", "TRAPD_BACKEND_URL"),
-        ("EnrollToken", "TRAPD_ENROLL_TOKEN"),
         ("AllowSystemRoots", "TRAPD_TLS_ALLOW_SYSTEM_ROOTS"),
     ] {
         if std::env::var_os(env_name).is_none() {
@@ -280,7 +279,7 @@ pub(super) async fn run_agent(
         if !backend_configured {
             warn!(
                 "TRAPD_BACKEND_URL is not set — starting in OFFLINE mode. Telemetry is \
-                 emitted locally only. Set TRAPD_BACKEND_URL + TRAPD_ENROLL_TOKEN in {}\\agent.env \
+                 emitted locally only. Set TRAPD_BACKEND_URL in {}\\agent.env \
                  for a backend-connected agent.",
                 paths::config_dir().display()
             );

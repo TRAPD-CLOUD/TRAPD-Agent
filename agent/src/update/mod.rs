@@ -169,7 +169,7 @@ impl Updater {
         if staged_within(&self.paths, STAGED_RETRY_AFTER) {
             return Ok(());
         }
-        let state = UpdateState::load(&self.paths);
+        let state = UpdateState::load(&self.paths)?;
         let bearer = self.tokens.current().await;
         let mut req = self
             .control
@@ -512,7 +512,10 @@ mod tests {
         assert!(!updater.paths.offer().exists());
         assert!(!updater.paths.recovery().exists());
         assert!(!updater.paths.artifact().exists());
-        assert_eq!(UpdateState::load(&updater.paths).last_issued_at, 500);
+        assert_eq!(
+            UpdateState::load(&updater.paths).unwrap().last_issued_at,
+            500
+        );
         std::fs::remove_dir_all(updater.paths.dir).unwrap();
     }
 
@@ -548,7 +551,7 @@ mod tests {
         // Also retry an early helper exit before it can create recovery.json.
         assert!(!paths.recovery().exists());
         assert!(resume_staged_update(&paths, |_| Ok(())).unwrap());
-        assert_eq!(UpdateState::load(&paths).last_issued_at, 500);
+        assert_eq!(UpdateState::load(&paths).unwrap().last_issued_at, 500);
         assert_eq!(
             std::fs::read(paths.offer()).unwrap(),
             b"existing signed offer"

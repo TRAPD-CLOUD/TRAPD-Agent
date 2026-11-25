@@ -3,7 +3,13 @@
 //! enforcement decision.
 
 use serde_json::Value;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{OwnedPermit, Sender};
+
+tokio::task_local! {
+    /// A signed command holds a queue slot from dispatch until its result.
+    /// Background events and TTL callbacks run in separate tasks.
+    static RESULT_SLOT: std::cell::RefCell<Option<OwnedPermit<AgentEvent>>>;
+}
 use tracing::warn;
 
 use crate::schema::{
@@ -28,6 +34,19 @@ impl AuditEmitter {
             #[cfg(windows)]
             user_notifications: None,
         }
+    }
+
+    pub(super) async fn reserve_result(&self) -> Option<OwnedPermit<AgentEvent>> {
+        self.tx.clone().reserve_owned().await.ok()
+    }
+
+    pub(super) async fn with_result_slot(
+        permit: OwnedPermit<AgentEvent>,
+        action: impl std::future::Future<Output = ()>,
+    ) {
+        RESULT_SLOT
+            .scope(std::cell::RefCell::new(Some(permit)), action)
+            .await;
     }
 
     /// Follow the signed config's user-notification setting. Without this call
@@ -66,6 +85,12 @@ impl AuditEmitter {
         }) {
             super::usernotify::notify(&action, kind, success, &details);
         }
+        let slot = command_id.as_ref().and_then(|_| {
+            RESULT_SLOT
+                .try_with(|slot| slot.borrow_mut().take())
+                .ok()
+                .flatten()
+        });
         let event = AgentEvent::new(
             self.agent_id.clone(),
             self.hostname.clone(),
@@ -83,7 +108,9 @@ impl AuditEmitter {
             }),
         );
 
-        if let Err(e) = self.tx.try_send(event) {
+        if let Some(slot) = slot {
+            slot.send(event);
+        } else if let Err(e) = self.tx.try_send(event) {
             warn!(kind, error = %e, "prevention audit event dropped");
         }
     }
