@@ -13,7 +13,7 @@ pub(crate) fn read_capped(
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
@@ -26,7 +26,8 @@ pub(crate) fn read_capped(
         ));
     }
     let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    file.take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         crate::telemetry::metrics::metrics().state_capacity_dropped(1);
         return Err(std::io::Error::new(

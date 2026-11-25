@@ -465,7 +465,7 @@ impl Watcher {
 }
 
 fn read_init(dir: &Path) -> (Option<i32>, Option<u64>) {
-    let pid = std::fs::read_to_string(dir.join("cgroup.procs"))
+    let pid = crate::collectors::read_text_capped(dir.join("cgroup.procs"), 64 * 1024)
         .ok()
         .and_then(|s| first_pid(&s));
     let start = pid.and_then(crate::telemetry::identity::process_start_time);

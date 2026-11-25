@@ -19,7 +19,6 @@ use crate::schema::{
     ProcessCreateData, ProcessTerminateData, Severity,
 };
 use crate::telemetry::identity::parent_generation_before_child;
-use crate::telemetry::limits::{truncate_str, MAX_CMDLINE_BYTES};
 use crate::telemetry::metrics::{metrics, CollectorMode};
 use crate::telemetry::{Enrichment, EnrichmentError};
 
@@ -155,6 +154,10 @@ fn scan_suid_baseline() -> HashSet<PathBuf> {
         }
         if let Ok(meta) = entry.metadata() {
             if meta.permissions().mode() & 0o4000 != 0 {
+                if set.len() == 4096 {
+                    metrics().state_capacity_dropped(1);
+                    break;
+                }
                 set.insert(entry.path().to_path_buf());
             }
         }
@@ -169,7 +172,7 @@ impl Default for ProcessCollector {
 }
 
 fn load_passwd() -> Result<HashMap<u32, String>> {
-    let content = fs::read_to_string("/etc/passwd")?;
+    let content = crate::collectors::read_text_capped("/etc/passwd", 512 * 1024)?;
     let mut map = HashMap::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.splitn(7, ':').collect();
@@ -184,10 +187,11 @@ fn load_passwd() -> Result<HashMap<u32, String>> {
 
 /// Parse /proc/{pid}/maps and return (region, perms) pairs for rwx anonymous mappings.
 fn check_rwx_maps(pid: i32) -> Vec<(String, String)> {
-    let content = match fs::read_to_string(format!("/proc/{pid}/maps")) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    let content =
+        match crate::collectors::read_text_capped(format!("/proc/{pid}/maps"), 2 * 1024 * 1024) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
     let mut results = Vec::new();
     for line in content.lines() {
         let mut fields = line.split_whitespace();
@@ -218,14 +222,17 @@ fn check_rwx_maps(pid: i32) -> Vec<(String, String)> {
     results
 }
 
-fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCreateData> {
+fn collect_processes(
+    uid_map: &HashMap<u32, String>,
+    known: &HashMap<i32, KnownProcess>,
+) -> Result<HashMap<i32, ProcessCreateData>> {
     let mut out = HashMap::new();
 
     let all = match procfs::process::all_processes() {
         Ok(iter) => iter,
         Err(e) => {
             warn!("Failed to list processes: {e}");
-            return out;
+            return Err(e.into());
         }
     };
 
@@ -240,6 +247,26 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
             Err(_) => continue,
         };
 
+        if out.len() >= 2048 {
+            metrics().state_capacity_dropped(1);
+            break;
+        }
+        if known
+            .get(&stat.pid)
+            .is_some_and(|old| old.start_time == Some(stat.starttime))
+        {
+            out.insert(
+                stat.pid,
+                ProcessCreateData {
+                    pid: stat.pid,
+                    ppid: stat.ppid,
+                    name: stat.comm,
+                    process_start_time: Some(stat.starttime),
+                    ..Default::default()
+                },
+            );
+            continue;
+        }
         let status = match proc.status() {
             Ok(s) => s,
             Err(_) => continue,
@@ -266,15 +293,14 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
             }
         };
 
-        let cmdline = match proc.cmdline() {
-            Ok(args) => {
-                let (value, truncation) = truncate_str(&args.join(" "), MAX_CMDLINE_BYTES);
+        let cmdline = match super::ebpf_exec::proc_cmdline(stat.pid as u32) {
+            Ok((value, truncation)) => {
                 notes.truncated("cmdline", truncation);
                 value
             }
-            Err(_) => {
+            Err(reason) => {
                 if !kthread {
-                    notes.fail("cmdline", EnrichmentError::ProcessExited);
+                    notes.fail("cmdline", reason);
                 }
                 String::new()
             }
@@ -303,7 +329,7 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
         };
         out.insert(stat.pid, data);
     }
-    out
+    Ok(out)
 }
 
 #[async_trait]
@@ -319,12 +345,24 @@ impl Collector for ProcessCollector {
         hostname: String,
     ) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(3));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         metrics().add_collector_mode(CollectorMode::ProcPolling);
 
         loop {
             ticker.tick().await;
 
-            let current = collect_processes(&self.uid_to_user);
+            let users = std::mem::take(&mut self.uid_to_user);
+            let known = std::mem::take(&mut self.known);
+            let (users, known, observed) = tokio::task::spawn_blocking(move || {
+                let observed = collect_processes(&users, &known);
+                (users, known, observed)
+            })
+            .await?;
+            self.uid_to_user = users;
+            self.known = known;
+            let Ok(current) = observed else {
+                continue;
+            };
 
             if !self.initialized {
                 self.known = snapshot_known(&current);
@@ -428,6 +466,14 @@ impl Collector for ProcessCollector {
 
             // Terminated processes
             for (pid, name) in diff.terminated {
+                if current.len() == 2048
+                    && !current.contains_key(&pid)
+                    && self.known.get(&pid).is_some_and(|old| {
+                        old.start_time == crate::telemetry::identity::process_start_time(pid)
+                    })
+                {
+                    continue;
+                }
                 let event = AgentEvent::new(
                     agent_id.clone(),
                     hostname.clone(),

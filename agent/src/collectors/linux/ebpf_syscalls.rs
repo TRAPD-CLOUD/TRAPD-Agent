@@ -699,7 +699,7 @@ fn cstr(buf: &[u8]) -> &str {
 }
 
 pub(super) fn proc_username(uid: u32) -> String {
-    fs::read_to_string("/etc/passwd")
+    crate::collectors::read_text_capped("/etc/passwd", 512 * 1024)
         .unwrap_or_default()
         .lines()
         .find_map(|line| {

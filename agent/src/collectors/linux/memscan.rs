@@ -84,6 +84,9 @@ pub fn parse_maps_line(line: &str) -> Option<MapRegion> {
     let (start_hex, end_hex) = range.split_once('-')?;
     let start = u64::from_str_radix(start_hex, 16).ok()?;
     let end = u64::from_str_radix(end_hex, 16).ok()?;
+    if end <= start {
+        return None;
+    }
     // Skip offset, dev, inode; the remainder (may contain spaces) is the path.
     let _offset = cols.next()?;
     let _dev = cols.next()?;
@@ -432,7 +435,7 @@ impl Collector for MemScanCollector {
         hostname: String,
     ) -> Result<()> {
         let (enabled, interval_secs) = {
-            let c = self.cfg.read().expect("config lock");
+            let c = self.cfg.read().unwrap_or_else(|e| e.into_inner());
             (c.memory_scan_enabled, c.memory_scan_interval_secs)
         };
         if !enabled {
@@ -442,6 +445,7 @@ impl Collector for MemScanCollector {
 
         let own_pid = std::process::id() as i32;
         let mut ticker = interval(Duration::from_secs(interval_secs.max(30)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
 
@@ -509,11 +513,17 @@ impl MemScanCollector {
         #[cfg(feature = "yara")]
         let mut yara_scanned: Vec<String> = Vec::new();
 
-        if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+        if let Ok(maps) =
+            crate::collectors::read_text_capped(format!("/proc/{pid}/maps"), 2 * 1024 * 1024)
+        {
             let regions = parse_maps(&maps);
             #[cfg(feature = "yara")]
             let mut suspicious: Vec<&MapRegion> = Vec::new();
             for region in &regions {
+                if out.len() >= 128 {
+                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                    break;
+                }
                 if let Some(f) = classify_region(region) {
                     if jit && f.rule_id == "memory.anon_exec" {
                         continue;
@@ -563,7 +573,9 @@ impl MemScanCollector {
             }
         }
 
-        if let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) {
+        if let Ok(environ) =
+            crate::collectors::read_capped(format!("/proc/{pid}/environ"), 128 * 1024)
+        {
             if let Some(val) = ld_preload_from_environ(&environ) {
                 if is_suspicious_preload(&val) {
                     let key = format!("{pid}:{start}:ld_preload:{val}");
@@ -589,7 +601,12 @@ impl MemScanCollector {
             return Vec::new();
         }
         #[cfg(feature = "yara")]
-        self.seen.extend(yara_scanned);
+        {
+            let room = 8192usize.saturating_sub(self.seen.len());
+            crate::telemetry::metrics::metrics()
+                .state_capacity_dropped(yara_scanned.len().saturating_sub(room) as u64);
+            self.seen.extend(yara_scanned.into_iter().take(room));
+        }
         // Carry the image path and hash so suppressions can match the binary
         // (hashed once per process, only when a finding is new; the hash is
         // cached and size-capped by `exehash`).
@@ -597,6 +614,10 @@ impl MemScanCollector {
         let mut image_hash: Option<Option<String>> = None;
         out.into_iter()
             .filter_map(|(key, severity, mut finding, anon_writable)| {
+                if self.seen.len() >= 8192 && !self.seen.contains(&key) {
+                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                    return None;
+                }
                 if !self.seen.insert(key) {
                     return None;
                 }
@@ -636,6 +657,10 @@ fn live_pids() -> Vec<i32> {
                 .to_str()
                 .and_then(|s| s.parse::<i32>().ok())
             {
+                if pids.len() >= 4096 {
+                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                    break;
+                }
                 pids.push(pid);
             }
         }
@@ -646,6 +671,11 @@ fn live_pids() -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_reversed_region_bounds() {
+        assert!(parse_maps_line("5000-4000 rwxp 0000 00:00 0").is_none());
+    }
 
     #[cfg(feature = "yara")]
     #[test]

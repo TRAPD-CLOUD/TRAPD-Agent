@@ -153,13 +153,20 @@ fn push_dir(
     let Ok(read) = std::fs::read_dir(root.join(rel)) else {
         return;
     };
-    let mut names: Vec<String> = read
+    let mut names = std::collections::BTreeSet::new();
+    let mut omitted = 0;
+    for name in read
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| accept(n))
-        .collect();
-    names.sort();
-    names.truncate(MAX_DIR_ENTRIES);
+    {
+        names.insert(name);
+        if names.len() > MAX_DIR_ENTRIES {
+            names.pop_last();
+            omitted += 1;
+        }
+    }
+    crate::telemetry::metrics::metrics().state_capacity_dropped(omitted);
     for name in names {
         out.push(Candidate {
             display: format!("{dir}/{name}"),
