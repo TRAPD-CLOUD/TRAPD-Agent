@@ -42,6 +42,11 @@ fn pending_linux_pairing_records_clean_signals_and_unclean_kills() {
         let root = std::env::temp_dir().join(format!("trapd-shutdown-{}", uuid::Uuid::new_v4()));
         let config = root.join("config");
         let state = root.join("state");
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
         std::fs::create_dir_all(&config).unwrap();
         std::fs::create_dir_all(&state).unwrap();
         let marker = state.join("run_state");

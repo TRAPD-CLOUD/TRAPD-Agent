@@ -370,16 +370,24 @@ pub(crate) fn private_directory(path: &Path) -> Result<std::fs::File> {
             continue;
         };
         current.push(part);
-        let create = std::fs::DirBuilder::new().mode(0o700).create(&current);
-        match create {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e).context("create private directory component"),
-        }
-        let directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(&current)?;
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&current)
+        };
+        let directory = match open() {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::DirBuilder::new().mode(0o700).create(&current) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e).context("create private directory component"),
+                }
+                open()?
+            }
+            Err(e) => return Err(e).context("open private directory component"),
+        };
         let meta = directory.metadata()?;
         if current == path {
             anyhow::ensure!(
