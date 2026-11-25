@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::warn;
 
 #[cfg(not(target_os = "windows"))]
 const DEFAULT_STATE_DIR: &str = "/var/lib/trapd";
@@ -346,7 +346,7 @@ pub fn init_state_dir() {
         return;
     }
     harden_dir_perms(dir);
-    info!(state = %dir.display(), config = %config_dir().display(), "filesystem layout resolved");
+    tracing::info!(state = %dir.display(), config = %config_dir().display(), "filesystem layout resolved");
 }
 
 /// A privileged writer must be able to trust each parent for the lifetime
