@@ -332,6 +332,13 @@ fn current_uid() -> u32 {
 
 /// Ensure the state directory exists and is owner-only (`0700`).  Called once at
 /// startup; logs but does not fail on permission errors.
+#[cfg(target_os = "linux")]
+pub fn init_state_dir() -> Result<()> {
+    private_directory(state_dir()).context("cannot secure agent state directory")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn init_state_dir() {
     let dir = state_dir();
     if let Err(e) = std::fs::create_dir_all(dir) {
@@ -342,14 +349,65 @@ pub fn init_state_dir() {
     info!(state = %dir.display(), config = %config_dir().display(), "filesystem layout resolved");
 }
 
+/// A privileged writer must be able to trust each parent for the lifetime
+/// of subsequent pathname opens. A root-owned sticky directory allows an
+/// owned child (e.g. a private test/service directory below /tmp).
 #[cfg(target_os = "linux")]
-fn harden_dir_perms(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(dir) {
-        let mut perms = meta.permissions();
-        perms.set_mode(0o700);
-        let _ = std::fs::set_permissions(dir, perms);
+pub(crate) fn private_directory(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    let path = std::path::absolute(path)?;
+    anyhow::ensure!(
+        path.file_name().is_some()
+            && !path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir),
+        "invalid private directory path"
+    );
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        let std::path::Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        let create = std::fs::DirBuilder::new().mode(0o700).create(&current);
+        match create {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).context("create private directory component"),
+        }
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&current)?;
+        let meta = directory.metadata()?;
+        if current == path {
+            anyhow::ensure!(
+                meta.uid() == uid && meta.mode() & 0o1000 == 0,
+                "unsafe private directory owner or sticky bit"
+            );
+            ensure_mode(&directory, 0o700)?;
+            return Ok(directory);
+        }
+        anyhow::ensure!(
+            (meta.uid() == 0 || meta.uid() == uid)
+                && (meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0),
+            "untrusted ancestor of private directory"
+        );
     }
+    anyhow::bail!("missing private directory component")
+}
+
+/// Set `mode` only when it differs. An unconditional `fchmod` raises
+/// `IN_ATTRIB` on every write, which the agent's own tamper watch reports as a
+/// critical `chmod` of its log (a self-inflicted feedback loop).
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_mode(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if file.metadata()?.permissions().mode() & 0o7777 != mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
 }
 
 /// Windows: restrict the directory to `SYSTEM` + `Administrators`, the analogue
@@ -630,6 +688,20 @@ mod tests {
             std::fs::read(root.join(".trapd_write_probe")).unwrap(),
             b"occupied"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_state_ancestor_is_rejected_without_creating_or_chmodding_target() {
+        let root = scratch_dir("linked-state");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("alias")).unwrap();
+        assert!(private_directory(&root.join("alias/state")).is_err());
+        assert!(!real.join("state").exists());
+        assert!(private_directory(&root.join("alias")).is_err());
+        assert!(private_directory(&root.join("safe/state")).is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
 
