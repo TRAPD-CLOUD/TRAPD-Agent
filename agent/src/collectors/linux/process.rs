@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{interval, Duration};
-use tracing::{info, warn};
+use tracing::warn;
 use walkdir::WalkDir;
 
 use crate::collectors::process_baseline::{

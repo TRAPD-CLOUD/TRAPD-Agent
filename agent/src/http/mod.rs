@@ -330,7 +330,7 @@ mod tests {
             tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buf = [0; 1024];
-                socket.read(&mut buf).await.unwrap();
+                assert!(socket.read(&mut buf).await.unwrap() > 0);
                 socket.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
                 socket.write_all(framing).await.unwrap();
             });

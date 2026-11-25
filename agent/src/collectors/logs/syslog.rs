@@ -111,10 +111,10 @@ mod tests {
     use super::*;
     #[test]
     fn existing_regular_file_is_preserved() {
-        let td = tempfile::tempdir().unwrap();
-        let path = td.path().join("occupied");
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         std::fs::write(&path, b"preserve").unwrap();
         assert!(remove_stale_socket(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
+        std::fs::remove_file(path).unwrap();
     }
 }
