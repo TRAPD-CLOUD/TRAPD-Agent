@@ -56,7 +56,7 @@ pub struct FlightRecorder {
 impl FlightRecorder {
     pub fn new(cap: usize) -> Self {
         Self {
-            cap: cap.max(1),
+            cap: cap.clamp(1, DEFAULT_CAPACITY),
             events: Mutex::new(VecDeque::new()),
             logons: Mutex::new(VecDeque::new()),
         }
@@ -66,7 +66,11 @@ impl FlightRecorder {
     /// successful logons additionally join the correlation ring.
     pub fn record(&self, event: &AgentEvent) {
         if let EventData::UserLogon(d) = &event.data {
-            if d.success {
+            if d.success
+                && (d.username.len() > 256 || d.src_addr.as_ref().is_some_and(|a| a.len() > 256))
+            {
+                crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+            } else if d.success {
                 if let Ok(mut logons) = self.logons.lock() {
                     push_capped(
                         &mut logons,
@@ -129,13 +133,14 @@ impl FlightRecorder {
             .iter()
             .filter(|l| l.username == user && l.timestamp >= cutoff && l.src_addr.is_some())
             .max_by_key(|l| l.timestamp)
-            .map(|l| (l.src_addr.clone().unwrap(), l.src_port))
+            .and_then(|l| l.src_addr.clone().map(|addr| (addr, l.src_port)))
     }
 }
 
 fn push_capped<T>(buf: &mut VecDeque<T>, item: T, cap: usize) {
     if buf.len() >= cap {
         buf.pop_front();
+        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
     }
     buf.push_back(item);
 }

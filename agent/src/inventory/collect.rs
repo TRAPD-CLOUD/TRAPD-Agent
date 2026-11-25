@@ -152,18 +152,18 @@ fn scan_suid_and_caps() -> (Vec<SuidSgidBinary>, Vec<FileCapability>) {
             if setuid || setgid {
                 if suid.len() >= 2048 {
                     crate::telemetry::metrics::metrics().state_capacity_dropped(1);
-                    continue;
+                } else {
+                    suid.push(SuidSgidBinary {
+                        mode: format!("{:04o}", mode & 0o7777),
+                        setuid,
+                        setgid,
+                        owner_uid: meta.uid(),
+                        owner_gid: meta.gid(),
+                        size: meta.len(),
+                        sha256: sha256_path(&path_str),
+                        path: path_str.clone(),
+                    });
                 }
-                suid.push(SuidSgidBinary {
-                    mode: format!("{:04o}", mode & 0o7777),
-                    setuid,
-                    setgid,
-                    owner_uid: meta.uid(),
-                    owner_gid: meta.gid(),
-                    size: meta.len(),
-                    sha256: sha256_path(&path_str),
-                    path: path_str.clone(),
-                });
             }
 
             if let Some(c) = read_file_capability(&path_str) {
