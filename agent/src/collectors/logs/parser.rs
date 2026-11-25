@@ -697,8 +697,8 @@ fn parse_postgresql(line: &str) -> ParsedLog {
         ..Default::default()
     };
     // `2024-01-15 12:00:00.123 UTC [1234] user@db LOG:  message`
-    if line.len() >= 23 {
-        p.timestamp = parse_ts(&line[..23]);
+    if let Some(stamp) = line.get(..23) {
+        p.timestamp = parse_ts(stamp);
     }
     if let Some(rest) = line.split("] ").nth(1) {
         // optional `user@db LEVEL:  msg`
@@ -991,8 +991,10 @@ fn merge_kv(into: &mut Map<String, Value>, rec: &str) {
     let mut s = rec;
     while let Some(eq) = s.find('=') {
         let key_start = s[..eq]
-            .rfind(|c: char| c.is_whitespace())
-            .map(|i| i + 1)
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(0);
         let key = s[key_start..eq].trim();
         let rest = &s[eq + 1..];
@@ -1093,6 +1095,14 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multibyte_log_delimiters_and_timestamps() {
+        let parsed = parse("kv", "start=1\u{2003}field=value");
+        assert_eq!(parsed.fields["field"], "value");
+        let parsed = parse("postgresql", &format!("{}é", "x".repeat(22)));
+        assert!(parsed.timestamp.is_none());
+    }
 
     #[test]
     fn syslog_rfc3164_sshd_failed() {
