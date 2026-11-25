@@ -116,7 +116,11 @@ impl snapshot::SnapshotProc for RealProc {
             .map(|p| p.to_string_lossy().into_owned())
     }
     fn cmdline(&self, pid: i32) -> Option<String> {
-        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let raw = crate::paths::bounded_regular_bytes(
+            std::path::Path::new(&format!("/proc/{pid}/cmdline")),
+            crate::telemetry::limits::MAX_CMDLINE_BYTES as u64,
+        )
+        .ok()?;
         let s: String = raw
             .split(|&b| b == 0)
             .filter(|p| !p.is_empty())
@@ -125,16 +129,21 @@ impl snapshot::SnapshotProc for RealProc {
             .join(" ");
         (!s.is_empty()).then_some(s)
     }
-    fn open_fds(&self, pid: i32) -> Vec<String> {
+    fn open_fds(&self, pid: i32) -> (Vec<String>, usize) {
         let mut out = Vec::new();
+        let mut total = 0;
         if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
             for e in entries.flatten() {
+                total += 1;
+                if out.len() >= snapshot::MAX_OPEN_FILES {
+                    continue;
+                }
                 if let Ok(target) = std::fs::read_link(e.path()) {
                     out.push(target.to_string_lossy().into_owned());
                 }
             }
         }
-        out
+        (out, total)
     }
 }
 
@@ -227,8 +236,8 @@ mod win {
                 (!joined.is_empty()).then_some(joined)
             })
         }
-        fn open_fds(&self, _: i32) -> Vec<String> {
-            Vec::new()
+        fn open_fds(&self, _: i32) -> (Vec<String>, usize) {
+            (Vec::new(), 0)
         }
     }
 }
