@@ -218,16 +218,12 @@ fn check_rwx_maps(pid: i32) -> Vec<(String, String)> {
     results
 }
 
-fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCreateData> {
+fn collect_processes(
+    uid_map: &HashMap<u32, String>,
+) -> procfs::ProcResult<HashMap<i32, ProcessCreateData>> {
     let mut out = HashMap::new();
 
-    let all = match procfs::process::all_processes() {
-        Ok(iter) => iter,
-        Err(e) => {
-            warn!("Failed to list processes: {e}");
-            return out;
-        }
-    };
+    let all = procfs::process::all_processes()?;
 
     for proc_result in all {
         let proc = match proc_result {
@@ -303,7 +299,7 @@ fn collect_processes(uid_map: &HashMap<u32, String>) -> HashMap<i32, ProcessCrea
         };
         out.insert(stat.pid, data);
     }
-    out
+    Ok(out)
 }
 
 #[async_trait]
@@ -320,11 +316,21 @@ impl Collector for ProcessCollector {
     ) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(3));
         metrics().add_collector_mode(CollectorMode::ProcPolling);
+        let mut coverage =
+            crate::telemetry::coverage::SourceCoverage::new("ProcessCollector/proc".into());
 
         loop {
             ticker.tick().await;
 
-            let current = collect_processes(&self.uid_to_user);
+            let snapshot = collect_processes(&self.uid_to_user);
+            coverage.set_failed(snapshot.is_err());
+            let current = match snapshot {
+                Ok(processes) => processes,
+                Err(error) => {
+                    warn!(%error, "Process list unavailable; retaining last snapshot");
+                    continue;
+                }
+            };
 
             if !self.initialized {
                 self.known = snapshot_known(&current);

@@ -17,15 +17,15 @@ use crate::schema::{
 pub struct NetworkCollector {
     /// Connection key → flow facts (incl. first-observed time). Doubles as the
     /// "known" set: a key leaving this map between polls is a closed flow.
-    known_tcp: HashMap<String, FlowInfo>,
-    known_udp: HashMap<String, FlowInfo>,
+    known_tcp: [HashMap<String, FlowInfo>; 2],
+    known_udp: [HashMap<String, FlowInfo>; 2],
 }
 
 impl NetworkCollector {
     pub fn new() -> Self {
         Self {
-            known_tcp: HashMap::new(),
-            known_udp: HashMap::new(),
+            known_tcp: Default::default(),
+            known_udp: Default::default(),
         }
     }
 }
@@ -196,6 +196,9 @@ impl Collector for NetworkCollector {
         // to the backend) as host network activity.
         let agent_pid = std::process::id() as i32;
 
+        let mut tcp_coverage = ["tcp", "tcp6"].map(table_coverage);
+        let mut udp_coverage = ["udp", "udp6"].map(table_coverage);
+
         loop {
             ticker.tick().await;
 
@@ -210,103 +213,120 @@ impl Collector for NetworkCollector {
                 .unwrap_or_default();
 
             // ── TCP (established only) ──────────────────────────────────────
-            let mut tcp_entries = Vec::new();
-            match procfs::net::tcp() {
-                Ok(v) => tcp_entries.extend(v),
-                Err(e) => warn!("Failed to read /proc/net/tcp: {e}"),
-            }
-            match procfs::net::tcp6() {
-                Ok(v) => tcp_entries.extend(v),
-                Err(e) => warn!("Failed to read /proc/net/tcp6: {e}"),
-            }
-
-            let mut new_tcp: HashMap<String, FlowInfo> = HashMap::new();
-            for entry in &tcp_entries {
-                if entry.state != TcpState::Established {
-                    continue;
-                }
-                let (pid, process_start_time, process) = resolve_pid_name(entry.inode, &inode_map);
-                if pid == Some(agent_pid) {
-                    continue; // self-exclusion
-                }
-                let flow = FlowInfo {
-                    inode: entry.inode,
-                    first_seen: Instant::now(),
-                    protocol: "tcp".to_string(),
-                    src_addr: entry.local_address.ip().to_string(),
-                    src_port: entry.local_address.port(),
-                    dst_addr: entry.remote_address.ip().to_string(),
-                    dst_port: entry.remote_address.port(),
-                    pid,
-                    process_start_time,
-                    process,
-                    owner: (None, None),
-                    stats: diag.get(&entry.inode).copied().unwrap_or_default(),
-                };
-                let key = flow_key(&flow);
-                new_tcp.insert(key, flow);
-            }
-            if reconcile(
-                &mut self.known_tcp,
-                new_tcp,
-                "established",
-                &tx,
-                &agent_id,
-                &hostname,
-            )
-            .await
-            .is_err()
+            for (family, table) in [procfs::net::tcp(), procfs::net::tcp6()]
+                .into_iter()
+                .enumerate()
             {
-                return Ok(());
+                let Some(tcp_entries) = observed_table(table, &mut tcp_coverage[family]) else {
+                    continue;
+                };
+                let mut new_tcp: HashMap<String, FlowInfo> = HashMap::new();
+                for entry in &tcp_entries {
+                    if entry.state != TcpState::Established {
+                        continue;
+                    }
+                    let (pid, process_start_time, process) =
+                        resolve_pid_name(entry.inode, &inode_map);
+                    if pid == Some(agent_pid) {
+                        continue; // self-exclusion
+                    }
+                    let flow = FlowInfo {
+                        inode: entry.inode,
+                        first_seen: Instant::now(),
+                        protocol: "tcp".to_string(),
+                        src_addr: entry.local_address.ip().to_string(),
+                        src_port: entry.local_address.port(),
+                        dst_addr: entry.remote_address.ip().to_string(),
+                        dst_port: entry.remote_address.port(),
+                        pid,
+                        process_start_time,
+                        process,
+                        owner: (None, None),
+                        stats: diag.get(&entry.inode).copied().unwrap_or_default(),
+                    };
+                    let key = flow_key(&flow);
+                    new_tcp.insert(key, flow);
+                }
+                if reconcile(
+                    &mut self.known_tcp[family],
+                    new_tcp,
+                    "established",
+                    &tx,
+                    &agent_id,
+                    &hostname,
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(());
+                }
             }
 
             // ── UDP (all sockets) ────────────────────────────────────────────
-            let mut udp_entries = Vec::new();
-            match procfs::net::udp() {
-                Ok(v) => udp_entries.extend(v),
-                Err(e) => warn!("Failed to read /proc/net/udp: {e}"),
-            }
-            match procfs::net::udp6() {
-                Ok(v) => udp_entries.extend(v),
-                Err(e) => warn!("Failed to read /proc/net/udp6: {e}"),
-            }
-
-            let mut new_udp: HashMap<String, FlowInfo> = HashMap::new();
-            for entry in &udp_entries {
-                let (pid, process_start_time, process) = resolve_pid_name(entry.inode, &inode_map);
-                if pid == Some(agent_pid) {
-                    continue; // self-exclusion
-                }
-                let flow = FlowInfo {
-                    inode: entry.inode,
-                    first_seen: Instant::now(),
-                    protocol: "udp".to_string(),
-                    src_addr: entry.local_address.ip().to_string(),
-                    src_port: entry.local_address.port(),
-                    dst_addr: entry.remote_address.ip().to_string(),
-                    dst_port: entry.remote_address.port(),
-                    pid,
-                    process_start_time,
-                    process,
-                    owner: (None, None),
-                    stats: super::inet_diag::FlowStats::default(),
-                };
-                let key = flow_key(&flow);
-                new_udp.insert(key, flow);
-            }
-            if reconcile(
-                &mut self.known_udp,
-                new_udp,
-                "open",
-                &tx,
-                &agent_id,
-                &hostname,
-            )
-            .await
-            .is_err()
+            for (family, table) in [procfs::net::udp(), procfs::net::udp6()]
+                .into_iter()
+                .enumerate()
             {
-                return Ok(());
+                let Some(udp_entries) = observed_table(table, &mut udp_coverage[family]) else {
+                    continue;
+                };
+                let mut new_udp: HashMap<String, FlowInfo> = HashMap::new();
+                for entry in &udp_entries {
+                    let (pid, process_start_time, process) =
+                        resolve_pid_name(entry.inode, &inode_map);
+                    if pid == Some(agent_pid) {
+                        continue; // self-exclusion
+                    }
+                    let flow = FlowInfo {
+                        inode: entry.inode,
+                        first_seen: Instant::now(),
+                        protocol: "udp".to_string(),
+                        src_addr: entry.local_address.ip().to_string(),
+                        src_port: entry.local_address.port(),
+                        dst_addr: entry.remote_address.ip().to_string(),
+                        dst_port: entry.remote_address.port(),
+                        pid,
+                        process_start_time,
+                        process,
+                        owner: (None, None),
+                        stats: super::inet_diag::FlowStats::default(),
+                    };
+                    let key = flow_key(&flow);
+                    new_udp.insert(key, flow);
+                }
+                if reconcile(
+                    &mut self.known_udp[family],
+                    new_udp,
+                    "open",
+                    &tx,
+                    &agent_id,
+                    &hostname,
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(());
+                }
             }
+        }
+    }
+}
+
+fn table_coverage(table: &str) -> crate::telemetry::coverage::SourceCoverage {
+    crate::telemetry::coverage::SourceCoverage::new(format!("NetworkCollector/{table}"))
+}
+
+/// A failed read provides no evidence that the sockets in this family closed.
+fn observed_table<T>(
+    table: procfs::ProcResult<Vec<T>>,
+    coverage: &mut crate::telemetry::coverage::SourceCoverage,
+) -> Option<Vec<T>> {
+    coverage.set_failed(table.is_err());
+    match table {
+        Ok(entries) => Some(entries),
+        Err(error) => {
+            warn!(%error, "Network socket table unavailable");
+            None
         }
     }
 }
@@ -401,6 +421,20 @@ async fn emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_table_is_distinct_from_an_empty_snapshot() {
+        let mut coverage = table_coverage("unit-test");
+        assert!(observed_table::<u8>(
+            Err(procfs::ProcError::PermissionDenied(None)),
+            &mut coverage
+        )
+        .is_none());
+        assert_eq!(
+            observed_table::<u8>(Ok(vec![]), &mut coverage),
+            Some(vec![])
+        );
+    }
 
     #[test]
     fn flow_start_and_close_keep_the_observed_process_generation() {

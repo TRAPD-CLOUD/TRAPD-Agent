@@ -127,22 +127,33 @@ fn diff(known: &HashMap<String, FileState>, current: &HashMap<String, FileState>
 }
 
 /// Hash every regular file under `roots` into a path→state map (bounded).
-fn scan(roots: &[String]) -> HashMap<String, FileState> {
+fn scan(roots: &[String]) -> (HashMap<String, FileState>, bool) {
     let mut out = HashMap::new();
+    let mut complete = true;
     for root in roots {
         if out.len() >= MAX_FILES {
             warn!(
                 cap = MAX_FILES,
                 "FIM: file cap reached — remaining paths skipped this scan"
             );
+            complete = false;
             break;
         }
-        for entry in WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        for entry in WalkDir::new(root).follow_links(false) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if !error
+                        .io_error()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        complete = false;
+                    }
+                    continue;
+                }
+            };
             if out.len() >= MAX_FILES {
+                complete = false;
                 break;
             }
             if !entry.file_type().is_file() {
@@ -151,7 +162,10 @@ fn scan(roots: &[String]) -> HashMap<String, FileState> {
             let path = entry.path();
             let meta = match entry.metadata() {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
             };
             let size = meta.len();
             let mtime = meta
@@ -163,7 +177,11 @@ fn scan(roots: &[String]) -> HashMap<String, FileState> {
             // Files over the cap are tracked by size/mtime only (sha left empty);
             // a size/mtime change still surfaces as a modification.
             let sha256 = if size <= MAX_FILE_BYTES {
-                super::exehash::sha256_file(path).unwrap_or_default()
+                let Some(digest) = super::exehash::sha256_file(path) else {
+                    complete = false;
+                    continue;
+                };
+                digest
             } else {
                 String::new()
             };
@@ -177,7 +195,32 @@ fn scan(roots: &[String]) -> HashMap<String, FileState> {
             );
         }
     }
-    out
+    (out, complete)
+}
+
+/// Missing entries in a partial scan cannot prove a deletion. Prioritize
+/// previously tracked files when the combined evidence reaches the budget.
+fn preserve_unobserved(
+    observed: &mut HashMap<String, FileState>,
+    previous: &HashMap<String, FileState>,
+    limit: usize,
+) {
+    let mut new_slots = limit.saturating_sub(previous.len());
+    observed.retain(|path, _| {
+        if previous.contains_key(path) {
+            return true;
+        }
+        if new_slots == 0 {
+            return false;
+        }
+        new_slots -= 1;
+        true
+    });
+    for (path, state) in previous {
+        if !observed.contains_key(path) {
+            observed.insert(path.clone(), state.clone());
+        }
+    }
 }
 
 fn load_baseline(path: &Path) -> Option<HashMap<String, FileState>> {
@@ -190,13 +233,12 @@ fn save_baseline(path: &Path, files: &HashMap<String, FileState>) {
     let baseline = Baseline {
         files: files.clone(),
     };
-    match serde_json::to_vec(&baseline) {
-        Ok(bytes) => {
-            if let Err(e) = crate::paths::write_atomic(path, &bytes, 0o600) {
-                warn!(error = %e, "FIM: failed to persist baseline");
-            }
-        }
-        Err(e) => warn!(error = %e, "FIM: failed to serialise baseline"),
+    let result = serde_json::to_vec(&baseline)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| crate::paths::write_atomic(path, &bytes, 0o600));
+    crate::telemetry::coverage::set_collector_failed("FimCollector/persistence", result.is_err());
+    if let Err(error) = result {
+        warn!(%error, "FIM: failed to persist baseline");
     }
 }
 
@@ -256,6 +298,8 @@ impl Collector for FimCollector {
             "FIM started"
         );
 
+        let mut scan_status =
+            crate::telemetry::coverage::SourceCoverage::new("FimCollector/scan".into());
         let mut ticker = interval(Duration::from_secs(interval_secs.max(60)));
         loop {
             ticker.tick().await;
@@ -263,15 +307,25 @@ impl Collector for FimCollector {
             // Hashing a large tree can take a while — keep it off the async
             // executor's worker so other tasks aren't starved.
             let roots = paths.clone();
-            let current = match tokio::task::spawn_blocking(move || scan(&roots)).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "FIM: scan task failed");
-                    continue;
-                }
-            };
+            let (mut current, complete) =
+                match tokio::task::spawn_blocking(move || scan(&roots)).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        scan_status.set_failed(true);
+                        warn!(error = %e, "FIM: scan task failed");
+                        continue;
+                    }
+                };
+
+            scan_status.set_failed(!complete);
+            if !complete {
+                preserve_unobserved(&mut current, &known, MAX_FILES);
+            }
 
             if !established {
+                if !complete && current.is_empty() {
+                    continue;
+                }
                 info!(files = current.len(), "FIM baseline established");
                 established = true;
                 save_baseline(&baseline_path, &current);
@@ -336,6 +390,22 @@ mod tests {
             size,
             mtime: 0,
         }
+    }
+
+    #[test]
+    fn partial_scan_keeps_unseen_files_and_observed_changes_within_budget() {
+        let known = HashMap::from([
+            ("unreadable".into(), state("old", 1)),
+            ("readable".into(), state("old", 1)),
+        ]);
+        let mut scan = HashMap::from([
+            ("new".into(), state("new", 3)),
+            ("readable".into(), state("changed", 2)),
+        ]);
+        preserve_unobserved(&mut scan, &known, 2);
+        assert_eq!(scan.len(), 2);
+        assert_eq!(scan["unreadable"], known["unreadable"]);
+        assert_eq!(scan["readable"], state("changed", 2));
     }
 
     #[test]
