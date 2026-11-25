@@ -125,6 +125,8 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
     let mut peer_proc: Option<control::ProcessIdentity> = None;
     let mut tick = tokio::time::interval(TICK);
     tokio::pin!(shutdown);
+    let publisher = crate::telemetry::snapshot::publish_guard(state_dir.clone());
+    tokio::pin!(publisher);
 
     let result = loop {
         // The exit watch resolves to `true` when the agent's process ended.
@@ -136,6 +138,7 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
         };
         tokio::select! {
             kind = &mut shutdown => break Exit::Shutdown(kind),
+            _ = &mut publisher => anyhow::bail!("guard report publisher exited"),
             accepted = async {
                 tokio::time::sleep_until(accept_after).await;
                 listener.accept().await

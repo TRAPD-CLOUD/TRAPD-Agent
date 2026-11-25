@@ -64,6 +64,56 @@ pub(crate) async fn publish_periodically(offline: bool) {
     }
 }
 
+/// The guard uses the same diagnostic format and atomic writer as the agent.
+pub(crate) async fn publish_guard(state_dir: PathBuf) {
+    let path = state_dir.join("guard-telemetry.json");
+    let started = std::time::Instant::now();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut published = None;
+    let mut failed = false;
+    loop {
+        ticker.tick().await;
+        let count = metrics().state_capacity_drops();
+        if published == Some(count) {
+            continue;
+        }
+        let path = path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let report = TelemetryReport::capture(true, started.elapsed().as_secs());
+            report.write_atomic(&path)?;
+            Ok::<_, std::io::Error>(report.metrics.state_capacity_drops_total)
+        })
+        .await;
+        if let Ok(Ok(count)) = result {
+            published = Some(count);
+            failed = false;
+        } else if first_publication_failure(&mut failed, true) {
+            tracing::warn!("could not publish guard telemetry report");
+        }
+    }
+}
+
+/// Last successfully published guard sample. Keep its capture time and PID:
+/// these are process-local counters, including when a guard has since stopped.
+#[derive(Clone, Serialize)]
+pub(crate) struct GuardCapacitySample {
+    captured_at_unix_ms: u64,
+    pid: u32,
+    dropped_total: u64,
+}
+
+impl GuardCapacitySample {
+    pub(crate) fn read(state_dir: &Path) -> Option<Self> {
+        let report = TelemetryReport::read(&state_dir.join("guard-telemetry.json")).ok()?;
+        Some(Self {
+            captured_at_unix_ms: report.captured_at_unix_ms,
+            pid: report.agent_pid,
+            dropped_total: report.metrics.state_capacity_drops_total,
+        })
+    }
+}
+
 fn first_publication_failure(previous: &mut bool, failed: bool) -> bool {
     let was_failed = std::mem::replace(previous, failed);
     failed && !was_failed
@@ -162,6 +212,28 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn heartbeat_can_read_the_last_guard_sample_after_restart() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let file = dir.join("guard-telemetry.json");
+        assert!(super::GuardCapacitySample::read(&dir).is_none());
+        let mut report = sample();
+        report.metrics.state_capacity_drops_total = 17;
+        report.write_atomic(&file).unwrap();
+        assert_eq!(
+            super::GuardCapacitySample::read(&dir)
+                .unwrap()
+                .dropped_total,
+            17
+        );
+        report.agent_pid = 77;
+        report.metrics.state_capacity_drops_total = 0;
+        report.write_atomic(&file).unwrap();
+        let latest = super::GuardCapacitySample::read(&dir).unwrap();
+        assert_eq!((latest.pid, latest.dropped_total), (77, 0));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn publication_warning_resets_after_a_successful_write() {
         let mut failed = false;

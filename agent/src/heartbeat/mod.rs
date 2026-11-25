@@ -186,6 +186,8 @@ struct Metrics {
     load_avg: [f64; 3],
     uptime_secs: u64,
     process_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_guard_capacity_sample: Option<crate::telemetry::snapshot::GuardCapacitySample>,
 }
 
 /// Read a response body of at most `limit` bytes, chunk by chunk. A larger body (also a chunked
@@ -396,6 +398,9 @@ impl Heartbeat {
             load_avg: [load.one, load.five, load.fifteen],
             uptime_secs: System::uptime(),
             process_count: proc_count,
+            last_guard_capacity_sample: crate::telemetry::snapshot::GuardCapacitySample::read(
+                crate::paths::state_dir(),
+            ),
         }
     }
 }

@@ -330,6 +330,10 @@ impl Metrics {
             .saturating_add(1)
     }
 
+    pub fn state_capacity_drops(&self) -> u64 {
+        self.state_capacity_drops.load(Ordering::Relaxed)
+    }
+
     pub fn state_capacity_dropped(&self, n: u64) {
         self.state_capacity_drops.fetch_add(n, Ordering::Relaxed);
     }
