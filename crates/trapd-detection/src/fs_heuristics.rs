@@ -7,7 +7,9 @@
 //! unit-tested on every CI host. The collectors own only the I/O: how events are
 //! obtained and how paths are normalised before they are passed in.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use trapd_schema::{
@@ -85,7 +87,11 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
     for &b in data {
         counts[b as usize] += 1;
     }
-    let len = data.len() as f64;
+    entropy_from_counts(&counts, data.len() as u64)
+}
+
+fn entropy_from_counts(counts: &[u64; 256], total: u64) -> f64 {
+    let len = total as f64;
     counts
         .iter()
         .filter(|&&c| c > 0)
@@ -102,13 +108,54 @@ pub fn file_entropy(path: &str) -> Option<f64> {
     if is_compressed_by_nature(path) {
         return None;
     }
-    let meta = std::fs::metadata(path).ok()?;
-    let len = meta.len();
-    if len == 0 || len > MAX_ENTROPY_BYTES {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return None;
+        }
+    }
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_ENTROPY_BYTES {
         return None;
     }
-    let data = std::fs::read(path).ok()?;
-    Some(shannon_entropy(&data))
+    bounded_entropy(file, MAX_ENTROPY_BYTES)
+}
+
+fn bounded_entropy(input: impl Read, limit: u64) -> Option<f64> {
+    let mut reader = input.take(limit.saturating_add(1));
+    let mut counts = [0u64; 256];
+    let mut total = 0;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match reader.read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => other.ok()?,
+        };
+        if n == 0 {
+            return (total > 0).then(|| entropy_from_counts(&counts, total));
+        }
+        total += n as u64;
+        if total > limit {
+            return None;
+        }
+        for &byte in &buf[..n] {
+            counts[usize::from(byte)] += 1;
+        }
+    }
 }
 
 pub fn is_compressed_by_nature(path: &str) -> bool {
@@ -188,17 +235,30 @@ pub fn burst_severity(count: usize) -> Severity {
 /// crosses [`RENAME_BURST_CRITICAL`] (each tier at most once per burst).
 #[derive(Default)]
 pub struct RenameBurst {
-    seen: HashMap<String, Instant>,
+    seen: VecDeque<(String, Instant)>,
     reported_tier: u8,
 }
 
 impl RenameBurst {
-    /// Returns `Some(distinct_count)` when this file moves the burst into a
-    /// new severity tier.
+    /// Returns the tier reached by the distinct paths in the current window.
     pub fn record(&mut self, path: &str, now: Instant) -> Option<usize> {
-        self.seen
-            .retain(|_, last| now.duration_since(*last) <= RENAME_BURST_WINDOW);
-        self.seen.insert(path.to_string(), now);
+        while self
+            .seen
+            .front()
+            .is_some_and(|(_, last)| now.saturating_duration_since(*last) > RENAME_BURST_WINDOW)
+        {
+            self.seen.pop_front();
+        }
+        if self.seen.len() < RENAME_BURST_MIN {
+            self.reported_tier = 0;
+        }
+        if let Some(i) = self.seen.iter().position(|(p, _)| p == path) {
+            self.seen.remove(i);
+        } else if self.seen.len() == RENAME_BURST_CRITICAL {
+            self.seen.pop_front();
+            trapd_schema::runtime::runtime().state_capacity_dropped(1);
+        }
+        self.seen.push_back((path.to_owned(), now));
         let n = self.seen.len();
         let tier = if n >= RENAME_BURST_CRITICAL {
             2
@@ -220,12 +280,16 @@ impl RenameBurst {
     }
 }
 
+type CoalescingKey = (Arc<str>, &'static str);
+
 /// Collapses repeated identical notifications. Security-critical paths bypass
 /// both the noise filter and the coalescing, so a persistence or credential
 /// change is never swallowed.
 #[derive(Default)]
 pub struct Coalescer {
-    recent: HashMap<(String, &'static str), Instant>,
+    recent: HashSet<CoalescingKey>,
+    order: VecDeque<(Instant, CoalescingKey)>,
+    path_bytes: usize,
 }
 
 impl Coalescer {
@@ -244,20 +308,42 @@ impl Coalescer {
         if noisy {
             return true;
         }
-        let key = (path.to_string(), action);
-        if self
-            .recent
-            .get(&key)
-            .is_some_and(|last| now.duration_since(*last) < GENERIC_COALESCE_WINDOW)
+        const MAX_KEYS: usize = 4096;
+        const MAX_PATH_BYTES: usize = 4 * 1024 * 1024;
+        while self
+            .order
+            .front()
+            .is_some_and(|(t, _)| now.saturating_duration_since(*t) >= GENERIC_COALESCE_WINDOW)
         {
+            self.remove_oldest();
+        }
+        if path.len() > MAX_PATH_BYTES {
+            trapd_schema::runtime::runtime().state_capacity_dropped(1);
+            return false;
+        }
+        let key = (Arc::<str>::from(path), action);
+        if self.recent.contains(&key) {
             return true;
         }
-        self.recent.insert(key, now);
-        if self.recent.len() > 4096 {
-            self.recent
-                .retain(|_, seen| now.duration_since(*seen) < GENERIC_COALESCE_WINDOW);
+        let mut evicted = 0;
+        while self.recent.len() == MAX_KEYS || self.path_bytes > MAX_PATH_BYTES - path.len() {
+            self.remove_oldest();
+            evicted += 1;
         }
+        if evicted != 0 {
+            trapd_schema::runtime::runtime().state_capacity_dropped(evicted);
+        }
+        self.path_bytes += path.len();
+        self.recent.insert(key.clone());
+        self.order.push_back((now, key));
         false
+    }
+
+    fn remove_oldest(&mut self) {
+        if let Some((_, key)) = self.order.pop_front() {
+            self.path_bytes -= key.0.len();
+            self.recent.remove(&key);
+        }
     }
 }
 
@@ -443,6 +529,32 @@ pub fn backup_deletion_event(agent_id: &str, hostname: &str, path: &str) -> Agen
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entropy_reader_stops_after_one_excess_byte() {
+        let mut source = std::io::Cursor::new([42u8; 100]);
+        assert_eq!(bounded_entropy(&mut source, 16), None);
+        assert_eq!(source.position(), 17);
+        assert_eq!(bounded_entropy(&[0, 1][..], 2), Some(1.0));
+        assert_eq!(bounded_entropy(&[][..], 2), None);
+    }
+
+    #[test]
+    fn bursts_cannot_exceed_tracking_capacity() {
+        let now = Instant::now();
+        let mut coalescer = Coalescer::default();
+        let mut renames = RenameBurst::default();
+        for i in 0..4100 {
+            let path = i.to_string();
+            assert!(!coalescer.suppress(&path, "write", false, false, now));
+            renames.record(&path, now);
+        }
+        assert_eq!(renames.seen.len(), RENAME_BURST_CRITICAL);
+        assert_eq!(coalescer.recent.len(), 4096);
+        assert_eq!(coalescer.order.len(), 4096);
+        assert!(coalescer.suppress("4099", "write", false, false, now));
+        assert!(!coalescer.suppress("0", "write", false, false, now));
+    }
 
     #[test]
     fn entropy_separates_text_from_random_bytes() {
