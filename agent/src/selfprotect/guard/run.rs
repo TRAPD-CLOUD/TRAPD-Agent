@@ -19,6 +19,7 @@ use super::{
 };
 
 /// How often the monitor is evaluated.
+const MAX_EXCHANGES: usize = 8;
 const TICK: Duration = Duration::from_secs(1);
 /// On a stop the guard keeps answering for up to this long so the agent can
 /// read the stop notice from a pong (the agent pings every `PING_INTERVAL`).
@@ -98,6 +99,8 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
 
     let stopping = Arc::new(Mutex::new(None::<StopNotice>));
     let delivered = Arc::new(AtomicBool::new(false));
+    let exchanges = Arc::new(tokio::sync::Semaphore::new(MAX_EXCHANGES));
+    let mut accept_after = tokio::time::Instant::now();
     let (obs_tx, mut obs_rx) = mpsc::channel::<Observation>(16);
     let shutting_down = Arc::new(AtomicBool::new(false));
     let mut supervisor = Supervisor::new(
@@ -122,16 +125,28 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
         };
         tokio::select! {
             kind = &mut shutdown => break Exit::Shutdown(kind),
-            accepted = listener.accept() => {
+            accepted = async {
+                tokio::time::sleep_until(accept_after).await;
+                listener.accept().await
+            } => {
                 let (mut stream, pid) = match accepted {
                     Ok(x) => x,
-                    Err(e) => { warn!(error = %e, "guard channel accept failed"); continue; }
+                    Err(e) => {
+                        warn!(error = %e, "guard channel accept failed");
+                        accept_after = tokio::time::Instant::now() + TICK;
+                        continue;
+                    }
+                };
+                let Ok(permit) = Arc::clone(&exchanges).try_acquire_owned() else {
+                    crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                    continue;
                 };
                 let tx = obs_tx.clone();
                 let state = state_dir.clone();
                 let stopping = Arc::clone(&stopping);
                 let delivered = Arc::clone(&delivered);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let notice = stopping.lock().ok().and_then(|g| g.clone());
                     let carries_notice = notice.is_some();
                     let served = tokio::time::timeout(EXCHANGE_TIMEOUT, ipc::serve(&mut stream, |p| Pong {
@@ -144,7 +159,9 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
                         if carries_notice {
                             delivered.store(true, Ordering::SeqCst);
                         }
-                        let _ = tx.send(Observation { pid, notice: ping.stop }).await;
+                        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Observation { pid, notice: ping.stop }) {
+                            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+                        }
                     }
                 });
             }
@@ -200,6 +217,7 @@ pub async fn run(shutdown: impl std::future::Future<Output = NoticeKind>) -> Res
         let wait = async {
             while !delivered.load(Ordering::SeqCst) {
                 if let Ok((mut stream, _)) = listener.accept().await {
+                    let _permit = permit;
                     let notice = stopping.lock().ok().and_then(|g| g.clone());
                     let ok = tokio::time::timeout(
                         EXCHANGE_TIMEOUT,

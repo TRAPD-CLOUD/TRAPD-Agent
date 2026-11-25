@@ -40,7 +40,9 @@ use crate::schema::Severity;
 
 /// Files larger than this are not read for a comparison or a hash.
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_HANDLE_TABLE: usize = 256 * 1024 * 1024;
+// The native query needs a single contiguous buffer. Leave room for the
+// core agent and other collectors under the 150 MB RSS target.
+const MAX_HANDLE_TABLE: usize = 16 * 1024 * 1024;
 const SYSTEM_EXTENDED_HANDLE_INFORMATION: i32 = 0x40;
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
 const MEM_IMAGE: u32 = 0x0100_0000;
@@ -403,13 +405,15 @@ fn system_handle_table() -> Option<Vec<u8>> {
             return None;
         }
         // The table grows between calls: ask for more than reported.
-        size = (needed as usize)
-            .max(size)
-            .saturating_mul(2)
-            .min(MAX_HANDLE_TABLE + 1);
-        if size > MAX_HANDLE_TABLE {
+        let required = needed as usize;
+        if required > MAX_HANDLE_TABLE || size == MAX_HANDLE_TABLE {
+            crate::telemetry::metrics::metrics().state_capacity_dropped(1);
             return None;
         }
+        size = required
+            .max(size)
+            .saturating_add(1024 * 1024)
+            .min(MAX_HANDLE_TABLE);
     }
     None
 }

@@ -628,28 +628,28 @@ pub fn spool_dir(state_dir: &Path) -> PathBuf {
     state_dir.join(SPOOL_DIR)
 }
 
-fn record_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+fn record_files(dir: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "json"))
-        .collect();
-    files.sort();
-    files
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
 }
 
-/// Number of records waiting.
+/// Number of records waiting, capped at the supported spool capacity.
 pub fn pending_count(state_dir: &Path) -> usize {
-    record_files(&spool_dir(state_dir)).len()
+    record_files(&spool_dir(state_dir))
+        .take(MAX_SPOOL_RECORDS)
+        .count()
 }
 
 /// Leave a record for the agent. Atomic; refused (dropped) when the spool is
 /// full, which only happens if nothing has been reading it.
 pub fn write_record(state_dir: &Path, record: &Record) -> Result<()> {
     let dir = spool_dir(state_dir);
-    if record_files(&dir).len() >= MAX_SPOOL_RECORDS {
+    if pending_count(state_dir) >= MAX_SPOOL_RECORDS {
+        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
         bail!("guard record spool is full");
     }
     let name = format!("{}-{}.json", record.at.timestamp_millis(), record.event_id);
@@ -662,7 +662,11 @@ pub fn write_record(state_dir: &Path, record: &Record) -> Result<()> {
 /// [`remove_record`] only after it was handed on.
 pub fn read_records(state_dir: &Path) -> Vec<(PathBuf, Record)> {
     let mut out = Vec::new();
-    for path in record_files(&spool_dir(state_dir)) {
+    let mut paths: Vec<_> = record_files(&spool_dir(state_dir))
+        .take(MAX_SPOOL_RECORDS)
+        .collect();
+    paths.sort_unstable();
+    for path in paths {
         match crate::paths::bounded_regular_bytes(&path, MAX_RECORD_BYTES)
             .ok()
             .and_then(|b| serde_json::from_slice::<Record>(&b).ok())
@@ -670,7 +674,10 @@ pub fn read_records(state_dir: &Path) -> Vec<(PathBuf, Record)> {
         {
             Some(r) => out.push((path, r)),
             None => {
-                let _ = std::fs::remove_file(&path);
+                if std::fs::remove_file(&path).is_ok() {
+                    crate::telemetry::metrics::metrics()
+                        .event_dropped(crate::telemetry::DropReason::PersistentQueueCorrupt);
+                }
             }
         }
     }
