@@ -374,8 +374,11 @@ fn redirect_findings_blocking(host: &str) -> Vec<Finding> {
     let mut out = Vec::new();
 
     let path = hosts_path();
-    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) <= MAX_HOSTS_BYTES {
-        if let Ok(text) = std::fs::read_to_string(&path) {
+    if let Ok(resolved) = std::fs::canonicalize(&path) {
+        if let Some(text) = crate::paths::bounded_regular_bytes(&resolved, MAX_HOSTS_BYTES)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
             let entries = redirect::parse_hosts(&text);
             for e in redirect::hosts_for(&entries, host) {
                 out.push(Finding::Redirected {

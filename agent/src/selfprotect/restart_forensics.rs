@@ -444,10 +444,7 @@ struct Watermark {
 
 pub fn read_watermark(dir: &Path) -> Option<DateTime<Utc>> {
     let path = dir.join(WATERMARK_FILE);
-    if std::fs::metadata(&path).ok()?.len() > MAX_WATERMARK_BYTES {
-        return None;
-    }
-    let raw = std::fs::read(path).ok()?;
+    let raw = crate::paths::bounded_regular_bytes(&path, MAX_WATERMARK_BYTES).ok()?;
     serde_json::from_slice::<Watermark>(&raw)
         .ok()
         .map(|w| w.scanned_until)
