@@ -323,6 +323,8 @@ impl FileActorState {
                     ancestors: Vec::new(),
                 });
                 if self.lineages.len() >= 1024 {
+                    crate::telemetry::metrics::metrics()
+                        .state_capacity_dropped(self.lineages.len() as u64);
                     self.lineages.clear();
                 }
                 self.lineages
@@ -989,6 +991,8 @@ impl DecodeState {
                         crate::deception::activity::record_exec(&data.username, &data.exe);
                         crate::detection::accessor_correlation::record_process(&data);
                         if self.proc_images.len() >= 8192 {
+                            crate::telemetry::metrics::metrics()
+                                .state_capacity_dropped(self.proc_images.len() as u64);
                             self.proc_images.clear();
                         }
                         if let Some(start) = event_start {
@@ -1191,6 +1195,8 @@ impl DecodeState {
         let signature = match hash.digest() {
             Some(digest) => {
                 if self.driver_signatures.len() >= 1024 {
+                    crate::telemetry::metrics::metrics()
+                        .state_capacity_dropped(self.driver_signatures.len() as u64);
                     self.driver_signatures.clear();
                 }
                 *self

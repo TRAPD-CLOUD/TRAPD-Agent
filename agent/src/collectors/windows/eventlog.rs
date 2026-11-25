@@ -34,7 +34,7 @@ impl Drop for Handle {
     }
 }
 
-fn render(event: EVT_HANDLE) -> Result<String> {
+fn render_as(event: EVT_HANDLE, format: EVT_RENDER_FLAGS) -> Result<String> {
     let mut bytes = 0;
     let mut properties = 0;
     // SAFETY: query size first; all out-pointers point to valid storage.
@@ -42,7 +42,7 @@ fn render(event: EVT_HANDLE) -> Result<String> {
         EvtRender(
             0,
             event,
-            EvtRenderEventXml,
+            format,
             0,
             std::ptr::null_mut(),
             &mut bytes,
@@ -58,7 +58,7 @@ fn render(event: EVT_HANDLE) -> Result<String> {
         EvtRender(
             0,
             event,
-            EvtRenderEventXml,
+            format,
             bytes,
             data.as_mut_ptr().cast(),
             &mut bytes,
@@ -70,6 +70,28 @@ fn render(event: EVT_HANDLE) -> Result<String> {
     }
     let length = data.iter().position(|c| *c == 0).unwrap_or(data.len());
     Ok(String::from_utf16(&data[..length])?)
+}
+
+// The bookmark provides the record identity even when its event XML is too
+// large or impossible to render. Commit this position only after any preceding
+// deliverable records have been accepted.
+fn skipped_record_id(event: EVT_HANDLE) -> Option<u64> {
+    let bookmark = Handle(unsafe { EvtCreateBookmark(std::ptr::null()) });
+    if bookmark.0 == 0 || unsafe { EvtUpdateBookmark(bookmark.0, event) } == 0 {
+        return None;
+    }
+    let xml = render_as(bookmark.0, EvtRenderBookmark).ok()?;
+    bookmark_record_id(&xml)
+}
+
+fn bookmark_record_id(xml: &str) -> Option<u64> {
+    roxmltree::Document::parse(xml)
+        .ok()?
+        .descendants()
+        .find(|node| node.has_tag_name("Bookmark"))?
+        .attribute("RecordId")?
+        .parse()
+        .ok()
 }
 
 /// Events requested from one `EvtNext` call.
@@ -98,6 +120,8 @@ const MAX_PER_TICK: usize = 8192;
 /// Result of one bounded read of a channel.
 struct Batch {
     records: Vec<String>,
+    examined: usize,
+    skipped_through: Option<u64>,
     /// The query reported no more items (`ERROR_NO_MORE_ITEMS`).
     exhausted: bool,
 }
@@ -182,8 +206,10 @@ fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<
     let mut out = Vec::with_capacity(limit.min(EVT_BATCH));
     let mut exhausted = false;
     let mut retained = 0usize;
-    'query: while out.len() < limit {
-        let want = (limit - out.len()).min(EVT_BATCH);
+    let mut examined = 0usize;
+    let mut skipped_through = None;
+    'query: while examined < limit {
+        let want = (limit - examined).min(EVT_BATCH);
         let mut events: [EVT_HANDLE; EVT_BATCH] = [0; EVT_BATCH];
         let mut returned = 0u32;
         // SAFETY: `events` has room for `want` handles; EvtNext writes at most
@@ -206,6 +232,9 @@ fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<
             }
             bail!("EvtNext failed: {error}");
         }
+        if returned == 0 {
+            break;
+        }
         // Own every returned handle first so none leaks on a render failure.
         let handles: Vec<Handle> = events
             .get(..returned as usize)
@@ -214,26 +243,33 @@ fn run_query(channel: &str, query: &str, reverse: bool, limit: usize) -> Result<
             .map(|h| Handle(*h))
             .collect();
         for event in &handles {
-            match render(event.0) {
+            match render_as(event.0, EvtRenderEventXml) {
                 Ok(xml) => {
                     if !fits_batch(retained, xml.capacity()) {
                         break 'query;
                     }
+                    skipped_through = None;
                     retained += xml.capacity();
                     out.push(xml);
                 }
                 // One unrenderable record must not wedge the channel.
                 Err(e) => {
                     tracing::warn!(error = %e, "skipping unrenderable event-log record");
-                    // The cursor moves past this record, so the loss must be counted.
+                    if let Some(id) = skipped_record_id(event.0) {
+                        skipped_through = Some(id);
+                    }
+                    // Count the source loss independently of checkpoint persistence.
                     crate::telemetry::metrics::metrics()
                         .event_dropped(crate::telemetry::DropReason::InternalError);
                 }
             }
+            examined += 1;
         }
     }
     Ok(Batch {
         records: out,
+        examined,
+        skipped_through,
         exhausted,
     })
 }
@@ -448,6 +484,7 @@ fn capture_logon_type(
     if let Ok(t) = get("LogonType").parse::<u32>() {
         if !logon_id.is_empty() {
             if cache.len() >= 4096 {
+                crate::telemetry::metrics::metrics().state_capacity_dropped(cache.len() as u64);
                 cache.clear();
             }
             cache.insert(logon_id.to_string(), t);
@@ -748,18 +785,22 @@ impl Collector for EventLogCollector {
                             break;
                         }
                     };
-                    let Batch { records, exhausted } = batch;
-                    let batch_len = records.len();
+                    let Batch {
+                        records,
+                        exhausted,
+                        examined,
+                        skipped_through,
+                    } = batch;
                     crate::telemetry::coverage::update(|c| c.set_eventlog_active(channel, true));
                     if unavailable.remove(channel) {
                         tracing::info!(channel, "Windows event log available again");
                     }
-                    if records.is_empty() && cursor.is_none() {
+                    if examined == 0 && cursor.is_none() {
                         cursors.insert(channel.into(), 0);
                     }
                     // A cleared log can restart record numbering. Rebase visibly
                     // instead of waiting forever for the previous high-water mark.
-                    if records.is_empty() && cursor.is_some() {
+                    if examined == 0 && cursor.is_some() {
                         if let Ok(latest) =
                             tokio::task::spawn_blocking(move || read(channel, None)).await?
                         {
@@ -952,12 +993,20 @@ impl Collector for EventLogCollector {
                     if retry {
                         break;
                     }
-                    drained += batch_len;
+                    if let Some(id) = skipped_through {
+                        cursors.insert(channel.into(), id);
+                    }
+                    if cursors.get(channel).copied() == cursor {
+                        // No readable identity in this page. Retry on the next
+                        // poll without monopolizing the blocking pool.
+                        break;
+                    }
+                    drained += examined;
                     // The first start only records the newest id (one read).
                     if cursor.is_none() {
                         break;
                     }
-                    match after_batch(batch_len, exhausted, drained) {
+                    match after_batch(examined, exhausted, drained) {
                         Drain::Again => {}
                         Drain::Done => break,
                         Drain::Backlog => {
@@ -976,6 +1025,20 @@ impl Collector for EventLogCollector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bookmark_identity_survives_unrenderable_event_data() {
+        assert_eq!(
+            super::bookmark_record_id(
+                r#"<BookmarkList><Bookmark Channel="System" RecordId="765" IsCurrent="true"/></BookmarkList>"#
+            ),
+            Some(765)
+        );
+        assert_eq!(
+            super::bookmark_record_id("<Bookmark RecordId='bad'/>"),
+            None
+        );
+    }
+
     #[test]
     fn batch_byte_limit_defers_records_without_overflow() {
         assert!(super::fits_batch(super::MAX_BATCH_BYTES - 1, 1));
