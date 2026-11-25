@@ -231,7 +231,8 @@ impl RootkitConfig {
                 .ok()
                 .and_then(|v| v.trim().parse::<i32>().ok())
                 .filter(|v| *v > 0)
-                .unwrap_or(defaults.pid_scan_max),
+                .unwrap_or(defaults.pid_scan_max)
+                .min(262_144),
             corroboration: std::env::var("TRAPD_ROOTKIT_CORROBORATION")
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok())
@@ -241,6 +242,7 @@ impl RootkitConfig {
                 .ok()
                 .map(|v| {
                     v.split(',')
+                        .take(64)
                         .map(|p| p.trim().to_string())
                         .filter(|p| p.starts_with('/'))
                         .collect::<Vec<_>>()
