@@ -24,8 +24,7 @@
 //!   starts without pins until its next config pull delivers them again;
 //!   signed state cannot be forged, but local deletion cannot be prevented.
 //!   An unreadable high-water file is treated as "flag set, set unknown": the
-//!   removal is reported but nothing can be enforced beyond the local pins
-//!   (failing closed would brick the agent without a way to recover).
+//!   connection is refused until a trusted high-water record or signed config is restored.
 
 use std::path::{Path, PathBuf};
 
@@ -83,17 +82,12 @@ pub enum HighWaterState {
 }
 
 pub fn load_high_water(path: &Path) -> HighWaterState {
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
+    let bytes = match crate::paths::bounded_regular_bytes(path, MAX_FILE_BYTES) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HighWaterState::Absent,
         Err(_) => return HighWaterState::Unreadable,
     };
-    if meta.len() > MAX_FILE_BYTES {
-        return HighWaterState::Unreadable;
-    }
-    let parsed = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<HighWater>(&b).ok());
+    let parsed = serde_json::from_slice::<HighWater>(&bytes).ok();
     match parsed {
         Some(hw)
             if !hw.pins.is_empty()
@@ -176,7 +170,10 @@ pub fn resolve(local: &PinPolicy, signed: &SignedPins, hw: &HighWaterState) -> R
             }),
         },
         HighWaterState::Unreadable => Resolution {
-            policy: local.clone(),
+            policy: PinPolicy {
+                enforce: true,
+                ..Default::default()
+            },
             store: StoreAction::Keep,
             removal: Some(RemovalNotice { enforced_pins: 0 }),
         },
@@ -455,15 +452,12 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_high_water_file_reports_removal_without_bricking_the_agent() {
+    fn unreadable_high_water_file_reports_removal_and_refuses_connections_until_repaired() {
         let path = tmp("corrupt");
         std::fs::write(&path, b"{not json").unwrap();
         let state = PinState::with_policy(PinPolicy::default());
         state.apply_signed(&SignedPins::default(), &path);
-        assert_eq!(
-            decide(&state.policy(), &chain(&[A])),
-            PinDecision::ReportOnly
-        );
+        assert_eq!(decide(&state.policy(), &chain(&[A])), PinDecision::Mismatch);
         assert_eq!(
             state.take_pins_removed(&path),
             Some(RemovalNotice { enforced_pins: 0 })

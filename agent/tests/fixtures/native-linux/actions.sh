@@ -5,7 +5,9 @@ mount -t tracefs tracefs /sys/kernel/tracing || true
 # Per-program run counters, so a failure can tell a hook that never ran from one
 # whose event was lost later (diagnostics only; read back before the stop).
 sysctl -qw kernel.bpf_stats_enabled=1 || true
-export TRAPD_OFFLINE=1 TRAPD_OUTPUT=stdout TRAPD_STATE_DIR=/test/state TRAPD_LOG_DIR=/test/logs TRAPD_EBPF_PATH=/test/trapd-agent-exec
+install -d -m 0700 /var/lib/trapd /var/log/trapd
+cp /test/state/*.json /var/lib/trapd/
+export TRAPD_OFFLINE=1 TRAPD_OUTPUT=stdout TRAPD_STATE_DIR=/var/lib/trapd TRAPD_LOG_DIR=/var/log/trapd TRAPD_EBPF_PATH=/test/trapd-agent-exec
 /test/agent > /test/events.ndjson 2>/test/agent.log & agent=$!
 echo "$agent" > /test/agent.pid
 trap 'kill -TERM "$agent" 2>/dev/null || true' EXIT

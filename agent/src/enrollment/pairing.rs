@@ -185,17 +185,13 @@ pub(super) fn classify_poll(status: u16, body: &str, retry_after: Option<Duratio
                 "authorization_pending" => PollOutcome::Pending,
                 "slow_down" => PollOutcome::SlowDown,
                 "expired_token" | "invalid_grant" => PollOutcome::Restart,
-                other => PollOutcome::Transient(format!("HTTP 400 ({})", snippet(other))),
+                _ => PollOutcome::Transient("HTTP 400 (unknown pairing error)".into()),
             },
             Err(_) => PollOutcome::Transient("HTTP 400 (unparsable error)".into()),
         },
         429 => PollOutcome::RateLimited(retry_after),
         s => PollOutcome::Transient(format!("HTTP {s}")),
     }
-}
-
-fn snippet(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).take(40).collect()
 }
 
 enum Step {
@@ -474,11 +470,7 @@ async fn try_start(
 
     let retry_after = parse_retry_after(&resp);
     let code = status.as_u16();
-    let body = crate::http::bounded_body(resp, crate::http::CONTROL_REPLY_BYTES)
-        .await
-        .unwrap_or_default();
-    let body = String::from_utf8_lossy(&body);
-    let reason = format!("HTTP {status} — {}", snippet(&body));
+    let reason = format!("HTTP {status}");
     if status.is_server_error() || matches!(code, 408 | 425 | 429) {
         Err(AttemptError::Transient {
             reason,
@@ -806,6 +798,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reflected_enrollment_tokens_stay_out_of_failure_reasons() {
+        let client = reqwest::Client::new();
+        for status in [403, 503] {
+            let (base, _) = stub_backend(vec![("/enroll", status, "private-test-token")]).await;
+            let err = crate::enrollment::try_enroll(
+                &client,
+                &format!("{base}/enroll"),
+                "private-test-token",
+                "device",
+                "host",
+            )
+            .await
+            .unwrap_err();
+            let reason = match err {
+                AttemptError::Permanent(s) | AttemptError::Transient { reason: s, .. } => s,
+            };
+            assert!(reason.contains(&status.to_string()));
+            assert!(!reason.contains("private-test-token"));
+        }
+        assert_eq!(
+            classify_poll(400, r#"{"error":"private-test-token"}"#, None),
+            PollOutcome::Transient("HTTP 400 (unknown pairing error)".into())
+        );
+    }
+
+    #[tokio::test]
     async fn permanent_start_rejection_is_an_error_not_a_loop() {
         let (base, _) = stub_backend(vec![(
             "/api/v1/agents/pair/start",
@@ -824,6 +842,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(format!("{err:#}").contains("rejected"), "{err:#}");
+        assert!(!format!("{err:#}").contains("Invalid pairing request"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -81,11 +81,18 @@ pub struct CompletedUpdate {
 }
 
 impl UpdateState {
-    pub fn load(paths: &StagingPaths) -> Self {
-        std::fs::read(paths.state())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+    pub fn load(paths: &StagingPaths) -> Result<Self> {
+        let bytes = match std::fs::read(paths.state()) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e).context("update: read replay state"),
+        };
+        let state: Self = serde_json::from_slice(&bytes).context("update: invalid replay state")?;
+        anyhow::ensure!(
+            state.last_issued_at >= 0,
+            "update: invalid replay watermark"
+        );
+        Ok(state)
     }
     pub fn save(&self, paths: &StagingPaths) -> Result<()> {
         crate::paths::write_atomic(&paths.state(), &serde_json::to_vec(self)?, 0o600)
@@ -547,7 +554,7 @@ fn finish_rollback(ctx: &ApplyContext<'_>, version: &str) -> Result<()> {
 }
 
 fn finish_update(paths: &StagingPaths, outcome: Outcome) -> Result<Outcome> {
-    let mut state = UpdateState::load(paths);
+    let mut state = UpdateState::load(paths)?;
     if let Outcome::RolledBack { attempted } = &outcome {
         state.blocked_version = Some(attempted.clone());
     }
@@ -566,7 +573,7 @@ fn finish_update(paths: &StagingPaths, outcome: Outcome) -> Result<Outcome> {
 /// installed-file changes. Match the exact offer so an old record cannot
 /// discard a newly accepted directive, even for the same release version.
 pub(super) fn resume_completed_staging(paths: &StagingPaths) -> Result<Option<Outcome>> {
-    let Some(completion) = UpdateState::load(paths).completion else {
+    let Some(completion) = UpdateState::load(paths)?.completion else {
         return Ok(None);
     };
     let offer = match std::fs::read(paths.offer()) {
@@ -715,7 +722,7 @@ fn apply_staged_marked(ctx: &ApplyContext<'_>, platform: &dyn Platform) -> Resul
 
     // The watermark was advanced when the offer was accepted, so verify as if
     // it were still one below and require the offer to be exactly that one.
-    let state = UpdateState::load(ctx.paths);
+    let state = UpdateState::load(ctx.paths)?;
     let verify = VerifyContext {
         last_issued_at: state.last_issued_at - 1,
         current_version: pending_recovery
@@ -1002,6 +1009,21 @@ mod tests {
         command: SigningKey,
     }
 
+    #[test]
+    fn damaged_update_state_never_resets_replay_protection() {
+        let env = setup(b"signed release", None);
+        for bytes in [b"truncated".as_slice(), br#"{"last_issued_at":-1}"#] {
+            std::fs::write(env.paths.state(), bytes).unwrap();
+            assert!(resume_completed_staging(&env.paths).is_err());
+            assert!(env.paths.offer().exists());
+            assert_eq!(std::fs::read(env.paths.state()).unwrap(), bytes);
+        }
+        std::fs::remove_file(env.paths.state()).unwrap();
+        assert_eq!(UpdateState::load(&env.paths).unwrap().last_issued_at, 0);
+        std::fs::create_dir(env.paths.state()).unwrap();
+        assert!(UpdateState::load(&env.paths).is_err());
+    }
+
     fn setup(artifact: &[u8], tamper_staged: Option<&[u8]>) -> Env {
         setup_full(artifact, tamper_staged, None)
     }
@@ -1251,7 +1273,10 @@ mod tests {
         assert!(recovery.installed.is_empty());
         assert!(env.paths.offer().exists());
         assert!(env.paths.artifact().exists());
-        assert!(UpdateState::load(&env.paths).blocked_version.is_none());
+        assert!(UpdateState::load(&env.paths)
+            .unwrap()
+            .blocked_version
+            .is_none());
         p.fail_stop = false;
         assert!(matches!(
             run_windows(&env, &p).unwrap(),
@@ -1260,7 +1285,10 @@ mod tests {
         assert_eq!(p.restarts.get(), 1);
         assert!(!env.paths.recovery().exists());
         assert_eq!(
-            UpdateState::load(&env.paths).blocked_version.as_deref(),
+            UpdateState::load(&env.paths)
+                .unwrap()
+                .blocked_version
+                .as_deref(),
             Some("0.5.0")
         );
     }
@@ -1278,7 +1306,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(env.paths.recovery()).unwrap()).unwrap();
         assert!(recovery.installed.is_empty());
         assert!(env.paths.offer().exists());
-        assert!(UpdateState::load(&env.paths).blocked_version.is_none());
+        assert!(UpdateState::load(&env.paths)
+            .unwrap()
+            .blocked_version
+            .is_none());
         p.fail_restart = false;
         assert!(matches!(
             run_windows(&env, &p).unwrap(),
@@ -1302,7 +1333,10 @@ mod tests {
             if fail_restart {
                 assert!(env.paths.recovery().exists());
                 assert!(env.paths.offer().exists());
-                assert!(UpdateState::load(&env.paths).blocked_version.is_none());
+                assert!(UpdateState::load(&env.paths)
+                    .unwrap()
+                    .blocked_version
+                    .is_none());
                 p.fail_restart = false;
                 assert!(matches!(
                     run_windows(&env, &p).unwrap(),
@@ -1311,7 +1345,10 @@ mod tests {
             }
             assert!(!env.paths.recovery().exists());
             assert_eq!(
-                UpdateState::load(&env.paths).blocked_version.as_deref(),
+                UpdateState::load(&env.paths)
+                    .unwrap()
+                    .blocked_version
+                    .as_deref(),
                 Some("0.5.0")
             );
         }
@@ -1416,7 +1453,10 @@ mod tests {
             );
             assert!(env.paths.offer().exists());
             assert!(env.paths.artifact().exists());
-            assert!(UpdateState::load(&env.paths).blocked_version.is_none());
+            assert!(UpdateState::load(&env.paths)
+                .unwrap()
+                .blocked_version
+                .is_none());
         }
     }
 
@@ -1739,7 +1779,10 @@ mod tests {
         assert_eq!(std::fs::read(&env.target).unwrap(), b"NEW BINARY");
         assert!(env.paths.recovery().exists());
         assert!(env.paths.offer().exists());
-        assert!(UpdateState::load(&env.paths).blocked_version.is_none());
+        assert!(UpdateState::load(&env.paths)
+            .unwrap()
+            .blocked_version
+            .is_none());
     }
 
     #[test]
@@ -1783,7 +1826,10 @@ mod tests {
         assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
         assert!(env.paths.offer().exists());
         assert!(env.paths.artifact().exists());
-        assert!(UpdateState::load(&env.paths).blocked_version.is_none());
+        assert!(UpdateState::load(&env.paths)
+            .unwrap()
+            .blocked_version
+            .is_none());
         assert!(matches!(
             run(&env, &platform(&env, None, false), 0).unwrap(),
             Outcome::RolledBack { .. }
@@ -1810,7 +1856,10 @@ mod tests {
             "offer remains available for recovery"
         );
         assert!(env.paths.artifact().exists());
-        assert!(UpdateState::load(&env.paths).blocked_version.is_none());
+        assert!(UpdateState::load(&env.paths)
+            .unwrap()
+            .blocked_version
+            .is_none());
     }
 
     #[test]
@@ -1953,7 +2002,7 @@ mod tests {
         );
         assert!(!env.paths.offer().exists());
         assert!(!env.paths.recovery().exists());
-        assert_eq!(UpdateState::load(&env.paths).last_issued_at, 500);
+        assert_eq!(UpdateState::load(&env.paths).unwrap().last_issued_at, 500);
     }
 
     #[test]
@@ -1970,7 +2019,7 @@ mod tests {
             }
         }
         assert!(run(&env, &InterruptedCleanup(&env), 0).is_err());
-        assert!(UpdateState::load(&env.paths).completion.is_some());
+        assert!(UpdateState::load(&env.paths).unwrap().completion.is_some());
         // Reconstruct the state at a crash immediately after the completion
         // commit: the healthy binary and the original rollback journal remain.
         std::fs::remove_dir(env.paths.recovery()).unwrap();
@@ -2016,7 +2065,10 @@ mod tests {
         .is_err());
         assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
         assert_eq!(
-            UpdateState::load(&env.paths).blocked_version.as_deref(),
+            UpdateState::load(&env.paths)
+                .unwrap()
+                .blocked_version
+                .as_deref(),
             Some("0.5.0")
         );
         assert!(env.paths.offer().exists());
@@ -2031,7 +2083,7 @@ mod tests {
         assert_eq!(p.restarts.get(), 0);
         assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
         assert!(!env.paths.offer().exists());
-        assert_eq!(UpdateState::load(&env.paths).last_issued_at, 500);
+        assert_eq!(UpdateState::load(&env.paths).unwrap().last_issued_at, 500);
     }
 
     #[test]
@@ -2048,14 +2100,14 @@ mod tests {
             std::fs::read(env.paths.artifact()).unwrap(),
             b"next artifact"
         );
-        assert_eq!(UpdateState::load(&env.paths).last_issued_at, 500);
+        assert_eq!(UpdateState::load(&env.paths).unwrap().last_issued_at, 500);
         std::fs::write(
             env.paths.state(),
             br#"{"last_issued_at":500,"blocked_version":null}"#,
         )
         .unwrap();
-        assert!(UpdateState::load(&env.paths).completion.is_none());
-        assert_eq!(UpdateState::load(&env.paths).last_issued_at, 500);
+        assert!(UpdateState::load(&env.paths).unwrap().completion.is_none());
+        assert_eq!(UpdateState::load(&env.paths).unwrap().last_issued_at, 500);
     }
 
     #[test]
@@ -2093,7 +2145,10 @@ mod tests {
         assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
         assert_eq!(p.restarts.get(), 2, "restart into new, then back into old");
         assert_eq!(
-            UpdateState::load(&env.paths).blocked_version.as_deref(),
+            UpdateState::load(&env.paths)
+                .unwrap()
+                .blocked_version
+                .as_deref(),
             Some("0.5.0")
         );
         assert!(
@@ -2326,7 +2381,10 @@ mod tests {
         );
         assert_eq!(std::fs::read(&env.target).unwrap(), b"OLD BINARY");
         assert_eq!(
-            UpdateState::load(&env.paths).blocked_version.as_deref(),
+            UpdateState::load(&env.paths)
+                .unwrap()
+                .blocked_version
+                .as_deref(),
             Some("0.5.0")
         );
     }

@@ -232,19 +232,7 @@ async fn rotate_log(log_file: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn secure_log_dir(path: &std::path::Path) -> Result<std::fs::File> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    std::fs::create_dir_all(path)?;
-    let directory = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)?;
-    if directory.metadata()?.uid() != unsafe { libc::geteuid() } {
-        anyhow::bail!("log directory is not owned by the agent user");
-    }
-    ensure_mode(&directory, 0o700)?;
-    Ok(directory)
-}
+use crate::paths::private_directory as secure_log_dir;
 
 #[cfg(target_os = "linux")]
 fn secure_log_file(directory: &std::fs::File, name: &str) -> Result<std::fs::File> {
@@ -280,20 +268,8 @@ fn open_secure_log(
             "log must be a regular, single-link file owned by the agent user",
         ));
     }
-    ensure_mode(&file, 0o600)?;
+    crate::paths::ensure_mode(&file, 0o600)?;
     Ok(file)
-}
-
-/// Set `mode` only when it differs. An unconditional `fchmod` raises
-/// `IN_ATTRIB` on every write, which the agent's own tamper watch reports as a
-/// critical `chmod` of its log (a self-inflicted feedback loop).
-#[cfg(target_os = "linux")]
-fn ensure_mode(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    if file.metadata()?.permissions().mode() & 0o7777 != mode {
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    }
-    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]

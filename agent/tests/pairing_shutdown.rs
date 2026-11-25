@@ -42,20 +42,63 @@ fn pending_linux_pairing_records_clean_signals_and_unclean_kills() {
         let root = std::env::temp_dir().join(format!("trapd-shutdown-{}", uuid::Uuid::new_v4()));
         let config = root.join("config");
         let state = root.join("state");
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
         std::fs::create_dir_all(&config).unwrap();
         std::fs::create_dir_all(&state).unwrap();
         let marker = state.join("run_state");
         std::fs::write(&marker, "clean").unwrap();
+        // A fresh, test-only TLS endpoint exercises the production pinned client.
+        use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+        let cert = config.join("ca.crt");
+        let key = root.join("server.key");
+        assert!(Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+                "-keyout"
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+        let tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from_pem_file(cert).unwrap()],
+                PrivateKeyDer::from_pem_file(key).unwrap(),
+            )
+            .unwrap();
+        let tls = std::sync::Arc::new(tls);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(60);
             while Instant::now() < deadline {
-                if let Ok((mut socket, _)) = listener.accept() {
+                if let Ok((socket, _)) = listener.accept() {
                     socket
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
+                    let conn = rustls::ServerConnection::new(tls.clone()).unwrap();
+                    let mut socket = rustls::StreamOwned::new(conn, socket);
                     let mut request = Vec::new();
                     let mut chunk = [0; 4096];
                     loop {
@@ -96,8 +139,8 @@ fn pending_linux_pairing_records_clean_signals_and_unclean_kills() {
                 .env("TRAPD_STATE_DIR", &state)
                 .env("TRAPD_LOG_DIR", root.join("logs"))
                 .env("TRAPD_OUTPUT", "file")
-                .env("TRAPD_BACKEND_URL", format!("http://{addr}"))
-                .env("TRAPD_TLS_ALLOW_SYSTEM_ROOTS", "1")
+                .env("TRAPD_BACKEND_URL", format!("https://{addr}"))
+                .env_remove("TRAPD_TLS_ALLOW_SYSTEM_ROOTS")
                 .env_remove("TRAPD_OFFLINE")
                 .env_remove("TRAPD_ENROLL_TOKEN")
                 .stdout(Stdio::null())

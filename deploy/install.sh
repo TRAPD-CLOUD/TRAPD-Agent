@@ -1,30 +1,20 @@
 #!/usr/bin/env bash
 # TRAPD Agent Installer
 #
-# Recommended install (download → inspect → run). Never pipe a remote script
-# straight into `sudo bash`: that prevents you from reviewing what runs as root,
-# and passing the enrollment token as a URL query parameter leaks it into shell
-# history and web-server / proxy access logs. Fetch the script, read it, then
-# run it with the token supplied via the environment (not the URL):
-#
-#   curl -fsSL -H "X-Enroll-Token: enroll_xxxx" \
-#        "https://api.example.com/install.sh" -o install.sh
-#   less install.sh                       # inspect before trusting it
+# Review this installer from a trusted distribution channel. For unattended
+# enrollment, provision /etc/trapd/enrollment.token as root with mode 0600.
+# Without a provisioned token, a backend-connected agent uses device pairing.
 #   sudo TRAPD_BACKEND_URL=https://api.example.com \
-#        TRAPD_ENROLL_TOKEN=enroll_xxxx \
-#        TRAPD_RELEASE_PUBKEY_B64=<independently-obtained-public-key> \
-#        bash install.sh
-#
-# Usage (manual):
-#   sudo TRAPD_BACKEND_URL=https://api.example.com \
-#        TRAPD_ENROLL_TOKEN=enroll_xxxx \
-#        TRAPD_RELEASE_PUBKEY_B64=<independently-obtained-public-key> \
-#        bash install.sh
+#        TRAPD_RELEASE_PUBKEY_B64=<independently-obtained-public-key> bash install.sh
 #
 # Optional: TRAPD_ENABLE_DECEPTION=1 also installs the systemd drop-in that lets
 # the agent plant honeytoken decoys in /home, /root, /srv and /opt (see
 # deploy/trapd-agent-deception.conf). Off by default; an existing drop-in is kept.
 set -euo pipefail
+if [[ -n "${TRAPD_ENROLL_TOKEN:-}" ]]; then
+    echo "Use /etc/trapd/enrollment.token or device pairing for enrollment." >&2
+    exit 1
+fi
 
 REPO="trapd-cloud/trapd-agent"
 BINARY_NAME="trapd-agent-linux-x86_64"
@@ -288,11 +278,10 @@ ENV_FILE="${ENV_DIR}/agent.env"
 TRAPD_BACKEND_URL="${TRAPD_BACKEND_URL:-}"
 TRAPD_BACKEND_URL="${TRAPD_BACKEND_URL%/}"
 
-if [[ -n "${TRAPD_BACKEND_URL}" && -n "${TRAPD_ENROLL_TOKEN:-}" ]]; then
+if [[ -n "${TRAPD_BACKEND_URL}" && ! -f "$ENV_FILE" ]]; then
     echo "Writing agent config to ${ENV_FILE}..."
     cat > "$ENV_FILE" <<ENVEOF
 TRAPD_BACKEND_URL=${TRAPD_BACKEND_URL}
-TRAPD_ENROLL_TOKEN=${TRAPD_ENROLL_TOKEN}
 TRAPD_OUTPUT=file
 RUST_LOG=info
 ENVEOF
@@ -302,11 +291,10 @@ elif [[ -f "$ENV_FILE" ]]; then
     echo "Keeping existing ${ENV_FILE} (not overwriting)."
 else
     echo ""
-    echo "⚠️  TRAPD_BACKEND_URL or TRAPD_ENROLL_TOKEN not set."
+    echo "⚠️  TRAPD_BACKEND_URL not set."
     echo "   Edit ${ENV_FILE} before starting the agent:"
     cat > "$ENV_FILE" <<ENVEOF
 TRAPD_BACKEND_URL=https://your-backend.example.com
-TRAPD_ENROLL_TOKEN=enroll_xxxx
 TRAPD_OUTPUT=file
 RUST_LOG=info
 ENVEOF
@@ -340,6 +328,7 @@ Environment=TRAPD_LOG_DIR=${LOG_DIR}
 Environment=HOME=${STATE_DIR}
 Environment=TRAPD_EBPF_PATH=${EBPF_INSTALL_BIN}
 EnvironmentFile=-/etc/trapd/agent.env
+UnsetEnvironment=TRAPD_ENROLL_TOKEN
 
 # systemd creates/owns these with correct permissions on every start.
 StateDirectory=trapd
@@ -412,6 +401,7 @@ Environment=TRAPD_CONFIG_DIR=/etc/trapd
 Environment=TRAPD_LOG_DIR=/var/log/trapd
 Environment=HOME=/var/lib/trapd
 EnvironmentFile=-/etc/trapd/agent.env
+UnsetEnvironment=TRAPD_ENROLL_TOKEN
 
 # The control channel (/run/trapd/guard.sock, 0600) and the records the guard
 # leaves for the agent (/var/lib/trapd/guard-events). Both units declare the

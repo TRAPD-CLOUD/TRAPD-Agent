@@ -101,9 +101,54 @@ enum AttemptError {
     Permanent(String),
 }
 
+/// Read provisioning secrets directly so child processes cannot inherit them.
+fn provisioned_token(dir: &std::path::Path) -> Result<Option<String>> {
+    let path = dir.join("enrollment.token");
+    match token_file::read(&path) {
+        Ok(token) => return Ok(Some(token)),
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(e) => return Err(e),
+    }
+    // Existing installations can carry the token in protected agent.env.
+    // systemd masks that setting and the native loader skips it.
+    match paths::bounded_regular_bytes(&dir.join("agent.env"), 1024 * 1024) {
+        Ok(bytes) => {
+            let text = std::str::from_utf8(&bytes).context("invalid agent.env encoding")?;
+            if let Some((_, token)) = paths::parse_agent_env(text)
+                .into_iter()
+                .rev()
+                .find(|(key, _)| key == "TRAPD_ENROLL_TOKEN")
+            {
+                if !token.is_empty() {
+                    return token_file::parse(token.as_bytes()).map(Some);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("cannot read enrollment configuration"),
+    }
+    #[cfg(windows)]
+    if let Some(token) = crate::collectors::windows::registry::string(
+        r"SOFTWARE\TRAPD\Agent",
+        "EnrollToken",
+        windows_sys::Win32::System::Registry::RRF_SUBKEY_WOW6464KEY,
+    ) {
+        if !token.is_empty() {
+            return token_file::parse(token.as_bytes()).map(Some);
+        }
+    }
+    anyhow::ensure!(
+        std::env::var_os("TRAPD_ENROLL_TOKEN").is_none(),
+        "environment enrollment tokens are unsupported; provision enrollment.token or use pairing"
+    );
+    Ok(None)
+}
+
 /// Load persisted credentials, or enroll for the first time.
 ///
-/// Enrollment uses `TRAPD_ENROLL_TOKEN` (one-time token from the dashboard) or,
+/// Enrollment uses a provisioned one-time credential or,
 /// when that is unset, device pairing (see [`pairing`]): the agent shows a short
 /// code (log + `pairing.txt`) that a signed-in user confirms in the web UI.
 /// Transient backend failures are retried with capped exponential backoff;
@@ -115,7 +160,9 @@ pub async fn load_or_enroll(
     hostname: &str,
 ) -> Result<Credentials> {
     // 1. Reuse valid persisted credentials.
-    if let Some(creds) = load_persisted().await {
+    if let Some(creds) =
+        parse_persisted_strict(tokio::fs::read_to_string(paths::credentials_file()).await)?
+    {
         info!(agent_id = %creds.agent_id, "Loaded persisted credentials");
         return Ok(creds);
     }
@@ -123,22 +170,7 @@ pub async fn load_or_enroll(
     // 2. First-run enrollment: an explicit one-time token (admin path), or —
     //    when none is configured — interactive device pairing, where a person
     //    confirms a short code in the web UI and the backend hands us a token.
-    let env_token = std::env::var("TRAPD_ENROLL_TOKEN")
-        .ok()
-        .filter(|t| !t.trim().is_empty());
-
-    // The one-time enrollment token has now been captured into a local. Remove
-    // it from the process environment so it is no longer exposed via
-    // /proc/self/environ for the (potentially long) lifetime of the agent. A
-    // leaked token would let an attacker enroll a rogue agent against the same
-    // project. We hold the copy we need for the retry loop below.
-    //
-    // SAFETY: called before any collectors/worker tasks are spawned, while the
-    // agent is still single-threaded, so no other thread can be reading the
-    // environment concurrently.
-    if env_token.is_some() {
-        unsafe { std::env::remove_var("TRAPD_ENROLL_TOKEN") };
-    }
+    let staged_token = provisioned_token(paths::config_dir())?;
 
     let base = crate::http::normalize_base_url(backend_url);
     let enroll_url = format!("{base}/api/v1/agents/enroll");
@@ -147,10 +179,10 @@ pub async fn load_or_enroll(
     // than send the one-time token to a potentially MITM'd endpoint.
     let client = crate::http::control_client()
         .context("cannot build a secured control-channel client for enrollment")?;
-    let enroll_token = match env_token {
+    let enroll_token = match staged_token {
         Some(token) => token,
         None => {
-            info!("No TRAPD_ENROLL_TOKEN set — starting device pairing");
+            info!("No provisioned enrollment token — starting device pairing");
             pairing::obtain_enrollment_token(&client, &base, device_id, hostname)
                 .await
                 .context("device pairing failed")?
@@ -248,8 +280,8 @@ async fn try_enroll(
                     })
                 }
             }
-            Err(e) => Err(AttemptError::Transient {
-                reason: format!("could not parse enrollment response: {e}"),
+            Err(_) => Err(AttemptError::Transient {
+                reason: "could not parse enrollment response".into(),
                 retry_after: None,
             }),
         };
@@ -257,11 +289,6 @@ async fn try_enroll(
 
     // Non-2xx: decide transient vs permanent.
     let retry_after = parse_retry_after(&resp);
-    let body = crate::http::bounded_body(resp, crate::http::CONTROL_REPLY_BYTES)
-        .await
-        .unwrap_or_default();
-    let body = String::from_utf8_lossy(&body);
-    let snippet = body.chars().take(300).collect::<String>();
     let code = status.as_u16();
 
     let transient = status.is_server_error() // 5xx
@@ -271,13 +298,11 @@ async fn try_enroll(
 
     if transient {
         Err(AttemptError::Transient {
-            reason: format!("HTTP {status} — {snippet}"),
+            reason: format!("HTTP {status}"),
             retry_after,
         })
     } else {
-        Err(AttemptError::Permanent(format!(
-            "HTTP {status} — {snippet}"
-        )))
+        Err(AttemptError::Permanent(format!("HTTP {status}")))
     }
 }
 
@@ -330,7 +355,7 @@ pub(crate) fn parse_persisted_strict(
         Err(e) => anyhow::bail!("credentials file is unreadable ({e})"),
     };
     let creds: Credentials = serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("credentials file is not valid JSON ({e})"))?;
+        .map_err(|_| anyhow::anyhow!("credentials file is not valid JSON"))?;
     if !creds.is_valid() {
         anyhow::bail!("credentials file holds an invalid identity");
     }
@@ -353,8 +378,8 @@ pub(crate) async fn load_persisted() -> Option<Credentials> {
             warn!(path = %path.display(), "credentials file present but invalid — will re-enroll");
             None
         }
-        Err(e) => {
-            warn!(path = %path.display(), error = %e, "credentials file unparsable — will re-enroll");
+        Err(_) => {
+            warn!(path = %path.display(), "credentials file unparsable");
             None
         }
     }
@@ -481,6 +506,31 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn provisioned_file_takes_precedence_and_invalid_file_fails_closed() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("agent.env"), "TRAPD_ENROLL_TOKEN=legacy").unwrap();
+        assert_eq!(
+            super::provisioned_token(&root).unwrap().as_deref(),
+            Some("legacy")
+        );
+        let file = root.join("enrollment.token");
+        std::fs::write(&file, "current").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            super::provisioned_token(&root).unwrap().as_deref(),
+            Some("current")
+        );
+        std::fs::write(&file, "invalid token").unwrap();
+        assert!(super::provisioned_token(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn strict_read_only_not_found_means_unenrolled() {
