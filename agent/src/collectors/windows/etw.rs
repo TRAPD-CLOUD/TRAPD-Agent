@@ -45,14 +45,21 @@ use crate::telemetry::image_hash::{self, HashOutcome};
 const SESSION_NAME: &str = "TRAPD-Agent";
 /// Cap on a single property's decoded size (defensive).
 const MAX_PROP_BYTES: usize = 64 * 1024;
-// Per session, at most 64 queued records and 32 being mapped. String and
-// byte-vector capacity counts, including context captured after TDH decoding.
-const QUEUE_RECORDS: usize = 64;
-const MAX_RECORD_BYTES: usize = 96 * 1024;
+// Both limits include records waiting for the blocking decoder. Small records
+// can absorb normal bursts while large records share a fixed heap budget.
+const QUEUE_RECORDS: usize = 8192;
+const QUEUE_BYTES: usize = 6 * 1024 * 1024;
 
-fn record_fits(record: &EtwRecord) -> bool {
-    let mut bytes = std::mem::size_of::<EtwRecord>()
-        + record.props.capacity() * (std::mem::size_of::<(String, EtwValue)>() + 2);
+struct QueuedRecord {
+    record: EtwRecord,
+    _budget: tokio::sync::OwnedSemaphorePermit,
+}
+
+fn record_charge(record: &EtwRecord) -> usize {
+    // Include room for allocator metadata, channel slots and the hash table.
+    let mut bytes = std::mem::size_of::<QueuedRecord>()
+        + 128
+        + record.props.capacity() * (std::mem::size_of::<(String, EtwValue)>() + 64);
     for (name, value) in &record.props {
         bytes += name.capacity()
             + match value {
@@ -72,13 +79,14 @@ fn record_fits(record: &EtwRecord) -> bool {
         .map(String::capacity)
         .sum::<usize>();
     }
-    bytes <= MAX_RECORD_BYTES
+    bytes
 }
 
 /// Shared sink the C callback writes decoded records into, drained by the async
 /// side. A plain channel keeps the `unsafe extern "system"` callback tiny.
 struct Sink {
-    tx: tokio::sync::mpsc::Sender<EtwRecord>,
+    tx: tokio::sync::mpsc::Sender<QueuedRecord>,
+    budget: Arc<tokio::sync::Semaphore>,
     lost: std::sync::atomic::AtomicU64,
     /// Main session: Kernel-File is subscribed only for named pipes, so every
     /// other Kernel-File record is dropped in the callback. The file-actor
@@ -159,9 +167,10 @@ impl Collector for EtwCollector {
     ) -> Result<()> {
         // The opt-in must hold before the first record is decoded.
         sync_amsi_capture(&self.config);
-        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<EtwRecord>(QUEUE_RECORDS);
+        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<QueuedRecord>(QUEUE_RECORDS);
         let sink = Arc::new(Sink {
             tx: rec_tx,
+            budget: Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTES)),
             lost: std::sync::atomic::AtomicU64::new(0),
             kernel_file_pipes_only: true,
         });
@@ -198,7 +207,7 @@ impl Collector for EtwCollector {
         // Records are decoded in batches: one blocking task per batch instead of
         // one per record, with the decode state moved in and out once. Order is
         // preserved (a batch is decoded sequentially, batches are sequential).
-        let mut batch: Vec<EtwRecord> = Vec::with_capacity(DECODE_BATCH);
+        let mut batch: Vec<QueuedRecord> = Vec::with_capacity(DECODE_BATCH);
         loop {
             crate::telemetry::liveness::beat("WindowsEtwCollector");
             sync_amsi_capture(&self.config);
@@ -223,7 +232,12 @@ impl Collector for EtwCollector {
             let host = hostname.clone();
             let records = std::mem::take(&mut batch);
             let (next_state, recycled, events) = tokio::task::spawn_blocking(move || {
-                let events = map_batch(&mut state, &records, &aid, &host);
+                let events = map_batch(
+                    &mut state,
+                    records.iter().map(|queued| &queued.record),
+                    &aid,
+                    &host,
+                );
                 (state, records, events)
             })
             .await?;
@@ -355,9 +369,10 @@ impl Collector for EtwFileActorCollector {
         _agent_id: String,
         _hostname: String,
     ) -> Result<()> {
-        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<EtwRecord>(QUEUE_RECORDS);
+        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::channel::<QueuedRecord>(QUEUE_RECORDS);
         let sink = Arc::new(Sink {
             tx: rec_tx,
+            budget: Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTES)),
             lost: std::sync::atomic::AtomicU64::new(0),
             kernel_file_pipes_only: false,
         });
@@ -378,7 +393,7 @@ impl Collector for EtwFileActorCollector {
             objects: etw_map::FileObjects::default(),
             lineages: HashMap::new(),
         };
-        let mut batch: Vec<EtwRecord> = Vec::with_capacity(DECODE_BATCH);
+        let mut batch: Vec<QueuedRecord> = Vec::with_capacity(DECODE_BATCH);
         loop {
             batch.clear();
             tokio::select! {
@@ -392,7 +407,7 @@ impl Collector for EtwFileActorCollector {
             let records = std::mem::take(&mut batch);
             let (next_state, recycled) = tokio::task::spawn_blocking(move || {
                 for rec in &records {
-                    state.handle(rec);
+                    state.handle(&rec.record);
                 }
                 (state, records)
             })
@@ -426,14 +441,14 @@ const PIPE_SHED_AFTER_LOST: u64 = 2000;
 const DECODE_BATCH: usize = 32;
 
 /// Decode `records` in order with one shared state.
-fn map_batch(
+fn map_batch<'a>(
     state: &mut DecodeState,
-    records: &[EtwRecord],
+    records: impl IntoIterator<Item = &'a EtwRecord>,
     agent_id: &str,
     hostname: &str,
 ) -> Vec<AgentEvent> {
     records
-        .iter()
+        .into_iter()
         .flat_map(|rec| state.map(rec, agent_id, hostname))
         .collect()
 }
@@ -659,11 +674,18 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         if decoded.provider == etw_map::KERNEL_PROCESS && decoded.id == 1 {
             decoded.captured = Some(capture_at_start(&decoded));
         }
-        if record_fits(&decoded) {
-            slot.send(decoded);
-        } else {
+        let charge = record_charge(&decoded);
+        if charge > QUEUE_BYTES {
             crate::telemetry::metrics::metrics()
                 .event_dropped(crate::telemetry::DropReason::EventTooLarge);
+        } else if let Ok(permit) = Arc::clone(&sink.budget).try_acquire_many_owned(charge as u32) {
+            slot.send(QueuedRecord {
+                record: decoded,
+                _budget: permit,
+            });
+        } else {
+            crate::telemetry::metrics::metrics()
+                .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
         }
     } else if [
         etw_map::KERNEL_PROCESS,
@@ -1485,6 +1507,7 @@ mod native_tests {
             let (tx, mut rx) = tokio::sync::mpsc::channel(8192);
             let sink = Arc::new(Sink {
                 tx,
+                budget: Arc::new(tokio::sync::Semaphore::new(QUEUE_BYTES)),
                 lost: std::sync::atomic::AtomicU64::new(0),
                 kernel_file_pipes_only: true,
             });
@@ -1510,7 +1533,8 @@ mod native_tests {
                 loop {
                     tokio::select! {
                         record = rx.recv() => {
-                            let Some(record) = record else { return false };
+                            let Some(queued) = record else { return false };
+                            let record = &queued.record;
                             let pid = record.int(&["ProcessID", "ProcessId"]);
                             if record.provider == etw_map::KERNEL_PROCESS
                                 && record.id == 1
@@ -1548,16 +1572,27 @@ mod record_budget_tests {
     use super::*;
 
     #[test]
-    fn multiple_admissible_properties_can_exceed_record_budget() {
+    fn byte_budget_accounts_for_heap_payloads_and_is_returned_after_mapping() {
         let mut record = EtwRecord::default();
         record
             .props
             .insert("one".into(), EtwValue::Bytes(vec![0; MAX_PROP_BYTES]));
-        assert!(record_fits(&record));
+        let original = record_charge(&record);
         record.captured = Some(ProcessEnrichment {
             cmdline: Some("x".repeat(MAX_PROP_BYTES)),
             ..Default::default()
         });
-        assert!(!record_fits(&record));
+        let charge = record_charge(&record);
+        assert!(charge >= original + MAX_PROP_BYTES);
+        let budget = Arc::new(tokio::sync::Semaphore::new(charge));
+        let queued = QueuedRecord {
+            record,
+            _budget: Arc::clone(&budget)
+                .try_acquire_many_owned(charge as u32)
+                .unwrap(),
+        };
+        assert!(budget.try_acquire().is_err());
+        drop(queued);
+        assert_eq!(budget.available_permits(), charge);
     }
 }
