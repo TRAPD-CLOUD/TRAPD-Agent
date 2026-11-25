@@ -172,6 +172,17 @@ pub fn restore(host: &mut dyn Host, receipt: Receipt) -> Result<()> {
     }
 }
 
+/// Both installer records contain only fixed fields. Leave malformed existing
+/// records in place so a repair attempt cannot erase ownership information.
+#[cfg(any(windows, test))]
+fn read_record<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<Option<T>> {
+    match crate::paths::bounded_regular_bytes(path, 4096) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[cfg(windows)]
 pub use windows_host::run_cli;
 
@@ -280,13 +291,6 @@ mod windows_host {
         prior: Option<Receipt>,
     }
 
-    fn load_receipt() -> Receipt {
-        std::fs::read(receipt_path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
-    }
-
     fn write_receipt(receipt: &Receipt) -> Result<()> {
         crate::paths::write_atomic(&receipt_path(), &serde_json::to_vec(receipt)?, 0o600)
             .context("record audit baseline receipt")
@@ -305,31 +309,26 @@ mod windows_host {
         let mut host = WindowsHost;
         match verb {
             Some("apply") => {
-                let prior = load_receipt();
-                let had_receipt = receipt_path().exists();
+                let prior = super::read_record::<Receipt>(&receipt_path())?;
                 // Kept so a failed install transaction can put things back.
                 crate::paths::write_atomic(
                     &snapshot_path(),
-                    &serde_json::to_vec(&Snapshot {
-                        prior: had_receipt.then_some(prior),
-                    })?,
+                    &serde_json::to_vec(&Snapshot { prior })?,
                     0o600,
                 )
                 .context("record audit baseline rollback snapshot")?;
-                apply_recording(&mut host, prior, &mut write_receipt).map(|_| ())
+                apply_recording(&mut host, prior.unwrap_or_default(), &mut write_receipt)
+                    .map(|_| ())
             }
             Some("rollback") => {
                 // Runs only if the install transaction failed after `apply`.
-                let Some(snapshot) = std::fs::read(snapshot_path())
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<Snapshot>(&b).ok())
-                else {
+                let Some(snapshot) = super::read_record::<Snapshot>(&snapshot_path())? else {
                     return Ok(());
                 };
                 let result = rollback(
                     &mut host,
                     snapshot.prior.unwrap_or_default(),
-                    load_receipt(),
+                    super::read_record(&receipt_path())?.unwrap_or_default(),
                 );
                 match snapshot.prior {
                     Some(prior) => write_receipt(&prior)?,
@@ -339,7 +338,10 @@ mod windows_host {
                 result
             }
             Some("restore") => {
-                restore(&mut host, load_receipt())?;
+                restore(
+                    &mut host,
+                    super::read_record(&receipt_path())?.unwrap_or_default(),
+                )?;
                 remove(snapshot_path())?;
                 remove(receipt_path())
             }
@@ -352,6 +354,17 @@ mod windows_host {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+
+    #[test]
+    fn damaged_installer_receipts_are_distinct_from_missing_receipts() {
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        assert!(read_record::<Receipt>(&path).unwrap().is_none());
+        std::fs::write(&path, vec![b' '; 4097]).unwrap();
+        assert!(read_record::<Receipt>(&path).is_err());
+        std::fs::write(&path, b"{").unwrap();
+        assert!(read_record::<Receipt>(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[derive(Default)]
     struct Fake {

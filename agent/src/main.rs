@@ -10,7 +10,6 @@ use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use tokio::fs;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -329,7 +328,6 @@ async fn main() -> Result<()> {
         Spool::in_memory(pipeline::SPOOL_MAX_MEMORY)
     } else {
         Spool::durable(pipeline::spool_max_from_env())
-            .with_max_bytes(pipeline::spool_max_bytes_from_env())
     };
     if spool.is_degraded() {
         warn!("spool has no durable backing — unacknowledged events will not survive a restart");
@@ -978,33 +976,43 @@ fn env_truthy(key: &str) -> bool {
 /// resolved independently of `$HOME`, so this works under a hardened systemd
 /// unit where `HOME` may be unset.  Written atomically at mode `0600`.
 async fn load_or_create_device_id() -> Result<String> {
-    let file = paths::device_id_file();
+    tokio::task::spawn_blocking(|| device_id_at(&paths::device_id_file()))
+        .await
+        .context("join device identity task")?
+}
 
-    if file.exists() {
-        let raw = fs::read_to_string(&file)
-            .await
-            .context("Failed to read device_id file")?;
-        let trimmed = raw.trim();
-        if Uuid::parse_str(trimmed).is_ok() {
-            return Ok(trimmed.to_string());
+fn device_id_at(file: &std::path::Path) -> Result<String> {
+    match paths::bounded_regular_bytes(file, 4096) {
+        Ok(raw) => {
+            let text = std::str::from_utf8(&raw).context("invalid device_id encoding")?;
+            let trimmed = text.trim();
+            if Uuid::parse_str(trimmed).is_ok() {
+                return Ok(trimmed.to_owned());
+            }
+            warn!("device_id file invalid — regenerating");
         }
-        warn!(path = %file.display(), "device_id file invalid — regenerating");
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("Failed to read device_id file"),
     }
 
     let id = Uuid::new_v4().to_string();
-    let bytes = id.as_bytes().to_vec();
-    let path = file.clone();
-    tokio::task::spawn_blocking(move || paths::write_atomic(&path, &bytes, 0o600))
-        .await
-        .context("join device_id write task")?
-        .context("Failed to write device_id file")?;
-    info!("Generated new device_id: {id}");
+    paths::write_atomic(file, id.as_bytes(), 0o600).context("Failed to write device_id file")?;
+    info!("Generated new device_id");
     Ok(id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_device_identity_is_preserved_after_failed_read() {
+        let file = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        std::fs::write(&file, [b'a'; 4097]).unwrap();
+        assert!(device_id_at(&file).is_err());
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), 4097);
+        std::fs::remove_file(file).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
