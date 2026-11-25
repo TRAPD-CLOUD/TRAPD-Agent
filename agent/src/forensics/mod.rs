@@ -150,16 +150,16 @@ impl snapshot::SnapshotProc for RealProc {
 /// Resolve a username from `/etc/passwd` (shared by the readers).
 #[cfg(not(windows))]
 fn username_for_uid(uid: u32) -> Option<String> {
-    std::fs::read_to_string("/etc/passwd")
-        .ok()?
-        .lines()
-        .find_map(|line| {
-            let mut f = line.splitn(7, ':');
-            let name = f.next()?;
-            let _ = f.next();
-            let u = f.next()?.parse::<u32>().ok()?;
-            (u == uid).then(|| name.to_string())
-        })
+    let bytes =
+        crate::paths::bounded_regular_bytes(std::path::Path::new("/etc/passwd"), 1024 * 1024)
+            .ok()?;
+    std::str::from_utf8(&bytes).ok()?.lines().find_map(|line| {
+        let mut f = line.splitn(7, ':');
+        let name = f.next()?;
+        let _ = f.next();
+        let u = f.next()?.parse::<u32>().ok()?;
+        (u == uid).then(|| name.to_string())
+    })
 }
 
 /// Windows readers. There is no `/proc`: process facts come from the process

@@ -14,7 +14,9 @@ pub fn gather_with_flags(
     flags: compliance::ComplianceFlags,
     cve_feed: &[compliance::CveEntry],
 ) -> InventorySnapshot {
-    let sys = System::new_all();
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.refresh_cpu();
     let reg_path = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
     let mut packages = Vec::new();
     for (key_view, value_view, arch) in [

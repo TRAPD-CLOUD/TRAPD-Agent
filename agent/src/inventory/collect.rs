@@ -423,7 +423,12 @@ fn build_inode_pid_map() -> std::collections::HashMap<u64, i32> {
     let Ok(proc_dir) = std::fs::read_dir("/proc") else {
         return map;
     };
+    let mut remaining = 65_536usize;
     for entry in proc_dir.flatten() {
+        if remaining == 0 {
+            break;
+        }
+        remaining -= 1;
         let name = entry.file_name();
         let Ok(pid) = name.to_string_lossy().parse::<i32>() else {
             continue;
@@ -432,6 +437,10 @@ fn build_inode_pid_map() -> std::collections::HashMap<u64, i32> {
             continue;
         };
         for fd in fd_dir.flatten() {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
             if let Ok(link) = std::fs::read_link(fd.path()) {
                 let s = link.to_string_lossy();
                 if let Some(inode) = s
@@ -443,6 +452,10 @@ fn build_inode_pid_map() -> std::collections::HashMap<u64, i32> {
                 }
             }
         }
+    }
+    if remaining == 0 {
+        crate::telemetry::metrics::metrics().state_capacity_dropped(1);
+        tracing::warn!("inventory socket owner lookup incomplete: FD sweep budget reached");
     }
     map
 }

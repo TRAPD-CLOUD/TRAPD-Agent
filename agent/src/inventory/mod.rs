@@ -309,7 +309,7 @@ impl InventoryReporter {
                         vuln_scan: c.vuln_scan_enabled,
                         cis: c.cis_benchmark_enabled,
                     },
-                    c.cve_feed.clone(),
+                    compliance::bounded_feed(&c.cve_feed),
                 )
             })
             .unwrap_or_default();
