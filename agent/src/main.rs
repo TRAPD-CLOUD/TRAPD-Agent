@@ -564,36 +564,7 @@ async fn main() -> Result<()> {
     // Publish the telemetry report the `diagnostics telemetry` command reads.
     // Runs in both modes: an offline agent still needs its queue and drop
     // counters to be inspectable.
-    {
-        let started = std::time::Instant::now();
-        let report_path = telemetry::TelemetryReport::default_path();
-        #[cfg(windows)]
-        let learning_config = Arc::clone(&agent_config);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
-            loop {
-                ticker.tick().await;
-                #[cfg(windows)]
-                {
-                    let enabled = learning_config
-                        .read()
-                        .map(|c| c.deception_activity_learning_enabled)
-                        .unwrap_or(false);
-                    if crate::deception::activity::enabled() != enabled {
-                        crate::deception::activity::set_enabled(enabled);
-                    }
-                    crate::deception::activity::persist();
-                }
-                let report =
-                    telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
-                if let Err(e) = report.write_atomic(&report_path) {
-                    // Losing the report costs visibility, not telemetry, so it
-                    // must never take the agent down with it.
-                    warn!(error = %e, "could not publish the telemetry report");
-                }
-            }
-        });
-    }
+    tokio::spawn(telemetry::snapshot::publish_periodically(offline));
 
     // Asset inventory reporter — runs in BOTH modes.  Online it POSTs to
     // `/api/v1/agents/{id}/inventory`; offline it writes <state>/inventory.json

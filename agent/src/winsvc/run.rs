@@ -646,20 +646,9 @@ pub(super) async fn run_agent(
         }
     });
 
-    let started = std::time::Instant::now();
-    handles.push(tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
-        loop {
-            ticker.tick().await;
-            crate::deception::activity::persist();
-            let report =
-                crate::telemetry::TelemetryReport::capture(offline, started.elapsed().as_secs());
-            if let Err(e) = report.write_atomic(&crate::telemetry::TelemetryReport::default_path())
-            {
-                warn!(error = %e, "could not publish telemetry report");
-            }
-        }
-    }));
+    handles.push(tokio::spawn(
+        crate::telemetry::snapshot::publish_periodically(offline),
+    ));
 
     let inventory = crate::inventory::InventoryReporter::new(
         &backend_url,

@@ -42,6 +42,33 @@ pub struct TelemetryReport {
     pub metrics: MetricsSnapshot,
 }
 
+/// Publish diagnostics on a single blocking worker at a time. A slow fsync
+/// or resume never queues extra snapshots.
+pub(crate) async fn publish_periodically(offline: bool) {
+    let started = std::time::Instant::now();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut failed = false;
+    loop {
+        ticker.tick().await;
+        let result = tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
+            crate::deception::activity::persist();
+            TelemetryReport::capture(offline, started.elapsed().as_secs())
+                .write_atomic(&TelemetryReport::default_path())
+        })
+        .await;
+        if first_publication_failure(&mut failed, !matches!(result, Ok(Ok(())))) {
+            tracing::warn!("could not publish telemetry report");
+        }
+    }
+}
+
+fn first_publication_failure(previous: &mut bool, failed: bool) -> bool {
+    let was_failed = std::mem::replace(previous, failed);
+    failed && !was_failed
+}
+
 impl TelemetryReport {
     /// Capture the current state of the global registry.
     pub fn capture(offline_mode: bool, uptime_secs: u64) -> Self {
@@ -135,6 +162,14 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publication_warning_resets_after_a_successful_write() {
+        let mut failed = false;
+        for (error, warn) in [(true, true), (true, false), (false, false), (true, true)] {
+            assert_eq!(super::first_publication_failure(&mut failed, error), warn);
+        }
+    }
+
     use super::*;
 
     fn tmp_path(tag: &str) -> PathBuf {
