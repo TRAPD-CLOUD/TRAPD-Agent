@@ -697,8 +697,8 @@ fn parse_postgresql(line: &str) -> ParsedLog {
         ..Default::default()
     };
     // `2024-01-15 12:00:00.123 UTC [1234] user@db LOG:  message`
-    if line.len() >= 23 {
-        p.timestamp = parse_ts(&line[..23]);
+    if let Some(prefix) = line.get(..23) {
+        p.timestamp = parse_ts(prefix);
     }
     if let Some(rest) = line.split("] ").nth(1) {
         // optional `user@db LEVEL:  msg`
@@ -1095,6 +1095,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn web_error_formats_preserve_severity_and_source_fields() {
+        let nginx = parse(
+            "nginx_error",
+            "2024/01/15 13:55:36 [error] 1234#0: upstream unavailable",
+        );
+        assert_eq!(nginx.pid, Some(1234));
+        assert_eq!(nginx.severity.as_deref(), Some("error"));
+        assert_eq!(nginx.message, "upstream unavailable");
+
+        let apache = parse("apache_error", "[Wed May 18 22:16:30.123456 2022] [core:error] [pid 1234] [client 192.0.2.3:4321] example");
+        assert_eq!(apache.fields["remote_addr"], "192.0.2.3");
+        assert_eq!(apache.fields["remote_port"], 4321);
+        assert_eq!(apache.severity.as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn cef_and_key_value_sources_preserve_structured_fields() {
+        let cef = parse(
+            "cef",
+            "CEF:0|Example|Collector|1|42|Session opened|3|src=192.0.2.3",
+        );
+        assert_eq!(cef.message, "Session opened");
+        assert_eq!(cef.fields["signature_id"], "42");
+        assert_eq!(cef.fields["src"], "192.0.2.3");
+
+        let kv = parse("kv", "service=web operation=read");
+        assert_eq!(kv.fields["service"], "web");
+        assert_eq!(kv.fields["operation"], "read");
+    }
+
+    #[test]
     fn syslog_rfc3164_sshd_failed() {
         let line = "<38>Oct 10 13:55:36 victim sshd[4242]: Failed password for root from 203.0.113.5 port 51000 ssh2";
         let p = parse("syslog", line);
@@ -1162,6 +1193,14 @@ mod tests {
         let p = parse("docker", line);
         assert_eq!(p.message, "listening on :80");
         assert_eq!(p.category, "container");
+    }
+
+    #[test]
+    fn postgres_preserves_localized_messages_without_a_timestamp() {
+        let text = "Datenbank bereit für Verbindungen";
+        let record = parse("postgresql", text);
+        assert_eq!(record.message, text);
+        assert!(record.timestamp.is_none());
     }
 
     #[test]

@@ -14,7 +14,10 @@ use tokio::process::{Child, Command};
 use tracing::{info, warn};
 
 use crate::config::LogSourceConfig;
-use crate::telemetry::{metrics::metrics, DropReason};
+use crate::telemetry::{
+    metrics::{metrics, Metrics},
+    DropReason,
+};
 
 use super::checkpoint::JournalCheckpoint;
 use super::parser::ParsedLog;
@@ -79,10 +82,10 @@ impl JournalTail {
     }
 
     /// Read the next JSON record, or `None` on EOF.
-    pub async fn next_line(&mut self) -> Option<String> {
+    pub async fn next_record(&mut self) -> Option<(ParsedLog, String)> {
         let max_line = self.max_line;
         let reader = self.reader.as_mut()?;
-        match read_line_bounded(reader, max_line).await {
+        match read_record(reader, max_line, metrics()).await {
             Ok(v) => v,
             Err(e) => {
                 warn!(source = %self.source, error = %e, "journal read failed");
@@ -98,12 +101,28 @@ impl JournalTail {
     }
 }
 
+/// Account for each physical record once, then continue with the next record.
+async fn read_record<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+    counters: &Metrics,
+) -> std::io::Result<Option<(ParsedLog, String)>> {
+    while let Some(line) = read_line_bounded(reader, max, counters).await? {
+        if let Some(record) = parse_journal_json(&line) {
+            return Ok(Some(record));
+        }
+        counters.event_dropped(DropReason::InternalError);
+    }
+    Ok(None)
+}
+
 /// Cap a single journal JSON record. A missing newline cannot grow the
 /// buffer without bound; oversized records are dropped as `event_too_large`
 /// and we resync on the next newline.
 async fn read_line_bounded<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max: usize,
+    counters: &Metrics,
 ) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
     let mut skipping = false;
@@ -118,15 +137,17 @@ async fn read_line_bounded<R: AsyncBufRead + Unpin>(
         if let Some(pos) = available.iter().position(|&b| b == b'\n') {
             if skipping {
                 reader.consume(pos + 1);
-                metrics().event_dropped(DropReason::EventTooLarge);
-                return Ok(Some(String::new()));
+                skipping = false;
+                continue;
+            }
+            if buf.len().saturating_add(pos + 1) > max {
+                reader.consume(pos + 1);
+                counters.event_dropped(DropReason::EventTooLarge);
+                buf.clear();
+                continue;
             }
             buf.extend_from_slice(&available[..=pos]);
             reader.consume(pos + 1);
-            if buf.len() > max {
-                metrics().event_dropped(DropReason::EventTooLarge);
-                return Ok(Some(String::new()));
-            }
             if buf.last() == Some(&b'\n') {
                 buf.pop();
             }
@@ -142,6 +163,7 @@ async fn read_line_bounded<R: AsyncBufRead + Unpin>(
         }
         if buf.len().saturating_add(n) > max {
             reader.consume(n);
+            counters.event_dropped(DropReason::EventTooLarge);
             skipping = true;
             buf.clear();
             continue;
@@ -238,7 +260,9 @@ mod tests {
     async fn bounded_read_keeps_short_line() {
         let data = b"{\"MESSAGE\":\"ok\"}\nnext\n";
         let mut r = BufReader::new(&data[..]);
-        let got = read_line_bounded(&mut r, 64).await.unwrap();
+        let got = read_line_bounded(&mut r, 64, &Metrics::new())
+            .await
+            .unwrap();
         assert_eq!(got.as_deref(), Some("{\"MESSAGE\":\"ok\"}"));
     }
 
@@ -248,10 +272,29 @@ mod tests {
         data.push(b'\n');
         data.extend_from_slice(b"ok\n");
         let mut r = BufReader::new(&data[..]);
-        let dropped = read_line_bounded(&mut r, 16).await.unwrap();
-        assert_eq!(dropped.as_deref(), Some(""));
-        let kept = read_line_bounded(&mut r, 16).await.unwrap();
+        let counters = Metrics::new();
+        let kept = read_line_bounded(&mut r, 16, &counters).await.unwrap();
         assert_eq!(kept.as_deref(), Some("ok"));
+        assert_eq!(counters.drops_for(DropReason::EventTooLarge), 1);
+    }
+
+    #[tokio::test]
+    async fn journal_accounts_for_invalid_json_and_unterminated_oversize() {
+        let data = b"missing json\n{\"MESSAGE\":\"ok\"}\n01234567890123456789";
+        let mut r = BufReader::with_capacity(4, &data[..]);
+        let counters = Metrics::new();
+        let limit = b"{\"MESSAGE\":\"ok\"}\n".len();
+        let (record, _) = read_record(&mut r, limit, &counters)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.message, "ok");
+        assert!(read_record(&mut r, limit, &counters)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(counters.drops_for(DropReason::InternalError), 1);
+        assert_eq!(counters.drops_for(DropReason::EventTooLarge), 1);
     }
 
     #[test]

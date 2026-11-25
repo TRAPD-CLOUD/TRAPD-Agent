@@ -45,18 +45,22 @@ impl Collector for AuthLogCollector {
         // (journal-only distros). If neither is available — or before the agent
         // has been granted read access (CAP_DAC_READ_SEARCH) — keep retrying
         // instead of giving up for the whole process lifetime.
+        let mut coverage =
+            crate::telemetry::coverage::SourceCoverage::new("AuthLogCollector/input".into());
         loop {
             let file = open_auth_log().await;
             let journalctl = find_journalctl();
             match select_source(file.is_some(), journalctl) {
                 AuthSource::File => {
+                    coverage.set_failed(false);
                     let (path, file) = file.expect("select_source returned File");
                     return tail_file(path, file, tx, agent_id, hostname).await;
                 }
                 AuthSource::Journal(bin) => {
-                    return run_journal(bin, tx, agent_id, hostname).await;
+                    return run_journal(bin, tx, agent_id, hostname, coverage).await;
                 }
                 AuthSource::Unavailable => {
+                    coverage.set_failed(true);
                     warn!(
                         "AuthLogCollector: no readable auth log in {AUTH_LOG_CANDIDATES:?} and no journalctl; retrying in 30s"
                     );
@@ -286,13 +290,23 @@ async fn run_journal(
     tx: Sender<AgentEvent>,
     agent_id: String,
     hostname: String,
+    mut coverage: crate::telemetry::coverage::SourceCoverage,
 ) -> Result<()> {
     info!("AuthLogCollector: no auth log file; following systemd journal via {journalctl}");
     let mut cursor: Option<String> = None;
     let mut backoff = JOURNAL_BACKOFF_MIN;
     loop {
         let started = std::time::Instant::now();
-        match follow_journal_once(journalctl, &mut cursor, &tx, &agent_id, &hostname).await {
+        match follow_journal_once(
+            journalctl,
+            &mut cursor,
+            &tx,
+            &agent_id,
+            &hostname,
+            &mut coverage,
+        )
+        .await
+        {
             Ok(true) => return Ok(()), // event channel closed
             Ok(false) => warn!("AuthLogCollector: journalctl exited; restarting in {backoff:?}"),
             Err(e) => warn!("AuthLogCollector: journalctl failed ({e}); restarting in {backoff:?}"),
@@ -300,6 +314,7 @@ async fn run_journal(
         if started.elapsed() > JOURNAL_BACKOFF_MAX {
             backoff = JOURNAL_BACKOFF_MIN; // it ran healthily for a while
         }
+        coverage.set_failed(true);
         sleep(backoff).await;
         backoff = (backoff * 2).min(JOURNAL_BACKOFF_MAX);
         if tx.is_closed() {
@@ -316,6 +331,7 @@ async fn follow_journal_once(
     tx: &Sender<AgentEvent>,
     agent_id: &str,
     hostname: &str,
+    coverage: &mut crate::telemetry::coverage::SourceCoverage,
 ) -> Result<bool> {
     use tokio::process::Command;
     let mut child = Command::new(journalctl)
@@ -331,6 +347,7 @@ async fn follow_journal_once(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("journalctl stdout not captured"))?;
+    coverage.set_failed(false);
     let mut reader = BufReader::new(stdout);
     let mut buf = Vec::new();
     loop {

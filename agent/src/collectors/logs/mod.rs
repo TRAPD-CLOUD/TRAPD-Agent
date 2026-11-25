@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 use crate::collectors::Collector;
 use crate::config::{AgentConfig, LogSourceConfig, SourceKind};
 use crate::schema::AgentEvent;
-use crate::telemetry::{metrics::metrics, DropReason};
+use crate::telemetry::{coverage::SourceCoverage, metrics::metrics, DropReason};
 
 mod catalogue;
 mod checkpoint;
@@ -103,6 +103,7 @@ impl Collector for LogCollector {
         // syslog tasks that die are retried after SOURCE_COOLDOWN.
         let mut tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
         let mut cooldown: HashMap<String, Instant> = HashMap::new();
+        let mut retry_coverage = SourceCoverage::new("LogCollector/source-retry".into());
         info!("LogCollector starting");
 
         loop {
@@ -116,6 +117,7 @@ impl Collector for LogCollector {
             };
             let desired: HashSet<String> = sources.iter().map(|s| s.name.clone()).collect();
 
+            cooldown.retain(|name, _| desired.contains(name));
             let stale: Vec<String> = tasks
                 .keys()
                 .filter(|n| !desired.contains(*n))
@@ -124,6 +126,7 @@ impl Collector for LogCollector {
             for name in stale {
                 if let Some(h) = tasks.remove(&name) {
                     h.abort();
+                    let _ = h.await;
                     info!(source = %name, "log source disarmed");
                 }
             }
@@ -169,6 +172,8 @@ impl Collector for LogCollector {
                     warn!(source = %name, "log source exited — retry after cooldown");
                 }
             }
+
+            retry_coverage.set_failed(!cooldown.is_empty());
 
             tokio::select! {
                 _ = tx.closed() => break,
@@ -217,6 +222,7 @@ async fn run_file_source(
     agent_id: String,
     hostname: String,
 ) {
+    let mut coverage = SourceCoverage::new(format!("log:{}", src.name));
     let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
     let mut watches: Vec<FileWatch> = Vec::new();
     let mut limiter = RateLimiter::new(src.max_eps);
@@ -247,11 +253,14 @@ async fn run_file_source(
             }
         }
 
+        let mut poll_failed = false;
         let mut i = 0;
         while i < watches.len() {
             let records = match watches[i].tail.poll() {
                 Ok(r) => r,
                 Err(e) => {
+                    poll_failed = true;
+                    coverage.set_failed(true);
                     debug!(source = %src.name, path = %watches[i].tail.path.display(), error = %e, "file poll");
                     i += 1;
                     continue;
@@ -420,6 +429,7 @@ async fn run_file_source(
             }
             i += 1;
         }
+        coverage.set_failed(poll_failed);
     }
 }
 
@@ -436,13 +446,10 @@ async fn run_journal_source(
         return;
     };
     let mut limiter = RateLimiter::new(src.max_eps);
-    while let Some(line) = tail.next_line().await {
+    while let Some((mut parsed, cursor)) = tail.next_record().await {
         if tx.is_closed() {
             break;
         }
-        let Some((mut parsed, cursor)) = journal::parse_journal_json(&line) else {
-            continue;
-        };
         // Product parser on the MESSAGE (sshd/sudo/json/…).
         if !src.parser.eq_ignore_ascii_case("raw") && !src.parser.eq_ignore_ascii_case("none") {
             let inner = parser::parse(&src.parser, &parsed.message);
@@ -495,11 +502,19 @@ async fn run_syslog_source(
         return;
     };
     let mut limiter = RateLimiter::new(src.max_eps);
-    let mut buf = vec![0u8; src.max_line_bytes.max(2048)];
+    let mut coverage = SourceCoverage::new(format!("log:{}", src.name));
+    // Reserve one sentinel byte to distinguish a complete datagram at the
+    // limit from a truncated one.
+    let mut buf = vec![0u8; src.max_line_bytes.max(2048).saturating_add(1)];
     loop {
-        let n = match sock.recv(&mut buf).await {
-            Ok(n) => n,
+        let n = match sock.recv_record(&mut buf, metrics()).await {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                coverage.set_failed(false);
+                continue;
+            }
             Err(e) => {
+                coverage.set_failed(true);
                 warn!(source = %src.name, error = %e, "syslog recv failed");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
@@ -508,6 +523,7 @@ async fn run_syslog_source(
         if tx.is_closed() {
             return;
         }
+        coverage.set_failed(false);
         let raw = String::from_utf8_lossy(&buf[..n]);
         if !emit_one(
             &src,
