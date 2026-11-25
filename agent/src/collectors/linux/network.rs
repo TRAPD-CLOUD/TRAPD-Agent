@@ -24,8 +24,8 @@ pub struct NetworkCollector {
 impl NetworkCollector {
     pub fn new() -> Self {
         Self {
-            known_tcp: HashMap::new(),
-            known_udp: HashMap::new(),
+            known_tcp: Default::default(),
+            known_udp: Default::default(),
         }
     }
 }
@@ -234,6 +234,9 @@ impl Collector for NetworkCollector {
         // to the backend) as host network activity.
         let agent_pid = std::process::id() as i32;
 
+        let mut tcp_coverage = table_coverage("tcp");
+        let mut udp_coverage = table_coverage("udp");
+
         loop {
             ticker.tick().await;
 
@@ -270,6 +273,8 @@ impl Collector for NetworkCollector {
                 (tcp, udp, inode_map, diag)
             })
             .await?;
+            tcp_coverage.set_failed(tcp_entries.is_err());
+            udp_coverage.set_failed(udp_entries.is_err());
             if let Ok(tcp_entries) = tcp_entries {
                 let mut new_tcp: HashMap<String, FlowInfo> = HashMap::new();
                 for entry in &tcp_entries {
@@ -357,6 +362,10 @@ impl Collector for NetworkCollector {
             }
         }
     }
+}
+
+fn table_coverage(table: &str) -> crate::telemetry::coverage::SourceCoverage {
+    crate::telemetry::coverage::SourceCoverage::new(format!("NetworkCollector/{table}"))
 }
 
 /// Stable socket key (protocol, 4-tuple and inode). Built from parsed fields, so it

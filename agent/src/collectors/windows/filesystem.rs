@@ -616,6 +616,9 @@ impl Collector for FilesystemCollector {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
+        let mut fim_status = crate::telemetry::coverage::SourceCoverage::new(
+            "WindowsFilesystemCollector/FIM".into(),
+        );
         let mut baseline = saved.files;
         let mut last_scan = std::time::Instant::now();
         let mut first = true;
@@ -633,6 +636,9 @@ impl Collector for FilesystemCollector {
                         // Retry missing/denied paths even without a config
                         // change (the generic target can be created later).
                         watches.sync();
+                    }
+                    if !cfg.fim_enabled {
+                        fim_status.set_failed(false);
                     }
                     if cfg.fim_enabled && (first || last_scan.elapsed().as_secs() >= cfg.fim_interval_secs.max(10)) {
                         let roots = windows_paths(&cfg.fim_paths, &defaults.fim_paths);
@@ -655,10 +661,16 @@ impl Collector for FilesystemCollector {
                                 previous_scan_paths = scanned_roots;
                                 let saved = Baseline { paths: previous_scan_paths.clone(), files: baseline.clone() };
                                 if let Err(e) = crate::paths::write_atomic(&baseline_path, &serde_json::to_vec(&saved)?, 0o600) {
+                                    fim_status.set_failed(true);
                                     tracing::warn!(error = %e, "Windows FIM baseline persistence failed");
+                                } else {
+                                    fim_status.set_failed(false);
                                 }
                             }
-                            Err(e) => tracing::warn!(error = %e, "Windows FIM scan incomplete; keeping prior baseline"),
+                            Err(e) => {
+                                fim_status.set_failed(true);
+                                tracing::warn!(error = %e, "Windows FIM scan incomplete; keeping prior baseline");
+                            }
                         }
                         first = false;
                         last_scan = std::time::Instant::now();

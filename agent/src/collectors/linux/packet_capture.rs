@@ -163,13 +163,17 @@ fn open_packet_socket() -> Result<PacketSocket> {
 // ── Parsed-event enum ─────────────────────────────────────────────────────────
 
 #[derive(Debug)]
-enum CaptureEvent {
+pub(super) enum CaptureEvent {
     Dns(DnsResolutionData),
     Tls(TlsHandshakeData),
 }
 
 /// Parse one captured L3 frame (IP packet) into zero or more capture events.
-fn parse_frame(frame: &[u8], tracker: &mut TlsTracker, now: Instant) -> Vec<CaptureEvent> {
+pub(super) fn parse_frame(
+    frame: &[u8],
+    tracker: &mut TlsTracker,
+    now: Instant,
+) -> Vec<CaptureEvent> {
     let mut out = Vec::new();
     let Some(l3) = parse_l3(frame) else {
         return out;

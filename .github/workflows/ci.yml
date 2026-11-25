@@ -22,6 +22,31 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  telemetry-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-08-15
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Verify generated log fields and queue replay
+        run: |
+          # The prebuilt cargo-fuzz defaults to its own (musl) target, which
+          # AddressSanitizer cannot use; name the runner's target explicitly.
+          target=x86_64-unknown-linux-gnu
+          cargo fuzz build --target "$target"
+          for fuzz_target in $(cargo fuzz list); do
+            mkdir -p "fuzz/corpus/$fuzz_target" "fuzz/seeds/$fuzz_target"
+            cargo fuzz run --target "$target" "$fuzz_target" "fuzz/corpus/$fuzz_target" "fuzz/seeds/$fuzz_target" -- -max_total_time=15
+          done
+
   windows-msi:
     uses: ./.github/workflows/windows-package.yml
 

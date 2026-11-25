@@ -333,6 +333,9 @@ impl Collector for NetworkCollector {
         agent_id: String,
         hostname: String,
     ) -> Result<()> {
+        let mut coverage = crate::telemetry::coverage::SourceCoverage::new(
+            "WindowsNetworkCollector/TCP tables".into(),
+        );
         let mut known = HashMap::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -342,10 +345,12 @@ impl Collector for NetworkCollector {
             let rows = match tokio::task::spawn_blocking(snapshot).await? {
                 Ok(rows) => rows,
                 Err(e) => {
+                    coverage.set_failed(true);
                     tracing::warn!(error = %e, "Windows TCP snapshot failed");
                     continue;
                 }
             };
+            coverage.set_failed(false);
             // ETW owns emission while active; still update polling history so
             // a later ETW outage does not re-announce an existing connection.
             let rows = rows

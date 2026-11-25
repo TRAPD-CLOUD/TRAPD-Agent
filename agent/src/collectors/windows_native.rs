@@ -8,6 +8,15 @@ pub const WMI_CHANNEL: &str = "Microsoft-Windows-WMI-Activity/Operational";
 /// the record is never forwarded, since script text can hold credentials.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const POWERSHELL_CHANNEL: &str = "Microsoft-Windows-PowerShell/Operational";
+/// Fixed set queried by the event-log collector and reported in coverage.
+pub const EVENTLOG_CHANNELS: [&str; 6] = [
+    "Security",
+    "System",
+    "Application",
+    SYSMON_CHANNEL,
+    WMI_CHANNEL,
+    POWERSHELL_CHANNEL,
+];
 /// The one WMI-Activity event worth keeping; the rest of that channel is
 /// high-volume provider chatter and query text.
 #[cfg_attr(not(windows), allow(dead_code))]

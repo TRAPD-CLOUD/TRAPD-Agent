@@ -643,7 +643,10 @@ pub fn spawn(
                         let mut drained = false;
                         for _ in 0..64 {
                             let Some(item) = rb.next() else { drained = true; break; };
-                            let Some(ev) = decode(&item) else { continue };
+                            let Some(ev) = decode(&item) else {
+                                metrics().event_dropped(DropReason::InternalError);
+                                continue;
+                            };
                             if !enabled(&cfg) || ev.pid == agent_pid {
                                 // Disabled by config, or the agent's own read:
                                 // intentional exclusion, not a loss.

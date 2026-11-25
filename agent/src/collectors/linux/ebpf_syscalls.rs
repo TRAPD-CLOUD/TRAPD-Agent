@@ -1083,10 +1083,14 @@ fn plausible_pid(pid: u32) -> bool {
 /// including potentially uninitialised kernel bytes — reaching the backend.
 unsafe fn read_raw<T: RawEbpfEvent>(bytes: &[u8]) -> Option<T> {
     if bytes.len() < std::mem::size_of::<T>() {
+        crate::telemetry::metrics::metrics()
+            .event_dropped(crate::telemetry::DropReason::InternalError);
         return None;
     }
     let ev: T = std::ptr::read_unaligned(bytes.as_ptr() as *const T);
     if !plausible_pid(ev.primary_pid()) {
+        crate::telemetry::metrics::metrics()
+            .event_dropped(crate::telemetry::DropReason::InternalError);
         return None;
     }
     Some(ev)

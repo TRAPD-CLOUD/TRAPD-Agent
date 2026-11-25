@@ -1207,10 +1207,7 @@ fn send_prevention(
             details,
         }),
     );
-    if tx.try_send(event).is_err() {
-        crate::telemetry::metrics::metrics()
-            .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
-    }
+    crate::pipeline::try_emit(tx, event, "WindowsHoneytokenCollector");
 }
 
 /// Build and ship one filesystem honeytoken detection event.
@@ -1294,10 +1291,7 @@ fn send_detection(
     );
     // Called from plain threads and from async context via spawn_blocking-free
     // sync paths; try_send never blocks the watcher on a full pipeline.
-    if tx.try_send(event).is_err() {
-        crate::telemetry::metrics::metrics()
-            .event_dropped(crate::telemetry::DropReason::UserspaceChannelFull);
-    }
+    crate::pipeline::try_emit(tx, event, "WindowsHoneytokenCollector");
 }
 
 // ── Legacy registry decoys (retired) ──────────────────────────────────────────

@@ -55,12 +55,57 @@ impl SyslogListen {
         None
     }
 
-    pub async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
+    pub async fn recv_record(
+        &self,
+        buf: &mut [u8],
+        counters: &crate::telemetry::metrics::Metrics,
+    ) -> std::io::Result<Option<usize>> {
+        let result = match self {
             Self::Udp(s) => s.recv(buf).await,
             #[cfg(unix)]
             Self::Unix(s) => s.recv(buf).await,
+        };
+        #[cfg(windows)]
+        if matches!(&result, Err(error) if error.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE))
+        {
+            counters.event_dropped(crate::telemetry::DropReason::EventTooLarge);
+            return Ok(None);
         }
+        let n = result?;
+        if n == buf.len() {
+            counters.event_dropped(crate::telemetry::DropReason::EventTooLarge);
+            return Ok(None);
+        }
+        Ok(Some(n))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::{metrics::Metrics, DropReason};
+
+    #[tokio::test]
+    async fn receive_distinguishes_exact_limit_from_oversize() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener = SyslogListen::Udp(receiver);
+        let mut buf = [0; 5];
+        let counters = Metrics::new();
+        for (message, expected) in [
+            (&b"1234"[..], Some(4)),
+            (b"12345", None),
+            (b"123456", None),
+            (b"ok", Some(2)),
+        ] {
+            sender.send_to(message, address).await.unwrap();
+            assert_eq!(
+                listener.recv_record(&mut buf, &counters).await.unwrap(),
+                expected
+            );
+        }
+        assert_eq!(counters.drops_for(DropReason::EventTooLarge), 2);
     }
 }
 
@@ -107,7 +152,7 @@ fn remove_stale_socket(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+mod socket_path_tests {
     use super::*;
     #[test]
     fn existing_regular_file_is_preserved() {

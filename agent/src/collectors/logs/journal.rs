@@ -8,13 +8,15 @@
 
 use std::process::Stdio;
 
-use serde_json::{Map, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{info, warn};
 
 use crate::config::LogSourceConfig;
-use crate::telemetry::{metrics::metrics, DropReason};
+use crate::telemetry::{
+    metrics::{metrics, Metrics},
+    DropReason,
+};
 
 use super::checkpoint::JournalCheckpoint;
 use super::parser::ParsedLog;
@@ -79,10 +81,10 @@ impl JournalTail {
     }
 
     /// Read the next JSON record, or `None` on EOF.
-    pub async fn next_line(&mut self) -> Option<String> {
+    pub async fn next_record(&mut self) -> Option<(ParsedLog, String)> {
         let max_line = self.max_line;
         let reader = self.reader.as_mut()?;
-        match read_line_bounded(reader, max_line).await {
+        match read_record(reader, max_line, metrics()).await {
             Ok(v) => v,
             Err(e) => {
                 warn!(source = %self.source, error = %e, "journal read failed");
@@ -99,12 +101,28 @@ impl JournalTail {
     }
 }
 
+/// Account for each physical record once, then continue with the next record.
+async fn read_record<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+    counters: &Metrics,
+) -> std::io::Result<Option<(ParsedLog, String)>> {
+    while let Some(line) = read_line_bounded(reader, max, counters).await? {
+        if let Some(record) = parse_journal_json(&line) {
+            return Ok(Some(record));
+        }
+        counters.event_dropped(DropReason::InternalError);
+    }
+    Ok(None)
+}
+
 /// Cap a single journal JSON record. A missing newline cannot grow the
 /// buffer without bound; oversized records are dropped as `event_too_large`
 /// and we resync on the next newline.
 async fn read_line_bounded<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max: usize,
+    counters: &Metrics,
 ) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
     let mut skipping = false;
@@ -119,15 +137,17 @@ async fn read_line_bounded<R: AsyncBufRead + Unpin>(
         if let Some(pos) = available.iter().position(|&b| b == b'\n') {
             if skipping {
                 reader.consume(pos + 1);
-                metrics().event_dropped(DropReason::EventTooLarge);
-                return Ok(Some(String::new()));
+                skipping = false;
+                continue;
+            }
+            if buf.len().saturating_add(pos + 1) > max {
+                reader.consume(pos + 1);
+                counters.event_dropped(DropReason::EventTooLarge);
+                buf.clear();
+                continue;
             }
             buf.extend_from_slice(&available[..=pos]);
             reader.consume(pos + 1);
-            if buf.len() > max {
-                metrics().event_dropped(DropReason::EventTooLarge);
-                return Ok(Some(String::new()));
-            }
             if buf.last() == Some(&b'\n') {
                 buf.pop();
             }
@@ -143,6 +163,7 @@ async fn read_line_bounded<R: AsyncBufRead + Unpin>(
         }
         if buf.len().saturating_add(n) > max {
             reader.consume(n);
+            counters.event_dropped(DropReason::EventTooLarge);
             skipping = true;
             buf.clear();
             continue;
@@ -170,74 +191,10 @@ async fn rejected_cursor(mut stderr: impl tokio::io::AsyncRead + Unpin) -> bool 
     rejected
 }
 
-/// Turn a `journalctl --output=json` line into a [`ParsedLog`] plus the cursor.
-pub fn parse_journal_json(line: &str) -> Option<(ParsedLog, String)> {
-    let mut map: Map<String, Value> = serde_json::from_str(line.trim()).ok()?;
-    let cursor = map
-        .remove("__CURSOR")
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default();
-    let message = json_str(&map, &["MESSAGE", "message"]).unwrap_or_default();
-    let mut parsed = ParsedLog {
-        message,
-        category: "syslog".into(),
-        host: json_str(&map, &["_HOSTNAME", "SYSLOG_HOSTNAME"]),
-        proc: json_str(&map, &["SYSLOG_IDENTIFIER", "_COMM"]),
-        pid: json_str(&map, &["_PID"]).and_then(|s| s.parse().ok()),
-        uid: json_str(&map, &["_UID"]).and_then(|s| s.parse().ok()),
-        facility: json_str(&map, &["SYSLOG_FACILITY"]),
-        timestamp: realtime_ts(&map),
-        fields: map,
-        ..Default::default()
-    };
-    if let Some(pri) = json_str(&parsed.fields, &["PRIORITY"]) {
-        parsed.severity = Some(priority_name(&pri));
-    }
-    if let Some(unit) = json_str(&parsed.fields, &["_SYSTEMD_UNIT", "UNIT"]) {
-        parsed.fields.insert("unit".into(), Value::String(unit));
-    }
-    Some((parsed, cursor))
-}
-
-fn json_str(map: &Map<String, Value>, keys: &[&str]) -> Option<String> {
-    for k in keys {
-        match map.get(*k) {
-            Some(Value::String(s)) if !s.is_empty() => return Some(s.clone()),
-            Some(Value::Array(arr)) => {
-                // journald sometimes stores MESSAGE as a byte array.
-                let bytes: Vec<u8> = arr
-                    .iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as u8))
-                    .collect();
-                if !bytes.is_empty() {
-                    return Some(String::from_utf8_lossy(&bytes).into_owned());
-                }
-            }
-            Some(Value::Number(n)) => return Some(n.to_string()),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn realtime_ts(map: &Map<String, Value>) -> Option<chrono::DateTime<chrono::Utc>> {
-    let us: i64 = json_str(map, &["__REALTIME_TIMESTAMP"])?.parse().ok()?;
-    chrono::DateTime::from_timestamp(us / 1_000_000, ((us % 1_000_000) * 1000) as u32)
-}
-
-fn priority_name(p: &str) -> String {
-    match p {
-        "0" => "emerg",
-        "1" => "alert",
-        "2" => "crit",
-        "3" => "err",
-        "4" => "warning",
-        "5" => "notice",
-        "6" => "info",
-        _ => "debug",
-    }
-    .to_string()
-}
+// Pure line parser, kept free of process and I/O code for fuzzing.
+#[path = "journal_json.rs"]
+mod journal_json;
+pub use journal_json::parse_journal_json;
 
 #[cfg(test)]
 mod tests {
@@ -253,7 +210,9 @@ mod tests {
     async fn bounded_read_keeps_short_line() {
         let data = b"{\"MESSAGE\":\"ok\"}\nnext\n";
         let mut r = BufReader::new(&data[..]);
-        let got = read_line_bounded(&mut r, 64).await.unwrap();
+        let got = read_line_bounded(&mut r, 64, &Metrics::new())
+            .await
+            .unwrap();
         assert_eq!(got.as_deref(), Some("{\"MESSAGE\":\"ok\"}"));
     }
 
@@ -263,10 +222,29 @@ mod tests {
         data.push(b'\n');
         data.extend_from_slice(b"ok\n");
         let mut r = BufReader::new(&data[..]);
-        let dropped = read_line_bounded(&mut r, 16).await.unwrap();
-        assert_eq!(dropped.as_deref(), Some(""));
-        let kept = read_line_bounded(&mut r, 16).await.unwrap();
+        let counters = Metrics::new();
+        let kept = read_line_bounded(&mut r, 16, &counters).await.unwrap();
         assert_eq!(kept.as_deref(), Some("ok"));
+        assert_eq!(counters.drops_for(DropReason::EventTooLarge), 1);
+    }
+
+    #[tokio::test]
+    async fn journal_accounts_for_invalid_json_and_unterminated_oversize() {
+        let data = b"missing json\n{\"MESSAGE\":\"ok\"}\n01234567890123456789";
+        let mut r = BufReader::with_capacity(4, &data[..]);
+        let counters = Metrics::new();
+        let limit = b"{\"MESSAGE\":\"ok\"}\n".len();
+        let (record, _) = read_record(&mut r, limit, &counters)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.message, "ok");
+        assert!(read_record(&mut r, limit, &counters)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(counters.drops_for(DropReason::InternalError), 1);
+        assert_eq!(counters.drops_for(DropReason::EventTooLarge), 1);
     }
 
     #[test]

@@ -366,6 +366,8 @@ impl Collector for ProcessCollector {
         let mut ticker = interval(Duration::from_secs(3));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         metrics().add_collector_mode(CollectorMode::ProcPolling);
+        let mut coverage =
+            crate::telemetry::coverage::SourceCoverage::new("ProcessCollector/proc".into());
 
         loop {
             ticker.tick().await;
@@ -379,8 +381,13 @@ impl Collector for ProcessCollector {
             .await?;
             self.uid_to_user = users;
             self.known = known;
-            let Ok(current) = observed else {
-                continue;
+            coverage.set_failed(observed.is_err());
+            let current = match observed {
+                Ok(processes) => processes,
+                Err(error) => {
+                    warn!(%error, "Process list unavailable; retaining last snapshot");
+                    continue;
+                }
             };
 
             if !self.initialized {

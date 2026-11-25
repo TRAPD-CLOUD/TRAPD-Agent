@@ -74,6 +74,9 @@ pub struct Coverage {
     /// `key_missing`, `open_failed`, `arm_failed`, `wait_failed`).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub registry_notify_fallbacks: BTreeMap<String, u64>,
+    /// Last read status of each configured native Event Log channel.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub eventlog_channels: BTreeMap<&'static str, bool>,
     /// Collector is enabled and its last Security channel read succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_eventlog_active: Option<bool>,
@@ -119,7 +122,15 @@ pub struct Coverage {
 
 impl Coverage {
     #[cfg(any(windows, test))]
-    pub fn set_eventlog_active(&mut self, channel: &str, active: bool) {
+    pub fn disable_eventlog_channels(&mut self) {
+        for channel in crate::collectors::windows_native::EVENTLOG_CHANNELS {
+            self.set_eventlog_active(channel, false);
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    pub fn set_eventlog_active(&mut self, channel: &'static str, active: bool) {
+        self.eventlog_channels.insert(channel, active);
         match channel {
             "Security" => self.security_eventlog_active = Some(active),
             "Microsoft-Windows-Sysmon/Operational" => self.sysmon_eventlog_active = Some(active),
@@ -196,6 +207,34 @@ pub fn update(f: impl FnOnce(&mut Coverage)) {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn set_collector_failed(name: &str, failed: bool) {
     update(|c| set_member(&mut c.failed_collectors, name, failed));
+}
+
+/// Publish transitions only. Removing or cancelling a source clears its marker.
+pub(crate) struct SourceCoverage {
+    label: String,
+    failed: bool,
+}
+
+impl SourceCoverage {
+    pub(crate) fn new(label: String) -> Self {
+        Self {
+            label,
+            failed: false,
+        }
+    }
+
+    pub(crate) fn set_failed(&mut self, failed: bool) {
+        if self.failed != failed {
+            set_collector_failed(&self.label, failed);
+            self.failed = failed;
+        }
+    }
+}
+
+impl Drop for SourceCoverage {
+    fn drop(&mut self) {
+        self.set_failed(false);
+    }
 }
 
 /// Replace the set of stalled components.
@@ -355,6 +394,39 @@ mod tests {
             serde_json::to_value(&c).unwrap(),
             serde_json::json!({"process_sensor": "etw", "etw_session": true})
         );
+    }
+
+    #[test]
+    fn source_coverage_clears_on_recovery_and_removal() {
+        let label = format!("log:test-{}", uuid::Uuid::new_v4());
+        let failed = || {
+            crate::telemetry::coverage::snapshot()
+                .failed_collectors
+                .contains(&label)
+        };
+        let mut coverage = SourceCoverage::new(label.clone());
+        coverage.set_failed(true);
+        assert!(failed());
+        coverage.set_failed(false);
+        assert!(!failed());
+        coverage.set_failed(true);
+        drop(coverage);
+        assert!(!failed());
+    }
+
+    #[test]
+    fn native_channel_status_recovers_independently_and_resets_on_disable() {
+        let mut coverage = Coverage::default();
+        coverage.disable_eventlog_channels();
+        for channel in crate::collectors::windows_native::EVENTLOG_CHANNELS {
+            assert_eq!(coverage.eventlog_channels.get(channel), Some(&false));
+            coverage.set_eventlog_active(channel, true);
+        }
+        coverage.set_eventlog_active("System", false);
+        assert_eq!(coverage.eventlog_channels.get("Application"), Some(&true));
+        assert_eq!(coverage.eventlog_channels.get("System"), Some(&false));
+        coverage.disable_eventlog_channels();
+        assert!(coverage.eventlog_channels.values().all(|&active| !active));
     }
 
     #[test]
