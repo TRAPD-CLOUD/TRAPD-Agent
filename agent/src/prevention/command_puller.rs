@@ -231,7 +231,7 @@ impl CommandPuller {
                         false,
                         "command could not be decoded by this agent version",
                         None,
-                        command_id,
+                        None,
                         serde_json::Value::Null,
                     );
                     continue;
@@ -245,16 +245,16 @@ impl CommandPuller {
                         return PollOutcome::Delivered;
                     }
                 }
-                Verdict::Rejected(reason) => {
+                Verdict::Rejected(rejection) => {
                     self.audit.emit(
                         crate::schema::EventAction::CommandRejected,
                         crate::schema::Severity::High,
                         "command_rejected",
                         cmd.envelope.command_id.to_string(),
                         false,
-                        reason,
+                        rejection.reason,
                         None,
-                        Some(cmd.envelope.command_id.to_string()),
+                        rejection.command_id.map(|id| id.to_string()),
                         serde_json::Value::Null,
                     );
                 }

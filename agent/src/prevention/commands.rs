@@ -265,7 +265,14 @@ pub struct SignedCommand {
 #[derive(Debug)]
 pub enum Verdict {
     Ok(CommandEnvelope),
-    Rejected(String),
+    Rejected(Rejection),
+}
+
+#[derive(Debug)]
+pub struct Rejection {
+    pub reason: String,
+    /// Set only for an authenticated, locally addressed, terminal refusal.
+    pub command_id: Option<Uuid>,
 }
 
 /// Loads + caches the Ed25519 verifying key.  Cheap to clone.
@@ -331,28 +338,32 @@ impl Verifier {
     /// Verify a `SignedCommand` end-to-end.  Failure reasons are returned so
     /// the caller can emit a `CommandRejected` audit event with context.
     pub fn verify(&self, cmd: &SignedCommand) -> Verdict {
+        let reject = |reason, command_id| Verdict::Rejected(Rejection { reason, command_id });
         // Signature check (canonical-JSON, re-serialised) is shared with the
         // remote-config channel via `verify_canonical`.
         if let Err(reason) = verify_canonical(&self.key, &cmd.envelope, &cmd.signature) {
-            return Verdict::Rejected(reason);
+            return reject(reason, None);
         }
 
         if cmd.envelope.agent_id != self.agent_id {
-            return Verdict::Rejected("command addressed to another agent".into());
+            return reject("command addressed to another agent".into(), None);
         }
 
         let now = Utc::now();
         if cmd.envelope.expires_at < now {
-            return Verdict::Rejected(format!(
-                "command expired at {} (now {})",
-                cmd.envelope.expires_at, now
-            ));
+            return reject(
+                format!(
+                    "command expired at {} (now {})",
+                    cmd.envelope.expires_at, now
+                ),
+                Some(cmd.envelope.command_id),
+            );
         }
         if cmd.envelope.issued_at > now + chrono::Duration::minutes(5) {
-            return Verdict::Rejected(format!(
-                "command issued in the future ({})",
-                cmd.envelope.issued_at
-            ));
+            return reject(
+                format!("command issued in the future ({})", cmd.envelope.issued_at),
+                Some(cmd.envelope.command_id),
+            );
         }
 
         // Recover from a poisoned lock instead of panicking: the nonce store
@@ -366,13 +377,8 @@ impl Verifier {
             .unwrap_or_else(|poison| poison.into_inner());
         match store.try_insert(cmd.envelope.nonce, cmd.envelope.expires_at) {
             Ok(true) => {}
-            Ok(false) => {
-                return Verdict::Rejected(format!(
-                    "replay: nonce {} already seen",
-                    cmd.envelope.nonce
-                ))
-            }
-            Err(e) => return Verdict::Rejected(format!("cannot persist replay protection: {e:#}")),
+            Ok(false) => return reject("command nonce already seen".into(), None),
+            Err(e) => return reject(format!("cannot persist replay protection: {e:#}"), None),
         }
         drop(store);
 
@@ -623,10 +629,35 @@ mod cross_lang_tests {
                 .unwrap();
         match v.verify(&cmd) {
             Verdict::Ok(env) => assert_eq!(env.agent_id, "agent-test"),
-            Verdict::Rejected(why) => panic!("install vector rejected: {why}"),
+            Verdict::Rejected(why) => panic!("install vector rejected: {why:?}"),
         }
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(n);
+    }
+
+    #[test]
+    fn foreign_forged_and_replayed_commands_cannot_complete_a_local_command() {
+        let (local, key, state) = verifier();
+        let mut cmd: SignedCommand =
+            serde_json::from_str(&format!(r#"{{"envelope":{ENV1},"signature":"{SIG1}"}}"#))
+                .unwrap();
+        let other = Verifier::new(&key, "different-agent".into(), &state).unwrap();
+        let uncorrelated = |result| {
+            matches!(
+                result,
+                Verdict::Rejected(Rejection {
+                    command_id: None,
+                    ..
+                })
+            )
+        };
+        assert!(uncorrelated(other.verify(&cmd)));
+        assert!(matches!(local.verify(&cmd), Verdict::Ok(_)));
+        assert!(uncorrelated(local.verify(&cmd)));
+        cmd.signature = "invalid".into();
+        assert!(uncorrelated(local.verify(&cmd)));
+        std::fs::remove_file(key).unwrap();
+        std::fs::remove_file(state).unwrap();
     }
 
     #[test]
@@ -712,7 +743,7 @@ mod cross_lang_tests {
             let cmd: SignedCommand = serde_json::from_str(&wire).unwrap();
             match v.verify(&cmd) {
                 Verdict::Ok(_) => {}
-                Verdict::Rejected(why) => panic!("vector rejected: {why}: {env}"),
+                Verdict::Rejected(why) => panic!("vector rejected: {why:?}: {env}"),
             }
             let _ = std::fs::remove_file(p);
             let _ = std::fs::remove_file(n);
@@ -740,7 +771,7 @@ mod cross_lang_tests {
                 .unwrap();
         match v.verify(&cmd) {
             Verdict::Ok(env) => assert_eq!(env.agent_id, "agent-test"),
-            Verdict::Rejected(why) => panic!("verification failed after poisoning: {why}"),
+            Verdict::Rejected(why) => panic!("verification failed after poisoning: {why:?}"),
         }
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(n);
@@ -783,7 +814,7 @@ mod cross_lang_tests {
                     .unwrap_or_else(|e| panic!("{label}: envelope parse failed: {e}"));
             match v.verify(&cmd) {
                 Verdict::Ok(_) => {}
-                Verdict::Rejected(why) => panic!("{label} vector rejected: {why}"),
+                Verdict::Rejected(why) => panic!("{label} vector rejected: {why:?}"),
             }
             let _ = std::fs::remove_file(p);
             let _ = std::fs::remove_file(n);
