@@ -634,7 +634,10 @@ pub fn spawn(
                         };
                         let rb = guard.get_inner_mut();
                         while let Some(item) = rb.next() {
-                            let Some(ev) = decode(&item) else { continue };
+                            let Some(ev) = decode(&item) else {
+                                metrics().event_dropped(DropReason::InternalError);
+                                continue;
+                            };
                             if !enabled(&cfg) || ev.pid == agent_pid {
                                 // Disabled by config, or the agent's own read:
                                 // intentional exclusion, not a loss.

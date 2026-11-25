@@ -307,6 +307,7 @@ impl Collector for EbpfExecCollector {
                 let bytes: &[u8] = &item;
 
                 if bytes.len() < std::mem::size_of::<RawExecEvent>() {
+                    metrics().event_dropped(crate::telemetry::DropReason::InternalError);
                     warn!(
                         got = bytes.len(),
                         want = std::mem::size_of::<RawExecEvent>(),

@@ -89,6 +89,10 @@ impl Collector for FilesystemCollector {
         let mut fim = super::fim::FimCollector::new(Arc::clone(&self.cfg));
         tokio::spawn(async move {
             if let Err(error) = fim.run(fs_tx, agent_id, hostname).await {
+                crate::telemetry::coverage::set_collector_failed(
+                    "FilesystemCollector/periodic-FIM",
+                    true,
+                );
                 warn!(%error, "FilesystemCollector: periodic FIM stopped");
             }
         });
@@ -113,6 +117,7 @@ fn run_sync(
     let mut inotify = match Inotify::init() {
         Ok(i) => i,
         Err(e) => {
+            crate::telemetry::coverage::set_collector_failed("FilesystemCollector/inotify", true);
             warn!("FilesystemCollector: inotify init failed: {e}");
             return;
         }
@@ -136,7 +141,7 @@ fn run_sync(
         // Skip optional watch roots that don't exist on this host (e.g. /var/www,
         // /backup on a minimal box) quietly — a missing root is not an error and
         // shouldn't spam WARN. Real failures on existing paths still warn.
-        if !std::path::Path::new(path).exists() {
+        if matches!(std::path::Path::new(path).try_exists(), Ok(false)) {
             debug!("FilesystemCollector: watch path {path} absent, skipping");
             continue;
         }
@@ -144,7 +149,13 @@ fn run_sync(
             Ok(wd) => {
                 wd_map.insert(wd, path.clone());
             }
-            Err(e) => warn!("FilesystemCollector: cannot watch {path}: {e}"),
+            Err(e) => {
+                crate::telemetry::coverage::set_collector_failed(
+                    "FilesystemCollector/inotify-roots",
+                    true,
+                );
+                warn!("FilesystemCollector: cannot watch {path}: {e}");
+            }
         }
     }
 
@@ -163,12 +174,22 @@ fn run_sync(
         let events = match inotify.read_events_blocking(&mut buf) {
             Ok(e) => e,
             Err(e) => {
+                crate::telemetry::coverage::set_collector_failed(
+                    "FilesystemCollector/inotify",
+                    true,
+                );
                 warn!("FilesystemCollector: inotify read error: {e}");
                 break;
             }
         };
 
         for event in events {
+            if event.mask.contains(EventMask::Q_OVERFLOW) {
+                // inotify reports an overflow, without an exact loss count.
+                crate::telemetry::metrics::metrics()
+                    .event_dropped(crate::telemetry::DropReason::KernelRingbufferFull);
+                continue;
+            }
             let dir = match wd_map.get(&event.wd) {
                 Some(d) => d,
                 None => continue,
@@ -393,6 +414,7 @@ fn run_token_fim(tx: tokio::sync::mpsc::Sender<AgentEvent>, agent_id: String, ho
     let mut inotify = match Inotify::init() {
         Ok(i) => i,
         Err(e) => {
+            crate::telemetry::coverage::set_collector_failed("FilesystemCollector/token-FIM", true);
             warn!("FilesystemCollector: token-FIM inotify init failed: {e}");
             return;
         }
@@ -426,6 +448,10 @@ fn run_token_fim(tx: tokio::sync::mpsc::Sender<AgentEvent>, agent_id: String, ho
                     }
                 }
             }
+            crate::telemetry::coverage::set_collector_failed(
+                "FilesystemCollector/token-FIM-roots",
+                !desired.is_subset(&watched),
+            );
             // Drop watches for paths no longer registered (revoked).
             let stale: std::collections::HashSet<String> =
                 watched.difference(&desired).cloned().collect();
@@ -449,6 +475,12 @@ fn run_token_fim(tx: tokio::sync::mpsc::Sender<AgentEvent>, agent_id: String, ho
         match inotify.read_events(&mut buf) {
             Ok(events) => {
                 for event in events {
+                    if event.mask.contains(EventMask::Q_OVERFLOW) {
+                        // inotify reports an overflow, without an exact loss count.
+                        crate::telemetry::metrics::metrics()
+                            .event_dropped(crate::telemetry::DropReason::KernelRingbufferFull);
+                        continue;
+                    }
                     // The kernel auto-removes a watch when the file disappears and
                     // delivers IGNORED — forget it so a re-deploy can re-arm.
                     if event.mask.contains(EventMask::IGNORED) {
@@ -508,6 +540,10 @@ fn run_token_fim(tx: tokio::sync::mpsc::Sender<AgentEvent>, agent_id: String, ho
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
+                crate::telemetry::coverage::set_collector_failed(
+                    "FilesystemCollector/token-FIM",
+                    true,
+                );
                 warn!("FilesystemCollector: token-FIM read error: {e}");
                 return;
             }

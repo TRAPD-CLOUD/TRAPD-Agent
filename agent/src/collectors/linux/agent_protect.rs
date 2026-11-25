@@ -380,6 +380,7 @@ fn run_protect_sync(
     let mut inotify = match Inotify::init() {
         Ok(i) => i,
         Err(e) => {
+            crate::telemetry::coverage::set_collector_failed("AgentProtectCollector/inotify", true);
             warn!("AgentProtectCollector: inotify init failed: {e}");
             return;
         }
@@ -402,6 +403,10 @@ fn run_protect_sync(
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => {
+                crate::telemetry::coverage::set_collector_failed(
+                    "AgentProtectCollector/inotify",
+                    true,
+                );
                 warn!("AgentProtectCollector: inotify read error: {e}");
                 break;
             }

@@ -497,6 +497,10 @@ impl Collector for ContainerWatchCollector {
         // cgroup v1 has no single tree to watch; the process-level container
         // id enrichment still works there.
         if !root.join("cgroup.controllers").exists() {
+            crate::telemetry::coverage::set_collector_failed(
+                "ContainerWatchCollector/cgroup-v2",
+                true,
+            );
             info!("containerwatch: cgroup v2 not mounted, container lifecycle unavailable");
             return Ok(());
         }
@@ -506,6 +510,10 @@ impl Collector for ContainerWatchCollector {
             let mut w = match Watcher::new(root2.clone()) {
                 Ok(w) => w,
                 Err(e) => {
+                    crate::telemetry::coverage::set_collector_failed(
+                        "ContainerWatchCollector/inotify",
+                        true,
+                    );
                     warn!("containerwatch: inotify init failed: {e}");
                     return;
                 }
