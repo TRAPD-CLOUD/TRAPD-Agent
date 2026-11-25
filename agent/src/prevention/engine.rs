@@ -926,9 +926,13 @@ impl Engine {
     pub fn spawn_command_loop(self: Arc<Self>, mut rx: Receiver<CommandEnvelope>) {
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
+                let Some(slot) = self.audit.reserve_result().await else {
+                    warn!(command_id = %cmd.command_id, "audit channel closed before dispatch");
+                    return;
+                };
                 let me = Arc::clone(&self);
                 tokio::spawn(async move {
-                    me.handle(cmd).await;
+                    AuditEmitter::with_result_slot(slot, me.handle(cmd)).await;
                 });
             }
         });
@@ -936,6 +940,20 @@ impl Engine {
 
     async fn handle(&self, env: CommandEnvelope) {
         let cmd_id = env.command_id.to_string();
+        if env.expires_at <= chrono::Utc::now() {
+            self.audit.emit(
+                EventAction::CommandRejected,
+                Severity::Medium,
+                "command_rejected",
+                "<command>",
+                false,
+                "command expired before execution",
+                None,
+                Some(cmd_id),
+                serde_json::Value::Null,
+            );
+            return;
+        }
         if !self.prevention_enabled() {
             self.kernel_blocker.set_enabled(false).await;
             self.audit.emit(

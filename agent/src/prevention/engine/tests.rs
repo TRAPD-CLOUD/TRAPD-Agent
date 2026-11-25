@@ -637,6 +637,47 @@ fn process_command(
 
 #[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
+async fn backpressured_dispatch_preserves_the_result_and_rechecks_expiry() {
+    let (engine, mut results) = test_engine();
+    for _ in 0..results.max_capacity() {
+        engine.audit.emit(
+            EventAction::CommandRejected,
+            crate::schema::Severity::Info,
+            "test",
+            "fixture",
+            false,
+            "fixture",
+            None,
+            None,
+            serde_json::Value::Null,
+        );
+    }
+    let mut child = ChildFixture::new();
+    let generation = crate::telemetry::identity::process_start_time(child.pid()).unwrap();
+    let mut cmd = process_command("kill_pid", child.pid(), Some(generation));
+    cmd.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let id = cmd.command_id.to_string();
+    let (tx, rx) = mpsc::channel(1);
+    Arc::new(engine).spawn_command_loop(rx);
+    tx.send(cmd).await.unwrap();
+    for _ in 0..results.max_capacity() {
+        results.recv().await.unwrap();
+    }
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), results.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let EventData::Prevention(result) = event.data else {
+        panic!("missing result")
+    };
+    assert_eq!(result.command_id.as_deref(), Some(id.as_str()));
+    assert!(!result.success);
+    assert!(result.reason.contains("expired"));
+    assert!(child.0.try_wait().unwrap().is_none());
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[tokio::test]
 async fn manual_process_commands_reject_wrong_generations_without_collecting_snapshots() {
     for kind in ["kill_pid", "freeze_pid", "thaw_pid"] {
         for stale in [false, true] {
