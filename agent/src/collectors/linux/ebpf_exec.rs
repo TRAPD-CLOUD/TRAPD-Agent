@@ -47,6 +47,11 @@ const SOURCE: &str = "ebpf_exec";
 const COMM_LEN: usize = 16;
 const FILENAME_LEN: usize = 256;
 const PRELOAD_LEN: usize = 256;
+const ARGS_BUF: usize = 1024 + 256;
+
+/// `args_flags` bits, as set by `capture_argv` in trapd-agent-ebpf/src/exec.rs.
+const ARGS_PRESENT: u32 = 1;
+const ARGS_TRUNCATED: u32 = 2;
 
 #[repr(C)]
 struct RawExecEvent {
@@ -59,6 +64,34 @@ struct RawExecEvent {
     filename_len: u32,
     ld_preload_len: u32,
     ld_preload: [u8; PRELOAD_LEN],
+    args_len: u32,
+    args_flags: u32,
+    args: [u8; ARGS_BUF],
+}
+
+/// The argv the kernel saw at execve entry, if the tracer captured it.
+fn kernel_argv(raw: &RawExecEvent) -> Option<(String, Option<Truncation>)> {
+    if raw.args_flags & ARGS_PRESENT == 0 {
+        return None;
+    }
+    let len = (raw.args_len as usize).min(ARGS_BUF);
+    let (text, truncation) = join_cmdline(&raw.args[..len], raw.args_flags & ARGS_TRUNCATED != 0);
+    (!text.is_empty()).then_some((text, truncation))
+}
+
+/// Pick the command line: `/proc` is preferred because it reflects what the
+/// process runs (for a script that is the interpreter line). A process that
+/// already exited leaves `/proc/<pid>/cmdline` empty or missing; then the argv
+/// captured in the kernel at execve entry is used instead (issue #218).
+fn choose_cmdline(
+    proc: Result<(String, Option<Truncation>), EnrichmentError>,
+    kernel: Option<(String, Option<Truncation>)>,
+) -> Result<(String, Option<Truncation>), EnrichmentError> {
+    match (proc, kernel) {
+        (Ok((text, t)), _) if !text.is_empty() => Ok((text, t)),
+        (_, Some(k)) => Ok(k),
+        (proc, None) => proc,
+    }
 }
 
 // ── Collector ─────────────────────────────────────────────────────────────────
@@ -302,6 +335,23 @@ impl Collector for EbpfExecCollector {
                 .context("failed to attach to syscalls/sys_enter_execve")?;
         }
 
+        // sys_enter_execveat only captures argv; without it execveat(2) falls
+        // back to /proc for the command line, so a failure is not fatal.
+        if let Some(prog) = bpf.program_mut("sys_enter_execveat") {
+            let attached = <&mut TracePoint>::try_from(prog)
+                .map_err(anyhow::Error::from)
+                .and_then(|p| {
+                    p.load()?;
+                    p.attach("syscalls", "sys_enter_execveat")?;
+                    Ok(())
+                });
+            if let Err(e) = attached {
+                warn!(
+                    "sys_enter_execveat not attached, execveat argv comes from /proc only: {e:#}"
+                );
+            }
+        }
+
         // Open the ring buffer map (shared by both tracepoints above)
         let ring_buf = RingBuf::try_from(
             bpf.map_mut("EXEC_EVENTS")
@@ -391,7 +441,7 @@ impl Collector for EbpfExecCollector {
                     .then(|| crate::telemetry::identity::process_start_time(ppid as i32))
                     .flatten();
 
-                let cmdline = match proc_cmdline(pid) {
+                let cmdline = match choose_cmdline(proc_cmdline(pid), kernel_argv(&raw)) {
                     Ok((value, truncation)) => {
                         notes.truncated("cmdline", truncation);
                         value
@@ -538,5 +588,72 @@ mod cmdline_tests {
         let (short, none) = super::join_cmdline(b"ls\0-l\0", false);
         assert_eq!(short, "ls -l");
         assert!(none.is_none());
+    }
+
+    fn raw_with_args(args: &[u8], flags: u32) -> super::RawExecEvent {
+        // SAFETY: plain-old-data struct; all-zero is a valid value.
+        let mut raw: super::RawExecEvent = unsafe { std::mem::zeroed() };
+        raw.args[..args.len()].copy_from_slice(args);
+        raw.args_len = args.len() as u32;
+        raw.args_flags = flags;
+        raw
+    }
+
+    #[test]
+    fn raw_exec_event_matches_the_kernel_layout() {
+        // 4 x u32, comm, filename, 2 x u32, ld_preload, 2 x u32, args.
+        let expected = 16 + 16 + 256 + 8 + 256 + 8 + super::ARGS_BUF;
+        assert_eq!(std::mem::size_of::<super::RawExecEvent>(), expected);
+    }
+
+    #[test]
+    fn kernel_argv_is_read_only_when_the_tracer_captured_it() {
+        let raw = raw_with_args(b"cat\0/proc/self/environ\0", super::ARGS_PRESENT);
+        let (text, truncation) = super::kernel_argv(&raw).expect("argv captured");
+        assert_eq!(text, "cat /proc/self/environ");
+        assert!(truncation.is_none());
+
+        let absent = raw_with_args(b"cat\0", 0);
+        assert!(super::kernel_argv(&absent).is_none());
+
+        let truncated = raw_with_args(
+            b"python3\0-c\0aaaa\0",
+            super::ARGS_PRESENT | super::ARGS_TRUNCATED,
+        );
+        let (_, truncation) = super::kernel_argv(&truncated).unwrap();
+        assert!(truncation.is_some(), "a cut argv must be marked");
+
+        // A corrupt length never reads past the buffer.
+        let mut bad = raw_with_args(b"ls\0", super::ARGS_PRESENT);
+        bad.args_len = u32::MAX;
+        assert_eq!(super::kernel_argv(&bad).unwrap().0, "ls");
+    }
+
+    #[test]
+    fn proc_wins_and_kernel_argv_fills_in_for_exited_processes() {
+        use super::{choose_cmdline, EnrichmentError};
+        let kernel = || Some(("cat /proc/self/environ".to_string(), None));
+
+        let proc_ok = Ok(("/bin/sh ./x.sh".to_string(), None));
+        assert_eq!(
+            choose_cmdline(proc_ok, kernel()).unwrap().0,
+            "/bin/sh ./x.sh"
+        );
+
+        // Exited but not yet reaped: /proc/<pid>/cmdline reads empty.
+        let proc_empty = Ok((String::new(), None));
+        assert_eq!(
+            choose_cmdline(proc_empty, kernel()).unwrap().0,
+            "cat /proc/self/environ"
+        );
+
+        let proc_gone = Err(EnrichmentError::ProcessExited);
+        assert_eq!(
+            choose_cmdline(proc_gone, kernel()).unwrap().0,
+            "cat /proc/self/environ"
+        );
+
+        let proc_gone = Err(EnrichmentError::ProcessExited);
+        assert!(choose_cmdline(proc_gone, None).is_err());
     }
 }

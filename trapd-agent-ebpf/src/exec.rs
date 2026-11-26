@@ -1,10 +1,11 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
+        bpf_probe_read_kernel_buf, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user,
+        bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
-    maps::RingBuf,
+    maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
     EbpfContext,
 };
@@ -12,6 +13,18 @@ use aya_ebpf::{
 use crate::{COMM_LEN, PATH_LEN};
 
 const PRELOAD_LEN: usize = 256;
+
+/// argv capture budget. A power of two so the write offset can be masked into
+/// range for the verifier; the buffer carries one extra argument's worth of
+/// slack so a masked offset plus `ARG_MAX` never leaves it.
+const ARGS_LEN: usize = 1024;
+const ARG_MAX: usize = 256;
+const ARGS_BUF: usize = ARGS_LEN + ARG_MAX;
+const MAX_ARGS: usize = 32;
+
+/// `args_flags` bits.
+const ARGS_PRESENT: u32 = 1;
+const ARGS_TRUNCATED: u32 = 2;
 
 /// Raw exec event — layout must match `RawExecEvent` in agent/src/collectors/linux/ebpf_exec.rs.
 #[repr(C)]
@@ -26,11 +39,37 @@ pub struct ExecEvent {
     /// Non-zero when an LD_PRELOAD value was detected in the process environment.
     pub ld_preload_len: u32,
     pub ld_preload:     [u8; PRELOAD_LEN],
+    /// argv as read at execve entry: NUL-terminated strings back to back,
+    /// like `/proc/<pid>/cmdline`. Only `args_len` bytes are meaningful.
+    pub args_len:       u32,
+    pub args_flags:     u32,
+    pub args:           [u8; ARGS_BUF],
 }
 
-/// 1 MiB ring buffer – handles ≈ 4 000 exec events/s at ≈ 256 B/event.
+/// argv captured at execve entry, waiting for `sched_process_exec`.
+#[repr(C)]
+pub struct PendingArgv {
+    pub len:   u32,
+    pub flags: u32,
+    pub buf:   [u8; ARGS_BUF],
+}
+
+/// 2 MiB ring buffer – an exec event is ≈ 1.9 KiB with argv, so this keeps
+/// about 1 000 events of headroom for exec bursts. Every collector that loads
+/// this object gets its own instance, so keep it modest.
 #[map]
-static EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
+static EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(2 * 1024 * 1024, 0);
+
+/// Scratch space for building a `PendingArgv` (too large for the BPF stack).
+#[map]
+static ARGV_SCRATCH: PerCpuArray<PendingArgv> = PerCpuArray::with_max_entries(1, 0);
+
+/// argv keyed by the exec'ing thread id. `/proc/<pid>/cmdline` is empty or
+/// gone once a short-lived process has exited, so the command line is taken
+/// from the syscall arguments instead (issue #218). LRU so failed execs that
+/// never reach `sched_process_exec` age out.
+#[map]
+static ARGV_PENDING: LruHashMap<u32, PendingArgv> = LruHashMap::with_max_entries(1024, 0);
 
 /// Tracepoint: sched/sched_process_exec
 ///
@@ -98,9 +137,104 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
     ev.ld_preload_len = 0;
     ev.filename       = filename;
     ev.filename_len   = written as u32;
+    ev.args_len       = 0;
+    ev.args_flags     = 0;
+
+    // old_pid is the id of the thread that called execve (a non-leader thread
+    // takes over the leader's pid during exec), which is the pending key.
+    let old_tid: i32 = unsafe { ctx.read_at(16).unwrap_or(-1) };
+    if old_tid > 0 {
+        let key = old_tid as u32;
+        if let Some(p) = ARGV_PENDING.get_ptr_mut(&key) {
+            let p = p as *const PendingArgv;
+            // Copy map memory to ring memory with a helper: a struct copy of
+            // this size would go through the 512-byte BPF stack.
+            let ok = unsafe {
+                bpf_probe_read_kernel_buf((*p).buf.as_ptr(), &mut ev.args).is_ok()
+            };
+            if ok {
+                let len = unsafe { (*p).len };
+                ev.args_len   = if (len as usize) < ARGS_BUF { len } else { ARGS_BUF as u32 };
+                ev.args_flags = unsafe { (*p).flags };
+            }
+        }
+        let _ = ARGV_PENDING.remove(&key);
+    }
 
     entry.submit(0);
     Ok(())
+}
+
+/// Read up to [`MAX_ARGS`] argv strings from user memory into the pending map
+/// for the current thread. Always clears an older entry first, so a failed
+/// capture can never leave a previous exec's argv to be attached.
+#[inline(always)]
+fn capture_argv(argv_uptr: u64) {
+    let tid = bpf_get_current_pid_tgid() as u32;
+    let _ = ARGV_PENDING.remove(&tid);
+    if argv_uptr == 0 {
+        return;
+    }
+    let scratch = match ARGV_SCRATCH.get_ptr_mut(0) {
+        Some(p) => p,
+        None => return,
+    };
+    let a = unsafe { &mut *scratch };
+    let mut off: usize = 0;
+    let mut flags = ARGS_PRESENT;
+    let mut ended = false;
+    for i in 0..MAX_ARGS {
+        let slot = (argv_uptr as usize).wrapping_add(i.wrapping_mul(8)) as *const u64;
+        let ptr: u64 = unsafe { bpf_probe_read_user(slot).unwrap_or(0) };
+        if ptr == 0 {
+            ended = true;
+            break;
+        }
+        if off >= ARGS_LEN {
+            flags |= ARGS_TRUNCATED;
+            ended = true;
+            break;
+        }
+        let at = off & (ARGS_LEN - 1);
+        let n = unsafe {
+            aya_ebpf::helpers::gen::bpf_probe_read_user_str(
+                a.buf.as_mut_ptr().add(at) as *mut core::ffi::c_void,
+                ARG_MAX as u32,
+                ptr as *const core::ffi::c_void,
+            )
+        };
+        if n <= 0 {
+            ended = true;
+            break;
+        }
+        // A full read may have cut the argument short.
+        if n as usize >= ARG_MAX {
+            flags |= ARGS_TRUNCATED;
+        }
+        off = at + n as usize;
+    }
+    if !ended {
+        // MAX_ARGS strings read; anything after them is lost.
+        let slot = (argv_uptr as usize).wrapping_add(MAX_ARGS * 8) as *const u64;
+        if unsafe { bpf_probe_read_user(slot).unwrap_or(0) } != 0 {
+            flags |= ARGS_TRUNCATED;
+        }
+    }
+    a.len = if off < ARGS_BUF { off as u32 } else { ARGS_BUF as u32 };
+    a.flags = flags;
+    if ARGV_PENDING.insert(&tid, a, 0).is_err() {
+        crate::dropcount::record_drop(crate::dropcount::SLOT_EXEC);
+    }
+}
+
+/// Tracepoint: syscalls/sys_enter_execveat — argv capture only.
+///
+///   offset 32 │ u64  arg2  argv  (user pointer to char** array)
+#[tracepoint]
+pub fn sys_enter_execveat(ctx: TracePointContext) -> u32 {
+    let argv: u64 = unsafe { ctx.read_at(32).unwrap_or(0) };
+    capture_argv(argv);
+    0
 }
 
 /// Tracepoint: syscalls/sys_enter_execve
@@ -123,7 +257,10 @@ pub fn sys_enter_execve(ctx: TracePointContext) -> u32 {
 #[inline(always)]
 fn try_execve_ld_preload(ctx: &TracePointContext) -> Result<(), i64> {
     let filename_uptr: u64 = unsafe { ctx.read_at(16).map_err(|_| -1i64)? };
+    let argv_uptr:     u64 = unsafe { ctx.read_at(24).unwrap_or(0) };
     let envp_uptr:     u64 = unsafe { ctx.read_at(32).map_err(|_| -1i64)? };
+
+    capture_argv(argv_uptr);
 
     if envp_uptr == 0 {
         return Ok(());
@@ -204,6 +341,8 @@ fn try_execve_ld_preload(ctx: &TracePointContext) -> Result<(), i64> {
             .unwrap_or(0)
     };
     ev.ld_preload_len = ld_written as u32;
+    ev.args_len       = 0;
+    ev.args_flags     = 0;
 
     entry.submit(0);
     Ok(())
