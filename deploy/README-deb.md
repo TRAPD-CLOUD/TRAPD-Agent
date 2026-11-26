@@ -90,6 +90,18 @@ Interaction between dpkg and the self-update:
   (`/usr/local/bin/trapd-agent` or `/etc/systemd/system/trapd-agent.service`),
   because that unit would shadow the packaged one. The message lists the removal
   steps; credentials in `/var/lib/trapd` are reused.
+- **perf policy**: Ubuntu kernels default to `kernel.perf_event_paranoid=4`,
+  which lets only CAP_SYS_ADMIN attach eBPF tracepoints; the unit has
+  CAP_PERFMON, so every eBPF collector would fail. On such hosts `postinst`
+  runs `trapd-agent perf-sysctl apply`: it writes
+  `/etc/sysctl.d/60-trapd-perf.conf` (level 3, previous value recorded) and
+  sets the running value. Level 3 still denies perf to unprivileged users.
+  Hosts at 3 or lower are not touched. `prerm` on removal runs
+  `perf-sysctl revert`, which deletes the file and restores the recorded value
+  unless an operator changed it meanwhile. To keep level 4, put
+  `kernel.perf_event_paranoid = 4` in a later file such as
+  `/etc/sysctl.d/99-local.conf`; eBPF telemetry is then unavailable and the
+  agent reports `collector_failed`.
 - **remove**: stops and disables the units, keeps `/var/lib/trapd`
   (credentials) and `/etc/trapd/agent.env`, so a reinstall keeps the device identity.
 - **uninstall protection** (only packages built with `maintenance_signing.pub`):

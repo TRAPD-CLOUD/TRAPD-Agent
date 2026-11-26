@@ -36,6 +36,9 @@ remove|deconfigure)
         systemctl stop trapd-agent-update.path trapd-guard.service trapd-agent.service || true
         systemctl disable trapd-agent.service trapd-guard.service trapd-agent-update.path >/dev/null 2>&1 || true
     fi
+    # Undo the perf_event_paranoid drop-in postinst wrote (before dpkg
+    # removes the binary that knows the recorded value).
+    /usr/bin/trapd-agent perf-sysctl revert || true
     # State survives removal, but a pairing session belongs to the stopped
     # process. Also handles old agents and unclean termination.
     if [ ! -L /var/lib/trapd ]; then
