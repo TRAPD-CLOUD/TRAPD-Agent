@@ -193,6 +193,14 @@ jobs:
         run: cargo xtask build-ebpf --release
       - name: Build agent for native kernel acceptance
         run: cargo build --release --manifest-path agent/Cargo.toml
+      # The runner kernel is recent; 5.15 LTS rejects constructs it accepts
+      # (issue #217). Boot 5.15 in QEMU and load every program there.
+      - name: Verifier check on kernel 5.15
+        run: |
+          cargo build --release --manifest-path agent/Cargo.toml --example ebpf_verifier_check
+          scripts/ebpf_verifier_kernels.sh \
+            target/bpfel-unknown-none/release/trapd-agent-exec \
+            target/release/examples/ebpf_verifier_check
       - name: Native honeytoken inode and fallback acceptance
         run: |
           bash agent/tests/native_linux_honeytokens.sh inode
