@@ -62,6 +62,12 @@ configure)
     # Keep the independent release verification key untouched.
     rm -f "$ENV_DIR/binary.sig"
 
+    # Ubuntu's kernel.perf_event_paranoid=4 lets only CAP_SYS_ADMIN attach
+    # tracepoints; the unit has CAP_PERFMON. Lowers 4 to 3 via a sysctl.d
+    # drop-in (prerm restores it); hosts at 3 or below are left alone.
+    "$BIN" perf-sysctl apply \
+        || warn "could not adjust kernel.perf_event_paranoid; eBPF telemetry may be unavailable"
+
     if systemd_active; then
         systemctl daemon-reload || warn "systemctl daemon-reload failed"
         systemctl enable trapd-agent.service trapd-guard.service trapd-agent-update.path >/dev/null 2>&1 \

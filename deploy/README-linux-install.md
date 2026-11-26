@@ -24,6 +24,11 @@ sudo TRAPD_RELEASE_PUBKEY_B64='<independently obtained public key>' \
   bash install.sh
 ```
 
+On Ubuntu (`kernel.perf_event_paranoid=4`) the installer lowers the level to 3
+through `/etc/sysctl.d/60-trapd-perf.conf` so the agent can attach its eBPF
+tracepoints with CAP_PERFMON; see `README-deb.md` (perf policy). Undo it with
+`sudo /usr/local/bin/trapd-agent perf-sysctl revert`.
+
 Device pairing is the default. For unattended enrollment, provision a root-owned mode-0600 file at `/etc/trapd/enrollment.token` and remove it after enrollment.
 
 The installer verifies all three artifacts before replacing any executable:

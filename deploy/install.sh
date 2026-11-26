@@ -571,6 +571,13 @@ cat > "$LOGROTATE_FILE" <<'EOF'
 }
 EOF
 
+# ── Kernel perf policy ────────────────────────────────────────────────────────
+# Ubuntu's kernel.perf_event_paranoid=4 lets only CAP_SYS_ADMIN attach
+# tracepoints; the unit has CAP_PERFMON. Lowers 4 to 3 via
+# /etc/sysctl.d/60-trapd-perf.conf; undo with `trapd-agent perf-sysctl revert`.
+"$INSTALL_BIN" perf-sysctl apply \
+    || echo "⚠️  Could not adjust kernel.perf_event_paranoid; eBPF telemetry may be unavailable."
+
 # ── Enable services ───────────────────────────────────────────────────────────
 systemctl daemon-reload
 systemctl enable --now trapd-agent trapd-guard

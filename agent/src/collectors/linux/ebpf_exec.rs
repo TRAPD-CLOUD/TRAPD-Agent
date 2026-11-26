@@ -506,8 +506,8 @@ fn perf_paranoid_hint() -> String {
     {
         Some(level) if level >= 4 => format!(
             " (kernel.perf_event_paranoid={level} requires CAP_SYS_ADMIN for tracepoints; \
-             lower it with `sysctl kernel.perf_event_paranoid=3` or grant CAP_SYS_ADMIN \
-             to the unit via a drop-in)"
+             run `trapd-agent perf-sysctl apply` as root, which the package \
+             does on install)"
         ),
         _ => String::new(),
     }

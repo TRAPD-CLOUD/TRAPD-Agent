@@ -141,6 +141,19 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `trapd-agent perf-sysctl <apply|revert>`, run by the package scripts:
+    // lowers Ubuntu's perf_event_paranoid=4 to 3 so the unit's CAP_PERFMON
+    // can attach eBPF tracepoints, and restores it on removal (issue #216).
+    if std::env::args().nth(1).as_deref() == Some("perf-sysctl") {
+        #[cfg(target_os = "linux")]
+        {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            return collectors::linux::perf_sysctl::run(&args);
+        }
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("perf-sysctl is Linux only");
+    }
+
     // `trapd-agent uninstall-gate [--token-file <path>]`, run by the deb's
     // prerm before the service is stopped for a removal: a failure (non-zero
     // exit) aborts the removal. Same gate as the Windows MSI action.
