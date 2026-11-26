@@ -77,13 +77,15 @@ for l in open(sys.argv[1]):
 python3 - "$dir" "$mode" <<'PY' || { diagnose; exit 1; }
 import collections,json,sys
 from pathlib import Path
-p=Path(sys.argv[1]);mode=sys.argv[2];pid=int((p/'agent.pid').read_text());hits=[];file_events=collections.Counter()
+p=Path(sys.argv[1]);mode=sys.argv[2];pid=int((p/'agent.pid').read_text());hits=[];file_events=collections.Counter();argv_cmds=[]
 for line in (p/'events.ndjson').read_text().splitlines():
  try:e=json.loads(line)
  except ValueError:continue
  assert e.get('metadata',{}).get('version')=='1.9.0','local telemetry is not OCSF 1.9.0'
  source=e.get('unmapped',{}).get('trapd',{})
  d=source.get('data',{})
+ if isinstance(d,dict) and source.get('origin',{}).get('source')=='ebpf_exec' and d.get('exe')=='/bin/true':
+  argv_cmds.append(d.get('cmdline',''))
  if isinstance(d,dict) and e.get('class_uid')==1001 and d.get('comm') in ('probe','mv') and '/test/decoy.txt' in (d.get('path'),d.get('old_path')):
   file_events[d['comm']]+=1
  if isinstance(d,dict) and d.get('token_id','').startswith(('11111111-','22222222-','33333333-')):
@@ -91,6 +93,9 @@ for line in (p/'events.ndjson').read_text().splitlines():
   assert e.get('finding_info',{}).get('uid')==e['metadata']['uid'],'finding identity changed'
   hits.append({'data':d})
 assert hits,'no Honeytoken data'
+# Short-lived processes keep their command line (issue #218).
+for i in range(1,31):
+ assert f'/bin/true trapd-argv-probe {i} two words' in argv_cmds,('argv lost',i,sum(1 for c in argv_cmds if not c),len(argv_cmds))
 assert not any(e['data']['token_id'].startswith('33333333-') and e['data']['access_kind'] in ['exec','open'] for e in hits),'failed exec became content access'
 assert not any(e['data'].get('accessor',{}).get('pid')==pid for e in hits),'agent self access leaked'
 # File telemetry of the same actions (write opens, rename) must arrive too.

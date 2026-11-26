@@ -12,6 +12,9 @@ export TRAPD_OFFLINE=1 TRAPD_OUTPUT=stdout TRAPD_STATE_DIR=/var/lib/trapd TRAPD_
 echo "$agent" > /test/agent.pid
 trap 'kill -TERM "$agent" 2>/dev/null || true' EXIT
 sleep 8
+# Short-lived processes: /proc/<pid>/cmdline is gone before the agent reads
+# it, so the command line must come from the kernel (issue #218).
+for i in $(seq 1 30); do /bin/true trapd-argv-probe "$i" 'two words'; done
 /test/probe /test/decoy.txt 2097152
 /test/probe /test/decoy.txt 65536
 ln -s decoy-invalid /test/invalid-alias
